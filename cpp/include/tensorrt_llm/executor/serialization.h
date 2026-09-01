@@ -66,11 +66,6 @@ public:
     static void serialize(AdditionalModelOutput const& additionalModelOutput, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(AdditionalModelOutput const& additionalModelOutput);
 
-    // ExternalDraftTokensConfig
-    [[nodiscard]] static ExternalDraftTokensConfig deserializeExternalDraftTokensConfig(std::istream& is);
-    static void serialize(ExternalDraftTokensConfig const& config, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(ExternalDraftTokensConfig const& config);
-
     // PromptTuningConfig
     [[nodiscard]] static PromptTuningConfig deserializePromptTuningConfig(std::istream& is);
     static void serialize(PromptTuningConfig const& config, std::ostream& os);
@@ -206,11 +201,6 @@ public:
     static EagleConfig deserializeEagleConfig(std::istream& is);
     static void serialize(EagleConfig const& eagleConfig, std::ostream& os);
     static size_t serializedSize(EagleConfig const& eagleConfig);
-
-    // SpeculativeDecodingConfig
-    static SpeculativeDecodingConfig deserializeSpeculativeDecodingConfig(std::istream& is);
-    static void serialize(SpeculativeDecodingConfig const& specDecConfig, std::ostream& os);
-    static size_t serializedSize(SpeculativeDecodingConfig const& specDecConfig);
 
     // GuidedDecodingConfig
     static GuidedDecodingConfig deserializeGuidedDecodingConfig(std::istream& is);

@@ -343,8 +343,6 @@ def test_llm_request():
         "prompt_embedding_table": torch.tensor((10, 10)),
         "prompt_vocab_size": 2,
         "embedding_bias": torch.tensor((10, 10)),
-        "stop_words_list": torch.tensor((10, 10)),
-        "bad_words_list": torch.tensor((10, 10)),
         "return_log_probs": True,
         "return_context_logits": False,
         "return_generation_logits": False
@@ -362,8 +360,6 @@ def test_llm_request():
                        kwargs["prompt_embedding_table"])
     assert llm_request.prompt_vocab_size == 2
     assert torch.equal(llm_request.embedding_bias, kwargs["embedding_bias"])
-    assert torch.equal(llm_request.stop_words_list, kwargs["stop_words_list"])
-    assert torch.equal(llm_request.bad_words_list, kwargs["bad_words_list"])
 
     assert llm_request.get_num_tokens(0) == 3
     assert llm_request.max_beam_num_tokens == 3

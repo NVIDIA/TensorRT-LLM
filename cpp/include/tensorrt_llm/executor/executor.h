@@ -253,32 +253,6 @@ public:
     std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs;
 };
 
-/// @brief Configuration for speculative decoding with external draft tokens.
-/// Allows to include draft tokens, draft logits and specify acceptance threshold.
-class ExternalDraftTokensConfig
-{
-public:
-    explicit ExternalDraftTokensConfig(VecTokens tokens, std::optional<Tensor> logits = std::nullopt,
-        std::optional<FloatType> const& acceptanceThreshold = std::nullopt,
-        std::optional<bool> const& fastLogits = std::nullopt);
-
-    [[nodiscard]] VecTokens getTokens() const;
-    [[nodiscard]] std::optional<Tensor> getLogits() const;
-    [[nodiscard]] std::optional<FloatType> getAcceptanceThreshold() const;
-    [[nodiscard]] std::optional<bool> getFastLogits() const;
-
-private:
-    friend class Serialization;
-    /// @brief The draft tokens
-    VecTokens mTokens;
-    /// @brief The draft logits. Expected shape: [num_draft_tokens, vocab_size].
-    std::optional<Tensor> mLogits;
-    /// @brief The acceptance threshold. Must be > 0.f and <= 1.f
-    std::optional<FloatType> mAcceptanceThreshold;
-    /// @brief Use direct transfer for draft logits
-    std::optional<bool> mFastLogits;
-};
-
 /// @brief Configuration for prompt tuning
 class PromptTuningConfig
 {
@@ -522,21 +496,6 @@ private:
     std::optional<std::string> mDisaggInfoEndpoint;
 };
 
-/// @brief Configuration for speculative decoding (both draft and target models)
-class SpeculativeDecodingConfig
-{
-public:
-    explicit SpeculativeDecodingConfig(bool fastLogits = false);
-
-    bool operator==(SpeculativeDecodingConfig const& other) const;
-
-    /// @brief Send logits tensor directly from draft to target model.
-    bool fastLogits;
-
-private:
-    friend class Serialization;
-};
-
 /// @brief Guided decoding parameters for a request.
 class GuidedDecodingParams
 {
@@ -732,7 +691,6 @@ public:
         std::optional<std::list<VecTokens>> badWords = std::nullopt,
         std::optional<std::list<VecTokens>> stopWords = std::nullopt,
         std::optional<Tensor> embeddingBias = std::nullopt,
-        std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<MultimodalInput> multimodalInput = std::nullopt,
         std::optional<Tensor> multimodalEmbedding = std::nullopt, std::optional<MropeConfig> mRopeConfig = std::nullopt,
@@ -777,7 +735,6 @@ public:
     [[nodiscard]] std::optional<std::list<VecTokens>> getBadWords() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getStopWords() const;
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
-    [[nodiscard]] std::optional<ExternalDraftTokensConfig> getExternalDraftTokensConfig() const;
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
     [[nodiscard]] std::optional<MultimodalInput> getMultimodalInput() const;
     [[nodiscard]] std::optional<Tensor> getMultimodalEmbedding() const;
@@ -814,7 +771,6 @@ public:
     void setBadWords(std::list<VecTokens> const& badWords);
     void setStopWords(std::list<VecTokens> const& stopWords);
     void setEmbeddingBias(Tensor const& embeddingBias);
-    void setExternalDraftTokensConfig(ExternalDraftTokensConfig const& externalDraftTokensConfig);
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
     void setMultimodalEmbedding(Tensor const& multimodalEmbedding);
     void setMultimodalInput(MultimodalInput const& multimodalInput);
@@ -1586,7 +1542,6 @@ public:
         ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig = ExtendedRuntimePerfKnobConfig(),
         std::optional<DebugConfig> debugConfig = std::nullopt, SizeType32 recvPollPeriodMs = 0,
         uint64_t maxSeqIdleMicroseconds = kDefaultMaxSeqIdleMicroseconds,
-        std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
@@ -1619,7 +1574,6 @@ public:
     [[nodiscard]] std::optional<DebugConfig> getDebugConfig() const;
     [[nodiscard]] SizeType32 getRecvPollPeriodMs() const;
     [[nodiscard]] uint64_t getMaxSeqIdleMicroseconds() const;
-    [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpecDecConfig() const;
     [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
     [[nodiscard]] std::optional<std::vector<AdditionalModelOutput>> getAdditionalModelOutputs() const;
     [[nodiscard]] bool getGatherGenerationLogits() const;
@@ -1649,7 +1603,6 @@ public:
     void setDebugConfig(DebugConfig const& debugConfig);
     void setRecvPollPeriodMs(SizeType32 const& recvPollPeriodMs);
     void setMaxSeqIdleMicroseconds(uint64_t maxSeqIdleMicroseconds);
-    void setSpecDecConfig(SpeculativeDecodingConfig const& specDecConfig);
     void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
     void setAdditionalModelOutputs(std::vector<AdditionalModelOutput> const& additionalModelOutputs);
     void setGatherGenerationLogits(bool gatherGenerationLogits);
@@ -1726,7 +1679,6 @@ private:
     uint64_t mMaxSeqIdleMicroseconds;
 
     /// @brief The speculative decoding configuration
-    std::optional<SpeculativeDecodingConfig> mSpeculativeDecodingConfig;
 
     /// @brief The guided decoding configuration
     std::optional<GuidedDecodingConfig> mGuidedDecodingConfig;

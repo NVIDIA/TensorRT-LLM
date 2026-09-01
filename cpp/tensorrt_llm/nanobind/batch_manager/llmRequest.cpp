@@ -85,8 +85,6 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         mEndId,                                                    //
         mPadId,                                                    //
         from_torch(mEmbeddingBias),                                //
-        from_torch(mBadWordsList),                                 //
-        from_torch(mStopWordsList),                                //
         mPositionIds,                                              //
         from_torch(mPromptEmbeddingTable),                         //
         mPromptVocabSize,                                          //

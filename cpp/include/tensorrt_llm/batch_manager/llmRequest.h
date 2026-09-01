@@ -122,7 +122,6 @@ public:
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
-        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -176,8 +175,6 @@ public:
         , mNumPreDecodedTokens(samplingConfig.beamWidth, 0)
         , mMaxSentTokenLen(mPromptLen)
         , mEmbeddingBias(std::move(embeddingBias))
-        , mBadWordsList(std::move(badWordsList))
-        , mStopWordsList(std::move(stopWordsList))
         , mPositionIds(std::move(positionIds))
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
@@ -238,7 +235,6 @@ public:
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
-        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -268,8 +264,6 @@ public:
         , mNumPreDecodedTokens(samplingConfig.beamWidth, 0)
         , mMaxSentTokenLen(mPromptLen)
         , mEmbeddingBias(std::move(embeddingBias))
-        , mBadWordsList(std::move(badWordsList))
-        , mStopWordsList(std::move(stopWordsList))
         , mPositionIds(std::move(positionIds))
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
@@ -308,7 +302,7 @@ public:
         : mRequestId(requestId)
         , mPromptLen(req.getInputTokenIds().size())
         , mMaxNewTokens(req.getMaxTokens())
-        , mSamplingConfig(req.getSamplingConfig(), req.getExternalDraftTokensConfig())
+        , mSamplingConfig(req.getSamplingConfig())
         , mEndId(req.getEndId())
         , mPadId(req.getPadId())
         , mClientId(req.getClientId())
@@ -381,15 +375,6 @@ public:
             // Add leading 1 dimension since that's what IFB code expects
             mEmbeddingBias.value()->unsqueeze(0);
         }
-        if (req.getBadWords())
-        {
-            mBadWordsList = createListTensor(req.getBadWords().value());
-        }
-        if (req.getStopWords())
-        {
-            mStopWordsList = createListTensor(req.getStopWords().value());
-        }
-
         if (req.getPositionIds())
         {
             mPositionIds = std::make_shared<std::vector<SizeType32>>(req.getPositionIds().value());
@@ -460,19 +445,6 @@ public:
                     executor::detail::toITensor(loraConfig.value().getConfig().value()));
                 mLoraConfig.value()->unsqueeze(0);
             }
-        }
-
-        auto externalDraftTokensConfig = req.getExternalDraftTokensConfig();
-        if (externalDraftTokensConfig)
-        {
-            mDraftTokens = std::make_shared<VecTokens>(externalDraftTokensConfig.value().getTokens());
-
-            if (externalDraftTokensConfig.value().getLogits())
-            {
-                mDraftLogits = executor::detail::toITensor(externalDraftTokensConfig.value().getLogits().value());
-            }
-
-            // NOTE: Draft acceptance threshold is stored in mSamplingConfig
         }
 
         if (req.getOutputConfig().additionalModelOutputs.has_value())
@@ -1142,16 +1114,6 @@ public:
     [[nodiscard]] std::optional<TensorPtr> getEmbeddingBias() const
     {
         return mEmbeddingBias;
-    }
-
-    [[nodiscard]] std::optional<TensorPtr> getBadWordsList() const
-    {
-        return mBadWordsList;
-    }
-
-    [[nodiscard]] std::optional<TensorPtr> getStopWordsList() const
-    {
-        return mStopWordsList;
     }
 
     [[nodiscard]] bool returnLogProbs() const
@@ -2148,8 +2110,6 @@ protected:
     SizeType32 mMaxSentTokenLen;
 
     std::optional<TensorPtr> mEmbeddingBias{std::nullopt};
-    std::optional<TensorPtr> mBadWordsList{std::nullopt};
-    std::optional<TensorPtr> mStopWordsList{std::nullopt};
 
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mPositionIds{std::nullopt};
 
@@ -2404,32 +2364,6 @@ private:
         mStartTime = std::chrono::steady_clock::now();
     }
 
-    TensorPtr createListTensor(std::list<VecTokens> const& wordsList)
-    {
-        std::vector<SizeType32> offsets;
-        VecTokens words;
-        SizeType32 offsetCnt = 0;
-        for (auto const& tokens : wordsList)
-        {
-            offsetCnt += tokens.size();
-            offsets.push_back(offsetCnt);
-            words.insert(words.end(), tokens.begin(), tokens.end());
-        }
-        offsets.resize(words.size(), -1);
-
-        auto const numWords = static_cast<SizeType32>(words.size());
-        auto const shape = runtime::ITensor::makeShape({2, numWords});
-        auto tensor = runtime::BufferManager::pinnedPool(shape, tensorrt_llm::DataType::kINT32);
-        auto* data = runtime::bufferCast<int32_t>(*tensor);
-        std::memcpy(data, words.data(), numWords * sizeof(int32_t));
-        std::memcpy(data + numWords, offsets.data(), numWords * sizeof(int32_t));
-
-        // Add leading dim of 1
-        tensor->unsqueeze(0);
-
-        return tensor;
-    }
-
     static TimePoint maybeToGlobalSteadyClock(TimePoint const& time_point)
     {
         auto const& offset = globalSteadyClockOffset();
@@ -2464,7 +2398,6 @@ public:
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
-        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -2503,8 +2436,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt,
         std::optional<std::string> cacheSalt = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
-            samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
-            std::move(stopWordsList),
+            samplingConfig, isStreaming, endId, padId, std::move(embeddingBias),
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
             std::move(promptEmbeddingTable), promptVocabSize,

@@ -54,7 +54,6 @@ public:
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
-        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -99,8 +98,6 @@ public:
             endId,                                                                                              //
             padId,                                                                                              //
             embeddingBias,                                                                                      //
-            badWordsList,                                                                                       //
-            stopWordsList,                                                                                      //
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value())) //
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),    //
             promptEmbeddingTable,                                                                               //

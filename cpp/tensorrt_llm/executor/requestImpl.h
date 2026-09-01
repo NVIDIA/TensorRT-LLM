@@ -51,7 +51,6 @@ public:
         OutputConfig outputConfig, std::optional<TokenIdType> const& endId, std::optional<TokenIdType> const& padId,
         std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
         std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
-        std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig,
         std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
         std::optional<Tensor> multimodalEmbedding, std::optional<MropeConfig> mRopeConfig,
         std::optional<LoraConfig> loraConfig, std::optional<LookaheadDecodingConfig> lookaheadConfig,
@@ -75,7 +74,6 @@ public:
         , mBadWords(std::move(badWords))
         , mStopWords(std::move(stopWords))
         , mEmbeddingBias(checkEmbeddingBias(std::move(embeddingBias)))
-        , mExternalDraftTokensConfig(std::move(externalDraftTokensConfig))
         , mPTuningConfig(std::move(pTuningConfig))
         , mMultimodalInput(std::move(multimodalInput))
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
@@ -188,11 +186,6 @@ public:
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const
     {
         return mEmbeddingBias;
-    }
-
-    [[nodiscard]] std::optional<ExternalDraftTokensConfig> getExternalDraftTokensConfig() const
-    {
-        return mExternalDraftTokensConfig;
     }
 
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const
@@ -371,11 +364,6 @@ public:
     void setEmbeddingBias(Tensor const& embeddingBias)
     {
         mEmbeddingBias = checkEmbeddingBias(embeddingBias);
-    }
-
-    void setExternalDraftTokensConfig(ExternalDraftTokensConfig const& externalDraftTokensConfig)
-    {
-        mExternalDraftTokensConfig = externalDraftTokensConfig;
     }
 
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig)
@@ -561,7 +549,6 @@ private:
         lambda(mBadWords);
         lambda(mStopWords);
         lambda(mEmbeddingBias);
-        lambda(mExternalDraftTokensConfig);
         lambda(mPTuningConfig);
         lambda(mMultimodalInput);
         lambda(mMultimodalEmbedding);
@@ -600,7 +587,6 @@ private:
     std::optional<std::list<VecTokens>> mBadWords;
     std::optional<std::list<VecTokens>> mStopWords;
     std::optional<Tensor> mEmbeddingBias;
-    std::optional<ExternalDraftTokensConfig> mExternalDraftTokensConfig;
     std::optional<PromptTuningConfig> mPTuningConfig;
     std::optional<MultimodalInput> mMultimodalInput;
     std::optional<Tensor> mMultimodalEmbedding;

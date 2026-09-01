@@ -382,22 +382,6 @@ void initConfigBindings(nb::module_& m)
         .def("__getstate__", extendedRuntimePerfKnobConfigGetstate)
         .def("__setstate__", extendedRuntimePerfKnobConfigSetstate);
 
-    auto SpeculativeDecodingConfigGetState
-        = [](tle::SpeculativeDecodingConfig const& self) { return nb::make_tuple(self.fastLogits); };
-    auto SpeculativeDecodingConfigSetState = [](tle::SpeculativeDecodingConfig& self, nb::tuple const& state)
-    {
-        if (state.size() != 1)
-        {
-            throw std::runtime_error("Invalid SpeculativeDecodingConfig state!");
-        }
-        new (&self) tle::SpeculativeDecodingConfig(nb::cast<bool>(state[0]));
-    };
-    nb::class_<tle::SpeculativeDecodingConfig>(m, "SpeculativeDecodingConfig")
-        .def(nb::init<bool>(), nb::arg("fast_logits") = false)
-        .def_rw("fast_logits", &tle::SpeculativeDecodingConfig::fastLogits)
-        .def("__getstate__", SpeculativeDecodingConfigGetState)
-        .def("__setstate__", SpeculativeDecodingConfigSetState);
-
     // Guided decoding config
     auto pyGuidedDecodingConfig = nb::class_<tle::GuidedDecodingConfig>(m, "GuidedDecodingConfig");
 
@@ -509,9 +493,9 @@ void initConfigBindings(nb::module_& m)
             c.getParallelConfig(), c.getPeftCacheConfig(), c.getLogitsPostProcessorConfig(), c.getDecodingConfig(),
             c.getUseGpuDirectStorage(), c.getGpuWeightsPercent(), c.getMaxQueueSize(),
             c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
-            c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
-            c.getAdditionalModelOutputs(), c.getCacheTransceiverConfig(), c.getGatherGenerationLogits(),
-            c.getPromptTableOffloading(), c.getEnableTrtOverlap(), c.getFailFastOnAttentionWindowTooLarge());
+            c.getMaxSeqIdleMicroseconds(), c.getGuidedDecodingConfig(), c.getAdditionalModelOutputs(),
+            c.getCacheTransceiverConfig(), c.getGatherGenerationLogits(), c.getPromptTableOffloading(),
+            c.getEnableTrtOverlap(), c.getFailFastOnAttentionWindowTooLarge());
         auto pickle_tuple = nb::make_tuple(cpp_states, nb::getattr(self, "__dict__"));
         return pickle_tuple;
     };
@@ -524,7 +508,7 @@ void initConfigBindings(nb::module_& m)
         }
 
         auto cpp_states = nb::cast<nb::tuple>(state[0]);
-        if (cpp_states.size() != 29)
+        if (cpp_states.size() != 28)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
@@ -553,14 +537,13 @@ void initConfigBindings(nb::module_& m)
             nb::cast<std::optional<tle::DebugConfig>>(cpp_states[18]),               // DebugConfig
             nb::cast<SizeType32>(cpp_states[19]),                                    // RecvPollPeriodMs
             nb::cast<uint64_t>(cpp_states[20]),                                      // MaxSeqIdleMicroseconds
-            nb::cast<std::optional<tle::SpeculativeDecodingConfig>>(cpp_states[21]), // SpecDecConfig
-            nb::cast<std::optional<tle::GuidedDecodingConfig>>(cpp_states[22]),      // GuidedDecodingConfig
-            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(cpp_states[23]), // AdditionalModelOutputs
-            nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[24]),             // CacheTransceiverConfig
-            nb::cast<bool>(cpp_states[25]),                                                   // GatherGenerationLogits
-            nb::cast<bool>(cpp_states[26]),                                                   // PromptTableOffloading
-            nb::cast<bool>(cpp_states[27]),                                                   // EnableTrtOverlap
-            nb::cast<bool>(cpp_states[28]) // FailFastOnAttentionWindowTooLarge
+            nb::cast<std::optional<tle::GuidedDecodingConfig>>(cpp_states[21]),      // GuidedDecodingConfig
+            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(cpp_states[22]), // AdditionalModelOutputs
+            nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[23]),             // CacheTransceiverConfig
+            nb::cast<bool>(cpp_states[24]),                                                   // GatherGenerationLogits
+            nb::cast<bool>(cpp_states[25]),                                                   // PromptTableOffloading
+            nb::cast<bool>(cpp_states[26]),                                                   // EnableTrtOverlap
+            nb::cast<bool>(cpp_states[27]) // FailFastOnAttentionWindowTooLarge
         );
 
         // Restore Python data
@@ -593,7 +576,6 @@ void initConfigBindings(nb::module_& m)
                  std::optional<tle::DebugConfig>,                        // DebugConfig
                  SizeType32,                                             // RecvPollPeriodMs
                  uint64_t,                                               // MaxSeqIdleMicroseconds
-                 std::optional<tle::SpeculativeDecodingConfig>,          // SpecDecConfig
                  std::optional<tle::GuidedDecodingConfig>,               // GuidedDecodingConfig
                  std::optional<std::vector<tle::AdditionalModelOutput>>, // AdditionalModelOutputs
                  std::optional<tle::CacheTransceiverConfig>,             // CacheTransceiverConfig
@@ -615,10 +597,10 @@ void initConfigBindings(nb::module_& m)
             nb::arg("extended_runtime_perf_knob_config") = tle::ExtendedRuntimePerfKnobConfig(),
             nb::arg("debug_config") = nb::none(), nb::arg("recv_poll_period_ms") = 0,
             nb::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
-            nb::arg("spec_dec_config") = nb::none(), nb::arg("guided_decoding_config") = nb::none(),
-            nb::arg("additional_model_outputs") = nb::none(), nb::arg("cache_transceiver_config") = nb::none(),
-            nb::arg("gather_generation_logits") = false, nb::arg("mm_embedding_offloading") = false,
-            nb::arg("enable_trt_overlap") = false, nb::arg("fail_fast_on_attention_window_too_large") = false)
+            nb::arg("guided_decoding_config") = nb::none(), nb::arg("additional_model_outputs") = nb::none(),
+            nb::arg("cache_transceiver_config") = nb::none(), nb::arg("gather_generation_logits") = false,
+            nb::arg("mm_embedding_offloading") = false, nb::arg("enable_trt_overlap") = false,
+            nb::arg("fail_fast_on_attention_window_too_large") = false)
         .def_prop_rw("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_prop_rw("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_prop_rw("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -655,7 +637,6 @@ void initConfigBindings(nb::module_& m)
             "recv_poll_period_ms", &tle::ExecutorConfig::getRecvPollPeriodMs, &tle::ExecutorConfig::setRecvPollPeriodMs)
         .def_prop_rw("max_seq_idle_microseconds", &tle::ExecutorConfig::getMaxSeqIdleMicroseconds,
             &tle::ExecutorConfig::setMaxSeqIdleMicroseconds)
-        .def_prop_rw("spec_dec_config", &tle::ExecutorConfig::getSpecDecConfig, &tle::ExecutorConfig::setSpecDecConfig)
         .def_prop_rw("guided_decoding_config", &tle::ExecutorConfig::getGuidedDecodingConfig,
             &tle::ExecutorConfig::setGuidedDecodingConfig)
         .def_prop_rw("additional_model_outputs", &tle::ExecutorConfig::getAdditionalModelOutputs,

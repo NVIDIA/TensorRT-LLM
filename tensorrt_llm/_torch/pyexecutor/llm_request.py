@@ -946,16 +946,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         if llm_request is not None:
             super().__init__(llm_request)
         else:
-            super().__init__(
-                *args,
-                client_id=client_id,
-                return_log_probs=return_log_probs,
-                return_context_logits=False,
-                return_generation_logits=False,
-                return_perf_metrics=return_perf_metrics,
-                stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
-                if stop_words_list else None,
-                **kwargs)
+            super().__init__(*args,
+                             client_id=client_id,
+                             return_log_probs=return_log_probs,
+                             return_context_logits=False,
+                             return_generation_logits=False,
+                             return_perf_metrics=return_perf_metrics,
+                             **kwargs)
         if encoder_output_len is not None and not hasattr(
                 self, "encoder_output_len"):
             self.encoder_output_len = int(encoder_output_len)
@@ -1591,9 +1588,6 @@ def executor_request_to_llm_request(
         end_id=executor_request.end_id,
         pad_id=executor_request.pad_id,
         embedding_bias=executor_request.embedding_bias,
-        bad_words_list=torch.tensor(
-            convert_wordlist(executor_request.bad_words), dtype=torch.int32)
-        if executor_request.bad_words else None,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
         prompt_embedding_table=None if executor_request.prompt_tuning_config

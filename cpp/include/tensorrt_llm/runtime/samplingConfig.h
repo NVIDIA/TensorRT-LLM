@@ -38,43 +38,6 @@ private:
     using OptVec = std::optional<std::vector<T>>;
 
     template <typename T>
-    static OptVec<T> fuseValues(
-        std::vector<SamplingConfig> const& configs, std::function<OptVec<T>(size_t ci)> accessor, T defaultValue)
-    {
-        std::vector<T> values;
-        bool atLeastOneHasValue{false};
-        for (size_t ci = 0; ci < configs.size(); ++ci)
-        {
-            auto const& configValue = accessor(ci);
-            if (configValue.has_value())
-            {
-                atLeastOneHasValue = true;
-                break;
-            }
-        }
-        if (atLeastOneHasValue)
-        {
-            for (size_t ci = 0; ci < configs.size(); ++ci)
-            {
-                auto value = defaultValue;
-                auto const& configValue = accessor(ci);
-                if (configValue.has_value())
-                {
-                    TLLM_CHECK(configValue.value().size() == 1);
-                    value = configValue.value().front();
-                }
-                values.push_back(value);
-            }
-
-            return std::make_optional<std::vector<T>>(values);
-        }
-        else
-        {
-            return std::nullopt;
-        }
-    }
-
-    template <typename T>
     bool validateVec(std::string name, OptVec<T> const& vec, T min, std::optional<T> max = std::nullopt)
     {
         bool valid{true};
@@ -109,104 +72,10 @@ public:
     {
     }
 
-    explicit SamplingConfig(std::vector<SamplingConfig> const& configs)
-    {
-        TLLM_CHECK(configs.size() > 0);
-        beamWidth = configs.front().beamWidth;
-        numReturnSequences = configs.front().numReturnSequences;
-        normalizeLogProbs = configs.front().normalizeLogProbs;
-        temperature = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].temperature; },
-            runtime::DefaultDecodingParams::getTemperature());
-        originalTemperature = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].originalTemperature; },
-            runtime::DefaultDecodingParams::getTemperature());
-        minLength = fuseValues<SizeType32>(
-            configs, [&configs](size_t ci) { return configs[ci].minLength; },
-            runtime::DefaultDecodingParams::getMinLength());
-        repetitionPenalty = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].repetitionPenalty; },
-            runtime::DefaultDecodingParams::getRepetitionPenalty());
-        presencePenalty = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].presencePenalty; },
-            runtime::DefaultDecodingParams::getPresencePenalty());
-        frequencyPenalty = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].frequencyPenalty; },
-            runtime::DefaultDecodingParams::getFrequencyPenalty());
-        promptIgnoreLength = fuseValues<SizeType32>(
-            configs, [&configs](size_t ci) { return configs[ci].promptIgnoreLength; },
-            runtime::DefaultDecodingParams::getPromptIgnoreLength());
-        noRepeatNgramSize = fuseValues<SizeType32>(
-            configs, [&configs](size_t ci) { return configs[ci].noRepeatNgramSize; },
-            runtime::DefaultDecodingParams::getNoRepeatNgramSize());
-        topK = fuseValues<SizeType32>(
-            configs, [&configs](size_t ci) { return configs[ci].topK; }, runtime::DefaultDecodingParams::getTopK());
-        topP = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].topP; }, runtime::DefaultDecodingParams::getTopP());
-
-        // Generate a random seed for each samplingConfig with randomSeed == std::nullopt
-        randomSeed = std::vector<uint64_t>(configs.size());
-        for (size_t ci = 0; ci < configs.size(); ++ci)
-        {
-            auto const& configValue = configs[ci].randomSeed;
-            if (configValue)
-            {
-                TLLM_CHECK(configValue->size() == 1);
-                randomSeed->at(ci) = configValue->front();
-            }
-            else
-            {
-                randomSeed->at(ci) = runtime::DefaultDecodingParams::generateRandomSeed();
-            }
-        }
-
-        topPDecay = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].topPDecay; },
-            runtime::DefaultDecodingParams::getTopPDecay());
-        topPMin = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].topPMin; },
-            runtime::DefaultDecodingParams::getTopPMin());
-        topPResetIds = fuseValues<TokenIdType>(
-            configs, [&configs](size_t ci) { return configs[ci].topPResetIds; },
-            runtime::DefaultDecodingParams::getTopPResetId());
-        beamSearchDiversityRate = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].beamSearchDiversityRate; },
-            runtime::DefaultDecodingParams::getBeamSearchDiversity());
-        lengthPenalty = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].lengthPenalty; },
-            runtime::DefaultDecodingParams::getLengthPenalty());
-        earlyStopping = fuseValues<SizeType32>(
-            configs, [&configs](size_t ci) { return configs[ci].earlyStopping; },
-            runtime::DefaultDecodingParams::getEarlyStopping());
-        topKMedusaHeads = fuseValues<std::vector<SizeType32>>(
-            configs, [&configs](size_t ci) { return configs[ci].topKMedusaHeads; },
-            runtime::DefaultDecodingParams::getTopKMedusaHeads());
-        outputLogProbs = fuseValues<bool>(
-            configs, [&configs](size_t ci) { return configs[ci].outputLogProbs; }, false);
-        cumLogProbs = fuseValues<bool>(
-            configs, [&configs](size_t ci) { return configs[ci].cumLogProbs; }, false);
-        beamWidthArray = fuseValues<std::vector<SizeType32>>(
-            configs, [&configs](size_t ci) { return configs[ci].beamWidthArray; },
-            runtime::DefaultDecodingParams::getBeamWidthArray());
-        // Only used for tests.
-        draftAcceptanceThreshold = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].draftAcceptanceThreshold; }, 0);
-        minP = fuseValues<FloatType>(
-            configs, [&configs](size_t ci) { return configs[ci].minP; }, runtime::DefaultDecodingParams::getMinP());
-    }
-
-    explicit SamplingConfig(executor::SamplingConfig const& samplingConfig,
-        std::optional<executor::ExternalDraftTokensConfig> const& externalDraftTokensConfig = std::nullopt)
+    explicit SamplingConfig(executor::SamplingConfig const& samplingConfig)
         : beamWidth{samplingConfig.getBeamWidth()}
         , numReturnSequences(samplingConfig.getNumReturnSequences())
     {
-
-        if (externalDraftTokensConfig && externalDraftTokensConfig.value().getAcceptanceThreshold())
-        {
-            draftAcceptanceThreshold
-                = std::vector<FloatType>{externalDraftTokensConfig.value().getAcceptanceThreshold().value()};
-        }
-
 #define SET_FROM_OPTIONAL(varName, VarName, VarType)                                                                   \
                                                                                                                        \
     if (samplingConfig.get##VarName())                                                                                 \
@@ -221,7 +90,6 @@ public:
         SET_FROM_OPTIONAL(topPDecay, TopPDecay, FloatType)
         SET_FROM_OPTIONAL(randomSeed, Seed, uint64_t)
         SET_FROM_OPTIONAL(temperature, Temperature, FloatType)
-        SET_FROM_OPTIONAL(originalTemperature, Temperature, FloatType)
         SET_FROM_OPTIONAL(minLength, MinTokens, SizeType32)
         SET_FROM_OPTIONAL(beamSearchDiversityRate, BeamSearchDiversityRate, FloatType)
         SET_FROM_OPTIONAL(repetitionPenalty, RepetitionPenalty, FloatType)
@@ -287,22 +155,10 @@ public:
         // Detect greedy sampling and overwrite params.
         if (temperature)
         {
-            // Keep original temperature for Eagle.
-            bool saveOriginalTemperature{false};
-            if (!originalTemperature)
-            {
-                saveOriginalTemperature = true;
-                originalTemperature = std::vector<FloatType>(temperature->size());
-            }
-
             for (size_t ti = 0; ti < temperature->size(); ++ti)
             {
                 if (temperature->at(ti) == 0.f)
                 {
-                    if (saveOriginalTemperature)
-                    {
-                        originalTemperature->at(ti) = 0.f;
-                    }
                     temperature->at(ti) = 1.0f;
 
                     if (topK)
@@ -314,25 +170,10 @@ public:
                         topP->at(ti) = 1.f;
                     }
                 }
-                else if (saveOriginalTemperature)
-                {
-                    originalTemperature->at(ti) = temperature->at(ti);
-                }
             }
         }
 
         return valid;
-    }
-
-    template <typename T>
-    bool useDefaultValues(OptVec<T> const& vec, T defaultValue)
-    {
-        bool useDefault{true};
-        if (vec)
-        {
-            useDefault = std::all_of(vec->begin(), vec->end(), [defaultValue](T elem) { return elem == defaultValue; });
-        }
-        return useDefault;
     }
 
 public:
@@ -341,7 +182,6 @@ public:
 
     // penalties, [1] for one request, [batchSize] for one batch, the same for other parameters below
     OptVec<FloatType> temperature;         // [1] or [batchSize]
-    OptVec<FloatType> originalTemperature; // [1] or [batchSize]
     OptVec<SizeType32> minLength;          // [1] or [batchSize]
     OptVec<FloatType> repetitionPenalty;   // [1] or [batchSize]
     OptVec<FloatType> presencePenalty;     // [1] or [batchSize]
@@ -369,25 +209,19 @@ public:
     OptVec<std::vector<SizeType32>> beamWidthArray; // [maxBeamWidthArrayLength] or [batchSize, maxBeamWidthArrayLength]
 
     // speculative decoding
-    OptVec<FloatType> draftAcceptanceThreshold; // [1] or [batchSize]
 
     // medusa params
-    OptVec<std::vector<SizeType32>> topKMedusaHeads; // [batchSize, maxMedusaHeads]
-
-    std::optional<bool> normalizeLogProbs;
 
     bool operator==(SamplingConfig const& other) const
     {
         return beamWidth == other.beamWidth && numReturnSequences == other.numReturnSequences
-            && temperature == other.temperature && originalTemperature == other.originalTemperature
-            && minLength == other.minLength && repetitionPenalty == other.repetitionPenalty
-            && presencePenalty == other.presencePenalty && frequencyPenalty == other.frequencyPenalty
-            && promptIgnoreLength == other.promptIgnoreLength && noRepeatNgramSize == other.noRepeatNgramSize
-            && topK == other.topK && topP == other.topP && randomSeed == other.randomSeed
-            && topPDecay == other.topPDecay && topPMin == other.topPMin && topPResetIds == other.topPResetIds
-            && beamSearchDiversityRate == other.beamSearchDiversityRate && lengthPenalty == other.lengthPenalty
-            && earlyStopping == other.earlyStopping && draftAcceptanceThreshold == other.draftAcceptanceThreshold
-            && topKMedusaHeads == other.topKMedusaHeads && normalizeLogProbs == other.normalizeLogProbs
+            && temperature == other.temperature && minLength == other.minLength
+            && repetitionPenalty == other.repetitionPenalty && presencePenalty == other.presencePenalty
+            && frequencyPenalty == other.frequencyPenalty && promptIgnoreLength == other.promptIgnoreLength
+            && noRepeatNgramSize == other.noRepeatNgramSize && topK == other.topK && topP == other.topP
+            && randomSeed == other.randomSeed && topPDecay == other.topPDecay && topPMin == other.topPMin
+            && topPResetIds == other.topPResetIds && beamSearchDiversityRate == other.beamSearchDiversityRate
+            && lengthPenalty == other.lengthPenalty && earlyStopping == other.earlyStopping
             && outputLogProbs == other.outputLogProbs && cumLogProbs == other.cumLogProbs && minP == other.minP
             && beamWidthArray == other.beamWidthArray;
     }

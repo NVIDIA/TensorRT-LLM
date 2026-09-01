@@ -426,8 +426,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
     nb::class_<tr::SamplingConfig>(m, "SamplingConfig")
         .def(nb::init<SizeType32>(), nb::arg("beam_width") = 1)
-        .def(nb::init<tle::SamplingConfig, std::optional<tle::ExternalDraftTokensConfig>>(),
-            nb::arg("executor_sample_config"), nb::arg("external_draft_tokens_config") = std::nullopt)
+        .def(nb::init<tle::SamplingConfig>(), nb::arg("executor_sample_config"))
         .def_rw("beam_width", &tr::SamplingConfig::beamWidth)
         .def_rw("temperature", &tr::SamplingConfig::temperature)
         .def_rw("min_length", &tr::SamplingConfig::minLength)
@@ -448,7 +447,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_rw("num_return_sequences", &tr::SamplingConfig::numReturnSequences)
         .def_rw("min_p", &tr::SamplingConfig::minP)
         .def_rw("beam_width_array", &tr::SamplingConfig::beamWidthArray)
-        .def_rw("normalize_log_probs", &tr::SamplingConfig::normalizeLogProbs)
         .def("__getstate__", SamplingConfigGetState)
         .def("__setstate__", SamplingConfigSetState)
         .def("__eq__", &tr::SamplingConfig::operator==);

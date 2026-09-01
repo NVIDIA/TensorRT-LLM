@@ -1018,7 +1018,7 @@ class TestFinishReasons:
 
         def __repr__(self):
             return f"RequestCase({self.prompt=}, {self.new_tokens=}, {self.finish_reasons=}, \
-            {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.stop_words_list=})"
+            {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.py_stop_words_list=})"
 
         @classmethod
         def build(

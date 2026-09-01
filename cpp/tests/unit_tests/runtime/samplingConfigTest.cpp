@@ -31,16 +31,16 @@ using te::RandomSeedType;
 
 static std::nullopt_t constexpr no = std::nullopt;
 
-void test(bool const useExternalDraftTokensConfig, SizeType32 beamWidth = 1, std::optional<SizeType32> topK = no,
-    std::optional<FloatType> topP = no, std::optional<FloatType> topPMin = no,
-    std::optional<TokenIdType> topPResetIds = no, std::optional<FloatType> topPDecay = no,
-    std::optional<RandomSeedType> randomSeed = no, std::optional<FloatType> temperature = no,
-    std::optional<SizeType32> minLength = no, std::optional<FloatType> beamSearchDiversityRate = no,
-    std::optional<FloatType> repetitionPenalty = no, std::optional<FloatType> presencePenalty = no,
-    std::optional<FloatType> frequencyPenalty = no, std::optional<SizeType32> promptIgnoreLength = no,
-    std::optional<FloatType> lengthPenalty = no, std::optional<SizeType32> earlyStopping = no,
-    std::optional<SizeType32> noRepeatNgramSize = no, std::optional<SizeType32> numReturnSequences = no,
-    std::optional<FloatType> minP = no, std::optional<std::vector<SizeType32>> beamWidthArray = no)
+void test(SizeType32 beamWidth = 1, std::optional<SizeType32> topK = no, std::optional<FloatType> topP = no,
+    std::optional<FloatType> topPMin = no, std::optional<TokenIdType> topPResetIds = no,
+    std::optional<FloatType> topPDecay = no, std::optional<RandomSeedType> randomSeed = no,
+    std::optional<FloatType> temperature = no, std::optional<SizeType32> minLength = no,
+    std::optional<FloatType> beamSearchDiversityRate = no, std::optional<FloatType> repetitionPenalty = no,
+    std::optional<FloatType> presencePenalty = no, std::optional<FloatType> frequencyPenalty = no,
+    std::optional<SizeType32> promptIgnoreLength = no, std::optional<FloatType> lengthPenalty = no,
+    std::optional<SizeType32> earlyStopping = no, std::optional<SizeType32> noRepeatNgramSize = no,
+    std::optional<SizeType32> numReturnSequences = no, std::optional<FloatType> minP = no,
+    std::optional<std::vector<SizeType32>> beamWidthArray = no)
 {
     // 20 parameters for SamplingConfig, from `beamWidth` to `beamWidthArray`
     try
@@ -49,25 +49,10 @@ void test(bool const useExternalDraftTokensConfig, SizeType32 beamWidth = 1, std
             temperature, minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty,
             promptIgnoreLength, lengthPenalty, earlyStopping, noRepeatNgramSize, numReturnSequences, minP,
             beamWidthArray);
-        std::optional<te::ExternalDraftTokensConfig> specCfg = std::nullopt;
-        if (useExternalDraftTokensConfig)
-        {
-            specCfg = te::ExternalDraftTokensConfig({1}, no, 0.5f);
-        }
-        tr::SamplingConfig samplingCfg(execSamplingCfg, specCfg);
+        tr::SamplingConfig samplingCfg(execSamplingCfg);
 
         EXPECT_EQ(samplingCfg.beamWidth, execSamplingCfg.getBeamWidth());
         EXPECT_EQ(samplingCfg.numReturnSequences, execSamplingCfg.getNumReturnSequences());
-
-        if (useExternalDraftTokensConfig)
-        {
-            EXPECT_TRUE(samplingCfg.draftAcceptanceThreshold.has_value());
-            EXPECT_THAT(samplingCfg.draftAcceptanceThreshold.value(), testing::ElementsAre(0.5f));
-        }
-        else
-        {
-            EXPECT_EQ(samplingCfg.draftAcceptanceThreshold, no);
-        }
     }
     catch (TllmException& e)
     {
@@ -84,48 +69,46 @@ void test(bool const useExternalDraftTokensConfig, SizeType32 beamWidth = 1, std
 TEST(samplingConfigTest, validInputs)
 {
     // Auto
-    test(false, 1);
-    // Use ExternalDraftTokensConfig
-    test(true, 1);
+    test(1);
     // TopK
-    test(false, 1, 2);
+    test(1, 2);
     // TopP
-    test(false, 1, no, 0.5f);
+    test(1, no, 0.5f);
     // TopPMin
-    test(false, 1, no, no, 0.5f);
+    test(1, no, no, 0.5f);
     // TopP reset ids
-    test(false, 1, no, no, no, 0);
+    test(1, no, no, no, 0);
     // TopP decay
-    test(false, 1, no, no, no, no, 0.5f);
+    test(1, no, no, no, no, 0.5f);
     // Seed
-    test(false, 1, no, no, no, no, no, 65536);
+    test(1, no, no, no, no, no, 65536);
     // Temperature
-    test(false, 1, no, no, no, no, no, no, 0.5f);
+    test(1, no, no, no, no, no, no, 0.5f);
     // Min token
-    test(false, 1, no, no, no, no, no, no, no, 64);
+    test(1, no, no, no, no, no, no, no, 64);
     // Beam divirsity rate
-    test(false, 2, no, no, no, no, no, no, no, no, 0.5f);
+    test(2, no, no, no, no, no, no, no, no, 0.5f);
     // Repetition penalty
-    test(false, 1, no, no, no, no, no, no, no, no, no, 1.f);
+    test(1, no, no, no, no, no, no, no, no, no, 1.f);
     // Presence penalty
-    test(false, 1, no, no, no, no, no, no, no, no, no, no, 1.f);
+    test(1, no, no, no, no, no, no, no, no, no, no, 1.f);
     // Frequency penalty
-    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, 1.f);
+    test(1, no, no, no, no, no, no, no, no, no, no, no, 1.f);
     // Prompt ignore length
-    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, 1);
+    test(1, no, no, no, no, no, no, no, no, no, no, no, no, 1);
     // Length penalty
-    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
+    test(1, no, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
     // Early stopping
-    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
+    test(1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
     // No repeat ngram size
-    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
+    test(1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
     // NumReturnSequences
-    test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
+    test(4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
     // MinP, 19 arguments
-    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 0.5f);
+    test(1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 0.5f);
     // BeamWidthArray
-    test(false, 5, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
-        std::vector<SizeType32>{2, 3, 4, 5});
+    test(
+        5, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, std::vector<SizeType32>{2, 3, 4, 5});
 
     // All parameters
     {
@@ -154,11 +137,9 @@ TEST(samplingConfigTest, validInputs)
             temperature, minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty,
             promptIgnoreLength, lengthPenalty, earlyStopping, noRepeatNgramSize, numReturnSequences, minP,
             beamWidthArray);
-        te::ExternalDraftTokensConfig specCfg({1}, no, 0.5f);
-        tr::SamplingConfig samplingCfg(execSamplingCfg, specCfg);
+        tr::SamplingConfig samplingCfg(execSamplingCfg);
         EXPECT_EQ(samplingCfg.beamWidth, execSamplingCfg.getBeamWidth());
         EXPECT_EQ(samplingCfg.numReturnSequences, execSamplingCfg.getNumReturnSequences());
-        EXPECT_THAT(samplingCfg.draftAcceptanceThreshold.value(), testing::ElementsAre(0.5f));
         EXPECT_THAT(samplingCfg.topK.value(), testing::ElementsAre(topK));
         EXPECT_THAT(samplingCfg.topP.value(), testing::ElementsAre(topP));
         EXPECT_THAT(samplingCfg.topPMin.value(), testing::ElementsAre(topPMin));

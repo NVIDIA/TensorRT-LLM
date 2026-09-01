@@ -198,7 +198,6 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         auto lambda = [&inputTokens, maxNewTokens, requestId]()
         {
             texec::Request execReq(inputTokens, maxNewTokens);
-            execReq.setExternalDraftTokensConfig(texec::ExternalDraftTokensConfig({1, 2}));
             tb::LlmRequest llmReq(requestId, execReq);
 
             llmReq.validate(500, 1000, 1, 32000);

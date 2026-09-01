@@ -31,7 +31,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     bool useGpuDirectStorage, float gpuWeightPercent, std::optional<SizeType32> maxQueueSize,
     ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::optional<DebugConfig> debugConfig,
     SizeType32 recvPollPeriodMs, uint64_t maxSeqIdleMicroseconds,
-    std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
+    std::optional<GuidedDecodingConfig> guidedDecodingConfig,
     std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs,
     std::optional<CacheTransceiverConfig> cacheTransceiverConfig, bool gatherGenerationLogits,
     bool promptTableOffloading, bool enableTrtOverlap, bool failFastOnAttentionWindowTooLarge)
@@ -56,7 +56,6 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mDebugConfig(std::move(debugConfig))
     , mRecvPollPeriodMs(recvPollPeriodMs)
     , mMaxSeqIdleMicroseconds(maxSeqIdleMicroseconds)
-    , mSpeculativeDecodingConfig(specDecConfig)
     , mGuidedDecodingConfig(std::move(guidedDecodingConfig))
     , mAdditionalModelOutputs(std::move(additionalModelOutputs))
     , mCacheTransceiverConfig(std::move(cacheTransceiverConfig))
@@ -186,11 +185,6 @@ SizeType32 ExecutorConfig::getRecvPollPeriodMs() const
 uint64_t ExecutorConfig::getMaxSeqIdleMicroseconds() const
 {
     return mMaxSeqIdleMicroseconds;
-}
-
-std::optional<SpeculativeDecodingConfig> ExecutorConfig::getSpecDecConfig() const
-{
-    return mSpeculativeDecodingConfig;
 }
 
 std::optional<GuidedDecodingConfig> ExecutorConfig::getGuidedDecodingConfig() const
@@ -340,11 +334,6 @@ void ExecutorConfig::setMaxSeqIdleMicroseconds(uint64_t maxSeqIdleMicroseconds)
 {
     mMaxSeqIdleMicroseconds = maxSeqIdleMicroseconds;
     TLLM_CHECK(mMaxSeqIdleMicroseconds > 0);
-}
-
-void ExecutorConfig::setSpecDecConfig(SpeculativeDecodingConfig const& specDecConfig)
-{
-    mSpeculativeDecodingConfig = specDecConfig;
 }
 
 void ExecutorConfig::setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig)

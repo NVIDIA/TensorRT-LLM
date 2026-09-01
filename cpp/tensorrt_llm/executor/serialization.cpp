@@ -309,35 +309,6 @@ size_t Serialization::serializedSize(AdditionalModelOutput const& additionalMode
     return totalSize;
 }
 
-// ExternalDraftTokensConfig
-ExternalDraftTokensConfig Serialization::deserializeExternalDraftTokensConfig(std::istream& is)
-{
-    auto tokens = su::deserialize<VecTokens>(is);
-    auto logits = su::deserialize<std::optional<Tensor>>(is);
-    auto acceptanceThreshold = su::deserialize<std::optional<FloatType>>(is);
-    auto fastLogits = su::deserialize<std::optional<bool>>(is);
-
-    return ExternalDraftTokensConfig{std::move(tokens), std::move(logits), acceptanceThreshold, fastLogits};
-}
-
-void Serialization::serialize(ExternalDraftTokensConfig const& config, std::ostream& os)
-{
-    su::serialize(config.mTokens, os);
-    su::serialize(config.mLogits, os);
-    su::serialize(config.mAcceptanceThreshold, os);
-    su::serialize(config.mFastLogits, os);
-}
-
-size_t Serialization::serializedSize(ExternalDraftTokensConfig const& config)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(config.mTokens);
-    totalSize += su::serializedSize(config.mLogits);
-    totalSize += su::serializedSize(config.mAcceptanceThreshold);
-    totalSize += su::serializedSize(config.mFastLogits);
-    return totalSize;
-}
-
 // PromptTuningConfig
 PromptTuningConfig Serialization::deserializePromptTuningConfig(std::istream& is)
 {
@@ -866,7 +837,6 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto badWords = su::deserialize<std::optional<std::list<VecTokens>>>(is);
     auto stopWords = su::deserialize<std::optional<std::list<VecTokens>>>(is);
     auto embeddingBias = su::deserialize<std::optional<Tensor>>(is);
-    auto externalDraftTokensConfig = su::deserialize<std::optional<ExternalDraftTokensConfig>>(is);
     auto pTuningConfig = su::deserialize<std::optional<PromptTuningConfig>>(is);
     auto multimodalInput = su::deserialize<std::optional<MultimodalInput>>(is);
     auto multimodalEmbedding = su::deserialize<std::optional<Tensor>>(is);
@@ -898,10 +868,9 @@ Request Serialization::deserializeRequest(std::istream& is)
 
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId, padId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
-        std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(multimodalInput),
-        std::move(multimodalEmbedding), std::move(mRopeConfig), std::move(loraConfig), lookaheadConfig,
-        std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName), std::nullopt,
-        std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
+        std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
+        std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
+        std::nullopt, std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
         std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt));
@@ -1254,7 +1223,6 @@ ExecutorConfig Serialization::deserializeExecutorConfig(std::istream& is)
     auto recvPollPeriodMs = su::deserializeWithGetterType<decltype(&ExecutorConfig::getRecvPollPeriodMs)>(is);
     auto maxSeqIdleMicroseconds
         = su::deserializeWithGetterType<decltype(&ExecutorConfig::getMaxSeqIdleMicroseconds)>(is);
-    auto specDecConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getSpecDecConfig)>(is);
     auto guidedDecodingConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getGuidedDecodingConfig)>(is);
     auto additionalModelOutputs
         = su::deserializeWithGetterType<decltype(&ExecutorConfig::getAdditionalModelOutputs)>(is);
@@ -1268,9 +1236,9 @@ ExecutorConfig Serialization::deserializeExecutorConfig(std::istream& is)
     return ExecutorConfig{maxBeamWidth, schedulerConfig, kvCacheConfig, enableChunkedContext, normalizeLogProbs,
         iterStatsMaxIterations, requestStatsMaxIterations, batchingType, maxBatchSize, maxNumTokens, parallelConfig,
         peftCacheConfig, std::nullopt, decodingConfig, useGpuDirectStorage, gpuWeightsPercent, maxQueueSize,
-        extendedRuntimePerfKnobConfig, debugConfig, recvPollPeriodMs, maxSeqIdleMicroseconds, specDecConfig,
-        guidedDecodingConfig, additionalModelOutputs, cacheTransceiverConfig, gatherGenerationLogits,
-        promptTableOffloading, enableTrtOverlap};
+        extendedRuntimePerfKnobConfig, debugConfig, recvPollPeriodMs, maxSeqIdleMicroseconds, guidedDecodingConfig,
+        additionalModelOutputs, cacheTransceiverConfig, gatherGenerationLogits, promptTableOffloading,
+        enableTrtOverlap};
 }
 
 size_t Serialization::serializedSize(ExecutorConfig const& executorConfig)
@@ -1300,7 +1268,6 @@ size_t Serialization::serializedSize(ExecutorConfig const& executorConfig)
     totalSize += su::serializedSize(executorConfig.getDebugConfig());
     totalSize += su::serializedSize(executorConfig.getRecvPollPeriodMs());
     totalSize += su::serializedSize(executorConfig.getMaxSeqIdleMicroseconds());
-    totalSize += su::serializedSize(executorConfig.getSpecDecConfig());
     totalSize += su::serializedSize(executorConfig.getGuidedDecodingConfig());
     totalSize += su::serializedSize(executorConfig.getAdditionalModelOutputs());
     totalSize += su::serializedSize(executorConfig.getCacheTransceiverConfig());
@@ -1336,7 +1303,6 @@ void Serialization::serialize(ExecutorConfig const& executorConfig, std::ostream
     su::serialize(executorConfig.getDebugConfig(), os);
     su::serialize(executorConfig.getRecvPollPeriodMs(), os);
     su::serialize(executorConfig.getMaxSeqIdleMicroseconds(), os);
-    su::serialize(executorConfig.getSpecDecConfig(), os);
     su::serialize(executorConfig.getGuidedDecodingConfig(), os);
     su::serialize(executorConfig.getAdditionalModelOutputs(), os);
     su::serialize(executorConfig.getCacheTransceiverConfig(), os);
@@ -1707,25 +1673,6 @@ size_t Serialization::serializedSize(EagleConfig const& eagleConfig)
     totalSize += su::serializedSize(eagleConfig.useDynamicTree());
     totalSize += su::serializedSize(eagleConfig.getDynamicTreeMaxTopK());
 
-    return totalSize;
-}
-
-// SpeculativeDecodingConfig
-SpeculativeDecodingConfig Serialization::deserializeSpeculativeDecodingConfig(std::istream& is)
-{
-    auto fastLogits = su::deserialize<decltype(SpeculativeDecodingConfig::fastLogits)>(is);
-    return SpeculativeDecodingConfig(fastLogits);
-}
-
-void Serialization::serialize(SpeculativeDecodingConfig const& specDecConfig, std::ostream& os)
-{
-    su::serialize(specDecConfig.fastLogits, os);
-}
-
-size_t Serialization::serializedSize(SpeculativeDecodingConfig const& specDecConfig)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(specDecConfig.fastLogits);
     return totalSize;
 }
 

@@ -408,17 +408,6 @@ TEST(SerializeUtilsTest, Nested)
             texec::SamplingConfig{1, 1, 0.05, 0.2}, texec::SamplingConfig{2, std::nullopt}});
         testSerializeDeserialize(val);
     }
-    {
-        auto const val = std::make_optional(texec::ExternalDraftTokensConfig({1, 1}));
-        auto const size = su::serializedSize(val);
-        std::ostringstream oss;
-        su::serialize(val, oss);
-        EXPECT_EQ(oss.str().size(), size);
-
-        std::istringstream iss(oss.str());
-        auto const val2 = su::deserialize<std::optional<texec::ExternalDraftTokensConfig>>(iss);
-        EXPECT_EQ(val2.value().getTokens(), val.value().getTokens());
-    }
 }
 
 TEST(SerializeUtilsTest, ResultResponse)
@@ -838,7 +827,6 @@ TEST(SerializeUtilsTest, ExecutorConfig)
         texec::PeftCacheConfig(10), std::nullopt,
         texec::DecodingConfig(texec::DecodingMode::Lookahead(), texec::LookaheadDecodingConfig(3, 5, 7)), false, 0.5f,
         8, texec::ExtendedRuntimePerfKnobConfig(true), texec::DebugConfig(true), 60000000, 180000000,
-        texec::SpeculativeDecodingConfig(true),
         texec::GuidedDecodingConfig(
             texec::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR, std::initializer_list<std::string>{"eos"}),
         std::vector{tensorrt_llm::executor::AdditionalModelOutput{"output_name"}},

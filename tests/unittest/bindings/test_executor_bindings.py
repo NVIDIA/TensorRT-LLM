@@ -90,25 +90,6 @@ def test_output_config_pickle():
     assert additional_model_output.gather_context == True
 
 
-def test_external_draft_tokens_config():
-    tokens = [1, 2, 3]
-    config = trtllm.ExternalDraftTokensConfig(tokens)
-    assert config.tokens == tokens
-    assert config.logits is None
-    assert config.acceptance_threshold is None
-    del config
-
-    logits = torch.ones(3, 1)
-    acceptance_threshold = 1.0
-    fast_logits = False
-    config = trtllm.ExternalDraftTokensConfig(tokens, logits,
-                                              acceptance_threshold, fast_logits)
-    assert config.tokens == tokens
-    assert (config.logits == logits).all()
-    assert config.acceptance_threshold == acceptance_threshold
-    assert config.fast_logits == fast_logits
-
-
 def test_prompt_tuning_config():
     embedding_table = torch.ones(100, 64)
     config = trtllm.PromptTuningConfig(embedding_table)
@@ -120,32 +101,20 @@ def test_multimodal_embedding():
     def get_base_kwargs():
         return {
             "input_token_ids": [1, 2, 3],
-            "max_tokens":
-            1,
-            "streaming":
-            False,
-            "sampling_config":
-            trtllm.SamplingConfig(),
-            "output_config":
-            trtllm.OutputConfig(),
-            "end_id":
-            -1,
-            "pad_id":
-            -2,
+            "max_tokens": 1,
+            "streaming": False,
+            "sampling_config": trtllm.SamplingConfig(),
+            "output_config": trtllm.OutputConfig(),
+            "end_id": -1,
+            "pad_id": -2,
             "bad_words": [[4, 5, 6]],
             "stop_words": [[7, 8, 9]],
-            "embedding_bias":
-            torch.ones(1),
-            "external_draft_tokens_config":
-            trtllm.ExternalDraftTokensConfig([1, 2, 3]),
+            "embedding_bias": torch.ones(1),
             "prompt_tuning_config":
             trtllm.PromptTuningConfig(torch.ones(100, 64)),
-            "lora_config":
-            trtllm.LoraConfig(1),
-            "logits_post_processor_name":
-            "my_logits_pp",
-            "client_id":
-            1234,
+            "lora_config": trtllm.LoraConfig(1),
+            "logits_post_processor_name": "my_logits_pp",
+            "client_id": 1234,
         }
 
     # Test with ones
@@ -364,8 +333,6 @@ def test_request():
         "bad_words": [[4, 5, 6]],
         "stop_words": [[7, 8, 9]],
         "embedding_bias": torch.ones(1),
-        "external_draft_tokens_config":
-        trtllm.ExternalDraftTokensConfig([1, 2, 3]),
         "prompt_tuning_config": trtllm.PromptTuningConfig(torch.ones(100, 64)),
         "multimodal_embedding": torch.ones(100, 64),
         "lora_config": trtllm.LoraConfig(1),
@@ -382,9 +349,6 @@ def test_request():
                 assert attr_value == v
     assert isinstance(request.sampling_config, trtllm.SamplingConfig)
     assert isinstance(request.output_config, trtllm.OutputConfig)
-    assert isinstance(request.external_draft_tokens_config,
-                      trtllm.ExternalDraftTokensConfig)
-    assert request.external_draft_tokens_config.tokens == [1, 2, 3]
     assert isinstance(request.prompt_tuning_config, trtllm.PromptTuningConfig)
     assert (request.prompt_tuning_config.embedding_table == torch.ones(
         100, 64)).all()
@@ -699,26 +663,7 @@ def test_kv_cache_retention_config():
         ], 50)
 
 
-def test_speculative_decoding_config():
-    config = trtllm.SpeculativeDecodingConfig(True)
-    assert config.fast_logits == True
-
-    kwargs = {
-        "fast_logits": True,
-    }
-
-    config = trtllm.SpeculativeDecodingConfig(**kwargs)
-    for k, v in kwargs.items():
-        assert getattr(config, k) == v
-
-
 @pytest.mark.cpu_only
-def test_speculative_decoding_config_pickle():
-    config = trtllm.SpeculativeDecodingConfig(True)
-    config_copy = pickle.loads(pickle.dumps(config))
-    assert config_copy.fast_logits == True
-
-
 @pytest.mark.cpu_only
 def test_lookahead_decoding_config():
     config = trtllm.LookaheadDecodingConfig(3, 5, 7)
@@ -951,7 +896,6 @@ def test_executor_config():
     assert config.debug_config is None
     assert config.recv_poll_period_ms == 0
     assert config.max_seq_idle_microseconds == 180000000
-    assert config.spec_dec_config is None
     assert config.guided_decoding_config is None
     assert config.additional_model_outputs is None
     assert config.gather_generation_logits is False
@@ -1006,8 +950,6 @@ def test_executor_config():
         50,
         "max_seq_idle_microseconds":
         240 * 1000 * 1000,
-        "spec_dec_config":
-        trtllm.SpeculativeDecodingConfig(fast_logits=True),
         "guided_decoding_config":
         trtllm.GuidedDecodingConfig(
             trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
@@ -1036,7 +978,6 @@ def test_executor_config():
     assert isinstance(config.debug_config, trtllm.DebugConfig)
     assert isinstance(config.logits_post_processor_config,
                       trtllm.LogitsPostProcessorConfig)
-    assert isinstance(config.spec_dec_config, trtllm.SpeculativeDecodingConfig)
     assert isinstance(config.guided_decoding_config,
                       trtllm.GuidedDecodingConfig)
     assert isinstance(config.additional_model_outputs, list)
@@ -1439,8 +1380,6 @@ def test_executor_config_pickle() -> None:
         50,
         "max_seq_idle_microseconds":
         240 * 1000 * 1000,
-        "spec_dec_config":
-        trtllm.SpeculativeDecodingConfig(fast_logits=True),
         "guided_decoding_config":
         trtllm.GuidedDecodingConfig(
             trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
@@ -1481,7 +1420,6 @@ def test_executor_config_pickle() -> None:
     assert config.debug_config.debug_input_tensors == config_copy.debug_config.debug_input_tensors
     assert config.max_seq_idle_microseconds == config_copy.max_seq_idle_microseconds
     assert config.backend == config_copy.backend
-    assert config.spec_dec_config.fast_logits == config_copy.spec_dec_config.fast_logits
     assert config.use_gpu_direct_storage == config_copy.use_gpu_direct_storage
 
     assert config_copy.guided_decoding_config.backend == config.guided_decoding_config.backend
