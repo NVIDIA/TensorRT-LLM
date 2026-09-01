@@ -534,10 +534,10 @@ def test_zero_accepted_hint_variant(B, H):
         _assert_close(f"{name}(fast vs general)", fast[name], general[name], atol=1e-5)
 
 
-def test_misaligned_state_indices_after_aligned_warmup():
-    """Mixed context/generation metadata remains valid after op warmup."""
+def test_misaligned_state_indices_rejected_after_aligned_warmup():
+    """The op enforces the alignment contract supplied by metadata prep."""
     data = make_conv_data(B=1, H=6, M=M, seed=13)
-    expected = cute_run(data)
+    cute_run(data)
 
     index_storage = torch.empty(2, dtype=torch.int32, device="cuda")
     index_storage[0] = -1
@@ -548,19 +548,8 @@ def test_misaligned_state_indices_after_aligned_warmup():
 
     misaligned_data = dict(data)
     misaligned_data["ssm_state_indices"] = misaligned_indices
-    actual = cute_run(misaligned_data)
-
-    for name in (
-        "out",
-        "recurrent_state",
-        "qkg_cache",
-        "v_cache",
-        "beta_cache",
-        "cs_q",
-        "cs_k",
-        "cs_v",
-    ):
-        _assert_close(f"{name}(misaligned vs aligned)", actual[name], expected[name], atol=1e-5)
+    with pytest.raises(AssertionError, match="16-byte aligned"):
+        cute_run(misaligned_data)
 
 
 if __name__ == "__main__":

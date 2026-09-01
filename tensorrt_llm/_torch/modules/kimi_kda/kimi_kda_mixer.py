@@ -308,6 +308,9 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_pool = layer_cache.conv  # [slots, 3D, W - 1] bf16
         ssm_pool = layer_cache.temporal  # [slots, H, V, K] fp32
+        generation_state_indices = state_indices[num_prefills:]
+        if self._has_kda_replay_caches(layer_cache):
+            generation_state_indices = mamba_metadata.generation_state_indices[:num_generations]
 
         outputs: List[torch.Tensor] = []
         if num_prefills > 0:
@@ -331,13 +334,11 @@ class KimiKDALinearAttention(nn.Module):
                         hidden_states[num_ctx_tokens:],
                         conv_pool,
                         ssm_pool,
-                        state_indices[num_prefills:],
+                        generation_state_indices,
                         mamba_metadata,
                         layer_cache,
                         ssm_state_indices=(
-                            mamba_metadata.state_indices[num_prefills:batch_size]
-                            if self._use_indexed_ssm_pool
-                            else None
+                            generation_state_indices if self._use_indexed_ssm_pool else None
                         ),
                     )
                 )
@@ -358,7 +359,7 @@ class KimiKDALinearAttention(nn.Module):
                         layer_cache,
                         conv_pool,
                         ssm_pool,
-                        state_indices[num_prefills:],
+                        generation_state_indices,
                     )
                 )
         out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
