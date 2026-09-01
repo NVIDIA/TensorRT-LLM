@@ -18,6 +18,7 @@ l0_dgx_h100:
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu2"
   - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
+  - unittest/_torch/moe/multi_gpu -m "not post_merge" TIMEOUT (90)
   - unittest/_torch/modeling/test_modeling_pixtral.py::test_tensor_parallelism
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph_tp2[v1]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph_tp2[v2]
@@ -84,6 +85,11 @@ l0_dgx_h100:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
+  # unittest/_torch/multi_gpu is otherwise only collected by the 2-GPU stage, so
+  # the 4-rank cases of the KV-pool rebalance agreement test (tp4, pp4, CP x TP,
+  # TP x PP, attention-DP over CP) always skip with "need 4 GPUs, have 2". Name
+  # the file here so those compositions actually run.
+  - unittest/_torch/multi_gpu/test_kv_pool_rebalance_tp.py
   # ------------- Model specific tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=True]
@@ -158,14 +164,14 @@ l0_dgx_h100:
   # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
   # Only CUTLASS and MARLIN backends run on H100 (SM90). TRTLLM/CUTEDSL/DEEPGEMM require SM100+.
   # --- CUTLASS ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8_BLOCK_SCALES"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A16_MXFP4"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_AWQ"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8_BLOCK_SCALES"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A16_MXFP4"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_AWQ"
   # --- MARLIN (SM90-only; focused DEP + ALLGATHER x NVFP4 matrix) ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MARLIN"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MARLIN"
   # ------------- MoE: test_multi_gpu_eplb ---------------
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
 - condition:
     ranges:
       system_gpu_count:
@@ -316,68 +322,6 @@ l0_dgx_h100:
     - unittest/llmapi/test_async_llm.py -m "gpu4"
     - ray_orchestrator/RL/test_rl_perf_reproduce.py::test_rl_perf_reproduce[tp2_2instances]
     - ray_orchestrator/RL/test_rl_perf_reproduce.py::test_rl_perf_reproduce[tp1_4instances]
-# ------------- AutoDeploy Backend Stages ---------------
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 4
-        lte: 4
-    wildcards:
-      gpu:
-      - '*h100*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: pre_merge
-      backend: autodeploy
-      auto_trigger: others
-      orchestrator: mpi
-  tests:
-  - unittest/auto_deploy/multigpu/compile
-  - unittest/auto_deploy/multigpu/custom_ops
-  - unittest/auto_deploy/multigpu/smoke
-  - unittest/auto_deploy/multigpu/transformations
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-4]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-attn_dp_off-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-attn_dp_on-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[fp8-4-attn_dp_off-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[fp8_ws4_80gb-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_attention_dp[4]
-  - accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_bf16_small[4]
-  - accuracy/test_llm_api_autodeploy.py::TestGemma4MoE::test_bf16
-  - accuracy/test_llm_api_autodeploy.py::TestMiniMaxM2::test_finegrained_fp8
-  - disaggregated/test_ad_disagg.py::test_async_generation_matches_aggregate
-  - disaggregated/test_ad_disagg.py::test_async_generation_no_overlap_matches_aggregate
-  - disaggregated/test_ad_disagg.py::test_async_sharded_generation_handoff
-  - disaggregated/test_ad_disagg.py::test_async_eagle3_full_model_handoff
-# ------------- AutoDeploy Backend Stages L1 / Nightly only ---------------
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 4
-        lte: 4
-    wildcards:
-      gpu:
-      - '*h100*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: post_merge
-      backend: autodeploy
-      auto_trigger: others
-      orchestrator: mpi
-  tests:
-  - disaggregated/test_ad_disagg_trtllm_serve.py::test_openai_completion
-  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[google_gemma-3-1b-it-False]
-  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[meta-llama_Llama-3.1-8B-Instruct-False]
-  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[mistralai_Ministral-8B-Instruct-2410-False]
-  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[mistralai_Codestral-22B-v0.1-False]
-  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[Qwen_QwQ-32B-False]
-  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[meta-llama_Llama-3.3-70B-Instruct-False]
-  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[nvidia_Llama-3.1-8B-Instruct-FP8-True]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[flashinfer]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-4-attn_dp_off-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[bf16-4-attn_dp_off-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[bf16-4-attn_dp_on-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[fp8-4-attn_dp_on-trtllm]
 - condition:
     ranges:
       system_gpu_count:
@@ -394,7 +338,7 @@ l0_dgx_h100:
       orchestrator: mpi
   tests:
   # ---- FP8 per-tensor (QDQ) moved to post-merge; block-scale stays in pre ----
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not FP8_BLOCK_SCALES"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not FP8_BLOCK_SCALES"
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_off-python_mamba_cache]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_off-cpp_mamba_cache]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_on-python_mamba_cache]

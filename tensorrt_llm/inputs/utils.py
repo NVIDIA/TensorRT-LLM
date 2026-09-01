@@ -351,11 +351,15 @@ class ConversationMessage(TypedDict, total=False):
             This is used by `interleave_mm_placeholders` to insert multimodal placeholders at the
             correct positions, and to reconstruct the OpenAI-style content list for templates that
             handle media natively.
+        tools: Message-level (dynamic) tool declarations carried on system messages. Only
+            populated for models whose python-renderer chat template consumes them (kimi_k3);
+            absent for other models.
     """
     role: str
     content: str
     media: List[MultimodalData]
     content_parts: List[Union[str, dict]]
+    tools: List[Dict[str, Any]]
 
 
 class MultimodalDataTracker:
@@ -476,8 +480,24 @@ class MultimodalDataTracker:
         `index` is the item's position in `multi_modal_data[modality]`;
         `placeholder` is the exact string the input processor will look
         for when splicing this item's encoder embedding.
+
+        Items are recorded in chat-part send order. When the model's chat
+        template regroups placeholders by modality (declared via
+        `MultimodalPlaceholderMetadata.prompt_modality_order`), sort by
+        that priority so the returned list matches what the template
+        actually emits — preserving per-modality send order as the tie
+        break.
         """
-        return list(self._item_order)
+        prompt_order = MULTIMODAL_PLACEHOLDER_REGISTRY.get_prompt_modality_order(
+            self._model_type)
+        if not prompt_order:
+            return list(self._item_order)
+        rank = {m: i for i, m in enumerate(prompt_order)}
+        return sorted(
+            self._item_order,
+            key=lambda e:
+            (rank.get(e["modality"], len(prompt_order)), e["index"]),
+        )
 
 
 def add_multimodal_placeholders(

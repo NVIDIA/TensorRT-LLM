@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 import base64
@@ -32,7 +47,7 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import (BaseModel, ConfigDict, Field, PositiveInt,
+from pydantic import (AliasChoices, BaseModel, ConfigDict, Field, PositiveInt,
                       field_validator, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
@@ -222,7 +237,6 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
-    conversation_id: Optional[str] = None
     ctx_usage: Optional[UsageInfo] = None
     # TODO(TRTLLM-12407): Multimodal E/PD over trtllm-serve needs these protocol fields too:
     # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
@@ -395,6 +409,7 @@ class EmbeddingResponse(OpenAIBaseModel):
 def _response_format_to_guided_decoding_params(
     response_format: Optional[ResponseFormat],
     reasoning_parser: Optional[str] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Optional[GuidedDecodingParams]:
     if response_format is None:
         guided_decoding_params = None
@@ -471,6 +486,32 @@ def _response_format_to_guided_decoding_params(
                     "begin": "<|start|>assistant<|channel|>final<|message|>",
                     "content": content,
                     "end": "",
+                },
+            ],
+            "stop_after_first":
+            True,
+        }
+    elif reasoning_parser == "kimi_k3":
+        # K3 XTML: the generation prompt already ends inside the channel the
+        # model starts in. In thinking mode (the default) the response channel
+        # opens mid-generation, so trigger the user constraint on it
+        # (mirrors the gpt_oss final-channel handling). In non-thinking mode
+        # the prompt ends inside <|open|>response<|sep|>, the trigger would
+        # never be generated, and the raw grammar applies from the first
+        # generated token instead.
+        thinking = (chat_template_kwargs or {}).get("thinking",
+                                                    True) is not False
+        if not thinking:
+            return guided_decoding_params
+        stag_format = {
+            "type":
+            "triggered_tags",
+            "triggers": ["<|open|>response<|sep|>"],
+            "tags": [
+                {
+                    "begin": "<|open|>response<|sep|>",
+                    "content": content,
+                    "end": "<|close|>response<|sep|>",
                 },
             ],
             "stop_after_first":
@@ -779,7 +820,24 @@ class ReasoningAssistantMessage(ChatCompletionAssistantMessageParam):
     reasoning_content: Optional[str]
 
 
-ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam,
+class DynamicToolsSystemMessageParam(TypedDict, total=False):
+    """System message carrying message-level (dynamic) tool declarations.
+
+    Kimi-style templates render such messages as an in-conversation tool
+    declare block. Must come first in `ChatCompletionMessageParam`: the
+    stock OpenAI system-message TypedDict otherwise wins smart-union scoring
+    and silently drops the `tools` key.
+    """
+    __pydantic_config__ = ConfigDict(extra="allow")  # type: ignore
+
+    role: Required[Literal["system"]]
+    tools: Required[List[dict]]
+    content: Union[str, List[ChatCompletionContentPartParam], None]
+    name: str
+
+
+ChatCompletionMessageParam = Union[DynamicToolsSystemMessageParam,
+                                   OpenAIChatCompletionMessageParam,
                                    CustomChatCompletionMessageParam,
                                    ReasoningAssistantMessage]
 
@@ -865,6 +923,19 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
+class ChatCompletionThinkingParam(OpenAIBaseModel):
+    """Kimi/Moonshot `thinking` extension controlling reasoning output.
+
+    `keep` is fixed to `"all"` when thinking is enabled and ignored when
+    disabled; `effort` is only meaningful when enabled. An explicit
+    `effort` wins over a request-level `reasoning_effort`, which applies
+    only when `effort` is absent (and never for a disabled request).
+    """
+    type: Literal["enabled", "disabled"] = "enabled"
+    keep: Optional[Literal["all"]] = None
+    effort: Optional[Literal["low", "high", "max"]] = None
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -892,17 +963,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[Union[Literal["none", "auto"],
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
-        "low", "medium", "high"]] = Field(
+        "low", "medium", "high", "max", "none"]] = Field(
             default=ReasoningEffort.LOW,
             description=(
                 "The level of reasoning effort to use. Controls how much "
                 "reasoning is shown in the model's response. Options: "
-                "'low', 'medium', 'high'."),
+                "'low', 'medium', 'high' (harmony/gpt-oss), plus 'max' and "
+                "'none' for models with Kimi-style thinking control."),
         )
+    # Kimi/Moonshot extension: structured control of reasoning output. The
+    # serving layer maps it into the chat-template kwargs for models whose
+    # template understands it (e.g. kimi_k3); other models ignore it.
+    thinking: Optional[ChatCompletionThinkingParam] = None
     thinking_token_budget: Optional[int] = None
     prompt_ignore_length: Optional[int] = 0
 
@@ -1072,7 +1148,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             guided_decoding=_response_format_to_guided_decoding_params(
-                self.response_format, reasoning_parser=reasoning_parser),
+                self.response_format,
+                reasoning_parser=reasoning_parser,
+                chat_template_kwargs=self.chat_template_kwargs),
             thinking_token_budget=self.thinking_token_budget,
 
             # logits_bias
@@ -1098,12 +1176,45 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_tool_choice(cls, data):
-        if "tool_choice" not in data and data.get("tools"):
+        if not isinstance(data, dict):
+            return data
+        has_dynamic_tools = any(
+            isinstance(msg, dict) and msg.get("role") == "system"
+            and msg.get("tools") for msg in data.get("messages") or [])
+        if "tool_choice" not in data and (data.get("tools")
+                                          or has_dynamic_tools):
             data["tool_choice"] = "auto"
-        if "tool_choice" in data and data["tool_choice"] != "none":
-            if "tools" not in data or data["tools"] is None:
+        # "none" and "auto" are meaningful without tools. "required" needs a
+        # non-empty tool set — request-level or message-level (dynamic)
+        # tools both count. A named function must be a request-level tool.
+        if "tool_choice" in data and data["tool_choice"] not in ("none",
+                                                                 "auto"):
+            satisfied = data.get("tools") or (data["tool_choice"] == "required"
+                                              and has_dynamic_tools)
+            if not satisfied:
                 raise ValueError(
                     "When using `tool_choice`, `tools` must be set.")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_message_tools_role(cls, data):
+        """Message-level tool declarations ride on system messages only.
+
+        Union validation strips unknown keys from non-system messages, so
+        this raw-payload validator is the only layer that can reject the
+        misuse loudly instead of silently dropping the client's tools. The
+        rest of the dynamic-tools contract is model-specific and validated
+        in the serving layer (kimi_k3 only).
+        """
+        if not isinstance(data, dict):
+            return data
+        for message in data.get("messages") or []:
+            if (isinstance(message, dict) and message.get("tools") is not None
+                    and message.get("role") != "system"):
+                raise ValueError(
+                    "Message-level `tools` are only allowed on system "
+                    "messages.")
         return data
 
     @model_validator(mode="before")
@@ -1182,14 +1293,60 @@ class KVCacheTruncateTokensRequest(OpenAIBaseModel):
     num_tokens_to_keep: List[int]
 
 
+# The trailing dict keeps a client's own item types from failing the request
+# outright. Codex multi-agent sessions carry "agent_message" items, which no
+# SDK model describes; without a permissive member the union rejects the whole
+# input and every request from a spawned agent comes back 422, so agent
+# collaboration cannot work at all. Known shapes still match their typed
+# member first; see _response_output_item_to_chat_completion_message for how
+# an unrecognised item is replayed.
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
                                            ResponseReasoningItem,
-                                           ResponseFunctionToolCall]
+                                           ResponseFunctionToolCall, dict[str,
+                                                                          Any]]
+
+# Roles whose message items map to EasyInputMessageParam / Message, both of
+# which forbid ``id``. An assistant message maps to ResponseOutputMessageParam
+# instead, which *requires* ``id`` and ``status`` - stripping ``id`` there
+# leaves the item matching no variant of the input union, so a conversation
+# breaks as soon as it carries one assistant turn.
+#
+# Module level on purpose: pydantic turns a leading-underscore class attribute
+# into a ModelPrivateAttr, so referring to it from a validator would raise
+# "argument of type 'ModelPrivateAttr' is not iterable" at request time.
+_ID_STRIPPED_ROLES = ("user", "system", "developer")
+
+
+def _materialize_validator_iterators(value, _depth=0):
+    """Recursively replace pydantic ValidatorIterator objects with lists.
+
+    Matched by type name rather than by import: the class lives in the
+    pydantic_core extension module and is not part of its public API.
+    """
+    if _depth > 12:
+        return value
+    if type(value).__name__ == "ValidatorIterator":
+        return [_materialize_validator_iterators(v, _depth + 1) for v in value]
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = _materialize_validator_iterators(item, _depth + 1)
+        return value
+    if isinstance(value, list):
+        return [_materialize_validator_iterators(v, _depth + 1) for v in value]
+    return value
 
 
 class ResponsesRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
+    #
+    # Unlike the rest of the OpenAI models this one accepts unknown fields.
+    # Real Responses API clients attach evolving telemetry and routing keys -
+    # Codex CLI sends client_metadata and prompt_cache_key, for instance - and
+    # rejecting the whole request over a field the server would ignore anyway
+    # makes those clients unusable for no benefit.
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
     background: Optional[bool] = False
     include: Optional[list[
         Literal[
@@ -1203,6 +1360,84 @@ class ResponsesRequest(OpenAIBaseModel):
     ]] = None
     input: Union[str, list[ResponseInputOutputItem]]
     instructions: Optional[str] = None
+
+    @field_validator("input", mode="before")
+    @classmethod
+    def _drop_unsupported_input_item_keys(cls, value):
+        """Strip per-item keys the vendored Responses item types reject.
+
+        Clients echo back items exactly as the server emitted them, so input
+        message items arrive carrying the ``id`` the server assigned, which
+        ``EasyInputMessageParam`` / ``Message`` forbid. That fails the whole
+        request over a field with no prompt content.
+
+        Assistant messages and tool-call items keep their ids: the former
+        needs it to validate, the latter uses it to pair calls with results.
+        """
+        if not isinstance(value, list):
+            return value
+
+        def _with_annotations(part):
+            """output_text requires annotations; clients often omit it."""
+            if (isinstance(part, dict) and part.get("type") == "output_text"
+                    and "annotations" not in part):
+                return {**part, "annotations": []}
+            return part
+
+        cleaned = []
+        for item in value:
+            # A client may send a bare content part as a top-level item, not
+            # only nested inside a message.
+            item = _with_annotations(item)
+            if isinstance(item, dict) and item.get("type") in (None, "message"):
+                role = item.get("role")
+                if "id" in item and role in _ID_STRIPPED_ROLES:
+                    item = {k: v for k, v in item.items() if k != "id"}
+                elif role == "assistant":
+                    # ResponseOutputMessageParam requires status, and each
+                    # output_text part requires annotations. Clients rebuild an
+                    # assistant turn from the streamed deltas rather than from
+                    # the server's content-part objects, so both routinely
+                    # arrive absent and fail the whole request. Default them
+                    # rather than reject a conversation over fields that carry
+                    # no prompt content.
+                    item = dict(item)
+                    item.setdefault("status", "completed")
+                    content = item.get("content")
+                    if isinstance(content, list):
+                        item["content"] = [
+                            {
+                                **part, "annotations": part.get(
+                                    "annotations", [])
+                            } if isinstance(part, dict)
+                            and part.get("type") == "output_text" else part
+                            for part in content
+                        ]
+            cleaned.append(item)
+        return cleaned
+
+    @field_validator("input", mode="after")
+    @classmethod
+    def _materialize_lazy_item_content(cls, value):
+        """Force lazily-validated sequences anywhere in ``input`` into lists.
+
+        Several vendored Responses item types declare sequence fields as
+        ``Iterable[...]`` - ``ResponseOutputMessageParam.content`` and
+        ``ResponseOutputTextParam.annotations`` among them - and pydantic
+        validates an Iterable lazily into a ``ValidatorIterator``. That object
+        cannot be pickled, so a request carrying structured input dies with
+
+            cannot pickle 'pydantic_core._pydantic_core.ValidatorIterator'
+
+        the moment it is handed to a postprocess worker. It is also
+        single-consumption, so even with workers disabled anything that reads
+        the field twice sees an empty sequence the second time.
+
+        The walk has to be recursive: the lazy fields are nested inside items,
+        e.g. input[1].content[0].annotations.
+        """
+        return _materialize_validator_iterators(value)
+
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
     metadata: Optional[Metadata] = None
@@ -1298,6 +1533,12 @@ class ResponsesRequest(OpenAIBaseModel):
 
 class InputTokensDetails(OpenAIBaseModel):
     cached_tokens: int
+    # Required by the openai SDK models that re-validate this payload when it
+    # is embedded in a streaming event. Omitting it fails validation while the
+    # response is being streamed, which truncates the stream with no
+    # terminating event and leaves the client waiting forever. Prompt cache
+    # writes are not tracked separately, so this is reported as zero.
+    cache_write_tokens: int = 0
 
 
 class OutputTokensDetails(OpenAIBaseModel):
@@ -1410,7 +1651,9 @@ class ResponsesStreamResponse(OpenAIBaseModel):
 
 
 class MemoryUpdateRequest(OpenAIBaseModel):
-    tags: List[str] = Field(default=["model", "kv_cache"])
+    tags: list[str] = Field(
+        min_length=1,
+        description="Memory tags to release/resume, e.g. ['model', 'kv_cache']")
 
 
 class UpdateWeightsRequest(OpenAIBaseModel):
@@ -1560,7 +1803,6 @@ def to_disaggregated_params(
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
         ctx_usage=ctx_usage,
-        conversation_id=tllm_disagg_params.conversation_id,
     )
 
 
@@ -1585,7 +1827,6 @@ def to_llm_disaggregated_params(
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
         ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
-        conversation_id=disaggregated_params.conversation_id,
     )
 
 
@@ -1616,7 +1857,7 @@ class ImageGenerationRequest(OpenAIBaseModel):
 
     # Prompt + transport (OpenAI-standard, always honored)
     prompt: str
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: Literal["url", "b64_json", "path"] = "url"
     format: Literal["png", "webp", "jpeg", "safetensors", "pt"] = Field(
         default="png",
         description=(
@@ -1681,10 +1922,76 @@ class ImageGenerationRequest(OpenAIBaseModel):
         return self
 
 
+class ImageEditRequest(OpenAIBaseModel):
+    """OpenAI-compatible image editing request.
+
+    The server accepts the OpenAI multipart shape and a JSON/base64
+    shape for tests and non-SDK clients. Model-specific knobs travel
+    through ``extra_params`` and are validated by the loaded visual
+    generation pipeline.
+    """
+
+    prompt: str
+    image: Union[str, UploadFile, List[Union[str, UploadFile]]] = Field(
+        description="Input image or images to edit.")
+    mask: Optional[Union[str, UploadFile]] = Field(
+        default=None,
+        description=
+        "Optional edit mask. Currently accepted for compatibility but unsupported.",
+    )
+    response_format: Literal["url", "b64_json"] = "url"
+    output_format: Literal["png", "webp", "jpeg"] = Field(
+        default="png",
+        validation_alias=AliasChoices("output_format", "format"),
+        description="Edited image content encoding format.",
+    )
+    seed: Optional[int] = Field(default=None,
+                                ge=0,
+                                description="Random seed for reproducibility.")
+
+    size: Optional[str] = Field(default=None, pattern=r"^(\d+x\d+|auto)$")
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+
+    num_inference_steps: Optional[int] = Field(default=None, gt=0)
+    guidance_scale: Optional[float] = Field(default=None, gt=0)
+    max_sequence_length: Optional[int] = Field(default=None, gt=0)
+    negative_prompt: Optional[str] = None
+    n: Optional[int] = Field(
+        default=None,
+        gt=0,
+        le=10,
+        description=("Number of edited images to generate. Capped at 10 to "
+                     "match the OpenAI images API."),
+    )
+
+    extra_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Model-specific parameters forwarded to the underlying pipeline. "
+            "See per-model docs for accepted keys."),
+    )
+
+    model: Optional[str] = None
+    quality: Optional[Literal["standard", "hd"]] = None
+    user: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_paired_dimensions(self):
+        if isinstance(self.image, list) and not self.image:
+            raise ValueError("image must contain at least one input image")
+        if (self.width is None) != (self.height is None):
+            raise ValueError(
+                "width and height must be sent together; got width="
+                f"{self.width!r}, height={self.height!r}")
+        return self
+
+
 class ImageObject(OpenAIBaseModel):
     """Generated image object in the response."""
     b64_json: Optional[str] = None
     url: Optional[str] = None
+    path: Optional[str] = None
     revised_prompt: Optional[str] = None
 
 
@@ -1715,7 +2022,7 @@ class VideoGenerationRequest(OpenAIBaseModel):
 
     # Prompt + transport
     prompt: str
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: Literal["file", "path"] = "file"
     format: Literal["mp4", "avi", "auto", "safetensors", "pt"] = Field(
         default="auto",
         description=(
@@ -1788,6 +2095,26 @@ class VideoGenerationRequest(OpenAIBaseModel):
                 f"{self.width!r}, height={self.height!r}")
         return self
 
+    @field_validator("response_format", mode="before")
+    @classmethod
+    def _reject_removed_response_format(cls, value):
+        """Give migrating callers an actionable error for removed values.
+
+        ``url``/``b64_json`` were valid before the transport rewrite; run
+        before the ``Literal`` check so the error names the replacement
+        instead of the generic "Input should be 'file' or 'path'".
+        """
+        removed = {
+            "url":
+            ("'url' was removed for video; use 'file' (raw bytes -- the "
+             "old 'url' behavior, renamed) or 'path' (server-side path)."),
+            "b64_json": ("'b64_json' was removed for video; use 'file' (raw "
+                         "bytes) or 'path' (server-side path)."),
+        }
+        if isinstance(value, str) and value in removed:
+            raise ValueError(removed[value])
+        return value
+
 
 class VideoJob(OpenAIBaseModel):
     """Metadata for an asynchronous video generation job.
@@ -1809,8 +2136,13 @@ class VideoJob(OpenAIBaseModel):
         default=None,
         description="Progress of the video generation job (0-100)")
     prompt: str = Field(description="The prompt used to generate the video")
-    status: Literal["queued", "in_progress", "completed", "failed"] = Field(
-        description="Current status of the video generation job")
+    status: Literal["queued", "generating", "postprocessing", "completed",
+                    "failed"] = Field(description=(
+                        "Current status of the video generation job. "
+                        "``generating`` (model inference) becomes "
+                        "``postprocessing`` (encode and/or write the output "
+                        "file) when inference finishes, then ``completed`` "
+                        "once downloadable via ``/content``."))
 
     # Video properties
     duration: Optional[float] = Field(default=None,
@@ -1823,17 +2155,35 @@ class VideoJob(OpenAIBaseModel):
     )
     size: Optional[str] = Field(default=None,
                                 description="Video dimensions in 'WxH' format")
+    # exclude=True: internal file-location for /content resolution + delete;
+    # never on the wire (the path payload is the hand-built {id, output_path}
+    # envelope in /content), so status/list model_dump() stays status-only.
     output_path: Optional[str] = Field(
-        default=None, description="Actual path where the video file was saved")
+        default=None,
+        exclude=True,
+        description="Server-side saved path (internal; excluded from the wire)."
+    )
     output_paths: Optional[List[str]] = Field(
-        default=None, description="Paths for all generated videos when n > 1")
-    response_format: Optional[Literal["url", "b64_json"]] = Field(
+        default=None,
+        exclude=True,
+        description=
+        "Server-side paths for n>1 (internal; excluded from the wire).")
+    # exclude=True internal timings, never on the wire (status/list
+    # model_dump() stays status-only). ``request_started`` is a
+    # ``perf_counter()`` stamped at the POST handler; the background task
+    # computes ``total`` from it and stores the header timings
+    # (``generation``/``denoise``/``total``) in ``timing_metrics`` so
+    # ``/content`` emits the same Server-Timing header as the sync route.
+    request_started: Optional[float] = Field(default=None, exclude=True)
+    timing_metrics: Optional[Dict[str, float]] = Field(default=None,
+                                                       exclude=True)
+    response_format: Optional[Literal["file", "path"]] = Field(
         default=None,
         description=(
             "Transport the client requested. ``GET /v1/videos/{id}/content`` "
-            "honors this: ``b64_json`` returns the encoded payload as a "
-            "base64 string inside a JSON envelope; ``url`` (or unset) "
-            "returns the file as a ``FileResponse`` download."),
+            "honors this: ``path`` returns the server-side output path(s) in a "
+            "JSON envelope; ``file`` (or unset) returns the file as a "
+            "``FileResponse`` download."),
     )
 
 

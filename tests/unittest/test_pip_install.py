@@ -180,7 +180,7 @@ def get_torch_constraint_file(constraint_dir="."):
             print(f"Found installed torch version: {torch_version}")
             # Strip the local version label (e.g. +5aff3928d8.nv26.05) so the
             # constraint satisfies PEP 440 ordered-comparison specifiers like
-            # ">=2.11.0,<=2.13.0a0" — local versions are excluded from such
+            # ">=2.12.0a0,<=2.13.0a0" — local versions are excluded from such
             # comparisons and would cause a pip conflict.
             from packaging.version import Version
             torch_version_public = Version(torch_version).public

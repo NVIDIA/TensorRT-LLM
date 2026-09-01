@@ -200,7 +200,6 @@ def _make_llm_args():
             calibration_file_path=None,
             calibration_layer_indices=None,
         ),
-        sampler_type=None,
         cuda_graph_config=None,
         parallel_config=SimpleNamespace(to_mapping=lambda: SimpleNamespace()),
         get_runtime_sizes=lambda: (1, 128, 128, 4),
@@ -402,19 +401,6 @@ def test_flashinfer_preserves_cache_reuse(monkeypatch):
 
     assert kv_cache_reuse is True
     assert runtime_cache_reuse is True
-
-
-def test_flashinfer_star_attention_disables_cache_reuse(monkeypatch):
-    """Verify Star Attention retains its cache-reuse compatibility guard."""
-    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
-        monkeypatch,
-        sm_version=100,
-        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
-        attn_backend="FLASHINFER_STAR_ATTENTION",
-    )
-
-    assert kv_cache_reuse is False
-    assert runtime_cache_reuse is False
 
 
 def test_default_transceiver_buffer_rounds_up_to_tokens_per_block(monkeypatch):

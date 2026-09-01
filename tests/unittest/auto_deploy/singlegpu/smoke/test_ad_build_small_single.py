@@ -109,24 +109,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             },
         ),
         (
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
-            },
-        ),
-        (
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "triton"},
-                },
-                "mode": "transformers",
-            },
-        ),
-        (
             "Qwen/Qwen3-30B-A3B",
             {
                 "transforms": {
@@ -142,24 +124,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "transformers_replace_cached_attn": {"backend": "triton"},
                 },
                 "mode": "transformers",
-            },
-        ),
-        (
-            "microsoft/Phi-3-mini-4k-instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
-            },
-        ),
-        (
-            "microsoft/Phi-3-mini-4k-instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "torch"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
             },
         ),
         (
@@ -190,24 +154,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "insert_cached_attention": {"backend": "triton"},
                     "compile_model": {"backend": "torch-simple"},
                 },
-            },
-        ),
-        (
-            "Qwen/Qwen2.5-3B-Instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-compile"},
-                },
-            },
-        ),
-        (
-            "Qwen/Qwen2.5-3B-Instruct",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "triton"},
-                },
-                "mode": "transformers",
             },
         ),
         (

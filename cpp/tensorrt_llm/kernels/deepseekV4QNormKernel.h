@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/config.h"
 
+#include <cstdint>
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -41,9 +42,16 @@ void invokeDeepseekV4QNorm(
 // MLA absorption-mode prefill path.
 //
 // Only headDim==512, nopeDim==448 is currently supported (DeepSeek-V4 absorption shape).
+//
+// With `cos_sin_cache` + `cache_seq_lens` (interleaved stride only), also applies the Q
+// RoPE and writes the rotated rope segment as FP8 into the same row, completing the Q row
+// so no RoPE kernel is needed. Positions come from the cache lengths: `cu_q_seqlens`
+// (+ `num_seqs`) for ragged context, `seq_len` for uniform generation. Null cos/sin keeps
+// the plain no-RoPE behaviour.
 void invokeDeepseekV4QNormFusedFp8(void const* input, void* quant_q_nope, void* q_pe_out,
     void const* quant_scale_qkv_ptr, int totalRows, int headDim, int nopeDim, int quantQNopeRowStrideBytes,
-    bool isBfloat16, float eps, cudaStream_t stream);
+    bool isBfloat16, float eps, void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len,
+    int const* cu_q_seqlens, int num_seqs, cudaStream_t stream);
 
 } // namespace kernels
 

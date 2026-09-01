@@ -17,13 +17,20 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    CustomAttentionMask,
+)
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 
-from .interface import Fmha
+from .interface import Fmha, FmhaPhase
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention_backend.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
 
 
 # ``AttentionForwardArgs`` fields that this backend does not consume.
@@ -48,6 +55,31 @@ _THOP_LITERALS: dict = {}
 
 class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
+
+    @classmethod
+    def is_available(cls, attn: "TrtllmAttention") -> bool:
+        sparse_algorithm = getattr(attn.sparse_params, "algorithm", None)
+        if sparse_algorithm in ("deepseek_v4", "dsa"):
+            if getattr(attn, "kv_cache_dtype", None) == "fp8_ds_mla":
+                return False
+            if get_sm_version() in (120, 121):
+                return False
+        return True
+
+    def is_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
+    ) -> bool:
+        del q, k, v, phase
+        return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
+            forward_args.update_kv_cache or metadata.is_cross
+        )
 
     def forward(
         self,
@@ -133,6 +165,8 @@ class FallbackFmha(Fmha):
             quant_scale_qkv=forward_args.quant_scale_qkv,
             dsv4_inv_rope_cos_sin_cache=forward_args.dsv4_inv_rope_cos_sin_cache,
             enable_dsv4_epilogue_fusion=forward_args.enable_dsv4_epilogue_fusion,
+            kv_norm_weight=forward_args.kv_norm_weight,
+            kv_norm_eps=forward_args.kv_norm_eps,
             sage_attn_num_elts_per_blk_q=forward_args.sage_attn_num_elts_per_blk_q,
             sage_attn_num_elts_per_blk_k=forward_args.sage_attn_num_elts_per_blk_k,
             sage_attn_num_elts_per_blk_v=forward_args.sage_attn_num_elts_per_blk_v,
