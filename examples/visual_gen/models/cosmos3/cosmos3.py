@@ -31,6 +31,8 @@ from tensorrt_llm import VisualGen, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import TRANSFER_HINT_KEYS
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
+_ACTION_MODES = ("policy", "forward_dynamics", "inverse_dynamics")
+_TENSOR_OUTPUT_SUFFIXES = {".pt", ".safetensors"}
 
 DEFAULT_PROMPT_FILE = "prompts/t2v.json"
 DEFAULT_NEGATIVE_PROMPT_FILE = "cosmos3_negative_prompt.json"
@@ -199,6 +201,95 @@ def resolve_prompt_and_options(
     return resolved_prompt, resolved_image, resolved_enable_audio, resolved_output_type
 
 
+def _validate_action_args(
+    args: argparse.Namespace, resolved_image_path: Optional[str] = None
+) -> None:
+    if args.action_mode is None:
+        return
+
+    # The first frame may come from --image_path or a prompt file's vision_path.
+    has_first_frame = resolved_image_path is not None or args.video_path is not None
+
+    mode = args.action_mode.strip().lower()
+    if mode not in _ACTION_MODES:
+        raise SystemExit(
+            f"Invalid --action_mode {args.action_mode!r}; expected one of {list(_ACTION_MODES)}."
+        )
+    args.action_mode = mode
+    if args.enable_audio:
+        raise SystemExit("Cosmos3 does not support joint action and audio generation.")
+    if args.output_type != "video":
+        raise SystemExit("Action generation requires --output_type video.")
+
+    if mode == "forward_dynamics":
+        if args.action_json is None:
+            raise SystemExit(f"{mode} requires --action_json.")
+        if not has_first_frame:
+            raise SystemExit(
+                f"{mode} requires --image_path, a prompt-file vision_path, or --video_path "
+                "for the first frame."
+            )
+    elif mode == "policy":
+        if not has_first_frame:
+            raise SystemExit(
+                f"{mode} requires --image_path, a prompt-file vision_path, or --video_path "
+                "for the first frame."
+            )
+        if args.raw_action_dim is None and args.domain_name is None and args.domain_id is None:
+            raise SystemExit(f"{mode} requires --raw_action_dim, --domain_name, or --domain_id.")
+    elif mode == "inverse_dynamics":
+        if args.video_path is None:
+            raise SystemExit(f"{mode} requires --video_path (an .mp4 or .avi file).")
+        if args.raw_action_dim is None and args.domain_name is None and args.domain_id is None:
+            raise SystemExit(f"{mode} requires --raw_action_dim, --domain_name, or --domain_id.")
+
+
+def _resolved_output_path(path: str, action_mode: Optional[str]) -> str:
+    if action_mode is None:
+        return path
+    output_path = Path(path)
+    if output_path.suffix.lower() in _TENSOR_OUTPUT_SUFFIXES:
+        return str(output_path)
+    return str(output_path.with_suffix(".safetensors"))
+
+
+def _default_action_output_path(output_path: str) -> str:
+    stem = Path(output_path)
+    return str(stem.with_suffix(".action.json"))
+
+
+def _save_action_output(output, path: str, args: argparse.Namespace) -> None:
+    """Write the trajectory plus the request that produced it.
+
+    The mode and embodiment are this script's own inputs, so they are read
+    from *args* rather than echoed back through the output schema.
+    """
+    if output.action is None:
+        return
+
+    action = output.action
+    if action.ndim == 3 and action.shape[0] == 1:
+        action_data = action[0].tolist()
+        shape = list(action.shape[1:])
+    else:
+        action_data = action.tolist()
+        shape = list(action.shape)
+
+    payload = {
+        "action_mode": args.action_mode,
+        "domain_name": args.domain_name,
+        "domain_id": args.domain_id,
+        "raw_action_dim": action.shape[-1],
+        "shape": shape,
+        "dtype": str(action.dtype).replace("torch.", ""),
+        "data": action_data,
+    }
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cosmos3 Text(+Image)-to-Video(+Audio) example")
     parser.add_argument(
@@ -275,10 +366,76 @@ def main():
     )
     parser.add_argument("--enable_audio", action="store_true", help="Enable audio generation")
     parser.add_argument(
+        "--action_mode",
+        type=str,
+        default=None,
+        choices=list(_ACTION_MODES),
+        help="Action mode: policy, forward_dynamics, or inverse_dynamics",
+    )
+    parser.add_argument(
+        "--domain_name",
+        type=str,
+        default=None,
+        help="Embodiment domain name (e.g. bridge_orig_lerobot, av, droid_lerobot)",
+    )
+    parser.add_argument(
+        "--domain_id",
+        type=int,
+        default=None,
+        help="Embodiment domain id (alternative to --domain_name)",
+    )
+    parser.add_argument(
+        "--raw_action_dim",
+        type=int,
+        default=None,
+        help="Raw action DOF for policy/inverse_dynamics",
+    )
+    parser.add_argument(
+        "--action_chunk_size",
+        type=int,
+        default=None,
+        help="Action tokens to generate. Defaults to the domain preset or model default.",
+    )
+    parser.add_argument(
+        "--action_json",
+        type=str,
+        default=None,
+        help="JSON file with action trajectory [T, D] for forward_dynamics",
+    )
+    parser.add_argument(
         "--video_path",
         type=str,
         default=None,
-        help="Reference video for V2V: a local MP4/AVI file (decoded on worker NVDEC)",
+        help=(
+            "Reference video (MP4/AVI, decoded on worker NVDEC): V2V conditioning, "
+            "or the observation clip for action inverse_dynamics"
+        ),
+    )
+    parser.add_argument(
+        "--action_resolution",
+        type=int,
+        default=None,
+        choices=[256, 480, 704, 720],
+        help=("Resolution bucket for action image sizing. Defaults to the domain preset or 480."),
+    )
+    parser.add_argument(
+        "--action_fps",
+        type=float,
+        default=None,
+        help="Action-token temporal rate for mRoPE (Hz). Defaults to frame_rate.",
+    )
+    parser.add_argument(
+        "--view_point",
+        type=str,
+        default=None,
+        choices=["ego_view", "third_person_view", "wrist_view", "concat_view"],
+        help="Camera perspective for the action caption (default: ego_view).",
+    )
+    parser.add_argument(
+        "--action_output_path",
+        type=str,
+        default=None,
+        help="Path to save predicted action JSON (default: <output_stem>.action.json)",
     )
     parser.add_argument(
         "--output_type", type=str, default="video", help="Output type (video, image)"
@@ -310,6 +467,7 @@ def main():
         enable_audio=args.enable_audio,
         output_type=args.output_type,
     )
+    _validate_action_args(args, resolved_image_path=image_path)
 
     # Engine config from shared YAML (optional); model-specific defaults apply otherwise.
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
@@ -336,6 +494,25 @@ def main():
     params.extra_params["use_guardrails"] = not args.disable_guardrails
     params.extra_params["output_type"] = output_type
 
+    if args.action_mode is not None:
+        params.extra_params["action_mode"] = args.action_mode
+    if args.domain_name is not None:
+        params.extra_params["domain_name"] = args.domain_name
+    if args.domain_id is not None:
+        params.extra_params["domain_id"] = args.domain_id
+    if args.raw_action_dim is not None:
+        params.extra_params["raw_action_dim"] = args.raw_action_dim
+    if args.action_chunk_size is not None:
+        params.extra_params["action_chunk_size"] = args.action_chunk_size
+    if args.action_resolution is not None:
+        params.extra_params["action_resolution"] = args.action_resolution
+    if args.action_fps is not None:
+        params.extra_params["action_fps"] = args.action_fps
+    if args.view_point is not None:
+        params.extra_params["view_point"] = args.view_point
+    if args.action_json is not None:
+        with open(args.action_json, encoding="utf-8") as f:
+            params.extra_params["action"] = json.load(f)
     if args.video_path is not None:
         params.extra_params["video"] = Path(args.video_path).read_bytes()
     if args.extra_params:
@@ -352,8 +529,18 @@ def main():
         params=params,
     )
 
-    output.save(args.output_path)
-    print(f"Saved: {args.output_path}")
+    output_path = _resolved_output_path(args.output_path, args.action_mode)
+    output.save(output_path)
+    print(f"Saved: {output_path}")
+
+    if args.action_mode is not None:
+        action_path = args.action_output_path or _default_action_output_path(output_path)
+        _save_action_output(output, action_path, args)
+        if output.action is not None:
+            print(f"Saved action: {action_path}")
+            print(f"Action shape: {tuple(output.action.shape)}")
+        else:
+            print("Warning: action_mode was set but the output carried no action tensor.")
 
     print(output.metrics)
 

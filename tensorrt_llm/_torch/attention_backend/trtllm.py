@@ -1902,15 +1902,24 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.output = outputs[0]
             forward_args.output_sf = outputs[1] if len(outputs) == 2 else None
 
-        forward_args.is_fused_qkv = not metadata.is_cross and k is None
-        forward_args.update_kv_cache = not metadata.is_cross or k is not None
+        has_q_only = False
+        if not self.is_mla_enable and not metadata.is_cross and k is None and v is None:
+            q_hidden_size = self.num_heads * self.head_dim
+            qkv_hidden_size = q_hidden_size + 2 * self.num_kv_heads * self.head_dim
+            has_q_only = q.size(-1) == q_hidden_size
+            forward_args.is_fused_qkv = q.size(-1) == qkv_hidden_size
+            forward_args.update_kv_cache = not has_q_only
+        else:
+            forward_args.is_fused_qkv = not metadata.is_cross and k is None
+            forward_args.update_kv_cache = not metadata.is_cross or k is not None
         has_fused_qkv = forward_args.is_fused_qkv and k is None and v is None
         has_unfused_kv = (not forward_args.is_fused_qkv and k is not None
                           and v is not None)
         uses_cached_cross_kv = (metadata.is_cross
                                 and not forward_args.update_kv_cache
                                 and k is None and v is None)
-        assert has_fused_qkv or has_unfused_kv or uses_cached_cross_kv
+        assert (has_fused_qkv or has_unfused_kv or has_q_only
+                or uses_cached_cross_kv)
         # `quant_scale_qkv` only makes sense paired with `quant_q_buffer`: the
         # C++ op interprets the buffer as the destination of a pre-quantized
         # FP8 Q for the DSv4 fused norm+RoPE path. `quant_q_buffer` alone is

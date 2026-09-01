@@ -34,19 +34,20 @@ from ..distributed import AllReduce, AllReduceParams
 from ..modules.attention import _helix_cp_allgather_input, _helix_cp_output_projection
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (
-    MiniMaxM2MoeRoutingMethod,
-    MoEImplClass,
-    RoutingMethodType,
-    create_moe,
-    resolve_moe_cls,
-)
-from ..modules.fused_moe.interface import MoEWeightLoadingMode
-from ..modules.fused_moe.weight_owner import is_moe_weight_owner
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (
+    MiniMaxM2MoeRoutingMethod,
+    MoEImplClass,
+    RoutingMethodType,
+    SqrtSoftplusMoeRoutingMethod,
+    create_moe,
+    resolve_moe_cls,
+)
+from ..moe.fused_moe.interface import MoEWeightLoadingMode
+from ..moe.fused_moe.weight_owner import is_moe_weight_owner
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .checkpoints.hf.weight_mapper import HfWeightMapper
@@ -59,7 +60,8 @@ from .modeling_utils import DecoderModel, register_auto_model, register_mapper
 
 
 class LagunaGate(nn.Module):
-    """Sigmoid router with e_score_correction_bias (MiniMaxM2 routing)."""
+    """Router with e_score_correction_bias and config-driven scoring: "sigmoid"
+    (MiniMaxM2 routing) or "sqrtsoftplus" (DeepSeek-V4-style sqrt-softplus)."""
 
     def __init__(
         self,
@@ -68,10 +70,17 @@ class LagunaGate(nn.Module):
         top_k: int,
         dtype: Optional[torch.dtype] = None,
         moe_backend_cls: Optional[MoEImplClass] = None,
+        scoring_func: str = "sigmoid",
     ) -> None:
         super().__init__()
         self.top_k = top_k
         self.moe_backend_cls = moe_backend_cls
+        if scoring_func not in ("sigmoid", "sqrtsoftplus"):
+            raise ValueError(
+                f"Unsupported moe_router_score_func={scoring_func!r}; "
+                'expected "sigmoid" or "sqrtsoftplus".'
+            )
+        self.scoring_func = scoring_func
         self.weight = nn.Parameter(
             torch.empty((num_experts, hidden_size), dtype=dtype),
             requires_grad=False,
@@ -99,7 +108,12 @@ class LagunaGate(nn.Module):
 
     @property
     def routing_method(self):
-        return MiniMaxM2MoeRoutingMethod(
+        routing_cls = (
+            SqrtSoftplusMoeRoutingMethod
+            if self.scoring_func == "sqrtsoftplus"
+            else MiniMaxM2MoeRoutingMethod
+        )
+        return routing_cls(
             top_k=self.top_k,
             num_experts=self.weight.shape[0],
             callable_e_score_correction_bias=lambda: self.e_score_correction_bias,
@@ -142,6 +156,7 @@ class LagunaMoE(nn.Module):
                 # layer does not run.
                 swiglu_gptoss_style=False,
             ),
+            scoring_func=getattr(config, "moe_router_score_func", "sigmoid"),
         )
 
         self.experts = create_moe(

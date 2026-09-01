@@ -261,7 +261,6 @@ class TestConfigDatabaseSync(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one latency and throughput"):
             RecipeList.model_validate(duplicate_profile)
 
-    @pytest.mark.skip(reason="https://nvbugs/6337224")
     def test_config_database_tests_sync(self):
         """Test that config database test files are synchronized with lookup.yaml.
 

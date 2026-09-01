@@ -9286,6 +9286,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_len_q: int,
             page_size: int,
             max_batch_size: int = 0,
+            emit_softmax_stats: bool = False,
         ):
             super().__init__()
             kernel_class = self.__class__._KERNEL_CLASS_BY_DTYPE.get(in_dtype)
@@ -9300,18 +9301,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.seq_len_q = seq_len_q
             self.page_size = page_size
             self.max_batch_size = max_batch_size
+            self.emit_softmax_stats = emit_softmax_stats
 
         def unique_id(self):
             # seq_len_q is part of the id: each decode variant (the MTP
             # target step's sq = 1 + draft_len, the draft steps' sq = 1)
             # constructs its own runner and is tuned independently during
             # the autotuner warmup's generation forward.
-            return (
+            base_id = (
                 self.in_dtype,
                 self.num_heads,
                 self.seq_len_q,
                 self.page_size,
             )
+            return base_id + (True, ) if self.emit_softmax_stats else base_id
 
         @classmethod
         def _get_max_active_blocks(cls) -> int:
@@ -9572,7 +9575,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 #   4 page_table: (max_blocks_per_sequence, B)
                 #   5 cache_seqs: (B,)
                 #   6 o:          (H, D, S_q, B)
-                #   7 workspace:  (workspace_size,)
+                #   7 workspace:     (workspace_size,)
+                #   8 softmax_stats: (B * S_q, H, 2), optional
 
                 # cache_seqs (index 5) is the single free dynamic batch dim;
                 # every other batch-carrying dim is tied to it by a constraint.
@@ -9599,6 +9603,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         i, d, lambda shapes, _i=i, _d=d: shapes[_i][_d])
                     for (i, d) in static_size_dims)
 
+                stats_constraints = ()
+                if self.emit_softmax_stats:
+                    stats_constraints = (ConstraintSpec(
+                        8,
+                        0,
+                        lambda shapes: shapes[5][0] * self.seq_len_q,
+                    ), )
+
                 # The batch search space, fixed up-front by max_batch_size
                 # when the engine max is known.
                 batch_buckets = (get_last_power_of_2_num_tokens_buckets(
@@ -9611,7 +9623,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         batch_buckets,
                         last_positive_power_of_2,
                     ), ),
-                    constraint_specs=batch_constraints + static_constraints,
+                    constraint_specs=(batch_constraints + static_constraints +
+                                      stats_constraints),
                     inputs_pre_hook=self._tuning_inputs_pre_hook,
                 )
             return cache[key]
@@ -9622,13 +9635,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> Tuple[Tuple[int, int], Tuple[int, int], int, bool]:
             """Fallback 4-tuple tactic ``(mma_qk, mma_pv, split_kv,
             is_persistent)`` for when the AutoTuner cache is not warmed and
-            ``choose_one`` returns its ``-1`` sentinel."""
+            ``choose_one`` returns its ``-1`` sentinel.
+
+            ``batch_size`` is rounded down to its tuning bucket
+            (``last_positive_power_of_2`` -- the same mapping the tuning
+            config uses) before deriving ``split_kv``: tuning profiles (and
+            therefore ``cute.compile``s) exactly the bucket-derived
+            ``split_kv`` variants, so a bucket-aligned fallback reuses an
+            already-compiled kernel where one exists instead of JIT-compiling
+            a fresh raw-batch ``split_kv`` variant in the serving loop. The
+            ``is_persistent`` choice is unaffected by the rounding (its
+            threshold is a power of two, so rounding down to a power of two
+            never crosses it), and both candidates are compiled during tuning
+            anyway."""
             mma_qk_tiler_mn = (128, 128)
             mma_pv_tiler_mn = (128, 256)
             max_active_blocks = self._get_max_active_blocks()
-            split_kv = self.get_default_split_kv(batch_size, self.seq_len_q,
+            bucketed_batch_size = last_positive_power_of_2(batch_size)
+            split_kv = self.get_default_split_kv(bucketed_batch_size,
+                                                 self.seq_len_q,
                                                  max_active_blocks)
-            is_persistent = self.get_default_is_persistent(batch_size)
+            is_persistent = self.get_default_is_persistent(bucketed_batch_size)
             return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent)
 
         def forward(
@@ -9655,6 +9682,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs[6] (o): Output tensor of shape (H, D, S_q, B).
                     inputs[7] (workspace): Contiguous raw workspace with at least
                         the workspace_size returned by get_workspace_layout.
+                    inputs[8] (softmax_stats): Optional contiguous float32 tensor
+                        of shape (B * S_q, H, 2). The kernel writes an equivalent
+                        softmax (max, sum) pair for Helix reduction.
                 tactic: Tuple containing (mma_qk_tiler_mn, mma_pv_tiler_mn,
                     split_kv, is_persistent).
                 **kwargs: Optional softmax_scale and output_scale values.
@@ -9664,7 +9694,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     tensor of shape (H, S_q, B) remains in the workspace.
             """
             (q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-             workspace) = inputs
+             workspace, softmax_stats) = inputs
             softmax_scale = float(kwargs.get("softmax_scale", 1.0))
             output_scale = float(kwargs.get("output_scale", 1.0))
 
@@ -9694,6 +9724,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # workspace = lse + split_kv_workspace
             batch_size = cache_seqs.shape[0]
             d_latent = q_latent.shape[1]
+            softmax_stats_kernel = None
+            if softmax_stats is not None:
+                expected_shape = (batch_size * seq_len_q, self.num_heads, 2)
+                if (softmax_stats.shape != expected_shape
+                        or softmax_stats.dtype != torch.float32
+                        or softmax_stats.device != o.device
+                        or not softmax_stats.is_contiguous()):
+                    raise RuntimeError(
+                        "CuteDSLNVMlaDecodeBlackwellRunner requires contiguous "
+                        "float32 softmax_stats on the output device with shape "
+                        f"{expected_shape}, got shape={tuple(softmax_stats.shape)}, "
+                        f"dtype={softmax_stats.dtype}, device={softmax_stats.device}, "
+                        f"contiguous={softmax_stats.is_contiguous()}.")
+                softmax_stats_kernel = softmax_stats.view(
+                    batch_size, seq_len_q, self.num_heads,
+                    2).permute(2, 1, 0, 3)
             max_batch_size = max(batch_size, self.max_batch_size)
             (lse_offset, lse_size, split_kv_offset, split_kv_size,
              required_workspace_size) = self.get_workspace_layout(
@@ -9761,8 +9807,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_heads=self.num_heads,
                     seq_len_q=seq_len_q,
                     fold_sq=fold_sq,
+                    emit_softmax_stats=self.emit_softmax_stats,
                 )
-
                 q_latent_ct = cute.runtime.from_dlpack(
                     q_latent,
                     assumed_align=16).mark_layout_dynamic(leading_dim=1)
@@ -9784,6 +9830,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             divisibility=(128 // out_dtype.width))
                 lse_ct = cute.runtime.from_dlpack(
                     lse, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+                softmax_stats_ct = (cute.runtime.from_dlpack(
+                    softmax_stats_kernel, assumed_align=16).mark_layout_dynamic(
+                        leading_dim=3) if softmax_stats_kernel is not None else
+                                    None)
                 use_workspace = split_kv > 1 and split_workspace.numel() > 0
                 workspace_ct = (cute.runtime.from_dlpack(
                     split_workspace, assumed_align=32).mark_layout_dynamic()
@@ -9793,29 +9843,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # Variable split-KV (block_split_kvs) is not used on this path:
                 block_split_kvs_ct = None
 
-                CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[cache_key] = \
+                compile_args = [
+                    q_latent_ct,
+                    q_rope_ct,
+                    c_latent_ct,
+                    c_rope_ct,
+                    page_table_ct,
+                    o_ct,
+                    lse_ct,
+                ]
+                compile_target = mla
+                if self.emit_softmax_stats:
+                    compile_target = mla.run_with_softmax_stats
+                    compile_args.append(softmax_stats_ct)
+                compile_args.extend([
+                    workspace_ct,
+                    split_kv,
+                    cache_seqs_ct,
+                    block_split_kvs_ct,
+                    cutlass.Float32(softmax_scale),
+                    cutlass.Float32(output_scale),
+                    stream,
+                ])
+                CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[cache_key] = (
                     cute.compile(
-                        mla,
-                        q_latent_ct,
-                        q_rope_ct,
-                        c_latent_ct,
-                        c_rope_ct,
-                        page_table_ct,
-                        o_ct,
-                        lse_ct,
-                        workspace_ct,
-                        split_kv,
-                        cache_seqs_ct,
-                        block_split_kvs_ct,
-                        cutlass.Float32(softmax_scale),
-                        cutlass.Float32(output_scale),
-                        stream,
+                        compile_target,
+                        *compile_args,
                         options="--opt-level 2",
-                    )
+                    ))
 
             compiled_mla = CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[
                 cache_key]
-            compiled_mla(
+            runtime_args = [
                 q_latent,
                 q_rope,
                 c_latent,
@@ -9823,6 +9882,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 page_table,
                 o,
                 lse,
+            ]
+            if self.emit_softmax_stats:
+                runtime_args.append(softmax_stats_kernel)
+            runtime_args.extend([
                 split_workspace if
                 (split_kv > 1 and split_workspace.numel() > 0) else None,
                 split_kv,
@@ -9831,12 +9894,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 softmax_scale,
                 output_scale,
                 stream,
-            )
+            ])
+            compiled_mla(*runtime_args)
             return o
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_mla_decode_fp8_blackwell",
-        mutates_args=("o", "workspace"),
+        mutates_args=("o", "workspace", "softmax_stats"),
         device_types="cuda",
     )
     def cute_dsl_mla_decode_fp8_blackwell(
@@ -9853,7 +9917,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
-        max_batch_size: int = 0,
+        # Keep the last two arguments required in the custom-op schema. PyTorch
+        # elides trailing default-valued arguments before its mutation fallback,
+        # while mutates_args retains their positional indices.
+        max_batch_size: int,
+        softmax_stats: Optional[torch.Tensor],
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
         """
@@ -9870,10 +9938,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_len_q=seq_len_q,
             page_size=page_size,
             max_batch_size=max_batch_size,
+            emit_softmax_stats=softmax_stats is not None,
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-            workspace
+            workspace, softmax_stats
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
@@ -9909,13 +9978,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
-        max_batch_size: int = 0,
+        max_batch_size: int,
+        softmax_stats: Optional[torch.Tensor],
     ) -> None:
         return None
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_mla_decode_fp16_blackwell",
-        mutates_args=("o", "workspace"),
+        mutates_args=("o", "workspace", "softmax_stats"),
         device_types="cuda",
     )
     def cute_dsl_mla_decode_fp16_blackwell(
@@ -9932,7 +10002,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
-        max_batch_size: int = 0,
+        # See the FP8 op above: these must remain required schema arguments.
+        max_batch_size: int,
+        softmax_stats: Optional[torch.Tensor],
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
         """
@@ -9966,10 +10038,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_len_q=seq_len_q,
             page_size=page_size,
             max_batch_size=max_batch_size,
+            emit_softmax_stats=softmax_stats is not None,
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-            workspace
+            workspace, softmax_stats
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
@@ -10005,6 +10078,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
-        max_batch_size: int = 0,
+        max_batch_size: int,
+        softmax_stats: Optional[torch.Tensor],
     ) -> None:
         return None
