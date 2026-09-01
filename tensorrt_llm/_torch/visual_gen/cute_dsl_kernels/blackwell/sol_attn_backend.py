@@ -22,6 +22,8 @@ import functools
 import os
 from typing import Callable, Optional
 
+import torch
+
 from tensorrt_llm.logger import logger
 
 HEAD_DIM = 128
@@ -117,8 +119,6 @@ def _strict() -> bool:
 
 
 def _dense_bthd(q, k, v):
-    import torch
-
     return torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2),
         k.transpose(1, 2),
@@ -126,6 +126,11 @@ def _dense_bthd(q, k, v):
     ).transpose(1, 2)
 
 
+# Opaque to Dynamo, like every other CuTe DSL launch boundary here (see
+# cute_dsl/fmha.py, video_sparse_attention/interface.py). Otherwise Dynamo
+# traces into the CuTe DSL JIT builder and retraces on every call: 69x slower
+# on B200 (denoise 2496.9 s vs 36.2 s), silently, as if compile just didn't help.
+@torch.compiler.disable
 def _run_sol_attn_bthd(
     q,
     k,
