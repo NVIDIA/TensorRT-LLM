@@ -286,14 +286,13 @@ if args.replay_file_path:
     # recorded, or it profiles different routing and still reports a number. Scoped to
     # the window being replayed: iterations outside it may hold another shape, and
     # those are none of this run's business.
-    recorded_tokens = calibrator.get_replay_token_count(replay_start_iter, replay_stop_iter)
-    if recorded_tokens is None:
-        parser.error(
-            f"{args.replay_file_path} does not record one single routing shape over "
-            f"iterations [{replay_start_iter}, {replay_stop_iter}], so no "
-            f"--batch-size/--seq-len-q reproduces it. One CUDA graph holds one shape; "
-            f"narrow the window with --replay-start-iter/--replay-stop-iter."
-        )
+    try:
+        recorded_tokens = calibrator.get_replay_token_count(replay_start_iter, replay_stop_iter)
+    except ValueError as e:
+        # Report it the way the rest of this block does rather than as a traceback:
+        # the message names the shapes and the iterations that carry them, which is
+        # what the caller has to act on.
+        parser.error(f"{args.replay_file_path}: {e}")
     mismatched = [
         (b, s)
         for b in args.batch_size_list
