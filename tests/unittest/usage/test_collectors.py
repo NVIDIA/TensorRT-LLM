@@ -126,19 +126,24 @@ class TestModelInfo:
         assert usage_lib._extract_architecture_class_name(None) is None
 
     def test_extract_architecture_empty_list(self):
-        """An empty architectures list without a legacy value is missing."""
-        mock = MagicMock(spec=[])  # No attributes by default
-        mock.architectures = []
-        assert usage_lib._extract_architecture_class_name(mock) is None
+        """An empty architectures list falls back to the config class name."""
+
+        class FakeConfig:
+            architectures = []
+
+        assert usage_lib._extract_architecture_class_name(FakeConfig()) == "FakeConfig"
 
     def test_extract_architecture_no_attr(self):
-        """A config type name is not used as architecture fallback."""
+        """A config without architecture fields falls back to its class name."""
 
         class FakeConfig:
             pass
 
         config = FakeConfig()
-        assert usage_lib._extract_architecture_class_name(config) is None
+        assert usage_lib._extract_architecture_class_name(config) == "FakeConfig"
+        name, digest = usage_lib._architecture_telemetry_fields(config)
+        assert name == ""
+        assert digest.startswith("sha256:")
 
     def test_extract_architecture_trtllm_singular(self):
         """TRT-LLM PretrainedConfig uses .architecture (singular string)."""

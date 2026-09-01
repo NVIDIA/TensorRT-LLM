@@ -387,9 +387,9 @@ def _extract_architecture_class_name(pretrained_config: Any) -> Optional[str]:
             if isinstance(architecture, str) and architecture.strip():
                 return architecture
 
-        # Do not fall back to type(pretrained_config).__name__. A custom config
-        # class name can itself disclose a private model architecture.
-        return None
+        # Preserve the legacy fallback when no explicit architecture is present.
+        # The caller still applies the plaintext allowlist before reporting it.
+        return type(pretrained_config).__name__
     except (AttributeError, TypeError, KeyError, IndexError):
         return None
 
