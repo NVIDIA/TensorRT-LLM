@@ -138,19 +138,23 @@ def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
 
 
 def prefer_direct_bf16_gemm_sm100(m: int, n: int, k: int) -> bool:
-    """Conservative B200 crossover heuristic for the direct vs split-K choice.
+    """Conservative Blackwell crossover for direct GEMM versus the normal path.
 
-    Returns ``True`` when the direct (SIMT) kernel is expected to be faster
-    than the tensor-core split-K kernel on B200 / B300 hardware without
-    autotuning.  The three bands are a compact fit to an empirical sweep:
+    The single-row bands are a compact fit to cold-L2 CUDA-graph measurements
+    against both cuBLAS and Split-K. Narrower batches retain the original
+    K=8192 bands. Shapes outside these conservative regions keep the caller's
+    normal GEMM or explicit autotuner path.
 
-    * ``M=1, N≤4608``  — single-row decode; split-K N-parallelism too thin.
-    * ``M≤4, N≤512``   — small batch, narrow projection (e.g. GQA kv_proj).
-    * ``M≤8, N≤256``   — very narrow outputs only.
+    * ``M=1, N≤2048`` for any supported K.
+    * ``M=1, K≥4096, N≤4608`` for deeper projections.
+    * ``M≤4, K=8192, N≤512`` and ``M≤8, K=8192, N≤256``.
 
-    Only applies to ``K=8192``; for other K values the autotuner decides.
+    The caller still validates dtype, device, layout, alignment, and kernel
+    tactic support before dispatching.
     """
-    return k == 8192 and ((m == 1 and n <= 4608) or (m <= 4 and n <= 512) or (m <= 8 and n <= 256))
+    if m == 1:
+        return n <= 2048 or (k >= 4096 and n <= 4608)
+    return k == 8192 and ((m <= 4 and n <= 512) or (m <= 8 and n <= 256))
 
 
 class _DirectDenseGemmKernel:

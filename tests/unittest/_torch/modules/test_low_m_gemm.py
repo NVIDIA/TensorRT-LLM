@@ -6,6 +6,7 @@
 # invoke the kernel hardware rather than the Python dispatch logic.
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -54,6 +55,23 @@ def test_parse_enabled_rejects_unknown_value(monkeypatch) -> None:
         _parse_enabled()
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, True),
+        ("off", False),
+        ("cublaslt", False),
+        ("auto", True),
+    ],
+)
+def test_parse_direct_enabled(value: str | None, expected: bool, monkeypatch) -> None:
+    if value is None:
+        monkeypatch.delenv(_BACKEND_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_BACKEND_ENV, value)
+    assert _mod._parse_direct_enabled() is expected
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher prepare()
 # ---------------------------------------------------------------------------
@@ -79,11 +97,307 @@ def test_prepare_labels_modules(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_linear_fast_rejects_m_above_max_m(monkeypatch) -> None:
-    monkeypatch.setattr(linear_module, "LOW_M_GEMM_ACTIVE", True)
+def test_linear_fast_rejects_m_above_max_m() -> None:
+    assert linear_module._is_low_m_input(torch.empty((32, 128)))
+    assert not linear_module._is_low_m_input(torch.empty((33, 128)))
 
-    assert linear_module._should_apply_low_m_gemm(torch.empty((32, 128)))
-    assert not linear_module._should_apply_low_m_gemm(torch.empty((33, 128)))
+
+def test_linear_uses_conservative_direct_path_without_autotuner(monkeypatch) -> None:
+    monkeypatch.setattr(linear_module, "LOW_M_GEMM_ACTIVE", False)
+    expected = torch.empty((1, 8))
+    direct = MagicMock(return_value=expected)
+    monkeypatch.setattr(linear_module, "apply_direct_low_m_gemm", direct)
+    autotuned = MagicMock(side_effect=AssertionError("autotuner path must remain opt-in"))
+    monkeypatch.setattr(linear_module, "apply_low_m_gemm", autotuned)
+    module = SimpleNamespace(
+        weight=torch.empty((8, 128)),
+        use_custom_cublas_mm=False,
+    )
+
+    output = linear_module.UnquantizedLinearMethod().apply(module, torch.empty((1, 128)), None)
+
+    assert output is expected
+    direct.assert_called_once()
+    autotuned.assert_not_called()
+
+
+def test_linear_keeps_explicit_autotuner_priority(monkeypatch) -> None:
+    monkeypatch.setattr(linear_module, "LOW_M_GEMM_ACTIVE", True)
+    expected = torch.empty((1, 8))
+    autotuned = MagicMock(return_value=expected)
+    monkeypatch.setattr(linear_module, "apply_low_m_gemm", autotuned)
+    direct = MagicMock(side_effect=AssertionError("direct policy bypassed explicit autotuning"))
+    monkeypatch.setattr(linear_module, "apply_direct_low_m_gemm", direct)
+    module = SimpleNamespace(
+        weight=torch.empty((8, 128)),
+        use_custom_cublas_mm=False,
+    )
+
+    output = linear_module.UnquantizedLinearMethod().apply(module, torch.empty((1, 128)), None)
+
+    assert output is expected
+    autotuned.assert_called_once()
+    direct.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Conservative direct dispatch without AutoTuner state
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "m,n,k,expected",
+    [
+        (1, 96, 2560, True),
+        (1, 512, 2560, True),
+        (1, 640, 2560, True),
+        (1, 2048, 2560, True),
+        (1, 320, 10240, True),
+        (1, 2560, 6144, True),
+        (1, 4608, 8192, True),
+        (1, 4096, 2560, False),
+        (1, 8192, 6144, False),
+        (1, 13312, 2560, False),
+        (1, 16384, 2560, False),
+        (1, 248320, 2560, False),
+        (4, 512, 8192, True),
+        (4, 512, 2560, False),
+        (8, 512, 8192, False),
+    ],
+)
+@_skip_non_sm10x
+def test_prefer_direct_bands(m: int, n: int, k: int, expected: bool) -> None:
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_direct import (
+        prefer_direct_bf16_gemm_sm100,
+    )
+
+    assert prefer_direct_bf16_gemm_sm100(m, n, k) is expected
+
+
+def test_apply_direct_declines_biased_calls(monkeypatch) -> None:
+    monkeypatch.setattr(_mod, "_DIRECT_LOW_M_GEMM_ACTIVE", True)
+    monkeypatch.setattr(
+        LowMGemmDispatcher,
+        "_is_candidate_shape",
+        staticmethod(lambda *_: True),
+    )
+    a = torch.empty((1, 2560), dtype=torch.bfloat16)
+    weight = torch.empty((512, 2560), dtype=torch.bfloat16)
+    bias = torch.empty((512,), dtype=torch.bfloat16)
+
+    assert _mod.apply_direct_low_m_gemm(a, weight, bias) is None
+
+
+def test_apply_direct_honors_explicit_disabled_policy(monkeypatch) -> None:
+    monkeypatch.setattr(_mod, "_DIRECT_LOW_M_GEMM_ACTIVE", False)
+    candidate = MagicMock(
+        side_effect=AssertionError("disabled policy must reject before shape checks")
+    )
+    monkeypatch.setattr(LowMGemmDispatcher, "_is_candidate_shape", candidate)
+
+    assert _mod.apply_direct_low_m_gemm(torch.empty((1, 128)), torch.empty((8, 128)), None) is None
+    candidate.assert_not_called()
+
+
+def test_apply_direct_declines_shapes_outside_the_bands(monkeypatch) -> None:
+    monkeypatch.setattr(_mod, "_DIRECT_LOW_M_GEMM_ACTIVE", True)
+    monkeypatch.setattr(
+        LowMGemmDispatcher,
+        "_is_candidate_shape",
+        staticmethod(lambda *_: True),
+    )
+    a = torch.empty((1, 2560), dtype=torch.bfloat16)
+    weight = torch.empty((16384, 2560), dtype=torch.bfloat16)
+    direct_module = SimpleNamespace(
+        default_tactic=MagicMock(
+            side_effect=AssertionError("excluded shape must not select a tactic")
+        ),
+        prefer_direct_bf16_gemm_sm100=lambda m, n, k: False,
+        run_direct_dense=MagicMock(
+            side_effect=AssertionError("excluded shape must not launch a kernel")
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_direct",
+        direct_module,
+    )
+
+    assert _mod.apply_direct_low_m_gemm(a, weight, None) is None
+    direct_module.default_tactic.assert_not_called()
+    direct_module.run_direct_dense.assert_not_called()
+
+
+def test_apply_direct_declines_unsupported_tactic(monkeypatch) -> None:
+    monkeypatch.setattr(_mod, "_DIRECT_LOW_M_GEMM_ACTIVE", True)
+    monkeypatch.setattr(
+        LowMGemmDispatcher,
+        "_is_candidate_shape",
+        staticmethod(lambda *_: True),
+    )
+    # This is inside the narrow-N band, but no supported block-size/vector
+    # product divides K=640 exactly.
+    a = torch.empty((1, 640), dtype=torch.bfloat16)
+    weight = torch.empty((512, 640), dtype=torch.bfloat16)
+    direct_module = SimpleNamespace(
+        default_tactic=MagicMock(side_effect=ValueError("unsupported tactic")),
+        prefer_direct_bf16_gemm_sm100=lambda m, n, k: True,
+        run_direct_dense=MagicMock(
+            side_effect=AssertionError("unsupported tactic must not launch a kernel")
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_direct",
+        direct_module,
+    )
+
+    assert _mod.apply_direct_low_m_gemm(a, weight, None) is None
+    direct_module.default_tactic.assert_called_once_with(1, 512, 640)
+    direct_module.run_direct_dense.assert_not_called()
+
+
+def test_apply_direct_preserves_leading_dimensions(monkeypatch) -> None:
+    monkeypatch.setattr(_mod, "_DIRECT_LOW_M_GEMM_ACTIVE", True)
+    monkeypatch.setattr(
+        LowMGemmDispatcher,
+        "_is_candidate_shape",
+        staticmethod(lambda *_: True),
+    )
+    calls = {}
+
+    def run_direct(a, weight_t, output, pdl, tactic):
+        calls.update(
+            a_shape=a.shape,
+            weight_shape=weight_t.shape,
+            output_shape=output.shape,
+            pdl=pdl,
+            tactic=tactic,
+        )
+        output.fill_(1)
+
+    direct_module = SimpleNamespace(
+        default_tactic=lambda m, n, k: (m, n, k),
+        prefer_direct_bf16_gemm_sm100=lambda m, n, k: True,
+        run_direct_dense=run_direct,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_direct",
+        direct_module,
+    )
+    monkeypatch.setattr(_mod, "get_env_enable_pdl", lambda: False)
+    a = torch.empty((1, 1, 640), dtype=torch.bfloat16)
+    weight = torch.empty((512, 640), dtype=torch.bfloat16)
+
+    output = _mod.apply_direct_low_m_gemm(a, weight, None)
+
+    assert output is not None and output.shape == (1, 1, 512)
+    assert calls == {
+        "a_shape": torch.Size([1, 640]),
+        "weight_shape": torch.Size([640, 512]),
+        "output_shape": torch.Size([1, 512]),
+        "pdl": False,
+        "tactic": (1, 512, 640),
+    }
+
+
+@_skip_non_sm10x
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        (96, 2560),
+        (512, 2560),
+        (640, 2560),
+        (1280, 2560),
+        (2560, 6144),
+        (320, 10240),
+    ],
+)
+def test_apply_direct_matches_fp32_reference(n: int, k: int, monkeypatch) -> None:
+    monkeypatch.setattr(_mod, "_DIRECT_LOW_M_GEMM_ACTIVE", True)
+    torch.manual_seed(0)
+    a = torch.randn((1, k), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda") * 0.02
+    reference = (a.float() @ weight.float().t()).to(torch.bfloat16)
+
+    output = _mod.apply_direct_low_m_gemm(a, weight, None)
+
+    assert output is not None
+    torch.testing.assert_close(output, reference, rtol=1e-2, atol=5e-3)
+
+
+@_skip_non_sm10x
+@torch.inference_mode()
+def test_qwen3_next_gate_direct_path_preserves_topk(monkeypatch) -> None:
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import low_m_bf16_direct
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextGate
+
+    monkeypatch.setattr(_mod, "_DIRECT_LOW_M_GEMM_ACTIVE", True)
+    calls = []
+    real_run_direct = low_m_bf16_direct.run_direct_dense
+    monkeypatch.setattr(
+        low_m_bf16_direct,
+        "run_direct_dense",
+        lambda *args, **kwargs: (
+            calls.append(1),
+            real_run_direct(*args, **kwargs),
+        )[1],
+    )
+    torch.manual_seed(0)
+    gate = Qwen3NextGate(
+        hidden_size=2560,
+        num_experts=512,
+        top_k=10,
+        dtype=torch.bfloat16,
+    )
+    gate.weight.data = torch.randn((512, 2560), dtype=torch.bfloat16, device="cuda") * 0.02
+    hidden = torch.randn((1, 2560), dtype=torch.bfloat16, device="cuda")
+
+    logits = gate(hidden)
+    baseline = torch.ops.trtllm.cublas_mm(
+        hidden,
+        gate.weight.t(),
+        bias=None,
+        out_dtype=torch.bfloat16,
+    )
+
+    assert calls == [1]
+    reference = (hidden.float() @ gate.weight.float().t()).to(torch.bfloat16)
+    torch.testing.assert_close(logits, reference, rtol=1e-2, atol=5e-3)
+    assert torch.equal(
+        logits.topk(10, dim=-1).indices.sort(dim=-1).values,
+        baseline.topk(10, dim=-1).indices.sort(dim=-1).values,
+    )
+
+
+@_skip_non_sm10x
+@torch.inference_mode()
+def test_qwen3_next_gate_prefill_falls_back(monkeypatch) -> None:
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import low_m_bf16_direct
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextGate
+
+    monkeypatch.setattr(_mod, "_DIRECT_LOW_M_GEMM_ACTIVE", True)
+    calls = []
+    monkeypatch.setattr(
+        low_m_bf16_direct,
+        "run_direct_dense",
+        lambda *args, **kwargs: calls.append(1),
+    )
+    gate = Qwen3NextGate(
+        hidden_size=2560,
+        num_experts=512,
+        top_k=10,
+        dtype=torch.bfloat16,
+    )
+    gate.weight.data = torch.randn((512, 2560), dtype=torch.bfloat16, device="cuda")
+    hidden = torch.randn((64, 2560), dtype=torch.bfloat16, device="cuda")
+
+    logits = gate(hidden)
+
+    assert not calls
+    assert logits.shape == (64, 512)
 
 
 # ---------------------------------------------------------------------------

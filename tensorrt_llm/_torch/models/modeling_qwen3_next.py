@@ -52,6 +52,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.low_m_gemm import apply_direct_low_m_gemm
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
@@ -169,6 +170,10 @@ class Qwen3NextGate(nn.Module):
         assert not apply_routing, "Qwen3NextGate routing is called inside MoE"
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.out_dtype == hidden_states.dtype:
+            logits = apply_direct_low_m_gemm(hidden_states, self.weight, None)
+            if logits is not None:
+                return logits
         logits: torch.Tensor = torch.ops.trtllm.cublas_mm(
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
