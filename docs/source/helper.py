@@ -15,7 +15,6 @@ import pygit2
 if TYPE_CHECKING:
     from sphinx.application import Sphinx
 
-
 LLMAPI_REFERENCE_MAX_BYTES = 4 * 1024 * 1024
 
 
@@ -430,8 +429,7 @@ def generate_llmapi():
     content += (
         "Use your browser's find command to search API names and parameters "
         "on this page. Follow the link after each entry for complete member "
-        "and inheritance documentation.\n\n"
-    )
+        "and inheritance documentation.\n\n")
     content += search_content
 
     with open(doc_path, "w+") as f:
