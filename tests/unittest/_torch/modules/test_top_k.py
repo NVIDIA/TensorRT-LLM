@@ -144,6 +144,7 @@ def test_gvr_uses_caller_prior_state(monkeypatch) -> None:
         2,
         decode_implementation=TopKImplementation.CUTE_DSL_GVR,
         compress_ratio=4,
+        gvr_self_sampling=False,
     )
     scores = torch.randn(1, 8)
     logical_lengths = torch.tensor([32], dtype=torch.int32)
@@ -181,7 +182,11 @@ def test_gvr_uses_caller_prior_state(monkeypatch) -> None:
 def test_gvr_uses_caller_prepared_row_order(monkeypatch) -> None:
     gvr = Mock(side_effect=lambda *args, **kwargs: args[3].zero_())
     monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_gvr_topk_decode", gvr)
-    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_self_sampling=False,
+    )
     next_n = 2
     lengths = torch.tensor([4, 1, 8, 2], dtype=torch.int32)
     row_order = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
@@ -231,7 +236,7 @@ def test_gvr_v2_decode_is_hint_free(monkeypatch) -> None:
     runner = _install_fake_selfsampling_runner(monkeypatch)
     top_k = TopK(
         2,
-        decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
         compress_ratio=4,
     )
 
@@ -252,7 +257,7 @@ def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
     monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
     top_k = TopK(
         2,
-        decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
         compress_ratio=4,
     )
     scores = torch.randn(1, 8, dtype=torch.bfloat16)
@@ -289,7 +294,7 @@ def test_gvr_v2_decode_rejects_output_width_mismatch(monkeypatch) -> None:
     runner = _install_fake_selfsampling_runner(monkeypatch)
     top_k = TopK(
         2,
-        decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
         compress_ratio=4,
     )
     with pytest.raises(AssertionError):
@@ -299,7 +304,11 @@ def test_gvr_v2_decode_rejects_output_width_mismatch(monkeypatch) -> None:
 
 
 def test_update_gvr_prior_from_prefill_uses_last_request_rows() -> None:
-    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_self_sampling=False,
+    )
     prefill_indices = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32)
     prior_indices = torch.zeros(3, 2, dtype=torch.int32)
 
@@ -315,7 +324,7 @@ def test_update_gvr_prior_from_prefill_uses_last_request_rows() -> None:
 
 
 def test_gvr_v2_does_not_update_prior_from_prefill() -> None:
-    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2)
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
     prior_indices = torch.zeros(1, 2, dtype=torch.int32)
 
     top_k.update_gvr_prior_from_prefill(
@@ -326,6 +335,17 @@ def test_gvr_v2_does_not_update_prior_from_prefill() -> None:
 
     assert prior_indices.tolist() == [[0, 0]]
     assert not top_k.needs_gvr_prior
+
+
+def test_needs_gvr_prior_follows_two_level_dispatch() -> None:
+    assert TopK(2, decode_implementation=TopKImplementation.CUDA_GVR).needs_gvr_prior
+    assert not TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR).needs_gvr_prior
+    assert TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_self_sampling=False,
+    ).needs_gvr_prior
+    assert not TopK(2).needs_gvr_prior
 
 
 def test_cuda_radix_defaults_dispatch_to_cpp(monkeypatch) -> None:

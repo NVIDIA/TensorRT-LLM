@@ -41,6 +41,7 @@ class DSAMetadataParams(SparseMetadataParams):
     q_split_threshold: int
     has_shared_indexer_layers: bool = False
     mtp_index_share: bool = False
+    use_self_sampling_topk: bool = True
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,10 @@ class DSAParams(SparseParams):
     q_split_threshold: int = 8192
     indexer_rope_interleave: bool = False
     enable_heuristic_topk: bool = False
+    # Second-level GVR dispatch: hint-free self-sampling engine (True) vs
+    # temporal previous-step-hint engines (False). Only meaningful when
+    # enable_heuristic_topk is set.
+    use_self_sampling_topk: bool = True
     indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
     # Shared layers reuse the preceding full layer's top-k.
     is_full_indexer_layer: bool = True

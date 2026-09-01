@@ -460,6 +460,56 @@ def test_indexer_configures_one_top_k_module(
     assert isinstance(indexer.top_k, TopK)
     assert indexer.top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
     assert indexer.top_k.decode_implementation == expected_decode
+    if enable_heuristic:
+        # index_topk=128 misses the self-sampling prerequisites, so the
+        # default use_self_sampling_topk=True falls back to the temporal path.
+        assert not indexer.top_k.gvr_self_sampling
+        assert indexer.top_k.needs_gvr_prior
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize(
+    "use_self_sampling,use_cute_dsl,expected_decode",
+    [
+        (True, False, TopKImplementation.CUTE_DSL_GVR),
+        (True, True, TopKImplementation.CUTE_DSL_GVR),
+        (False, True, TopKImplementation.CUTE_DSL_GVR),
+        (False, False, TopKImplementation.CUDA_GVR),
+    ],
+)
+def test_indexer_two_level_gvr_dispatch(
+    monkeypatch,
+    use_self_sampling,
+    use_cute_dsl,
+    expected_decode,
+):
+    # The retired TRTLLM_GVR_SELF_SAMPLING env must be ignored: with
+    # use_self_sampling_topk=False the temporal path must win regardless.
+    monkeypatch.setenv("TRTLLM_GVR_SELF_SAMPLING", "1")
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=512,
+        use_cute_dsl_topk=use_cute_dsl,
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=use_self_sampling,
+    )
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
+            return_value=100,
+        ),
+    ):
+        indexer = create_indexer(sparse_config)
+
+    assert indexer.top_k.decode_implementation == expected_decode
+    assert indexer.top_k.gvr_self_sampling == use_self_sampling
+    assert indexer.top_k.needs_gvr_prior == (not use_self_sampling)
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):

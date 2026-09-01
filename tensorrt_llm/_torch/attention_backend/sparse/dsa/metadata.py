@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
@@ -161,6 +160,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.enable_gvr_topk = (
             sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
         )
+        self.use_self_sampling_topk = sparse_metadata_params.use_self_sampling_topk
         self.kv_lens_row_reorder = None
         capture_graph = self.is_cuda_graph
         # Plain DSA has no compression and uses the default [1]. DeepSeek-V4's
@@ -354,18 +354,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         warmed keys are the ones dispatch actually looks up. Batches outside
         this set still compile lazily on first touch. The helper enumerates
         one representative row per distinct engine compile key, so large
-        batch lists warm in bounded time and memory. No-op unless the opt-in
-        gate (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
+        batch lists warm in bounded time and memory. No-op unless the
+        two-level dispatch (enable_heuristic_topk + use_self_sampling_topk)
+        selects the self-sampling engine.
         """
-        if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
-            return
-        # same hardware gates as the dispatch flag (indexer __init__): never
-        # compile these kernels on unsupported stacks during warmup
+        # same two-level dispatch and hardware gates as the indexer __init__:
+        # never compile these kernels on unsupported stacks during warmup
         if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
             return
         if not self.enable_gvr_topk or self.kv_cache_manager is None:
             return
-        top_k = getattr(self.sparse_metadata_params, "index_topk", None)
+        if not self.use_self_sampling_topk:
+            return
+        top_k = self.sparse_mla_topk
         if not top_k or int(top_k) not in (512, 1024, 2048):
             return
         cr = int(self._indexer_compress_ratio) if self._indexer_compress_ratio else 1
