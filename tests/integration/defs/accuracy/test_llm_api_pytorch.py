@@ -4662,9 +4662,9 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
 
         The baseline and sa legs run post-merge in the GB300 16-GPU 4-node CI
         stage (test-db list l0_gb300_multi_nodes_node4_gpu16.yml); all three
-        legs are also registered in qa/llm_function_multinode.txt and run by
-        QA's weekly multinode pipeline (qualified on 4x4 GB300 nodes; the
-        reuse leg is QA-weekly-only). Each mode mirrors
+        modes of this test are also registered in qa/llm_function_multinode.txt
+        and run by QA's weekly multinode pipeline (qualified on 4x4 GB300
+        nodes; the reuse mode is QA-weekly-only). Each mode mirrors
         the corresponding examples/kimi_k3/eval_extra_llm_options*.yaml config
         - keep them in sync when editing either. The `sa` leg additionally
         records spec-dec acceptance: AL/AR lines in the eval log (via
