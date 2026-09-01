@@ -234,6 +234,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     int const* __restrict__ ssm_state_indices, float* __restrict__ state, int64_t state_slot_stride,
     __nv_bfloat16* __restrict__ out, float lower_bound, float scale, float onorm_epsilon)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    __trap();
+#else
     constexpr int kFlat = kHeads * kDim;
     constexpr bool kUseCpAsyncBulk = kSchedule == KernelSchedule::kSingleCtaTwoStageCpAsyncBulk
         || kSchedule == KernelSchedule::kSingleCtaFourStageCpAsyncBulk;
@@ -574,6 +577,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
             out[output_index] = bf16_store(raw_output * inverse_rms * preloaded_weight * preloaded_gate);
         }
     }
+#endif
 }
 
 template <KernelSchedule kSchedule, int kHeads>
@@ -631,20 +635,22 @@ cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t str
     return cudaGetLastError();
 }
 
-void validateBlackwellParams(KdaDecodeParams const& params)
+void validateOptimizedParams(KdaDecodeParams const& params)
 {
     TLLM_CHECK_WITH_INFO(
-        params.numHeads == params.numValueHeads, "Blackwell KDA decode requires numHeads == numValueHeads");
-    TLLM_CHECK_WITH_INFO(params.applyOutputNorm, "Blackwell KDA decode requires output normalization");
-    TLLM_CHECK_WITH_INFO(!params.updateConvCache, "Blackwell KDA decode does not yet support updateConvCache=true");
-    TLLM_CHECK_WITH_INFO(params.useLowerBound, "Blackwell KDA decode requires the lower-bound gate");
-    TLLM_CHECK_WITH_INFO(params.applyBetaSigmoid, "Blackwell KDA decode requires beta sigmoid in the kernel");
+        params.numHeads == params.numValueHeads, "Optimized KDA decode requires numHeads == numValueHeads");
+    TLLM_CHECK_WITH_INFO(params.applyOutputNorm, "Optimized KDA decode requires output normalization");
+    TLLM_CHECK_WITH_INFO(!params.updateConvCache, "Optimized KDA decode does not yet support updateConvCache=true");
+    TLLM_CHECK_WITH_INFO(params.useLowerBound, "Optimized KDA decode requires the lower-bound gate");
+    TLLM_CHECK_WITH_INFO(params.applyBetaSigmoid, "Optimized KDA decode requires beta sigmoid in the kernel");
 }
 
 template <KernelSchedule kSchedule>
-void dispatchKdaDecodeBlackwellHeads(KdaDecodeParams const& params, cudaStream_t stream)
+void dispatchKdaDecodeOptimizedHeads(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    validateBlackwellParams(params);
+    TLLM_CHECK_WITH_INFO(tensorrt_llm::common::getSMVersion() >= 90,
+        "Optimized KDA decode kernels require compute capability 9.0 or later");
+    validateOptimizedParams(params);
     switch (params.numHeads)
     {
     case 1: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 1>(params, stream))); break;
@@ -659,30 +665,30 @@ void dispatchKdaDecodeBlackwellHeads(KdaDecodeParams const& params, cudaStream_t
     case 32: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 32>(params, stream))); break;
     case 48: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 48>(params, stream))); break;
     case 96: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 96>(params, stream))); break;
-    default: TLLM_CHECK_WITH_INFO(false, "Blackwell KDA decode does not support numHeads=%d", params.numHeads);
+    default: TLLM_CHECK_WITH_INFO(false, "Optimized KDA decode does not support numHeads=%d", params.numHeads);
     }
 }
 
 } // namespace
 
-void launchKdaDecodeBlackwellSingleCta(KdaDecodeParams const& params, cudaStream_t stream)
+void launchKdaDecodeOptimizedSingleCta(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    dispatchKdaDecodeBlackwellHeads<KernelSchedule::kSingleCtaCpAsync>(params, stream);
+    dispatchKdaDecodeOptimizedHeads<KernelSchedule::kSingleCtaCpAsync>(params, stream);
 }
 
-void launchKdaDecodeBlackwellTwoStageBulk(KdaDecodeParams const& params, cudaStream_t stream)
+void launchKdaDecodeOptimizedTwoStageBulk(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    dispatchKdaDecodeBlackwellHeads<KernelSchedule::kSingleCtaTwoStageCpAsyncBulk>(params, stream);
+    dispatchKdaDecodeOptimizedHeads<KernelSchedule::kSingleCtaTwoStageCpAsyncBulk>(params, stream);
 }
 
-void launchKdaDecodeBlackwellFourStageBulk(KdaDecodeParams const& params, cudaStream_t stream)
+void launchKdaDecodeOptimizedFourStageBulk(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    dispatchKdaDecodeBlackwellHeads<KernelSchedule::kSingleCtaFourStageCpAsyncBulk>(params, stream);
+    dispatchKdaDecodeOptimizedHeads<KernelSchedule::kSingleCtaFourStageCpAsyncBulk>(params, stream);
 }
 
-void launchKdaDecodeBlackwellFourCtaCluster(KdaDecodeParams const& params, cudaStream_t stream)
+void launchKdaDecodeOptimizedFourCtaCluster(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    dispatchKdaDecodeBlackwellHeads<KernelSchedule::kFourCtaThreadBlockClusterCpAsync>(params, stream);
+    dispatchKdaDecodeOptimizedHeads<KernelSchedule::kFourCtaThreadBlockClusterCpAsync>(params, stream);
 }
 
 } // namespace kernels::kdaDecode
