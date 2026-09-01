@@ -1668,6 +1668,9 @@ class Indexer(nn.Module):
                     and next_n == 1
                     and not dsl_atom_split
                     and num_gen_tokens <= 256
+                    # ext tiers are single-CTA/sort-path only; row reordering
+                    # routes the Top-K through order_row, which excludes them
+                    and metadata.kv_lens_row_reorder is None
                 ):
                     gvr_emit_kwargs = self.top_k.prepare_gvr_emission(
                         num_generations,
