@@ -1776,7 +1776,7 @@ class BatchMLADecodePagedTSWrapper:
 
         Parameters
         ----------
-        device : device-like
+        device : int, str, or torch.device
             CUDA device on which the plan will execute.
         batch_size : int
             Exact runtime request count.
@@ -1791,7 +1791,10 @@ class BatchMLADecodePagedTSWrapper:
         mask_type : {"dense", "causal"}
             Attention mask mode.
         workspace_buffer : torch.Tensor, optional
-            Caller-owned scratch for this plan.
+            Caller-owned contiguous int8 or uint8 scratch on ``device``. It
+            must be 32-byte aligned and large enough for the selected plan.
+            When omitted, planning allocates the buffer. The retained buffer
+            is exclusive to one in-flight launch or graph replay.
         """
 
         if not isinstance(packed_query, bool):
@@ -1918,6 +1921,11 @@ class BatchMLADecodePagedTSWrapper:
             Caller-owned output tensor. A new tensor is allocated when omitted.
         validate : bool
             Enable explicit runtime validation. Defaults to ``True``.
+
+        Returns
+        -------
+        torch.Tensor
+            The fixed or packed MLA attention output.
         """
 
         state = self._plan_state
@@ -2017,7 +2025,10 @@ def batch_decode_mla_with_paged_kv_cache(
     qo_indptr : torch.Tensor, optional
         Cumulative query offsets selecting packed-query mode.
     max_seq_len_q : int, optional
-        Static packed-query length bound.
+        Per-request packed-query length capacity. For packed Q it defaults to
+        the maximum delta in ``qo_indptr``; an explicit value may be larger.
+        For fixed Q it defaults to the query's sequence extent and, when
+        provided, must equal that extent.
     kv_lora_rank, qk_rope_head_dim : int
         Latent and RoPE dimensions.
     mask_type : {"dense", "causal"}
@@ -2030,6 +2041,11 @@ def batch_decode_mla_with_paged_kv_cache(
         Caller-owned output tensor.
     out_dtype : torch.dtype
         Output dtype.
+
+    Returns
+    -------
+    torch.Tensor
+        The fixed or packed MLA attention output.
     """
 
     packed_query = qo_indptr is not None

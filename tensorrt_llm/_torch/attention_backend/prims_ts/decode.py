@@ -959,43 +959,6 @@ def _validate_paged_kv_row_metadata(
     return device, batch_size
 
 
-def _validate_paged_kv_csr_storage(
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-) -> tuple[torch.device, int]:
-    """Validate live-plan CSR storage without reading device values."""
-
-    metadata = (
-        (paged_kv_indptr, "paged_kv_indptr"),
-        (paged_kv_indices, "paged_kv_indices"),
-    )
-    for tensor, name in metadata:
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor")
-        if tensor.ndim != 1:
-            raise ValueError(f"{name} must be one-dimensional")
-        if tensor.dtype != torch.int32:
-            raise TypeError(f"{name} must have dtype torch.int32")
-        if tensor.device.type != "cuda":
-            raise ValueError(f"{name} must be a CUDA tensor")
-        if not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous")
-        if tensor.data_ptr() % 4 != 0:
-            raise ValueError(f"{name} data pointer must be 4-byte aligned")
-
-    device = paged_kv_indptr.device
-    if paged_kv_indices.device != device:
-        raise ValueError("all paged-KV metadata tensors must be on the same device")
-    batch_size = int(paged_kv_indptr.numel()) - 1
-    if batch_size <= 0:
-        raise ValueError("paged_kv_indptr must contain at least two offsets")
-    if paged_kv_indices.numel() < batch_size:
-        raise ValueError(
-            "paged_kv_indices must have storage for at least one page per request"
-        )
-    return device, batch_size
-
-
 def _validate_paged_kv_metadata(
     paged_kv_indptr: torch.Tensor,
     paged_kv_indices: torch.Tensor,
@@ -2191,11 +2154,15 @@ def prims_ts_batch_decode_with_kv_cache(
     max_seq_len : int
         Static maximum K/V length used for policy selection and JIT caching.
     seq_len_q : int
-        Fixed query length when ``qo_indptr`` is omitted.
+        Fixed query length when ``qo_indptr`` is omitted. In packed-query mode,
+        a non-default value is a backward-compatible alias for
+        ``max_seq_len_q`` and must agree with it when both are provided.
     qo_indptr : torch.Tensor, optional
         Cumulative query offsets selecting packed-query mode.
     max_seq_len_q : int, optional
-        Static packed-query length bound.
+        Per-request packed-query length capacity. When omitted for packed Q,
+        a non-default ``seq_len_q`` must supply the bound. In fixed-query mode,
+        it must equal ``seq_len_q``.
     bmm1_scale, bmm2_scale : float, optional
         QK and value/output scaling factors.
     out : torch.Tensor, optional
@@ -2372,7 +2339,13 @@ class BatchDecodePagedTSWrapper:
 
     @flashinfer_api
     def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
-        """Initialize an unplanned wrapper with one static K/V layout."""
+        """Initialize an unplanned wrapper with one static K/V layout.
+
+        Parameters
+        ----------
+        kv_layout : {"HND"}
+            Layout of the paged K/V cache. Only ``"HND"`` is supported.
+        """
 
         _validate_layout(kv_layout)
         self._kv_layout = kv_layout
@@ -2413,20 +2386,69 @@ class BatchDecodePagedTSWrapper:
     ) -> None:
         """Compile one static-capacity plan without retaining request metadata.
 
-        max_seq_len_q is the exact fixed Q length when packed_query is false
-        and the per-request capacity when packed_query is true. A packed run
-        supplies qo_indptr and compact [total_q, Hq, D] storage.
+        ``max_seq_len_q`` is the exact fixed Q length when ``packed_query`` is
+        false and the per-request capacity when ``packed_query`` is true. A
+        packed run supplies ``qo_indptr`` and compact ``[total_q, Hq, D]``
+        storage.
 
-        seq_lens is optional CPU-only specialization evidence. When omitted,
-        both K/V prefix and length handling compile dynamically. When supplied,
-        planning may prove a full split prefix or uniform maximum K/V length.
-        The tensor is never passed to a launch. With validation enabled, run
-        synchronously verifies that live lengths still satisfy every selected
-        constexpr proof.
+        ``seq_lens`` is optional CPU-only specialization evidence. When
+        omitted, both K/V prefix and length handling compile dynamically. When
+        supplied, planning may prove a full split prefix or uniform maximum
+        K/V length. The values are never passed to a launch. With validation
+        enabled, ``run`` synchronously verifies that live lengths still satisfy
+        every selected constexpr proof.
 
-        workspace_buffer is caller-owned scratch for this plan. It is allocated
-        when omitted, initialized during planning, retained by the frozen plan
-        state, and never reset by run.
+        ``workspace_buffer`` is caller-owned scratch for this plan. It is
+        allocated when omitted, initialized during planning, retained by the
+        frozen plan state, and never reset by ``run``.
+
+        Parameters
+        ----------
+        device : int, str, or torch.device
+            CUDA device on which the specialization is compiled and run.
+        batch_size : int
+            Exact number of requests in every run.
+        num_qo_heads : int
+            Number of query/output heads.
+        num_kv_heads : int
+            Number of K/V heads.
+        head_dim : int
+            Query, key, value, and output head dimension.
+        page_size : int
+            Number of K/V tokens stored in each page.
+        max_kv_len : int
+            Per-request K/V length capacity used for policy selection,
+            compilation, and workspace sizing.
+        max_seq_len_q : int
+            Exact fixed Q length, or per-request capacity for packed Q.
+            Defaults to ``1``.
+        packed_query : bool
+            Select compact ``[total_q, Hq, D]`` query/output storage instead
+            of fixed ``[B, SQ, Hq, D]`` storage. Fixed SQ1 storage is
+            ``[B, Hq, D]``. Defaults to ``False``.
+        q_data_type : torch.dtype
+            Query dtype used to compile the plan. Defaults to
+            ``torch.float16``.
+        kv_data_type : torch.dtype, optional
+            K/V dtype used to compile the plan. Defaults to ``q_data_type``.
+        o_data_type : torch.dtype, optional
+            Output dtype used to compile the plan. Defaults to
+            ``q_data_type``.
+        mask_type : {"dense", "causal"}
+            Attention mask mode. Defaults to ``"dense"``.
+        window_left : int
+            Left sliding-window extent, or ``-1`` to disable the window. A
+            non-negative value requires causal masking.
+        seq_lens : Sequence[int] or torch.Tensor, optional
+            Host-only per-request K/V lengths used as specialization evidence.
+            A tensor must be a one-dimensional CPU int32 or int64 tensor. The
+            sequence must contain exactly ``batch_size`` positive values no
+            larger than ``max_kv_len``.
+        workspace_buffer : torch.Tensor, optional
+            Caller-owned contiguous int8 or uint8 scratch on ``device``. It
+            must be 32-byte aligned and large enough for the selected plan.
+            When omitted, planning allocates the buffer. The retained buffer
+            is exclusive to one in-flight launch or graph replay.
         """
 
         if not isinstance(packed_query, bool):
@@ -2598,17 +2620,50 @@ class BatchDecodePagedTSWrapper:
     ) -> torch.Tensor:
         """Launch the current plan with entirely live request metadata.
 
-        validate=True performs structural, value, specialization-evidence, and
-        alias validation. It reads metadata values back to the host. This is
-        the safe public default. validate=False treats every run argument as a
-        trusted binding, performs no explicit wrapper validation, and remains
-        free of metadata device-to-host synchronization. Lifecycle enforcement,
-        K/V view selection, scale forwarding, and optional output allocation
-        are unavoidable in both modes.
+        ``validate=True`` performs structural, value,
+        specialization-evidence, and alias validation. It reads metadata
+        values back to the host. This is the safe public default.
+        ``validate=False`` treats every run argument as a trusted binding,
+        performs no explicit wrapper validation, and remains free of metadata
+        device-to-host synchronization. Lifecycle enforcement, K/V view
+        selection, scale forwarding, and optional output allocation are
+        unavoidable in both modes.
 
-        Packed plans require qo_indptr with B + 1 Int32 offsets. Fixed plans
-        require qo_indptr to be omitted. All metadata tensors belong to this
-        launch and may change identity between ordered runs.
+        Packed plans require ``qo_indptr`` with ``B + 1`` int32 offsets. Fixed
+        plans require ``qo_indptr`` to be omitted. All metadata tensors belong
+        to this launch and may change identity between ordered runs.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Runtime fixed or packed query tensor matching the plan.
+        paged_kv_cache : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+            Runtime combined or separate paged K/V storage matching the plan.
+        seq_lens : torch.Tensor
+            Live contiguous int32 CUDA K/V lengths with shape ``[B]``.
+        paged_kv_indptr : torch.Tensor
+            Live contiguous int32 CUDA CSR row offsets with shape ``[B + 1]``.
+        paged_kv_indices : torch.Tensor
+            Live contiguous int32 CUDA physical page IDs.
+        qo_indptr : torch.Tensor, optional
+            Live cumulative query offsets with shape ``[B + 1]``. Required for
+            a packed-query plan and rejected for a fixed-query plan.
+        bmm1_scale : float, optional
+            QK scaling factor. Defaults to the inverse square root of
+            ``head_dim``.
+        bmm2_scale : float
+            Value/output scaling factor. Defaults to ``1.0``.
+        out : torch.Tensor, optional
+            Caller-owned output tensor. A new tensor is allocated when omitted.
+        validate : bool
+            Run explicit structural, value, specialization-evidence, and alias
+            validation. Disable only when the caller guarantees the complete
+            runtime contract. Defaults to ``True``.
+
+        Returns
+        -------
+        torch.Tensor
+            The fixed or packed attention output.
         """
 
         state = self._require_plan_state()
@@ -2750,11 +2805,15 @@ def batch_decode_with_paged_kv_cache(
     paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len : torch.Tensor
         Native CSR page metadata.
     seq_len_q : int
-        Fixed query length when ``qo_indptr`` is omitted.
+        Fixed query length when ``qo_indptr`` is omitted. In packed-query mode,
+        a non-default value is a backward-compatible alias for
+        ``max_seq_len_q`` and must agree with it when both are provided.
     qo_indptr : torch.Tensor, optional
         Cumulative query offsets selecting packed-query mode.
     max_seq_len_q : int, optional
-        Static packed-query length bound.
+        Per-request packed-query length capacity. When omitted for packed Q,
+        it is derived from ``qo_indptr`` unless a non-default ``seq_len_q``
+        supplies the bound. In fixed-query mode, it must equal ``seq_len_q``.
     mask_type : {"dense", "causal"}
         Attention mask mode.
     window_left : int
@@ -2767,6 +2826,11 @@ def batch_decode_with_paged_kv_cache(
         Caller-owned output tensor.
     out_dtype : torch.dtype, optional
         Output dtype; defaults to ``out.dtype`` or the query dtype.
+
+    Returns
+    -------
+    torch.Tensor
+        The fixed or packed attention output.
     """
 
     _validate_layout(kv_layout)
