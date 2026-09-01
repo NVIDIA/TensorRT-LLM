@@ -81,8 +81,8 @@ from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
-from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
-from tensorrt_llm._torch.modules.fused_moe.weight_owner import is_moe_weight_owner
+from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm._torch.utils import split
 
 _HC_FUSED_MIX_ENV = "TRTLLM_QWEN4_EXP_HC_FUSED_MIX"

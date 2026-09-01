@@ -49,7 +49,7 @@ from torch import nn
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.mapping import Mapping
 
-from .fused_shared_expert import PendingSharedExpertGate
+from ..moe.fused_shared_expert import PendingSharedExpertGate
 from .linear import Linear
 from .mamba.layernorm_gated import RMSNorm as TritonRMSNorm
 from .qwen4_exp_hyper_connection_kernels import hc_combine, hc_combine_norm, hc_gate_mix, hc_silu

@@ -236,7 +236,7 @@ def test_multimodal_embedding_without_local_encoder_requires_handoff_support() -
 
 
 def test_text_model_is_eligible_for_online_eplb() -> None:
-    from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import moe_model_arch_list
+    from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import moe_model_arch_list
 
     assert "Qwen4ExpForCausalLM" in moe_model_arch_list
     assert "Qwen4ExpForConditionalGeneration" in moe_model_arch_list
@@ -373,7 +373,7 @@ def test_mapper_normalizes_bf16_and_per_expert_fp8_weights() -> None:
         _normalize_moe_module_weights,
         _rank_block,
     )
-    from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
+    from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 
     q = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     z = torch.arange(8, 16, dtype=torch.float32).reshape(4, 2)

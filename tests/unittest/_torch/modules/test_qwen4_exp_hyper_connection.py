@@ -4,14 +4,14 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.fused_shared_expert import (
-    PendingSharedExpertGate,
-    fused_sigmoid_gate_mul_add,
-)
 from tensorrt_llm._torch.modules.qwen4_exp_hyper_connection import Qwen4ExpHyperConnection
 from tensorrt_llm._torch.modules.qwen4_exp_hyper_connection_kernels import (
     hc_combine,
     hc_combine_norm,
+)
+from tensorrt_llm._torch.moe.fused_shared_expert import (
+    PendingSharedExpertGate,
+    fused_sigmoid_gate_mul_add,
 )
 from tensorrt_llm._utils import is_sm_100f
 
