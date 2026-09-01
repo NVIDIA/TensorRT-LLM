@@ -342,7 +342,7 @@
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda_graph": 639.7142962962963,
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=MEGAMOE_DEEPGEMM]": 785.2970606060605,
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM]": 398.6672222222222,
-   "accuracy/test_llm_api_pytorch.py::TestGLM52::test_nvfp4_mtp_index_share[tp_size=8-ep_size=8]": 772.4247628865979,
+   "accuracy/test_glm52.py::TestGLM52NVFP4::test_mtp_index_share[tp_size=8-ep_size=8]": 772.4247628865979,
    "accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dflash": 559.5412219387755,
    "accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format": 117.9636990521327,
    "accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[cutlass-one_model-overlap_scheduler]": 1493.5923557692308,

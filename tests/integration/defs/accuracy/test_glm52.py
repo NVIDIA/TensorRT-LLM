@@ -1,0 +1,519 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+
+import jsonschema
+import pytest
+import torch
+
+from tensorrt_llm import LLM
+from tensorrt_llm.evaluate import JsonModeEval as JsonModeEvaluator
+from tensorrt_llm.llmapi import (
+    CudaGraphConfig,
+    KvCacheConfig,
+    MoeConfig,
+    MTPDecodingConfig,
+    RequestOutput,
+    SamplingParams,
+    SchedulingParams,
+)
+from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.sampling_params import LogitsProcessor
+
+from ..conftest import llm_models_root, parametrize_with_ids, skip_pre_blackwell, skip_ray
+from .accuracy_core import GSM8K, JsonModeEval, LlmapiAccuracyTestHarness
+
+
+class _ForceTokenLogitsProcessor(LogitsProcessor):
+    def __init__(self, forced_token_id: int) -> None:
+        self._forced_token_id = forced_token_id
+
+    def __call__(
+        self,
+        req_id: int,
+        logits: torch.Tensor,
+        token_ids: list[list[int]],
+        stream_ptr: int | None,
+        client_id: int | None,
+    ) -> None:
+        del req_id, token_ids, client_id
+        if stream_ptr is None:
+            self._force_token(logits)
+            return
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            self._force_token(logits)
+
+    def _force_token(self, logits: torch.Tensor) -> None:
+        logits.fill_(float("-inf"))
+        logits[..., self._forced_token_id] = 0
+
+
+class _JsonModeGrammarEval(JsonModeEvaluator):
+    def compute_score(
+        self,
+        outputs: list[RequestOutput],
+        references: list[str],
+        schemas: list[str],
+    ) -> float:
+        del references
+        assert outputs
+        assert len(outputs) == len(schemas)
+        for output, schema in zip(outputs, schemas, strict=True):
+            parsed_output = json.loads(output.outputs[0].text)
+            jsonschema.validate(parsed_output, json.loads(schema))
+        return 100.0
+
+
+@skip_pre_blackwell
+class TestGLM5FP8(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "zai-org/GLM-5-FP8"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5-FP8"
+
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_8gpus(self, tp_size, ep_size):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
+            moe_config=MoeConfig(backend="DEEPGEMM"),
+            speculative_config=MTPDecodingConfig(),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=ep_size,
+            kv_cache_config=kv_cache_config,
+            max_seq_len=8192,
+            **pytorch_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "zai-org/GLM-5.2"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_tep(self, tp_size, ep_size):
+        # GLM-5.2 reuses the DeepSeek-V3.2 path (MLA + DSA) with cross-layer
+        # indexer sharing. NVFP4 weights run on the CuteDSL MoE backend with
+        # MTP speculative decoding. The checkpoint keeps the leading dense
+        # layers and per-MoE-layer shared_experts / self_attn in higher
+        # precision.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            speculative_config=MTPDecodingConfig(max_draft_len=1),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=ep_size,
+            kv_cache_config=kv_cache_config,
+            max_seq_len=8192,
+            **pytorch_config,
+        ) as llm:
+            assert llm.args.disable_overlap_scheduler is False
+            assert llm.args.cuda_graph_config is not None
+            assert llm.args.cuda_graph_config.enable_padding is True
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.timeout(7200)
+    @skip_pre_blackwell
+    @skip_ray
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.threadleak(enabled=False)
+    def test_attention_dp(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        num_ranks = 8
+        output_length = 8
+        monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")
+        prompts = [[1, 42, 43] for _ in range(num_ranks)]
+        scheduling_params = [
+            SchedulingParams(attention_dp_rank=rank, attention_dp_relax=False)
+            for rank in range(num_ranks)
+        ]
+
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=num_ranks,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=num_ranks,
+            enable_attention_dp=True,
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+            enable_autotuner=False,
+            max_batch_size=num_ranks,
+            max_seq_len=8192,
+            max_stats_len=128,
+            enable_iter_perf_stats=True,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                free_gpu_memory_fraction=0.4,
+            ),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            speculative_config=MTPDecodingConfig(max_draft_len=1),
+        ) as llm:
+            assert llm.args.enable_attention_dp is True
+            outputs = llm.generate(
+                prompts,
+                sampling_params=SamplingParams(
+                    max_tokens=output_length,
+                    temperature=0,
+                    end_id=-1,
+                ),
+                scheduling_params=scheduling_params,
+                use_tqdm=False,
+            )
+            stats_entries = llm.get_stats(timeout=10)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+        assert isinstance(outputs, list)
+        assert len(outputs) == num_ranks
+        reference_token_ids = outputs[0].outputs[0].token_ids
+        for rank, output in enumerate(outputs):
+            token_ids = output.outputs[0].token_ids
+            assert len(token_ids) == output_length
+            assert token_ids == reference_token_ids, (
+                f"ADP rank {rank} produced tokens that differ from rank 0"
+            )
+
+        assert stats_entries
+        for rank in range(num_ranks):
+            rank_stats = [
+                entry
+                for entry in stats_entries
+                if entry.get("rank", entry.get("attentionDpRank")) == rank
+            ]
+            assert rank_stats, f"No iteration statistics reported for ADP rank {rank}"
+            assert any(
+                entry.get("inflightBatchingStats", {}).get("numContextRequests", 0) > 0
+                for entry in rank_stats
+            ), f"No real context request executed on ADP rank {rank}"
+            assert any(
+                entry.get("inflightBatchingStats", {}).get("numGenRequests", 0) > 0
+                for entry in rank_stats
+            ), f"No real generation request executed on ADP rank {rank}"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_mtp_index_share(self, tp_size, ep_size):
+        # Like test_tep but max_draft_len=3, exercising DSA indexer Top-K reuse
+        # across MTP draft steps (index_share_for_mtp_iteration=true from the checkpoint).
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            speculative_config=MTPDecodingConfig(max_draft_len=3),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=ep_size,
+            kv_cache_config=kv_cache_config,
+            max_seq_len=8192,
+            **pytorch_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_mtp_index_share_mtp_ar(self, tp_size, ep_size):
+        # Acceptance-rate guard for max_draft_len=3 + index-share.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            speculative_config=MTPDecodingConfig(max_draft_len=3),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=ep_size,
+            kv_cache_config=kv_cache_config,
+            max_seq_len=8192,
+            **pytorch_config,
+        ) as llm:
+            raw_prompts = [
+                "The capital of France is",
+                "The president of the United States is",
+                "The future of AI is",
+            ]
+            prompts = [
+                llm.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": p}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                for p in raw_prompts
+            ]
+            tok_ids = [llm.tokenizer.encode(p) for p in prompts]
+            sampling_params = SamplingParams(
+                max_tokens=128,
+                temperature=0,
+                end_id=-1,
+                return_perf_metrics=True,
+            )
+            outputs = llm.generate(
+                tok_ids,
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )
+
+            total_drafted = 0
+            total_accepted = 0
+            assert isinstance(outputs, list)
+            assert len(outputs) == len(tok_ids)
+            for i, output in enumerate(outputs):
+                request_perf_metrics = output.outputs[0].request_perf_metrics
+                assert request_perf_metrics is not None
+                speculative_metrics = request_perf_metrics.speculative_decoding
+                assert speculative_metrics is not None
+                num_drafted = int(speculative_metrics.total_draft_tokens)
+                num_accepted = int(speculative_metrics.total_accepted_draft_tokens)
+                assert num_drafted > 0
+                accept_rate = num_accepted / num_drafted
+                total_drafted += num_drafted
+                total_accepted += num_accepted
+                print(
+                    f"GLM-5.2 MTP index-share prompt {i} acceptance rate: "
+                    f"{accept_rate:.2%} ({num_accepted}/{num_drafted} tokens)"
+                )
+
+            aggregate_accept_rate = total_accepted / total_drafted if total_drafted > 0 else 0.0
+            print(
+                "GLM-5.2 MTP index-share aggregate acceptance rate: "
+                f"{aggregate_accept_rate:.2%} ({total_accepted}/"
+                f"{total_drafted} tokens across {len(tok_ids)} prompts)"
+            )
+            assert aggregate_accept_rate > 0.2, (
+                f"Aggregate acceptance rate {aggregate_accept_rate:.2%} below threshold 20%"
+            )
+
+    @skip_pre_blackwell
+    @skip_ray
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.threadleak(enabled=False)
+    def test_chunked_prefill(self):
+        prompt_length = 768
+        max_num_tokens = 256
+        output_length = 16
+        prompt_token_ids = [1] + [42] * (prompt_length - 2) + [43]
+
+        with LLM(
+            self.MODEL_PATH,
+            skip_tokenizer_init=True,
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=8,
+            enable_attention_dp=False,
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+            enable_chunked_prefill=True,
+            max_batch_size=1,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=1024,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                free_gpu_memory_fraction=0.6,
+            ),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            return_perf_metrics=True,
+        ) as llm:
+            assert llm.args.enable_chunked_prefill is True
+            assert llm.args.max_num_tokens == max_num_tokens
+            outputs = llm.generate(
+                [prompt_token_ids],
+                sampling_params=SamplingParams(
+                    max_tokens=output_length,
+                    temperature=0,
+                    end_id=-1,
+                ),
+                use_tqdm=False,
+            )
+
+        assert isinstance(outputs, list)
+        assert len(outputs) == 1
+        assert len(outputs[0].outputs[0].token_ids) == output_length
+        time_breakdown = outputs[0].time_breakdown_metrics
+        assert time_breakdown is not None
+        context_chunks = time_breakdown.get("ctx_chunk_metrics")
+        assert isinstance(context_chunks, list)
+        assert len(context_chunks) >= 3
+
+    @skip_pre_blackwell
+    @skip_ray
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.threadleak(enabled=False)
+    def test_kv_cache_reuse(self) -> None:
+        prompt_token_ids = [1] + [42] * 255
+        output_length = 8
+        sampling_params = SamplingParams(
+            max_tokens=output_length,
+            temperature=0,
+            end_id=-1,
+            return_perf_metrics=True,
+        )
+
+        with LLM(
+            self.MODEL_PATH,
+            skip_tokenizer_init=True,
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=8,
+            enable_attention_dp=False,
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+            max_seq_len=1024,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=True,
+                free_gpu_memory_fraction=0.6,
+                dtype="fp8",
+            ),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+        ) as llm:
+            assert llm.args.kv_cache_config.enable_block_reuse is True
+            cold_output = llm.generate(
+                [prompt_token_ids],
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )[0].outputs[0]
+            warm_output = llm.generate(
+                [prompt_token_ids],
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )[0].outputs[0]
+
+        cold_metrics = cold_output.request_perf_metrics
+        warm_metrics = warm_output.request_perf_metrics
+        assert cold_metrics is not None
+        assert warm_metrics is not None
+        assert cold_metrics.kv_cache_metrics.num_reused_blocks == 0
+        assert warm_metrics.kv_cache_metrics.num_reused_blocks > 0
+        assert len(cold_output.token_ids) == output_length
+        assert len(warm_output.token_ids) == output_length
+        assert warm_output.token_ids == cold_output.token_ids
+
+    @skip_pre_blackwell
+    @skip_ray
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.threadleak(enabled=False)
+    def test_logits_processor(self) -> None:
+        forced_token_id = 22
+        output_length = 4
+        sampling_params = SamplingParams(
+            max_tokens=output_length,
+            temperature=0,
+            end_id=-1,
+            logits_processor=_ForceTokenLogitsProcessor(forced_token_id),
+        )
+
+        with LLM(
+            self.MODEL_PATH,
+            skip_tokenizer_init=True,
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=8,
+            enable_attention_dp=False,
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+            max_seq_len=1024,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                free_gpu_memory_fraction=0.6,
+            ),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+        ) as llm:
+            outputs = llm.generate(
+                [[1, 42, 43]],
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )
+
+        assert isinstance(outputs, list)
+        assert len(outputs) == 1
+        assert outputs[0].outputs[0].token_ids == [forced_token_id] * output_length
+
+    @pytest.mark.timeout(7200)
+    @skip_pre_blackwell
+    @skip_ray
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding(self, backend: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TRTLLM_XGUIDANCE_LENIENT", "1")
+
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=8,
+            enable_attention_dp=False,
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+            max_seq_len=2048,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                free_gpu_memory_fraction=0.6,
+            ),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            guided_decoding_backend=backend,
+        ) as llm:
+            evaluator = _JsonModeGrammarEval(
+                dataset_path=JsonModeEval.DATASET_DIR,
+                num_samples=4,
+                random_seed=0,
+                apply_chat_template=True,
+            )
+            score = evaluator.evaluate(
+                llm,
+                SamplingParams(
+                    max_tokens=JsonModeEval.MAX_OUTPUT_LEN,
+                    truncate_prompt_tokens=JsonModeEval.MAX_INPUT_LEN,
+                ),
+            )
+
+        assert score == 100.0
