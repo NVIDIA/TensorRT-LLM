@@ -9003,6 +9003,42 @@ class TestGLM52(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_nvfp4_nvfp4kv(self, tp_size, ep_size):
+        """Exercise the GLM-5.2 NVFP4 KV cache decode path."""
+        model_name = "zai-org/GLM-5.2"
+        model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
+        kv_cache_config = KvCacheConfig(
+            dtype="nvfp4",
+            free_gpu_memory_fraction=0.7,
+            use_kv_cache_manager_v2=True,
+        )
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            enable_chunked_prefill=False,
+        )
+
+        with LLM(
+                model_path,
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=1,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                max_seq_len=8192,
+                **pytorch_config,
+        ) as llm:
+            assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
     def test_nvfp4_mtp_index_share(self, tp_size, ep_size):
         # Like test_nvfp4 but max_draft_len=3, exercising DSA indexer Top-K reuse
         # across MTP draft steps (index_share_for_mtp_iteration=true from the checkpoint).

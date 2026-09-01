@@ -36,6 +36,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 using namespace tensorrt_llm::kernels;
 namespace tc = tensorrt_llm::common;
@@ -1093,9 +1094,9 @@ int AttentionOp::mlaGeneration(
     int32_t const batch_beam = generation_params.beam_width * generation_params.num_requests;
 
     // The element size of the KV cache.
-    auto const elemSize = mKVCacheQuantMode.hasFp8KvCache() ? sizeof(__nv_fp8_e4m3) : sizeof(T);
+    auto const elemSize = mFP8GenerationMLA ? sizeof(__nv_fp8_e4m3) : sizeof(T);
     auto const sizePerToken = num_kv_heads * head_size * elemSize;
-    params.cache_type = (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
+    params.cache_type = (mFP8GenerationMLA ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
 
     auto kv_cache_buffer = KVBlockArray(batch_beam, generation_params.max_blocks_per_sequence, mTokensPerBlock,
         sizePerToken, generation_params.cyclic_attention_window_size,
@@ -1103,7 +1104,8 @@ int AttentionOp::mlaGeneration(
         generation_params.can_use_one_more_block, generation_params.host_primary_pool_pointer,
         generation_params.host_secondary_pool_pointer, generation_params.block_offsets);
 
-    // Currently NVFP4 KV cache is not supported for MLA. An empty placeholder is provided.
+    // Static sparse NVFP4 MLA reads a separately dequantized FP8 scratch pool,
+    // so this paged-cache scale descriptor is not consumed by the attention kernel.
     auto kv_scale_cache_buffer = KVBlockArray();
 
     void* scratchPtr = params.workspace;
@@ -1251,6 +1253,31 @@ int AttentionOp::mlaGeneration(
             else
             {
                 tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_kv_cache_pool;
+
+                bool const usesAuxiliaryKvPool
+                    = tllmRunnerParams.kvPtr != nullptr && tllmRunnerParams.kvPtr != kv_cache_buffer.mPrimaryPoolPtr;
+                if (usesAuxiliaryKvPool)
+                {
+                    // Static sparse MLA indexes a compact KV pool containing at most
+                    // mSparseTopK rows per query. Do not let the original dense KV
+                    // length drive kernel selection or launch geometry: for long
+                    // sequences that can select a multi-CTA kernel which addresses
+                    // beyond the compact page table.
+                    TLLM_CHECK_WITH_INFO(tllmRunnerParams.mSparseTopK > 0,
+                        "Static sparse MLA requires a positive TopK, got %d", tllmRunnerParams.mSparseTopK);
+                    int32_t const originalMaxSeqLenKv = tllmRunnerParams.mMaxSeqLenKv;
+                    int32_t const effectiveMaxSeqLenKv = std::min(originalMaxSeqLenKv, tllmRunnerParams.mSparseTopK);
+                    tllmRunnerParams.mMaxSeqLenKv = effectiveMaxSeqLenKv;
+                    tllmRunnerParams.mJITWarmupMaxSeqLenKv
+                        = std::min(tllmRunnerParams.mJITWarmupMaxSeqLenKv, effectiveMaxSeqLenKv);
+                    int64_t const sumOfSeqLensKv
+                        = static_cast<int64_t>(tllmRunnerParams.mBatchSize) * effectiveMaxSeqLenKv;
+                    TLLM_CHECK_WITH_INFO(sumOfSeqLensKv <= std::numeric_limits<int32_t>::max(),
+                        "Static sparse MLA cumulative KV length exceeds int32 capacity: %ld", sumOfSeqLensKv);
+                    tllmRunnerParams.mSumOfSeqLensKv = static_cast<int32_t>(sumOfSeqLensKv);
+                    TLLM_LOG_DEBUG("Clamp static sparse MLA max KV length from %d to %d (TopK=%d)", originalMaxSeqLenKv,
+                        effectiveMaxSeqLenKv, tllmRunnerParams.mSparseTopK);
+                }
             }
         }
 
@@ -1888,7 +1915,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             params.mla_param->quant_scale_q = params.kv_scale_orig_quant;
             params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
             params.mla_param->dequant_scale_q = params.kv_scale_quant_orig;
-            params.mla_param->dequant_scale_kv = params.kv_scale_quant_orig;
+            params.mla_param->dequant_scale_kv
+                = cache_type == KvCacheDataType::NVFP4 ? nullptr : params.kv_scale_quant_orig;
             params.mla_param->host_bmm1_scale
                 = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
             // The sparse MLA is in the absorption mode for the context phase.
@@ -1898,6 +1926,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             bool const useFusedQFp8 = params.mla_param->fuse_q_fp8_in_rope && mFP8ContextMLA
                 && params.mla_param->absorption_mode && cache_type == KvCacheDataType::FP8
                 && params.mla_param->quant_q_buf != nullptr && params.mla_param->quant_scale_qkv != nullptr;
+            TLLM_CHECK_WITH_INFO(cache_type != KvCacheDataType::NVFP4 || params.mla_param->latent_cache == nullptr,
+                "NVFP4 sparse MLA context must append its latent cache before launching attention");
             if (params.mla_param->latent_cache != nullptr)
             {
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
@@ -2903,8 +2933,9 @@ int AttentionOp::initialize() noexcept
         "fuse_fp4_quant only supports SM100f or SM120 or SM121 devices.");
 
     // Check requirements for FP4 KV cache.
-    TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA,
-        "mFP8ContextFMHA must enable if FP4 KV cache is enabled");
+    TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA
+            || (mIsMLAEnabled && mUseSparseAttention && (mFP8ContextMLA || mFP8GenerationMLA)),
+        "FP4 KV cache requires FP8 context FMHA or sparse MLA with an FP8 scratch pool");
 
     TLLM_CHECK(isRoPE() == (mRotaryEmbeddingDim != 0));
     TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != tensorrt_llm::DataType::kBF16),
@@ -3017,7 +3048,7 @@ int AttentionOp::initialize() noexcept
             fmhaParams.dataTypeOut = DATA_TYPE_BF16;
             fmhaParams.dataTypeKv = DATA_TYPE_BF16;
         }
-        if (mFP8ContextMLA && mKVCacheQuantMode.hasFp8KvCache())
+        if (mFP8ContextMLA)
         {
             fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
             fmhaParams.dataTypeOut = DATA_TYPE_BF16;
@@ -3140,7 +3171,7 @@ int AttentionOp::initialize() noexcept
                     TLLM_CHECK_WITH_INFO(false, "The data type is not supported.");
                 }
 
-                if (mKVCacheQuantMode.hasFp8KvCache())
+                if (mFP8GenerationMLA)
                 {
                     qDataType = DATA_TYPE_E4M3;
                     kvDataType = DATA_TYPE_E4M3;

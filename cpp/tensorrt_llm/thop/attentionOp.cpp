@@ -758,7 +758,7 @@ public:
         {
             kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
             kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
-            if (op.mKVCacheQuantMode.hasFp4KvCache())
+            if (op.mKVCacheQuantMode.hasFp4KvCache() && !op.isMLAEnabled())
             {
                 TORCH_CHECK(kv_scale_orig_quant.value().size(0) == 3);
                 TORCH_CHECK(kv_scale_quant_orig.value().size(0) == 3);
@@ -816,8 +816,9 @@ public:
         {
             if (host_kv_cache_pool_pointers.has_value())
             {
-                auto* kvCachePool = reinterpret_cast<char*>(
-                    host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
+                auto* kvCachePool = reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().dim() == 3
+                        ? host_kv_cache_pool_pointers.value().index({pool_index, 0, 0}).item<int64_t>()
+                        : host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
                 if (sparse_attn_kv_lens.has_value())
                 {
                     // Deepseek V4 dynamic sparse MLA always uses the SWA pool for now.
@@ -830,7 +831,9 @@ public:
                 }
                 else
                 {
-                    op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = kvCachePool;
+                    op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = aux_kv_cache_pool_ptr.has_value()
+                        ? reinterpret_cast<char*>(aux_kv_cache_pool_ptr.value())
+                        : kvCachePool;
                 }
             }
         }
@@ -1367,9 +1370,12 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         op->mFP8ContextMLA
             = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::getSMVersion() == 100
                   || tensorrt_llm::common::getSMVersion() == 103 || tensorrt_llm::common::getSMVersion() == 120)
-            && op->mKVCacheQuantMode.hasFp8KvCache();
+            && (op->mKVCacheQuantMode.hasFp8KvCache()
+                || (op->mKVCacheQuantMode.hasFp4KvCache() && op->mUseSparseAttention
+                    && aux_kv_cache_pool_ptr.has_value()));
         op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
-        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
+        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache()
+            || (op->mKVCacheQuantMode.hasFp4KvCache() && op->mUseSparseAttention && aux_kv_cache_pool_ptr.has_value());
         // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
         op->mUseGenFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && tokens_per_block == 64 && head_size == 576;
 
