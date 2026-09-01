@@ -33,9 +33,9 @@ from ...locality_domain.autotune import \
     _LocalityDomainConcurrentTunableRunner
 from ...locality_domain.policy import LocalityDomainExecutionPlanner
 from ...locality_domain.runtime import LocalityDomainRuntime
-from ...locality_domain_utils import get_reserved_remainder_stream
+from ...locality_domain_utils import (_copy_to_new_cuda_allocation,
+                                      get_reserved_remainder_stream)
 from ...model_config import ModelConfig
-from ...modules.linear import _copy_to_new_cuda_allocation
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
