@@ -1262,6 +1262,163 @@ def all_to_all_5d(
                            head_dim)
 
 
+class _KimiK3TailMnnvlMemory(MnnvlMemory):
+    """MNNVL fabric allocation over the plain TP group. The base class colors
+    its communicator split by moe_tp_rank, which would fracture a hybrid
+    moe_tp x ep TEP group; the MoE-tail collectives run over the attention TP
+    group regardless of the MoE sharding. __init_subclass__ gives this class
+    isolated comm/VA state."""
+
+    @classmethod
+    def get_comm(cls, mapping: Mapping):
+        if cls.comm is not None:
+            return cls.comm
+        comm = mpi_comm().Split(
+            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
+            mapping.tp_rank,
+        )
+        cls.comm = comm
+        return comm
+
+
+# One fabric workspace per process (Mapping-keyed); holds the MnnvlMemory,
+# flag tensors and the serialized pointer table alive for the process
+# lifetime (freeing fabric memory under a captured graph is unsafe).
+_kimi_k3_tail_fabric_workspaces: Dict[Mapping, Tuple] = {}
+
+
+def _get_kimi_k3_tail_fabric_workspace(mapping: Mapping) -> torch.Tensor:
+    """[3N+2] int64 pointer table in the allreduce_fusion workspace layout,
+    with the lamport triple buffer backed by MNNVL fabric memory so the
+    oneshot MoE-tail kernels work across nodes (e.g. GB300 tep8: 4 GPUs per
+    node).
+
+    Layout consumed by LamportComm (allReduceFusionKernels.cu /
+    kimiK3MoeTailFusion.cu): entries [2N..3N) = per-rank lamport bases,
+    [3N] = flag triple {counter, non-lamport flag, lamport flag},
+    [3N+1] = {clear size, per-phase buffer stride}. Entries [0..2N) belong to
+    the twoshot SyncComm path, which these kernels never touch -- left 0.
+
+    Collective: every TP rank must call this at construction time (before any
+    CUDA-graph capture); the MPI split + allgathers rendezvous here.
+    """
+    if mapping in _kimi_k3_tail_fabric_workspaces:
+        return _kimi_k3_tail_fabric_workspaces[mapping][0]
+    from tensorrt_llm.bindings.internal.runtime import lamport_initialize
+
+    n = mapping.tp_size
+    # Kernel cap: bf16, T<=64 tokens; the tail-head round stores every rank's
+    # latent slot (64 x 3584) plus every rank's shared-segment slot
+    # (64 x 7168/n); size for the widest supported shapes.
+    max_msg_bytes = 64 * (3584 + 7168) * 2
+    per_phase_bytes = n * max_msg_bytes
+    total_bytes = 3 * per_phase_bytes
+
+    mem = _KimiK3TailMnnvlMemory(mapping, total_bytes)
+    comm = _KimiK3TailMnnvlMemory.get_comm(mapping)
+    local_ptr = mem.ptr + comm.Get_rank() * mem.rank_stride
+    lamport_initialize(local_ptr, total_bytes)
+
+    # flag triple: [atomic CTA counter, non-lamport flag, lamport flag]
+    flag_buffer = torch.tensor([0, 0, 0], dtype=torch.int, device="cuda")
+    # [bytes to clear on the next call, per-phase buffer stride]
+    layout_buffer = torch.tensor([0, per_phase_bytes],
+                                 dtype=torch.int64,
+                                 device="cuda")
+    ptrs = ([0] * (2 * n) + [mem.ptr + i * mem.rank_stride for i in range(n)] +
+            [flag_buffer.data_ptr(),
+             layout_buffer.data_ptr()])
+    workspace = torch.tensor(ptrs, dtype=torch.int64, device="cuda")
+
+    # All ranks must see zeroed sentinels before anyone pushes.
+    torch.cuda.synchronize()
+    comm.Barrier()
+
+    _kimi_k3_tail_fabric_workspaces[mapping] = (workspace, mem, flag_buffer,
+                                                layout_buffer)
+    return workspace
+
+
+class KimiK3MoeTailFused(nn.Module):
+    """Fused Kimi K3 MoE-tail head for TEP decode: one kernel does the
+    oneshot-lamport AllReduce of the routed latent partial + RMSNorm
+    epilogue, concurrently with a ReduceScatter of the shared-expert partial
+    (segment owners end with their fully-reduced [T, H/tp] slice). Replaces
+    the baseline [cat -> combined AR -> split -> contiguous -> rmsnorm]
+    chain. Single-node TP groups reuse the standard cudaIpc lamport
+    workspace; cross-node TP groups get a private MNNVL-fabric-backed
+    workspace in the same layout. bf16, T in [1, 64], tp in {2, 4, 8}."""
+
+    @staticmethod
+    def is_supported(mapping: Mapping) -> bool:
+        from tensorrt_llm._ipc_utils import can_access_peer
+        if mapping.tp_size <= mapping.gpus_per_node and can_access_peer(
+                mapping):
+            return True  # single node: cudaIpc lamport workspace
+        # cross node: MNNVL fabric workspace (NVL72 domain)
+        return mapping.is_multi_node() and MnnvlMemory.supports_mnnvl()
+
+    def __init__(self, mapping: Mapping):
+        super().__init__()
+        assert self.is_supported(mapping), (
+            "KimiK3MoeTailFused: TP group is neither single-node "
+            "P2P-capable (cudaIpc) nor MNNVL-fabric-capable")
+        self.mapping = mapping
+        if mapping.tp_size <= mapping.gpus_per_node:
+            self.workspace = get_allreduce_workspace(self.mapping)
+        else:
+            self.workspace = _get_kimi_k3_tail_fabric_workspace(self.mapping)
+
+    def forward(self, latent_partial: torch.Tensor,
+                shared_partial: torch.Tensor, norm_weight: torch.Tensor,
+                rms_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns ``(z, s_shard)``: the reduced+normed latent (full width on
+        every rank) and this rank's fully-reduced shared segment."""
+        # trigger_completion_at_end=False: fire launch-completion early so
+        # the dependent kernel becomes resident (and can prefetch weights)
+        # while this kernel still runs; the dependent's own PDL wait still
+        # fences the z/s_shard HBM outputs.
+        out = torch.ops.trtllm.kimi_k3_moe_tail_ar_rs_norm(
+            latent_partial, shared_partial, norm_weight, self.workspace,
+            self.mapping.tp_rank, self.mapping.tp_size, rms_eps, False)
+        return out[0], out[1]
+
+
+class KimiK3StripeAllGatherAdd(nn.Module):
+    """Fused [oneshot-lamport AllGather + elementwise add] for the Kimi K3
+    column-striped up-projection: rank r computes ``out[:, r*S:(r+1)*S]``
+    locally from its bf16 weight stripe; this op gathers the stripes into the
+    full hidden row. ``shard_add`` ([T, S], the RS'd shared segment) is
+    folded into the pushed stripe; ``shared`` (full width, strided rows OK)
+    is added on the poll side. Shares the workspace machinery -- and the
+    interleaving-safe rotation protocol -- with :class:`KimiK3MoeTailFused`.
+    bf16, T in [1, 64], tp in {2, 4, 8}."""
+
+    @staticmethod
+    def is_supported(mapping: Mapping) -> bool:
+        return KimiK3MoeTailFused.is_supported(mapping)
+
+    def __init__(self, mapping: Mapping):
+        super().__init__()
+        assert self.is_supported(mapping), (
+            "KimiK3StripeAllGatherAdd: TP group is neither single-node "
+            "P2P-capable (cudaIpc) nor MNNVL-fabric-capable")
+        self.mapping = mapping
+        if mapping.tp_size <= mapping.gpus_per_node:
+            self.workspace = get_allreduce_workspace(self.mapping)
+        else:
+            self.workspace = _get_kimi_k3_tail_fabric_workspace(self.mapping)
+
+    def forward(self,
+                shard: torch.Tensor,
+                shared: Optional[torch.Tensor],
+                shard_add: Optional[torch.Tensor] = None) -> torch.Tensor:
+        hidden = shard.shape[1] * self.mapping.tp_size
+        return torch.ops.trtllm.kimi_k3_stripe_allgather_add(
+            shard, shared, shard_add, self.workspace, self.mapping.tp_rank,
+            self.mapping.tp_size, hidden, True)
+
+
 class MiniMaxAllReduceRMS(nn.Module):
 
     def __init__(self, mapping: Mapping):

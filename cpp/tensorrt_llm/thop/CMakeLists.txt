@@ -93,6 +93,7 @@ add_library(
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
   helixPostProcessOp.cpp
+  kimiK3MoeTailOp.cpp
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp

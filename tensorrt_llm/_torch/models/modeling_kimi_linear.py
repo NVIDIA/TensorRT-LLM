@@ -109,6 +109,7 @@ from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams
+from ..distributed.ops import KimiK3MoeTailFused, KimiK3StripeAllGatherAdd
 from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
@@ -129,6 +130,21 @@ from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
     os.environ.get("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
 )
+
+KIMI_K3_MOE_TAIL_FUSION_ENV = "KIMI_K3_MOE_TAIL_FUSION"
+# Opt-in (default off): fused MoE tail for TEP decode. Replaces the
+# [cat -> combined AR over [M, hidden+latent] -> split -> contiguous ->
+# rmsnorm -> replicated up_proj GEMM -> add] chain with three ops:
+#   1. one fused kernel: oneshot AR(latent) + RMSNorm concurrent with a
+#      ReduceScatter of the shared-expert partial,
+#   2. a bf16 column-stripe up_proj GEMM (1/tp of the weight read),
+#   3. a fused AllGather with the RS'd shared segment folded into the push.
+# Decode token counts <= 64 only; larger batches (prefill) keep the
+# replicated path. Requires the FP8 weight-read conversion pass (default on):
+# the bf16 weight stripe is stashed there, before the conversion frees the
+# BF16 storage. Measured on GB300 tep8 decode: -538us/step at 8-token verify
+# steps (+1.74% tok/s/user), GSM8K-neutral.
+_MOE_TAIL_FUSION_ENABLED = os.environ.get(KIMI_K3_MOE_TAIL_FUSION_ENV, "0") == "1"
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -837,6 +853,17 @@ def _convert_moe_mlps_to_fp8_weight_read(
                 count += _swap_linear_to_fp8_weight_read(
                     shared, attr, linear_types=(nn.Linear, TrtllmLinear)
                 )
+        # Fused MoE tail (KIMI_K3_MOE_TAIL_FUSION): stash this rank's bf16
+        # up_proj row stripe before the FP8 conversion frees the BF16
+        # storage. The full projection stays FP8-resident for the fallback
+        # (prefill / token counts above the fused-kernel cap), so the stripe
+        # costs only H/tp x latent bf16 extra (~6.4MB/layer at tep8).
+        up = getattr(moe, "routed_expert_up_proj", None)
+        if getattr(moe, "_moe_tail_fused", None) is not None and isinstance(up, nn.Linear):
+            stripe_mapping = moe._moe_tail_fused.mapping
+            stripe = up.out_features // stripe_mapping.tp_size
+            r = stripe_mapping.tp_rank
+            moe._up_stripe_weight = up.weight.data[r * stripe : (r + 1) * stripe].clone()
         for attr in ("routed_expert_down_proj", "routed_expert_up_proj"):
             count += _swap_linear_to_fp8_weight_read(moe, attr)
 
@@ -1285,6 +1312,41 @@ class KimiK3MoERuntime(nn.Module):
         self.routed_expert_norm = RMSNorm(
             hidden_size=self.moe_hidden_size, eps=cfg.rms_norm_eps, dtype=dtype
         )
+        # Fused MoE tail (KIMI_K3_MOE_TAIL_FUSION=1). The bf16 up_proj weight
+        # stripe is stashed by the FP8 weight-read conversion pass at load
+        # time; until then (or when that pass never runs) the fused path
+        # stays dormant and forward takes the replicated projection
+        # unchanged. Constructing the comm modules here is collective
+        # (workspace rendezvous across the TP group) and must precede any
+        # CUDA-graph capture.
+        self._moe_tail_fused = None
+        self._up_stripe_ag = None
+        self._up_stripe_weight = None
+        _tail_mapping = model_config.mapping
+        if (
+            _MOE_TAIL_FUSION_ENABLED
+            and use_shared_tp
+            and _tail_mapping.tp_size in (2, 4, 8)
+            and cfg.hidden_size % (_tail_mapping.tp_size * 8) == 0
+            and self.moe_hidden_size % 8 == 0
+            and 128 <= self.moe_hidden_size // 8 <= 512
+        ):
+            if KimiK3MoeTailFused.is_supported(_tail_mapping):
+                self._moe_tail_fused = KimiK3MoeTailFused(_tail_mapping)
+                self._up_stripe_ag = KimiK3StripeAllGatherAdd(_tail_mapping)
+                logger.info_once(
+                    "Kimi K3 MoE tail fusion: ENABLED (fused AR+RS+norm -> "
+                    f"bf16 1/{_tail_mapping.tp_size} stripe GEMM -> fused "
+                    "AllGather+add)",
+                    key="kimi_k3_moe_tail_fusion",
+                )
+            else:
+                logger.warning_once(
+                    "Kimi K3 MoE tail fusion requested but the TP group is "
+                    "neither single-node P2P nor MNNVL-fabric capable; "
+                    "keeping the replicated tail path.",
+                    key="kimi_k3_moe_tail_fusion_unsupported",
+                )
 
     @staticmethod
     def _routed_projection(hidden_states: torch.Tensor, projection: nn.Module) -> torch.Tensor:
@@ -1472,6 +1534,12 @@ class KimiK3MoERuntime(nn.Module):
             disable_on_compile=True,
         )
         if self._use_combined_all_reduce:
+            if (
+                self._moe_tail_fused is not None
+                and self._up_stripe_weight is not None
+                and routed_out.shape[0] <= 64
+            ):
+                return self._fused_tail(routed_out, shared_out)
             combined = moe_all_reduce(torch.cat((shared_out, routed_out), dim=-1))
             shared_out, routed_latent = torch.split(
                 combined,
@@ -1483,6 +1551,23 @@ class KimiK3MoERuntime(nn.Module):
             routed_latent = self.routed_expert_norm(routed_latent.contiguous())
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
         return routed_out + shared_out
+
+    def _fused_tail(self, routed_out: torch.Tensor, shared_out: torch.Tensor) -> torch.Tensor:
+        """Fused TEP decode tail: one kernel does the oneshot AR of the
+        routed latent partial + RMSNorm concurrently with a ReduceScatter of
+        the shared-expert partial; this rank's bf16 weight stripe then
+        computes only its output columns; the fused AllGather folds the RS'd
+        segment into the push and assembles the full hidden row. Kills the
+        cat/split/contiguous copies, the standalone norm kernel, the
+        replicated up_proj read (1/tp of the bytes) and the trailing add."""
+        z, s_shard = self._moe_tail_fused(
+            routed_out,
+            shared_out,
+            self.routed_expert_norm.weight,
+            float(self.routed_expert_norm.variance_epsilon),
+        )
+        shard = torch.nn.functional.linear(z, self._up_stripe_weight)
+        return self._up_stripe_ag(shard, None, s_shard)
 
 
 # ---------------------------------------------------------------------------
