@@ -1439,6 +1439,29 @@ class TestComputeScheduledTokens:
         assert PyExecutor._compute_scheduled_tokens([req0, req1], []) == 20 + 40
 
 
+def test_event_loop_uses_model_engine_recompile_limit():
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = Mock(_torch_compile_recompile_limit=23)
+    executor._is_warmup = True
+    executor.garbage_collection_gen0_threshold = 700
+    executor._executor_loop_cleanup = Mock()
+
+    observed_limits = []
+
+    def event_loop():
+        observed_limits.append(torch._dynamo.config.recompile_limit)
+        executor._event_loop_completed = True
+
+    executor.event_loop = event_loop
+    original_limit = torch._dynamo.config.recompile_limit
+
+    PyExecutor._event_loop_wrapper(executor)
+
+    assert observed_limits == [23]
+    assert torch._dynamo.config.recompile_limit == original_limit
+    executor._executor_loop_cleanup.assert_called_once_with()
+
+
 # ---------------------------------------------------------------------------
 # Tests for event-loop crash propagation to _await_single_response callers.
 #
