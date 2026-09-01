@@ -33,6 +33,12 @@ if TYPE_CHECKING:
     )
 
 
+# Keep in sync with MMHA_SUPPORTED_HEAD_SIZES in
+# cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention.cu.
+_MMHA_SUPPORTED_HEAD_SIZES = frozenset({32, 48, 64, 80, 96, 104, 112, 128, 144, 160, 192, 224, 256})
+_CONTEXT_FMHA_ONLY_HEAD_SIZE = 72
+
+
 # ``AttentionForwardArgs`` fields that this backend does not consume.
 # Sync test (test_attention_op_sync.py) requires every other field to map to a
 # kwarg name, a @property on the dataclass, or a field that some @property
@@ -77,8 +83,18 @@ class FallbackFmha(Fmha):
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
         del q, k, v, phase
-        return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
-            forward_args.update_kv_cache or metadata.is_cross
+        if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
+            return False
+        if not forward_args.update_kv_cache and not metadata.is_cross:
+            return False
+        # Mirrors the head-size pre-check in ``AttentionOp::initialize``: MLA is
+        # exempt, and head size 72 only has context FMHA kernels, so a batch
+        # carrying generation requests would reach the missing MMHA kernel.
+        attn = self.attn
+        return (
+            attn.is_mla_enable
+            or attn.head_dim in _MMHA_SUPPORTED_HEAD_SIZES
+            or (attn.head_dim == _CONTEXT_FMHA_ONLY_HEAD_SIZE and metadata.num_generations == 0)
         )
 
     def forward(

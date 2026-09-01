@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.fmha.combined import CombinedFmha
+from tensorrt_llm._torch.attention_backend.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from tensorrt_llm._torch.attention_backend.fmha.interface import Fmha, FmhaPhase
 from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams, PhasedFmha
@@ -28,16 +29,19 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 
 class _TestAttention:
-    def __init__(self) -> None:
+    def __init__(self, head_dim: int = 4) -> None:
         self.is_mla_enable = False
         self.kv_lora_rank = None
         self.v_head_dim = None
-        self.head_dim = 4
+        self.head_dim = head_dim
         self.num_heads = 1
         self.num_kv_heads = 1
         self.predicted_tokens_per_seq = 1
         self.flashinfer_mla_backend = None
         self.has_fp8_kv_cache = False
+        self.sparse_params = None
+        self.position_embedding_type = 0
+        self.non_phased_fmha_libs = []
 
 
 class _TestPhasedFmha(PhasedFmha):
@@ -311,12 +315,14 @@ def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
 @pytest.mark.parametrize("sm_version", [100, 103])
 @pytest.mark.parametrize("tokens_per_block", [32, 64])
 @pytest.mark.parametrize("num_contexts", [1, 4, 5])
+@pytest.mark.parametrize("head_dim", [64, 512])
 def test_flashinfer_context_fallback_scope(
     monkeypatch: pytest.MonkeyPatch,
     dtype: torch.dtype,
     sm_version: int,
     tokens_per_block: int,
     num_contexts: int,
+    head_dim: int,
     is_fused_qkv: bool,
 ) -> None:
     monkeypatch.setattr(
@@ -325,14 +331,8 @@ def test_flashinfer_context_fallback_scope(
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = 2
-    attn = SimpleNamespace(
-        is_mla_enable=False,
-        sparse_params=None,
-        position_embedding_type=0,
-        head_dim=64,
-        num_heads=1,
-        num_kv_heads=1,
-    )
+    attn = _TestAttention(head_dim=head_dim)
+    attn.non_phased_fmha_libs = [FallbackFmha(attn)]
     q_hidden_size = attn.num_heads * attn.head_dim
     # Both layouts the trtllm-gen self-attention path accepts, wired the way
     # TrtllmAttention.forward wires them: fused QKV carries K/V inline and writes
@@ -371,7 +371,10 @@ def test_flashinfer_context_fallback_scope(
         phase=FmhaPhase.CONTEXT,
     )
 
-    expected_fallback = (dtype == torch.bfloat16 and num_contexts <= 4) or sm_version == 103
+    small_bf16_fallback = (
+        dtype == torch.bfloat16 and num_contexts <= 4 and is_fused_qkv and head_dim == 64
+    )
+    expected_fallback = small_bf16_fallback or sm_version == 103
     if expected_fallback:
         assert not supported
         assert "fallback FMHA" in reason
