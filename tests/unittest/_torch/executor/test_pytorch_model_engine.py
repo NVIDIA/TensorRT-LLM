@@ -26,7 +26,8 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
-    _filter_cuda_graph_batch_sizes, _make_single_token_context_graph_batch)
+    _filter_cuda_graph_batch_sizes, _get_context_prompt_lookahead_token,
+    _make_single_token_context_graph_batch)
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
                                           PrefillCudaGraphBackend,
@@ -43,6 +44,8 @@ from utils.util import skip_ray
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.interface import \
+    INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -169,6 +172,15 @@ def _create_request_with_tokens(tokens: list[int], req_id: int) -> LlmRequest:
     )
     request.paged_kv_block_ids = []
     return request
+
+
+def test_context_prompt_lookahead_stops_at_prompt_boundary() -> None:
+    request = _create_request_with_tokens([10, 11, 12, 13, 14], 1)
+
+    assert _get_context_prompt_lookahead_token(request, 2) == 12
+    assert _get_context_prompt_lookahead_token(request, 4) == 14
+    assert (_get_context_prompt_lookahead_token(
+        request, 5) == INVALID_PROMPT_LOOKAHEAD_TOKEN)
 
 
 def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
@@ -1648,7 +1660,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           max_num_tokens=32,
                                           kv_cache_manager=kv_cache_manager)
         attn_metadata.is_cuda_graph = False
-        spec_metadata = Mock()
+        # A bare Mock auto-vivifies every attribute, so optional metadata
+        # fields read by _prepare_tp_inputs must be pinned off explicitly.
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
 
         context = _create_request_with_tokens([11, 22, 33, 44], 1)
         context.context_current_position = 3
