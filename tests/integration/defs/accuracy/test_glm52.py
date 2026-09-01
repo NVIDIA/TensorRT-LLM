@@ -180,7 +180,10 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                 enable_block_reuse=False,
                 free_gpu_memory_fraction=0.4,
             ),
-            moe_config=MoeConfig(backend="CUTEDSL"),
+            moe_config=MoeConfig(
+                backend="CUTEDSL",
+                disable_finalize_fusion=True,
+            ),
             speculative_config=MTPDecodingConfig(max_draft_len=1),
         ) as llm:
             assert llm.args.enable_attention_dp is True
@@ -437,7 +440,10 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             sparse_attention_config=DeepSeekSparseAttentionConfig(
                 skip_indexer_for_short_seqs=False,
             ),
-            moe_config=MoeConfig(backend="CUTEDSL"),
+            moe_config=MoeConfig(
+                backend="CUTEDSL",
+                disable_finalize_fusion=True,
+            ),
         ) as llm:
             assert llm.args.kv_cache_config.enable_block_reuse is True
             assert llm.args.sparse_attention_config.skip_indexer_for_short_seqs is False
