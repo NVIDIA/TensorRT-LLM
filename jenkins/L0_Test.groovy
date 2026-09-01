@@ -3966,54 +3966,64 @@ def describe(exc):
     return repr(exc)
 
 
-print("[probe] library: " + MPI.Get_library_version().strip().splitlines()[0], flush=True)
-print(f"[probe] COMM_WORLD size={MPI.COMM_WORLD.Get_size()} "
-      f"rank={MPI.COMM_WORLD.Get_rank()} "
-      f"under_mpirun={'OMPI_COMM_WORLD_SIZE' in os.environ}", flush=True)
+def main():
+    print("[probe] library: " + MPI.Get_library_version().strip().splitlines()[0], flush=True)
+    print(f"[probe] COMM_WORLD size={MPI.COMM_WORLD.Get_size()} "
+          f"rank={MPI.COMM_WORLD.Get_rank()} "
+          f"under_mpirun={'OMPI_COMM_WORLD_SIZE' in os.environ}", flush=True)
 
-for name, make in (
-        ("COMM_WORLD.Dup", lambda: MPI.COMM_WORLD.Dup()),
-        ("COMM_WORLD.Split_type(SHARED)",
-         lambda: MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED, 0, MPI.INFO_NULL)),
-):
+    for name, make in (
+            ("COMM_WORLD.Dup", lambda: MPI.COMM_WORLD.Dup()),
+            ("COMM_WORLD.Split_type(SHARED)",
+             lambda: MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED, 0, MPI.INFO_NULL)),
+    ):
+        try:
+            comm = make()
+            print(f"[probe] {name} OK size={comm.Get_size()}", flush=True)
+            comm.Free()
+        except Exception as e:
+            print(f"[probe] {name} FAILED: {describe(e)}", flush=True)
+
+    # Raw MPI_Comm_spawn, no mpi4py.futures: separates the MPI runtime from the
+    # executor's manager thread, which is where the CI failure gets swallowed.
+    t0 = time.time()
     try:
-        comm = make()
-        print(f"[probe] {name} OK size={comm.Get_size()}", flush=True)
-        comm.Free()
+        child = MPI.COMM_SELF.Spawn(
+            sys.executable,
+            args=["-c", "from mpi4py import MPI; MPI.Comm.Get_parent().Disconnect()"],
+            maxprocs=1)
+        print(f"[probe] raw Comm_spawn OK in {time.time() - t0:.1f}s", flush=True)
+        child.Disconnect()
     except Exception as e:
-        print(f"[probe] {name} FAILED: {describe(e)}", flush=True)
+        print(f"[probe] raw Comm_spawn FAILED after {time.time() - t0:.1f}s: "
+              f"{describe(e)}", flush=True)
 
-# Raw MPI_Comm_spawn, no mpi4py.futures: separates the MPI runtime from the
-# executor's manager thread, which is where the CI failure gets swallowed.
-t0 = time.time()
-try:
-    child = MPI.COMM_SELF.Spawn(
-        sys.executable,
-        args=["-c", "from mpi4py import MPI; MPI.Comm.Get_parent().Disconnect()"],
-        maxprocs=1)
-    print(f"[probe] raw Comm_spawn OK in {time.time() - t0:.1f}s", flush=True)
-    child.Disconnect()
-except Exception as e:
-    print(f"[probe] raw Comm_spawn FAILED after {time.time() - t0:.1f}s: "
-          f"{describe(e)}", flush=True)
+    # The 120s MpiPoolSession leg is the expensive one; only the variants that
+    # need the full CI path switch it on.
+    if os.environ.get("PROBE_POOL") != "1":
+        print("[probe] MpiPoolSession skipped (PROBE_POOL != 1)", flush=True)
+        return
 
-# The 120s MpiPoolSession leg is the expensive one; only the variants that
-# need the full CI path switch it on.
-if os.environ.get("PROBE_POOL") != "1":
-    print("[probe] MpiPoolSession skipped (PROBE_POOL != 1)", flush=True)
-    sys.exit(0)
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
-from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+    t0 = time.time()
+    try:
+        session = MpiPoolSession(n_workers=1, wait_shutdown=True)
+        print(f"[probe] MpiPoolSession OK in {time.time() - t0:.1f}s "
+              f"identities={session._worker_identities}", flush=True)
+        session.shutdown()
+    except Exception as e:
+        print(f"[probe] MpiPoolSession FAILED after {time.time() - t0:.1f}s: "
+              f"{describe(e)}", flush=True)
 
-t0 = time.time()
-try:
-    session = MpiPoolSession(n_workers=1, wait_shutdown=True)
-    print(f"[probe] MpiPoolSession OK in {time.time() - t0:.1f}s "
-          f"identities={session._worker_identities}", flush=True)
-    session.shutdown()
-except Exception as e:
-    print(f"[probe] MpiPoolSession FAILED after {time.time() - t0:.1f}s: "
-          f"{describe(e)}", flush=True)
+
+# MUST stay guarded. mpi4py.futures makes each spawned worker runpy-import the
+# parent's __main__ module so submitted callables unpickle. Without this the
+# worker re-executes the whole probe, recursively builds another MpiPoolSession
+# and aborts with "Errorcode: 1" -- which is exactly what run 1820's control G
+# showed, masking whether the pool actually works under a DVM.
+if __name__ == "__main__":
+    main()
 PROBE_EOF
 
         # Quiet variant runner: only the [probe] verdicts plus any traceback,
@@ -4071,7 +4081,9 @@ PROBE_EOF
             timeout -k 10 300 mpirun --allow-run-as-root -n 1 \
             python3 -u /tmp/mpi_spawn_probe.py > /tmp/probe_ctrl_g.out 2>&1
         echo "[mpi-diag] control G exit=\$?"
-        grep -a -E '^\\[probe\\]|Traceback|Exception|Error' /tmp/probe_ctrl_g.out | head -30
+        # Full output, not a grep: when the pool worker dies the reason is in its
+        # own stderr, and grepping for [probe] lines throws exactly that away.
+        cat /tmp/probe_ctrl_g.out
 
         echo "--- leftovers from the probes, then cleanup ---"
         ls -la /tmp 2>&1 | grep -E 'prte|pmix' | head -20
