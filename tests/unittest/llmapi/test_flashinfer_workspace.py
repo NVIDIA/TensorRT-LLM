@@ -101,17 +101,18 @@ def test_worker_bootstrap_uses_unlocked_slot(
     assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(tmp_path / f"rank-{rank + world_size}")
 
 
-def test_worker_bootstrap_preserves_explicit_workspace(
+def test_worker_bootstrap_replaces_inherited_managed_workspace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    explicit_workspace = tmp_path / "explicit"
-    monkeypatch.setenv(_FLASHINFER_WORKSPACE_ENV, str(explicit_workspace))
-    monkeypatch.delenv(_FLASHINFER_MANAGED_ENV, raising=False)
+    inherited_workspace = tmp_path / "parent"
+    monkeypatch.setenv(_FLASHINFER_WORKSPACE_ENV, str(inherited_workspace))
+    monkeypatch.setenv(_FLASHINFER_MANAGED_ENV, "1")
 
     _run_worker_bootstrap(monkeypatch, tmp_path)
 
-    assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(explicit_workspace)
-    assert _FLASHINFER_MANAGED_ENV not in os.environ
+    rank = mpi_session.mpi4py.MPI.COMM_WORLD.Get_rank()
+    assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(tmp_path / f"rank-{rank}")
+    assert os.environ[_FLASHINFER_MANAGED_ENV] == "1"
 
 
 def test_worker_bootstrap_falls_back_when_isolation_fails(
