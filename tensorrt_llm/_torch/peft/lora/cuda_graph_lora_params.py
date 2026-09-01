@@ -120,12 +120,17 @@ class CudaGraphLoraParams:
             self.slot_ranks, device="cpu", pin_memory=prefer_pinned()
         )
 
-        # Per-(layer_idx, module_id) packed [max_lora_size, 3] (A, B, dora) host
-        # pointer tables for the routed-expert MoE LoRA path, populated lazily by
-        # get_moe_slot_inputs and refreshed in place by _refresh_moe_slot_ptr_cache.
-        # Initialized here (not lazily) so the refresh path cannot silently no-op
-        # out of order.
-        self._moe_slot_ptrs_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+        # Per-(layer_idx, module_id) host tables for the routed-expert MoE LoRA
+        # path: a [max_lora_size] int32 rank table and a packed [max_lora_size, 3]
+        # (A, B, dora) pointer table. Populated lazily by get_moe_slot_inputs and
+        # refreshed in place by _refresh_moe_slot_cache. Initialized here (not
+        # lazily) so the refresh path cannot silently no-op out of order.
+        #
+        # The ranks are the global per-slot ranks masked to the slots this
+        # layer/module actually has pointers for: an adapter need not cover every
+        # MoE layer, and the grouped-GEMM problem builder reads an unmasked
+        # rank > 0 on a null-pointer slot as an active rank-sized GEMM.
+        self._moe_slot_cache: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
 
         for key, info in self.layer_info.items():
             assert (
@@ -315,36 +320,66 @@ class CudaGraphLoraParams:
             layer_param.d_b_ptrs.copy_(layer_param.h_b_ptrs, non_blocking=True)
             layer_param.d_b_prime_ptrs.copy_(layer_param.h_b_prime_ptrs, non_blocking=True)
 
-        # The routed-expert MoE LoRA path reads its slot weight-pointer table
-        # from pinned buffers that get_moe_slot_inputs caches for stable
+        # The routed-expert MoE LoRA path reads its slot rank and weight-pointer
+        # tables from pinned buffers that get_moe_slot_inputs caches for stable
         # addresses but only refreshes during graph capture. The captured H2D
         # copy reads them by address at replay, so refresh them in place here;
         # otherwise the ranks update but the pointers stay stale and an active
         # (rank>0) slot dereferences a stale/null pointer at replay.
-        self._refresh_moe_slot_ptr_cache()
+        for layer_idx, module_id in list(self._moe_slot_cache):
+            self._refresh_moe_slot_cache(layer_idx, module_id)
 
-    def _refresh_moe_slot_ptr_cache(self) -> None:
-        """Re-pack cached MoE slot weight-pointer tables from the current
-        per-layer host pointers so CUDA-graph replay reads up-to-date pointers.
+    def _refresh_moe_slot_cache(
+        self, layer_idx: int, module_id: int
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Re-pack this (layer, module)'s cached MoE slot tables from the current
+        per-layer host pointers and global per-slot ranks, allocating them on
+        first use.
 
-        No-op until get_moe_slot_inputs has created cache entries. The cached
-        pinned buffers are updated in place to keep their addresses stable (the
-        captured H2D copy reads them by address at replay).
+        The ranks are masked to zero on slots whose A/B pointers are null here:
+        `slot_ranks_host` is global to the adapter, but the pointer tables are per
+        layer and module, and an adapter may target only a subset of the MoE
+        layers. The kernels treat rank == 0 as "slot inactive" and rely on
+        rank > 0 implying dereferenceable A/B pointers.
+
+        The cached pinned buffers are updated in place to keep their addresses
+        stable (the captured H2D copy reads them by address at replay). Returns
+        None if (layer_idx, module_id) carries no LoRA modules.
         """
-        cache = self._moe_slot_ptrs_cache
-        if not cache:
-            return
-        for (layer_idx, module_id), packed in cache.items():
-            key = self.layer_module2key.get((layer_idx, module_id))
-            if key is None:
-                continue
-            layer_param = self.layer_params.get(key)
-            if layer_param is None:
-                continue
-            local_module_id = key.module_ids.index(module_id)
-            packed[:, 0].copy_(layer_param.h_b_ptrs[local_module_id].to(torch.int64))
-            packed[:, 1].copy_(layer_param.h_b_prime_ptrs[local_module_id].to(torch.int64))
-            # Column 2 (DoRA magnitude) stays zero.
+        key = self.layer_module2key.get((layer_idx, module_id))
+        layer_param = self.layer_params.get(key) if key is not None else None
+        if layer_param is None:
+            return None
+
+        cache_key = (layer_idx, module_id)
+        entry = self._moe_slot_cache.get(cache_key)
+        if entry is None:
+            # Allocated rather than viewed: the per-layer storage is not laid out
+            # as (A, B, dora) per slot, and the ranks are per layer and module
+            # while slot_ranks_host is global.
+            entry = (
+                torch.zeros(
+                    self.max_lora_size,
+                    dtype=self.SIZES_DTYPE,
+                    device="cpu",
+                    pin_memory=prefer_pinned(),
+                ),
+                torch.zeros(
+                    (self.max_lora_size, 3),
+                    dtype=self.PTR_DTYPE,
+                    device="cpu",
+                    pin_memory=prefer_pinned(),
+                ),
+            )
+            self._moe_slot_cache[cache_key] = entry
+        ranks, packed = entry
+
+        local_module_id = key.module_ids.index(module_id)
+        packed[:, 0].copy_(layer_param.h_b_ptrs[local_module_id])
+        packed[:, 1].copy_(layer_param.h_b_prime_ptrs[local_module_id])
+        # Column 2 (DoRA magnitude) stays zero.
+        torch.mul(self.slot_ranks_host, packed[:, :2].ne(0).all(dim=1), out=ranks)
+        return ranks, packed
 
     @staticmethod
     def get_offset_from_counts(
@@ -443,39 +478,11 @@ class CudaGraphLoraParams:
 
         Returns:
             A tuple (slot_ranks_host, slot_weight_ptrs_host), where
-            slot_ranks_host is [max_lora_size] int32 (an alias to
-            self.slot_ranks_host), and slot_weight_ptrs_host is
-            [max_lora_size, 3] int64 with columns (A_ptr, B_ptr, dora_ptr).
+            slot_ranks_host is [max_lora_size] int32 holding this layer/module's
+            per-slot ranks -- the global ranks masked to zero on slots whose
+            adapter does not target this layer/module -- and slot_weight_ptrs_host
+            is [max_lora_size, 3] int64 with columns (A_ptr, B_ptr, dora_ptr).
             dora_ptr is always 0, since DoRA with MoE is rejected upstream.
             Returns None if (layer_idx, module_id) is not in this layer's map.
         """
-        key = self.layer_module2key.get((layer_idx, module_id))
-        if key is None:
-            return None
-        layer_param = self.layer_params.get(key)
-        if layer_param is None:
-            return None
-        local_module_id = key.module_ids.index(module_id)
-        # Slice [max_lora_size] views for the requested module.
-        ptrs_a = layer_param.h_b_ptrs[local_module_id]
-        ptrs_b = layer_param.h_b_prime_ptrs[local_module_id]
-        # Pack into [max_lora_size, 3]. We allocate a new tensor here because
-        # the existing storage isn't laid out as (A, B, dora) per slot. To
-        # keep this graph-capture safe, cache the packed buffer per (layer_idx,
-        # module_id) so its address is stable across calls.
-        cache = self._moe_slot_ptrs_cache
-        cache_key = (layer_idx, module_id)
-        packed = cache.get(cache_key)
-        if packed is None:
-            packed = torch.zeros(
-                (self.max_lora_size, 3),
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            )
-            cache[cache_key] = packed
-        # In-place update (graph-capture safe).
-        packed[:, 0].copy_(ptrs_a.to(torch.int64))
-        packed[:, 1].copy_(ptrs_b.to(torch.int64))
-        # Column 2 (dora) stays zero.
-        return self.slot_ranks_host, packed
+        return self._refresh_moe_slot_cache(layer_idx, module_id)
