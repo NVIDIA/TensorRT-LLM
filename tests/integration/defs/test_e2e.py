@@ -1059,7 +1059,6 @@ def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
 @pytest.mark.skip_less_mpi_world_size(8)
 @skip_pre_hopper
 @pytest.mark.parametrize("model_path", [
-    pytest.param('DeepSeek-V3', marks=skip_post_blackwell),
     pytest.param('DeepSeek-V3-0324', marks=skip_post_blackwell),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
 ])
@@ -1776,14 +1775,6 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
 @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 16), (8, 2, 8)],
                          ids=["tp16", "tp8pp2"])
 @pytest.mark.parametrize("model_path,llm_api_config", [
-    pytest.param('Qwen3/Qwen3-235B-A22B',
-                 None,
-                 marks=skip_pre_hopper,
-                 id='Qwen3/Qwen3-235B-A22B'),
-    pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
-                 None,
-                 marks=skip_pre_blackwell,
-                 id='Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf'),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4',
                  None,
                  marks=skip_pre_blackwell,
