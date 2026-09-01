@@ -101,7 +101,7 @@ __device__ inline float toFloat(__nv_bfloat16 v)
 //! Attribution inside one fused kernel is otherwise guesswork: ncu reports a single kernel,
 //! and the stages differ by more than an order of magnitude depending on a row's filters.
 #ifdef TLLM_USAMP_STAGE_TIMING
-#define USAMP_STAGES 8
+#define USAMP_STAGES 16
 __device__ unsigned long long gUsampStageCycles[USAMP_STAGES];
 
 //! Both __syncthreads() calls make this usable ONLY where the whole block arrives: a mark
@@ -292,6 +292,9 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
     long long targetCount, float targetMass, bool byCount, int* sCount, float* sMass, float* sCand, int* sCandCount,
     int* sBucketCount, int* sChosen, long long* sCountHi, float* sMassHi, bool* sFired)
 {
+#ifdef TLLM_USAMP_STAGE_TIMING
+    long long stageLast = clock64();
+#endif
     uint32_t prefix = 0u;
     uint32_t fixedMask = 0u;
     long long countHi = 0;
@@ -341,7 +344,10 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
                 }
                 uint32_t const digit = (bits >> shift) & (kRadixBuckets - 1);
                 atomicAdd(&myCount[digit], 1);
-                atomicAdd(&myMass[digit], w);
+                if (!byCount)
+                {
+                    atomicAdd(&myMass[digit], w);
+                }
             }
         }
         else
@@ -361,7 +367,10 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
                     }
                     uint32_t const digit = (bits >> shift) & (kRadixBuckets - 1);
                     atomicAdd(&myCount[digit], 1);
-                    atomicAdd(&myMass[digit], w);
+                    if (!byCount)
+                    {
+                        atomicAdd(&myMass[digit], w);
+                    }
                 });
         }
         __syncthreads();
@@ -372,17 +381,23 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
         for (int b = tid; b < kRadixBuckets; b += blockDim.x)
         {
             int totalCount = sCount[b];
-            float totalMass = sMass[b];
+            float totalMass = byCount ? 0.0f : sMass[b];
 #pragma unroll
             for (int c = 1; c < kHistCopies; ++c)
             {
                 totalCount += sCount[c * kRadixBuckets + b];
-                totalMass += sMass[c * kRadixBuckets + b];
+                if (!byCount)
+                {
+                    totalMass += sMass[c * kRadixBuckets + b];
+                }
             }
             sCount[b] = totalCount;
-            sMass[b] = totalMass;
             sCount[kRadixBuckets + b] = totalCount;
-            sMass[kRadixBuckets + b] = totalMass;
+            if (!byCount)
+            {
+                sMass[b] = totalMass;
+                sMass[kRadixBuckets + b] = totalMass;
+            }
         }
         __syncthreads();
 
@@ -402,13 +417,16 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
             if (active)
             {
                 addCount = sCount[tid + offset];
-                addMass = sMass[tid + offset];
+                addMass = byCount ? 0.0f : sMass[tid + offset];
             }
             __syncthreads();
             if (active)
             {
                 sCount[tid] += addCount;
-                sMass[tid] += addMass;
+                if (!byCount)
+                {
+                    sMass[tid] += addMass;
+                }
             }
             __syncthreads();
         }
@@ -441,7 +459,7 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
             // Everything strictly above the chosen bucket, i.e. what the serial walk had
             // accumulated before it stopped.
             *sCountHi = countHi + (b + 1 < kRadixBuckets ? sCount[b + 1] : 0);
-            *sMassHi = massHi + (b + 1 < kRadixBuckets ? sMass[b + 1] : 0.0f);
+            *sMassHi = byCount ? 0.0f : massHi + (b + 1 < kRadixBuckets ? sMass[b + 1] : 0.0f);
             // How many survivors the next pass has to look at. Read from the raw copy,
             // since sCount now holds suffix sums.
             *sBucketCount = sCount[kRadixBuckets + b];
@@ -503,6 +521,8 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
             useShared = *sCandCount <= kCandCap;
             __syncthreads();
         }
+        // End of the pass body: block-uniform, which is what the mark requires.
+        USAMP_MARK(8 + pass);
     }
 
     return __uint_as_float(prefix);
@@ -1031,9 +1051,9 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     __syncthreads();
     if (row == 0 && threadIdx.x == 0)
     {
-        printf("[USAMP] softmax=%llu minp=%llu descent=%llu keptmass=%llu probs=%llu sample=%llu\n",
-            gUsampStageCycles[0], gUsampStageCycles[1], gUsampStageCycles[2], gUsampStageCycles[3],
-            gUsampStageCycles[4], gUsampStageCycles[5]);
+        printf("[USAMP] softmax=%llu descent=%llu probs=%llu | pass0=%llu pass1=%llu pass2=%llu pass3=%llu\n",
+            gUsampStageCycles[0], gUsampStageCycles[2], gUsampStageCycles[4], gUsampStageCycles[8],
+            gUsampStageCycles[9], gUsampStageCycles[10], gUsampStageCycles[11]);
     }
 #endif
 }
