@@ -51,7 +51,7 @@ class Fp4MlaFmha(PhasedFmha):
     """TRTLLM FMHA library for FP4 MLA context and no-dequant decode."""
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
         return attn.is_mla_enable and attn.has_fp4_kv_cache
 
     def forward(
