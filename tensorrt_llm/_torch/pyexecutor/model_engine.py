@@ -1476,6 +1476,8 @@ class PyTorchModelEngine(ModelEngine):
                 self._get_full_general_warmup_requests(resource_manager))
             # Currently graph has not been captured, disable cuda graph for this warmup.
             with self.no_cuda_graph():
+                # Do not bypass torch.compile if compile_only_piecewise_graphs
+                # is enabled, to allow for correct piecewise graph specialization
                 self._general_warmup(resource_manager, warmup_requests_configs)
                 # Release C++ MoE workspace buffers so the autotuner can
                 # reclaim the memory.  They will be re-allocated on next use.
@@ -1538,7 +1540,8 @@ class PyTorchModelEngine(ModelEngine):
         log_mem_snapshot("warmup/after_cute_dsl_radix_topk")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
-            # fragmentation at runtime.
+            # fragmentation at runtime. If compile_only_piecewise_graphs is
+            # enabled, torch.compile can be safely bypassed here.
             warmup_requests_configs = self._get_max_shape_warmup_requests(
                 resource_manager)
             with self._without_torch_compile():
