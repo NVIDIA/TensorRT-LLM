@@ -117,6 +117,9 @@ _BATCH_STAGES = (STAGE_OPTIMIZER_EVALUATOR, STAGE_INTEGRATOR)
 @dataclass
 class WorkflowState:
     task_path: str
+    # Execution identity only. Concrete round/item/attempt paths are always
+    # re-derived from PerfOptimizeLayout rather than checkpointed here.
+    execution: dict[str, Any] = field(default_factory=dict)
     # Loop bounds resolved from task.yaml (+ CLI override) at init and
     # frozen into the checkpoint so a resume keeps the original budget.
     # ``max_items_per_round`` defaults to 1 here (not the task-schema
@@ -226,6 +229,7 @@ def load_state(path: Path) -> WorkflowState:
         )
     return WorkflowState(
         task_path=str(data["task_path"]),
+        execution=dict(data.get("execution") or {}),
         max_rounds=int(data.get("max_rounds", 3)),
         max_attempts_per_item=int(data.get("max_attempts_per_item", 3)),
         max_items_per_round=int(data.get("max_items_per_round", 1)),

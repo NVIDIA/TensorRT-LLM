@@ -148,7 +148,8 @@ def create_worktree(
 ) -> None:
     """Create ``branch`` at ``base_commit`` in a new linked worktree."""
     worktree = Path(path)
-    worktree.parent.mkdir(parents=True, exist_ok=True)
+    if not _CLUSTER_SSH:
+        worktree.parent.mkdir(parents=True, exist_ok=True)
     _git(repo, "worktree", "add", "-b", branch, str(worktree), base_commit)
 
 
@@ -184,6 +185,11 @@ def commit_all(repo: str | Path, message: str) -> str:
     _git(repo, "add", "-A")
     _git(repo, "commit", "--no-verify", "-m", message)
     return rev_parse_head(repo)
+
+
+def format_patch(repo: str | Path, base_commit: str, result_commit: str = "HEAD") -> str:
+    """Return one binary-safe textual patch for ``base..result``."""
+    return _git(repo, "diff", "--binary", f"{base_commit}..{result_commit}")
 
 
 def discard_uncommitted(repo: str | Path) -> None:

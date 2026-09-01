@@ -8,6 +8,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import fsspec
 import pytest
 import yaml
 
@@ -17,6 +18,7 @@ from agent_flow.workflows.perf_optimize import progress as progress_module
 from agent_flow.workflows.perf_optimize import roadmap_schema, task_schema
 from agent_flow.workflows.perf_optimize import state as state_module
 from agent_flow.workflows.perf_optimize import workflow as workflow_module
+from agent_flow.workflows.perf_optimize.execution import RunFileSystems
 
 Workflow = workflow_module.PerfOptimizeWorkflow
 
@@ -106,6 +108,10 @@ class FakeGitOps:
     def commit_all(self, repo, message):
         self.calls.append(("commit_all", message))
         return "c" * 40
+
+    def format_patch(self, repo, base, result="HEAD"):
+        self.calls.append(("format_patch", str(repo), base, result))
+        return "diff --git a/src.py b/src.py\n"
 
     def discard_uncommitted(self, repo):
         self.calls.append(("discard_uncommitted", str(repo)))
@@ -286,7 +292,11 @@ def _stub_agents(
         candidates = [
             entry for entry in state.item_batch if entry.get("status") == "candidate_ready"
         ]
-        integration_repo = Path(state.integration_worktree_path)
+        integration_repo = Path(
+            workflow._execution_path(
+                workflow.perf_layout.integration_worktree(state.round_index + 1)
+            )
+        )
         if (integration_repo / ".git").exists():
             for candidate in candidates:
                 commit = candidate.get("candidate_commit")
@@ -386,6 +396,7 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     assert state.reporter_done is True
     assert state.campaign_git_branch.startswith("perf-optimize/")
     assert state.campaign_git_base_commit == "b" * 40
+    assert state.execution["mode"] == "local"
 
     # The orchestrator recorded the accepted item's lifecycle.
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
@@ -402,6 +413,11 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     assert fake_git.count("discard_uncommitted") == 0
     (commit_message,) = [c[1] for c in fake_git.calls if c[0] == "commit_all"]
     assert "opt-001" in commit_message
+    assert (ws / "rounds/round_1/item_1_opt-001/result/code.patch").is_file()
+    integration_result = yaml.safe_load(
+        (ws / "rounds/round_1/integration/integration_result.yaml").read_text(encoding="utf-8")
+    )
+    assert integration_result["included_item_ids"] == ["opt-001"]
     # The normalized spec and the tuning config pair were materialized.
     resolved = yaml.safe_load((ws / "task.yaml").read_text(encoding="utf-8"))
     assert resolved["optimize"]["max_rounds"] == 5
@@ -411,6 +427,34 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     assert (ws / "tuning" / "extra_llm_api_options.accepted.yaml").read_text(
         encoding="utf-8"
     ) == "{}\n"
+
+
+def test_candidate_export_happens_before_candidate_ready(tmp_path, fake_git):
+    task = _write_task(tmp_path)
+    workflow = Workflow(workspace=tmp_path / "ws")
+    _stub_agents(workflow)
+    original = workflow._sync_evaluator_approved_result_to_control
+    observed: list[str] = []
+
+    def guarded_sync(state, item_state, *, candidate_commit):
+        entry = next(
+            row for row in state.item_batch if row["current_item_id"] == item_state.current_item_id
+        )
+        observed.append(str(entry["status"]))
+        assert entry["status"] != "candidate_ready"
+        original(
+            state,
+            item_state,
+            candidate_commit=candidate_commit,
+        )
+
+    workflow._sync_evaluator_approved_result_to_control = guarded_sync
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert observed == ["running"]
 
 
 def test_integrator_verdict_is_not_recomputed_by_python(tmp_path, fake_git):
@@ -531,7 +575,7 @@ def test_sol_run_executes_projector_once_before_round_one(tmp_path, fake_git):
     assert (ws / "sol_projection.md").read_text(encoding="utf-8") == "# SOL Projection\n"
 
 
-def test_git_routes_over_ssh_when_the_task_names_a_cluster(tmp_path, fake_git):
+def test_git_routes_over_ssh_when_the_task_names_a_cluster(tmp_path, fake_git, monkeypatch):
     """The routing is chosen before the first git command, on BOTH paths.
 
     A run whose ``slurm-environment`` carries ``cluster_ssh`` is running off-cluster:
@@ -554,7 +598,18 @@ def test_git_routes_over_ssh_when_the_task_names_a_cluster(tmp_path, fake_git):
     task = _write_task(tmp_path, slurm)
     ws = tmp_path / "ws"
 
-    workflow = Workflow(workspace=ws)
+    def local_remote_filesystems(cls, layout, **kwargs):
+        fs = fsspec.filesystem("file")
+        return cls(layout=layout, control_fs=fs, execution_fs=fs)
+
+    monkeypatch.setattr(
+        RunFileSystems,
+        "from_layout",
+        classmethod(local_remote_filesystems),
+    )
+
+    execution_run_root = str(tmp_path / "remote-run")
+    workflow = Workflow(workspace=ws, execution_run_root=execution_run_root)
     _stub_agents(workflow)
     workflow.run(str(task))
     assert fake_git.cluster == "me@login-01"
@@ -569,7 +624,7 @@ def test_git_routes_over_ssh_when_the_task_names_a_cluster(tmp_path, fake_git):
     state_module.save_state(ws / state_module.STATE_FILENAME, state)
 
     fake_git.cluster = None
-    resumed = Workflow(workspace=ws)
+    resumed = Workflow(workspace=ws, execution_run_root=execution_run_root)
     _stub_agents(resumed)
     resumed.run(str(task))
     assert fake_git.cluster == "me@login-01", (
@@ -586,6 +641,25 @@ def test_git_stays_local_without_a_cluster_ssh(tmp_path, fake_git):
     _stub_agents(workflow)
     workflow.run(str(task))
     assert fake_git.cluster == "", "an ordinary run must not reach for an ssh host"
+
+
+def test_remote_host_without_execution_root_is_rejected(tmp_path, fake_git):
+    task = _write_task(
+        tmp_path,
+        {
+            "slurm-environment": {
+                "slurm_partition": "batch",
+                "docker_image": "/img.sqsh",
+                "cluster_ssh": "me@login-01",
+            }
+        },
+    )
+    workflow = Workflow(workspace=tmp_path / "ws")
+    try:
+        with pytest.raises(ValueError, match="no --execution-run-root"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
 
 
 def test_resume_parked_at_projector_with_block_runs_it(tmp_path, fake_git):

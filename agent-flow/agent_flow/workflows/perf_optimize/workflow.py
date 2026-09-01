@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Lock
 from typing import Any
 
@@ -32,9 +32,17 @@ from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_res
 
 from . import gitops, kernel_ledger, reuse, roadmap_schema
 from .disagg import disagg_config_path, has_disagg, load_disagg_config, worker_config_yaml
+from .execution import (
+    ExecutionLayout,
+    PerfOptimizeLayout,
+    RunFileSystems,
+    initialize_remote_execution,
+    sync_benchmarker_results_to_control,
+    sync_qa_results_to_control,
+    sync_run_inputs_to_execution,
+)
 from .progress import (
     EVALUATOR_DECISIONS,
-    EVALUATOR_REASON_CATEGORIES,
     INTEGRATOR_DECISIONS,
     OPTIMIZATION_STAGE,
     ProgressContext,
@@ -57,7 +65,6 @@ from .state import (
     STAGE_PROJECTOR,
     STAGE_QA,
     STAGE_REPORTER,
-    STATE_FILENAME,
     WorkflowState,
     load_state,
     save_state,
@@ -225,8 +232,15 @@ class PerfOptimizeWorkflow:
         max_rounds_override: int | None = None,
         reuse_analysis: str | Path | None = None,
         sol_methodology: SolMethodology | None = None,
+        execution_run_root: str | None = None,
+        ssh_known_hosts: str | Path | None = None,
     ) -> None:
         self.workspace = workspace
+        self.perf_layout = PerfOptimizeLayout()
+        self.execution_run_root = execution_run_root
+        self.ssh_known_hosts = ssh_known_hosts
+        self.execution_layout: ExecutionLayout | None = None
+        self.run_fs: RunFileSystems | None = None
         self.prompts = prompts or DEFAULT_PROMPTS
         # Which SOL methodology skill this session has. Resolved by the CLI
         # before the run (so the projector's prompt matches), and defaulted to
@@ -235,28 +249,28 @@ class PerfOptimizeWorkflow:
         self.sol_methodology = sol_methodology or SolMethodology()
         self.max_rounds_override = max_rounds_override
         self.reuse_analysis = Path(reuse_analysis).expanduser() if reuse_analysis else None
-        self.task_path = workspace / "task.yaml"
-        self.baseline_dir = workspace / "baseline"
-        self.baseline_results_path = self.baseline_dir / "benchmark_results.md"
-        self.sol_projection_path = workspace / "sol_projection.md"
-        self.tuning_dir = workspace / "tuning"
-        self.tuning_config_path = self.tuning_dir / "extra_llm_api_options.yaml"
-        self.tuning_accepted_path = self.tuning_dir / "extra_llm_api_options.accepted.yaml"
-        self.roadmap_path = workspace / "roadmap.yaml"
-        self.sol_work_dir = workspace / "sol_work"
+        self.task_path = workspace / self.perf_layout.task
+        self.baseline_dir = workspace / self.perf_layout.baseline
+        self.baseline_results_path = workspace / self.perf_layout.baseline_report
+        self.sol_projection_path = workspace / self.perf_layout.sol_projection
+        self.tuning_dir = workspace / self.perf_layout.tuning
+        self.tuning_config_path = workspace / self.perf_layout.tuning_live
+        self.tuning_accepted_path = workspace / self.perf_layout.tuning_accepted
+        self.roadmap_path = workspace / self.perf_layout.roadmap
+        self.sol_work_dir = workspace / self.perf_layout.sol_work
         # Where ``--reuse-analysis`` parks its provenance manifest and the
         # source campaign's roadmap (prior art, never the live ledger).
-        self.reuse_dir = workspace / reuse.REUSE_DIRNAME
+        self.reuse_dir = workspace / self.perf_layout.reuse_analysis
         self.reuse_manifest_path = self.reuse_dir / reuse.MANIFEST_NAME
         self.prior_roadmap_path = self.reuse_dir / reuse.PRIOR_ROADMAP_NAME
-        self.rounds_dir = workspace / "rounds"
-        self.worktrees_dir = workspace / "worktrees"
-        self.final_verification_dir = workspace / "final_verification"
-        self.verification_report_path = self.final_verification_dir / "verification_report.md"
-        self.report_path = workspace / "optimization_report.md"
-        self.report_html_path = workspace / "optimization_report.html"
-        self.progress_path = workspace / "progress.yaml"
-        self.state_path = workspace / STATE_FILENAME
+        self.rounds_dir = workspace / self.perf_layout.rounds
+        self.worktrees_dir = workspace / self.perf_layout.worktrees
+        self.final_verification_dir = workspace / self.perf_layout.final_verification
+        self.verification_report_path = workspace / self.perf_layout.verification_report
+        self.report_path = workspace / self.perf_layout.report
+        self.report_html_path = workspace / self.perf_layout.report_html
+        self.progress_path = workspace / self.perf_layout.progress
+        self.state_path = workspace / self.perf_layout.state
         self._checkpoint_lock = Lock()
         self._progress_lock = Lock()
 
@@ -269,20 +283,45 @@ class PerfOptimizeWorkflow:
                 try:
                     stale_state = load_state(self.state_path)
                     task_data = yaml.safe_load(self.task_path.read_text(encoding="utf-8"))
-                    stale_repo = (
-                        task_data.get("trtllm_repo_path") if isinstance(task_data, dict) else None
+                    if not isinstance(task_data, dict):
+                        raise ValueError("checkpoint task.yaml is not a mapping")
+                    stale_layout = (
+                        ExecutionLayout.from_dict(stale_state.execution)
+                        if stale_state.execution
+                        else ExecutionLayout.local(
+                            control_workspace=self.workspace,
+                            campaign_repo=str(task_data.get("trtllm_repo_path") or ""),
+                        )
                     )
-                    stale_paths = [
-                        str(entry.get("item_worktree_path", "")) for entry in stale_state.item_batch
+                    stale_fs = RunFileSystems.from_layout(
+                        stale_layout,
+                        known_hosts=self.ssh_known_hosts,
+                    )
+                    gitops.use_cluster(stale_layout.remote_host or "")
+                    relatives = [
+                        self.perf_layout.item_worktree(
+                            stale_state.round_index + 1,
+                            int(entry["item_index"]) + 1,
+                            str(entry["current_item_id"]),
+                        )
+                        for entry in stale_state.item_batch
                     ]
-                    stale_paths.append(stale_state.integration_worktree_path)
-                    for stale_path in stale_paths:
-                        if stale_repo and stale_path and Path(stale_path).exists():
-                            gitops.remove_worktree(str(stale_repo), stale_path)
+                    relatives.append(
+                        self.perf_layout.integration_worktree(stale_state.round_index + 1)
+                    )
+                    for relative in relatives:
+                        if stale_layout.campaign_repo and stale_fs.exists(relative, on="execution"):
+                            gitops.remove_worktree(
+                                stale_layout.campaign_repo,
+                                stale_fs.path(relative, on="execution"),
+                            )
+                    stale_fs.close()
                 except (OSError, ValueError, yaml.YAMLError, gitops.GitOpsError):
                     # ``--clean`` must still recover from a corrupt checkpoint;
                     # git's later `worktree prune` can remove an orphan record.
                     pass
+                finally:
+                    gitops.use_cluster("")
             # Wipe the workflow's managed files and directories so the
             # constructor proceeds as a fresh run. The TRT-LLM checkout is
             # NOT touched — abandoned optimization branches are left for
@@ -375,10 +414,9 @@ class PerfOptimizeWorkflow:
                     # Sessions are scoped to each role's unit of work: the
                     # judges (evaluator, qa) are stateless so every verdict
                     # gets fresh eyes, uninfluenced by earlier attempts' /
-                    # rounds' conclusions; the optimizer's persistent
-                    # session is additionally reset at item boundaries
-                    # (see ``_advance_after_item``); the analyzer keeps
-                    # campaign-long memory of the roadmap it authored.
+                    # rounds' conclusions; each item constructs its own
+                    # persistent optimizer worker for its attempt loop;
+                    # the analyzer keeps campaign-long roadmap memory.
                     session_mode=(
                         "stateless" if role in ("qa", "evaluator", "integrator") else "persistent"
                     ),
@@ -397,6 +435,8 @@ class PerfOptimizeWorkflow:
             layer = getattr(self, role)
             if hasattr(layer, "__exit__"):
                 layer.__exit__(None, None, None)
+        if self.run_fs is not None:
+            self.run_fs.close()
 
     # ------------------------------------------------------------- orchestration
 
@@ -431,6 +471,11 @@ class PerfOptimizeWorkflow:
                 print_rule("[bold cyan]Benchmarker (baseline)[/bold cyan]", log)
                 clear_stale_benchmark_results(self.baseline_dir)
                 self._run_benchmarker(state)
+                sync_benchmarker_results_to_control(
+                    self._execution(),
+                    self._filesystems(),
+                    self.perf_layout,
+                )
                 self._require_stage_outputs(STAGE_BENCHMARKER, [self.baseline_results_path])
                 self._require_baseline_measurement()
                 state.benchmarker_done = True
@@ -475,7 +520,7 @@ class PerfOptimizeWorkflow:
 
                 if state.stage == STAGE_ANALYZER:
                     analysis_dir = self._analysis_dir(state)
-                    analysis_dir.mkdir(parents=True, exist_ok=True)
+                    self._filesystems().makedirs(self._analysis_relative(state), on="both")
                     replan_only = self._replan_only(state)
                     if replan_only:
                         print_message(
@@ -581,9 +626,17 @@ class PerfOptimizeWorkflow:
             if state.stage == STAGE_QA:
                 if self._any_accepted_items():
                     print_rule("[bold cyan]QA (final verification)[/bold cyan]", log)
-                    self.final_verification_dir.mkdir(parents=True, exist_ok=True)
+                    self._filesystems().makedirs(
+                        self.perf_layout.final_verification,
+                        on="both",
+                    )
                     clear_stale_benchmark_results(self.final_verification_dir)
                     self._run_qa(state)
+                    sync_qa_results_to_control(
+                        self._execution(),
+                        self._filesystems(),
+                        self.perf_layout,
+                    )
                     self._require_stage_outputs(STAGE_QA, [self.verification_report_path])
                 else:
                     print_message(
@@ -633,6 +686,65 @@ class PerfOptimizeWorkflow:
 
     # ------------------------------------------------------------ state & setup
 
+    def _configure_execution(
+        self,
+        state: WorkflowState,
+        task_data: dict[str, Any],
+        *,
+        fresh: bool,
+    ) -> None:
+        """Bind persisted execution identity to the two filesystem backends."""
+        if state.execution:
+            layout = ExecutionLayout.from_dict(state.execution)
+            if self.execution_run_root and self.execution_run_root.rstrip("/") != layout.run_root:
+                raise ValueError(
+                    "--execution-run-root cannot change on resume: "
+                    f"checkpoint has {layout.run_root!r}, got {self.execution_run_root!r}"
+                )
+        elif self.execution_run_root:
+            host = cluster_ssh(task_data)
+            if not host:
+                raise ValueError(
+                    "--execution-run-root requires slurm-environment.cluster_ssh in task.yaml"
+                )
+            layout = ExecutionLayout.remote(
+                control_workspace=self.workspace,
+                remote_host=host,
+                run_root=self.execution_run_root,
+                campaign_repo=str(task_data.get("trtllm_repo_path") or ""),
+            )
+            state.execution = layout.to_dict()
+        else:
+            host = cluster_ssh(task_data)
+            if host:
+                raise ValueError(
+                    "task.yaml selects remote host "
+                    f"{host!r} but no --execution-run-root was provided; "
+                    "refusing a partial mode where Git is remote but workflow "
+                    "files and worktrees are local"
+                )
+            layout = ExecutionLayout.local(
+                control_workspace=self.workspace,
+                campaign_repo=str(task_data.get("trtllm_repo_path") or ""),
+            )
+            state.execution = layout.to_dict()
+
+        self.execution_layout = layout
+        self.run_fs = RunFileSystems.from_layout(layout, known_hosts=self.ssh_known_hosts)
+        if fresh and layout.mode == "remote":
+            initialize_remote_execution(layout, self.run_fs, self.perf_layout)
+            sync_run_inputs_to_execution(layout, self.run_fs, self.perf_layout)
+
+    def _filesystems(self) -> RunFileSystems:
+        if self.run_fs is None:
+            raise RuntimeError("execution filesystems are not configured")
+        return self.run_fs
+
+    def _execution(self) -> ExecutionLayout:
+        if self.execution_layout is None:
+            raise RuntimeError("execution layout is not configured")
+        return self.execution_layout
+
     def _init_state(self, task: str, log) -> WorkflowState | None:
         """Load or create the workflow state; return ``None`` to no-op.
 
@@ -668,6 +780,7 @@ class PerfOptimizeWorkflow:
                     f"from it.[/bold yellow]",
                     log,
                 )
+            self._configure_execution(state, self._task_data(), fresh=False)
             return state
 
         # Fresh run: validate + normalize the spec and materialize it into
@@ -706,6 +819,7 @@ class PerfOptimizeWorkflow:
             item_execution=str(optimize["item_execution"]),
             stage=STAGE_BENCHMARKER,
         )
+        self._configure_execution(state, task_data, fresh=True)
         if self.reuse_analysis is not None:
             self._seed_from_reuse(state, log)
         # Checkpoint before running the first stage so a crash mid-stage
@@ -862,8 +976,7 @@ class PerfOptimizeWorkflow:
         batch: list[dict[str, Any]] = []
         for index, item in enumerate(items):
             item_id = str(item["id"])
-            safe = re.sub(r"[^A-Za-z0-9._-]+", "-", item_id).strip("-.")[:48] or "item"
-            worktree = self.worktrees_dir / f"round_{round_no}" / f"item_{index + 1}_{safe}"
+            safe = self.perf_layout._safe_item_id(item_id)
             branch = f"{state.campaign_git_branch}-round-{round_no}-item-{index + 1}-{safe}"
             batch.append(
                 {
@@ -871,13 +984,11 @@ class PerfOptimizeWorkflow:
                     "item_index": index,
                     "attempt_index": 0,
                     "approach_violation": "",
-                    "item_worktree_path": str(worktree),
                     "item_branch": branch,
                     "item_base_commit": base,
                     "phase": STAGE_OPTIMIZER,
                     "status": "pending",
                     "candidate_commit": "",
-                    "candidate_config_path": "",
                     "last_error": "",
                     "finalized": False,
                 }
@@ -892,8 +1003,11 @@ class PerfOptimizeWorkflow:
 
     def _ensure_item_runtime(self, state: WorkflowState, entry: dict[str, Any]) -> None:
         """Create any missing worktree/config/progress parts for a batch row."""
-        worktree = Path(str(entry["item_worktree_path"]))
-        if not worktree.exists():
+        worktree_relative = self._item_worktree_relative(state, entry)
+        worktree = self._execution_path(worktree_relative)
+        if not self._filesystems().exists(worktree_relative, on="execution"):
+            parent = str(PurePosixPath(worktree_relative).parent)
+            self._filesystems().makedirs(parent, on="execution")
             gitops.create_worktree(
                 self._trtllm_repo_path(),
                 worktree,
@@ -901,16 +1015,31 @@ class PerfOptimizeWorkflow:
                 str(entry["item_base_commit"]),
             )
         local_state = self._local_item_state(state, entry)
-        item_dir = self._item_dir(local_state)
-        tuning_dir = item_dir / "tuning"
-        tuning_dir.mkdir(parents=True, exist_ok=True)
-        live = tuning_dir / "extra_llm_api_options.yaml"
-        accepted = tuning_dir / "extra_llm_api_options.accepted.yaml"
-        if not live.exists():
-            shutil.copyfile(self.tuning_accepted_path, live)
-        if not accepted.exists():
-            shutil.copyfile(self.tuning_accepted_path, accepted)
-        progress_path = item_dir / "progress.yaml"
+        self._filesystems().makedirs(self._item_relative(local_state), on="both")
+        live, accepted = self._state_tuning_relatives(local_state)
+        self._filesystems().makedirs(
+            self.perf_layout.item_tuning_dir(
+                local_state.round_index + 1,
+                local_state.item_index + 1,
+                local_state.current_item_id,
+            ),
+            on="execution",
+        )
+        if not self._filesystems().exists(live, on="execution"):
+            self._filesystems().copy_file(
+                self.perf_layout.tuning_accepted,
+                live,
+                source_side="execution",
+                destination_side="execution",
+            )
+        if not self._filesystems().exists(accepted, on="execution"):
+            self._filesystems().copy_file(
+                self.perf_layout.tuning_accepted,
+                accepted,
+                source_side="execution",
+                destination_side="execution",
+            )
+        progress_path = self._item_progress_path(local_state)
         if not progress_path.exists():
             init_progress_file(progress_path)
 
@@ -922,7 +1051,7 @@ class PerfOptimizeWorkflow:
             item_index=int(entry["item_index"]),
             attempt_index=int(entry.get("attempt_index", 0)),
             approach_violation=str(entry.get("approach_violation", "")),
-            item_worktree_path=str(entry["item_worktree_path"]),
+            item_worktree_path=self._execution_path(self._item_worktree_relative(state, entry)),
             item_branch=str(entry["item_branch"]),
             item_base_commit=str(entry["item_base_commit"]),
             item_batch=[],
@@ -1005,6 +1134,135 @@ class PerfOptimizeWorkflow:
             if met:
                 break
 
+    def _sync_evaluator_approved_result_to_control(
+        self,
+        state: WorkflowState,
+        item_state: WorkflowState,
+        *,
+        candidate_commit: str,
+    ) -> None:
+        """Archive only an approved item's changed code/config in control."""
+        result_dir = self.perf_layout.item_result_dir(
+            item_state.round_index + 1,
+            item_state.item_index + 1,
+            item_state.current_item_id,
+        )
+        if candidate_commit:
+            patch = gitops.format_patch(
+                item_state.item_worktree_path,
+                item_state.item_base_commit,
+                candidate_commit,
+            )
+            if patch:
+                self._filesystems().write_text(
+                    f"{result_dir}/code.patch",
+                    patch + ("" if patch.endswith("\n") else "\n"),
+                    on="control",
+                )
+
+        live, accepted = self._state_tuning_relatives(item_state)
+        if self._filesystems().read_text(live, on="execution") != self._filesystems().read_text(
+            accepted, on="execution"
+        ):
+            self._filesystems().copy_file(
+                live,
+                f"{result_dir}/config_snapshot.yaml",
+                source_side="execution",
+                destination_side="control",
+            )
+
+    def _sync_integrator_result_to_control(
+        self,
+        state: WorkflowState,
+        *,
+        decision: str,
+        included: set[str],
+        integration_base_commit: str,
+        result_commit: str,
+        integration_worktree: str,
+        integration_config_relative: str,
+        verdict: dict[str, Any],
+    ) -> None:
+        """Write the parallel integration patch, config and structured result."""
+        round_no = state.round_index + 1
+        integration_dir = self.perf_layout.integration_dir(round_no)
+        integrated_patch = f"{integration_dir}/integrated.patch"
+        final_config = f"{integration_dir}/config_snapshot.yaml"
+
+        integrated_patch_path: str | None = None
+        final_config_path: str | None = None
+        if decision != "REJECT":
+            if result_commit and result_commit != integration_base_commit:
+                patch = gitops.format_patch(
+                    integration_worktree,
+                    integration_base_commit,
+                    result_commit,
+                )
+                if patch:
+                    self._filesystems().write_text(
+                        integrated_patch,
+                        patch + ("" if patch.endswith("\n") else "\n"),
+                        on="control",
+                    )
+                    integrated_patch_path = integrated_patch
+            self._filesystems().copy_file(
+                integration_config_relative,
+                final_config,
+                source_side="execution",
+                destination_side="control",
+            )
+            final_config_path = final_config
+
+        items: list[dict[str, Any]] = []
+        for entry in state.item_batch:
+            item_id = str(entry["current_item_id"])
+            result_dir = self.perf_layout.item_result_dir(
+                round_no,
+                int(entry["item_index"]) + 1,
+                item_id,
+            )
+            patch_path = f"{result_dir}/code.patch"
+            config_path = f"{result_dir}/config_snapshot.yaml"
+            items.append(
+                {
+                    "item_id": item_id,
+                    "candidate_commit": str(entry.get("candidate_commit") or ""),
+                    "patch_path": (
+                        patch_path if self._filesystems().exists(patch_path, on="control") else None
+                    ),
+                    "config_path": (
+                        config_path
+                        if self._filesystems().exists(config_path, on="control")
+                        else None
+                    ),
+                    "integration_status": "included" if item_id in included else "dropped",
+                }
+            )
+
+        payload = {
+            "round": round_no,
+            "decision": decision,
+            "base_commit": integration_base_commit,
+            "items": items,
+            "included_item_ids": sorted(included),
+            "dropped_item_ids": sorted(
+                str(entry["current_item_id"])
+                for entry in state.item_batch
+                if str(entry["current_item_id"]) not in included
+            ),
+            "result_commit": result_commit or None,
+            "integrated_patch_path": integrated_patch_path,
+            "final_config_path": final_config_path,
+            "measured_value": verdict.get("measured_value"),
+            "measured_gain_pct": verdict.get("measured_gain_pct"),
+            "curve": verdict.get("curve") if isinstance(verdict.get("curve"), list) else [],
+        }
+        self._filesystems().write_text(
+            f"{integration_dir}/integration_result.yaml",
+            yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+            on="control",
+        )
+
     def _finalize_serial_item(self, state: WorkflowState, item_id: str, log) -> None:
         """Promote one terminal serial worker result into the campaign state."""
         entry = next(
@@ -1032,9 +1290,24 @@ class PerfOptimizeWorkflow:
             self._checkpoint(state)
             if entry.get("candidate_commit"):
                 gitops.fast_forward(repo, str(entry["item_branch"]))
-            candidate_config = Path(str(entry["candidate_config_path"]))
-            shutil.copyfile(candidate_config, self.tuning_config_path)
-            shutil.copyfile(candidate_config, self.tuning_accepted_path)
+            local_state = self._local_item_state(state, entry)
+            candidate_config, _ = self._state_tuning_relatives(local_state)
+            for destination in (
+                self.perf_layout.tuning_live,
+                self.perf_layout.tuning_accepted,
+            ):
+                self._filesystems().copy_file(
+                    candidate_config,
+                    destination,
+                    source_side="execution",
+                    destination_side="execution",
+                )
+                self._filesystems().copy_file(
+                    candidate_config,
+                    destination,
+                    source_side="execution",
+                    destination_side="control",
+                )
             roadmap_schema.apply_evaluation(
                 self.roadmap_path,
                 item_id,
@@ -1043,7 +1316,6 @@ class PerfOptimizeWorkflow:
                 measured_gain_pct=gain,
             )
             value = entry.get("measured_value")
-            local_state = self._local_item_state(state, entry)
             if value is not None:
                 curve = entry.get("curve") if isinstance(entry.get("curve"), list) else None
                 roadmap_schema.set_current_best(
@@ -1079,14 +1351,17 @@ class PerfOptimizeWorkflow:
             phase="complete",
             finalized=True,
         )
-        worktree = str(entry.get("item_worktree_path", ""))
-        if worktree and Path(worktree).exists():
+        worktree_relative = self._item_worktree_relative(state, entry)
+        worktree = self._execution_path(worktree_relative)
+        if self._filesystems().exists(worktree_relative, on="execution"):
             self._remove_worktree_best_effort(repo, worktree, log)
 
     def _run_opt_item(self, state: WorkflowState, entry: dict[str, Any], log) -> None:
         """Run one existing optimizer/evaluator attempt loop in isolation."""
         item_state = self._local_item_state(state, entry)
         item_id = item_state.current_item_id
+        repo = item_state.item_worktree_path
+        agent_cwd = Path(repo) if self._execution().mode == "local" else self._item_dir(item_state)
         progress_path = self._item_progress_path(item_state)
         progress_ctx = ProgressContext(
             path=progress_path,
@@ -1099,7 +1374,7 @@ class PerfOptimizeWorkflow:
             self.prompts.optimizer,
             tools["optimizer"],
             required_tools=["append_optimizer_progress"],
-            cwd=Path(item_state.item_worktree_path),
+            cwd=agent_cwd,
         )
         evaluator = _make_agent(
             f"evaluator-{item_id}",
@@ -1107,19 +1382,23 @@ class PerfOptimizeWorkflow:
             tools["evaluator"],
             required_tools=["append_evaluator_progress"],
             session_mode="stateless",
-            cwd=Path(item_state.item_worktree_path),
+            cwd=agent_cwd,
         )
-        repo = item_state.item_worktree_path
-        live_config, accepted_config = self._state_tuning_paths(item_state)
+        live_relative, accepted_relative = self._state_tuning_relatives(item_state)
         try:
             while item_state.attempt_index < item_state.max_attempts_per_item:
                 attempt_no = item_state.attempt_index + 1
                 item_state.stage = str(entry.get("phase", STAGE_OPTIMIZER))
-                self._attempt_dir(item_state).mkdir(parents=True, exist_ok=True)
+                self._filesystems().makedirs(self._attempt_relative(item_state), on="both")
 
                 if item_state.stage == STAGE_OPTIMIZER:
                     gitops.reset_to(repo, item_state.item_base_commit)
-                    shutil.copyfile(accepted_config, live_config)
+                    self._filesystems().copy_file(
+                        accepted_relative,
+                        live_relative,
+                        source_side="execution",
+                        destination_side="execution",
+                    )
                     self._update_batch_item(
                         state,
                         item_id,
@@ -1135,7 +1414,12 @@ class PerfOptimizeWorkflow:
                     violation = self._detect_approach_violation(item_state)
                     if violation is not None:
                         gitops.reset_to(repo, item_state.item_base_commit)
-                        shutil.copyfile(accepted_config, live_config)
+                        self._filesystems().copy_file(
+                            accepted_relative,
+                            live_relative,
+                            source_side="execution",
+                            destination_side="execution",
+                        )
                         if attempt_no >= item_state.max_attempts_per_item:
                             self._update_batch_item(
                                 state,
@@ -1191,6 +1475,14 @@ class PerfOptimizeWorkflow:
                             f"perf-optimize: {item_id} candidate-ready "
                             f"[round {item_state.round_index + 1}]",
                         )
+                    elif gitops.rev_parse_head(repo) != item_state.item_base_commit:
+                        # Resume after a commit succeeded but candidate export failed.
+                        commit = gitops.rev_parse_head(repo)
+                    self._sync_evaluator_approved_result_to_control(
+                        state,
+                        item_state,
+                        candidate_commit=commit,
+                    )
                     self._update_batch_item(
                         state,
                         item_id,
@@ -1198,7 +1490,6 @@ class PerfOptimizeWorkflow:
                         phase="complete",
                         attempts=attempt_no,
                         candidate_commit=commit,
-                        candidate_config_path=str(live_config),
                         measured_gain_pct=gain,
                         measured_value=value,
                         curve=curve,
@@ -1206,7 +1497,12 @@ class PerfOptimizeWorkflow:
                     return
                 if decision == "REJECT" or attempt_no >= item_state.max_attempts_per_item:
                     gitops.reset_to(repo, item_state.item_base_commit)
-                    shutil.copyfile(accepted_config, live_config)
+                    self._filesystems().copy_file(
+                        accepted_relative,
+                        live_relative,
+                        source_side="execution",
+                        destination_side="execution",
+                    )
                     self._update_batch_item(
                         state,
                         item_id,
@@ -1218,7 +1514,12 @@ class PerfOptimizeWorkflow:
                     return
 
                 gitops.reset_to(repo, item_state.item_base_commit)
-                shutil.copyfile(accepted_config, live_config)
+                self._filesystems().copy_file(
+                    accepted_relative,
+                    live_relative,
+                    source_side="execution",
+                    destination_side="execution",
+                )
                 item_state.attempt_index += 1
                 entry["phase"] = STAGE_OPTIMIZER
                 self._update_batch_item(
@@ -1256,40 +1557,58 @@ class PerfOptimizeWorkflow:
 
     def _integrate_batch(self, state: WorkflowState, log) -> None:
         """Combine candidate-ready items and trust the Integrator's verdict."""
-        candidates = [
-            dict(entry) for entry in state.item_batch if entry.get("status") == "candidate_ready"
-        ]
+        candidates: list[dict[str, Any]] = []
+        for entry in state.item_batch:
+            if entry.get("status") != "candidate_ready":
+                continue
+            candidate = dict(entry)
+            item_state = self._local_item_state(state, entry)
+            live_config, _ = self._state_tuning_relatives(item_state)
+            candidate["candidate_config_path"] = self._execution_path(live_config)
+            candidates.append(candidate)
         if not candidates:
             raise RuntimeError("integrator stage has no candidate-ready items")
 
         repo = self._trtllm_repo_path()
+        integration_base_commit = gitops.rev_parse_head(repo)
         round_no = state.round_index + 1
-        integration_dir = self._round_dir(state) / "integration"
-        integration_dir.mkdir(parents=True, exist_ok=True)
-        worktree = self.worktrees_dir / f"round_{round_no}" / "integration"
-        if not state.integration_worktree_path:
-            state.integration_worktree_path = str(worktree)
+        integration_relative = self.perf_layout.integration_dir(round_no)
+        self._filesystems().makedirs(integration_relative, on="both")
+        integration_dir = self._control_path(integration_relative)
+        worktree_relative = self.perf_layout.integration_worktree(round_no)
+        worktree = self._execution_path(worktree_relative)
+        if not state.integration_branch:
             state.integration_branch = f"{state.campaign_git_branch}-round-{round_no}-integration"
             self._checkpoint(state)
-        if not Path(state.integration_worktree_path).exists():
+        if not self._filesystems().exists(worktree_relative, on="execution"):
+            self._filesystems().makedirs(
+                str(PurePosixPath(worktree_relative).parent),
+                on="execution",
+            )
             gitops.create_worktree(
                 repo,
-                state.integration_worktree_path,
+                worktree,
                 state.integration_branch,
                 gitops.rev_parse_head(repo),
             )
 
-        integration_tuning_dir = integration_dir / "tuning"
-        integration_tuning_dir.mkdir(parents=True, exist_ok=True)
-        integration_config = integration_tuning_dir / "extra_llm_api_options.yaml"
-        if not integration_config.exists():
-            shutil.copyfile(self.tuning_accepted_path, integration_config)
+        integration_tuning_relative = f"{integration_relative}/tuning"
+        self._filesystems().makedirs(integration_tuning_relative, on="execution")
+        integration_config_relative = f"{integration_tuning_relative}/extra_llm_api_options.yaml"
+        integration_config = self._execution_path(integration_config_relative)
+        if not self._filesystems().exists(integration_config_relative, on="execution"):
+            self._filesystems().copy_file(
+                self.perf_layout.tuning_accepted,
+                integration_config_relative,
+                source_side="execution",
+                destination_side="execution",
+            )
         manifest_path = integration_dir / "candidate_manifest.yaml"
         manifest_path.write_text(
             yaml.safe_dump(
                 {
                     "round": round_no,
-                    "campaign_base_commit": gitops.rev_parse_head(repo),
+                    "campaign_base_commit": integration_base_commit,
                     "candidates": candidates,
                 },
                 sort_keys=False,
@@ -1310,7 +1629,7 @@ class PerfOptimizeWorkflow:
             self.integrator(
                 self._disagg_directive() + f"Workspace: {self.workspace}\n"
                 f"Round: {round_no}\n"
-                f"Integration worktree: {state.integration_worktree_path}\n"
+                f"Integration worktree: {worktree}\n"
                 f"Integration branch: {state.integration_branch}\n"
                 f"Candidate manifest: {manifest_path}\n"
                 f"Live integration config: {integration_config}\n"
@@ -1347,19 +1666,47 @@ class PerfOptimizeWorkflow:
 
         decision = str(verdict["decision"])
         included = {str(item_id) for item_id in verdict.get("included_item_ids", [])}
+        result_commit = ""
         if decision != "REJECT":
             # Persist the stale-profile decision before mutating the accepted
             # campaign state so a crash cannot resume into replan-only mode.
             state.profile_required = True
             self._checkpoint(state)
-            if not gitops.worktree_clean(state.integration_worktree_path):
-                gitops.commit_all(
-                    state.integration_worktree_path,
+            if not gitops.worktree_clean(worktree):
+                result_commit = gitops.commit_all(
+                    worktree,
                     f"perf-optimize: integrate round {round_no} candidates",
                 )
+            else:
+                result_commit = gitops.rev_parse_head(worktree)
+        self._sync_integrator_result_to_control(
+            state,
+            decision=decision,
+            included=included,
+            integration_base_commit=integration_base_commit,
+            result_commit=result_commit,
+            integration_worktree=worktree,
+            integration_config_relative=integration_config_relative,
+            verdict=verdict,
+        )
+        if decision != "REJECT":
             gitops.fast_forward(repo, state.integration_branch)
-            shutil.copyfile(integration_config, self.tuning_config_path)
-            shutil.copyfile(integration_config, self.tuning_accepted_path)
+            for destination in (
+                self.perf_layout.tuning_live,
+                self.perf_layout.tuning_accepted,
+            ):
+                self._filesystems().copy_file(
+                    integration_config_relative,
+                    destination,
+                    source_side="execution",
+                    destination_side="execution",
+                )
+                self._filesystems().copy_file(
+                    integration_config_relative,
+                    destination,
+                    source_side="execution",
+                    destination_side="control",
+                )
 
         for entry in state.item_batch:
             item_id = str(entry["current_item_id"])
@@ -1376,7 +1723,7 @@ class PerfOptimizeWorkflow:
             roadmap_schema.set_current_best(
                 self.roadmap_path,
                 float(verdict["measured_value"]),
-                str(report_path.relative_to(self.workspace)),
+                str(report_path.relative_to(self._control_path(""))),
                 curve=curve,
             )
             self._record_nsys_capture(state, integration_dir / "profile")
@@ -1390,12 +1737,17 @@ class PerfOptimizeWorkflow:
     def _finish_item_batch(self, state: WorkflowState, log) -> None:
         """Clean batch worktrees and deterministically close the round."""
         repo = self._trtllm_repo_path()
-        paths = [str(entry.get("item_worktree_path", "")) for entry in state.item_batch]
-        if state.integration_worktree_path:
-            paths.append(state.integration_worktree_path)
-        for path in paths:
-            if path and Path(path).exists():
-                self._remove_worktree_best_effort(repo, path, log)
+        for entry in state.item_batch:
+            relative = self._item_worktree_relative(state, entry)
+            if self._filesystems().exists(relative, on="execution"):
+                self._remove_worktree_best_effort(repo, self._execution_path(relative), log)
+        integration_relative = self.perf_layout.integration_worktree(state.round_index + 1)
+        if self._filesystems().exists(integration_relative, on="execution"):
+            self._remove_worktree_best_effort(
+                repo,
+                self._execution_path(integration_relative),
+                log,
+            )
 
         state.round_index += 1
         state.item_index = 0
@@ -1425,175 +1777,7 @@ class PerfOptimizeWorkflow:
         state.stage = STAGE_ANALYZER
         self._checkpoint(state)
 
-    # ------------------------------------------------------------ accept/reject
-
-    def _attempt_uses_code(self, state: WorkflowState) -> bool:
-        """Whether the current roadmap item may rebuild ignored artifacts.
-
-        The roadmap is schema-validated before an item is dispatched, so
-        lookup failure is an inconsistent-state edge. Treat it as code
-        conservatively: one unnecessary profile is safer than re-planning
-        from traces that may no longer describe the runtime binary.
-        """
-        try:
-            roadmap = roadmap_schema.load_roadmap(self.roadmap_path)
-            item = roadmap_schema.find_item(roadmap, state.current_item_id)
-        except RoadmapError:
-            return True
-        return item is None or item.get("approach") == "code"
-
-    def _guard_reverted_code_artifacts(
-        self, state: WorkflowState, *, code_violation: bool = False
-    ) -> None:
-        """Require a profile if a reverted attempt may have rebuilt code.
-
-        ``git reset --hard`` + ``clean -fd`` restores source state but
-        intentionally preserves gitignored output. A code attempt can
-        therefore leave a rebuilt extension or JIT/AOT cache behind even
-        after rejection. Record the conservative profile decision before
-        the revert so a crash cannot lose it.
-        """
-        if state.profile_required or not (code_violation or self._attempt_uses_code(state)):
-            return
-        state.profile_required = True
-        self._checkpoint(state)
-
-    def _accept_attempt(self, state: WorkflowState, attempt_no: int, log) -> None:
-        """Evaluator APPROVEd: commit, snapshot config, advance the roadmap."""
-        repo = self._trtllm_repo_path()
-        item_id = state.current_item_id
-        gain = self._latest_evaluator_measured_gain()
-        value = self._latest_evaluator_measured_value()
-        target_metric = str(self._optimize_block()["target_metric"])
-
-        # The optimizer has already changed the live build/config by the
-        # time the evaluator approves it. Persist that the standing
-        # profile is stale *before* the commit/copy operations: a crash in
-        # either one must resume onto the profiling path, not assert that
-        # the old analysis is current.
-        state.profile_required = True
-        self._checkpoint(state)
-
-        # Config-only items leave the checkout untouched — commit only
-        # when the attempt actually changed tracked/untracked files.
-        if not gitops.worktree_clean(repo):
-            gain_str = f"{gain:+.2f}%" if gain is not None else "n/a"
-            gitops.commit_all(
-                repo,
-                f"perf-optimize: {item_id} accepted ({gain_str} {target_metric}) "
-                f"[round {state.round_index + 1}]",
-            )
-        shutil.copyfile(self.tuning_config_path, self.tuning_accepted_path)
-
-        roadmap_schema.apply_evaluation(
-            self.roadmap_path,
-            item_id,
-            status="accepted",
-            attempts=attempt_no,
-            measured_gain_pct=gain,
-        )
-        if value is not None:
-            curve = self._latest_evaluator_curve()
-            if curve is None and self._curve_mode():
-                print_message(
-                    "[yellow]evaluator APPROVE carried no per-point curve — "
-                    "current_best degrades to scalar; the next gate compares "
-                    "means[/yellow]",
-                    log,
-                )
-            # ``source`` is workspace-relative per the roadmap spec (like the
-            # analyzer's ``baseline/benchmark_results.md``) — prefixing the
-            # workspace here would double up when it is later re-joined.
-            roadmap_schema.set_current_best(
-                self.roadmap_path,
-                value,
-                str((self._attempt_dir(state) / "evaluation.md").relative_to(self.workspace)),
-                curve=curve,
-            )
-        # The accept-evidence capture (when the evaluator produced one) is
-        # now the freshest trace of the accepted state.
-        self._record_nsys_capture(state, self._attempt_dir(state) / "profile")
-        print_message(
-            f"[bold green]✔ evaluator APPROVE — {item_id} accepted "
-            f"(measured {gain if gain is not None else 'n/a'}% on {target_metric})"
-            f"[/bold green]",
-            log,
-        )
-        self._advance_after_item(state, log)
-
-    def _reject_attempt(
-        self, state: WorkflowState, attempt_no: int, decision: str | None, log
-    ) -> None:
-        """Terminal outcome: revert everything and fail the item.
-
-        Reached on an explicit evaluator REJECT (the item's premise is
-        broken — no retry would help), or when a PUSH_BACK / missing
-        decision lands on the item's final attempt.
-        """
-        repo = self._trtllm_repo_path()
-        item_id = state.current_item_id
-        reason = self._latest_evaluator_reason()
-
-        # Drop the attempt's code edits and restore the last accepted
-        # tuning config, so the campaign continues from the last accepted
-        # tracked state. A code attempt may have rebuilt gitignored output;
-        # preserve that uncertainty across the revert and profile it next
-        # round instead of re-planning from stale traces.
-        self._guard_reverted_code_artifacts(state)
-        gitops.discard_uncommitted(repo)
-        shutil.copyfile(self.tuning_accepted_path, self.tuning_config_path)
-
-        roadmap_schema.apply_evaluation(
-            self.roadmap_path,
-            item_id,
-            status="failed",
-            attempts=attempt_no,
-            measured_gain_pct=self._latest_evaluator_measured_gain(),
-        )
-        label = decision or "missing decision"
-        if decision != "REJECT":
-            label += ", retries exhausted"
-        print_message(
-            f"[bold yellow]✗ evaluator {label} — {item_id} failed after "
-            f"{attempt_no} attempt(s) ({reason or 'no reason recorded'}) — "
-            f"reverted[/bold yellow]",
-            log,
-        )
-        # The checkout is back at the last accepted state, so the round
-        # continues with the next item exactly as if this one had never
-        # been attempted.
-        self._advance_after_item(state, log)
-
-    def _pushback_attempt(
-        self, state: WorkflowState, attempt_no: int, decision: str | None, log
-    ) -> None:
-        """Evaluator PUSH_BACK (or missing decision) with retries left: revert and retry."""
-        repo = self._trtllm_repo_path()
-        item_id = state.current_item_id
-        reason = self._latest_evaluator_reason()
-
-        # Drop the attempt's edits so the retry starts from the last
-        # accepted tracked state, with the evaluator's feedback as its
-        # brief. Preserve the same ignored-build uncertainty as a terminal
-        # reject; a later retry does not prove those artifacts disappeared.
-        self._guard_reverted_code_artifacts(state)
-        gitops.discard_uncommitted(repo)
-        shutil.copyfile(self.tuning_accepted_path, self.tuning_config_path)
-
-        roadmap_schema.apply_evaluation(
-            self.roadmap_path,
-            item_id,
-            status="in_progress",
-            attempts=attempt_no,
-        )
-        print_message(
-            f"[bold yellow]↻ evaluator {decision or 'missing'} "
-            f"({reason or 'no reason recorded'}) — retrying {item_id}[/bold yellow]",
-            log,
-        )
-        state.attempt_index += 1
-        state.stage = STAGE_OPTIMIZER
-        self._checkpoint(state)
+    # ------------------------------------------------------ deterministic gates
 
     def _detect_approach_violation(self, state: WorkflowState | None = None) -> str | None:
         """Return why the attempt violates ``optimize.approaches``, or ``None``.
@@ -1606,10 +1790,10 @@ class PerfOptimizeWorkflow:
         """
         approaches = self._allowed_approaches()
         active_state = state or WorkflowState(task_path=str(self.task_path))
-        tuning_config, tuning_accepted = self._state_tuning_paths(active_state)
         if "config" not in approaches:
-            live = tuning_config.read_text(encoding="utf-8")
-            accepted = tuning_accepted.read_text(encoding="utf-8")
+            tuning_config, tuning_accepted = self._state_tuning_relatives(active_state)
+            live = self._filesystems().read_text(tuning_config, on="execution")
+            accepted = self._filesystems().read_text(tuning_accepted, on="execution")
             if live != accepted:
                 return (
                     "the attempt changed tuning/extra_llm_api_options.yaml, but "
@@ -1623,166 +1807,6 @@ class PerfOptimizeWorkflow:
                     "not in optimize.approaches"
                 )
         return None
-
-    def _reject_approach_violation(
-        self, state: WorkflowState, attempt_no: int, violation: str, log
-    ) -> None:
-        """Orchestrator auto-reject: the attempt used a disallowed approach.
-
-        The deterministic counterpart of the
-        :meth:`_pushback_attempt` / :meth:`_reject_attempt` pair, applied
-        before the evaluator ever runs: revert everything, count the
-        attempt, and either retry (carrying the violation as feedback in
-        place of evaluator feedback) or fail the item.
-        """
-        repo = self._trtllm_repo_path()
-        item_id = state.current_item_id
-        # In a config-only campaign, reaching this branch means the
-        # checkout changed despite code being disallowed. In a code item,
-        # even a tuning-only violation may have rebuilt ignored output
-        # earlier in the optimizer turn. Both require a real profile.
-        self._guard_reverted_code_artifacts(
-            state, code_violation="code" not in self._allowed_approaches()
-        )
-        gitops.discard_uncommitted(repo)
-        shutil.copyfile(self.tuning_accepted_path, self.tuning_config_path)
-
-        if attempt_no >= state.max_attempts_per_item:
-            roadmap_schema.apply_evaluation(
-                self.roadmap_path,
-                item_id,
-                status="failed",
-                attempts=attempt_no,
-            )
-            print_message(
-                f"[bold yellow]✗ {item_id} failed after {attempt_no} attempt(s) "
-                f"(approach violation: {violation}) — reverted[/bold yellow]",
-                log,
-            )
-            self._advance_after_item(state, log)
-        else:
-            roadmap_schema.apply_evaluation(
-                self.roadmap_path,
-                item_id,
-                status="in_progress",
-                attempts=attempt_no,
-            )
-            print_message(
-                f"[bold yellow]↻ auto-reject without evaluation "
-                f"(approach violation: {violation}) — retrying {item_id}[/bold yellow]",
-                log,
-            )
-            state.approach_violation = violation
-            state.attempt_index += 1
-            state.stage = STAGE_OPTIMIZER
-            self._checkpoint(state)
-
-    def _advance_after_item(self, state: WorkflowState, log) -> None:
-        """Route the loop after an item's terminal outcome (accepted/failed).
-
-        In order: conclude the loop when the optional improvement target
-        is met on the roadmap ledger; on a dry roadmap spend one more
-        round re-planning against what this round measured (profiling
-        first when accepts are outstanding) unless the round budget is
-        spent; dispatch the next item while the per-round item budget has
-        room; otherwise close the round — into the next round's analyzer,
-        or into the final verification when the round budget is spent. No
-        agent decides any of this: every break is deterministic.
-
-        A dry roadmap is never the conclusion here. The campaign ends on
-        it at the top of the loop instead, where the analyzer has just
-        planned against the round's verdicts — the difference between
-        "the plan ran out" and "there is nothing left to plan".
-        """
-        # The optimizer's session is scoped to the item that just reached
-        # a terminal status: its retry attempts shared the session, but
-        # the next item starts fresh — earlier items' exploration is
-        # stale context, not useful memory. (A crash/resume gets a fresh
-        # process anyway; the reset makes in-process behavior match.)
-        self.optimizer.reset_session()
-        state.current_item_id = ""
-        state.attempt_index = 0
-        state.approach_violation = ""
-        state.item_index += 1
-
-        met, cumulative = self._target_met()
-        if met:
-            state.round_index += 1
-            state.item_index = 0
-            self._conclude_round_loop(
-                state,
-                f"target_improvement_pct reached (cumulative "
-                f"{cumulative:+.2f}% on the roadmap ledger)",
-                log,
-            )
-            return
-
-        roadmap = roadmap_schema.load_roadmap(self.roadmap_path)
-        noise_floor = float(self._optimize_block()["noise_floor_pct"])
-        item = roadmap_schema.top_pending_item(roadmap, noise_floor, self._allowed_approaches())
-        if item is None:
-            state.round_index += 1
-            state.item_index = 0
-            if state.round_index < state.max_rounds:
-                # The roadmap ran dry mid-round — against a plan the
-                # analyzer wrote before this round's measurements existed.
-                # Open one more round rather than concluding here: what
-                # ends the campaign is the break at the top of the loop,
-                # which fires on a plan made *against* those measurements.
-                #
-                # Neither shape of that round is waste. When the standing
-                # profile is stale, the build the campaign would close on
-                # has never been analyzed — because of accepts or because a
-                # reverted code attempt may have changed ignored build
-                # output — so the round profiles. Otherwise it opens
-                # replan-only: no server, no profiler, no GPU time, and the
-                # verdicts it mines are the case a REJECT makes for the item
-                # nobody planned.
-                if state.profile_required:
-                    print_message(
-                        "[dim]roadmap exhausted without a current runtime "
-                        "profile — re-profiling before closing[/dim]",
-                        log,
-                    )
-                else:
-                    print_message(
-                        "[dim]roadmap exhausted on an unchanged build — one "
-                        "replan round (no GPU time) against this round's "
-                        "verdicts before closing[/dim]",
-                        log,
-                    )
-                state.stage = STAGE_ANALYZER
-                self._checkpoint(state)
-                return
-            reason = "roadmap has no actionable pending items; round budget exhausted"
-            if state.profile_required:
-                reason += " before the potentially changed runtime could be re-profiled"
-            self._conclude_round_loop(state, reason, log)
-            return
-
-        if state.item_index < state.max_items_per_round:
-            # Same ordering as the analyzer branch: checkpoint the pick
-            # before flipping the item to ``in_progress``.
-            state.current_item_id = str(item["id"])
-            state.stage = STAGE_OPTIMIZER
-            self._checkpoint(state)
-            roadmap_schema.mark_in_progress(self.roadmap_path, item["id"])
-            print_message(
-                f"[bold cyan]→ next roadmap item ({state.item_index + 1}/"
-                f"{state.max_items_per_round} this round): {item['id']} — "
-                f"{item['title']}[/bold cyan]",
-                log,
-            )
-            return
-
-        # The round's item budget is spent with actionable items remaining.
-        state.round_index += 1
-        state.item_index = 0
-        if state.round_index >= state.max_rounds:
-            self._conclude_round_loop(state, "round budget exhausted", log)
-            return
-        state.stage = STAGE_ANALYZER
-        self._checkpoint(state)
 
     def _replan_only(self, state: WorkflowState) -> bool:
         """Whether the round about to open should re-plan instead of re-profile.
@@ -2212,13 +2236,6 @@ class PerfOptimizeWorkflow:
         d = str(entry.get("decision", "")).strip().upper()
         return d if d in EVALUATOR_DECISIONS else None
 
-    def _latest_evaluator_reason(self, path: Path | None = None) -> str | None:
-        entry = latest_entry(path or self.progress_path, "evaluator")
-        if entry is None:
-            return None
-        reason = str(entry.get("reason_category", "")).strip().lower()
-        return reason if reason in EVALUATOR_REASON_CATEGORIES else None
-
     def _latest_evaluator_measured_gain(self, path: Path | None = None) -> float | None:
         entry = latest_entry(path or self.progress_path, "evaluator")
         if entry is None:
@@ -2274,11 +2291,58 @@ class PerfOptimizeWorkflow:
 
     # ------------------------------------------------------------- round paths
 
+    def _control_path(self, relative: str) -> Path:
+        if self.run_fs is None:
+            return self.workspace / relative
+        return Path(self.run_fs.path(relative, on="control"))
+
+    def _execution_path(self, relative: str) -> str:
+        if self.run_fs is None:
+            return str(self.workspace / relative)
+        return self.run_fs.path(relative, on="execution")
+
+    def _round_relative(self, state: WorkflowState) -> str:
+        return self.perf_layout.round_dir(state.round_index + 1)
+
+    def _analysis_relative(self, state: WorkflowState) -> str:
+        return self.perf_layout.analysis_dir(state.round_index + 1)
+
+    def _item_relative(self, state: WorkflowState) -> str:
+        return self.perf_layout.item_dir(
+            state.round_index + 1,
+            state.item_index + 1,
+            state.current_item_id,
+        )
+
+    def _item_worktree_relative(
+        self,
+        state: WorkflowState,
+        entry: dict[str, Any],
+    ) -> str:
+        legacy_path = str(entry.get("item_worktree_path") or "")
+        if legacy_path and self.run_fs is not None:
+            execution_root = self._execution().execution_workspace.rstrip("/") + "/"
+            if legacy_path.startswith(execution_root):
+                return legacy_path.removeprefix(execution_root)
+        return self.perf_layout.item_worktree(
+            state.round_index + 1,
+            int(entry["item_index"]) + 1,
+            str(entry["current_item_id"]),
+        )
+
+    def _attempt_relative(self, state: WorkflowState) -> str:
+        return self.perf_layout.attempt_dir(
+            state.round_index + 1,
+            state.item_index + 1,
+            state.current_item_id,
+            state.attempt_index + 1,
+        )
+
     def _round_dir(self, state: WorkflowState) -> Path:
-        return self.rounds_dir / f"round_{state.round_index + 1}"
+        return self._control_path(self._round_relative(state))
 
     def _analysis_dir(self, state: WorkflowState) -> Path:
-        return self._round_dir(state) / "analysis"
+        return self._control_path(self._analysis_relative(state))
 
     def _item_dir(self, state: WorkflowState) -> Path:
         """Directory for the item currently in the optimizer ⇄ evaluator loop.
@@ -2288,25 +2352,34 @@ class PerfOptimizeWorkflow:
         from item 1 would otherwise satisfy item 2's output gate). The
         analyzer authors the ids, so they are sanitized for path use.
         """
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", state.current_item_id).strip("-.")[:48]
-        return self._round_dir(state) / f"item_{state.item_index + 1}_{safe or 'item'}"
+        return self._control_path(self._item_relative(state))
 
     def _attempt_dir(self, state: WorkflowState) -> Path:
-        return self._item_dir(state) / f"attempt_{state.attempt_index + 1}"
+        return self._control_path(self._attempt_relative(state))
 
     def _item_progress_path(self, state: WorkflowState) -> Path:
-        return self._item_dir(state) / "progress.yaml"
+        relative = self.perf_layout.item_progress(
+            state.round_index + 1,
+            state.item_index + 1,
+            state.current_item_id,
+        )
+        return self._control_path(relative)
 
     def _state_repo_path(self, state: WorkflowState) -> str:
         return state.item_worktree_path or self._trtllm_repo_path()
 
     def _state_tuning_paths(self, state: WorkflowState) -> tuple[Path, Path]:
+        live, accepted = self._state_tuning_relatives(state)
+        return Path(self._execution_path(live)), Path(self._execution_path(accepted))
+
+    def _state_tuning_relatives(self, state: WorkflowState) -> tuple[str, str]:
         if not state.item_worktree_path:
-            return self.tuning_config_path, self.tuning_accepted_path
-        tuning_dir = self._item_dir(state) / "tuning"
+            return self.perf_layout.tuning_live, self.perf_layout.tuning_accepted
+        round_no = state.round_index + 1
+        item_index = state.item_index + 1
         return (
-            tuning_dir / "extra_llm_api_options.yaml",
-            tuning_dir / "extra_llm_api_options.accepted.yaml",
+            self.perf_layout.item_tuning_live(round_no, item_index, state.current_item_id),
+            self.perf_layout.item_tuning_accepted(round_no, item_index, state.current_item_id),
         )
 
     # ------------------------------------------------------------------ agents

@@ -66,6 +66,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "optimization_report.md/.html, progress.yaml) and run artifacts.",
     )
     parser.add_argument(
+        "--execution-run-root",
+        default=None,
+        help="Absolute run root on slurm-environment.cluster_ssh. Setting this "
+        "enables remote execution storage; the execution workspace is "
+        "<root>/workspace. Omit for local execution.",
+    )
+    parser.add_argument(
+        "--ssh-known-hosts",
+        default=None,
+        help="known_hosts file used by sshfs in remote mode "
+        "(default: ~/.ssh/known_hosts). Host-key verification is never disabled.",
+    )
+    parser.add_argument(
         "--clean",
         action="store_true",
         help="Wipe the workspace checkpoint and managed files/directories "
@@ -145,6 +158,8 @@ def main(argv: list[str] | None = None) -> None:
         max_rounds_override=args.max_rounds,
         reuse_analysis=args.reuse_analysis,
         sol_methodology=methodology,
+        execution_run_root=args.execution_run_root,
+        ssh_known_hosts=args.ssh_known_hosts,
     ) as workflow:
         workflow.run(args.task)
 
