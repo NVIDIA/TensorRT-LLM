@@ -107,12 +107,23 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
+  # CuTe MTP verify kernel parity (trtllm::kda_mtp_decode).
+  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
   - unittest/_torch/moe/test_kimi_k3_mlp.py
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py
+  # Kimi K3 MLA backend selection + config/checkpoint plumbing (monkeypatched,
+  # HW-light). Collected nowhere else: the CPU-Generic stage only collects files
+  # carrying the literal cpu_only marker, and these carry none.
+  - unittest/_torch/modules/test_kimi_k3_mla_backend.py
+  - unittest/_torch/modeling/test_kimi_k3_config_routing.py
+  - unittest/_torch/modeling/test_kimi_linear_checkpoint.py
+  - unittest/_torch/modeling/test_kimi_k3_fp8_weight_read_gates.py
+  # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
+  - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   - unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py TIMEOUT (15)
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py
@@ -179,6 +190,10 @@ l0_b200:
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
+  # On-device suffix-automaton spec-dec kernel tests (CUDA graph capture;
+  # cuda-availability skipif like the sibling KDA parity tests; relocated
+  # from tests/torch/ which test-db cannot list).
+  - unittest/_torch/speculative/test_suffix_automaton.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
@@ -272,6 +287,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache_user_coefficients.py
   - unittest/_torch/visual_gen/test_wan22_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan22_t2v_teacache.py
+  - unittest/_torch/visual_gen/test_offloading.py
   - unittest/_torch/visual_gen/test_wan_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_action.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
@@ -344,6 +360,9 @@ l0_b200:
   # Covered by H100 pre_merge for primary HW-agnostic signal; keep B200 runtime
   # canary in post_merge for CUDA IPC / virtual memory / profiling paths.
   - unittest/_torch/misc
+  # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
+  # checkpoint); ~13 min, too heavy for pre_merge. Mirrors l0_gb300_multi_gpus.
+  - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[mxfp8-latency]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]
@@ -428,6 +447,11 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_lpips_against_golden TIMEOUT (15)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_t2i_lpips_against_golden TIMEOUT (15)
   - examples/visual_gen/test_visual_gen_wan.py::test_fastwan_lpips_against_golden TIMEOUT (10)
+  # Heavyweight CPU-offload accuracy tests (each loads the full pipeline twice:
+  # offload + baseline). Kept in post_merge to bound the B200 pre_merge wall-time.
+  - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_offload_matches_baseline
+  - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_fp8_offload_matches_baseline
+  - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3Offload::test_cosmos3_offload_matches_baseline
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_lpips_against_golden TIMEOUT (10)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]

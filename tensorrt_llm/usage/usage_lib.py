@@ -16,7 +16,8 @@
 
 Collects anonymous usage data (system info, GPU config, model architecture)
 and sends it to NVIDIA's NvTelemetry/GXT service. Runs in a background
-daemon thread, never blocks or crashes the main process.
+daemon thread and never crashes the main process. Terminal delivery may wait
+for at most 0.5 seconds during an instrumented shutdown boundary.
 
 Adapted from PR #11299 (usage lib POC), with:
 - GXT Event Protocol v1.6 envelope (NvTelemetry-compliant)
@@ -41,6 +42,7 @@ CI/Test auto-detection:
     TRTLLM_USAGE_FORCE_ENABLED=1 if needed.
 """
 
+import atexit
 import json
 import logging
 import os
@@ -50,10 +52,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 from tensorrt_llm.usage import schema
+from tensorrt_llm.usage.config import UsageContext
 from tensorrt_llm.usage.llmapi_config import _failure_llm_api_config_payloads
 from tensorrt_llm.usage.llmapi_config import (
     collect_llm_api_config_payloads as _collect_llm_api_config_payloads,
@@ -70,6 +74,40 @@ _DISAGG_DEPLOYMENT_ID_ENV = "TRTLLM_DISAGG_DEPLOYMENT_ID"
 _DEFAULT_ENDPOINT = "https://events.gfe.nvidia.com/v1.1/events/json"
 _HTTP_TIMEOUT = 2.0
 _MAX_HEARTBEATS = 1000
+_TERMINAL_FLUSH_TIMEOUT = 0.5
+_ALLOWED_USAGE_CONTEXTS = frozenset(context.value for context in UsageContext)
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class TerminalOutcome:
+    """One typed process-boundary or previously observed terminal outcome."""
+
+    termination_kind: schema.TerminationKind
+    component: Optional[schema.TerminationComponent] = None
+    reporting_source: schema.ReportingSource = "self"
+    exit_code_known: Optional[bool] = None
+    exit_code: int = 0
+    signal_number: int = 0
+
+    def with_observation(self, observation: Optional["TerminalOutcome"]) -> "TerminalOutcome":
+        """Prefer an earlier causal observation over boundary classification."""
+        if observation is None:
+            return self
+        if observation.exit_code_known is None:
+            exit_code_known = self.exit_code_known
+            exit_code = self.exit_code
+        else:
+            exit_code_known = observation.exit_code_known
+            exit_code = observation.exit_code
+        return TerminalOutcome(
+            termination_kind=observation.termination_kind,
+            component=observation.component or self.component,
+            reporting_source=observation.reporting_source,
+            exit_code_known=exit_code_known,
+            exit_code=exit_code,
+            signal_number=observation.signal_number or self.signal_number,
+        )
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -590,9 +628,13 @@ def _background_reporter(
     It is wrapped in try/except at every level to ensure fail-silent behavior.
     """
     try:
-        session_id = uuid.uuid4().hex
-        trtllm_version = _get_trtllm_version()
-
+        session = _get_session()
+        # A late authoritative opt-out removes and disables the session before
+        # waking the reporter. Never replace it with an uncorrelated event.
+        if session is None:
+            return
+        session_id = session.session_id
+        trtllm_version = session.trtllm_version
         # --- Collect initial data ---
         system_info = _collect_system_info()
         gpu_info = _collect_gpu_info()
@@ -614,9 +656,8 @@ def _background_reporter(
                 args_class=args_class
             )
 
-        # Disaggregated serving metadata (set by serve.py orchestrator)
-        disagg_role = os.environ.get(_DISAGG_ROLE_ENV, "")
-        deployment_id = os.environ.get(_DISAGG_DEPLOYMENT_ID_ENV, "")
+        # Use the latest process counters after the collection work above.
+        event_snapshot = _event_snapshot(usage_context)
 
         # --- Build initial report event ---
         # All fields are required by the SMS schema. Use empty string / 0
@@ -640,6 +681,8 @@ def _background_reporter(
             cudaVersion=_clamp_str(gpu_info.get("cuda_version") or "", _S),
             # Model
             architectureClassName=_clamp_str(arch_class_name or "", _L),
+            # Reserved for TRTLLM-411. This change does not populate hashes.
+            architectureClassHash="",
             # Config
             backend=_clamp_str(trtllm_config.get("backend") or "", _S),
             tensorParallelSize=trtllm_config.get("tensor_parallel_size") or 1,
@@ -650,15 +693,11 @@ def _background_reporter(
             dtype=_clamp_str(trtllm_config.get("dtype") or "", _S),
             quantizationAlgo=_clamp_str(trtllm_config.get("quantization_algo") or "", _S),
             kvCacheDtype=_clamp_str(trtllm_config.get("kv_cache_dtype") or "", _S),
-            # Ingress point
-            ingressPoint=_clamp_str(usage_context or "", _S),
             # Feature flags
             featuresJson=features_json,
             llmApiConfigJson=llm_api_config_json,
             llmApiConfigMetaJson=llm_api_config_meta_json,
-            # Disaggregated serving
-            disaggRole=_clamp_str(disagg_role, _S),
-            deploymentId=_clamp_str(deployment_id, _S),
+            **_session_event_fields(event_snapshot),
         )
 
         # --- Send initial report ---
@@ -667,7 +706,9 @@ def _background_reporter(
             session_id=session_id,
             trtllm_version=trtllm_version,
         )
-        _send_to_gxt(payload)
+        if not session.claim_initial():
+            return
+        _send_if_session_active(session, payload)
 
         # --- Heartbeat loop ---
         heartbeat_interval = _get_heartbeat_interval()
@@ -676,18 +717,24 @@ def _background_reporter(
                 return  # stop requested
 
             try:
-                heartbeat_event = schema.TrtllmHeartbeat(seq=seq)
+                event_snapshot = _event_snapshot(usage_context)
+                heartbeat_event = schema.TrtllmHeartbeat(
+                    seq=seq,
+                    **_session_event_fields(event_snapshot),
+                )
                 heartbeat_payload = schema.build_gxt_payload(
                     event=heartbeat_event,
                     session_id=session_id,
                     trtllm_version=trtllm_version,
                 )
-                _send_to_gxt(heartbeat_payload)
+                _send_if_session_active(session, heartbeat_payload)
             except (urllib.error.URLError, OSError, ValueError, TypeError):
                 pass  # fail-silent on individual heartbeat
 
     except Exception:
         pass  # fail-silent: entire background reporter
+    finally:
+        _finish_background_reporter()
 
 
 # ---------------------------------------------------------------------------
@@ -696,8 +743,706 @@ def _background_reporter(
 
 
 _REPORTER_STARTED = False
+_REPORTER_ACTIVE = False
 _REPORTER_LOCK = threading.Lock()
 _REPORTER_STOP = threading.Event()  # signal heartbeat loop to exit
+_PENDING_TERMINAL: Optional["_PendingTerminal"] = None
+_PROCESS_PID = os.getpid()
+_PROCESS_EXIT_HOOK_REGISTERED = False
+
+_DISTRIBUTED_SIZE_ENV_VARS = (
+    "WORLD_SIZE",
+    "OMPI_COMM_WORLD_SIZE",
+    "PMI_SIZE",
+    "PMIX_SIZE",
+    "MV2_COMM_WORLD_SIZE",
+)
+
+
+class _TelemetrySession:
+    """Process-local identity, correlation, counters, and terminal state."""
+
+    def __init__(
+        self,
+        usage_context: str,
+        component: schema.TerminationComponent,
+        lifecycle_phase: schema.LifecyclePhase,
+    ) -> None:
+        self.owner_pid = os.getpid()
+        self.session_id = uuid.uuid4().hex
+        self.trtllm_version = _get_trtllm_version()
+        self.usage_context = usage_context
+        self.disagg_role = ""
+        self.deployment_id = ""
+        self.component = component
+        self.lifecycle_phase = lifecycle_phase
+        self.observed_signal = 0
+        self.observed_outcome: Optional[TerminalOutcome] = None
+
+        self.llm_initialization_attempts = 0
+        self.llm_instances_created = 0
+        self.active_llm_instances = 0
+        self.max_concurrent_llm_instances = 0
+        self.llm_initialization_failures = 0
+
+        self.disabled = False
+        self.initial_reported = False
+        self.terminal_reported = False
+        self.lock = threading.Lock()
+        self.refresh_metadata()
+
+    @staticmethod
+    def _increment(value: int) -> int:
+        return min(value + 1, schema._UINT32_MAX)
+
+    def _refresh_metadata_unlocked(self) -> None:
+        if not self.disagg_role:
+            self.disagg_role = os.environ.get(_DISAGG_ROLE_ENV, "")
+        if not self.deployment_id:
+            self.deployment_id = os.environ.get(_DISAGG_DEPLOYMENT_ID_ENV, "")
+
+        normalized_role = self.disagg_role.lower()
+        if self.component == "server" and (
+            normalized_role.startswith("ctx")
+            or normalized_role.startswith("gen")
+            or normalized_role in ("context", "generation")
+        ):
+            self.component = "disagg_worker"
+
+    def refresh_metadata(self) -> None:
+        """Promote correlation fields that become known after early startup."""
+        with self.lock:
+            self._refresh_metadata_unlocked()
+
+    def configure(
+        self,
+        *,
+        usage_context: str = "",
+        component: Optional[schema.TerminationComponent] = None,
+        lifecycle_phase: Optional[schema.LifecyclePhase] = None,
+    ) -> None:
+        """Promote process metadata without replacing authoritative values."""
+        with self.lock:
+            if self.disabled:
+                return
+            if self.usage_context in ("", "unknown") and usage_context not in (
+                "",
+                "unknown",
+            ):
+                self.usage_context = usage_context
+            if self.component == "unknown" and component is not None:
+                self.component = component
+            if lifecycle_phase is not None:
+                self.lifecycle_phase = lifecycle_phase
+            self._refresh_metadata_unlocked()
+
+    def record_llm_initialization_attempt(self) -> bool:
+        """Increment the attempt counter and enter model initialization."""
+        with self.lock:
+            if self.disabled or self.terminal_reported:
+                return False
+            self.llm_initialization_attempts = self._increment(self.llm_initialization_attempts)
+            self.lifecycle_phase = "model_initialization"
+            if self.component == "unknown":
+                self.component = "llm"
+            self._refresh_metadata_unlocked()
+            return True
+
+    def record_llm_initialization_failure(self) -> None:
+        """Increment the initialization failure counter."""
+        with self.lock:
+            if not self.disabled and not self.terminal_reported:
+                self.llm_initialization_failures = self._increment(self.llm_initialization_failures)
+
+    def record_llm_initialized(self) -> bool:
+        """Record a successfully constructed and active LLM object."""
+        with self.lock:
+            if self.disabled or self.terminal_reported:
+                return False
+            self.llm_instances_created = self._increment(self.llm_instances_created)
+            self.active_llm_instances = self._increment(self.active_llm_instances)
+            self.max_concurrent_llm_instances = max(
+                self.max_concurrent_llm_instances,
+                self.active_llm_instances,
+            )
+            self.lifecycle_phase = "serving"
+            return True
+
+    def record_llm_shutdown(self) -> None:
+        """Decrement the active gauge without allowing it to become negative."""
+        with self.lock:
+            if not self.disabled and self.active_llm_instances > 0:
+                self.active_llm_instances -= 1
+
+    def set_lifecycle_phase(self, lifecycle_phase: schema.LifecyclePhase) -> None:
+        """Update the best-known process lifecycle phase."""
+        with self.lock:
+            if not self.disabled and not self.terminal_reported:
+                self.lifecycle_phase = lifecycle_phase
+
+    def set_usage_context(self, usage_context: str) -> None:
+        """Set an authoritative allowlisted process ingress point."""
+        if usage_context not in _ALLOWED_USAGE_CONTEXTS:
+            return
+        with self.lock:
+            if not self.disabled and not self.terminal_reported:
+                self.usage_context = usage_context
+
+    def record_observed_signal(self, signal_number: int) -> None:
+        """Remember a handled signal for the authoritative outer boundary."""
+        if signal_number <= 0 or signal_number > schema._UINT32_MAX:
+            return
+        with self.lock:
+            if not self.disabled and not self.terminal_reported:
+                self.observed_signal = signal_number
+
+    def record_termination_observation(
+        self,
+        outcome: TerminalOutcome,
+        lifecycle_phase: Optional[schema.LifecyclePhase] = None,
+    ) -> None:
+        """Atomically remember a causal classification and its lifecycle phase."""
+        with self.lock:
+            if self.disabled or self.terminal_reported or self.observed_outcome is not None:
+                return
+            self.observed_outcome = outcome
+            if lifecycle_phase is not None:
+                self.lifecycle_phase = lifecycle_phase
+
+    def _snapshot_unlocked(self) -> dict[str, Any]:
+        self._refresh_metadata_unlocked()
+        return {
+            "ingressPoint": _clamp_str(self.usage_context, schema._SHORT_STR),
+            "disaggRole": _clamp_str(self.disagg_role, schema._SHORT_STR),
+            "deploymentId": _clamp_str(self.deployment_id, schema._SHORT_STR),
+            "llmInitializationAttempts": self.llm_initialization_attempts,
+            "llmInstancesCreated": self.llm_instances_created,
+            "activeLlmInstances": self.active_llm_instances,
+            "maxConcurrentLlmInstances": self.max_concurrent_llm_instances,
+            "llmInitializationFailures": self.llm_initialization_failures,
+            "lifecyclePhase": self.lifecycle_phase,
+            "component": self.component,
+            "observedSignal": self.observed_signal,
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return an atomic metadata and counter snapshot."""
+        with self.lock:
+            return self._snapshot_unlocked()
+
+    def claim_terminal(
+        self, outcome: TerminalOutcome
+    ) -> Optional[tuple[dict[str, Any], TerminalOutcome]]:
+        """Atomically merge causal context and claim the terminal slot."""
+        with self.lock:
+            if self.disabled or self.terminal_reported:
+                return None
+            outcome = outcome.with_observation(self.observed_outcome)
+            self.terminal_reported = True
+            return self._snapshot_unlocked(), outcome
+
+    def claim_initial(self) -> bool:
+        """Claim the success-only initial report before network delivery."""
+        with self.lock:
+            if self.disabled or self.initial_reported or self.terminal_reported:
+                return False
+            self.initial_reported = True
+            return True
+
+    def try_start_delivery(self) -> bool:
+        """Reject queued delivery when process opt-out already won the race."""
+        with self.lock:
+            return not self.disabled
+
+    def disable(self) -> None:
+        """Prevent a stale reference from emitting after process opt-out."""
+        with self.lock:
+            self.disabled = True
+
+
+@dataclass(frozen=True)
+class _PendingTerminal:
+    """Terminal payload waiting for the active reporter to finish."""
+
+    session: _TelemetrySession
+    payload: dict
+    completion: threading.Event
+
+
+_SESSION: Optional[_TelemetrySession] = None
+_SESSION_LOCK = threading.Lock()
+_SESSION_DISABLED = False
+
+
+def _ensure_process_state() -> None:
+    """Reset inherited process-local state after ``fork()``."""
+    global _NOTIFICATION_SHOWN
+    global _PENDING_TERMINAL
+    global _PROCESS_PID
+    global _REPORTER_ACTIVE
+    global _REPORTER_LOCK
+    global _REPORTER_STARTED
+    global _REPORTER_STOP
+    global _SESSION
+    global _SESSION_LOCK
+
+    current_pid = os.getpid()
+    if current_pid == _PROCESS_PID:
+        return
+
+    _PROCESS_PID = current_pid
+    _SESSION = None
+    _SESSION_LOCK = threading.Lock()
+    _REPORTER_STARTED = False
+    _REPORTER_ACTIVE = False
+    _REPORTER_LOCK = threading.Lock()
+    _REPORTER_STOP = threading.Event()
+    _PENDING_TERMINAL = None
+    _NOTIFICATION_SHOWN = threading.Event()
+
+
+def _get_session() -> Optional[_TelemetrySession]:
+    """Return this process's telemetry session, if one exists."""
+    _ensure_process_state()
+    with _SESSION_LOCK:
+        session = _SESSION
+    if session is not None and session.owner_pid != os.getpid():
+        return None
+    return session
+
+
+def _deactivate_usage_session() -> None:
+    """Stop process telemetry after any authoritative opt-out decision."""
+    global _PENDING_TERMINAL
+    global _SESSION
+    global _SESSION_DISABLED
+    with _SESSION_LOCK:
+        session = _SESSION
+        _SESSION = None
+        _SESSION_DISABLED = True
+    pending = None
+    with _REPORTER_LOCK:
+        if session is not None:
+            session.disable()
+        pending = _PENDING_TERMINAL
+        _PENDING_TERMINAL = None
+    if pending is not None:
+        pending.completion.set()
+    _REPORTER_STOP.set()
+
+
+def _empty_event_snapshot(usage_context: str = "") -> dict[str, Any]:
+    """Return the schema defaults used by isolated reporter tests."""
+    return {
+        "ingressPoint": _clamp_str(usage_context, schema._SHORT_STR),
+        "disaggRole": _clamp_str(os.environ.get(_DISAGG_ROLE_ENV, ""), schema._SHORT_STR),
+        "deploymentId": _clamp_str(
+            os.environ.get(_DISAGG_DEPLOYMENT_ID_ENV, ""), schema._SHORT_STR
+        ),
+        "llmInitializationAttempts": 0,
+        "llmInstancesCreated": 0,
+        "activeLlmInstances": 0,
+        "maxConcurrentLlmInstances": 0,
+        "llmInitializationFailures": 0,
+        "lifecyclePhase": "unknown",
+        "component": "unknown",
+        "observedSignal": 0,
+    }
+
+
+def _event_snapshot(usage_context: str = "") -> dict[str, Any]:
+    """Return the current session snapshot or schema defaults."""
+    session = _get_session()
+    return session.snapshot() if session is not None else _empty_event_snapshot(usage_context)
+
+
+def _session_event_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Select correlation and lifecycle counters shared by all events."""
+    return {
+        "ingressPoint": snapshot["ingressPoint"],
+        "disaggRole": snapshot["disaggRole"],
+        "deploymentId": snapshot["deploymentId"],
+        "llmInitializationAttempts": snapshot["llmInitializationAttempts"],
+        "llmInstancesCreated": snapshot["llmInstancesCreated"],
+        "activeLlmInstances": snapshot["activeLlmInstances"],
+        "maxConcurrentLlmInstances": snapshot["maxConcurrentLlmInstances"],
+        "llmInitializationFailures": snapshot["llmInitializationFailures"],
+    }
+
+
+def _validated_usage_context(value: Any) -> str:
+    """Return a bounded ingress category or the unset sentinel."""
+    if isinstance(value, UsageContext):
+        return value.value
+    if isinstance(value, str) and value in _ALLOWED_USAGE_CONTEXTS:
+        return value
+    return ""
+
+
+def _telemetry_settings(
+    telemetry_config: Any,
+    default_usage_context: str = "",
+) -> tuple[bool, str]:
+    """Extract opt-out and ingress values from a telemetry config."""
+    disabled = False
+    usage_context = ""
+    if telemetry_config is not None:
+        if isinstance(telemetry_config, dict):
+            # Raw dictionaries have not passed TelemetryConfig validation. An
+            # explicit opt-out is authoritative; every other value fails closed
+            # for early failure reporting.
+            disabled_value = telemetry_config.get("disabled")
+            usage_context_value = telemetry_config.get("usage_context")
+            if disabled_value is not True:
+                disabled_value = None
+        else:
+            missing = object()
+            disabled_value = getattr(telemetry_config, "disabled", missing)
+            usage_context_value = getattr(telemetry_config, "usage_context", None)
+
+        if isinstance(disabled_value, bool):
+            disabled = disabled_value
+        else:
+            disabled = True
+
+        usage_context = _validated_usage_context(usage_context_value)
+
+    if usage_context in ("", "unknown"):
+        usage_context = _validated_usage_context(default_usage_context)
+    return disabled, usage_context
+
+
+def _is_reporting_rank() -> bool:
+    """Return whether this process is the telemetry-reporting MPI rank."""
+    try:
+        from tensorrt_llm._utils import mpi_rank  # noqa: E402 — deferred by design
+
+        return mpi_rank() == 0
+    except Exception:
+        for name in _DISTRIBUTED_SIZE_ENV_VARS:
+            try:
+                if int(os.environ.get(name, "1")) > 1:
+                    return False
+            except ValueError:
+                return False
+        return True
+
+
+def _report_process_exit() -> None:
+    """Best-effort fallback for direct ``LLM()`` interpreter exits."""
+    try:
+        session = _get_session()
+        if session is None or not is_usage_stats_enabled():
+            return
+
+        snapshot = session.snapshot()
+        signal_number = snapshot["observedSignal"]
+        outcome = TerminalOutcome(
+            exit_code_known=False,
+            exit_code=0,
+            signal_number=signal_number,
+            termination_kind="signal" if signal_number else "unknown",
+        )
+        report_exit(
+            outcome,
+            lifecycle_phase=None,
+        )
+    except Exception:
+        pass
+
+
+def apply_usage_session_config(
+    telemetry_config: Any = None,
+    *,
+    default_usage_context: str = "",
+    component: Optional[schema.TerminationComponent] = None,
+    lifecycle_phase: Optional[schema.LifecyclePhase] = None,
+) -> bool:
+    """Apply configuration to the process-local session without sending data.
+
+    Returns whether telemetry is active for the process. An enabled config
+    creates or updates the session; an authoritative opt-out deactivates it.
+    """
+    global _PROCESS_EXIT_HOOK_REGISTERED
+    global _SESSION
+    try:
+        _ensure_process_state()
+        if _SESSION_DISABLED:
+            return False
+        if telemetry_config is not None:
+            if isinstance(telemetry_config, dict):
+                if telemetry_config.get("disabled") is not True:
+                    # Defer until Pydantic has validated this user-supplied config.
+                    return False
+            elif not isinstance(getattr(telemetry_config, "disabled", None), bool):
+                # Invalid objects are rejected later by Pydantic. Do not turn
+                # that validation failure into a permanent process opt-out.
+                return False
+        disabled, usage_context = _telemetry_settings(
+            telemetry_config,
+            default_usage_context,
+        )
+        if not is_usage_stats_enabled(telemetry_disabled=disabled):
+            _deactivate_usage_session()
+            return False
+        with _SESSION_LOCK:
+            if _SESSION_DISABLED:
+                return False
+            if _SESSION is None:
+                session = _TelemetrySession(
+                    usage_context=usage_context,
+                    component=component or "unknown",
+                    lifecycle_phase=lifecycle_phase or "unknown",
+                )
+                if not _PROCESS_EXIT_HOOK_REGISTERED:
+                    atexit.register(_report_process_exit)
+                    _PROCESS_EXIT_HOOK_REGISTERED = True
+                _REPORTER_STOP.clear()
+                _SESSION = session
+                return True
+            session = _SESSION
+
+        session.configure(
+            usage_context=usage_context,
+            component=component,
+            lifecycle_phase=lifecycle_phase,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _session_call(
+    operation: Callable[[_TelemetrySession], _T],
+    default: _T,
+) -> _T:
+    """Call an existing process session without affecting the application."""
+    try:
+        session = _get_session()
+        if session is None:
+            return default
+        return operation(session)
+    except Exception:
+        return default
+
+
+def record_llm_initialization_attempt(
+    telemetry_config: Any = None,
+    *,
+    default_usage_context: str = "llm_class",
+) -> bool:
+    """Start local tracking and record entry into an LLM constructor."""
+    if not apply_usage_session_config(
+        telemetry_config,
+        default_usage_context=default_usage_context,
+        component="llm",
+        lifecycle_phase="model_initialization",
+    ):
+        return False
+    return _session_call(
+        lambda session: session.record_llm_initialization_attempt(),
+        False,
+    )
+
+
+def record_llm_initialization_failure() -> None:
+    """Record a handled Python exception from an LLM constructor."""
+    _session_call(lambda session: session.record_llm_initialization_failure(), None)
+
+
+def record_llm_initialized() -> bool:
+    """Record one successfully constructed LLM object."""
+    return _session_call(lambda session: session.record_llm_initialized(), False)
+
+
+def record_llm_shutdown() -> None:
+    """Mark one successfully tracked LLM object inactive."""
+    _session_call(lambda session: session.record_llm_shutdown(), None)
+
+
+def set_lifecycle_phase(lifecycle_phase: schema.LifecyclePhase) -> None:
+    """Update the best-known phase for an outer process boundary."""
+    _session_call(lambda session: session.set_lifecycle_phase(lifecycle_phase), None)
+
+
+def set_usage_context(usage_context: str) -> None:
+    """Set a known process ingress after command resolution."""
+    _session_call(lambda session: session.set_usage_context(usage_context), None)
+
+
+def record_observed_signal(signal_number: int) -> None:
+    """Remember a handled signal without reporting an exit prematurely."""
+    _session_call(lambda session: session.record_observed_signal(signal_number), None)
+
+
+def record_termination_observation(
+    outcome: TerminalOutcome,
+    *,
+    lifecycle_phase: Optional[schema.LifecyclePhase] = None,
+) -> None:
+    """Remember a terminal cause and phase for an authoritative boundary."""
+    _session_call(
+        lambda session: session.record_termination_observation(
+            outcome,
+            lifecycle_phase,
+        ),
+        None,
+    )
+
+
+def get_observed_signal() -> int:
+    """Return the signal observed by the current process, if any."""
+    return _session_call(
+        lambda session: int(session.snapshot()["observedSignal"]),
+        0,
+    )
+
+
+def _send_if_session_active(
+    session: _TelemetrySession,
+    payload: dict,
+    completion: Optional[threading.Event] = None,
+) -> bool:
+    """Start delivery only if process opt-out has not already won."""
+    try:
+        if not session.try_start_delivery():
+            return False
+        _send_to_gxt(payload)
+        return True
+    finally:
+        if completion is not None:
+            completion.set()
+
+
+def _finish_background_reporter() -> None:
+    """Deactivate the reporter and flush a terminal payload queued to it."""
+    global _PENDING_TERMINAL
+    global _REPORTER_ACTIVE
+    pending = None
+    try:
+        with _REPORTER_LOCK:
+            _REPORTER_ACTIVE = False
+            pending = _PENDING_TERMINAL
+            _PENDING_TERMINAL = None
+        if pending is not None:
+            _send_if_session_active(
+                pending.session,
+                pending.payload,
+                pending.completion,
+            )
+    except Exception:
+        if pending is not None:
+            pending.completion.set()
+
+
+def report_exit(
+    outcome: TerminalOutcome,
+    *,
+    lifecycle_phase: Optional[schema.LifecyclePhase] = None,
+    telemetry_config: Any = None,
+    default_usage_context: str = "",
+) -> bool:
+    """Attempt one correlated terminal event with a bounded delivery wait.
+
+    The first valid caller claims the terminal slot. Later calls are no-ops,
+    even when shutdown and error paths race. The return value reports whether
+    this call claimed the slot, not whether network delivery succeeded.
+    """
+    claimed = False
+    try:
+        disabled, _ = _telemetry_settings(
+            telemetry_config,
+            default_usage_context,
+        )
+        if not is_usage_stats_enabled(telemetry_disabled=disabled):
+            _deactivate_usage_session()
+            return False
+        session = _get_session()
+        if session is None:
+            return False
+        # Rank selection may change during startup when disaggregated serving
+        # splits the world communicator into context and generation groups.
+        # Keep setup local on every process and decide only at emission time so
+        # each group's eventual rank 0 can report without duplicate rank events.
+        if not _is_reporting_rank():
+            return False
+
+        terminal = session.claim_terminal(outcome)
+        if terminal is None:
+            return False
+        snapshot, outcome = terminal
+        claimed = True
+
+        # Ignore successful CLI invocations that ended before model startup,
+        # such as help, version, and shell-completion probes. The claimed slot
+        # keeps the atexit fallback from replacing suppression with "unknown".
+        if (
+            outcome.termination_kind == "clean"
+            and snapshot["lifecyclePhase"] in ("cli_parsing", "config_validation")
+            and snapshot["llmInitializationAttempts"] == 0
+        ):
+            return True
+
+        _show_usage_notification()
+
+        exit_code_known = outcome.exit_code_known is True
+        exit_code = outcome.exit_code
+        signal_number = outcome.signal_number
+        if not exit_code_known:
+            exit_code = 0
+        elif not isinstance(exit_code, int) or not 0 <= exit_code <= schema._UINT32_MAX:
+            exit_code_known = False
+            exit_code = 0
+        if not isinstance(signal_number, int) or not 0 <= signal_number <= schema._UINT32_MAX:
+            signal_number = 0
+
+        event = schema.TrtllmExitReport(
+            exitCodeKnown=exit_code_known,
+            exitCode=exit_code,
+            signalNumber=signal_number,
+            terminationKind=outcome.termination_kind,
+            lifecyclePhase=lifecycle_phase or snapshot["lifecyclePhase"],
+            component=outcome.component or snapshot["component"],
+            reportingSource=outcome.reporting_source,
+            **_session_event_fields(snapshot),
+        )
+        payload = schema.build_gxt_payload(
+            event=event,
+            session_id=session.session_id,
+            trtllm_version=session.trtllm_version,
+        )
+
+        completion = threading.Event()
+        queued_to_reporter = False
+        global _PENDING_TERMINAL
+        with _REPORTER_LOCK:
+            if not session.try_start_delivery():
+                completion.set()
+                return True
+            if _REPORTER_ACTIVE:
+                _PENDING_TERMINAL = _PendingTerminal(
+                    session=session,
+                    payload=payload,
+                    completion=completion,
+                )
+                queued_to_reporter = True
+
+        _REPORTER_STOP.set()
+        if queued_to_reporter:
+            completion.wait(timeout=_TERMINAL_FLUSH_TIMEOUT)
+            return True
+
+        thread = threading.Thread(
+            target=_send_if_session_active,
+            args=(session, payload, completion),
+            daemon=True,
+            name="trtllm-usage-terminal",
+        )
+        thread.start()
+        completion.wait(timeout=_TERMINAL_FLUSH_TIMEOUT)
+        return True
+    except Exception:
+        return claimed
 
 
 def report_usage(
@@ -719,37 +1464,23 @@ def report_usage(
         pretrained_config: The pretrained model config (for architecture name).
         telemetry_config: TelemetryConfig object (opt-out + usage context).
     """
+    global _PENDING_TERMINAL
+    global _REPORTER_ACTIVE
     global _REPORTER_STARTED
     try:
-        # Extract fields from TelemetryConfig (defensive -- may be None or wrong type)
-        disabled = False
-        usage_context = ""
-        if telemetry_config is not None:
-            disabled = getattr(telemetry_config, "disabled", False)
-            ctx = getattr(telemetry_config, "usage_context", None)
-            if ctx is not None:
-                usage_context = ctx.value if hasattr(ctx, "value") else str(ctx)
-
-        if not is_usage_stats_enabled(telemetry_disabled=disabled):
+        _, usage_context = _telemetry_settings(telemetry_config)
+        if not apply_usage_session_config(telemetry_config):
             return
-
-        # Only rank 0 in a TP group should report (matches vLLM behavior).
-        # NOTE: This import is intentionally deferred (not top-level) because
-        # usage_lib.py must be importable without the full TRT-LLM stack —
-        # test conftest stubs out tensorrt_llm. The try/except ensures
-        # lightweight installs and test environments aren't broken.
-        try:
-            from tensorrt_llm._utils import mpi_rank  # noqa: E402 — deferred by design
-
-            if mpi_rank() != 0:
-                return
-        except Exception:
-            pass  # fail-silent: if we can't determine rank, proceed
+        # See report_exit(): the authoritative communicator may not exist at
+        # early session creation time, so rank gating belongs at emission.
+        if not _is_reporting_rank():
+            return
 
         with _REPORTER_LOCK:
             if _REPORTER_STARTED:
                 return
             _REPORTER_STARTED = True
+            _REPORTER_ACTIVE = True
 
         _show_usage_notification()
 
@@ -762,5 +1493,11 @@ def report_usage(
         thread.start()
 
     except Exception:
+        pending = None
         with _REPORTER_LOCK:
             _REPORTER_STARTED = False
+            _REPORTER_ACTIVE = False
+            pending = _PENDING_TERMINAL
+            _PENDING_TERMINAL = None
+        if pending is not None:
+            pending.completion.set()
