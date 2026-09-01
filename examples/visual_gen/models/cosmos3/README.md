@@ -65,13 +65,16 @@ A prompt file may hold any of three shapes:
 | Shape | Example | Notes |
 |---|---|---|
 | Omni prompt object | `prompts/t2v.json` | `prompt` plus optional `model_mode`, `vision_path`, `enable_audio`, which supply defaults for the matching flags |
-| Omni object with structured prompt | `prompts/action_edge_policy_droid.json` | the nested `prompt` object is serialized as the exact model input while retaining request options such as `vision_path` |
+| Omni object with structured prompt | `prompts/action_policy.json` | the nested `prompt` object is serialized as the exact model input while retaining request options such as `vision_path` |
 | Structured caption | a checkpoint's `assets/example_i2v_prompt.json` | the object *is* the caption; carries no options |
 | Plain text | any `.txt` | used verbatim |
 
 Structured captions are what the model cards ship and what the checkpoints were
 tuned on; they give noticeably cleaner output than a one-line summary.
 `--negative_prompt` defaults to `cosmos3_negative_prompt.json` in this directory.
+The bundled Action prompts contain the caption metadata for their documented
+domain and 16:9 reference. Update the nested timing and canvas fields along with
+the action text when using a different domain or reference aspect ratio.
 
 ## Usage
 

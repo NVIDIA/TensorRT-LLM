@@ -247,11 +247,58 @@ class TestShippedPromptFiles:
     """The files this README tells users to pass must actually load."""
 
     @pytest.mark.parametrize(
-        "name", ["t2v", "t2i", "i2v", "v2v", "t2av", "action_edge_policy_droid"]
+        "name",
+        [
+            "t2v",
+            "t2i",
+            "i2v",
+            "v2v",
+            "t2av",
+            "action_policy",
+            "action_forward_dynamics",
+            "action_inverse_dynamics",
+            "action_edge_policy_droid",
+        ],
     )
     def test_bundled_prompt_files_load(self, name):
         data = cosmos3.load_prompt_file(f"prompts/{name}.json")
         assert data["prompt"]
+
+    @pytest.mark.parametrize(
+        ("name", "domain_name"),
+        [
+            ("action_policy", "bridge_orig_lerobot"),
+            ("action_forward_dynamics", "av"),
+            ("action_inverse_dynamics", "bridge_orig_lerobot"),
+        ],
+    )
+    def test_action_prompt_matches_example_domain(self, name, domain_name):
+        data = cosmos3.load_prompt_file(f"prompts/{name}.json")
+        prompt = json.loads(data["prompt"])
+        config = resolve_domain_action_config(domain_name=domain_name)
+
+        assert list(prompt) == [
+            "cinematography",
+            "actions",
+            "duration",
+            "fps",
+            "resolution",
+            "aspect_ratio",
+        ]
+        assert prompt["cinematography"] == {
+            "framing": "This video is captured from a first-person perspective looking at the scene."
+        }
+        duration_seconds = config["num_frames"] / config["frame_rate"]
+        minutes, seconds = divmod(round(duration_seconds), 60)
+        assert prompt["duration"] == f"{int(duration_seconds)}s"
+        assert prompt["actions"][0]["time"] == f"0:00-{minutes}:{seconds:02d}"
+        assert prompt["fps"] == config["frame_rate"]
+        width, height = find_closest_target_size(720, 1280, config["action_resolution"])
+        assert prompt["resolution"] == {"H": height, "W": width}
+        assert VIDEO_RES_SIZE_INFO[str(config["action_resolution"])][prompt["aspect_ratio"]] == (
+            width,
+            height,
+        )
 
     def test_edge_policy_prompt_matches_checkpoint_defaults(self):
         data = cosmos3.load_prompt_file("prompts/action_edge_policy_droid.json")
