@@ -76,6 +76,10 @@ endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_manager_v2/CMakeLists.txt)
 list(APPEND SRCS ${KV_CACHE_MANAGER_V2_SRCS})
 
+# Include the KVCM cold-page compression codec bridge sources.
+include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_compression/CMakeLists.txt)
+list(APPEND SRCS ${KV_CACHE_COMPRESSION_SRCS})
+
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
