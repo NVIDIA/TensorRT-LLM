@@ -13,9 +13,9 @@
         "duration": "2s",
         "fps": 15.0,
         "resolution": {
-            "H": 736,
-            "W": 544
+            "H": 544,
+            "W": 736
         },
-        "aspect_ratio": "3,4"
+        "aspect_ratio": "4,3"
     }
 }

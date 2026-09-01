@@ -15,7 +15,10 @@ from pathlib import Path
 
 import pytest
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.action import VIDEO_RES_SIZE_INFO
+from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
+    VIDEO_RES_SIZE_INFO,
+    find_closest_target_size,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     resolve_checkpoint_policy_defaults,
     resolve_domain_action_config,
@@ -267,7 +270,8 @@ class TestShippedPromptFiles:
         assert prompt["duration"] == f"{int(duration_seconds)}s"
         assert prompt["actions"][0]["time"] == f"0:00-{minutes}:{seconds:02d}"
         assert prompt["fps"] == config["frame_rate"]
-        assert prompt["aspect_ratio"] == "3,4"
+        width, height = find_closest_target_size(544, 736, config["action_resolution"])
+        assert prompt["resolution"] == {"H": height, "W": width}
         width, height = VIDEO_RES_SIZE_INFO[str(config["action_resolution"])][
             prompt["aspect_ratio"]
         ]
