@@ -3,9 +3,9 @@
 Derives the two knobs for **equal-cost context chunking** (KV cache manager V2
 scheduler) from the iteration logs of an ordinary run:
 
-- `TLLM_V2_CTX_COST_LSTAR` — kv-token equivalents of the KV-independent
+- `TLLM_V2_CTX_COST_KV_OFFSET` — kv-token equivalents of the KV-independent
   per-token work; a model × kernel × precision property.
-- `TLLM_V2_CTX_COST_KV_REF` — the KV depth above which chunks shrink; a
+- `TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD` — the KV depth above which chunks shrink; a
   workload property (a low percentile of the observed depth distribution).
 
 ## Workflow
@@ -32,4 +32,4 @@ scheduler) from the iteration logs of an ordinary run:
    throughput / TTFT / per-rank iteration-time spread against step 1.
 
 Re-fit after changing the model, attention kernels, precision, or GPU
-(`LSTAR` moves) or the workload mix (`KV_REF` moves).
+(`kv_cost_offset` moves) or the workload mix (`kv_depth_threshold` moves).

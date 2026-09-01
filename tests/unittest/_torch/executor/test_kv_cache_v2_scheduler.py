@@ -2808,9 +2808,9 @@ class TestMultimodalAwareChunkingV2:
 
 
 class TestEqualCostChunking:
-    """Chunks capped by (LSTAR + kv_start) * n against B = (LSTAR + KV_REF) * max_num_tokens."""
+    """Chunks capped by (kv_cost_offset + kv_start) * n against B = (kv_cost_offset + kv_depth_threshold) * max_num_tokens."""
 
-    ENV = {"TLLM_V2_CTX_COST_LSTAR": "140000", "TLLM_V2_CTX_COST_KV_REF": "64000"}
+    ENV = {"TLLM_V2_CTX_COST_KV_OFFSET": "140000", "TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD": "64000"}
 
     def _make(self, env=None, max_num_tokens=8192):
         mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -2835,7 +2835,7 @@ class TestEqualCostChunking:
     def test_shallow_request_unaffected(self):
         req = self._deep_req(0, kv_start=32_000)
         self._make(self.ENV).schedule_request([req], set())
-        assert req.context_chunk_size == 8192  # token cap binds below KV_REF
+        assert req.context_chunk_size == 8192  # token cap binds below kv_depth_threshold
 
     def test_deep_request_shrinks_per_formula(self):
         req = self._deep_req(0, kv_start=500_000)
@@ -2852,7 +2852,7 @@ class TestEqualCostChunking:
         assert shallow.context_chunk_size == 192
 
     def test_head_of_line_floor(self):
-        env = {"TLLM_V2_CTX_COST_LSTAR": "100", "TLLM_V2_CTX_COST_KV_REF": "100"}
+        env = {"TLLM_V2_CTX_COST_KV_OFFSET": "100", "TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD": "100"}
         req = self._deep_req(0, kv_start=10_000)
         self._make(env, max_num_tokens=1024).schedule_request([req], set())
         # affordable = 204_800 // 10_100 = 20 < unit -> floored to one unit

@@ -63,7 +63,7 @@ class BudgetTracker:
         max_num_tokens: Optional[int],
         max_num_requests: int,
         peft_cache_manager=None,
-        max_cost: Optional[float] = None,
+        max_ctx_cost: Optional[float] = None,
     ):
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = max_num_requests
@@ -71,8 +71,8 @@ class BudgetTracker:
         self.num_requests = 0
         # Equal-cost chunking budget in token*kv units; None keeps pure
         # token budgeting. See KVCacheV2Scheduler.__init__.
-        self.max_cost = max_cost
-        self.cost = 0.0
+        self.max_ctx_cost = max_ctx_cost
+        self.ctx_cost = 0.0
 
         # PEFT accounting
         self._peft_cache_manager = peft_cache_manager
@@ -102,15 +102,15 @@ class BudgetTracker:
         return self.max_num_tokens - self.num_tokens
 
     @property
-    def remaining_cost(self) -> float:
+    def remaining_ctx_cost(self) -> float:
         """Remaining cost budget (token*kv units), inf if cost-unlimited."""
-        if self.max_cost is None:
+        if self.max_ctx_cost is None:
             return float("inf")
-        return self.max_cost - self.cost
+        return self.max_ctx_cost - self.ctx_cost
 
-    def commit_cost(self, cost: float) -> None:
+    def commit_ctx_cost(self, cost: float) -> None:
         """Record a scheduled context chunk's predicted cost."""
-        self.cost += cost
+        self.ctx_cost += cost
 
     def commit(self, req: LlmRequest, num_tokens: int, peft_pages: int) -> None:
         """Record a successfully scheduled request's token and PEFT consumption."""
@@ -251,26 +251,26 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
 
         # Opt-in (default off): equal-cost context chunking. A context chunk
-        # of n tokens at KV depth kv costs ~ (LSTAR + kv) * n, where LSTAR
+        # of n tokens at KV depth kv costs ~ (kv_cost_offset + kv) * n, where kv_cost_offset
         # converts the KV-independent per-token work into kv equivalents.
         # Capping each rank's chunks against the shared budget
-        # B = (LSTAR + KV_REF) * max_num_tokens equalizes attention-DP
+        # B = (kv_cost_offset + kv_depth_threshold) * max_num_tokens equalizes attention-DP
         # lockstep iteration times with no cross-rank coordination; requests
-        # shallower than KV_REF are unaffected (the token cap binds first).
-        # TODO(perf): promote to a config field, calibrate LSTAR online.
-        cost_lstar = int(os.environ.get("TLLM_V2_CTX_COST_LSTAR", "0"))
-        cost_kv_ref = int(os.environ.get("TLLM_V2_CTX_COST_KV_REF", "0"))
+        # shallower than kv_depth_threshold are unaffected (the token cap binds first).
+        # TODO(perf): promote to a config field, calibrate kv_cost_offset online.
+        kv_cost_offset = int(os.environ.get("TLLM_V2_CTX_COST_KV_OFFSET", "0"))
+        kv_depth_threshold = int(os.environ.get("TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD", "0"))
         self._cost_chunking_enabled = (
-            cost_lstar > 0 and cost_kv_ref > 0 and max_num_tokens is not None
+            kv_cost_offset > 0 and kv_depth_threshold > 0 and max_num_tokens is not None
         )
-        self._cost_lstar = cost_lstar
-        self._cost_budget: Optional[float] = None
+        self._kv_cost_offset = kv_cost_offset
+        self._ctx_cost_budget: Optional[float] = None
         if self._cost_chunking_enabled:
-            self._cost_budget = float((cost_lstar + cost_kv_ref) * max_num_tokens)
+            self._ctx_cost_budget = float((kv_cost_offset + kv_depth_threshold) * max_num_tokens)
             logger.info(
                 f"KVCacheV2Scheduler: equal-cost context chunking ON, "
-                f"LSTAR={cost_lstar}, KV_REF={cost_kv_ref}, "
-                f"cost_budget={self._cost_budget:.4e} token*kv"
+                f"kv_cost_offset={kv_cost_offset}, kv_depth_threshold={kv_depth_threshold}, "
+                f"cost_budget={self._ctx_cost_budget:.4e} token*kv"
             )
 
     @property
@@ -324,7 +324,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             self.max_num_tokens,
             self.max_num_requests,
             self.peft_cache_manager,
-            max_cost=self._cost_budget,
+            max_ctx_cost=self._ctx_cost_budget,
         )
 
         # TODO: block reuse skip optimization (_beneficial_to_skip).
@@ -701,9 +701,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # budget. context_current_position is valid here — prepare_context
         # above already advanced it past the reused prefix / prior chunks.
         if self._cost_chunking_enabled:
-            cost_rate = self._cost_lstar + req.context_current_position
-            affordable = int(budget.remaining_cost // cost_rate)
-            if affordable < self.chunk_unit_size and budget.cost == 0.0:
+            cost_rate = self._kv_cost_offset + req.context_current_position
+            affordable = int(budget.remaining_ctx_cost // cost_rate)
+            if affordable < self.chunk_unit_size and budget.ctx_cost == 0.0:
                 # Head-of-line floor: a bounded budget overshoot beats
                 # starving a deep request forever.
                 affordable = self.chunk_unit_size
@@ -756,8 +756,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             return cross_action, 0, False
 
         if self._cost_chunking_enabled:
-            budget.commit_cost(
-                float(self._cost_lstar + req.context_current_position) * chunk_tokens
+            budget.commit_ctx_cost(
+                float(self._kv_cost_offset + req.context_current_position) * chunk_tokens
             )
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length

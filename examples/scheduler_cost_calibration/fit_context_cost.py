@@ -15,11 +15,11 @@
 """Fit the equal-cost context chunking parameters from worker iteration logs.
 
 Equal-cost context chunking (KV cache manager V2 scheduler, enabled via
-TLLM_V2_CTX_COST_LSTAR / TLLM_V2_CTX_COST_KV_REF) needs two numbers:
+TLLM_V2_CTX_COST_KV_OFFSET / TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD) needs two numbers:
 
-  LSTAR   kv-token equivalents of the KV-independent per-token work
+  kv_cost_offset   kv-token equivalents of the KV-independent per-token work
           (a model x kernel x precision property -- measure it, don't guess)
-  KV_REF  the KV depth above which chunks start to shrink
+  kv_depth_threshold  the KV depth above which chunks start to shrink
           (a workload property -- a low percentile of the depth distribution)
 
 This script derives both from the per-rank iteration log of an ordinary
@@ -38,9 +38,9 @@ Method (robust to eviction/onboard stall outliers):
      time vs KV depth gives c2 (time per token*kv); the depth term cancels
      the intercept, and the median rejects stall outliers.
   3. The intercept A = median(T - slope*kv) over deep samples folds the
-     KV-independent cost; LSTAR = A / (c2 * max_num_tokens), reported as a
+     KV-independent cost; kv_cost_offset = A / (c2 * max_num_tokens), reported as a
      range for an assumed 0..35% fixed-overhead share of A.
-  4. KV_REF = a percentile of the token-weighted KV-depth distribution over
+  4. kv_depth_threshold = a percentile of the token-weighted KV-depth distribution over
      all scheduled work (default p50).
 
 The report also includes a piecewise-linearity check, the measured lockstep
@@ -143,7 +143,7 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("logs", nargs="+", help="context worker log file(s)")
     ap.add_argument("--max-num-tokens", type=int, default=8192)
-    ap.add_argument("--kv-ref-percentile", type=float, default=50.0)
+    ap.add_argument("--kv-depth-threshold-percentile", type=float, default=50.0)
     ap.add_argument("--min-span", type=int, default=6,
                     help="minimum monopoly-span length in iterations")
     ap.add_argument("--warmup-iters", type=int, default=5,
@@ -160,7 +160,7 @@ def main():
     print(f"parsed {len(recs)} records: iters {iters[0]}..{iters[-1]}, "
           f"{len(ranks)} ranks, {len(devt)} timed iterations")
 
-    # ---- LSTAR ----
+    # ---- kv_cost_offset ----
     spans = find_monopoly_spans(recs, iters, ranks, devt, m, args.min_span)
     n_samples = sum(len(s) for s in spans)
     if not spans:
@@ -177,12 +177,12 @@ def main():
     deep = [t - slope * kv for kv, t in flat if kv > 200_000] or \
            [t - slope * kv for kv, t in flat]
     a = st.median(deep)       # c0 + c1 * max_num_tokens
-    lstar_hi = a / (c2 * m)
-    lstar_lo = 0.65 * lstar_hi  # if fixed overhead is 35% of A
-    lstar = round((lstar_lo + lstar_hi) / 2, -3)
+    offset_hi = a / (c2 * m)
+    offset_lo = 0.65 * offset_hi  # if fixed overhead is 35% of A
+    kv_cost_offset = round((offset_lo + offset_hi) / 2, -3)
     print(f"slope = {slope * 1e3:.2f} us/kv @N={m}  ->  c2 = {c2 * 1e6:.3f} ns/(token*kv)")
     print(f"A = c0 + c1*{m} = {a:.0f} ms")
-    print(f"LSTAR in [{lstar_lo / 1e3:.0f}k, {lstar_hi / 1e3:.0f}k]  ->  recommended {lstar:.0f}")
+    print(f"kv_cost_offset in [{offset_lo / 1e3:.0f}k, {offset_hi / 1e3:.0f}k]  ->  recommended {kv_cost_offset:.0f}")
 
     # linearity diagnostic: per-depth-band slopes should agree
     print("linearity check (per-band Theil-Sen slope, us/kv):")
@@ -193,7 +193,7 @@ def main():
         print(f"  kv {lo // 1000:>4}k-{hi // 1000:<5}k: "
               f"{f'{s_band * 1e3:.2f}' if s_band else 'insufficient data'}")
 
-    # ---- KV_REF ----
+    # ---- kv_depth_threshold ----
     kvbar = []
     for it in iters:
         if it < args.warmup_iters:
@@ -202,11 +202,11 @@ def main():
             rec = recs.get((it, r))
             if rec and rec[2] > 0:
                 kvbar.append(rec[3] / max(rec[1], 1) + rec[2] / 2)
-    kv_ref = round(pct(kvbar, args.kv_ref_percentile), -3)
+    kv_depth_threshold = round(pct(kvbar, args.kv_depth_threshold_percentile), -3)
     print(f"\ntoken-weighted KV-depth percentiles (k): "
           f"p10={pct(kvbar, 10) / 1e3:.0f} p25={pct(kvbar, 25) / 1e3:.0f} "
           f"p50={pct(kvbar, 50) / 1e3:.0f} p90={pct(kvbar, 90) / 1e3:.0f}")
-    print(f"KV_REF (p{args.kv_ref_percentile:.0f}) -> recommended {kv_ref:.0f}")
+    print(f"kv_depth_threshold (p{args.kv_depth_threshold_percentile:.0f}) -> recommended {kv_depth_threshold:.0f}")
 
     # ---- expected benefit ----
     waste, gains = [], []
@@ -225,8 +225,8 @@ def main():
         waste.append(1 - st.mean(costs) / max(costs))
         depths = [f[3] / max(f[1], 1) + f[2] / 2 for f in feats]
         gains.append(
-            sum(1 / (lstar + d) for d in depths) /
-            (len(depths) / (lstar + max(depths))))
+            sum(1 / (kv_cost_offset + d) for d in depths) /
+            (len(depths) / (kv_cost_offset + max(depths))))
     if waste:
         print(f"\nlockstep waste (1 - mean/max of per-rank cost): "
               f"mean={st.mean(waste) * 100:.1f}%  p90={pct(waste, 90) * 100:.1f}%")
@@ -234,8 +234,8 @@ def main():
               f"p50={pct(gains, 50):.2f}x")
 
     print("\nready to paste (context workers):")
-    print(f"  TLLM_V2_CTX_COST_LSTAR={lstar:.0f}")
-    print(f"  TLLM_V2_CTX_COST_KV_REF={kv_ref:.0f}")
+    print(f"  TLLM_V2_CTX_COST_KV_OFFSET={kv_cost_offset:.0f}")
+    print(f"  TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD={kv_depth_threshold:.0f}")
 
 
 if __name__ == "__main__":
