@@ -19,7 +19,6 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
 set(SRCS
-    assignReqSeqSlots.cpp
     baseTransBuffer.cpp
     blockKey.cpp
     cacheFormatter.cpp
