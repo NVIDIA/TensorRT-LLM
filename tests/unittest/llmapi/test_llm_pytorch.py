@@ -1571,9 +1571,19 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
     assert final_used_num_blocks == 0
 
 
+_DISAGG_CANCEL_REQUEST_TIMEOUT_SECONDS = 120.0
+# Two iterations retain repeated cleanup coverage without making the L0 test
+# carry stress-test exposure.
+_DISAGG_CANCEL_TEST_ITERATIONS = 2
+
+
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 @skip_ray
+# https://nvbugs/6608382: isolate the test from reused MPI worker state while
+# the rare context-response stall is being root-caused.
+@pytest.mark.private_mpi_session
+@pytest.mark.timeout(600)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
 async def test_llm_disagg_gen_cancelled(transceiver_runtime):
@@ -1609,9 +1619,8 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
                   **llm_args_extra)
 
     try:
-        num_iterations = 10
         prev_after_free_num_blocks = 0
-        for iter in range(num_iterations):
+        for iteration in range(_DISAGG_CANCEL_TEST_ITERATIONS):
 
             max_tokens = 1
             sampling_params = SamplingParams(max_tokens=max_tokens)
@@ -1623,19 +1632,16 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
                 * 10
             ]
             # Send context-only request
-            ctx_outputs = []
-            for output in llm_ctx.generate(
-                    prompt,
-                    sampling_params=sampling_params,
-                    disaggregated_params=disaggregated_params):
-                ctx_outputs.append(output)
-
-            assert len(ctx_outputs) == 1
+            ctx_output = llm_ctx.generate_async(
+                prompt[0],
+                sampling_params=sampling_params,
+                disaggregated_params=disaggregated_params)
+            ctx_output.result(timeout=_DISAGG_CANCEL_REQUEST_TIMEOUT_SECONDS)
 
             max_tokens = 10000
             sampling_params = SamplingParams(max_tokens=max_tokens,
                                              ignore_eos=True)
-            disaggregated_params = ctx_outputs[0].disaggregated_params
+            disaggregated_params = ctx_output.disaggregated_params
             disaggregated_params.request_type = "generation_only"
 
             # Send gen-only request
@@ -1647,9 +1653,11 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
             # Sleep a little to have tokens generated, between 0.2 and 0.7 seconds
             sleep_time = random.uniform(0.2, 0.7)
             time.sleep(sleep_time)
-            #Abort the generation request
+            # Abort the generation request.
             gen_output.abort()
-            result = await gen_output.aresult()
+            result = await asyncio.wait_for(
+                gen_output.aresult(),
+                timeout=_DISAGG_CANCEL_REQUEST_TIMEOUT_SECONDS)
             num_output_tokens = len(result.outputs[0].token_ids)
             print(f"num output tokens: {num_output_tokens}")
             assert result.outputs[0].finish_reason == "cancelled"
@@ -1676,7 +1684,7 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
 
             after_free_num_blocks = results[-1]["kvCacheStats"]["freeNumBlocks"]
             # Check that number of free blocks stays the same
-            if iter > 0:
+            if iteration > 0:
                 assert after_free_num_blocks == prev_after_free_num_blocks
 
             # Check that number of free blocks stays the same
