@@ -26,7 +26,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import CuteDslFusedMoE, CutlassFusedMoE, MarlinFusedMoE
+from tensorrt_llm._torch.moe.fused_moe import (
+    CuteDslFc12FusedMoE,
+    CuteDslFusedMoE,
+    CutlassFusedMoE,
+    MarlinFusedMoE,
+)
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ACTIVATION_PAYLOAD,
     SimpleActivation,
@@ -71,6 +76,7 @@ class MoeBackendType(str, Enum):
     CUTLASS = "CUTLASS"
     TRTLLM = "TRTLLM"
     CUTEDSL = "CUTEDSL"
+    CUTEDSL_FC12 = "CUTEDSL_FC12"
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
     # Keep the two MegaMoE variants explicit.
@@ -119,6 +125,7 @@ def find_backend_class(
     backend_class_map = {
         MoeBackendType.CUTLASS: CutlassFusedMoE,
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
+        MoeBackendType.CUTEDSL_FC12: CuteDslFc12FusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
@@ -694,7 +701,7 @@ def should_skip_cutedsl(
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    if backend_type != MoeBackendType.CUTEDSL:
+    if backend_type not in (MoeBackendType.CUTEDSL, MoeBackendType.CUTEDSL_FC12):
         return None
 
     if model_config is None:
