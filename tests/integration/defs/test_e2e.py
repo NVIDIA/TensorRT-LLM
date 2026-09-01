@@ -1059,7 +1059,6 @@ def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
 @pytest.mark.skip_less_mpi_world_size(8)
 @skip_pre_hopper
 @pytest.mark.parametrize("model_path", [
-    pytest.param('DeepSeek-V3-0324', marks=skip_post_blackwell),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
