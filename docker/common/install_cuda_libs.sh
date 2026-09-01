@@ -4,7 +4,7 @@ set -ex
 
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08
-CUDA_VER="13.4" # 13.4.59
+CUDA_VER="13.4" # image reports CUDA_VERSION=13.4.1.012
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
 CUDNN_VER="9.25.0.28-1" # TODO(dlfw-26.08): exact internal build, not yet on the public CUDA apt repo (public max is 9.25.0.15-1)
@@ -13,8 +13,8 @@ CUBLAS_VER="13.7.0.27-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="13.4.59-1"
-CUDA_RUNTIME="13.2.75-1" # TODO(dlfw-26.08): public cuda-cudart-13-4 package not yet released, verify once published
-CUDA_DRIVER_VERSION="595.58.03-1.el8" # TODO(dlfw-26.08): NGC 26.08 forward-compat driver is 615.61, public cuda-drivers package not yet released
+CUDA_RUNTIME="13.4.49-1" # TODO(dlfw-26.08): rockylinux only; the public cuda-toolkit-13-4-* rpms are not released yet
+CUDA_DRIVER_VERSION="615.65.02-1.el8" # TODO(dlfw-26.08): rockylinux only; taken from the image's CUDA_DRIVER_VERSION, re-check the rpm release suffix once cuda-compat-13-4 is published
 
 for i in "$@"; do
     case $i in

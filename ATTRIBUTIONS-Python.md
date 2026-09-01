@@ -48450,7 +48450,7 @@ SOFTWARE.
 
 
 
-## polygraphy (0.49.26)
+## polygraphy (0.53.4)
 
 ### Licenses
 License: `Apache 2.0`
