@@ -46,6 +46,23 @@ def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
     return k > 0 and input.numel() <= _LOW_M_GEMM_MAX_M * k
 
 
+def _copy_to_new_cuda_allocation(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy ``tensor`` into a fresh contiguous allocation on the current CUDA device.
+
+    The allocation follows the allocator selected by the surrounding context,
+    including ``torch.cuda.use_mem_pool``. Unlike ``contiguous().cuda()``, this
+    always allocates new storage when ``tensor`` is already contiguous and on
+    the current CUDA device.
+    """
+    copied = torch.empty_like(
+        tensor,
+        device="cuda",
+        memory_format=torch.contiguous_format,
+    )
+    copied.copy_(tensor)
+    return copied
+
+
 class WeightMode(str, enum.Enum):
     # weight of a vanilla layer
     VANILLA = 'vanilla'

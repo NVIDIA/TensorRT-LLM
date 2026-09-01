@@ -5,7 +5,7 @@ import ast
 import functools
 import itertools
 import math
-from typing import ClassVar, List, Optional, Tuple, Type
+from typing import List, Optional, Tuple, Type
 
 import torch
 
@@ -27,8 +27,7 @@ from ..locality_domain_utils import (get_current_locality_domain,
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape, fp8_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
-                     infer_output_m_shape, is_gated_activation,
-                     last_positive_power_of_2, mxfp8_scale_infer_shape,
+                     is_gated_activation, last_positive_power_of_2,
                      next_positive_power_of_2)
 from .cutedsl_matmul_heuristics import (NVFP4_PRECISION,
                                         nvmmh_enabled_for_nvfp4, nvmmh_fields,
@@ -12983,7 +12982,3 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                n,
                                dtype=output_dtype,
                                device=input.device)
-
-
-
-

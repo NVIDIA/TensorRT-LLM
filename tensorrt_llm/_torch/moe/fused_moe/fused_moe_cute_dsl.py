@@ -35,11 +35,11 @@ from ...locality_domain.policy import LocalityDomainExecutionPlanner
 from ...locality_domain.runtime import LocalityDomainRuntime
 from ...locality_domain_utils import get_reserved_remainder_stream
 from ...model_config import ModelConfig
+from ...modules.linear import _copy_to_new_cuda_allocation
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
-from ...modules.linear import _copy_to_new_cuda_allocation
 from .fused_moe_cutlass import CutlassFusedMoE
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
                             MoERejectReason, MoERunContext, MoEStaticCapability,
@@ -572,7 +572,6 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
             CuteDslFusedMoEBF16Runner,
             tuple(checked_runner_types),
         )
-
 
 
 class CuteDslFusedMoE(CutlassFusedMoE):
