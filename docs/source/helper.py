@@ -24,56 +24,33 @@ def _is_llmapi_search_entry(name: str, options: object) -> bool:
             and getattr(options, "no_index", False) is True)
 
 
-def _compact_parameter_signature(obj: object) -> Optional[str]:
-    try:
-        parameters = list(inspect.signature(obj).parameters.values())
-    except (TypeError, ValueError):
-        return None
-
-    parts = []
-    keyword_separator_added = False
-    for index, parameter in enumerate(parameters):
-        if parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
-            parts.append(parameter.name)
-            if (index + 1 == len(parameters) or parameters[index + 1].kind
-                    != inspect.Parameter.POSITIONAL_ONLY):
-                parts.append("/")
-        elif parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD:
-            parts.append(parameter.name)
-        elif parameter.kind == inspect.Parameter.VAR_POSITIONAL:
-            parts.append(f"*{parameter.name}")
-            keyword_separator_added = True
-        elif parameter.kind == inspect.Parameter.KEYWORD_ONLY:
-            if not keyword_separator_added:
-                parts.append("*")
-                keyword_separator_added = True
-            parts.append(parameter.name)
-        else:
-            parts.append(f"**{parameter.name}")
-
-    return f"({', '.join(parts)})"
-
-
 def compact_llmapi_search_signature(
         app: "Sphinx", what: str, name: str, obj: object, options: object,
         signature: Optional[str], return_annotation: Optional[str]
 ) -> tuple[Optional[str], Optional[str]]:
     """Keep only parameter names in the searchable LLM API index."""
-    del app, what
     if not _is_llmapi_search_entry(name, options):
         return signature, return_annotation
 
-    compact_signature = _compact_parameter_signature(obj)
-    if compact_signature is None:
+    try:
+        object_signature = inspect.signature(obj)
+    except (TypeError, ValueError):
         return signature, return_annotation
-    return compact_signature, None
+
+    empty = inspect.Parameter.empty
+    parameters = [
+        parameter.replace(annotation=empty, default=empty)
+        for parameter in object_signature.parameters.values()
+    ]
+    return str(
+        object_signature.replace(parameters=parameters,
+                                 return_annotation=empty)), None
 
 
 def strip_llmapi_search_docstrings(app: "Sphinx", what: str, name: str,
                                    obj: object, options: object,
                                    lines: list[str]) -> None:
     """Leave full docstrings on detail pages, not the searchable index."""
-    del app, what, obj
     if _is_llmapi_search_entry(name, options):
         lines.clear()
 
@@ -478,14 +455,10 @@ def generate_llmapi():
 
         # Keep compact signatures on the landing page so browser find can
         # search parameter names. Sphinx callbacks remove class docstrings and
-        # annotations here; detail pages retain the complete documentation.
+        # annotations and defaults here; detail pages retain the complete
+        # documentation.
         search_content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
         search_content += "    :no-index:\n\n"
-        if cls_name == "LLM":
-            search_content += (
-                "``LLM`` accepts additional keyword arguments through "
-                "``**kwargs``; see :doc:`TorchLlmArgs <reference/TorchLlmArgs>` "
-                "for the complete list.\n\n")
         search_content += (
             f":doc:`View the full {cls_name} reference <reference/{cls_name}>`\n\n"
         )
