@@ -5556,14 +5556,6 @@ class PyExecutor:
                     "enable_pipelined_transfer is not supported with "
                     f"pipeline_parallel_size={self.dist.pp_size} on context workers."
                 )
-            # Monolithic transfer accepts helix CP, so cp_size > 1 reaches here.
-            # Helix strides src_block_ids by cp_rank while pipelining projects
-            # dst_block_ids onto a chunk; the two have never run together.
-            if self.dist.cp_size != 1:
-                raise ValueError(
-                    "enable_pipelined_transfer is not supported with "
-                    f"context_parallel_size={self.dist.cp_size} on context workers."
-                )
 
         # Validate beam width
         sampling_config = request.sampling_config

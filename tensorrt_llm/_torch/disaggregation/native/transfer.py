@@ -849,6 +849,13 @@ class Sender(SenderBase):
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
+        self_ri = self._registrar.self_rank_info
+        token_range = task._slice.token_range
+        if token_range is not None and (self_ri.cp_size > 1 or peer_ri.cp_size > 1):
+            raise ValueError(
+                "enable_pipelined_transfer is not supported with context parallelism "
+                f"(sender cp_size={self_ri.cp_size}, receiver cp_size={peer_ri.cp_size})"
+            )
         timer = task._perf_timer
         if timer:
             timer.record_prepare_args_start(peer_ri.instance_rank)
@@ -895,8 +902,7 @@ class Sender(SenderBase):
                 dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
             else:
                 tpb = extractor.page_table.tokens_per_block
-                token_range = task._slice.token_range
-                if peer_ri.cp_size > 1 and self._registrar.self_rank_info.cp_size == 1:
+                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
                     # (same protocol as partition_context_for_helix). The strided
                     # subset has exactly the receiver's block count, so the

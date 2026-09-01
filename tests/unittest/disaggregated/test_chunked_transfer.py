@@ -698,33 +698,15 @@ def test_pipelined_transfer_rejects_pipeline_parallelism_for_context_request():
         PyExecutor._validate_request(executor, request)
 
 
-def test_pipelined_transfer_rejects_context_parallelism_for_context_request():
-    """Helix CP passes the transceiver's own compatibility check, so gate it here.
-
-    Monolithic transfer supports helix CP, which strides src_block_ids by
-    cp_rank. Pipelining independently projects dst_block_ids onto a chunk, and
-    the combination is untested, so context workers must reject cp_size > 1.
-    """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = MagicMock()
-    executor.kv_cache_transceiver.pipeline_transfer_enabled = True
-    executor.model_engine.attn_runtime_features.chunked_prefill = True
-    executor.dist.pp_size = 1
-    executor.dist.cp_size = 2
-
-    request = MagicMock()
-    request.py_beam_width = 1
-    request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
-    request.py_disaggregated_params = SimpleNamespace(
-        schedule_style=DisaggScheduleStyle.GENERATION_FIRST
-    )
+def test_pipelined_transfer_rejects_helix_receiver():
+    sender = _make_projection_sender()
+    sender._registrar.get_peer_rank_info.return_value.cp_size = 2
 
     with pytest.raises(
         ValueError,
-        match="not supported with context_parallel_size=2 on context workers",
+        match=r"context parallelism \(sender cp_size=1, receiver cp_size=2\)",
     ):
-        PyExecutor._validate_request(executor, request)
+        sender._build_kv_write_meta(_make_projection_task(), _make_projection_req_info())
 
 
 def test_pipelined_transfer_requires_single_beam_for_context_request():

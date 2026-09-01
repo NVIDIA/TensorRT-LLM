@@ -4488,13 +4488,13 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
 
     enable_pipelined_transfer: bool = Field(
         default=False,
-        description="When True, start transferring each prefill chunk's KV cache "
-        "as soon as its prefill completes, overlapping GPU compute "
-        "with cache transfer. Requires enable_chunked_prefill=True on the context "
-        "server, schedule_style=generation_first, pipeline_parallel_size=1, "
-        "kv_cache_bounce_size_mb=0, beam_width=0, and a non-Mamba/hybrid cache manager. "
-        "Incompatible configurations may cause failure at startup or per request."
-    )
+        description=
+        "Transfer each completed prefill chunk's KV cache while later chunks "
+        "compute. Requires Python NIXL, generation-first scheduling, chunked "
+        "prefill, pipeline_parallel_size=1, context_parallel_size=1 on both "
+        "peers, beam_width=1, no bounce buffer or Mamba/hybrid cache, and block "
+        "reuse disabled or set to all_reusable. Invalid static settings fail at "
+        "startup; per-request constraints reject the request.")
 
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
