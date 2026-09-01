@@ -3763,7 +3763,7 @@ class GvrTopkRegKernel:
             if need >= m:
                 whole = cutlass.Int32(1)
 
-            # ---- ESCAPE: 32-step key-space bisection
+            # ---- ESCAPE: radix descent over the key space
             # Count-crossing enforcement: when the hint-derived bracket's low
             # edge sits above the true k-th value, the classify arms count
             # fewer than k entries (q < 0 is never histogrammed) and the

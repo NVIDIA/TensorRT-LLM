@@ -235,7 +235,7 @@ def test_selfsampling_topk_high_anchor_hint_completeness(n_valid):
     row head) bracket the sampling band so it contains fewer than top_k
     entries. The classify histogram then never reaches k and the crossing
     scan pins its bin-0 fallback as a fake crossing; the register-family
-    whole-bin emit must escape to the key-space bisection instead of
+    whole-bin emit must escape to the key-space ranking instead of
     stopping at the histogram total (regression: rows exited with
     out[tot:k) unwritten -- a prefix-only write). Deterministic worst case:
     row[0] = second-max, so the bracket holds exactly two entries. The
