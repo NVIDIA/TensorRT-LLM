@@ -653,8 +653,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in failed:
             req = reqs.pop(rid, None)
             if req is not None:
-                req.state = LlmRequestState.DISAGG_TRANS_ERROR
-                if mark_retired:
+                if not mark_retired:
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                else:
                     req.py_kv_send_session_retired = True
             session = sessions.pop(rid, None)
             if session is not None:

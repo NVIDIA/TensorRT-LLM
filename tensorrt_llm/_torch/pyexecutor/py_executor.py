@@ -51,6 +51,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
 
+from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.executor.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.executor.pp_termination import DisaggPPTerminationHandler
@@ -658,6 +659,7 @@ class PyExecutor:
         # responses and flushing them at a synchronised point in the executor
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
+        self._pending_ctx_transfer_failures: set[int] = set()
         # Requests with a buffered terminal response are terminated only after
         # the synchronized flush has published that response.  This preserves
         # queue-backed client delivery while retaining normal termination as
@@ -4085,6 +4087,15 @@ class PyExecutor:
         if not self.kv_cache_transceiver:
             return
 
+        pending_ids = getattr(self, "_pending_ctx_transfer_failures", set())
+        pending_requests = ([
+            request for request in self.active_requests
+            if get_unique_rid(request) in pending_ids
+        ] if pending_ids else [])
+        pending_ids.clear()
+        for request in pending_requests:
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
+
         if self._is_disagg_inflight_cancel_active():
             local_poisoned = self.kv_cache_transceiver.has_poisoned_transfer_buffer(
             )
@@ -4106,6 +4117,8 @@ class PyExecutor:
                 return
 
         if not (self.enable_attention_dp and self.dist.world_size != 1):
+            if pending_requests:
+                self._check_cache_transfer_errors("context requests")
             return
 
         local_error_requests = [
@@ -7559,10 +7572,7 @@ class PyExecutor:
                     continue
                 if self.kv_cache_transceiver.has_retired_send_session(req):
                     # The peer registration went away with the session, so
-                    # no further slice can land. Checked before the branch
-                    # below because start_transfer() would otherwise pin
-                    # blocks that only end_transfer() can release.
-                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                    # no further slice can land.
                     continue
                 if req.is_context_finished or req.is_finished_due_to_length:
                     # Forward is done for this request — release the
@@ -7660,8 +7670,9 @@ class PyExecutor:
         ctx_status = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
 
-        completed_req_ids = set(ctx_status.completed_request_ids) | set(
-            ctx_status.error_request_ids)
+        failed_req_ids = set(ctx_status.error_request_ids)
+        completed_req_ids = set(
+            ctx_status.completed_request_ids) | failed_req_ids
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
@@ -7669,13 +7680,19 @@ class PyExecutor:
         for request_id in completed_req_ids:
 
             if request_id not in requests_in_transfer:
-                logger.warning(
-                    f"Request {request_id} not found in transfer manager")
+                if request_id in failed_req_ids:
+                    self._pending_ctx_transfer_failures.add(request_id)
+                else:
+                    logger.warning(
+                        f"Request {request_id} not found in transfer manager")
                 continue
 
             request = requests_in_transfer[request_id]
-
-            self._end_transfer_and_maybe_terminate(request)
+            if request_id in failed_req_ids:
+                self._pending_ctx_transfer_failures.add(request_id)
+                self.async_transfer_manager.end_transfer(request)
+            else:
+                self._end_transfer_and_maybe_terminate(request)
 
         # The set of requests in transfer may have changed since we terminated some requests.
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(

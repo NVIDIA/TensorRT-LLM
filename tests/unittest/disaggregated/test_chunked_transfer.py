@@ -895,6 +895,24 @@ def test_pipelined_chunk_without_a_complete_block_is_not_sent():
     transceiver._finalize_send.assert_not_called()
 
 
+def test_failed_pipelined_send_retires_without_mutating_request_state():
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    request = SimpleNamespace(
+        state=LlmRequestState.CONTEXT_INIT,
+        py_kv_send_session_retired=False,
+    )
+    session = MagicMock()
+
+    KvCacheTransceiverV2._close_failed_sessions(
+        MagicMock(), {42: session}, {42: request}, [42], mark_retired=True
+    )
+
+    assert request.state == LlmRequestState.CONTEXT_INIT
+    assert request.py_kv_send_session_retired
+    session.close.assert_called_once()
+
+
 def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     """Drive two chunks through respond_and_send_async and a real TxSession."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -1309,6 +1327,7 @@ def _make_send_kv_executor(canceled_req_ids):
     executor = MagicMock()
     executor.kv_connector_manager = None
     executor.canceled_req_ids = list(canceled_req_ids)
+    executor._pending_ctx_transfer_failures = set()
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.kv_cache_transceiver.kv_transfer_timeout_ms = None
     executor.kv_cache_transceiver.has_retired_send_session.return_value = False
@@ -1323,6 +1342,8 @@ def _make_send_kv_request(is_last_chunk: bool, request_id: int = 7):
         is_finished_due_to_length=is_last_chunk,
         is_child=False,
         parent_request_id=None,
+        py_disaggregated_params=None,
+        request_id=request_id,
         py_request_id=request_id,
         py_kv_transfer_start_time=None,
         state=(
@@ -1353,6 +1374,58 @@ def test_send_disagg_ctx_kv_sends_final_chunk_in_generation_complete_state():
 
     executor.async_transfer_manager.start_transfer.assert_called_once_with(request)
     executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(request)
+
+
+@pytest.mark.parametrize(
+    ("is_last_chunk", "expected_state"),
+    [
+        (False, LlmRequestState.CONTEXT_INIT),
+        (True, LlmRequestState.GENERATION_COMPLETE),
+    ],
+)
+def test_send_disagg_ctx_kv_skips_retired_session_without_mutating_state(
+    is_last_chunk, expected_state
+):
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = _make_send_kv_executor([])
+    executor.kv_cache_transceiver.has_retired_send_session.return_value = True
+    request = _make_send_kv_request(is_last_chunk=is_last_chunk)
+
+    PyExecutor._send_disagg_ctx_kv_async(executor, [request])
+
+    assert request.state == expected_state
+    executor.async_transfer_manager.start_transfer.assert_not_called()
+    executor.kv_cache_transceiver.respond_and_send_async.assert_not_called()
+
+
+def test_context_send_failure_is_applied_at_next_loop_boundary():
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = _make_send_kv_executor([])
+    request = _make_send_kv_request(is_last_chunk=False)
+    request.py_kv_transfer_timed_out = False
+    executor.active_requests = [request]
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = SimpleNamespace(
+        completed_request_ids=[], error_request_ids=[request.py_request_id]
+    )
+    executor.async_transfer_manager.requests_in_transfer.return_value = {}
+
+    PyExecutor._check_disagg_ctx_cache_transfer_status(executor)
+
+    assert request.state == LlmRequestState.CONTEXT_INIT
+    assert executor._pending_ctx_transfer_failures == {request.py_request_id}
+    executor.async_transfer_manager.end_transfer.assert_not_called()
+
+    executor.enable_attention_dp = False
+    executor.dist.world_size = 1
+    executor._is_disagg_inflight_cancel_active.return_value = False
+
+    PyExecutor._handle_disagg_cache_errors_synced(executor)
+
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert not executor._pending_ctx_transfer_failures
+    executor._check_cache_transfer_errors.assert_called_with("context requests")
 
 
 @pytest.mark.parametrize("is_last_chunk", [False, True])
