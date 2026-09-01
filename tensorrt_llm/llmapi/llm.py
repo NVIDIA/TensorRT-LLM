@@ -57,7 +57,8 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING, TorchLlmArgs,
+from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
+                       TORCH_LLMARGS_REMOVED_KEYS, TorchLlmArgs,
                        validate_token_encoder_bucket_config)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader)
@@ -403,6 +404,8 @@ class BaseLLM:
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) +
                 ['_mpi_session', 'backend'])
+            if issubclass(llm_args_cls, TorchLlmArgs):
+                valid_keys |= TORCH_LLMARGS_REMOVED_KEYS
             for key in kwargs:
                 if key not in valid_keys:
                     raise ValueError(
@@ -2012,9 +2015,9 @@ class _TorchLLM(BaseLLM):
 
         # Check if any arguments not supported by the PyTorch backend are passed.
         unsupported_args = [
-            key for key in kwargs
-            if key not in torchllm_fields and key not in ('_mpi_session',
-                                                          'backend')
+            key for key in kwargs if key not in torchllm_fields and key not in (
+                '_mpi_session',
+                'backend') and key not in TORCH_LLMARGS_REMOVED_KEYS
         ]
 
         if unsupported_args:

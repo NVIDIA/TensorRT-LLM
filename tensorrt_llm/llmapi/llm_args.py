@@ -5294,7 +5294,35 @@ class TorchCompileConfig(StrictBaseModel):
         "The maximum number of CUDA streams to use for torch.compile.")
 
 
+# Keys that were removed from TorchLlmArgs but are still tolerated on input, so
+# that callers pinned to an older TRT-LLM keep constructing. `_TorchLLM` and
+# `BaseLLM` reject unknown kwargs before pydantic runs, so both consult this set
+# too. Each entry is absorbed by a `mode="before"` validator below.
+TORCH_LLMARGS_REMOVED_KEYS = frozenset({"sampler_type"})
+
+
 class TorchLlmArgs(BaseLlmArgs):
+
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_removed_sampler_type(cls, data):
+        """Absorb the removed `sampler_type` knob.
+
+        TorchSampler is now the only sampler, so sampler selection has no
+        meaning and every former value resolves to the same behavior. Drop the
+        key with a warning rather than raising: raising would break the pinned
+        RL/rollout integrations (e.g. verl) that still pass it, for a choice
+        they can no longer make either way.
+        """
+        if isinstance(data, dict) and "sampler_type" in data:
+            data = dict(data)
+            requested = data.pop("sampler_type")
+            logger.warning(
+                f"'sampler_type' was removed (got {requested!r}) and is "
+                "ignored. TorchSampler is the only sampler; remove the "
+                "argument to silence this warning.")
+        return data
+
     # PyTorch backend specific configurations
     generation_config: Literal["auto", "trtllm"] = Field(
         default="trtllm",
