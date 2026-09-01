@@ -15,12 +15,17 @@
 import socket
 import time
 import unittest
-from threading import Lock, Thread
+from threading import Lock, Thread, get_ident
 
 import pytest
 from parameterized import parameterized
 
-from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
+from tensorrt_llm._torch.disaggregation.native import messenger as messenger_module
+from tensorrt_llm._torch.disaggregation.native.messenger import (
+    ZMQDealerPool,
+    ZMQMessenger,
+    decode_message,
+)
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
 TEST_CASES = [
@@ -195,6 +200,55 @@ def test_zmq_messenger_parallel_creation_uses_one_context(dynamic_endpoint):
     assert errors == []
     assert len(contexts) == len(threads)
     assert len({id(context) for context in contexts}) == 1
+
+
+def test_zmq_dealer_pool_confines_sockets_to_owner_thread(monkeypatch):
+    socket_threads = set()
+    lock = Lock()
+
+    class FakeMessenger:
+        def __init__(self, mode, endpoint):
+            assert mode == "DEALER"
+            assert endpoint in {"tcp://peer-a:1", "tcp://peer-b:2"}
+            with lock:
+                socket_threads.add(get_ident())
+
+        def send(self, messages):
+            assert messages
+            with lock:
+                socket_threads.add(get_ident())
+
+        def stop(self):
+            with lock:
+                socket_threads.add(get_ident())
+
+    monkeypatch.setattr(messenger_module, "ZMQMessenger", FakeMessenger)
+    pool = ZMQDealerPool()
+    threads = [
+        Thread(
+            target=pool.send,
+            args=(
+                f"tcp://peer-{'a' if index % 2 == 0 else 'b'}:{1 if index % 2 == 0 else 2}",
+                [b"x"],
+            ),
+        )
+        for index in range(32)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    pool.stop()
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert len(socket_threads) == 1
+
+
+def test_zmq_dealer_pool_rejects_send_after_stop():
+    pool = ZMQDealerPool()
+    pool.stop()
+    with pytest.raises(RuntimeError, match="closed"):
+        pool.send("tcp://peer:1", [b"late"])
 
 
 if __name__ == "__main__":

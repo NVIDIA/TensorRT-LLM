@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
+from concurrent.futures import Future
+from queue import Queue
 from threading import Event, Lock, Thread
 from typing import Callable, Optional
 from uuid import uuid4
@@ -237,3 +239,56 @@ class ZMQMessenger(MessengerInterface):
         self, exc_type: Optional[type], exc_val: Optional[BaseException], exc_tb: Optional
     ) -> None:
         self.stop()
+
+
+class ZMQDealerPool:
+    """Thread-safe multi-endpoint sender with one DEALER-socket owner thread."""
+
+    def __init__(self) -> None:
+        self._commands: Queue[tuple[str, list[bytes], Future[None]] | None] = Queue()
+        self._lock = Lock()
+        self._closed = False
+        self._thread = Thread(target=self._run, daemon=True, name="zmq_dealer_pool")
+        self._thread.start()
+
+    def send(self, endpoint: str, messages: list[bytes]) -> None:
+        """Send a multipart message without exposing a DEALER across threads."""
+        result: Future[None] = Future()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("ZMQDealerPool is closed")
+            self._commands.put((endpoint, messages, result))
+        result.result()
+
+    def stop(self) -> None:
+        """Drain queued sends, close sockets on their owner thread, and join it."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._commands.put(None)
+        self._thread.join()
+
+    def _run(self) -> None:
+        dealers: dict[str, ZMQMessenger] = {}
+        while True:
+            command = self._commands.get()
+            if command is None:
+                break
+            endpoint, messages, result = command
+            try:
+                dealer = dealers.get(endpoint)
+                if dealer is None:
+                    dealer = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+                    dealers[endpoint] = dealer
+                dealer.send(messages)
+            except Exception as error:
+                result.set_exception(error)
+            else:
+                result.set_result(None)
+
+        for endpoint, dealer in dealers.items():
+            try:
+                dealer.stop()
+            except Exception as error:
+                logger.warning(f"Failed to stop DEALER for endpoint {endpoint}: {error}")
