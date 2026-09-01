@@ -42,7 +42,7 @@ from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
 pytestmark = pytest.mark.cpu_only
 
 
-def test_format_bind_address_brackets_ipv6():
+def test_format_bind_address_brackets_ipv6() -> None:
     """A bare IPv6 host is bracketed; IPv4 and already-bracketed hosts are not."""
     from tensorrt_llm.grpc.openengine.server import _format_bind_address
 
@@ -51,7 +51,7 @@ def test_format_bind_address_brackets_ipv6():
     assert _format_bind_address("[::1]", 8000) == "[::1]:8000"
 
 
-def test_openengine_server_serves_the_stub_contract():
+def test_openengine_server_serves_the_stub_contract() -> None:
     """The server binds, attaches Control, answers, and shuts down cleanly.
 
     The servicer is the generated base, so UNIMPLEMENTED is its contract;

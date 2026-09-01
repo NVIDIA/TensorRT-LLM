@@ -27,6 +27,8 @@ import builtins
 import importlib
 import sys
 import types
+from collections.abc import Sequence
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -137,7 +139,9 @@ def test_smg_server_startup_failure_cleans_up(monkeypatch, failure_point):
     llm.shutdown.assert_called_once_with()
 
 
-def test_openengine_server_missing_bindings_raises_import_error(monkeypatch):
+def test_openengine_server_missing_bindings_raises_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Absent bindings surface as ImportError, which is what serve.py catches.
 
     ``trtllm-serve --grpc --grpc_protocol openengine`` wraps the import of
@@ -149,10 +153,16 @@ def test_openengine_server_missing_bindings_raises_import_error(monkeypatch):
     """
     real_import = builtins.__import__
 
-    def import_without_openengine(name, globals=None, locals=None, fromlist=(), level=0):
+    def import_without_openengine(
+        name: str,
+        globals_: Optional[dict] = None,
+        locals_: Optional[dict] = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> types.ModuleType:
         if name.startswith("openengine"):
             raise ModuleNotFoundError("No module named 'openengine'", name="openengine")
-        return real_import(name, globals, locals, fromlist, level)
+        return real_import(name, globals_, locals_, fromlist, level)
 
     monkeypatch.delitem(sys.modules, "openengine", raising=False)
     monkeypatch.delitem(sys.modules, "openengine.v1", raising=False)
