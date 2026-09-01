@@ -42,6 +42,8 @@ exclude = [
     "**3rdparty/**",
     "tensorrt_llm/_torch/attention/backends/prims_ts/**",
     "triton_kernels/**",
+    "tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/manual_mma_128dp.py",
+    "tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py",
 ]
 
 
