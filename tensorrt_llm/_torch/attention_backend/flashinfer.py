@@ -194,7 +194,12 @@ class PlanParams:
 
 @dataclass(kw_only=True, frozen=True)
 class PlanWorkspaceKey:
-    """Plan properties that determine persistent FlashInfer workspace state."""
+    """Key for CUDA-graph workspaces that hold FlashInfer plan schedules.
+
+    Different plan kinds need separate schedules. ``num_generations`` is
+    excluded so batch-size replicas share memory; the last replica to plan
+    owns the shared schedule until another replica replaces it.
+    """
 
     num_heads: int
     num_kv_heads: int
@@ -289,8 +294,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _logical_kv_lens: torch.Tensor = field(init=False, repr=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
+    # Shallow-copied CUDA-graph replicas share one buffer and owner per key.
     _plan_workspace_buffers: Dict[PlanWorkspaceKey,
-                                  torch.Tensor] = field(init=False, repr=False)
+                                  torch.Tensor] = field(init=False,
+                                                        default_factory=dict,
+                                                        repr=False)
+    _plan_workspace_owners: Dict[PlanWorkspaceKey, FlashInferWrappers] = field(
+        init=False, default_factory=dict, repr=False)
 
     # MLA wrappers and stable buffers.
     # Cached plan params + is-planned flag let prepare() refresh the plan
@@ -339,16 +349,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             return True
 
         wrappers = self._plan_params_to_wrappers[plan_params]
-        return not wrappers.is_planned
+        return (not wrappers.is_planned
+                or not self._owns_plan_workspace(plan_params, wrappers))
 
-    def _get_plan_workspace(self, plan_params: PlanParams) -> torch.Tensor:
-        assert self.workspace_buffer is not None
+    def _get_plan_workspace_key(
+            self, plan_params: PlanParams) -> Optional[PlanWorkspaceKey]:
         is_persistent = (plan_params.attention_mask_data is None
                          and plan_params.multi_item_params is None)
         if not self.is_cuda_graph or not is_persistent:
-            return self.workspace_buffer
+            return None
 
-        workspace_key = PlanWorkspaceKey(
+        return PlanWorkspaceKey(
             num_heads=plan_params.num_heads,
             num_kv_heads=plan_params.num_kv_heads,
             head_dim=plan_params.head_dim,
@@ -360,14 +371,36 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             kv_pool_id=plan_params.kv_pool_id,
             q_len_per_req=plan_params.q_len_per_req,
         )
+
+    def _get_plan_workspace(self, plan_params: PlanParams) -> torch.Tensor:
+        assert self.workspace_buffer is not None
+        workspace_key = self._get_plan_workspace_key(plan_params)
+        if workspace_key is None:
+            return self.workspace_buffer
+
         workspace = self._plan_workspace_buffers.get(workspace_key)
         if workspace is None:
-            # Keep the original workspace for plans outside this registry. A
-            # persistent graph plan must not alias it or another plan can
-            # overwrite the schedule that graph replay expects to remain.
+            # Eager and ephemeral plans use workspace_buffer as scratch. A
+            # captured schedule must not alias scratch that another plan writes.
             workspace = torch.empty_like(self.workspace_buffer)
             self._plan_workspace_buffers[workspace_key] = workspace
         return workspace
+
+    def _set_plan_workspace_owner(self, plan_params: PlanParams,
+                                  wrappers: FlashInferWrappers) -> None:
+        workspace_key = self._get_plan_workspace_key(plan_params)
+        if workspace_key is None:
+            return
+
+        assert (self._plan_workspace_buffers[workspace_key]
+                is wrappers.workspace_buffer)
+        self._plan_workspace_owners[workspace_key] = wrappers
+
+    def _owns_plan_workspace(self, plan_params: PlanParams,
+                             wrappers: FlashInferWrappers) -> bool:
+        workspace_key = self._get_plan_workspace_key(plan_params)
+        return (workspace_key is None
+                or self._plan_workspace_owners.get(workspace_key) is wrappers)
 
     def get_prefill_wrapper(
         self, plan_params: PlanParams
@@ -1008,11 +1041,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 cache_name="workspace_buffer",
                 capture_graph=capture_graph,
             )
-        # CUDA-graph batch-size metadata objects are shallow copies. Keep this
-        # registry shared so they reuse one workspace per semantic plan kind.
-        if not hasattr(self, "_plan_workspace_buffers"):
-            self._plan_workspace_buffers = {}
-
         self.paged_kv_indptr_decode = torch.empty((self.max_num_requests + 1, ),
                                                   device='cuda',
                                                   dtype=torch.int)
@@ -1494,7 +1522,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # subsequent forward calls.
             if plan_params.attention_mask_data is None and plan_params.multi_item_params is None:
                 wrappers = self._plan_params_to_wrappers[plan_params]
-                if wrappers.fa2_plan_num_blocks is not None:
+                if (wrappers.fa2_plan_num_blocks is not None
+                        and self._owns_plan_workspace(plan_params, wrappers)):
                     continue
                 wrappers.is_planned = False
                 if not defer_plan:
@@ -1512,10 +1541,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 continue
             if not num_blocks:
                 wrappers.fa2_plan_num_blocks = None
-            elif wrappers.fa2_plan_num_blocks != num_blocks:
-                # Graph replay does not re-enter forward_impl. Each wrapper
-                # owns an isolated plan/run workspace, so refreshing this
-                # schedule cannot overwrite another wrapper's plan state.
+            elif (wrappers.fa2_plan_num_blocks != num_blocks
+                  or not self._owns_plan_workspace(plan_params, wrappers)):
+                # Replay cannot call plan(). Restore this wrapper's schedule if
+                # the page shape changed or another replica last used the buffer.
                 wrappers.is_planned = False
                 self._plan_with_params(plan_params)
 
@@ -1885,10 +1914,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     if self.num_generations < batch_size:
                         kv_lens_buf[self.num_generations:batch_size].zero_()
 
-        # Refresh captured FA2 schedules only after all page metadata updates.
-        # Eager multi-wrapper execution shares one workspace, so defer each
-        # plan until its forward. CUDA-graph wrappers have isolated workspaces
-        # and must all be planned before stream capture.
+        # Eager wrappers share scratch and plan immediately before use. Graph
+        # wrappers keep one workspace per plan kind; prepare() restores the
+        # active batch-size replica's schedule before capture or replay.
         active_wrappers = [
             pp for pp in self._plan_params_to_wrappers
             if pp.attention_mask_data is None and pp.multi_item_params is None
@@ -2025,11 +2053,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 plan_params,
                 ragged_prefill_wrapper,
                 flashinfer_backend=ragged_flashinfer_backend)
-            self._plan_params_to_wrappers[plan_params] = FlashInferWrappers(
+            wrappers = FlashInferWrappers(
                 is_planned=True,
                 workspace_buffer=workspace_buffer,
                 ragged_prefill_wrapper=ragged_prefill_wrapper,
             )
+            self._plan_params_to_wrappers[plan_params] = wrappers
+            self._set_plan_workspace_owner(plan_params, wrappers)
             return plan_params
 
         if plan_params.multi_item_params is not None:
@@ -2170,6 +2200,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             decode_plan()
 
         wrappers.is_planned = True
+        self._set_plan_workspace_owner(plan_params, wrappers)
 
         return plan_params
 
