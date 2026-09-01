@@ -23,6 +23,7 @@ import torch
 from packaging.version import Version
 
 import tensorrt_llm._torch.attention_backend.fmha.prims_ts as prims_ts_module
+import tensorrt_llm._torch.attention_backend.fmha.utils as fmha_utils
 import tensorrt_llm._torch.attention_backend.prims_ts as prims_ts_package
 import tensorrt_llm._torch.attention_backend.prims_ts.context as prims_context_module
 import tensorrt_llm._torch.attention_backend.prims_ts.decode as prims_decode_module
@@ -201,6 +202,7 @@ def _support_result(
             enable_swa_scratch_reuse=enable_swa_scratch_reuse,
             num_local_layers=1,
             num_pools=num_kv_cache_pools,
+            kv_offset=torch.full((num_kv_cache_pools,), 128, dtype=torch.int32),
         )
     else:
         kv_cache_manager = _make_v1_manager(
@@ -208,6 +210,10 @@ def _support_result(
             impl=SimpleNamespace(),
             num_local_layers=1,
             num_pools=num_kv_cache_pools,
+            host_kv_cache_block_offsets=torch.tensor(
+                [[[[0], [128]]]],
+                dtype=torch.int32,
+            ),
         )
     metadata = SimpleNamespace(
         helix_position_offsets=None,
@@ -231,7 +237,6 @@ def _support_result(
         max_seq_len=max_seq_len,
     )
     fmha = PrimsTSFmha(attn)
-    fmha._get_kv_page_offset = Mock(return_value=1)
     k = _TensorSpec((4, attn.num_kv_heads * head_dim), dtype) if has_separate_kv else None
     v = _TensorSpec((4, attn.num_kv_heads * head_dim), dtype) if has_separate_kv else None
     return fmha._is_supported_with_reason(
@@ -724,7 +729,15 @@ def test_kv_page_offset_uses_v2_manager_displacement() -> None:
         host_kv_cache_pool_mapping=torch.tensor([[1, 0]], dtype=torch.int32),
     )
 
-    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 128
+    assert (
+        fmha_utils._get_kv_page_offset(
+            fmha.attn,
+            metadata,
+            0,
+            cache=fmha._kv_page_offset_cache,
+        )
+        == 128
+    )
 
 
 def test_kv_page_offset_is_inferred_from_v1_host_tables() -> None:
@@ -742,10 +755,21 @@ def test_kv_page_offset_is_inferred_from_v1_host_tables() -> None:
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
     )
 
-    assert fmha._get_kv_page_offset(fmha.attn, metadata, 1) == 64
+    assert (
+        fmha_utils._get_kv_page_offset(
+            fmha.attn,
+            metadata,
+            1,
+            cache=fmha._kv_page_offset_cache,
+        )
+        == 64
+    )
 
 
-def test_context_metadata_stages_live_lengths_and_padded_pages() -> None:
+def test_context_metadata_uses_kernel_kv_tile_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(prims_context_module, "_CONTEXT_KV_TILE_N", 256)
     block_tables = torch.tensor(
         [
             [[10, 11, 12, 13], [110, 111, 112, 113]],
@@ -763,6 +787,7 @@ def test_context_metadata_stages_live_lengths_and_padded_pages() -> None:
         32,
         need_context=True,
     )
+    assert fmha._context_page_column_capacity == 8
 
     logical_kv_indptr, seq_lens, dense_page_table = fmha._stage_context_metadata(
         block_tables,
@@ -778,8 +803,14 @@ def test_context_metadata_stages_live_lengths_and_padded_pages() -> None:
         dense_page_table,
         torch.tensor(
             [
-                [[10, 11, 11, 11], [10, 11, 11, 11]],
-                [[20, 21, 21, 21], [20, 21, 21, 21]],
+                [
+                    [10, 11, 11, 11, 11, 11, 11, 11],
+                    [10, 11, 11, 11, 11, 11, 11, 11],
+                ],
+                [
+                    [20, 21, 21, 21, 21, 21, 21, 21],
+                    [20, 21, 21, 21, 21, 21, 21, 21],
+                ],
             ],
             dtype=torch.int32,
         ),

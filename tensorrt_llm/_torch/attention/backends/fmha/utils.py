@@ -14,15 +14,78 @@
 # limitations under the License.
 
 import math
+from collections.abc import MutableMapping
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.internal import thop
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
+
+
+def _get_kv_page_offset(
+    attn: "TrtllmAttention",
+    metadata: "TrtllmAttentionMetadata",
+    seq_offset: int,
+    *,
+    cache: Optional[MutableMapping[tuple[int, int], int]] = None,
+) -> Optional[int]:
+    """Return the V-page displacement relative to a K page ID."""
+    manager = metadata.kv_cache_manager
+    local_layer_idx = attn.local_layer_idx
+    if local_layer_idx is None:
+        local_layer_idx = int(attn.get_local_layer_idx(metadata))
+    pool_mapping = metadata.host_kv_cache_pool_mapping
+    pool_index = int(pool_mapping[local_layer_idx, 0])
+    cache_key = (id(manager), pool_index)
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    if isinstance(manager, KVCacheManagerV2):
+        kv_offsets = manager.kv_offset
+        kv_offset = int(kv_offsets[pool_index])
+        if kv_offset > 0:
+            if cache is not None:
+                cache[cache_key] = kv_offset
+            return kv_offset
+        return None
+
+    if isinstance(manager, KVCacheManager):
+        host_block_offsets = manager.host_kv_cache_block_offsets
+        if host_block_offsets is None or host_block_offsets.ndim != 4:
+            return None
+        if pool_index >= host_block_offsets.shape[0]:
+            return None
+
+        rows = host_block_offsets[pool_index]
+        if 0 <= seq_offset < rows.shape[0]:
+            row_deltas = rows[seq_offset, 1] - rows[seq_offset, 0]
+            positive = row_deltas[row_deltas > 0]
+            if positive.numel() > 0:
+                kv_offset = int(positive[0])
+                if cache is not None:
+                    cache[cache_key] = kv_offset
+                return kv_offset
+        all_deltas = rows[:, 1] - rows[:, 0]
+        positive = all_deltas[all_deltas > 0]
+        if positive.numel() == 0:
+            return None
+        kv_offset = int(positive[0])
+        if cache is not None:
+            cache[cache_key] = kv_offset
+        return kv_offset
+
+    raise TypeError(f"Unsupported KV cache manager: {type(manager).__name__}.")
 
 
 @lru_cache(maxsize=128)

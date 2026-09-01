@@ -37,6 +37,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .utils import _get_kv_page_offset
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.prims_ts.context import BatchPrefillPagedTSWrapper
@@ -66,18 +67,28 @@ class PrimsTSFmha(PhasedFmha):
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
+        # Stable fixed-stride CSR storage for standard decode, plus aligned
+        # sequence-length staging shared by context and MLA decode.
         self._page_indices_buffer: Optional[torch.Tensor] = None
         self._fixed_indptr_buffer: Optional[torch.Tensor] = None
         self._sequence_lengths_buffer: Optional[torch.Tensor] = None
+        # Allocation-free scratch used to stage the dense, KV-tile-aligned
+        # context page table and its repeated-last-page gather indices.
         self._context_page_indices_buffer: Optional[torch.Tensor] = None
         self._context_page_gather_indices_buffer: Optional[torch.Tensor] = None
         self._context_page_columns_buffer: Optional[torch.Tensor] = None
         self._context_last_page_indices_buffer: Optional[torch.Tensor] = None
+        # Decode CSR and context page tables resize independently, so keep
+        # their row and column capacities separate.
         self._metadata_row_capacity = 0
         self._metadata_column_capacity = 0
         self._context_metadata_row_capacity = 0
         self._context_page_column_capacity = 0
+        # Cache each manager/pool's K-to-V page displacement without retaining
+        # the manager itself.
         self._kv_page_offset_cache: dict[tuple[int, int], int] = {}
+        # Device geometry is stable, while superseded metadata allocations must
+        # remain alive for CUDA graph nodes that captured their addresses.
         self._multi_processor_count: Optional[int] = None
         self._retained_metadata_buffers: list[tuple[torch.Tensor, ...]] = []
         # Every other plan attribute is fixed by this layer/model instance.
@@ -85,7 +96,11 @@ class PrimsTSFmha(PhasedFmha):
         self._context_wrappers: dict[int, "BatchPrefillPagedTSWrapper"] = {}
         self._decode_wrappers: dict[int, "BatchDecodePagedTSWrapper"] = {}
         self._mla_decode_wrappers: dict[int, "BatchMLADecodePagedTSWrapper"] = {}
+        # Decode plans retain views into the shared workspace and are invalidated
+        # whenever its underlying allocation changes.
         self._workspace_allocation: Optional[tuple[object, ...]] = None
+        # Byte range reserved for PrimTS decode scratch within the caller-owned
+        # shared FMHA workspace.
         self._decode_workspace_offset_bytes: Optional[int] = None
         self._decode_workspace_required_bytes = 0
 
@@ -403,60 +418,26 @@ class PrimsTSFmha(PhasedFmha):
                 "compatible with the PrimTS native CSR page-table ABI."
             )
 
-        if not is_mla and self._get_kv_page_offset(attn, meta, 0) is None:
+        if (
+            not is_mla
+            and _get_kv_page_offset(
+                attn,
+                meta,
+                0,
+                cache=self._kv_page_offset_cache,
+            )
+            is None
+        ):
             return False, "the K-to-V page displacement could not be resolved."
         return True, ""
 
-    def _get_kv_page_offset(
-        self,
-        attn: "TrtllmAttention",
-        meta: "TrtllmAttentionMetadata",
-        seq_offset: int,
-    ) -> Optional[int]:
-        """Return the V-page displacement relative to a K page ID."""
-        manager = meta.kv_cache_manager
-        local_layer_idx = attn.local_layer_idx
-        if local_layer_idx is None:
-            local_layer_idx = int(attn.get_local_layer_idx(meta))
-        pool_mapping = meta.host_kv_cache_pool_mapping
-        pool_index = int(pool_mapping[local_layer_idx, 0])
-        cache_key = (id(manager), pool_index)
-        cached = self._kv_page_offset_cache.get(cache_key)
-        if cached is not None:
-            return cached
+    @staticmethod
+    def _get_context_pages_per_kv_tile(page_size: int) -> int:
+        # Keep this import lazy: importing the vendored context module eagerly
+        # would make every FMHA registry import depend on FlashInfer and CuTe.
+        from tensorrt_llm._torch.attention_backend.prims_ts.context import _CONTEXT_KV_TILE_N
 
-        if isinstance(manager, KVCacheManagerV2):
-            kv_offsets = manager.kv_offset
-            kv_offset = int(kv_offsets[pool_index])
-            if kv_offset > 0:
-                self._kv_page_offset_cache[cache_key] = kv_offset
-                return kv_offset
-            return None
-
-        if isinstance(manager, KVCacheManager):
-            host_block_offsets = manager.host_kv_cache_block_offsets
-            if host_block_offsets is None or host_block_offsets.ndim != 4:
-                return None
-            if pool_index >= host_block_offsets.shape[0]:
-                return None
-
-            rows = host_block_offsets[pool_index]
-            if 0 <= seq_offset < rows.shape[0]:
-                row_deltas = rows[seq_offset, 1] - rows[seq_offset, 0]
-                positive = row_deltas[row_deltas > 0]
-                if positive.numel() > 0:
-                    kv_offset = int(positive[0])
-                    self._kv_page_offset_cache[cache_key] = kv_offset
-                    return kv_offset
-            all_deltas = rows[:, 1] - rows[:, 0]
-            positive = all_deltas[all_deltas > 0]
-            if positive.numel() == 0:
-                return None
-            kv_offset = int(positive[0])
-            self._kv_page_offset_cache[cache_key] = kv_offset
-            return kv_offset
-
-        raise TypeError(f"Unsupported KV cache manager: {type(manager).__name__}.")
+        return _CONTEXT_KV_TILE_N // page_size
 
     def _ensure_metadata_buffers(
         self,
@@ -467,10 +448,12 @@ class PrimsTSFmha(PhasedFmha):
         *,
         need_context: bool = False,
     ) -> None:
-        pages_per_kv_tile = 128 // page_size
-        context_column_capacity = (
-            (column_capacity + pages_per_kv_tile - 1) // pages_per_kv_tile
-        ) * pages_per_kv_tile
+        context_column_capacity = 0
+        if need_context:
+            pages_per_kv_tile = self._get_context_pages_per_kv_tile(page_size)
+            context_column_capacity = (
+                (column_capacity + pages_per_kv_tile - 1) // pages_per_kv_tile
+            ) * pages_per_kv_tile
         base_needs_allocation = (
             self._page_indices_buffer is None
             or self._fixed_indptr_buffer is None
@@ -610,7 +593,7 @@ class PrimsTSFmha(PhasedFmha):
         if cu_kv_seqlens.numel() < batch_size + 1:
             raise RuntimeError("PrimTS context cumulative KV lengths are too short.")
 
-        pages_per_kv_tile = 128 // page_size
+        pages_per_kv_tile = self._get_context_pages_per_kv_tile(page_size)
         active_pages = (max_kv_len + page_size - 1) // page_size
         required_padded_pages = (
             (active_pages + pages_per_kv_tile - 1) // pages_per_kv_tile
@@ -1129,7 +1112,12 @@ class PrimsTSFmha(PhasedFmha):
         # The returned pool and block table share the THOP flat-page index ABI.
         if kv_pool is None or block_tables is None:
             raise RuntimeError("TRT-LLM preprocessing did not return PrimTS KV metadata.")
-        kv_page_offset = self._get_kv_page_offset(attn, meta, params.seq_offset)
+        kv_page_offset = _get_kv_page_offset(
+            attn,
+            meta,
+            params.seq_offset,
+            cache=self._kv_page_offset_cache,
+        )
         if kv_page_offset is None:
             raise RuntimeError("PrimTS could not resolve the K-to-V page displacement.")
         k_cache, v_cache = self._standard_kv_views(kv_pool, kv_page_offset)
@@ -1289,7 +1277,12 @@ class PrimsTSFmha(PhasedFmha):
         # The returned pool and block table share the THOP flat-page index ABI.
         if kv_pool is None or block_tables is None:
             raise RuntimeError("TRT-LLM preprocessing did not return PrimTS KV metadata.")
-        kv_page_offset = self._get_kv_page_offset(attn, meta, params.seq_offset)
+        kv_page_offset = _get_kv_page_offset(
+            attn,
+            meta,
+            params.seq_offset,
+            cache=self._kv_page_offset_cache,
+        )
         if kv_page_offset is None:
             raise RuntimeError("PrimTS could not resolve the K-to-V page displacement.")
         k_cache, v_cache = self._standard_kv_views(kv_pool, kv_page_offset)
