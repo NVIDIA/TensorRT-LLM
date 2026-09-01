@@ -16,12 +16,17 @@
  */
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/promptTuningBuffers.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 
+#include <cuda_runtime_api.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <condition_variable>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -35,6 +40,41 @@ using VecTokens = tb::LlmRequest::VecTokens;
 using SizeType32 = tb::LlmRequest::SizeType32;
 using VecTokenExtraIds = tb::LlmRequest::VecTokenExtraIds;
 using VecUniqueTokens = tb::LlmRequest::VecUniqueTokens;
+
+namespace
+{
+
+class CudaStreamHostGate
+{
+public:
+    ~CudaStreamHostGate()
+    {
+        open();
+    }
+
+    static void CUDART_CB wait(void* opaque)
+    {
+        auto& gate = *static_cast<CudaStreamHostGate*>(opaque);
+        std::unique_lock lock{gate.mMutex};
+        gate.mCondition.wait(lock, [&gate] { return gate.mOpen; });
+    }
+
+    void open()
+    {
+        {
+            std::lock_guard lock{mMutex};
+            mOpen = true;
+        }
+        mCondition.notify_all();
+    }
+
+private:
+    std::mutex mMutex;
+    std::condition_variable mCondition;
+    bool mOpen{false};
+};
+
+} // namespace
 
 class LlmRequestTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
@@ -160,6 +200,52 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         }
         EXPECT_EQ(llmReq.getUniqueTokens(0), uniqueTokens);
     }
+}
+
+TEST_F(LlmRequestTest, promptEmbeddingTableH2DSourceLifetime)
+{
+    auto stream = std::make_shared<tr::CudaStream>();
+    tr::BufferManager manager{stream};
+
+    SizeType32 constexpr promptVocabSize{23};
+    SizeType32 constexpr hiddenSize{64};
+    tr::ModelConfig modelConfig(256, 1, 1, 0, 1, hiddenSize, nvinfer1::DataType::kFLOAT);
+    modelConfig.setMaxPromptEmbeddingTableSize(promptVocabSize);
+    tr::WorldConfig worldConfig;
+    tb::PromptTuningBuffers promptTuningBuffers(1, manager, modelConfig, worldConfig, false);
+
+    // Hold this stream before the H2D so the first cleanup poll deterministically sees an incomplete event. The gate's
+    // destructor opens it before promptTuningBuffers is destroyed, including on an early ASSERT return.
+    CudaStreamHostGate streamGate;
+    TLLM_CUDA_CHECK(cudaLaunchHostFunc(stream->get(), &CudaStreamHostGate::wait, &streamGate));
+
+    auto promptEmbeddingTable = tr::BufferManager::pinnedPool(
+        tr::ITensor::makeShape({1, promptVocabSize, hiddenSize}), nvinfer1::DataType::kFLOAT);
+    std::weak_ptr<tr::ITensor> promptEmbeddingTableWeak = promptEmbeddingTable;
+
+    std::optional<tr::ITensor::SharedPtr> promptEmbeddingTableOpt{std::move(promptEmbeddingTable)};
+    auto request = std::make_shared<tb::LlmRequest>(1, 1, VecTokens{1}, tr::SamplingConfig{}, false, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::move(promptEmbeddingTableOpt),
+        promptVocabSize);
+    tb::RequestVector contextRequests{request};
+
+    promptTuningBuffers.fill(contextRequests, {}, manager, false);
+    ASSERT_TRUE(request->getPromptEmbeddingTable().has_value());
+    EXPECT_EQ(request->getPromptEmbeddingTable().value()->getMemoryType(), tr::MemoryType::kGPU);
+
+    contextRequests.clear();
+    request.reset();
+
+    // Request cancellation/destruction must not block and must not control the asynchronous copy's source lifetime.
+    EXPECT_FALSE(promptEmbeddingTableWeak.expired());
+
+    promptTuningBuffers.fill({}, {}, manager, false);
+    EXPECT_FALSE(promptEmbeddingTableWeak.expired());
+
+    streamGate.open();
+    stream->synchronize();
+    promptTuningBuffers.fill({}, {}, manager, false);
+    EXPECT_TRUE(promptEmbeddingTableWeak.expired());
 }
 
 TEST_F(LlmRequestTest, invalidExecRequest)

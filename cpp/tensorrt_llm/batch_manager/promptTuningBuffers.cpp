@@ -18,12 +18,49 @@
 #include "tensorrt_llm/batch_manager/promptTuningBuffers.h"
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/runtime/cudaEvent.h"
 
 namespace tensorrt_llm::batch_manager
 {
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TensorPtr = runtime::ITensor::SharedPtr;
+
+class PromptTuningBuffers::PendingPromptEmbeddingTableH2DCopy
+{
+public:
+    explicit PendingPromptEmbeddingTableH2DCopy(TensorPtr source)
+        : mSource{std::move(source)}
+    {
+    }
+
+    void recordCompletion(runtime::CudaStream const& stream)
+    {
+        stream.record(mCompletionEvent);
+        mCompletionEventRecorded = true;
+    }
+
+    [[nodiscard]] bool isComplete() const
+    {
+        return mCompletionEventRecorded && mCompletionEvent.isComplete();
+    }
+
+    [[nodiscard]] bool hasRecordedCompletionEvent() const
+    {
+        return mCompletionEventRecorded;
+    }
+
+    void synchronize() const
+    {
+        mCompletionEvent.synchronize();
+    }
+
+private:
+    TensorPtr mSource;
+    runtime::CudaEvent mCompletionEvent;
+    bool mCompletionEventRecorded{false};
+};
 
 PromptTuningBuffers::PromptTuningBuffers(SizeType32 maxBatchSize, runtime::BufferManager const& manager,
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig)
@@ -74,6 +111,58 @@ PromptTuningBuffers::PromptTuningBuffers(SizeType32 maxBatchSize, runtime::Buffe
     mPromptTuningParams.tasks = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
 }
 
+PromptTuningBuffers::~PromptTuningBuffers()
+{
+    for (auto& pendingCopy : mPendingPromptEmbeddingTableH2DCopies)
+    {
+        if (!pendingCopy->hasRecordedCompletionEvent())
+        {
+            // An exception occurred after ownership was retained but before completion could be recorded. Completion
+            // cannot be proven, so intentionally quarantine the pooled-pinned source instead of making it reusable.
+            TLLM_LOG_ERROR("Quarantining prompt embedding table source because its H2D completion was not recorded");
+            static_cast<void>(pendingCopy.release());
+            continue;
+        }
+
+        try
+        {
+            // Wait only for this source's H2D copy, not for unrelated work queued later on the runtime stream.
+            pendingCopy->synchronize();
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_EXCEPTION(e);
+            // Releasing this source without proving completion would recreate the pinned-pool reuse race. Leaking the
+            // small holder on this exceptional shutdown path is the safe failure mode.
+            static_cast<void>(pendingCopy.release());
+        }
+    }
+}
+
+void PromptTuningBuffers::releasePromptEmbeddingTableHostBuffersIfReady()
+{
+    for (auto it = mPendingPromptEmbeddingTableH2DCopies.begin(); it != mPendingPromptEmbeddingTableH2DCopies.end();)
+    {
+        if ((*it)->isComplete())
+        {
+            it = mPendingPromptEmbeddingTableH2DCopies.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+PromptTuningBuffers::PendingPromptEmbeddingTableH2DCopy&
+PromptTuningBuffers::retainPromptEmbeddingTableHostBufferBeforeCopy(TensorPtr source)
+{
+    auto pendingCopy = std::make_unique<PendingPromptEmbeddingTableH2DCopy>(std::move(source));
+    auto& result = *pendingCopy;
+    mPendingPromptEmbeddingTableH2DCopies.emplace_back(std::move(pendingCopy));
+    return result;
+}
+
 void PromptTuningBuffers::validate(
     std::optional<TensorPtr> const& optReqPromptEmbeddingTable, std::optional<SizeType32> const& optReqPromptVocabSize)
 {
@@ -117,6 +206,8 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
     runtime::BufferManager const& manager, bool packed)
 {
     NVTX3_SCOPED_RANGE_WITH_NAME(range, "PromptTuningBuffers::fill");
+
+    releasePromptEmbeddingTableHostBuffersIfReady();
 
     auto const numContextRequests = static_cast<SizeType32>(contextRequests.size());
 
@@ -172,8 +263,19 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
                     }
                     else
                     {
-                        // Move to GPU
-                        llmReq->movePromptEmbeddingTableToGpu(manager);
+                        // Keep the pooled-pinned source alive outside the request until its asynchronous H2D copy has
+                        // completed. Request cancellation must neither release the source nor wait for the copy.
+                        auto hostPromptEmbeddingTable = optReqPromptEmbeddingTable.value();
+                        if (hostPromptEmbeddingTable->getMemoryType() != runtime::MemoryType::kGPU)
+                        {
+                            // Allocate and link the holder before queuing the asynchronous copy. Once copyFrom returns,
+                            // no potentially-throwing ownership operation may occur before the completion event is
+                            // recorded.
+                            auto& pendingCopy
+                                = retainPromptEmbeddingTableHostBufferBeforeCopy(std::move(hostPromptEmbeddingTable));
+                            llmReq->movePromptEmbeddingTableToGpu(manager);
+                            pendingCopy.recordCompletion(manager.getStream());
+                        }
                         optReqPromptEmbeddingTable = llmReq->getPromptEmbeddingTable();
                     }
 

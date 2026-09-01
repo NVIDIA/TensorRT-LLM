@@ -66,6 +66,22 @@ public:
         TLLM_CUDA_CHECK(::cudaEventSynchronize(get()));
     }
 
+    //! \brief Returns true when all work captured by the event has completed.
+    [[nodiscard]] bool isComplete() const
+    {
+        auto const error = ::cudaEventQuery(get());
+        if (error == cudaSuccess)
+        {
+            return true;
+        }
+        if (error == cudaErrorNotReady)
+        {
+            return false;
+        }
+        TLLM_CUDA_CHECK(error);
+        return false;
+    }
+
 private:
     class Deleter
     {
