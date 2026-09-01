@@ -45,6 +45,45 @@ scaffold still derive from that project.
 `preprocess.py` implements the routing/threshold stage in Triton, so Triton is
 a required runtime dependency on every Sol-Attn path, not only a fallback.
 
+## A derived file outside this directory
+
+`../sol_attn_backend.py` is **not** part of the vendored package above, but it
+is a derivative work and is recorded here because this file is where a future
+currency check starts. It is adapted from upstream's
+`techniques/sparse_backends/sol_attn_backend.py` (same branch and commit as the
+package). Only the kernel-wrapper subset is carried -- the shape/dtype guard,
+the dense-SDPA fallback, and the call counters. Upstream's model-integration
+half is not carried: the diffusers self-attention dispatch hook, HunyuanVideo's
+padded `[video, text]` MMDiT handling, and model-level Morton ordering.
+
+Deliberate divergences from upstream in that file, all of which a re-sync must
+preserve rather than overwrite:
+
+| Divergence | Why |
+|---|---|
+| `logger.warning_once` replaces `print()` | fallbacks must be suppressible and routed through the repo's logger |
+| `dense_fallback_calls` counter added | makes a silently-degraded run countable, not just visible in stderr |
+| `sol_attn_ineligible_reason()` added | names the specific reason (arch / head_dim / dtype) instead of one boolean |
+| `SOL_ATTN_STRICT=1` also covers the eligibility path | upstream raises only on kernel exceptions, so an ineligible run stayed silent |
+| `@torch.compiler.disable` on `_run_sol_attn_bthd` | see below |
+
+**Upstream solves the `torch.compile` problem differently, and arguably
+better.** Its `sol_attn_backend.py` wraps the same call in a
+`torch.library.custom_op` (`sana_sol_attn::self_attention`) with a
+`register_fake` returning `torch.empty_like(q)`, which keeps the kernel in the
+compiled graph as an opaque node instead of breaking the graph at it; a second
+consumer (`models/ltx2.5-refiner/GB200/sol_attention.py`) applies
+`torch.compiler.disable` at the call site behind a flag. This repository uses
+`@torch.compiler.disable` on the launch boundary instead, matching the
+convention every other CuTe DSL entry point here already follows
+(`attention_backend/cute_dsl/fmha.py`,
+`cute_dsl_kernels/blackwell/video_sparse_attention/interface.py`). Without some
+such guard Dynamo traces into the CuTe DSL JIT builder and retraces on every
+call -- measured at 69x slower on B200. Migrating to the `custom_op` form would
+remove the per-layer graph break and is a reasonable follow-up; it was not done
+here because the `torch.compiler.disable` form is what this repository's other
+kernels use and what the measurements above were taken with.
+
 The runtime also depends on NVIDIA CUTLASS / CuTe DSL, cuda-python, and
 PyTorch. Those dependencies are not redistributed by this repository and
 remain subject to their respective licenses.

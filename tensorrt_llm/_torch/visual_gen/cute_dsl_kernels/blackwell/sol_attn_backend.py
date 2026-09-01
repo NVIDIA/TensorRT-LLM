@@ -1,5 +1,10 @@
 """Shape/dtype guard and dense-fallback wrapper around the Sol-Attn kernel.
 
+Adapted from upstream's ``techniques/sparse_backends/sol_attn_backend.py`` at
+the pin in ``sol_attn/THIRD_PARTY_NOTICES.md``, which records exactly which
+subset is carried and how this version deliberately diverges. Check that file
+before re-syncing against upstream.
+
 The kernel-facing API accepts contiguous BF16
 ``[batch, tokens, heads, 128]`` Q/K/V, ``tau``, ``thresh_type``,
 ``kv_splits``, and an optional exact KV sink range.
