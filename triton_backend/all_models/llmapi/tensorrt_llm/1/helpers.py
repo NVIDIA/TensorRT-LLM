@@ -24,6 +24,7 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import importlib
 import os
 
 import numpy as np
@@ -32,6 +33,8 @@ import triton_python_backend_utils as pb_utils
 from torch.utils.dlpack import from_dlpack
 
 _LORA_CKPT_SOURCES = ("hf", "nemo")
+
+_LOGITS_POST_PROCESSOR_INPUT_NAME = "sampling_param_logits_post_processor_name"
 
 
 def _decode_string_scalar(value):
@@ -175,6 +178,88 @@ def get_lora_request_from_request(request, batch_size=1, batch_index=0):
                        lora_int_id=int(lora_id),
                        lora_path=lora_path,
                        lora_ckpt_source=lora_ckpt_source)
+
+
+def load_logits_post_processors(specs):
+    """Import and instantiate named logits post-processors.
+
+    ``specs`` is the optional ``logits_post_processors`` section of
+    model.yaml: a mapping from processor name to a python import spec of the
+    form ``"module.path:attribute"``. The attribute may be a
+    ``tensorrt_llm.sampling_params.LogitsProcessor`` instance, or a class
+    that is instantiated once (with no arguments) at load time.
+
+    Import specs are resolved through the regular python import machinery
+    (never ``eval``'ed), so only code installed on the Triton server can be
+    referenced.
+
+    Used in llmapi/tensorrt_llm.
+    """
+    if not specs:
+        return {}
+    if not isinstance(specs, dict):
+        raise pb_utils.TritonModelException(
+            "logits_post_processors must be a mapping of "
+            "name -> 'module.path:attribute' import spec, "
+            f"got {type(specs).__name__}")
+    processors = {}
+    for name, spec in specs.items():
+        if not isinstance(spec, str) or ":" not in spec:
+            raise pb_utils.TritonModelException(
+                f"logits_post_processors['{name}'] must be an import spec "
+                f"of the form 'module.path:attribute', got {spec!r}")
+        module_name, _, attr_path = spec.partition(":")
+        try:
+            obj = importlib.import_module(module_name)
+        except ImportError as e:
+            raise pb_utils.TritonModelException(
+                f"logits_post_processors['{name}']: cannot import module "
+                f"'{module_name}': {e}")
+        for attr in attr_path.split("."):
+            try:
+                obj = getattr(obj, attr)
+            except AttributeError:
+                raise pb_utils.TritonModelException(
+                    f"logits_post_processors['{name}']: module "
+                    f"'{module_name}' has no attribute '{attr_path}'")
+        if isinstance(obj, type):
+            obj = obj()
+        if not callable(obj):
+            raise pb_utils.TritonModelException(
+                f"logits_post_processors['{name}']: '{spec}' resolved to a "
+                f"non-callable {type(obj).__name__}; expected a "
+                f"LogitsProcessor instance or class")
+        processors[name] = obj
+    return processors
+
+
+def get_logits_post_processor_from_request(request,
+                                           processors,
+                                           batch_size=1,
+                                           batch_index=0):
+    """Resolve the request's named logits post-processor, if any.
+
+    Reads the optional ``sampling_param_logits_post_processor_name`` input
+    and looks it up in ``processors`` (the mapping built by
+    :func:`load_logits_post_processors`). Returns None when the input is
+    absent or empty; raises for names that were not configured.
+
+    Used in llmapi/tensorrt_llm.
+    """
+    name = get_input_scalar_by_name(request, _LOGITS_POST_PROCESSOR_INPUT_NAME,
+                                    batch_size, batch_index)
+    if name is None:
+        return None
+    name = _decode_string_scalar(name)
+    if not name:
+        return None
+    if name not in processors:
+        available = sorted(processors) if processors else "none configured"
+        raise pb_utils.TritonModelException(
+            f"Unknown logits post-processor '{name}'. Processors must be "
+            f"declared under 'logits_post_processors' in model.yaml. "
+            f"Available: {available}")
+    return processors[name]
 
 
 def get_input_scalar_by_name(request,

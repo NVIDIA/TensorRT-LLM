@@ -40,10 +40,12 @@ import numpy as np
 import pandas as pd
 import triton_python_backend_utils as pb_utils
 import yaml
-from helpers import (get_input_tensor_by_name, get_lora_request_from_request,
+from helpers import (get_input_tensor_by_name,
+                     get_logits_post_processor_from_request,
+                     get_lora_request_from_request,
                      get_output_config_from_request,
                      get_sampling_params_from_request,
-                     get_streaming_from_request)
+                     get_streaming_from_request, load_logits_post_processors)
 
 # NOTE: tensorrt_llm imports are deferred to initialize() to support multi-instance deployments.
 # Root cause: CUDA is not fork-safe. Importing tensorrt_llm imports torch, which initializes
@@ -208,12 +210,24 @@ class TritonPythonModel:
         is_leader = global_mpi_rank() == 0
 
         if is_leader:
+            # Load named logits post-processors declared in model.yaml.
+            # This section is consumed here and must not reach the LLM
+            # engine arguments below.
+            self._logits_post_processors = load_logits_post_processors(
+                get_model_config(os.environ.get('LLM_CONFIG_PATH',
+                                                'model.yaml'),
+                                 include_keys=["logits_post_processors"
+                                               ]).get("logits_post_processors"))
+            if self._logits_post_processors:
+                self.logger.log_info(f"[trtllm] Loaded logits post-processors: "
+                                     f"{sorted(self._logits_post_processors)}")
+
             # Initialize engine arguments
             self.llm_engine_args = update_llm_args_with_extra_dict(
                 {},
-                get_model_config(os.environ.get('LLM_CONFIG_PATH',
-                                                'model.yaml'),
-                                 exclude_keys=["triton_config"]),
+                get_model_config(
+                    os.environ.get('LLM_CONFIG_PATH', 'model.yaml'),
+                    exclude_keys=["triton_config", "logits_post_processors"]),
             )
 
             # For multi-instance mode, set gpus_per_node to match the assigned GPUs
@@ -609,6 +623,10 @@ class TritonPythonModel:
             prompt = prompt.decode("utf-8")
 
         sampling_params = get_sampling_params_from_request(request)
+        logits_processor = get_logits_post_processor_from_request(
+            request, self._logits_post_processors)
+        if logits_processor is not None:
+            sampling_params['logits_processor'] = logits_processor
         output_config = get_output_config_from_request(request)
         streaming = get_streaming_from_request(request)
         lora_request = get_lora_request_from_request(request)

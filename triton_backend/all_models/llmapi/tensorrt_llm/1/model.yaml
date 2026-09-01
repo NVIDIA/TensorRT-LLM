@@ -8,6 +8,18 @@ backend: "pytorch"
 tensor_parallel_size: 1
 pipeline_parallel_size: 1
 
+# ======= Logits Post-Processors (optional) =======
+# Named logits post-processors that requests can select via the optional
+# 'sampling_param_logits_post_processor_name' input tensor. Each entry maps a
+# name to a python import spec 'module.path:attribute' resolving to a
+# tensorrt_llm.sampling_params.LogitsProcessor instance or class (classes are
+# instantiated once, with no arguments, at model load). The referenced module
+# must be importable on the Triton server (e.g. installed or on PYTHONPATH).
+#
+# logits_post_processors:
+#   ban_bad_words: my_company.processors:BadWordsBanner
+#   json_only: my_company.processors:json_guard
+
 
 # ======= Triton Server Configurations =======
 # Triton Configurations to override the default values in config.pbtxt

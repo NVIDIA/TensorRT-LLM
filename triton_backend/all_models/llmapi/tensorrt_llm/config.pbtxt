@@ -124,6 +124,14 @@ input [
     dims: [ 1 ]
     optional: true
   },
+  {
+    # Name of a logits post-processor declared under
+    # 'logits_post_processors' in model.yaml.
+    name: "sampling_param_logits_post_processor_name"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  },
   ## Arguments for Controlling Response Output Fields ##
   {
     name: "return_finish_reason"
