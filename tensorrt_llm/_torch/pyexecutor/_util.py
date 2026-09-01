@@ -144,7 +144,7 @@ def get_kv_cache_manager_cls(
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
-    quant_config = model_config.quant_config
+    quant_config = getattr(model_config, "quant_config", None)
     if (is_mla(config) and quant_config is not None
             and quant_config.quant_mode.has_fp4_kv_cache()):
         if is_disagg:
@@ -693,7 +693,7 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
-                quant_config = model_config.quant_config
+                quant_config = getattr(model_config, "quant_config", None)
                 if (is_mla(config) and quant_config is not None
                         and quant_config.quant_mode.has_fp4_kv_cache()):
                     raise NotImplementedError(

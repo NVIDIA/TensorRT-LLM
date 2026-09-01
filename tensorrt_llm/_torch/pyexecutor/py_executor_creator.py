@@ -56,7 +56,6 @@ _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
-FLASH_MLA_TOKENS_PER_BLOCK = 64
 FP4_MLA_TOKENS_PER_BLOCK = 128
 
 
@@ -215,29 +214,6 @@ def _has_fp4_kv_cache(model_config, kv_cache_config) -> bool:
 def _uses_fp4_mla_attention(model_config, kv_cache_config) -> bool:
     return (_has_fp4_kv_cache(model_config, kv_cache_config)
             and getattr(model_config, "attn_backend", None) == "TRTLLM")
-
-
-def _select_mla_tokens_per_block(config, model_config, kv_cache_config,
-                                 tokens_per_block: int) -> int:
-    if not is_mla(config):
-        return tokens_per_block
-
-    if _uses_fp4_mla_attention(model_config, kv_cache_config):
-        tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
-        logger.info(
-            f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
-        )
-        kv_cache_config.tokens_per_block = tokens_per_block
-        return tokens_per_block
-
-    if model_config.enable_flash_mla:
-        tokens_per_block = FLASH_MLA_TOKENS_PER_BLOCK
-        logger.info(
-            f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
-        )
-        kv_cache_config.tokens_per_block = tokens_per_block
-
-    return tokens_per_block
 
 
 def _configure_fp4_mla_speculative_kv_cache(spec_config, config, model_config,
@@ -727,10 +703,32 @@ def create_py_executor(
     )
     max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
                                 max_batch_size * getattr(mapping, "pp_size", 1))
-    tokens_per_block = _select_mla_tokens_per_block(
-        config, model_engine.model.model_config, kv_cache_config,
-        tokens_per_block)
     if is_mla(config):
+        if _uses_fp4_mla_attention(model_engine.model.model_config,
+                                   kv_cache_config):
+            tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
+            kv_cache_config.tokens_per_block = tokens_per_block
+            logger.info(
+                f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
+            )
+        else:
+            if model_engine.model.model_config.enable_flash_mla:
+                tokens_per_block = 64
+                # Propagate the override back to kv_cache_config so any consumer
+                # that later reads llm_args.kv_cache_config.tokens_per_block sees
+                # the effective value. KvCacheConnectorScheduler subclasses
+                # (LMCache, Dynamo KVBM) are instantiated further down via
+                # scheduler_cls(llm_args) and size their block pools from
+                # llm_args.kv_cache_config.tokens_per_block. Without this the
+                # connector's block size desynced from the KVCacheManager's
+                # actual tokens_per_block (user-set or default 32 vs. FlashMLA's
+                # forced 64), producing a frozen cache_block_ids view to the
+                # connector and silently-corrupted decode KV (#13320).
+                kv_cache_config.tokens_per_block = tokens_per_block
+                logger.info(
+                    f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
+                )
+
         sm_version = get_sm_version()
         if (kv_cache_config.enable_block_reuse and sm_version
                 not in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS):

@@ -7700,7 +7700,7 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
-        if not self._disable_overlap_scheduler:
+        if not getattr(self, "_disable_overlap_scheduler", True):
             # Do not refill reusable host staging while the previous
             # iteration's asynchronous H2D copies still consume it.  This
             # event precedes the model forward, so its synchronization retains
