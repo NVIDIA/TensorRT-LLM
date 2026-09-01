@@ -254,7 +254,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
     {
         setCudaStream(*stream);
     }
-    TLLM_CHECK_DEBUG_WITH_INFO(mCudaStream.has_value(), "cuda_stream is never set");
+    TLLM_CHECK_WITH_INFO(mCudaStream.has_value(), "cuda_stream is never set");
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
     // Check utilization against threshold.
