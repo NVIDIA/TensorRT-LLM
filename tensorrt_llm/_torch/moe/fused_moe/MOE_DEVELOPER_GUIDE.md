@@ -117,7 +117,7 @@ The codebase is transitioning between two architectures:
 
 ConfigurableMoE currently supports these backends (`create_moe.py`):
 - `CutlassFusedMoE`, `TRTLLMGenFusedMoE`, `DeepGemmFusedMoE`, `CuteDslFusedMoE`,
-  `CuteDslB12xFusedMoE`, `DenseGEMMFusedMoE`, `MegaMoEDeepGemm`,
+  `CuteDslB12xFusedMoE`, `CuteDslFc12FusedMoE`, `DenseGEMMFusedMoE`, `MegaMoEDeepGemm`,
   `MegaMoECuteDsl`, `MarlinFusedMoE`
 
 Still on old path (standalone, with embedded communication):
@@ -157,6 +157,7 @@ Still on old path (standalone, with embedded communication):
 | `fused_moe_densegemm.py` | `DenseGEMMFusedMoE` | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl.py` | `CuteDslFusedMoE` | SM100/SM103 | High throughput NVFP4, generally faster than Cutlass | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xFusedMoE` | SM120/SM121 | NVFP4 hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode — best perf on RTX PRO 6000 (SM120) and DGX Spark (SM121); select via the `CUTEDSL` backend path (it heads that family's candidate list, so it wins on SM120/121 when flashinfer is present and yields to `CuteDslFusedMoE` otherwise); single-GPU-shaped topology only — it rejects both `ep_size > 1` and attention-DP, because it has no dispatch/combine kernel and has never been exercised behind a DP allgather | `EXTERNAL_COMM` |
+| `fused_moe_cute_dsl_fc12.py` | `CuteDslFc12FusedMoE` | SM107 (Rubin) | NVFP4 fused FC1+FC2: subclass of `CuteDslFusedMoE` driving the single persistent `cute_dsl_nvfp4_fc12_fused_rubin` kernel (keeps the FC1->FC2 intermediate on-chip, removing the global round-trip and one launch); opt-in via the dedicated `CUTEDSL_FC12` backend family; requires CuTe DSL Rubin support (`IS_CUTLASS_DSL_RUBIN_AVAILABLE`); v1 kernel supports only the 128-wide tile; non-uGPU | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `MegaMoEDeepGemm` | SM100/SM103 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `mega_moe/mega_moe_cute_dsl.py` | `MegaMoECuteDsl` | SM100/SM103 | NVFP4 via ported CuteDSL `Sm100MegaMoEKernel` fused dispatch+FC1+act+FC2+combine kernel; requires CUDA 13 Cutlass DSL runtime (PR #14354) and NVSHMEM provider (hard gate); threads per-expert `fc31_alpha`/`fc2_alpha`/`fc1_norm_const` through the kernel ABI and takes the SwiGLU clamp as a `UNIFORM_SCALAR` (`gate_up_clamp=self.act_clamp`); default deepgemm graph (topk score folded before fc1-out quant, host `combine_output.sum(dim=1)`) | `FUSED_COMM` |
 | `fused_moe_marlin.py` | `MarlinFusedMoE` | SM89-SM99 | W4A16 NVFP4 on Ada/Hopper (BF16 activations + FP4 weights, fused single-launch `marlin_nvfp4_moe_gemm` kernel); supports attention-DP + EP via external comm (scheduler precomputes routing; dispatch payload is plain BF16, no activation scales); non-NVFP4 layers (e.g. unquantized MTP draft layers) degrade to Cutlass in `resolve_moe_impl`, recorded in the layer's `MoEResolutionReport`; no dynamic EPLB | `EXTERNAL_COMM` |

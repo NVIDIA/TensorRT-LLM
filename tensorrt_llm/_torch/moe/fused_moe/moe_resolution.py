@@ -31,6 +31,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .activation import ActivationParamShape, MoEActivation, activation_constant_names
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
@@ -78,6 +79,7 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     MegaMoEDeepGemm,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     MegaMoECuteDsl,
     CuteDslFusedMoE,
+    CuteDslFc12FusedMoE,  # SM107 (Rubin) NVFP4 fused FC1+FC2 -- opt-in via CUTEDSL_FC12
     TRTLLMGenFusedMoE,
     DeepGemmFusedMoE,
     DenseGEMMFusedMoE,
@@ -93,6 +95,7 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "VANILLA": frozenset({VanillaMoE}),
     "MARLIN": frozenset({MarlinFusedMoE}),
     "CUTEDSL": frozenset({CuteDslB12xFusedMoE, CuteDslFusedMoE}),
+    "CUTEDSL_FC12": frozenset({CuteDslFc12FusedMoE}),
     "DEEPGEMM": frozenset({DeepGemmFusedMoE}),
     "DENSEGEMM": frozenset({DenseGEMMFusedMoE}),
     "TRTLLM": frozenset({TRTLLMGenFusedMoE}),
