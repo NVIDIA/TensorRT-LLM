@@ -1029,8 +1029,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         self.img_context_token = self.config.img_context_token
         self.video_context_token = self.config.video_context_token
         self.video_context_token_id = self.config.video_context_token_id
-        self.img_start_token = self.config.img_start_token
-        self.img_end_token = self.config.img_end_token
+        # Nemotron 3.5 Super VL carries only `img_context_token`; fall back to the
+        # InternVL `<img>`/`</img>` pair its processor uses.
+        self.img_start_token = getattr(self.config, "img_start_token", "<img>")
+        self.img_end_token = getattr(self.config, "img_end_token", "</img>")
         # Pre-tokenize special tokens for video EVS processing (following vLLM).
         # These may be multi-token under BPE, so we store the full ID list.
         self._img_start_token_ids = self.tokenizer.encode(
@@ -1068,8 +1070,13 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                     "Dynamic resolution (enabled via `vision_config.min_num_patches`) only supports "
                     f"`config.ps_version='v2'. Got {pixel_shuffle_version=}."
                 )
+            # Nemotron 3.5 Super VL states the context length only on the inner
+            # `llm_config`, with no top-level `max_sequence_length`.
+            max_model_len = getattr(config, "max_sequence_length", None)
+            if max_model_len is None:
+                max_model_len = config.llm_config.max_position_embeddings
             self.dynamic_tiler = DynamicResolutionImageTiler(
-                max_model_len=config.max_sequence_length,
+                max_model_len=max_model_len,
                 patch_size=self.patch_size,
                 downsample_ratio=self.downsample_ratio,
                 min_num_patches=vision_args["min_num_patches"],
@@ -1082,12 +1089,17 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # Video temporal compression and sizing config.
         vision_config = getattr(config, "vision_config", config)
         self.video_temporal_patch_size = getattr(vision_config, "video_temporal_patch_size", 1)
+        # Tile-based (InternVL-style) checkpoints state the video sizing on
+        # `vision_config`. Patch-based ones (Nemotron 3.5 Super VL) state it on the
+        # image processor instead, and that processor has no `max_num_tiles`, so the
+        # tile fallback in `_process_videos_frames` cannot serve them.
+        video_sizing = vision_config if hasattr(self.processor, "max_num_tiles") else self.processor
         self.video_maintain_aspect_ratio = getattr(
-            vision_config, "video_maintain_aspect_ratio", False
+            video_sizing, "video_maintain_aspect_ratio", False
         )
         # Resolve video target size: video_target_num_patches or video_target_img_size.
-        target_num_patches = getattr(vision_config, "video_target_num_patches", None)
-        target_img_size = getattr(vision_config, "video_target_img_size", None)
+        target_num_patches = getattr(video_sizing, "video_target_num_patches", None)
+        target_img_size = getattr(video_sizing, "video_target_img_size", None)
         if target_num_patches is not None and target_img_size is not None:
             raise ValueError(
                 "Exactly one of video_target_num_patches or "
@@ -2613,6 +2625,9 @@ _NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 @register_vision_encoder(NanoV2VLMultimodalEncoder)
 @register_auto_model("NemotronH_Nano_Omni_Reasoning_V3")
 @register_auto_model("NemotronH_Nano_VL_V2")
+# Nemotron 3.5 Super VL: same class, no "Nano" infix, and vision-only (its
+# `sound_config` is null) despite the "Omni" in the architecture name.
+@register_auto_model("NemotronH_Omni_Reasoning_V3")
 @register_input_processor(
     NanoV2VLInputProcessor,
     model_type="NemotronH_Nano_VL_V2",
@@ -2621,6 +2636,13 @@ _NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 @register_input_processor(
     NanoV2VLInputProcessor,
     model_type="NemotronH_Nano_Omni_Reasoning_V3",
+    placeholder_metadata=_NANO_VL_PLACEHOLDER_METADATA,
+)
+# `model_type`, not architecture: the Nano checkpoints set both to the same
+# string, this one does not.
+@register_input_processor(
+    NanoV2VLInputProcessor,
+    model_type="nemotron_h_omni",
     placeholder_metadata=_NANO_VL_PLACEHOLDER_METADATA,
 )
 class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):

@@ -1214,11 +1214,12 @@ class RADIOVisionModel(PreTrainedModel):
         img_size = VIT_TIMM_CONFIG_BY_NAME[model_name].img_size
         mlp_ratio = intermediate_size / embed_dim
 
-        # Build the model.
+        # Build the model. C-RADIOv4-H omits `in_chans`, `input_size` and `drop`
+        # from the RADIO argument bag, so these reads tolerate their absence.
         in_chans = 3
-        if args.in_chans is not None:
+        if getattr(args, 'in_chans', None) is not None:
             in_chans = args.in_chans
-        elif args.input_size is not None:
+        elif getattr(args, 'input_size', None) is not None:
             in_chans = args.input_size[0]
         vit_model = VisionTransformer(
             img_size=img_size,
@@ -1228,7 +1229,7 @@ class RADIOVisionModel(PreTrainedModel):
             depth=depth,
             num_heads=num_attention_heads,
             mlp_ratio=mlp_ratio,
-            drop_rate=args.drop,
+            drop_rate=getattr(args, 'drop', 0.0),
             special_args=args,
             model_config=self.model_config,
         )
@@ -1242,30 +1243,41 @@ class RADIOVisionModel(PreTrainedModel):
         input_conditioner = nn.Identity()
         input_conditioner.dtype = config.torch_dtype
 
-        adaptor_names = config.adaptor_names or []
+        # C-RADIOv4 configs omit these three fields; absent means "not configured",
+        # which is the only case these guards accept anyway.
+        adaptor_names = getattr(config, 'adaptor_names', None) or []
         if len(adaptor_names) > 0:
             raise ValueError(
                 "Adaptor names are not supported for RADIO models.")
         adaptors = dict()
 
         feature_normalizer = None
-        if config.feature_normalizer_config is not None:
+        if getattr(config, 'feature_normalizer_config', None) is not None:
             raise ValueError(
                 "Feature normalizer is not supported for RADIO models.")
 
         inter_feature_normalizer = None
-        if config.inter_feature_normalizer_config is not None:
+        if getattr(config, 'inter_feature_normalizer_config', None) is not None:
             raise ValueError(
                 "Intermediate feature normalizer is not supported for RADIO models."
             )
+
+        # C-RADIOv4 renames both: `max_img_size` is `max_resolution`, and
+        # `image_size` the preferred (square) resolution. `vitdet_window_size`
+        # has no v4 counterpart; None is the constructor's own default.
+        max_resolution = (config.max_resolution if hasattr(
+            config, 'max_resolution') else config.max_img_size)
+        preferred_resolution = (config.preferred_resolution if hasattr(
+            config, 'preferred_resolution') else Resolution(
+                config.image_size, config.image_size))
 
         self.radio_model = RADIOVisionModelBase(
             vit_model,
             input_conditioner,
             patch_size=config.patch_size,
-            max_resolution=config.max_resolution,
-            window_size=config.vitdet_window_size,
-            preferred_resolution=config.preferred_resolution,
+            max_resolution=max_resolution,
+            window_size=getattr(config, 'vitdet_window_size', None),
+            preferred_resolution=preferred_resolution,
             adaptors=adaptors,
             feature_normalizer=feature_normalizer,
             inter_feature_normalizer=inter_feature_normalizer,
