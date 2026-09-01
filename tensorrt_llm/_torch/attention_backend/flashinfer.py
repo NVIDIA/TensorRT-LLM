@@ -193,7 +193,7 @@ class PlanParams:
 
 
 @dataclass(kw_only=True, frozen=True)
-class PlanWorkspaceKey:
+class _PlanWorkspaceKey:
     """Key for CUDA-graph workspaces that hold FlashInfer plan schedules.
 
     Different plan kinds need separate schedules. ``num_generations`` is
@@ -295,11 +295,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
     # Shallow-copied CUDA-graph replicas share one buffer and owner per key.
-    _plan_workspace_buffers: Dict[PlanWorkspaceKey,
+    _plan_workspace_buffers: Dict[_PlanWorkspaceKey,
                                   torch.Tensor] = field(init=False,
                                                         default_factory=dict,
                                                         repr=False)
-    _plan_workspace_owners: Dict[PlanWorkspaceKey, FlashInferWrappers] = field(
+    _plan_workspace_owners: Dict[_PlanWorkspaceKey, FlashInferWrappers] = field(
         init=False, default_factory=dict, repr=False)
 
     # MLA wrappers and stable buffers.
@@ -353,13 +353,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 or not self._owns_plan_workspace(plan_params, wrappers))
 
     def _get_plan_workspace_key(
-            self, plan_params: PlanParams) -> Optional[PlanWorkspaceKey]:
+            self, plan_params: PlanParams) -> Optional[_PlanWorkspaceKey]:
         is_persistent = (plan_params.attention_mask_data is None
                          and plan_params.multi_item_params is None)
         if not self.is_cuda_graph or not is_persistent:
             return None
 
-        return PlanWorkspaceKey(
+        return _PlanWorkspaceKey(
             num_heads=plan_params.num_heads,
             num_kv_heads=plan_params.num_kv_heads,
             head_dim=plan_params.head_dim,
