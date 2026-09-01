@@ -842,7 +842,6 @@ cuda_graph_config: null
 moe_config:
   backend: TRTLLM
   max_num_tokens: 8192
-```
 
 sparse_attention_config:
   algorithm: qsa
@@ -938,10 +937,10 @@ both passed this contract.
   [`qwen4_exp_hyper_connection_kernels.py`](../../../tensorrt_llm/_torch/modules/qwen4_exp_hyper_connection_kernels.py),
   and [`qwen4_exp_ple.py`](../../../tensorrt_llm/_torch/modules/qwen4_exp_ple.py)
 - MoE backend resolution and kernels:
-  [`moe_resolution.py`](../../../tensorrt_llm/_torch/modules/fused_moe/moe_resolution.py),
-  [`fused_moe_trtllm_gen.py`](../../../tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py),
-  [`fused_moe_cutlass.py`](../../../tensorrt_llm/_torch/modules/fused_moe/fused_moe_cutlass.py), and
-  [`fused_moe_deepgemm.py`](../../../tensorrt_llm/_torch/modules/fused_moe/fused_moe_deepgemm.py)
+  [`moe_resolution.py`](../../../tensorrt_llm/_torch/moe/fused_moe/moe_resolution.py),
+  [`fused_moe_trtllm_gen.py`](../../../tensorrt_llm/_torch/moe/fused_moe/fused_moe_trtllm_gen.py),
+  [`fused_moe_cutlass.py`](../../../tensorrt_llm/_torch/moe/fused_moe/fused_moe_cutlass.py), and
+  [`fused_moe_deepgemm.py`](../../../tensorrt_llm/_torch/moe/fused_moe/fused_moe_deepgemm.py)
 - MTP and accepted-state lifecycle:
   [`modeling_speculative.py`](../../../tensorrt_llm/_torch/models/modeling_speculative.py),
   [`mtp.py`](../../../tensorrt_llm/_torch/speculative/mtp.py), and
