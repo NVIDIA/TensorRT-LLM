@@ -12,15 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Device-side verify-window selection: the in-graph prologue.
+"""Device-side verify-window selection for the pre-replay prologue.
 
 The host planner decides windows from a confidence snapshot that is one
 iteration old (the batch reshuffles across the lag, and the read itself must
 not sync). This module ranks the block that is about to be verified by its
 OWN confidence instead: everything from the slot-indexed gather to the
-per-token row maps is a pure tensor function, so it can run at the head of
-the captured graph, after the previous step's draft wrote the confidence
-buffer and before this step's verify attention reads the layout.
+per-token row maps is device-resident.  The production exact-tier caller runs
+it immediately before replay, after the previous step's draft wrote the
+confidence buffer and before this step's verify attention reads the layout.
+The tensor-control fallback remains suitable for capture by a caller whose
+graph key owns all of its replay-varying controls.
 
 The split of responsibilities follows the paper's dual-timescale design:
 
@@ -30,14 +32,14 @@ The split of responsibilities follows the paper's dual-timescale design:
 * the RANKING -- which requests win the budget -- is computed here from
   fresh confidence, at zero staleness.
 
-Nothing in this module raises on data: a captured graph cannot branch.
-Feasibility (the bucket bounds) is checkable from host-known scalars before
-launch; per-row staleness degrades to the neutral row (verify everything for
-that request), mirroring the host planner's fail-open semantics.
+Per-row staleness degrades to the neutral row (verify everything for that
+request), mirroring the host planner's fail-open semantics.  Exact-tier
+feasibility is checked from host-known scalars before the fused launch; an
+unsupported fused shape falls back to the established tensor schedule/fill.
 """
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import torch
 
@@ -47,6 +49,7 @@ from .dspark_schedule import (
     DSparkScheduleConfig,
     compute_survival,
     schedule_verify_lens_topk,
+    schedule_verify_lens_topk_fused_fill,
 )
 
 __all__ = [
@@ -117,14 +120,15 @@ def select_windows_device(
     *,
     confidence_logits: torch.Tensor,
     slot_idx: torch.Tensor,
-    num_real: torch.Tensor,
-    budget: torch.Tensor,
+    num_real: Union[int, torch.Tensor],
+    budget: Union[int, torch.Tensor],
     graph_num_tokens: int,
     cfg: DSparkScheduleConfig,
     apply_calibration: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     stamp: Optional[torch.Tensor] = None,
     expected_stamp: Optional[torch.Tensor] = None,
     pad_len: Optional[int] = None,
+    use_fused_exact: bool = False,
 ) -> DeviceWindowResult:
     """Rank the batch by fresh confidence and pack it into the agreed bucket.
 
@@ -138,9 +142,12 @@ def select_windows_device(
         slot_idx: ``[padded_bs]`` int64 buffer row per batch position;
             entries at or beyond ``num_real`` are never read meaningfully
             (point them at any valid row, e.g. 0).
-        num_real: 0-d integer tensor; rows past it are padding.
-        budget: 0-d integer tensor, verify tokens above the floor -- the
-            host-decided (lagged) capacity knob, written before launch.
+        num_real: Python integer in the production pre-replay prologue, or a
+            0-d integer tensor for a device-owned caller; rows past it are
+            padding.
+        budget: Python integer in the production pre-replay prologue, or a
+            0-d integer tensor paired with tensor ``num_real``; verify tokens
+            above the floor -- the host-decided (lagged) capacity knob.
         graph_num_tokens: the captured token bucket (capture constant).
         cfg: scheduling bounds; ``resolved_max_verify_len + 1`` is the
             per-row token ceiling.
@@ -154,10 +161,16 @@ def select_windows_device(
             which its pre-launch copy widths depend on (see
             :func:`fill_bucket_device`). The caller must clamp ``budget`` so
             the real rows can absorb ``graph_num_tokens - n_pad * pad_len``.
+        use_fused_exact: enable the policy-neutral Triton fast path.
+            Production sets this only for shapes compiled successfully during
+            warmup and when its independent default-off switch is enabled;
+            false uses the established tensor schedule/fill implementation.
 
     Returns:
-        :class:`DeviceWindowResult`; every tensor is derived without a host
-        sync, so the call is capture-safe end to end.
+        :class:`DeviceWindowResult`; every output tensor stays device-resident.
+        The Python-control exact path is intended for the pre-replay prologue,
+        while the tensor-control fallback may be captured by a compatible
+        caller.
     """
     if confidence_logits.dim() != 2:
         raise ValueError(
@@ -165,6 +178,20 @@ def select_windows_device(
         )
     device = confidence_logits.device
     padded_bs = slot_idx.numel()
+    controls_are_tensors = isinstance(num_real, torch.Tensor)
+    if controls_are_tensors != isinstance(budget, torch.Tensor):
+        raise TypeError("num_real and budget must both be Python ints or both be tensors")
+    if controls_are_tensors:
+        if num_real.dim() != 0 or budget.dim() != 0:
+            raise ValueError("tensor num_real and budget must both be 0-d")
+        # Narrow integer controls can overflow while multiplying by K or while
+        # casting the verification budget; production scalar controls are ordinary
+        # Python ints, and a device-owned caller must use a safe width.
+        integer_dtypes = {torch.int32, torch.int64}
+        if num_real.dtype not in integer_dtypes or budget.dtype not in integer_dtypes:
+            raise TypeError("tensor num_real and budget must both have integer dtype")
+        if num_real.device != device or budget.device != device:
+            raise ValueError("tensor num_real and budget must share confidence_logits.device")
 
     selected = confidence_logits.index_select(0, slot_idx.to(torch.long))
     if stamp is not None:
@@ -179,24 +206,40 @@ def select_windows_device(
 
     calibrate = apply_calibration or torch.sigmoid
     survival = compute_survival(calibrate(selected))
-    # Pad rows must win no budget: zero survival sits below survival_eps, so
-    # the ranking never selects them and their windows stay at the floor
-    # until the fill tops them up.
+    # Pad rows must win no policy budget. Zero is below the configured
+    # numerical epsilon, preserving the established tensor scheduler exactly.
     is_real = torch.arange(padded_bs, device=device) < num_real
     survival = torch.where(is_real.unsqueeze(1), survival, torch.zeros_like(survival))
 
-    scheduled = schedule_verify_lens_topk(survival=survival, budget=budget, cfg=cfg)
-    # The scheduler counts drafted positions; the token window adds the
-    # bonus/anchor, matching every host fill_bucket callsite.
-    token_lens = scheduled + 1
     max_token_len = int(cfg.resolved_max_verify_len) + 1
-    filled = fill_bucket_device(
-        token_lens,
-        num_real=num_real,
-        graph_num_tokens=graph_num_tokens,
-        max_verify_len=max_token_len,
-        pad_fill=pad_len,
+    fused_exact = (
+        use_fused_exact
+        and pad_len is not None
+        and not controls_are_tensors
+        and padded_bs <= 256
+        and cfg.survival_eps > 0.0
     )
+    if fused_exact:
+        filled = schedule_verify_lens_topk_fused_fill(
+            survival=survival,
+            budget=int(budget),
+            num_real=int(num_real),
+            pad_len=int(pad_len),
+            cfg=cfg,
+            graph_num_tokens=graph_num_tokens,
+        )
+    else:
+        scheduled = schedule_verify_lens_topk(survival=survival, budget=budget, cfg=cfg)
+        # The scheduler counts drafted positions; the token window adds the
+        # bonus/anchor, matching every host fill_bucket callsite.
+        token_lens = scheduled + 1
+        filled = fill_bucket_device(
+            token_lens,
+            num_real=num_real,
+            graph_num_tokens=graph_num_tokens,
+            max_verify_len=max_token_len,
+            pad_fill=pad_len,
+        )
     req_idx, correction = build_row_maps_device(filled, graph_num_tokens=graph_num_tokens)
     return DeviceWindowResult(
         verify_lens=filled,

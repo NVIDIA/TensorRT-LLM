@@ -29,12 +29,16 @@ from dataclasses import dataclass
 from typing import Union
 
 import torch
+import triton
+import triton.language as tl
 
 __all__ = [
     "DSparkScheduleConfig",
+    "DSparkFusedScheduleError",
     "HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT",
     "NATIVE_UNIFORM_VERIFY_OUTPUT",
     "compute_survival",
+    "schedule_verify_lens_topk_fused_fill",
     "schedule_verify_lens_topk",
 ]
 
@@ -50,6 +54,15 @@ NEUTRAL_CONFIDENCE_LOGIT = 30.0
 # the current iteration's policy across overlap with the next iteration.
 HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT = "host_policy_windows_snapshot"
 NATIVE_UNIFORM_VERIFY_OUTPUT = "native_uniform_verify"
+
+
+class DSparkFusedScheduleError(RuntimeError):
+    """A synchronous optional fused-scheduler dispatch failure.
+
+    Input and graph-contract errors remain ordinary ``ValueError`` exceptions;
+    callers may safely disable one fused G only for this wrapped launch error
+    and rerun the established tensor implementation.
+    """
 
 
 @dataclass(frozen=True)
@@ -182,3 +195,248 @@ def schedule_verify_lens_topk(
     granted = selected.view(bs, schedulable).sum(dim=1).to(torch.int32)
     verify_lens += granted
     return torch.clamp(verify_lens, min=floor, max=cfg.resolved_max_verify_len)
+
+
+@triton.jit(do_not_specialize=["num_real", "budget"])
+def _schedule_topk_rank_kernel(
+    survival_ptr,
+    output_ptr,
+    stride_row,
+    stride_position,
+    num_real,
+    budget,
+    survival_eps,
+    FLOOR: tl.constexpr,
+    COLS: tl.constexpr,
+    NUM_CANDIDATES: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    BLOCK_CP: tl.constexpr,
+):
+    request = tl.program_id(0)
+    position = tl.arange(0, BLOCK_COLS)
+    candidate_mask = position < COLS
+    survival = tl.load(
+        survival_ptr + request * stride_row + (position + FLOOR).to(tl.int64) * stride_position,
+        mask=candidate_mask,
+        other=0.0,
+    ).to(tl.float32)
+    valid = candidate_mask & (survival >= survival_eps)
+    masked_survival = tl.where(valid, survival, float("-inf"))
+
+    rank = tl.zeros([BLOCK_COLS], dtype=tl.int32)
+    for peer_start in range(0, NUM_CANDIDATES, BLOCK_CP):
+        peer = peer_start + tl.arange(0, BLOCK_CP)
+        peer_mask = peer < NUM_CANDIDATES
+        peer_request = peer // COLS
+        peer_position = peer % COLS
+        peer_survival = tl.load(
+            survival_ptr
+            + peer_request.to(tl.int64) * stride_row
+            + (peer_position + FLOOR).to(tl.int64) * stride_position,
+            mask=peer_mask,
+            other=0.0,
+        ).to(tl.float32)
+        peer_valid = peer_mask & (peer_request < num_real) & (peer_survival >= survival_eps)
+        peer_masked_survival = tl.where(peer_valid, peer_survival, float("-inf"))
+
+        higher = peer_masked_survival[None, :] > masked_survival[:, None]
+        equal = peer_masked_survival[None, :] == masked_survival[:, None]
+        earlier = (peer_position[None, :] < position[:, None]) | (
+            (peer_position[None, :] == position[:, None]) & (peer_request[None, :] < request)
+        )
+        before = (higher | (equal & earlier)) & peer_valid[None, :]
+        rank += tl.sum(before.to(tl.int32), axis=1)
+
+    selected = valid & (rank < budget)
+    tl.store(output_ptr + request, tl.sum(selected.to(tl.int32), axis=0))
+
+
+@triton.jit(do_not_specialize=["num_real", "budget", "pad_len", "graph_num_tokens"])
+def _schedule_topk_fill_kernel(
+    output_ptr,
+    num_rows,
+    num_real,
+    budget,
+    pad_len,
+    graph_num_tokens,
+    TOKEN_FLOOR: tl.constexpr,
+    MAX_TOKEN_LEN: tl.constexpr,
+    HAS_CANDIDATES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.arange(0, BLOCK)
+    row_mask = rows < num_rows
+    is_real = row_mask & (rows < num_real)
+    selected_extra = tl.load(
+        output_ptr + rows,
+        mask=is_real & (budget > 0) & HAS_CANDIDATES,
+        other=0,
+    ).to(tl.int32)
+    token_len = tl.where(is_real, TOKEN_FLOOR + selected_extra, pad_len)
+
+    # Reproduce fill_bucket_device's exact-pad real-row phase. The explicit
+    # policy budget controls only the confidence-ranked allocation. Any
+    # already-paid graph remainder is filled round-robin in request-index
+    # order; fusion must not promote it into another confidence budget.
+    spare = graph_num_tokens - tl.sum(tl.where(row_mask, token_len, 0), axis=0)
+    for _ in range(MAX_TOKEN_LEN - 1):
+        headroom = is_real & (token_len < MAX_TOKEN_LEN)
+        in_cycle = tl.cumsum(headroom.to(tl.int32), axis=0) <= spare
+        grant = headroom & in_cycle
+        token_len += grant.to(tl.int32)
+        spare -= tl.sum(grant.to(tl.int32), axis=0)
+    tl.store(output_ptr + rows, token_len, mask=row_mask)
+
+
+def _schedule_verify_lens_topk_fused_fill_triton(
+    *,
+    survival: torch.Tensor,
+    budget: int,
+    num_real: int,
+    pad_len: int,
+    graph_num_tokens: int,
+    cfg: DSparkScheduleConfig,
+) -> torch.Tensor:
+    """Triton implementation of policy top-k plus exact round-robin fill."""
+    num_rows = survival.shape[0]
+    if num_rows == 0:
+        return torch.empty(0, dtype=torch.int32, device=survival.device)
+    if num_rows > 256:
+        raise ValueError(f"fused top-k scheduler supports at most 256 rows, got {num_rows}")
+    schedulable = int(cfg.schedulable_per_request)
+    output = torch.empty(num_rows, dtype=torch.int32, device=survival.device)
+
+    # Specialize rank work by the captured graph row count, never by the
+    # step-varying real-row count. This keeps one compiled kernel per all-G
+    # graph key; peer rows past num_real are masked inside the kernel.
+    num_candidates = num_rows * schedulable
+    ranked = budget > 0 and num_real > 0 and num_candidates > 0
+    if ranked:
+        block_cols = triton.next_power_of_2(schedulable)
+        block_cp = 128
+        try:
+            _schedule_topk_rank_kernel[(num_real,)](
+                survival,
+                output,
+                survival.stride(0),
+                survival.stride(1),
+                num_real,
+                budget,
+                float(cfg.survival_eps),
+                FLOOR=int(cfg.min_verify_len),
+                COLS=schedulable,
+                NUM_CANDIDATES=num_candidates,
+                BLOCK_COLS=block_cols,
+                BLOCK_CP=block_cp,
+            )
+        except Exception as exc:
+            raise DSparkFusedScheduleError("DSpark fused top-k rank launch failed") from exc
+    finalize_block = triton.next_power_of_2(num_rows)
+    try:
+        _schedule_topk_fill_kernel[(1,)](
+            output,
+            num_rows,
+            num_real,
+            budget,
+            pad_len,
+            graph_num_tokens,
+            TOKEN_FLOOR=int(cfg.min_verify_len) + 1,
+            MAX_TOKEN_LEN=int(cfg.resolved_max_verify_len) + 1,
+            HAS_CANDIDATES=schedulable > 0,
+            BLOCK=finalize_block,
+        )
+    except Exception as exc:
+        raise DSparkFusedScheduleError("DSpark fused round-robin fill launch failed") from exc
+    return output
+
+
+def schedule_verify_lens_topk_fused_fill(
+    *,
+    survival: torch.Tensor,
+    budget: int,
+    num_real: int,
+    pad_len: int,
+    cfg: DSparkScheduleConfig,
+    graph_num_tokens: int,
+) -> torch.Tensor:
+    """Fuse the established top-k schedule and exact round-robin bucket fill.
+
+    The explicit ``budget`` retains exactly the semantics of
+    :func:`schedule_verify_lens_topk`. Pad rows receive exactly ``pad_len``
+    tokens; any graph-token remainder is granted to real rows in index-order
+    round-robin cycles, exactly as ``fill_bucket_device(..., pad_fill=...)``.
+    CUDA uses two deterministic Triton launches. CPU executes the established
+    tensor operations as the functional oracle.
+    """
+    if survival.dim() != 2:
+        raise ValueError(f"survival must be [bs, K], got shape {tuple(survival.shape)}")
+    num_rows, num_positions = survival.shape
+    if num_positions != cfg.block_size:
+        raise ValueError(
+            f"survival has {num_positions} positions but block_size is {cfg.block_size}"
+        )
+    budget = int(budget)
+    num_real = int(num_real)
+    pad_len = int(pad_len)
+    if cfg.survival_eps <= 0.0:
+        raise ValueError(
+            "fused top-k scheduling requires survival_eps > 0 so zeroed pad "
+            "rows cannot compete for the legacy policy budget"
+        )
+    if not 0 <= num_real <= num_rows:
+        raise ValueError(f"num_real must be in [0, {num_rows}], got {num_real}")
+    max_token_len = int(cfg.resolved_max_verify_len) + 1
+    if not 1 <= pad_len <= max_token_len:
+        raise ValueError(f"pad_len must be in [1, {max_token_len}], got {pad_len}")
+
+    graph_num_tokens = int(graph_num_tokens)
+    token_floor = int(cfg.min_verify_len) + 1
+    pad_tokens = (num_rows - num_real) * pad_len
+    minimum_tokens = num_real * token_floor + pad_tokens
+    maximum_tokens = num_real * max_token_len + pad_tokens
+    scheduled_capacity = min(max(budget, 0), num_real * int(cfg.schedulable_per_request))
+    if not minimum_tokens + scheduled_capacity <= graph_num_tokens <= maximum_tokens:
+        raise ValueError(
+            "fused schedule cannot realize the selected CUDA graph without "
+            "changing policy semantics: "
+            f"expected [{minimum_tokens + scheduled_capacity}, {maximum_tokens}] "
+            f"tokens, graph requires {graph_num_tokens}"
+        )
+
+    if survival.is_cuda:
+        return _schedule_verify_lens_topk_fused_fill_triton(
+            survival=survival,
+            budget=budget,
+            num_real=num_real,
+            pad_len=pad_len,
+            graph_num_tokens=graph_num_tokens,
+            cfg=cfg,
+        )
+
+    rows = torch.arange(num_rows, device=survival.device)
+    real_survival = torch.where(
+        (rows < num_real).unsqueeze(1),
+        survival,
+        torch.full_like(survival, -1.0),
+    )
+    scheduled = schedule_verify_lens_topk(
+        survival=real_survival,
+        budget=budget,
+        cfg=cfg,
+    )
+    token_lens = torch.where(
+        rows < num_real,
+        scheduled + 1,
+        torch.full_like(scheduled, pad_len),
+    )
+    spare = graph_num_tokens - int(token_lens.sum())
+    for _ in range(max_token_len - 1):
+        if spare <= 0:
+            break
+        headroom = (rows < num_real) & (token_lens < max_token_len)
+        grant = headroom & (torch.cumsum(headroom.to(torch.int64), dim=0) <= spare)
+        token_lens += grant.to(torch.int32)
+        spare -= int(grant.sum())
+    if spare != 0:
+        raise ValueError(f"fused schedule left {spare} graph tokens after round-robin fill")
+    return token_lens

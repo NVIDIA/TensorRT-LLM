@@ -486,11 +486,14 @@ class PyTorchModelEngine(ModelEngine):
         self._dspark_confidence_enabled = bool(
             spec_config is not None
             and getattr(spec_config, "enable_confidence_scheduling", False))
+        self._dspark_fused_scheduler_enabled = bool(
+            spec_config is not None and getattr(
+                spec_config, "enable_fused_confidence_scheduler", False))
         self._dspark_trims_submitted_tokens = bool(
             self._dspark_confidence_enabled)
         self._dspark_device_windows = bool(
-            self._dspark_trims_submitted_tokens and getattr(
-                spec_config, "enable_fused_confidence_scheduler", False))
+            self._dspark_trims_submitted_tokens
+            and self._dspark_fused_scheduler_enabled)
         self.sparse_attention_config = None if is_draft_model else llm_args.sparse_attention_config
         self.enable_spec_decode = self.is_spec_decode
         self.is_draft_model = is_draft_model
@@ -1548,6 +1551,8 @@ class PyTorchModelEngine(ModelEngine):
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         self._warmup_dspark_ragged_compressor_metadata()
         log_mem_snapshot("warmup/after_dspark_ragged_compressor_metadata")
+        self._warmup_dspark_fused_scheduler()
+        log_mem_snapshot("warmup/after_dspark_fused_scheduler")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
         # MTP / DSL expansion factor when applicable). CUDA-graph warmup only
@@ -1582,6 +1587,94 @@ class PyTorchModelEngine(ModelEngine):
         # .fdata reflects steady-state serving only. No-op on normal builds.
         from ..bolt_profiling import maybe_bolt_clear_counters
         maybe_bolt_clear_counters()
+
+    @torch.inference_mode()
+    def _warmup_dspark_fused_scheduler(self) -> None:
+        """Compile the optional policy-neutral scheduler before live requests.
+
+        The device-window prologue is deliberately skipped during whole-model
+        CUDA-graph capture, so its Triton rank/finalize kernels would otherwise
+        compile on the first live compact step.  Compile every authenticated
+        exact-SPS graph row count on every rank and record only successful
+        shapes.  Unsupported shapes retain the established tensor fallback.
+        """
+        self._dspark_fused_schedule_ready_sizes = set()
+        if (not self._dspark_fused_scheduler_enabled
+                or not self._dspark_confidence_enabled
+                or not self._dspark_trims_submitted_tokens
+                or not self._dspark_device_windows):
+            return
+
+        worker = self._get_spec_worker()
+        planner = getattr(worker, "verify_planner", None)
+        exact_table = (planner.exact_cost_table
+                       if planner is not None else None)
+        if exact_table is None:
+            return
+
+        from ..speculative.dspark_schedule import \
+            schedule_verify_lens_topk_fused_fill
+
+        cfg = planner.cfg
+        if cfg.survival_eps <= 0.0:
+            logger.warning_once(
+                "DSpark fused scheduler requires survival_eps > 0; using the "
+                "tensor scheduler for every graph size",
+                key="dspark_fused_scheduler_zero_epsilon",
+            )
+            return
+        ready = []
+        with torch.inference_mode():
+            for graph_bs in sorted(int(g) for g in exact_table.tables):
+                if graph_bs > 256:
+                    logger.warning_once(
+                        "DSpark fused scheduler supports at most "
+                        f"256 rows; G={graph_bs} will use the tensor fallback",
+                        key=("dspark_fused_scheduler_unsupported_"
+                             f"{graph_bs}"),
+                    )
+                    continue
+                survival = torch.ones(
+                    (graph_bs, int(cfg.block_size)),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                try:
+                    warmup_budget = min(
+                        1, graph_bs * int(cfg.schedulable_per_request))
+                    graph_num_tokens = (graph_bs *
+                                        (int(cfg.min_verify_len) + 1) +
+                                        warmup_budget)
+                    schedule_verify_lens_topk_fused_fill(
+                        survival=survival,
+                        budget=warmup_budget,
+                        num_real=graph_bs,
+                        pad_len=1,
+                        cfg=cfg,
+                        graph_num_tokens=graph_num_tokens,
+                    )
+                except Exception as exc:
+                    logger.warning_once(
+                        "DSpark fused scheduler prewarm failed for "
+                        f"G={graph_bs}; using the tensor fallback. "
+                        f"{type(exc).__name__}: {exc}",
+                        key=("dspark_fused_scheduler_prewarm_failure_"
+                             f"{graph_bs}"),
+                    )
+                    continue
+                try:
+                    torch.cuda.synchronize()
+                except Exception as exc:
+                    # An asynchronous kernel failure may poison the context;
+                    # continuing with the tensor fallback is not safe.
+                    raise RuntimeError(
+                        "DSpark fused scheduler failed its startup "
+                        f"CUDA gate for G={graph_bs}") from exc
+                ready.append(graph_bs)
+
+        self._dspark_fused_schedule_ready_sizes = set(ready)
+        logger.info("DSpark fused scheduler prewarm complete for graph "
+                    f"batch sizes {ready}")
 
     @torch.inference_mode()
     def _warmup_dspark_ragged_compressor_metadata(self) -> None:
@@ -5388,6 +5481,42 @@ class PyTorchModelEngine(ModelEngine):
             request.py_verify_len = int(tokens) - 1
         return int(bucket)
 
+    def _select_dspark_windows_with_fused_fallback(
+        self,
+        *,
+        select_fn: Callable[..., Any],
+        selector_kwargs: Dict[str, Any],
+        padded_bs: int,
+    ) -> Any:
+        """Run the optional scheduler once, retiring only a failed graph G."""
+        from ..speculative.dspark_schedule import DSparkFusedScheduleError
+
+        ready_sizes = getattr(self, "_dspark_fused_schedule_ready_sizes", set())
+        use_fused_exact = padded_bs in ready_sizes
+        try:
+            return select_fn(**selector_kwargs, use_fused_exact=use_fused_exact)
+        except DSparkFusedScheduleError as exc:
+            if not use_fused_exact:
+                raise
+            # A synchronous optional-kernel failure must cost at most one step
+            # for this graph shape. Keep the established tensor path live and
+            # permanently retire the failing shape for this engine instance.
+            ready_sizes = set(ready_sizes)
+            ready_sizes.discard(padded_bs)
+            self._dspark_fused_schedule_ready_sizes = ready_sizes
+            failure_counts = getattr(self,
+                                     "_dspark_fused_schedule_failure_counts",
+                                     {})
+            failure_counts[padded_bs] = failure_counts.get(padded_bs, 0) + 1
+            self._dspark_fused_schedule_failure_counts = failure_counts
+            logger.warning_once(
+                "DSpark fused scheduler failed for "
+                f"G={padded_bs}; disabling that shape and rerunning the exact "
+                f"tensor fallback. {type(exc).__name__}: {exc}",
+                key=f"dspark_fused_scheduler_runtime_failure_{padded_bs}",
+            )
+            return select_fn(**selector_kwargs, use_fused_exact=False)
+
     def _apply_device_window_prologue(self, inputs, new_tensors_device) -> bool:
         """Re-rank this step's verify windows on device, with fresh confidence.
 
@@ -5468,7 +5597,7 @@ class PyTorchModelEngine(ModelEngine):
         expected_stamp = worker.verified_draft_seq_cuda()
         stamps = worker.confidence_stamp_buffer(
         ) if expected_stamp is not None else None
-        result = select_windows_device(
+        selector_kwargs = dict(
             confidence_logits=worker.staged_confidence_buffer(),
             slot_idx=worker.batch_slot_view(padded_bs),
             num_real=n_real,
@@ -5479,6 +5608,11 @@ class PyTorchModelEngine(ModelEngine):
             stamp=stamps,
             expected_stamp=expected_stamp,
             pad_len=pad_len_tok,
+        )
+        result = self._select_dspark_windows_with_fused_fallback(
+            select_fn=select_windows_device,
+            selector_kwargs=selector_kwargs,
+            padded_bs=padded_bs,
         )
 
         lens_buf[:padded_bs].copy_(result.verify_lens)
