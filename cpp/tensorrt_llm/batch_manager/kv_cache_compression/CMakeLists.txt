@@ -1,5 +1,5 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
-# AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
 # use this file except in compliance with the License. You may obtain a copy of
@@ -13,16 +13,6 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
-  add_subdirectory(batch_manager)
-endif()
-
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
-  add_subdirectory(executor)
-endif()
-
-add_subdirectory(common)
-add_subdirectory(kernels)
-add_subdirectory(multi_gpu)
-add_subdirectory(runtime)
-add_subdirectory(thop)
+# Sources for the KVCM cold-page compression codec bridge. These are added to
+# the tensorrt_llm_batch_manager_static target by the parent CMakeLists.txt.
+set(KV_CACHE_COMPRESSION_SRCS kv_cache_compression/nativeColdPageCodec.cpp)
