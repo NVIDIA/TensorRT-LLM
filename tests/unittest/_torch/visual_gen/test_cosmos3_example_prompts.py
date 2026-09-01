@@ -260,7 +260,7 @@ class TestShippedPromptFiles:
             "action_edge_policy_droid",
         ],
     )
-    def test_bundled_prompt_files_load(self, name):
+    def test_bundled_prompt_files_load(self, name: str) -> None:
         data = cosmos3.load_prompt_file(f"prompts/{name}.json")
         assert data["prompt"]
 
@@ -272,7 +272,7 @@ class TestShippedPromptFiles:
             ("action_inverse_dynamics", "bridge_orig_lerobot"),
         ],
     )
-    def test_action_prompt_matches_example_domain(self, name, domain_name):
+    def test_action_prompt_matches_example_domain(self, name: str, domain_name: str) -> None:
         data = cosmos3.load_prompt_file(f"prompts/{name}.json")
         prompt = json.loads(data["prompt"])
         config = resolve_domain_action_config(domain_name=domain_name)
