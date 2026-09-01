@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import bisect
 import functools
+import inspect
 import math
 import os
 import weakref
-from collections import OrderedDict
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Set, Tuple
@@ -54,17 +55,80 @@ from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 
-# Exact scheduler-shape keys are unbounded over a process lifetime. A miss can
-# safely rerun selection, so retain only the most recently used shapes.
-_FMHA_SELECTION_CACHE_CAPACITY = 256
-_FMHA_SELECTION_CACHE_SANITY_CHECK_ENV = (
-    "TRTLLM_FMHA_SELECTION_CACHE_SANITY_CHECK")
+# Keep these general-purpose cache buckets aligned with the shape coverage used
+# by TRTLLM-Gen JIT warmup in fmhaKernels.h. Adding the predecessor of every
+# ceiling candidate prevents support changes at a candidate from aliasing with
+# the interval immediately below it. Values above the largest grid point share
+# the largest bucket.
+_FMHA_CACHE_BATCH_SIZE_CANDIDATES: Tuple[int, ...] = (
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    26,
+    28,
+    30,
+    32,
+    36,
+    40,
+    48,
+    56,
+    64,
+    80,
+    96,
+    128,
+    256,
+    384,
+    512,
+    768,
+    1024,
+    1280,
+    1536,
+    2048,
+)
+_FMHA_CACHE_SEQ_LEN_Q_CANDIDATES: Tuple[int, ...] = (1, 2, 4, 8, 32, 64, 128)
 
 
-class _FmhaSelectionCacheKey(NamedTuple):
+def _make_fmha_cache_grid(candidates: Tuple[int, ...]) -> Tuple[int, ...]:
+    return tuple(
+        sorted({
+            boundary
+            for candidate in candidates
+            for boundary in (candidate - 1, candidate) if boundary > 0
+        }))
+
+
+_FMHA_CACHE_BATCH_SIZE_GRID: Tuple[int, ...] = _make_fmha_cache_grid(
+    _FMHA_CACHE_BATCH_SIZE_CANDIDATES)
+_FMHA_CACHE_SEQ_LEN_Q_GRID: Tuple[int, ...] = _make_fmha_cache_grid(
+    _FMHA_CACHE_SEQ_LEN_Q_CANDIDATES)
+_FMHA_CACHE_SANITY_CHECK_ENV = ("TRTLLM_FMHA_CACHE_SANITY_CHECK")
+
+
+class _FmhaCacheKey(NamedTuple):
     context_batch_size: int
     generation_batch_size: int
-    generation_num_tokens: int
+    generation_seq_len_q: int
     attention_mask_type: AttentionMaskType
     use_spec_decoding: bool
     # LoRA can change the effective output from packed NVFP4 to unpacked BF16
@@ -73,10 +137,26 @@ class _FmhaSelectionCacheKey(NamedTuple):
     output_sf_dtype: Optional[torch.dtype]
 
 
-_FmhaSelectionInputSnapshot = Dict[str, str]
+_FmhaCacheInputs = Dict[str, str]
+_FMHA_CACHE_INPUT_EXCLUDED_FIELDS = frozenset({"kv_cache_manager"})
 
 
-def _is_fmha_selection_cache_enabled() -> bool:
+def _should_snapshot_fmha_cache_field(value: object, name: str) -> bool:
+    descriptor = inspect.getattr_static(type(value), name, None)
+    return (not name.startswith("_")
+            and name not in _FMHA_CACHE_INPUT_EXCLUDED_FIELDS
+            and not isinstance(descriptor,
+                               (property, functools.cached_property)))
+
+
+def _normalize_fmha_cache_grid_value(value: int, grid: Tuple[int, ...]) -> int:
+    if value <= 0:
+        return 0
+    index = bisect.bisect_left(grid, value)
+    return grid[min(index, len(grid) - 1)]
+
+
+def _is_fmha_cache_enabled() -> bool:
     # Selection policy may differ while tuning (currently for CuTe DSL MLA).
     # Keep all temporary selections out of the serving cache so future FMHAs
     # inherit the same cache boundary.
@@ -86,12 +166,12 @@ def _is_fmha_selection_cache_enabled() -> bool:
     return autotuner is None or not autotuner.is_tuning_mode
 
 
-def _is_fmha_selection_cache_sanity_check_enabled() -> bool:
-    return os.environ.get(_FMHA_SELECTION_CACHE_SANITY_CHECK_ENV, "0") == "1"
+def _is_fmha_cache_sanity_check_enabled() -> bool:
+    return os.environ.get(_FMHA_CACHE_SANITY_CHECK_ENV, "0") == "1"
 
 
-def _snapshot_fmha_selection_value(
-    snapshot: _FmhaSelectionInputSnapshot,
+def _snapshot_fmha_cache_value(
+    snapshot: _FmhaCacheInputs,
     path: str,
     value: object,
     seen: Set[int],
@@ -110,8 +190,8 @@ def _snapshot_fmha_selection_value(
             return
         seen.add(id(value))
         for value_field in fields(value):
-            if not value_field.name.startswith("_"):
-                _snapshot_fmha_selection_value(
+            if _should_snapshot_fmha_cache_field(value, value_field.name):
+                _snapshot_fmha_cache_value(
                     snapshot,
                     f"{path}.{value_field.name}",
                     getattr(value, value_field.name),
@@ -122,79 +202,61 @@ def _snapshot_fmha_selection_value(
             return
         seen.add(id(value))
         for index, item in enumerate(value):
-            _snapshot_fmha_selection_value(snapshot, f"{path}[{index}]", item,
-                                           seen)
+            _snapshot_fmha_cache_value(snapshot, f"{path}[{index}]", item, seen)
     elif isinstance(value, dict):
         if id(value) in seen:
             return
         seen.add(id(value))
         for key in sorted(value, key=repr):
-            _snapshot_fmha_selection_value(snapshot, f"{path}[{key!r}]",
-                                           value[key], seen)
+            _snapshot_fmha_cache_value(snapshot, f"{path}[{key!r}]", value[key],
+                                       seen)
 
 
-def _snapshot_fmha_selection_fields(
-    snapshot: _FmhaSelectionInputSnapshot,
+def _snapshot_fmha_cache_fields(
+    snapshot: _FmhaCacheInputs,
     path: str,
     value: object,
     seen: Set[int],
 ) -> None:
     seen.add(id(value))
     if is_dataclass(value):
-        value_fields = ((value_field.name, getattr(value, value_field.name))
-                        for value_field in fields(value)
-                        if not value_field.name.startswith("_"))
+        value_fields = (
+            (value_field.name, getattr(value, value_field.name))
+            for value_field in fields(value)
+            if _should_snapshot_fmha_cache_field(value, value_field.name))
     else:
         value_fields = ((name, field_value)
                         for name, field_value in vars(value).items()
-                        if not name.startswith("_"))
+                        if _should_snapshot_fmha_cache_field(value, name))
     for name, field_value in value_fields:
-        _snapshot_fmha_selection_value(snapshot, f"{path}.{name}", field_value,
-                                       seen)
+        _snapshot_fmha_cache_value(snapshot, f"{path}.{name}", field_value,
+                                   seen)
 
 
-def _snapshot_fmha_selection_inputs(
+def _snapshot_fmha_cache_inputs(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
     v: Optional[torch.Tensor],
     metadata: "TrtllmAttentionMetadata",
     forward_args: AttentionForwardArgs,
-) -> _FmhaSelectionInputSnapshot:
-    snapshot: _FmhaSelectionInputSnapshot = {}
+) -> _FmhaCacheInputs:
+    snapshot: _FmhaCacheInputs = {}
     seen: Set[int] = set()
-    _snapshot_fmha_selection_value(snapshot, "q", q, seen)
-    _snapshot_fmha_selection_value(snapshot, "k", k, seen)
-    _snapshot_fmha_selection_value(snapshot, "v", v, seen)
-    _snapshot_fmha_selection_fields(snapshot, "metadata", metadata, seen)
-    _snapshot_fmha_selection_fields(snapshot, "forward_args", forward_args,
-                                    seen)
-
-    # These values are properties derived from tensor contents or runtime
-    # objects, so the direct field walk above cannot expose them.
-    for name in ("num_generations", "num_ctx_tokens", "num_tokens", "is_cross",
-                 "tokens_per_block"):
-        value = getattr(metadata, name, None)
-        _snapshot_fmha_selection_value(snapshot, f"metadata.{name}", value,
-                                       seen)
-    kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
-    snapshot["metadata.has_kv_cache_manager"] = repr(
-        kv_cache_manager is not None)
-    if kv_cache_manager is not None:
-        for name in ("dtype", "tokens_per_block"):
-            value = getattr(kv_cache_manager, name, None)
-            _snapshot_fmha_selection_value(snapshot,
-                                           f"metadata.kv_cache_manager.{name}",
-                                           value, seen)
+    _snapshot_fmha_cache_value(snapshot, "q", q, seen)
+    _snapshot_fmha_cache_value(snapshot, "k", k, seen)
+    _snapshot_fmha_cache_value(snapshot, "v", v, seen)
+    _snapshot_fmha_cache_fields(snapshot, "metadata", metadata, seen)
+    _snapshot_fmha_cache_fields(snapshot, "forward_args", forward_args, seen)
     return snapshot
 
 
-def _format_fmha_selection_input_diff(
-    cached: Optional[_FmhaSelectionInputSnapshot],
-    uncached: _FmhaSelectionInputSnapshot,
+def _format_fmha_cache_input_diff(
+    cached: Optional[_FmhaCacheInputs],
+    uncached: _FmhaCacheInputs,
 ) -> str:
     if cached is None:
         return ("  cached input snapshot unavailable; enable "
-                f"{_FMHA_SELECTION_CACHE_SANITY_CHECK_ENV} before the cache "
+                f"{_FMHA_CACHE_SANITY_CHECK_ENV} before the cache "
                 "entry is created")
 
     missing = "<missing>"
@@ -210,25 +272,25 @@ def _format_fmha_selection_input_diff(
     return "\n".join(differences)
 
 
-def _fmha_selections_match(cached: Optional[Fmha],
-                           uncached: Optional[Fmha]) -> bool:
+def _fmha_cache_values_match(cached: Optional[Fmha],
+                             uncached: Optional[Fmha]) -> bool:
     if cached is uncached:
         return True
     if not (isinstance(cached, CombinedFmha)
             and isinstance(uncached, CombinedFmha)):
         return False
-    return (_fmha_selections_match(cached._get_context_impl(),
-                                   uncached._get_context_impl())
-            and _fmha_selections_match(cached._get_generation_impl(),
-                                       uncached._get_generation_impl()))
+    return (_fmha_cache_values_match(cached._get_context_impl(),
+                                     uncached._get_context_impl())
+            and _fmha_cache_values_match(cached._get_generation_impl(),
+                                         uncached._get_generation_impl()))
 
 
-def _describe_fmha_selection(fmha: Optional[Fmha]) -> str:
+def _describe_fmha_cache_value(fmha: Optional[Fmha]) -> str:
     if fmha is None:
         return "None"
     if isinstance(fmha, CombinedFmha):
-        context = _describe_fmha_selection(fmha._get_context_impl())
-        generation = _describe_fmha_selection(fmha._get_generation_impl())
+        context = _describe_fmha_cache_value(fmha._get_context_impl())
+        generation = _describe_fmha_cache_value(fmha._get_generation_impl())
         return f"CombinedFmha(context={context}, generation={generation})"
     return type(fmha).__name__
 
@@ -1672,14 +1734,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.fmha_libs: List[Fmha] = []
         self.phased_fmha_libs: List[PhasedFmha] = []
         self.non_phased_fmha_libs: List[Fmha] = []
-        self._fmha_selection_cache: OrderedDict[_FmhaSelectionCacheKey,
-                                                Fmha] = OrderedDict()
-        self._fmha_selection_cache_sanity_inputs: Dict[
-            _FmhaSelectionCacheKey, _FmhaSelectionInputSnapshot] = {}
+        self._fmha_cache: Dict[_FmhaCacheKey, Fmha] = {}
+        self._fmha_cache_inputs: Dict[_FmhaCacheKey, _FmhaCacheInputs] = {}
         # Environment configuration is fixed for an attention instance so
         # normal forwarding never pays for an environment lookup.
-        self._fmha_selection_cache_sanity_check_enabled = (
-            _is_fmha_selection_cache_sanity_check_enabled())
+        self._fmha_cache_sanity_check_enabled = (
+            _is_fmha_cache_sanity_check_enabled())
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1935,10 +1995,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return self.rope_params.original_max_positions
 
     def create_fmha_libs(self) -> None:
-        self._fmha_selection_cache = OrderedDict()
-        self._fmha_selection_cache_sanity_inputs = {}
-        self._fmha_selection_cache_sanity_check_enabled = (
-            _is_fmha_selection_cache_sanity_check_enabled())
+        self._fmha_cache = {}
+        self._fmha_cache_inputs = {}
+        self._fmha_cache_sanity_check_enabled = (
+            _is_fmha_cache_sanity_check_enabled())
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
                 and get_sm_version() in (120, 121)
@@ -1958,55 +2018,60 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             fmha for fmha in self.fmha_libs if not isinstance(fmha, PhasedFmha)
         ]
 
-    def _make_fmha_selection_cache_key(
+    def _make_fmha_cache_key(
         self,
         q: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
-    ) -> _FmhaSelectionCacheKey:
-        """Build the dynamic selection key for one attention instance.
+    ) -> _FmhaCacheKey:
+        """Build the dynamic FMHA cache key for one attention instance.
 
-        FMHA selection inputs not represented here must remain invariants for
+        FMHA cache inputs not represented here must remain invariants for
         the cache lifetime. Rebuilding the FMHA library list starts a new one.
 
-        The batch fields describe the complete source scheduler batch, even
-        when ``q`` contains only one compacted phase. A zero
-        generation-token count distinguishes a context-only subcall from a
-        generation-active subcall with the same source batch composition.
-        Ordinary attention instances use mixed inputs, while MLA instances
-        use those compacted phase calls, so these values encode the
-        per-instance input regimes.
+        Batch size and generation Q length use ceiling grid buckets based on
+        TRTLLM-Gen JIT warmup candidates. Each candidate and its predecessor
+        are separate grid points so a support boundary at the candidate cannot
+        alias with the interval below it. Generation Q lengths are uniform in
+        the executor, including padded speculative-decoding batches.
 
-        Request dimensions must remain exact. FMHA support predicates can use
-        exact allowlists, thresholds, or kernel capability checks that do not
-        align with JIT warmup grids. The total generation-token count also
-        distinguishes speculative batches with non-uniform draft lengths.
+        The batch fields describe the complete source scheduler batch, even
+        when ``q`` contains only one compacted phase. Ordinary attention
+        instances use mixed inputs, while MLA instances use those compacted
+        phase calls, so the zero Q length still distinguishes a context-only
+        subcall from a generation-active subcall.
         """
         attention_input_type = forward_args.attention_input_type
         output_dtype = (forward_args.output.dtype
                         if forward_args.output is not None else None)
         output_sf_dtype = (forward_args.output_sf.dtype
                            if forward_args.output_sf is not None else None)
-        # Explicit mask data has the same FMHA selection constraints as a
+        # Explicit mask data has the same FMHA support constraints as a
         # custom mask enum, even when the accompanying enum remains causal.
         attention_mask_type = (AttentionMaskType.custom_mask if (
             forward_args.attention_mask == CustomAttentionMask.CUSTOM
             or forward_args.attention_mask_data is not None) else
                                AttentionMaskType(forward_args.mask_type))
 
-        context_batch_size = metadata.num_contexts
-        generation_batch_size = metadata.num_generations
-        generation_num_tokens = 0
+        context_batch_size = _normalize_fmha_cache_grid_value(
+            metadata.num_contexts, _FMHA_CACHE_BATCH_SIZE_GRID)
+        generation_batch_size = _normalize_fmha_cache_grid_value(
+            metadata.num_generations, _FMHA_CACHE_BATCH_SIZE_GRID)
+        generation_seq_len_q = 0
         if (attention_input_type != AttentionInputType.context_only
                 and metadata.num_generations > 0):
             generation_num_tokens = q.shape[0]
             if attention_input_type == AttentionInputType.mixed:
                 generation_num_tokens -= metadata.num_ctx_tokens
+            generation_seq_len_q = (generation_num_tokens //
+                                    metadata.num_generations)
+            generation_seq_len_q = _normalize_fmha_cache_grid_value(
+                generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID)
 
-        return _FmhaSelectionCacheKey(
+        return _FmhaCacheKey(
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
-            generation_num_tokens=generation_num_tokens,
+            generation_seq_len_q=generation_seq_len_q,
             attention_mask_type=attention_mask_type,
             use_spec_decoding=metadata.use_spec_decoding,
             output_dtype=output_dtype,
@@ -2021,48 +2086,41 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Optional[Fmha]:
-        if not _is_fmha_selection_cache_enabled():
+        if not _is_fmha_cache_enabled():
             return self._select_fmha_uncached(q, k, v, metadata, forward_args)
 
-        cache_key = self._make_fmha_selection_cache_key(q, metadata,
-                                                        forward_args)
-        fmha = self._fmha_selection_cache.get(cache_key)
+        cache_key = self._make_fmha_cache_key(q, metadata, forward_args)
+        fmha = self._fmha_cache.get(cache_key)
         if fmha is not None:
-            if self._fmha_selection_cache_sanity_check_enabled:
+            if self._fmha_cache_sanity_check_enabled:
                 uncached_fmha = self._select_fmha_uncached(
                     q, k, v, metadata, forward_args)
-                if not _fmha_selections_match(fmha, uncached_fmha):
-                    uncached_inputs = _snapshot_fmha_selection_inputs(
+                if not _fmha_cache_values_match(fmha, uncached_fmha):
+                    uncached_inputs = _snapshot_fmha_cache_inputs(
                         q, k, v, metadata, forward_args)
-                    input_diff = _format_fmha_selection_input_diff(
-                        self._fmha_selection_cache_sanity_inputs.get(cache_key),
-                        uncached_inputs)
-                    message = ("FMHA selection cache sanity check failed for "
+                    input_diff = _format_fmha_cache_input_diff(
+                        self._fmha_cache_inputs.get(cache_key), uncached_inputs)
+                    message = ("FMHA cache sanity check failed for "
                                f"key={cache_key}: "
-                               f"cached={_describe_fmha_selection(fmha)}, "
+                               f"cached={_describe_fmha_cache_value(fmha)}, "
                                "uncached="
-                               f"{_describe_fmha_selection(uncached_fmha)}.\n"
+                               f"{_describe_fmha_cache_value(uncached_fmha)}.\n"
                                f"Forward input differences:\n{input_diff}")
                     logger.error(message)
                     raise RuntimeError(message)
-                if cache_key not in self._fmha_selection_cache_sanity_inputs:
-                    self._fmha_selection_cache_sanity_inputs[
-                        cache_key] = _snapshot_fmha_selection_inputs(
+                if cache_key not in self._fmha_cache_inputs:
+                    self._fmha_cache_inputs[
+                        cache_key] = _snapshot_fmha_cache_inputs(
                             q, k, v, metadata, forward_args)
-            self._fmha_selection_cache.move_to_end(cache_key)
             return fmha
 
         fmha = self._select_fmha_uncached(q, k, v, metadata, forward_args)
         if fmha is None:
             return None
-        self._fmha_selection_cache[cache_key] = fmha
-        if self._fmha_selection_cache_sanity_check_enabled:
-            self._fmha_selection_cache_sanity_inputs[
-                cache_key] = _snapshot_fmha_selection_inputs(
-                    q, k, v, metadata, forward_args)
-        if len(self._fmha_selection_cache) > _FMHA_SELECTION_CACHE_CAPACITY:
-            evicted_key, _ = self._fmha_selection_cache.popitem(last=False)
-            self._fmha_selection_cache_sanity_inputs.pop(evicted_key, None)
+        self._fmha_cache[cache_key] = fmha
+        if self._fmha_cache_sanity_check_enabled:
+            self._fmha_cache_inputs[cache_key] = _snapshot_fmha_cache_inputs(
+                q, k, v, metadata, forward_args)
         return fmha
 
     def _select_fmha_uncached(
