@@ -17,7 +17,6 @@
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Literal, Optional, Union
 
-import numexpr
 import torch
 from pydantic import ConfigDict, model_validator
 from pydantic import Field as PydanticField
@@ -28,6 +27,13 @@ from ..params import SparseParams, SparseRuntimeParams
 
 _RESERVED_FORMULA_KEYS = frozenset({"formula", "target_sparsity"})
 _SKIP_SOFTMAX_ALGORITHMS = frozenset({"skip_softmax", "softmax_skip"})
+
+
+def _load_numexpr() -> Any:
+    """Import NumExpr only when a checkpoint formula must be consumed."""
+    import numexpr
+
+    return numexpr
 
 
 def _is_skip_softmax_group(group: Dict[str, Any]) -> bool:
@@ -126,7 +132,8 @@ class SkipSoftmaxFormula(StrictBaseModel):
     )
 
     @model_validator(mode="after")
-    def _validate_formula(self):
+    def _validate_formula(self) -> "SkipSoftmaxFormula":
+        numexpr = _load_numexpr()
         try:
             parsed = numexpr.NumExpr(self.formula)
         except Exception as exc:
@@ -151,6 +158,7 @@ class SkipSoftmaxFormula(StrictBaseModel):
 
     def compute_threshold_scale_factor(self, target_sparsity: float) -> float:
         """Evaluate the formula at ``target_sparsity`` to get threshold_scale_factor."""
+        numexpr = _load_numexpr()
         result = numexpr.evaluate(
             self.formula,
             local_dict={**self.coefficients, "target_sparsity": float(target_sparsity)},
