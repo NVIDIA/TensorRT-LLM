@@ -84,10 +84,10 @@ def test_gemma4_metadata_gqa_ratio_uses_per_layer_kv_heads():
         model_type = "gemma4_text"
         num_hidden_layers = 12
         num_attention_heads = 16
-        per_layer_attributes = {"head_dim", "num_key_value_heads"}
+        per_layer_attributes = {"num_key_value_heads"}
         per_layer_config = [
             SimpleNamespace(
-                head_dim=256 if (layer_idx + 1) % 6 else 512,
+                head_dim=256,
                 num_key_value_heads=8 if (layer_idx + 1) % 6 else 1,
             ) for layer_idx in range(12)
         ]

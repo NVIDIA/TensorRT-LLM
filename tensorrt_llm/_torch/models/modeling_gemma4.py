@@ -230,7 +230,7 @@ class Gemma4Attention(QKNormRoPEAttention):
         config = model_config.pretrained_config
         geometry_layer_idx = layer_idx
         if geometry_layer_idx is None:
-            if getattr(config, "per_layer_config", None) is not None:
+            if getattr(config, "per_layer_attributes", None):
                 raise ValueError(
                     "Gemma4Attention requires layer_idx with a heterogeneous Transformers config."
                 )
