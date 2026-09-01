@@ -596,7 +596,7 @@ def resolve_domain_action_config(
             warnings.append(
                 f"Cosmos3 domain_name={domain_name!r}, domain_id={domain_id!r} overrides "
                 f"checkpoint policy domain_name={checkpoint_domain!r}; checkpoint domain "
-                "representation defaults will not be applied."
+                "defaults will not be applied."
             )
 
     policy_domain_matches = checkpoint_domain is not None and (
@@ -714,6 +714,7 @@ def resolve_domain_action_config(
 
     return {
         "domain_name": domain_name,
+        "checkpoint_policy_domain_matches": policy_domain_matches,
         "raw_action_dim": resolved_raw_action_dim,
         "action_chunk_size": int(resolved_chunk),
         "action_resolution": resolved_resolution,

@@ -247,6 +247,7 @@ class TestCheckpointPolicyDefaults:
         assert cfg["frame_rate"] == 15.0
         assert cfg["action_fps"] == 15.0
         assert cfg["use_state"] is True
+        assert cfg["checkpoint_policy_domain_matches"] is True
         assert cfg["warnings"] == []
 
     def test_explicit_non_policy_domain_does_not_inherit_droid_width(self):
@@ -258,6 +259,7 @@ class TestCheckpointPolicyDefaults:
         assert cfg["raw_action_dim"] == 10
         assert cfg["action_chunk_size"] == 16
         assert cfg["use_state"] is False
+        assert cfg["checkpoint_policy_domain_matches"] is False
         assert any("overrides checkpoint policy" in warning for warning in cfg["warnings"])
 
     @pytest.mark.parametrize(

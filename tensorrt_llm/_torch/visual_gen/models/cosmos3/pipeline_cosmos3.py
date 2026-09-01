@@ -452,13 +452,23 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         super().__init__(pipeline_config)
 
-    def _mode_params(self, output_type: str, *, action_mode: Optional[str] = None) -> dict:
+    def _mode_params(
+        self,
+        output_type: str,
+        *,
+        action_mode: Optional[str] = None,
+        checkpoint_policy_domain_matches: bool = True,
+    ) -> dict:
         """Generation defaults selected from the request's output and action mode."""
         normalized_action_mode = normalize_action_mode(action_mode)
         request_mode = "action" if normalized_action_mode is not None else output_type
         params = COSMOS3_GENERATION_DEFAULTS[(self.family, request_mode)]
         checkpoint_policy_defaults = getattr(self, "checkpoint_policy_defaults", {})
-        if normalized_action_mode == ACTION_MODE_POLICY and checkpoint_policy_defaults:
+        if (
+            normalized_action_mode == ACTION_MODE_POLICY
+            and checkpoint_policy_domain_matches
+            and checkpoint_policy_defaults
+        ):
             sampling_keys = {"num_inference_steps", "guidance_scale", "guidance_interval"}
             return {
                 **params,
@@ -471,11 +481,20 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         return params
 
     def _resolve_generation_params(
-        self, output_type: str, *, action_mode: Optional[str] = None, **values
+        self,
+        output_type: str,
+        *,
+        action_mode: Optional[str] = None,
+        checkpoint_policy_domain_matches: bool = True,
+        **values,
     ) -> dict:
         """Fill None values: sampling-policy overrides win, then the mode
         table, then the video table (for fields the image table omits)."""
-        mode_params = self._mode_params(output_type, action_mode=action_mode)
+        mode_params = self._mode_params(
+            output_type,
+            action_mode=action_mode,
+            checkpoint_policy_domain_matches=checkpoint_policy_domain_matches,
+        )
         video_params = self._mode_params("video")
         sampling_overrides = self.sampling.generation_default_overrides()
         resolved = {}
@@ -1660,7 +1679,32 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             transfer_config=transfer_config,
         )
 
-        mode_params = self._mode_params(output_type, action_mode=normalized_action_mode)
+        action_cfg: dict[str, Any] = {}
+        checkpoint_policy_domain_matches = True
+        if do_action:
+            checkpoint_policy_defaults = (
+                getattr(self, "checkpoint_policy_defaults", {})
+                if normalized_action_mode == ACTION_MODE_POLICY
+                else {}
+            )
+            action_cfg = resolve_domain_action_config(
+                domain_name=domain_name,
+                domain_id=domain_id,
+                raw_action_dim=raw_action_dim,
+                action_chunk_size=action_chunk_size,
+                action_resolution=action_resolution,
+                frame_rate=frame_rate,
+                action_fps=action_fps,
+                use_state=use_state,
+                checkpoint_policy_defaults=checkpoint_policy_defaults,
+            )
+            checkpoint_policy_domain_matches = action_cfg["checkpoint_policy_domain_matches"]
+
+        mode_params = self._mode_params(
+            output_type,
+            action_mode=normalized_action_mode,
+            checkpoint_policy_domain_matches=checkpoint_policy_domain_matches,
+        )
         values_to_resolve = {
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
@@ -1677,6 +1721,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         resolved = self._resolve_generation_params(
             output_type,
             action_mode=normalized_action_mode,
+            checkpoint_policy_domain_matches=checkpoint_policy_domain_matches,
             **values_to_resolve,
         )
         num_inference_steps = resolved["num_inference_steps"]
@@ -1714,22 +1759,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             enable_audio = False
 
         if do_action:
-            checkpoint_policy_defaults = (
-                getattr(self, "checkpoint_policy_defaults", {})
-                if normalized_action_mode == ACTION_MODE_POLICY
-                else {}
-            )
-            action_cfg = resolve_domain_action_config(
-                domain_name=domain_name,
-                domain_id=domain_id,
-                raw_action_dim=raw_action_dim,
-                action_chunk_size=action_chunk_size,
-                action_resolution=action_resolution,
-                frame_rate=frame_rate,
-                action_fps=action_fps,
-                use_state=use_state,
-                checkpoint_policy_defaults=checkpoint_policy_defaults,
-            )
             if self.rank == 0:
                 for warning in action_cfg["warnings"]:
                     logger.warning(warning)

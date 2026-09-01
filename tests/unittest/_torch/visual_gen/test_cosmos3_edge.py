@@ -869,6 +869,51 @@ class TestEdgeDefaults:
             }
         assert pipeline._mode_params("video") is COSMOS3_EDGE_VIDEO_PARAMS
 
+    def test_policy_manifest_sampling_does_not_cross_domain_override(self, monkeypatch):
+        pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+        pipeline.action_gen = True
+        pipeline.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
+            {
+                "action_chunk_size": 32,
+                "conditioning_fps": 15.0,
+                "domain_name": "droid_lerobot",
+            }
+        )
+        monkeypatch.setattr(pipeline, "_scheduler_for", lambda *args, **kwargs: object())
+        monkeypatch.setattr(pipeline_module, "action_reference_size", lambda **kwargs: (480, 640))
+
+        request = pipeline._resolve_request(
+            image=None,
+            height=None,
+            width=None,
+            num_frames=None,
+            num_inference_steps=None,
+            guidance_scale=None,
+            max_sequence_length=None,
+            frame_rate=None,
+            use_system_prompt=None,
+            enable_audio=False,
+            output_type="video",
+            video=None,
+            flow_shift=None,
+            action_mode=ACTION_MODE_POLICY,
+            domain_name="bridge_orig_lerobot",
+            domain_id=None,
+            raw_action_dim=None,
+            action_chunk_size=None,
+            use_state=None,
+            action_resolution=None,
+            action_fps=None,
+            transfer_config=None,
+        )
+
+        assert request.num_inference_steps == COSMOS3_ACTION_PARAMS["num_inference_steps"]
+        assert request.guidance_scale == COSMOS3_ACTION_PARAMS["guidance_scale"]
+        assert request.guidance_interval is None
+        assert request.domain_name == "bridge_orig_lerobot"
+        assert request.action_chunk_size == 16
+        assert request.frame_rate == 5.0
+
     def test_guidance_interval_resolves_for_visual_and_audio_modes(self) -> None:
         pipeline = _bare_pipeline(QWEN3_RECIPE.name)
 
