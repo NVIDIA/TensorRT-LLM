@@ -10,6 +10,7 @@ from collections.abc import Hashable
 from typing import Any
 
 import torch
+from torch import nn
 
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
@@ -22,6 +23,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
+    InputProcessor,
     get_multimodal_encoder_item_metadata,
 )
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy, TorchLlmArgs
@@ -64,7 +66,7 @@ def validate_mm_encoder_scheduling_compatibility(
         )
 
 
-def is_multimodal(model: Any, input_processor: Any) -> bool:
+def is_multimodal(model: nn.Module, input_processor: InputProcessor) -> bool:
     """True iff this engine drives a multimodal model.
 
     Primary signal: ``MultimodalModelMixin`` is the canonical marker --
@@ -82,7 +84,7 @@ def is_multimodal(model: Any, input_processor: Any) -> bool:
     return isinstance(input_processor, BaseMultimodalInputProcessor)
 
 
-def mm_item_scheduling_enabled(llm_args: Any, model: Any) -> bool:
+def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool:
     """Whether the item-scheduling wiring is engaged this run.
 
     Item scheduling is declared once, as a model capability (the ``MultimodalModelMixin``
@@ -106,14 +108,14 @@ def mm_item_scheduling_enabled(llm_args: Any, model: Any) -> bool:
     )
 
 
-def mm_encoder_cache_enabled(model: Any) -> bool:
+def mm_encoder_cache_enabled(model: nn.Module) -> bool:
     """Whether the multimodal encoder cache is active for this model."""
     return isinstance(model, MultimodalModelMixin) and model.encoder_cache_active
 
 
 def setup_mm_encoder_attn_metadata(
-    model: Any,
-    input_processor: Any,
+    model: nn.Module,
+    input_processor: InputProcessor,
     encoder_max_num_tokens: int,
     attention_metadata_capacity: dict[str, int] | None,
 ) -> None:
@@ -145,7 +147,7 @@ def setup_mm_encoder_attn_metadata(
             module.set_attn_max_seq_len(max_seq_len)
 
 
-def resolve_bytes_per_mm_encoder_embedding(model: Any) -> int:
+def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:
     """Bytes occupied by one multimodal encoder output embedding.
 
     Prefers the mixin's explicit ``embedding_dim``/``embedding_dtype`` contract, then the
@@ -178,9 +180,9 @@ def resolve_bytes_per_mm_encoder_embedding(model: Any) -> int:
 
 
 def resolve_mm_encoder_output_budget(
-    input_processor: Any,
+    input_processor: BaseMultimodalDummyInputsBuilder,
     encoder_max_num_tokens: int,
-    model: Any,
+    model: MultimodalModelMixin,
 ) -> tuple[int, int]:
     """Resolve ``(output_budget_bytes, bytes_per_embedding)`` for resident MM encoder outputs.
 
@@ -231,7 +233,7 @@ class MultimodalItemScheduler:
         self,
         *,
         model: MultimodalModelMixin,
-        input_processor: Any,
+        input_processor: BaseMultimodalDummyInputsBuilder | None = None,
         attention_metadata_capacity: dict[str, int] | None = None,
         encoder_max_num_tokens: int | None = None,
         output_budget_bytes: int | None = None,
@@ -248,9 +250,9 @@ class MultimodalItemScheduler:
     def maybe_create(
         cls,
         *,
-        llm_args: Any,
-        model: Any,
-        input_processor: Any,
+        llm_args: TorchLlmArgs,
+        model: nn.Module,
+        input_processor: BaseMultimodalDummyInputsBuilder,
         encoder_max_num_tokens: int | None,
     ) -> "MultimodalItemScheduler | None":
         """Build the scheduler if this run engages item scheduling, else ``None``.
@@ -267,6 +269,7 @@ class MultimodalItemScheduler:
         validate_mm_encoder_scheduling_compatibility(llm_args, enabled)
         if not enabled:
             return None
+        assert isinstance(model, MultimodalModelMixin)  # narrowed by the predicate
         return cls.create(
             model=model,
             input_processor=input_processor,
@@ -279,7 +282,7 @@ class MultimodalItemScheduler:
         cls,
         *,
         model: MultimodalModelMixin,
-        input_processor: Any,
+        input_processor: BaseMultimodalDummyInputsBuilder,
         encoder_max_num_tokens: int | None,
         configured_encoder_max_num_tokens: int | None,
     ) -> "MultimodalItemScheduler":
@@ -367,7 +370,7 @@ class MultimodalItemScheduler:
         )
 
     @property
-    def encoder_cache(self) -> TensorLRUCache | None:
+    def encoder_cache(self) -> TensorLRUCache[Any] | None:
         """The encoder cache the item path reads through, or ``None``.
 
         Only models that opt into the encoder cache (``supports_encoder_cache`` with
