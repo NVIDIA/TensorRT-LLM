@@ -101,7 +101,10 @@ def test_remote_initializer_uploads_only_run_inputs(tmp_path: Path) -> None:
     initialize_remote_execution(layout, run_fs, perf_layout)
     sync_run_inputs_to_execution(layout, run_fs, perf_layout)
 
-    assert run_fs.read_text(perf_layout.task, on="execution") == "checkpoint_path: /model\n"
+    assert (
+        run_fs.read_text(perf_layout.execution_task, on="execution") == "checkpoint_path: /model\n"
+    )
+    assert not run_fs.exists(perf_layout.task, on="execution")
     assert run_fs.read_text(perf_layout.tuning_live, on="execution") == "x: 1\n"
     assert run_fs.exists(perf_layout.worktrees, on="execution")
     assert not run_fs.exists("progress.yaml", on="execution")

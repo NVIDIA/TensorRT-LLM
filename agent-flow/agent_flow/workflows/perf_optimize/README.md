@@ -323,7 +323,31 @@ perf-optimize --task path/to/task.yaml --workspace workspace/perf-optimize/my-mo
 perf-optimize --task ... --workspace ... --max-rounds 5
 # start at the optimize stage, reusing a previous run's analysis:
 perf-optimize --task ... --workspace ... --reuse-analysis workspace/perf-analyze/my-model
+
+# remote mode: workflow/control files stay local; code, Git, builds,
+# benchmarks, profiling, GPU work, and Slurm run through SSH on the cluster
+perf-optimize --task ... --workspace ... \
+  --execution-run-root /remote/run/root \
+  --ssh-known-hosts ~/.ssh/known_hosts
 ```
+
+### Remote execution
+
+`--execution-run-root` enables remote mode and requires
+`slurm-environment.cluster_ssh` in the task. The CLI and agent SDK stay
+local in the control workspace. Each agent receives a remote execution
+policy plus a per-turn `REMOTE_EXECUTION_CONTEXT` containing the SSH
+alias and resolved control/execution paths. Source/config changes, Git,
+builds, tests, serving, benchmarks, profiling, GPU work, and every Slurm
+command run through `ssh <cluster_ssh> ...`; reports and progress remain
+local.
+
+The canonical local spec remains `<workspace>/task.yaml`. Its remote
+execution projection is `<execution-workspace>/task.execution.yaml`, so
+an agent cannot mistake the two files for mirrored copies. Raw execution
+artifacts are not mirrored continuously; the workflow transfers only
+the contracted benchmark JSON and accepted result snapshots at role
+boundaries.
 
 ## task.yaml
 
@@ -388,7 +412,7 @@ down).
   task's `extra_llm_api_options` seed still applies as the baseline
   config in every mode.
 
-## Workspace layout
+## Control workspace layout
 
 ```
 <workspace>/

@@ -36,6 +36,7 @@ from .execution import (
     ExecutionLayout,
     PerfOptimizeLayout,
     RunFileSystems,
+    Side,
     initialize_remote_execution,
     sync_benchmarker_results_to_control,
     sync_qa_results_to_control,
@@ -52,7 +53,13 @@ from .progress import (
     latest_entry,
     read_progress,
 )
-from .prompts import DEFAULT_PROMPTS, PromptBundle
+from .prompts import (
+    DEFAULT_PROMPTS,
+    PromptBundle,
+    RemoteExecutionContext,
+    append_remote_execution_context,
+    with_remote_execution_policy,
+)
 from .roadmap_schema import RoadmapError
 from .state import (
     ROUND_STAGES,
@@ -350,6 +357,13 @@ class PerfOptimizeWorkflow:
         # ``--clean`` has just wiped it if the user wanted to start over.
         self.resume = self.state_path.is_file()
 
+        remote_prompt_requested = bool(self.execution_run_root)
+        if self.resume and not remote_prompt_requested:
+            checkpoint = load_state(self.state_path)
+            remote_prompt_requested = checkpoint.execution.get("mode") == "remote"
+        if remote_prompt_requested:
+            self.prompts = with_remote_execution_policy(self.prompts)
+
         if not self.resume:
             # On a fresh run, every managed output must be empty so we
             # don't silently scribble over a prior run the user forgot
@@ -420,6 +434,7 @@ class PerfOptimizeWorkflow:
                     session_mode=(
                         "stateless" if role in ("qa", "evaluator", "integrator") else "persistent"
                     ),
+                    cwd=self.workspace,
                 ),
             )
         self._progress_tools = progress_tools
@@ -469,7 +484,7 @@ class PerfOptimizeWorkflow:
             # ---- one-shot: baseline ----
             if state.stage == STAGE_BENCHMARKER:
                 print_rule("[bold cyan]Benchmarker (baseline)[/bold cyan]", log)
-                clear_stale_benchmark_results(self.baseline_dir)
+                self._clear_stale_benchmark_results(self.perf_layout.baseline)
                 self._run_benchmarker(state)
                 sync_benchmarker_results_to_control(
                     self._execution(),
@@ -554,7 +569,11 @@ class PerfOptimizeWorkflow:
                     roadmap = self._validate_roadmap()
                     if enforce_ledger:
                         self._validate_kernel_ledger(roadmap, analysis_dir)
-                    self._record_nsys_capture(state, analysis_dir)
+                    self._record_nsys_capture(
+                        state,
+                        self._analysis_relative(state),
+                        on="execution",
+                    )
                     if not replan_only and not state.reuse_pending:
                         # This round's evidence now describes the current
                         # build; a replan round produced none and leaves the
@@ -630,7 +649,7 @@ class PerfOptimizeWorkflow:
                         self.perf_layout.final_verification,
                         on="both",
                     )
-                    clear_stale_benchmark_results(self.final_verification_dir)
+                    self._clear_stale_benchmark_results(self.perf_layout.final_verification)
                     self._run_qa(state)
                     sync_qa_results_to_control(
                         self._execution(),
@@ -868,7 +887,11 @@ class PerfOptimizeWorkflow:
             state.projector_done = self._sol_enabled()
         if imported.findings:
             state.reuse_pending = True
-            self._record_nsys_capture(state, self.rounds_dir / "round_1" / "analysis")
+            self._record_nsys_capture(
+                state,
+                self.perf_layout.analysis_dir(1),
+                on="control",
+            )
         print_message(
             f"[bold cyan]reusing analysis from {source}: "
             f"{imported.summary()} (manifest: {imported.manifest_path})[/bold cyan]",
@@ -1328,7 +1351,11 @@ class PerfOptimizeWorkflow:
                     ),
                     curve=curve,
                 )
-            self._record_nsys_capture(state, self._attempt_dir(local_state) / "profile")
+            self._record_nsys_capture(
+                state,
+                f"{self._attempt_relative(local_state)}/profile",
+                on="execution",
+            )
             final_status = "accepted"
             print_message(
                 f"[bold green]✔ serial evaluator APPROVE — {item_id} accepted[/bold green]",
@@ -1457,7 +1484,7 @@ class PerfOptimizeWorkflow:
                 )
                 evaluation_path = self._attempt_dir(item_state) / "evaluation.md"
                 if not (self._is_nonempty(evaluation_path) and cached_attempt == attempt_no):
-                    clear_stale_benchmark_results(self._attempt_dir(item_state))
+                    self._clear_stale_benchmark_results(self._attempt_relative(item_state))
                     self._run_evaluator(item_state, agent=evaluator, progress_ctx=progress_ctx)
                     self._require_stage_outputs(
                         STAGE_EVALUATOR,
@@ -1575,6 +1602,7 @@ class PerfOptimizeWorkflow:
         integration_relative = self.perf_layout.integration_dir(round_no)
         self._filesystems().makedirs(integration_relative, on="both")
         integration_dir = self._control_path(integration_relative)
+        execution_integration_dir = self._execution_path(integration_relative)
         worktree_relative = self.perf_layout.integration_worktree(round_no)
         worktree = self._execution_path(worktree_relative)
         if not state.integration_branch:
@@ -1624,20 +1652,24 @@ class PerfOptimizeWorkflow:
             and verdict.get("round") == round_no
         )
         if not cached_verdict:
-            clear_stale_benchmark_results(integration_dir)
+            self._clear_stale_benchmark_results(integration_relative)
             self._stamp_progress(state, round_no=round_no)
-            self.integrator(
-                self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            reference_result_dir = self._execution_reference_result_dir()
+            execution_accepted_config = self._execution_path(self.perf_layout.tuning_accepted)
+            instruction = (
+                self._disagg_directive() + f"Control workspace: {self.workspace}\n"
                 f"Round: {round_no}\n"
-                f"Integration worktree: {worktree}\n"
+                f"Execution integration worktree: {worktree}\n"
                 f"Integration branch: {state.integration_branch}\n"
-                f"Candidate manifest: {manifest_path}\n"
-                f"Live integration config: {integration_config}\n"
-                f"Campaign accepted config (base): {self.tuning_accepted_path}\n"
-                f"Task: {self.task_path}\n"
-                f"Roadmap/current_best: {self.roadmap_path}\n"
-                f"Reference benchmark results: {self._reference_result_dir()}\n"
-                f"Write the integration report to: {report_path}\n\n"
+                f"Control candidate manifest: {manifest_path}\n"
+                f"Execution live integration config: {integration_config}\n"
+                f"Execution campaign accepted config (base): "
+                f"{execution_accepted_config}\n"
+                f"Control task: {self.task_path}\n"
+                f"Control roadmap/current_best: {self.roadmap_path}\n"
+                f"Execution reference benchmark results: {reference_result_dir}\n"
+                f"Execution artifact directory: {execution_integration_dir}\n"
+                f"Write the control integration report to: {report_path}\n\n"
                 f"Read the manifest in order. Cherry-pick every non-empty "
                 f"candidate_commit into the integration branch, resolve only "
                 f"merge conflicts/minimal combination defects, and combine the "
@@ -1658,6 +1690,20 @@ class PerfOptimizeWorkflow:
                 f"APPROVE, FALLBACK_BEST, or REJECT decision and all required "
                 f"fields. Leave precisely the accepted code/config state in the "
                 f"integration worktree and integration config."
+            )
+            self.integrator(
+                self._with_remote_execution_context(
+                    instruction,
+                    execution_command_cwd=worktree,
+                    control_output_dir=integration_dir,
+                    control_candidate_manifest_path=manifest_path,
+                    control_roadmap_path=self.roadmap_path,
+                    execution_worktree=worktree,
+                    execution_live_config=integration_config,
+                    execution_accepted_config=execution_accepted_config,
+                    execution_reference_result_dir=reference_result_dir,
+                    execution_artifact_dir=execution_integration_dir,
+                )
             )
         self._require_stage_outputs(STAGE_INTEGRATOR, [report_path])
         verdict = latest_entry(self.progress_path, "integrator")
@@ -1726,7 +1772,11 @@ class PerfOptimizeWorkflow:
                 str(report_path.relative_to(self._control_path(""))),
                 curve=curve,
             )
-            self._record_nsys_capture(state, integration_dir / "profile")
+            self._record_nsys_capture(
+                state,
+                f"{integration_relative}/profile",
+                on="execution",
+            )
         print_message(
             f"[bold green]Integrator verdict: {decision}; included "
             f"{', '.join(sorted(included)) or 'none'}[/bold green]",
@@ -2097,8 +2147,14 @@ class PerfOptimizeWorkflow:
             return tuple(str(entry) for entry in methods)
         return ("nsys",)
 
-    def _record_nsys_capture(self, state: WorkflowState, directory: Path) -> None:
-        """Point ``last_nsys_dir`` at ``directory`` when it holds a capture.
+    def _record_nsys_capture(
+        self,
+        state: WorkflowState,
+        relative_directory: str,
+        *,
+        on: Side,
+    ) -> None:
+        """Point ``last_nsys_dir`` at a side-qualified capture directory.
 
         Called after the stages that may produce an nsys profile — the
         analyzer's round profile, and an accepted attempt's
@@ -2107,8 +2163,41 @@ class PerfOptimizeWorkflow:
         A stage that captured nothing leaves the pointer unchanged. The
         caller checkpoints.
         """
-        if any(directory.glob("*.nsys-rep")) or (directory / "nsys_stats.txt").is_file():
-            state.last_nsys_dir = str(directory)
+        if self.run_fs is None:
+            directory = self.workspace / relative_directory
+            captured = any(directory.glob("*.nsys-rep")) or (directory / "nsys_stats.txt").is_file()
+            resolved = str(directory)
+        else:
+            captured = False
+            if self.run_fs.exists(relative_directory, on=on):
+                for path in self.run_fs.files(relative_directory, on=on):
+                    name = PurePosixPath(path).name
+                    if name.endswith(".nsys-rep") or name == "nsys_stats.txt":
+                        captured = True
+                        break
+            resolved = self.run_fs.path(relative_directory, on=on)
+        if captured:
+            state.last_nsys_dir = resolved
+
+    def _clear_stale_benchmark_results(self, relative_directory: str) -> None:
+        """Clear stale benchmark JSON/curve directories on the execution side."""
+        if self.run_fs is None or self._execution().mode == "local":
+            clear_stale_benchmark_results(self._control_path(relative_directory))
+            return
+        if not self.run_fs.exists(relative_directory, on="execution"):
+            return
+
+        stale: set[str] = set()
+        base = PurePosixPath(relative_directory)
+        for path in self.run_fs.files(relative_directory, on="execution"):
+            child = PurePosixPath(path).relative_to(base)
+            first = child.parts[0]
+            if first.startswith("concurrency_"):
+                stale.add(f"{relative_directory}/{first}")
+            elif len(child.parts) == 1 and first.startswith("openai-") and first.endswith(".json"):
+                stale.add(path)
+        for path in sorted(stale):
+            self.run_fs.remove(path, on="execution", recursive=True)
 
     def _any_accepted_items(self) -> bool:
         """True iff the roadmap records at least one accepted item.
@@ -2219,6 +2308,19 @@ class PerfOptimizeWorkflow:
                 if candidate.is_dir() and candidate != self.workspace:
                     return candidate
         return self.baseline_dir
+
+    def _execution_equivalent(self, control_path: str | Path) -> str:
+        """Resolve a control artifact's logical relative path on execution."""
+        path = Path(control_path)
+        try:
+            relative = path.relative_to(self._control_path(""))
+        except ValueError:
+            return str(control_path)
+        return self._execution_path(relative.as_posix())
+
+    def _execution_reference_result_dir(self) -> str:
+        """Execution-side raw JSON directory for the accepted reference."""
+        return self._execution_equivalent(self._reference_result_dir())
 
     def _trtllm_hint(self) -> str:
         """Best-effort grep root for the source-search hints in prompts."""
@@ -2382,6 +2484,31 @@ class PerfOptimizeWorkflow:
             self.perf_layout.item_tuning_accepted(round_no, item_index, state.current_item_id),
         )
 
+    def _with_remote_execution_context(
+        self,
+        instruction: str,
+        *,
+        execution_command_cwd: str | None = None,
+        control_cwd: str | Path | None = None,
+        **locations: str | Path,
+    ) -> str:
+        """Append resolved locations to one turn when execution is remote."""
+        layout = self.execution_layout
+        if layout is None or layout.mode != "remote":
+            return instruction
+        context = RemoteExecutionContext(
+            remote_host=str(layout.remote_host),
+            control_workspace=layout.control_workspace,
+            control_cwd=str(control_cwd or self.workspace),
+            control_task_path=str(self._control_path(self.perf_layout.task)),
+            execution_workspace=layout.execution_workspace,
+            execution_task_path=self._execution_path(self.perf_layout.execution_task),
+            execution_campaign_repo=layout.campaign_repo,
+            execution_command_cwd=execution_command_cwd or layout.campaign_repo,
+            locations={name: str(path) for name, path in locations.items()},
+        )
+        return append_remote_execution_context(instruction, context)
+
     # ------------------------------------------------------------------ agents
 
     def _stamp_progress(
@@ -2402,6 +2529,8 @@ class PerfOptimizeWorkflow:
 
     def _run_benchmarker(self, state: WorkflowState) -> None:
         self._stamp_progress(state, round_no=0)
+        execution_baseline_dir = self._execution_path(self.perf_layout.baseline)
+        execution_tuning_config = self._execution_path(self.perf_layout.tuning_live)
         if self._curve_mode():
             points = self._curve_points()
             load_instruction = (
@@ -2412,7 +2541,7 @@ class PerfOptimizeWorkflow:
                 f"command in your system prompt** — fill in the paths and "
                 f"`benchmark` values, keep the other flags as given, and do "
                 f"not improvise. Pass "
-                f"`--result-dir {self.baseline_dir}/concurrency_<c>` for the "
+                f"`--result-dir {execution_baseline_dir}/concurrency_<c>` for the "
                 f"run at point `<c>` so each point's result JSON lands under "
                 f"`baseline/`"
             )
@@ -2429,15 +2558,15 @@ class PerfOptimizeWorkflow:
                 f"**canonical `benchmark_serving.py` command in your system "
                 f"prompt** — fill in the paths and `benchmark` values, keep the "
                 f"other flags as given, and do not improvise. Pass "
-                f"`--result-dir {self.baseline_dir}` so the result JSON lands "
+                f"`--result-dir {execution_baseline_dir}` so the result JSON lands "
                 f"under `baseline/`"
             )
             baseline_note = (
                 "naming the target metric's value explicitly — it becomes "
                 "the roadmap's `baseline.value`. "
             )
-        self.benchmarker(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n\n"
+        instruction = (
+            self._disagg_directive() + f"Control workspace: {self.workspace}\n\n"
             f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
             f"`trtllm_repo_path`, and the `benchmark` / `optimize` blocks.\n\n"
             f"Then **load the `perf-optimization-casebook` skill** (via the "
@@ -2445,7 +2574,7 @@ class PerfOptimizeWorkflow:
             f"directs, so your Configuration/Notes are grounded in known "
             f"TRT-LLM performance precedents.\n\n"
             f"Launch `trtllm-serve` with "
-            f"`--extra_llm_api_options {self.tuning_config_path}` (the live "
+            f"`--extra_llm_api_options {execution_tuning_config}` (the live "
             f"tuning config — always passed in this workflow), poll it to "
             f"readiness, {load_instruction}, and tear the server down "
             f"(always).\n\n"
@@ -2460,17 +2589,27 @@ class PerfOptimizeWorkflow:
             f"with a `summary` of the commands you ran, the operating point, "
             f"the headline metrics, and the files you wrote."
         )
+        self.benchmarker(
+            self._with_remote_execution_context(
+                instruction,
+                control_output_dir=self.baseline_dir,
+                control_baseline_report_path=self.baseline_results_path,
+                execution_live_config=execution_tuning_config,
+                execution_artifact_dir=execution_baseline_dir,
+            )
+        )
 
     def _run_projector(self, state: WorkflowState) -> None:
         self._stamp_progress(state, round_no=0)
+        execution_tuning_config = self._execution_path(self.perf_layout.tuning_live)
         output = output_instruction(
             self.sol_methodology,
             str(self.sol_projection_path),
             f"{self.workspace}/sol_work/peaks.json",
             "the Analyzer's per-round measured\u2194SOL correlation",
         )
-        self.projector(
-            f"Workspace: {self.workspace}\n\n"
+        instruction = (
+            f"Control workspace: {self.workspace}\n\n"
             f"You run once per campaign — your projection guides the "
             f"Analyzer's roadmap ranking and the Reporter's headroom story "
             f"for every later round.\n\n"
@@ -2480,7 +2619,7 @@ class PerfOptimizeWorkflow:
             f'`read_latest_progress` with `agent: "benchmarker"`) to recover '
             f"the measured baseline operating point, GPU, and headline "
             f"metrics. The parallel mapping (tp/pp/ep) comes from "
-            f"`{self.tuning_config_path}` — the live tuning config every "
+            f"`{execution_tuning_config}` — the live tuning config every "
             f"server in this workflow runs with.\n\n"
             f"{projector_instruction(self.sol_methodology)}\n\n"
             f"Do **all** of this within this single turn; the stage only "
@@ -2490,6 +2629,14 @@ class PerfOptimizeWorkflow:
             f"with a `summary` of the sources you used, the mapping, the "
             f"headline SOL ceiling and baseline-vs-SOL gap, and the files "
             f"you wrote."
+        )
+        self.projector(
+            self._with_remote_execution_context(
+                instruction,
+                control_output_dir=self.sol_work_dir,
+                control_projection_path=self.sol_projection_path,
+                execution_live_config=execution_tuning_config,
+            )
         )
 
     def _baseline_curve_note(self) -> str:
@@ -2532,6 +2679,7 @@ class PerfOptimizeWorkflow:
         that assignment in ``run``).
         """
         analysis_dir = self._analysis_dir(state)
+        execution_tuning_config = self._execution_path(self.perf_layout.tuning_live)
         findings_path = analysis_dir / "profile_findings.md"
         prior_roadmap_context = ""
         if self.prior_roadmap_path.is_file():
@@ -2558,8 +2706,8 @@ class PerfOptimizeWorkflow:
                 f"correlation the source produced is already in "
                 f"`{analysis_dir}` — do not re-derive it.\n\n"
             )
-        self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+        instruction = (
+            self._disagg_directive() + f"Control workspace: {self.workspace}\n"
             f"Round: 1 (**reused analysis** — no profiling this round)\n"
             f"Analysis directory (already populated): {analysis_dir}\n\n"
             f"This campaign was launched with "
@@ -2586,7 +2734,7 @@ class PerfOptimizeWorkflow:
             f"Two checks you still owe — both read-only, neither needs a "
             f"GPU: verify the imported analysis actually describes **this** "
             f"task (same model/checkpoint, parallel mapping in "
-            f"`{self.tuning_config_path}`, and operating point as "
+            f"`{execution_tuning_config}`, and operating point as "
             f"`{self.task_path}`), and run the **dormant-capability sweep** "
             f"per your system prompt (checkpoint config + weight index, "
             f"unset serving knobs, gated code paths — inspect files and "
@@ -2612,11 +2760,23 @@ class PerfOptimizeWorkflow:
             f"artifacts you planned from, the fit check's outcome, and the "
             f"roadmap items you authored with their expected gains."
         )
+        self.analyzer(
+            self._with_remote_execution_context(
+                instruction,
+                control_output_dir=analysis_dir,
+                control_roadmap_path=self.roadmap_path,
+                control_baseline_report_path=self.baseline_results_path,
+                execution_live_config=execution_tuning_config,
+                execution_source_root=self._trtllm_hint(),
+            )
+        )
 
     def _run_analyzer(self, state: WorkflowState) -> None:
         round_no = state.round_index + 1
         self._stamp_progress(state, round_no=round_no)
         analysis_dir = self._analysis_dir(state)
+        execution_analysis_dir = self._execution_path(self._analysis_relative(state))
+        execution_tuning_config = self._execution_path(self.perf_layout.tuning_live)
         if state.reuse_pending:
             self._run_reused_analyzer(state)
             return
@@ -2716,10 +2876,12 @@ class PerfOptimizeWorkflow:
                 f"of the gap gets a new item or an evidence-backed reason it "
                 f"cannot be closed in this campaign.\n\n"
             )
-        self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+        instruction = (
+            self._disagg_directive() + f"Control workspace: {self.workspace}\n"
             f"Round: {round_no}\n"
-            f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
+            f"Control analysis directory (write reports here): {analysis_dir}\n"
+            f"Execution analysis directory (write raw artifacts here): "
+            f"{execution_analysis_dir}\n\n"
             f"Read `{self.task_path}` and `{self.baseline_results_path}` to "
             f"recover the serve + benchmark commands and operating point.\n\n"
             f"{round_context}\n\n"
@@ -2732,7 +2894,7 @@ class PerfOptimizeWorkflow:
             f"`grep -rn`/`rg` via `Bash` under `{self._trtllm_hint()}` as your "
             f"system prompt directs, then profile the current build under the "
             f"methods in `profile.methods`: relaunch `trtllm-serve` with "
-            f"`--extra_llm_api_options {self.tuning_config_path}` (the live "
+            f"`--extra_llm_api_options {execution_tuning_config}` (the live "
             f"tuning config), replay the canonical benchmark load"
             + (
                 f" (Pareto-curve mode: one replay at the largest concurrency "
@@ -2750,7 +2912,7 @@ class PerfOptimizeWorkflow:
             f"name is not found) as the capture + interpretation "
             f"methodology — {ncu_scope}. Save the traces, `nsys stats` "
             f"output, and {ncu_artifacts} under "
-            f"`{analysis_dir}`. Tear every server "
+            f"`{execution_analysis_dir}`. Tear every server "
             f"down.\n\n"
             f"Do **all** of this within this single turn — poll readiness in "
             f"the foreground and do not yield to a background poll.\n\n"
@@ -2768,6 +2930,17 @@ class PerfOptimizeWorkflow:
             "with a `summary` of which profilers ran, the trace files "
             "produced, and the roadmap items you added / re-ordered / marked "
             "obsolete with their expected gains."
+        )
+        self.analyzer(
+            self._with_remote_execution_context(
+                instruction,
+                control_output_dir=analysis_dir,
+                control_roadmap_path=self.roadmap_path,
+                control_baseline_report_path=self.baseline_results_path,
+                execution_live_config=execution_tuning_config,
+                execution_source_root=self._trtllm_hint(),
+                execution_artifact_dir=execution_analysis_dir,
+            )
         )
 
     def _run_replan_analyzer(self, state: WorkflowState) -> None:
@@ -2809,8 +2982,8 @@ class PerfOptimizeWorkflow:
                 f"an evidence-backed reason it cannot be closed in this "
                 f"campaign.\n\n"
             )
-        self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+        instruction = (
+            self._disagg_directive() + f"Control workspace: {self.workspace}\n"
             f"Round: {round_no} (**replan only** — no profiling this round)\n"
             f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
             f"Round {state.round_index} accepted **nothing**. "
@@ -2870,6 +3043,14 @@ class PerfOptimizeWorkflow:
             f"verdicts you planned from, and the items you marked obsolete / "
             f"revised / added with their expected gains."
         )
+        self.analyzer(
+            self._with_remote_execution_context(
+                instruction,
+                control_output_dir=analysis_dir,
+                control_roadmap_path=self.roadmap_path,
+                control_previous_round_dir=prev_round_dir,
+            )
+        )
 
     def _run_optimizer(
         self,
@@ -2882,6 +3063,7 @@ class PerfOptimizeWorkflow:
         attempt_no = state.attempt_index + 1
         self._stamp_progress(state, round_no=round_no, with_attempt=True, ctx=progress_ctx)
         attempt_dir = self._attempt_dir(state)
+        execution_attempt_dir = self._execution_path(self._attempt_relative(state))
         repo = self._state_repo_path(state)
         tuning_config, _ = self._state_tuning_paths(state)
         retry_context = ""
@@ -2936,16 +3118,18 @@ class PerfOptimizeWorkflow:
                 f"and a premise they disprove is a blocker to record in "
                 f"your summary, not a claim to re-assert.\n\n"
             )
-        (agent or self.optimizer)(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+        instruction = (
+            self._disagg_directive() + f"Control workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
             f"Roadmap item to implement: **{state.current_item_id}** (read it in "
             f"`{self.roadmap_path}`)\n"
             f"Optimization branch: `{state.item_branch or state.campaign_git_branch}` "
-            f"at `{repo}`\n"
-            f"Attempt directory (write your artifacts here): {attempt_dir}"
+            f"in the execution worktree `{repo}`\n"
+            f"Control attempt directory (write the summary here): {attempt_dir}\n"
+            f"Execution attempt directory (write smoke artifacts here): "
+            f"{execution_attempt_dir}"
             f"{retry_context}\n\n"
             f"Read `{self.task_path}` and the roadmap item, then **load the "
             f"`perf-optimization-casebook` skill** (via the `Skill` tool) as "
@@ -2973,6 +3157,18 @@ class PerfOptimizeWorkflow:
             f"with a `summary` of the item you implemented, what you changed, "
             f"the smoke-check result, and any risks or blockers."
         )
+        (agent or self.optimizer)(
+            self._with_remote_execution_context(
+                instruction,
+                execution_command_cwd=repo,
+                control_cwd=self._item_dir(state),
+                control_output_dir=attempt_dir,
+                control_roadmap_path=self.roadmap_path,
+                execution_worktree=repo,
+                execution_live_config=tuning_config,
+                execution_artifact_dir=execution_attempt_dir,
+            )
+        )
 
     def _evaluator_capture_context(self, state: WorkflowState) -> str:
         """The accept-evidence capture directive for this attempt, or ``""``.
@@ -2984,11 +3180,12 @@ class PerfOptimizeWorkflow:
         """
         if "nsys" not in self._profile_methods():
             return ""
-        profile_dir = self._attempt_dir(state) / "profile"
+        profile_dir = self._execution_path(f"{self._attempt_relative(state)}/profile")
         if state.last_nsys_dir:
+            previous_profile_dir = self._execution_equivalent(state.last_nsys_dir)
             compare = (
                 f"compare it against the previous capture of the accepted "
-                f"state at `{state.last_nsys_dir}`"
+                f"state at `{previous_profile_dir}`"
             )
         else:
             compare = (
@@ -3026,10 +3223,11 @@ class PerfOptimizeWorkflow:
         attempt_no = state.attempt_index + 1
         self._stamp_progress(state, round_no=round_no, with_attempt=True, ctx=progress_ctx)
         attempt_dir = self._attempt_dir(state)
+        execution_attempt_dir = self._execution_path(self._attempt_relative(state))
         repo = self._state_repo_path(state)
         tuning_config, tuning_accepted = self._state_tuning_paths(state)
         optimize = self._optimize_block()
-        reference_dir = self._reference_result_dir()
+        reference_dir = self._execution_reference_result_dir()
         if self._curve_mode():
             points = self._curve_points()
             focus = self._focus_points()
@@ -3067,7 +3265,7 @@ class PerfOptimizeWorkflow:
                 f"then measure with the **canonical `benchmark_serving.py` "
                 f"command in your system prompt** once per concurrency point "
                 f"{points}, sequentially ascending over the same server, "
-                f"passing `--result-dir {attempt_dir}/concurrency_<c>` per "
+                f"passing `--result-dir {execution_attempt_dir}/concurrency_<c>` per "
                 f"point. Curve mode: apply the **Pareto gate** — per-point "
                 f"gains vs `current_best.curve` (same concurrency), "
                 f"{mean_rule} — per the acceptance gate in your "
@@ -3090,7 +3288,7 @@ class PerfOptimizeWorkflow:
                 f"then measure with the "
                 f"**canonical `benchmark_serving.py` command in your system "
                 f"prompt** at the configured operating point, passing "
-                f"`--result-dir {attempt_dir}`. Compute `measured_gain_pct` "
+                f"`--result-dir {execution_attempt_dir}`. Compute `measured_gain_pct` "
                 f"against `current_best.value` per the measurement protocol, "
                 f"and apply the acceptance gate"
             )
@@ -3112,16 +3310,18 @@ class PerfOptimizeWorkflow:
             )
         else:
             attempt_note = ""
-        (agent or self.evaluator)(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+        instruction = (
+            self._disagg_directive() + f"Control workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
             f"Roadmap item under review: **{state.current_item_id}** (read it in "
             f"`{self.roadmap_path}`)\n"
             f"Optimization branch: `{state.item_branch or state.campaign_git_branch}` "
-            f"at `{repo}`\n"
-            f"Attempt directory (write your artifacts here): {attempt_dir}\n"
+            f"in the execution worktree `{repo}`\n"
+            f"Control attempt directory (read/write reports here): {attempt_dir}\n"
+            f"Execution attempt directory (write raw artifacts here): "
+            f"{execution_attempt_dir}\n"
             f"Acceptance gate: accept_fraction={optimize['accept_fraction']}, "
             f"noise_floor_pct={optimize['noise_floor_pct']}, "
             f"target_metric={optimize['target_metric']}"
@@ -3158,15 +3358,31 @@ class PerfOptimizeWorkflow:
             f"Before completing your turn, call `append_evaluator_progress` "
             f"{progress_fields}."
         )
+        (agent or self.evaluator)(
+            self._with_remote_execution_context(
+                instruction,
+                execution_command_cwd=repo,
+                control_cwd=self._item_dir(state),
+                control_output_dir=attempt_dir,
+                control_roadmap_path=self.roadmap_path,
+                execution_worktree=repo,
+                execution_live_config=tuning_config,
+                execution_accepted_config=tuning_accepted,
+                execution_artifact_dir=execution_attempt_dir,
+                execution_reference_result_dir=reference_dir,
+            )
+        )
 
     def _run_qa(self, state: WorkflowState) -> None:
         self._stamp_progress(state)
+        execution_verification_dir = self._execution_path(self.perf_layout.final_verification)
+        execution_tuning_config = self._execution_path(self.perf_layout.tuning_live)
         accuracy = self._accuracy_block()
         if accuracy:
             accuracy_context = (
                 f"`task.yaml` **has** an `accuracy` block: run its `command` "
                 f"verbatim against the live server, record the score under "
-                f"`{self.final_verification_dir}`, and compare it to "
+                f"`{execution_verification_dir}`, and compare it to "
                 f"`baseline_score` / `max_drop_pct` as your system prompt "
                 f"directs."
             )
@@ -3189,7 +3405,7 @@ class PerfOptimizeWorkflow:
                 f"run the **canonical `benchmark_serving.py` command in "
                 f"your system prompt** once per concurrency point {points}, "
                 f"sequentially ascending over the same server, with "
-                f"`--result-dir {self.final_verification_dir}/concurrency_<c>` "
+                f"`--result-dir {execution_verification_dir}/concurrency_<c>` "
                 f"per point"
             )
             cumulative_instruction = (
@@ -3207,7 +3423,7 @@ class PerfOptimizeWorkflow:
             benchmark_instruction = (
                 f"run the **canonical `benchmark_serving.py` command in "
                 f"your system prompt** at the configured operating point with "
-                f"`--result-dir {self.final_verification_dir}`"
+                f"`--result-dir {execution_verification_dir}`"
             )
             cumulative_instruction = (
                 "Compute `cumulative_improvement_pct` from your own "
@@ -3217,19 +3433,21 @@ class PerfOptimizeWorkflow:
                 "with both fields — `summary` and "
                 "`cumulative_improvement_pct` — from your own measurement"
             )
-        self.qa(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+        instruction = (
+            self._disagg_directive() + f"Control workspace: {self.workspace}\n"
             f"Campaign: the optimization loop is over ({state.round_index} "
             f"round(s) ran); the system under test is the final accepted "
             f"state.\n"
-            f"Verification directory (write your artifacts here): "
-            f"{self.final_verification_dir}\n\n"
+            f"Control verification directory (write the report here): "
+            f"{self.final_verification_dir}\n"
+            f"Execution verification directory (write raw artifacts here): "
+            f"{execution_verification_dir}\n\n"
             f"You are the campaign's final verification. Ground yourself "
             f"ONLY in `{self.task_path}`, `{self.roadmap_path}`, and your own "
             f"runs this turn — do not read other agents' reports or progress "
             f"entries.\n\n"
             f"Launch `trtllm-serve` with "
-            f"`--extra_llm_api_options {self.tuning_config_path}` (the live "
+            f"`--extra_llm_api_options {execution_tuning_config}` (the live "
             f"tuning config), poll to readiness in the foreground within this "
             f"turn, {benchmark_instruction}, and send a few completion requests "
             f"as a sanity check. {accuracy_context} Tear every server down "
@@ -3240,6 +3458,15 @@ class PerfOptimizeWorkflow:
             f"Accuracy / Conclusion).\n\n"
             f"Before completing your turn, call `append_qa_progress` "
             f"{progress_fields}."
+        )
+        self.qa(
+            self._with_remote_execution_context(
+                instruction,
+                control_output_dir=self.final_verification_dir,
+                control_roadmap_path=self.roadmap_path,
+                execution_live_config=execution_tuning_config,
+                execution_artifact_dir=execution_verification_dir,
+            )
         )
 
     def _run_reporter(self, state: WorkflowState) -> None:
@@ -3276,7 +3503,14 @@ class PerfOptimizeWorkflow:
                 "`baseline`) — the final verification did not run (no "
                 "accepted items), so say so"
             )
-        if state.last_nsys_dir:
+        if self.execution_layout is not None and self.execution_layout.mode == "remote":
+            after_profile = (
+                "raw nsys captures remain on the execution side; use each "
+                "control-side `profile_findings.md` and accepted "
+                "`evaluation.md` Kernel evidence section for the distilled "
+                "before/after comparison"
+            )
+        elif state.last_nsys_dir:
             after_profile = (
                 f"`{state.last_nsys_dir}` holds the freshest nsys capture "
                 f"of the final accepted state — prefer it as the 'after' "
@@ -3332,8 +3566,8 @@ class PerfOptimizeWorkflow:
                 f"was imported, so no reader mistakes an inherited "
                 f"measurement for one this campaign made),"
             )
-        self.reporter(
-            f"Workspace: {self.workspace}\n"
+        instruction = (
+            f"Control workspace: {self.workspace}\n"
             f"Optimization branch: `{state.campaign_git_branch}` — base commit "
             f"`{state.campaign_git_base_commit}` in `trtllm_repo_path`\n\n"
             f"The campaign is over ({state.round_index} round(s) ran). Read "
@@ -3344,9 +3578,9 @@ class PerfOptimizeWorkflow:
             f"statuses, expected vs measured gains, baseline/current_best), "
             f"every `optimization_summary.md` / `evaluation.md` under "
             f"`{self.rounds_dir}`, every round's "
-            f"`analysis/profile_findings.md` + `analysis/nsys_stats.txt` and "
-            f"every accepted attempt's `profile/nsys_stats.txt` (the "
-            f"kernel-level before/after evidence; {after_profile}), "
+            f"`analysis/profile_findings.md` and every accepted attempt's "
+            f"`evaluation.md` Kernel evidence section (the kernel-level "
+            f"before/after evidence; {after_profile}), "
             f"`{self.verification_report_path}` when it exists (the final "
             f"verification's independent benchmark + accuracy), "
             f"`{self.progress_path}` (the chronological trail the "
@@ -3377,6 +3611,17 @@ class PerfOptimizeWorkflow:
             f"with a `summary` of the cumulative improvement headline, the "
             f"accepted/failed item counts, and confirmation that both files "
             f"were written."
+        )
+        self.reporter(
+            self._with_remote_execution_context(
+                instruction,
+                execution_command_cwd=self._trtllm_repo_path(),
+                control_output_dir=self.workspace,
+                control_report_path=self.report_path,
+                control_report_html_path=self.report_html_path,
+                control_roadmap_path=self.roadmap_path,
+                execution_source_repo=self._trtllm_repo_path(),
+            )
         )
 
 

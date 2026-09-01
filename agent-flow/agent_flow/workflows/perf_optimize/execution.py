@@ -93,6 +93,7 @@ class PerfOptimizeLayout:
     """The single relative-path contract for perf-optimize artifacts."""
 
     task = "task.yaml"
+    execution_task = "task.execution.yaml"
     state = ".perf_optimize_state.json"
     progress = "progress.yaml"
     roadmap = "roadmap.yaml"
@@ -337,11 +338,13 @@ def sync_run_inputs_to_execution(
     """Upload the normalized task and initial tuning files on a new remote run."""
     if layout.mode != "remote":
         return
-    for relative in (
+    run_fs.copy_file(
         perf_layout.task,
-        perf_layout.tuning_live,
-        perf_layout.tuning_accepted,
-    ):
+        perf_layout.execution_task,
+        source_side="control",
+        destination_side="execution",
+    )
+    for relative in (perf_layout.tuning_live, perf_layout.tuning_accepted):
         run_fs.copy_file(
             relative,
             relative,

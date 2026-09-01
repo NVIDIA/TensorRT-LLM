@@ -3183,7 +3183,7 @@ def test_reporter_prompt_points_at_base_commit_and_inputs(tmp_path):
     assert "a" * 12 in prompt  # abbreviated base commit
     assert "roadmap.yaml" in prompt
     assert "verification_report.md" in prompt
-    assert "profile/nsys_stats.txt" in prompt
+    assert "evaluation.md` Kernel evidence section" in prompt
     assert "Launch no servers" in prompt
 
 

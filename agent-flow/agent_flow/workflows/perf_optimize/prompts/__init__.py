@@ -20,6 +20,11 @@ from .optimizer import SYSTEM_PROMPT as OPTIMIZER_SYSTEM_PROMPT
 from .projector import SYSTEM_PROMPT as PROJECTOR_SYSTEM_PROMPT
 from .projector import build_projector_prompt
 from .qa import SYSTEM_PROMPT as QA_SYSTEM_PROMPT
+from .remote_execution import (
+    REMOTE_EXECUTION_POLICY,
+    RemoteExecutionContext,
+    append_remote_execution_context,
+)
 from .reporter import SYSTEM_PROMPT as REPORTER_SYSTEM_PROMPT
 
 
@@ -87,6 +92,20 @@ DEFAULT_PROMPTS = PromptBundle(
     qa=QA_SYSTEM_PROMPT,
     reporter=REPORTER_SYSTEM_PROMPT,
 )
+
+
+def with_remote_execution_policy(bundle: PromptBundle) -> PromptBundle:
+    """Append the remote location/SSH contract to every role prompt."""
+    return bundle.with_extensions(
+        benchmarker=REMOTE_EXECUTION_POLICY,
+        projector=REMOTE_EXECUTION_POLICY,
+        analyzer=REMOTE_EXECUTION_POLICY,
+        optimizer=REMOTE_EXECUTION_POLICY,
+        evaluator=REMOTE_EXECUTION_POLICY,
+        integrator=REMOTE_EXECUTION_POLICY,
+        qa=REMOTE_EXECUTION_POLICY,
+        reporter=REMOTE_EXECUTION_POLICY,
+    )
 
 
 def build_perf_optimize_prompts(
@@ -219,7 +238,11 @@ __all__ = [
     "PROJECTOR_SYSTEM_PROMPT",
     "PromptBundle",
     "QA_SYSTEM_PROMPT",
+    "REMOTE_EXECUTION_POLICY",
     "REPORTER_SYSTEM_PROMPT",
+    "RemoteExecutionContext",
+    "append_remote_execution_context",
     "build_perf_optimize_prompts",
     "build_projector_prompt",
+    "with_remote_execution_policy",
 ]
