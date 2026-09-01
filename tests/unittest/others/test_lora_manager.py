@@ -234,7 +234,7 @@ class TestLoraManagerRetainDeviceTensors(unittest.TestCase):
     "Native FP8 LoRA requires SM90 or SM100",
 )
 class TestLoraManagerFp8(unittest.TestCase):
-    def test_hf_loader_reports_dense_fp8_dtype(self):
+    def test_hf_loader_reports_fp8_dtype(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             adapter_dir = Path(tmpdir) / "adapter"
             adapter_dir.mkdir()
@@ -247,9 +247,9 @@ class TestLoraManagerFp8(unittest.TestCase):
 
             loader = HfLoraLoader([str(adapter_dir)])
 
-        self.assertEqual(loader.get_dense_lora_dtype(), torch.float8_e4m3fn)
+        self.assertEqual(loader.get_lora_dtype(), torch.float8_e4m3fn)
 
-    def test_hf_loader_ignores_expert_only_fp8_dtype(self):
+    def test_hf_loader_reports_expert_only_fp8_adapter_dtype(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             adapter_dir = Path(tmpdir) / "adapter"
             adapter_dir.mkdir()
@@ -257,7 +257,7 @@ class TestLoraManagerFp8(unittest.TestCase):
 
             loader = HfLoraLoader([str(adapter_dir)])
 
-        self.assertIsNone(loader.get_dense_lora_dtype())
+        self.assertEqual(loader.get_lora_dtype(), torch.float8_e4m3fn)
 
     def test_fp8_dora_is_rejected(self):
         model_config = MockModelConfig()
@@ -288,7 +288,7 @@ class TestLoraManagerFp8(unittest.TestCase):
                     uids=["fp8-dora"],
                 )
 
-    def test_fp8_moe_weights_are_converted_to_model_dtype(self):
+    def test_fp8_moe_weights_remain_fp8(self):
         model_config = MockModelConfig(
             lora_target_modules=["moe_h_to_4h"],
             trtllm_modules_to_hf_modules={"moe_h_to_4h": "mlp.experts.gate_proj"},
@@ -311,9 +311,9 @@ class TestLoraManagerFp8(unittest.TestCase):
                 uids=["fp8-moe"],
             )
 
-        self.assertEqual(manager.cpp_lora_weights["fp8-moe"].dtype, torch.bfloat16)
+        self.assertEqual(manager.cpp_lora_weights["fp8-moe"].dtype, torch.float8_e4m3fn)
 
-    def test_mixed_fp8_dense_and_moe_modules_are_rejected_before_cache_mutation(self):
+    def test_mixed_fp8_dense_and_moe_modules_use_one_fp8_cache_dtype(self):
         model_config = MockModelConfig(
             lora_target_modules=["attn_q", "moe_h_to_4h"],
             trtllm_modules_to_hf_modules={
@@ -335,14 +335,13 @@ class TestLoraManagerFp8(unittest.TestCase):
             adapter_dir.mkdir()
             _create_dummy_hf_moe_lora_adapter(adapter_dir, include_dense=True)
 
-            with self.assertRaisesRegex(ValueError, "one PEFT cache dtype"):
-                manager.load_from_hf(
-                    model_dirs=[str(adapter_dir)],
-                    model_config=model_config,
-                    uids=["mixed-fp8"],
-                )
+            manager.load_from_hf(
+                model_dirs=[str(adapter_dir)],
+                model_config=model_config,
+                uids=["mixed-fp8"],
+            )
 
-        self.assertNotIn("mixed-fp8", manager.cpp_lora_weights)
+        self.assertEqual(manager.cpp_lora_weights["mixed-fp8"].dtype, torch.float8_e4m3fn)
 
     def test_partial_qkv_fp8_adapter_uses_fp8_placeholders(self):
         model_config = MockModelConfig(dtype="bfloat16")
@@ -517,7 +516,7 @@ class TestLoraManagerFp8(unittest.TestCase):
                 dtype=torch.float8_e4m3fn,
                 input_dtype=torch.float8_e5m2,
             )
-            self.assertIsNone(HfLoraLoader([str(adapter_dir)]).get_dense_lora_dtype())
+            self.assertIsNone(HfLoraLoader([str(adapter_dir)]).get_lora_dtype())
 
             with self.assertRaisesRegex(
                 ValueError, "FP8 LoRA input and output weights must have the same dtype"

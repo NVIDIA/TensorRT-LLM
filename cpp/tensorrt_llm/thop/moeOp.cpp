@@ -388,6 +388,7 @@ public:
         torch::optional<torch::Tensor> const& gated_lora_weight_ptrs = torch::nullopt,
         torch::optional<torch::Tensor> const& host_request_types = torch::nullopt,
         torch::optional<torch::Tensor> const& host_context_lengths = torch::nullopt, int64_t lora_max_low_rank = 0,
+        torch::optional<c10::ScalarType> const& lora_dtype = torch::nullopt,
         // Slot-indexed CUDA-graph LoRA inputs (mutually exclusive with the per-request
         // schema above). When fc1_slot_lora_ranks is provided, the per-token expansion
         // is performed inside the op via token_to_slot[t] indexed into the slot tables.
@@ -634,7 +635,7 @@ public:
             TORCH_CHECK(
                 mWeightDtype == c10::ScalarType::Half || mWeightDtype == c10::ScalarType::BFloat16 || is_per_tensor_fp8,
                 "MoE LoRA supports unquantized fp16/bf16 or per-tensor FP8 (qdq) base expert weights only "
-                "(LoRA adapters are always fp16/bf16).");
+                "with fp16, bf16, fp32, or fp8 LoRA adapter weights.");
             // The grouped-GEMM core runs entirely on the stream, so CUDA-graph
             // capture is supported, but only with the slot-indexed schema. The
             // per-request schema expands adapters on the host into pinned
@@ -651,8 +652,8 @@ public:
             fc2_lora_weight_ptrs, gated_lora_ranks, gated_lora_weight_ptrs, host_request_types, host_context_lengths,
             fc1_slot_lora_ranks, fc1_slot_lora_weight_ptrs, fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot,
-            /*num_tokens=*/num_rows, hidden_size, inter_size, mActivationDtype, lora_max_low_rank, is_gated_act, stream,
-            static_cast<int>(experts_per_token));
+            /*num_tokens=*/num_rows, hidden_size, inter_size, mActivationDtype, lora_dtype, lora_max_low_rank,
+            is_gated_act, stream, static_cast<int>(experts_per_token));
 
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream,
@@ -1189,10 +1190,11 @@ private:
         // low-rank intermediate is owned here.
         at::Tensor lowrank_workspace; // dtype  [P_max * max_lora_rank]
 
-        // Pinned-host single GemmCoord upper bounds; required by the
-        // cuda_graph_*_grouped_gemm wrappers for kernel selection.
-        at::Tensor host_max_problem_in;  // int8 pinned [sizeof(GemmCoord)]
-        at::Tensor host_max_problem_out; // int8 pinned [sizeof(GemmCoord)]
+        // Pinned-host per-problem GemmCoord upper bounds; required by the
+        // cuda_graph_*_grouped_gemm wrappers for kernel selection and FP8
+        // alignment validation.
+        at::Tensor host_max_problem_in;  // int8 pinned [P_max * sizeof(GemmCoord)]
+        at::Tensor host_max_problem_out; // int8 pinned [P_max * sizeof(GemmCoord)]
     };
 
     LoraGroupedGemmBuffers mFc1DeviceBuf;
@@ -1312,10 +1314,8 @@ private:
 
     // ===== LoRA helpers =====
 
-    // Map a torch dtype to the TRT-LLM tensorrt_llm::DataType used to size the
-    // grouped-GEMM low-rank scratch. Kept as a const member (not static) so the
-    // FP8 case can read mOutputDtype to pick the fp16/bf16 LoRA compute dtype.
-    tensorrt_llm::DataType loraTypeFromActDtype(c10::ScalarType dtype) const
+    // Map the PEFT cache scalar type to the grouped-GEMM datatype.
+    tensorrt_llm::DataType loraTypeFromCacheDtype(c10::ScalarType dtype) const
     {
         switch (dtype)
         {
@@ -1325,13 +1325,25 @@ private:
         case c10::ScalarType::BFloat16: return tensorrt_llm::DataType::kBF16;
 #endif
 #ifdef ENABLE_FP8
-        case c10::ScalarType::Float8_e4m3fn:
+        case c10::ScalarType::Float8_e4m3fn: return tensorrt_llm::DataType::kFP8;
+#endif
+        default: C10_THROW_ERROR_FORMATTED(Error, "MoE LoRA only supports fp16/bf16/fp32/fp8 cache dtype.");
+        }
+    }
+
+    // FP8 base activations are dequantized to the output dtype for the legacy
+    // FP16/BF16 LoRA path. An explicit cache dtype bypasses this mapping.
+    tensorrt_llm::DataType loraTypeFromActDtype(c10::ScalarType dtype) const
+    {
+#ifdef ENABLE_FP8
+        if (dtype == c10::ScalarType::Float8_e4m3fn)
+        {
             TORCH_CHECK(mOutputDtype != c10::ScalarType::Float8_e4m3fn,
                 "MoE LoRA with FP8 base activations requires an fp16/bf16 output (LoRA compute) dtype.");
-            return loraTypeFromActDtype(mOutputDtype);
-#endif
-        default: C10_THROW_ERROR_FORMATTED(Error, "MoE LoRA only supports fp16/bf16/fp32 activation dtype.");
+            return loraTypeFromCacheDtype(mOutputDtype);
         }
+#endif
+        return loraTypeFromCacheDtype(dtype);
     }
 
     // Expand per-request LoRA ranks and weight-pointer pairs into per-token arrays.
@@ -1576,8 +1588,8 @@ private:
     // so callers must ensure any in-flight CUDA graph referencing the old
     // addresses has been destroyed or will not replay.
     //
-    // The host-side max-problem-size pins hold one GemmCoord each; the value is
-    // a worst-case upper bound, independent of per-call data.
+    // The host-side max-problem-size pins hold one GemmCoord per possible
+    // problem; every entry contains the same worst-case upper bound.
     void ensureLoraDeviceScratch(int64_t capacity, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices,
         bool has_gated, cudaStream_t stream = nullptr)
     {
@@ -1587,7 +1599,7 @@ private:
         TORCH_CHECK(splitk_slices > 0, "grouped-GEMM splitk_slices must be positive; got ", splitk_slices);
 
         bool const need_resize = capacity > mLoraDeviceScratchCapacity || max_lora_rank > mLoraDeviceScratchMaxLoraRank
-            || dtype_bytes != mLoraDeviceScratchDtypeBytes || splitk_slices != mLoraDeviceScratchSplitKSlices
+            || dtype_bytes > mLoraDeviceScratchDtypeBytes || splitk_slices != mLoraDeviceScratchSplitKSlices
             || (has_gated && !mLoraDeviceScratchHasGated);
         if (!need_resize)
         {
@@ -1648,8 +1660,8 @@ private:
 
             mod.lowrank_workspace = at::empty({new_capacity * new_max_lora_rank}, dev_dtype_opts);
 
-            mod.host_max_problem_in = at::empty({gemm_coord_bytes}, pinned_int8_opts);
-            mod.host_max_problem_out = at::empty({gemm_coord_bytes}, pinned_int8_opts);
+            mod.host_max_problem_in = at::empty({new_capacity * gemm_coord_bytes}, pinned_int8_opts);
+            mod.host_max_problem_out = at::empty({new_capacity * gemm_coord_bytes}, pinned_int8_opts);
         };
 
         alloc_one(mFc1DeviceBuf);
@@ -1720,8 +1732,8 @@ private:
         torch::optional<torch::Tensor> const& gated_slot_lora_ranks,
         torch::optional<torch::Tensor> const& gated_slot_lora_weight_ptrs,
         torch::optional<torch::Tensor> const& token_to_slot, int64_t num_tokens, int64_t hidden_size,
-        int64_t inter_size, c10::ScalarType act_dtype, int64_t lora_max_low_rank, bool is_gated_activation,
-        cudaStream_t stream, int experts_per_token)
+        int64_t inter_size, c10::ScalarType act_dtype, torch::optional<c10::ScalarType> const& lora_dtype,
+        int64_t lora_max_low_rank, bool is_gated_activation, cudaStream_t stream, int experts_per_token)
     {
         bool const has_per_request = fc1_lora_ranks.has_value();
         bool const has_slot_indexed = fc1_slot_lora_ranks.has_value();
@@ -2008,7 +2020,9 @@ private:
         // (slot-indexed) inputs feed this capture-safe core. The TensorRT MoE
         // plugin leaves grouped_gemm.enabled false and uses its own cuBLAS path.
         {
-            int64_t const dtype_bytes = static_cast<int64_t>(common::getDTypeSize(loraTypeFromActDtype(act_dtype)));
+            tensorrt_llm::DataType const lora_data_type
+                = lora_dtype.has_value() ? loraTypeFromCacheDtype(*lora_dtype) : loraTypeFromActDtype(act_dtype);
+            int64_t const dtype_bytes = static_cast<int64_t>(common::getDTypeSize(lora_data_type));
             int64_t const capacity = num_tokens * static_cast<int64_t>(experts_per_token);
             // Pass stream so a mid-capture resize (which would invalidate
             // previously captured graphs) is rejected with a clear error
@@ -2021,6 +2035,7 @@ private:
             grouped_gemm.in_hidden_size = hidden_size;
             grouped_gemm.max_lora_rank = lora_max_low_rank;
             grouped_gemm.dtype_bytes = dtype_bytes;
+            grouped_gemm.data_type = lora_data_type;
             grouped_gemm.splitk_slices = kGroupedGemmSplitKSlices;
             grouped_gemm.has_gated = has_gated;
             // Populate the libtorch-bound GEMM dispatch entry point so
@@ -2069,20 +2084,26 @@ private:
             // for kernel selection. Values are upper bounds safe to fix at
             // warmup time (M=1 since each problem is one row; N/K depend on
             // module direction and max_lora_rank).
-            auto fill_max_problem = [](void* host_ptr, int m, int n, int k)
+            auto fill_max_problems = [](void* host_ptr, int64_t count, int m, int n, int k)
             {
                 auto* coord = static_cast<cutlass::gemm::GemmCoord*>(host_ptr);
-                *coord = cutlass::gemm::GemmCoord(m, n, k);
+                std::fill_n(coord, count, cutlass::gemm::GemmCoord(m, n, k));
             };
             // In-GEMM: M=1, N=max_lora_rank, K=in_dim. Out-GEMM: M=1, N=out_dim, K=max_lora_rank.
-            fill_max_problem(grouped_gemm.fc1.host_max_problem_in_pinned, 1, lora_max_low_rank, hidden_size);
-            fill_max_problem(grouped_gemm.fc1.host_max_problem_out_pinned, 1, inter_size, lora_max_low_rank);
-            fill_max_problem(grouped_gemm.fc2.host_max_problem_in_pinned, 1, lora_max_low_rank, inter_size);
-            fill_max_problem(grouped_gemm.fc2.host_max_problem_out_pinned, 1, hidden_size, lora_max_low_rank);
+            fill_max_problems(grouped_gemm.fc1.host_max_problem_in_pinned, mLoraDeviceScratchCapacity, 1,
+                lora_max_low_rank, hidden_size);
+            fill_max_problems(grouped_gemm.fc1.host_max_problem_out_pinned, mLoraDeviceScratchCapacity, 1, inter_size,
+                lora_max_low_rank);
+            fill_max_problems(grouped_gemm.fc2.host_max_problem_in_pinned, mLoraDeviceScratchCapacity, 1,
+                lora_max_low_rank, inter_size);
+            fill_max_problems(grouped_gemm.fc2.host_max_problem_out_pinned, mLoraDeviceScratchCapacity, 1, hidden_size,
+                lora_max_low_rank);
             if (has_gated)
             {
-                fill_max_problem(grouped_gemm.gated.host_max_problem_in_pinned, 1, lora_max_low_rank, hidden_size);
-                fill_max_problem(grouped_gemm.gated.host_max_problem_out_pinned, 1, inter_size, lora_max_low_rank);
+                fill_max_problems(grouped_gemm.gated.host_max_problem_in_pinned, mLoraDeviceScratchCapacity, 1,
+                    lora_max_low_rank, hidden_size);
+                fill_max_problems(grouped_gemm.gated.host_max_problem_out_pinned, mLoraDeviceScratchCapacity, 1,
+                    inter_size, lora_max_low_rank);
             }
         }
 

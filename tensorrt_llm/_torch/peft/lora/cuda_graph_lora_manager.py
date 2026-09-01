@@ -47,6 +47,7 @@ class CudaGraphLoraManager:
         overlap_lora_and_base: bool = False,
         device: str = "cuda",
         max_tokens_per_seq: int = 1,
+        max_num_tokens: Optional[int] = None,
     ):
         """
         Initialize the CUDA Graph LoRA manager.
@@ -60,6 +61,7 @@ class CudaGraphLoraManager:
             overlap_lora_and_base: Whether to overlap LoRA and base model computations.
             device: Device to allocate tensors on
             max_tokens_per_seq: Maximum number of tokens per sequence (>1 for spec decode)
+            max_num_tokens: Engine-wide token capacity, including eager prefill
         """
         self.max_lora_size = max_lora_size
         self.max_batch_size = max_batch_size
@@ -67,6 +69,7 @@ class CudaGraphLoraManager:
         self.device = device
 
         self.max_tokens_per_seq = max_tokens_per_seq
+        self.max_num_tokens = max_num_tokens
         self.adapter_slot_manager = AdapterSlotManager(max_lora_size)
         self.lora_model_config = lora_model_config
         self.lora_aux_stream = torch.cuda.Stream(device=device) if overlap_lora_and_base else None
@@ -112,8 +115,13 @@ class CudaGraphLoraManager:
         happen before any CUDA graph capture so the buffer addresses baked into
         the graph remain valid across replays.
         """
-        # Worst-case tokens in a single captured forward.
-        max_num_tokens = self.max_batch_size * self.max_tokens_per_seq
+        # Captured decode and eager prefill share the same cached runner. Once a
+        # graph records its scratch addresses, a later prefill must not grow
+        # them, so reserve the larger of the two engine-wide limits.
+        max_num_tokens = max(
+            self.max_batch_size * self.max_tokens_per_seq,
+            self.max_num_tokens or 0,
+        )
         reserved = 0
         for _, module in model.named_modules():
             reserve_fn = getattr(module, "reserve_moe_lora_cuda_graph_workspace", None)

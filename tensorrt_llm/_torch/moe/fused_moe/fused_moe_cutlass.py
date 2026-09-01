@@ -432,8 +432,8 @@ class CutlassFusedMoE(MoEImplBase):
         CudaGraphLoraManager does this automatically.
 
         Args:
-            max_num_tokens: Worst-case tokens in a captured forward
-                (max_batch_size * max_tokens_per_seq).
+            max_num_tokens: Engine-wide token capacity, covering both captured
+                decode and eager prefill forwards.
             max_lora_rank: Largest LoRA rank across adapters.
             max_lora_size: Adapter-slot pool size for the slot-indexed device tables.
         """
@@ -597,7 +597,6 @@ class CutlassFusedMoE(MoEImplBase):
             self.layer_idx, {}) if self.layer_idx is not None else {}
         if not layer_params:
             return None
-
         # Gather (ranks, weight_ptrs) per kernel slot. weight_pointers is built
         # flat ([num_seqs * 3], row-major (A, B, DoRA) per seq) in
         # PyTorchModelEngine._build_lora_params; the op expects [num_seqs, 3].
@@ -633,6 +632,7 @@ class CutlassFusedMoE(MoEImplBase):
             "host_request_types": _slice(lora_params["host_request_types"]),
             "host_context_lengths": _slice(lora_params["prompt_lens_cpu"]),
             "lora_max_low_rank": active_max_rank,
+            "lora_dtype": lora_params.get("data_type"),
         }
 
     def _extract_moe_lora_tensors_cuda_graph(
@@ -699,6 +699,8 @@ class CutlassFusedMoE(MoEImplBase):
             token_to_slot,
             "lora_max_low_rank":
             max_rank,
+            "lora_dtype":
+            lora_params.get("data_type"),
         }
 
     def _check_configs(self):

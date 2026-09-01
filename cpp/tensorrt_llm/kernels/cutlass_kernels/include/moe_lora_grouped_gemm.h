@@ -145,6 +145,7 @@ struct MoeLoraGroupedGemm
     int64_t in_hidden_size = 0;
     int64_t max_lora_rank = 0;
     int64_t dtype_bytes = 0;
+    tensorrt_llm::DataType data_type = tensorrt_llm::DataType::kBF16;
     int64_t splitk_slices = 0;
 
     bool has_gated = false;

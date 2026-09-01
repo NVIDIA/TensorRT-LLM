@@ -10,7 +10,7 @@ that glue end-to-end on the Python side, without model weights or the built C++
 op:
 
   * `CudaGraphLoraParams.get_moe_slot_inputs` packs the per-module
-    (A, B, dora) slot-pointer table and aliases the shared per-slot rank table.
+    (rank, A, B, dora) slot metadata.
   * `CutlassFusedMoE._extract_moe_lora_tensors_cuda_graph` threads those tables
     plus `token_to_slot` into the slot-indexed kwargs the op consumes, applying
     the moe_h_to_4h->fc1 / moe_gate->gated / moe_4h_to_h->fc2 mapping and the
@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import CudaGraphLoraParams
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 
@@ -35,6 +36,27 @@ requires_cuda = pytest.mark.skipif(
 
 _HIDDEN = 128
 _INTER = 256
+
+
+def test_workspace_reservation_covers_eager_prefill_capacity():
+    reservations = []
+
+    class _MoeStub(torch.nn.Module):
+        def reserve_moe_lora_cuda_graph_workspace(self, *args):
+            reservations.append(args)
+
+    model = torch.nn.Module()
+    model.moe = _MoeStub()
+    manager = CudaGraphLoraManager.__new__(CudaGraphLoraManager)
+    manager.max_batch_size = 4
+    manager.max_tokens_per_seq = 1
+    manager.max_num_tokens = 256
+    manager.max_lora_rank = 16
+    manager.max_lora_size = 1
+
+    manager._reserve_moe_lora_workspaces(model)
+
+    assert reservations == [(256, 16, 1)]
 
 
 class _ExtractStub:
@@ -81,19 +103,19 @@ def _fake_ptr(module_id, slot, side):
 
 
 def _populate_pointers(params, key, module_ids, rank):
-    """Fill per-module A/B host pointer tables and the shared per-slot rank
-    table, mimicking what the PEFT cache manager would do for occupied slots."""
+    """Fill per-module A/B host pointer and rank tables."""
     layer_param = params.layer_params[key]
     for local_id, module_id in enumerate(module_ids):
         for slot in range(params.max_lora_size):
             layer_param.h_b_ptrs[local_id, slot] = _fake_ptr(module_id, slot, 0)
             layer_param.h_b_prime_ptrs[local_id, slot] = _fake_ptr(module_id, slot, 1)
+            layer_param.h_ranks[local_id, slot] = rank
     for slot in range(params.max_lora_size):
         params.slot_ranks_host[slot] = rank
 
 
 @requires_cuda
-def test_get_moe_slot_inputs_packs_pointers_and_aliases_ranks():
+def test_get_moe_slot_inputs_packs_pointers_and_module_ranks():
     rank = 8
     params, key, module_ids = _make_params(max_lora_size=2, max_rank=rank)
     _populate_pointers(params, key, module_ids, rank)
@@ -102,8 +124,8 @@ def test_get_moe_slot_inputs_packs_pointers_and_aliases_ranks():
         out = params.get_moe_slot_inputs(layer_idx=0, module_id=module_id)
         assert out is not None
         ranks_host, packed = out
-        # Ranks are the shared per-slot table aliased (not a per-module copy).
-        assert ranks_host is params.slot_ranks_host
+        local_module_id = key.module_ids.index(module_id)
+        assert ranks_host.data_ptr() == params.layer_params[key].h_ranks[local_module_id].data_ptr()
         assert packed.shape == (params.max_lora_size, 3)
         for slot in range(params.max_lora_size):
             assert packed[slot, 0].item() == _fake_ptr(module_id, slot, 0)  # A
@@ -117,6 +139,29 @@ def test_get_moe_slot_inputs_packs_pointers_and_aliases_ranks():
     assert (
         params.get_moe_slot_inputs(layer_idx=99, module_id=int(LoraModuleType.MOE_H_TO_4H)) is None
     )
+
+
+@requires_cuda
+def test_get_moe_slot_inputs_disables_missing_module_for_occupied_slot():
+    """A task may adapt only some layers/modules; missing pointers require rank 0."""
+    rank = 8
+    params, _, module_ids = _make_params(max_lora_size=1, max_rank=rank)
+    adapted_module_id = module_ids[0]
+
+    class _Config:
+        layer_id = 0
+        module_id = adapted_module_id
+        adapter_size = rank
+        weights_in_pointer = _fake_ptr(adapted_module_id, 0, 0)
+        weights_out_pointer = _fake_ptr(adapted_module_id, 0, 1)
+
+    params.update_weight_pointers({7: [_Config()]}, (7,))
+
+    adapted_ranks, _ = params.get_moe_slot_inputs(0, adapted_module_id)
+    missing_ranks, missing_ptrs = params.get_moe_slot_inputs(0, module_ids[1])
+    assert adapted_ranks.tolist() == [rank]
+    assert missing_ranks.tolist() == [0]
+    assert torch.count_nonzero(missing_ptrs).item() == 0
 
 
 @requires_cuda
@@ -153,12 +198,14 @@ def test_extract_moe_lora_tensors_cuda_graph_wires_slot_tables():
         "use_cuda_graph_mode": True,
         "cuda_graph_params": params,
         "num_seqs": num_seqs,
+        "data_type": torch.float8_e4m3fn,
     }
     kwargs = CutlassFusedMoE._extract_moe_lora_tensors_cuda_graph(_ExtractStub(0), lora_params)
     assert kwargs is not None
 
     # max_rank is the global cap, not a per-step value.
     assert kwargs["lora_max_low_rank"] == rank
+    assert kwargs["lora_dtype"] == torch.float8_e4m3fn
 
     # All three modules present, mapped to their kernel slots.
     for kernel, module_id in (

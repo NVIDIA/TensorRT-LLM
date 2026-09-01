@@ -155,8 +155,8 @@ def load_torch_hf_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
     loaded later by LoraManager when requests arrive with LoRA UIDs.
 
     Returns:
-        The common dense LoRA weight dtype, or ``None`` when no homogeneous
-        dense LoRA weights are present.
+        The common LoRA weight dtype, or ``None`` when no homogeneous LoRA
+        weights are present.
     """
     if not lora_config.trtllm_modules_to_hf_modules:
         lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
@@ -177,7 +177,7 @@ def load_torch_hf_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
 
     missing_qkv_modules = LoraManager.get_missing_qkv_modules(lora_config.lora_target_modules)
     lora_config.lora_target_modules.extend(missing_qkv_modules)
-    return lora_loader.get_dense_lora_dtype()
+    return lora_loader.get_lora_dtype()
 
 
 def load_torch_nemo_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
@@ -685,9 +685,7 @@ class LoraManager(object):
 
             def uses_native_fp8(module_weights):
                 return (
-                    get_output_dtype(module_weights) == torch.float8_e4m3fn
-                    and not _is_moe_module_weights(module_weights)
-                    and supports_native_fp8
+                    get_output_dtype(module_weights) == torch.float8_e4m3fn and supports_native_fp8
                 )
 
             for layer_weights in all_weights.values():
@@ -718,8 +716,8 @@ class LoraManager(object):
                 dtype_names = ", ".join(sorted(str(dtype) for dtype in cache_dtypes))
                 raise ValueError(
                     "A LoRA adapter must use one PEFT cache dtype across all modules; "
-                    f"{model_dir} requires {dtype_names}. Mixing native FP8 dense modules "
-                    "with compute-dtype modules such as routed-expert MoE is not supported."
+                    f"{model_dir} requires {dtype_names}. Mixing native FP8 modules "
+                    "with compute-dtype modules is not supported."
                 )
 
             cpp_lora_weights = []

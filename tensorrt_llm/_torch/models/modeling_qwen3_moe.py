@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 from typing import Dict, List, Optional
 
@@ -123,7 +138,9 @@ class Qwen3MoE(nn.Module):
             ),
         )
 
-        self.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ if config.model_type == "qwen3_vl_moe_text" else MoEWeightLoadingMode.VANILLA
+        self.weight_loading_mode = (MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
+                                    if config.model_type == "qwen3_vl_moe_text"
+                                    else MoEWeightLoadingMode.VANILLA)
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -143,6 +160,7 @@ class Qwen3MoE(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
@@ -160,6 +178,7 @@ class Qwen3MoE(nn.Module):
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
             do_finalize=do_finalize,
+            lora_params=lora_params,
         )
 
         if not do_finalize:
@@ -281,6 +300,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
+            lora_params=kwargs.get("lora_params"),
         )
 
         if deepstack_embeds is not None and self.layer_idx in range(

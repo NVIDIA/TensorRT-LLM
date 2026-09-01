@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from collections import namedtuple
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -20,6 +35,7 @@ class LoraLayerParams:
     d_b_prime_ptrs: torch.Tensor  # Lora_out weight pointers
     h_b_ptrs: torch.Tensor  # Lora_in weight pointers in host
     h_b_prime_ptrs: torch.Tensor  # Lora_out weight pointers in host
+    h_ranks: torch.Tensor  # Per-module ranks in host
 
     d_output_sizes: torch.Tensor
     d_output_sizes_offset: torch.Tensor
@@ -179,6 +195,7 @@ class CudaGraphLoraParams:
             d_b_prime_ptrs=torch.zeros(shape_2d, dtype=torch.int64, device=self.device),
             h_b_ptrs=torch.zeros(shape_2d, dtype=torch.int64, pin_memory=prefer_pinned()),
             h_b_prime_ptrs=torch.zeros(shape_2d, dtype=torch.int64, pin_memory=prefer_pinned()),
+            h_ranks=torch.zeros(shape_2d, dtype=torch.int32, pin_memory=prefer_pinned()),
             d_output_sizes=output_hidden_sizes_device,
             d_output_sizes_offset=output_sizes_offset_device,
             h_output_sizes=output_hidden_sizes,
@@ -268,6 +285,7 @@ class CudaGraphLoraParams:
             for layer_param in self.layer_params.values():
                 layer_param.h_b_ptrs[:, slot_id] = 0
                 layer_param.h_b_prime_ptrs[:, slot_id] = 0
+                layer_param.h_ranks[:, slot_id] = 0
 
         for slot_id in range(self.max_lora_size):
             task_id = slot_to_task_mapping[slot_id]
@@ -308,6 +326,7 @@ class CudaGraphLoraParams:
                     layer_param.h_b_prime_ptrs[local_module_id, slot_id] = (
                         config.weights_out_pointer
                     )
+                    layer_param.h_ranks[local_module_id, slot_id] = rank
 
         self.slot_ranks.copy_(self.slot_ranks_host, non_blocking=True)
 
@@ -443,8 +462,8 @@ class CudaGraphLoraParams:
 
         Returns:
             A tuple (slot_ranks_host, slot_weight_ptrs_host), where
-            slot_ranks_host is [max_lora_size] int32 (an alias to
-            self.slot_ranks_host), and slot_weight_ptrs_host is
+            slot_ranks_host is [max_lora_size] int32 for this exact layer and
+            module, and slot_weight_ptrs_host is
             [max_lora_size, 3] int64 with columns (A_ptr, B_ptr, dora_ptr).
             dora_ptr is always 0, since DoRA with MoE is rejected upstream.
             Returns None if (layer_idx, module_id) is not in this layer's map.
@@ -478,4 +497,4 @@ class CudaGraphLoraParams:
         packed[:, 0].copy_(ptrs_a.to(torch.int64))
         packed[:, 1].copy_(ptrs_b.to(torch.int64))
         # Column 2 (dora) stays zero.
-        return self.slot_ranks_host, packed
+        return layer_param.h_ranks[local_module_id], packed
