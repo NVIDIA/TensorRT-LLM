@@ -7689,10 +7689,9 @@ class PyExecutor:
 
             request = requests_in_transfer[request_id]
             if request_id in failed_req_ids:
-                self._pending_ctx_transfer_failures.add(request_id)
-                self.async_transfer_manager.end_transfer(request)
-            else:
-                self._end_transfer_and_maybe_terminate(request)
+                # Past the context phase: writing the error state here is safe
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            self._end_transfer_and_maybe_terminate(request)
 
         # The set of requests in transfer may have changed since we terminated some requests.
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
