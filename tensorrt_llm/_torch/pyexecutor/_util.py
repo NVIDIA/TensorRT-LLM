@@ -48,9 +48,10 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
+                           extract_qwen4_exp_ple_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid,
+                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -158,8 +159,12 @@ def get_kv_cache_manager_cls(
                     sparse_attn_config, use_kv_cache_manager_v2=use_v2)
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
+        if sparse_attn_algorithm == "qsa" and not use_v2:
+            raise ValueError(
+                "QSA with hybrid Mamba / linear-attention models requires "
+                "use_kv_cache_manager_v2=True.")
         if (sparse_attn_config is not None
-                and sparse_attn_algorithm != "skip_softmax"):
+                and sparse_attn_algorithm not in ("qsa", "skip_softmax")):
             raise ValueError(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
@@ -293,6 +298,9 @@ def get_kv_cache_manager_cls(
                 "V2 Mamba block reuse is not compatible with "
                 "enable_kv_pool_rebalance because the rebalancer does not "
                 "yet model retained recurrent-state snapshots.")
+        if sparse_attn_algorithm == "qsa":
+            return get_sparse_attn_kv_cache_manager(
+                sparse_attn_config, use_kv_cache_manager_v2=True)
         return MambaHybridCacheManagerV2
     elif sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config,
@@ -2192,6 +2200,31 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
+def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
+                                    is_draft: bool):
+    """Align target-only PLE state with a target/draft cache layout."""
+    if is_draft:
+        # The recurrent MTP layer is QSA-only and does not carry PLE state.
+        return None
+
+    params = extract_qwen4_exp_ple_cache_params(config)
+    num_target_layers = len(params.ple_layer_mask)
+    if num_target_layers > total_layers:
+        raise ValueError(
+            "PLE layer mask cannot exceed the hybrid cache layout: "
+            f"got {num_target_layers}, expected at most {total_layers}")
+    if num_target_layers == total_layers:
+        return params
+
+    # A unified one-model cache appends full-attention MTP layers after the
+    # target layers. Those layers do not own PLE state.
+    return dataclasses.replace(
+        params,
+        ple_layer_mask=params.ple_layer_mask + [False] *
+        (total_layers - num_target_layers),
+    )
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -2578,7 +2611,12 @@ def _create_kv_cache_manager(
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             **mamba_manager_extra_kwargs,
         )
-    elif is_qwen3_hybrid(config):
+    elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
+        # Qwen4-Exp reuses the Qwen3-hybrid GDN construction path: same
+        # extract_mamba_kv_cache_params, same layer masks, and the same
+        # "qwen3_next" conv-state layout (its GDN mixer is the shared module).
+        # This mamba branch absorbs is_disagg via **mamba_manager_extra_kwargs;
+        # the generic non-mamba else-branch would pass is_disagg twice.
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -2654,6 +2692,21 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
+                                               MambaHybridCacheManagerV2):
+            # Qwen4-Exp's PLE (n-gram short-conv) side path carries two extra
+            # per-layer recurrent-state pools (short-conv-state + n-gram-context)
+            # beyond the GDN conv/ssm state; the V2 hybrid cache manager owns and
+            # exposes them. Only V2 accepts this kwarg; Qwen3-hybrid
+            # models have no PLE side path and pass nothing.
+            ple_cache_params = _get_qwen4_exp_ple_cache_params(
+                config,
+                total_layers=len(mamba_layer_mask),
+                is_draft=is_draft,
+            )
+            if ple_cache_params is not None:
+                mamba_manager_extra_kwargs[
+                    "qwen4_exp_ple_cache_params"] = ple_cache_params
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,

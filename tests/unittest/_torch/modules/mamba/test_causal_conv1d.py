@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_update
 
 
 def mamba_conv1d_ref(x, past_conv_state, conv_weight, conv_bias, apply_silu):
@@ -244,3 +245,93 @@ class TestCausalConv1d:
 
         torch.testing.assert_close(x_kernel_reshaped, out_ref, rtol=1e-2, atol=1e-1)
         torch.testing.assert_close(conv_state_kernel, conv_state_ref, rtol=1e-2, atol=1e-1)
+
+    @pytest.mark.parametrize("dconv", [2, 3, 4])
+    @pytest.mark.parametrize("dim", [256, 10240])
+    @pytest.mark.parametrize("batch_size", [1, 8])
+    def test_update_seqlen_one(self, batch_size, dim, dconv):
+        """Decode update (one token, silu, slot-indexed state).
+
+        The channel work is spread over a block width chosen from the batch,
+        the channel count and the device, so the shapes here span the choices.
+        """
+        torch.manual_seed(42)
+        device = "cuda"
+        dtype = torch.bfloat16
+        slots = batch_size + 2
+
+        x = torch.randn(batch_size, dim, dtype=dtype, device=device) * 0.5
+        conv_state = torch.randn(slots, dim, dconv - 1, dtype=dtype, device=device) * 0.5
+        conv_weight = torch.randn(dim, 1, dconv, dtype=dtype, device=device)
+        conv_bias = torch.randn(dim, dtype=dtype, device=device)
+        indices = torch.arange(2, 2 + batch_size, dtype=torch.int32, device=device)
+
+        x_kernel = x.clone()
+        conv_state_kernel = conv_state.clone()
+        causal_conv1d_update(
+            x_kernel,
+            conv_state_kernel,
+            conv_weight.squeeze(1).contiguous(),
+            conv_bias,
+            activation="silu",
+            conv_state_indices=indices,
+        )
+
+        out_ref, state_ref = mamba_conv1d_ref(
+            x.unsqueeze(-1),
+            conv_state[2 : 2 + batch_size],
+            conv_weight,
+            conv_bias,
+            apply_silu=True,
+        )
+
+        torch.testing.assert_close(x_kernel, out_ref.squeeze(-1), rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(
+            conv_state_kernel[2 : 2 + batch_size], state_ref, rtol=1e-2, atol=1e-2
+        )
+        # Slots outside the index list must be untouched.
+        torch.testing.assert_close(conv_state_kernel[:2], conv_state[:2], rtol=0, atol=0)
+
+    def test_update_seqlen_one_under_cuda_graph(self):
+        """The decode update is captured into a CUDA graph in production."""
+        torch.manual_seed(43)
+        device = "cuda"
+        dtype = torch.bfloat16
+        dim, dconv = 10240, 4
+
+        x = torch.randn(1, dim, dtype=dtype, device=device) * 0.5
+        conv_state = torch.randn(4, dim, dconv - 1, dtype=dtype, device=device) * 0.5
+        conv_weight = torch.randn(dim, dconv, dtype=dtype, device=device) * 0.1
+        conv_bias = torch.randn(dim, dtype=dtype, device=device) * 0.1
+        indices = torch.tensor([1], dtype=torch.int32, device=device)
+
+        def update(x_buf, state_buf):
+            causal_conv1d_update(
+                x_buf,
+                state_buf,
+                conv_weight,
+                conv_bias,
+                activation="silu",
+                conv_state_indices=indices,
+            )
+
+        x_eager, state_eager = x.clone(), conv_state.clone()
+        update(x_eager, state_eager)
+
+        x_graph, state_graph = x.clone(), conv_state.clone()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            update(x.clone(), conv_state.clone())
+        torch.cuda.current_stream().wait_stream(side)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            update(x_graph, state_graph)
+        x_graph.copy_(x)
+        state_graph.copy_(conv_state)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(x_graph, x_eager)
+        assert torch.equal(state_graph, state_eager)

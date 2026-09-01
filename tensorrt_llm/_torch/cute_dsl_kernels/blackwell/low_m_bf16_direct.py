@@ -6,9 +6,10 @@
 # Original copyright: Copyright contributors to the vLLM project
 #                     Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 #
-# TODO(TRTLLM-15304): This file is a vendored copy of the FlashInfer direct (SIMT) kernel.
-# Once FlashInfer releases v0.6.18 (which packages these kernels as importable Python
-# modules), remove this file and import directly from flashinfer instead.
+# TODO(TRTLLM-15304): The GEMM mainloop in this file is a vendored copy of the FlashInfer
+# direct (SIMT) kernel.  Once FlashInfer releases v0.6.18 (which packages these kernels as
+# importable Python modules), import the plain GEMM from flashinfer and keep only the
+# epilogue variants below, which have no FlashInfer counterpart.
 # Tracking: https://github.com/flashinfer-ai/flashinfer/pull/4266
 """Register-prefetch BF16 GEMM for low-M, long-K decode shapes on SM10x.
 
@@ -20,12 +21,15 @@ tactic spaces.
 
 Unlike the split-K kernel this path uses SIMT (scalar) FP32 accumulators and
 a register-file prefetch of the entire K dimension, which avoids TMA and TMEM
-overhead and excels for **M=1..4, K=8192, N≤4608** decode shapes where the
-tensor-core path has too little N-dim parallelism to fill the SMs.
+overhead and excels for narrow decode shapes where the tensor-core path has
+too little N-dim parallelism to fill the SMs.  See
+:func:`prefer_direct_bf16_gemm_sm100` for the measured shape bands.
 
 Public API::
 
     run_direct_dense(a, b, out, pdl, tactic)  # a=[M,K], b=[K,N] col-major
+
+    run_direct_dense_silu_prefix(a, b, out, pdl, tactic, scale, prefix)
 
     prefer_direct_bf16_gemm_sm100(m, n, k)  # heuristic crossover predicate
 """
@@ -38,6 +42,7 @@ import functools
 import cuda.bindings.driver as _cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.math as cute_math
 import torch as _torch
 from cutlass import const_expr
 from cutlass.cute import experimental as cute_ext
@@ -57,6 +62,13 @@ MAX_M = 32
 
 #: ptxas register cap (keeps occupancy predictable across block sizes).
 _COMPILE_OPTIONS = "--ptxas-options -maxrregcount=64"
+
+#: Epilogue modes; "none" preserves the generic GEMM store path.
+_EPILOGUE_MODES = ("none", "silu_prefix")
+
+
+def _sigmoid_f32(value):
+    return 1.0 / (cute_math.exp(value * -1.0) + 1.0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -140,17 +152,35 @@ def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
 def prefer_direct_bf16_gemm_sm100(m: int, n: int, k: int) -> bool:
     """Conservative B200 crossover heuristic for the direct vs split-K choice.
 
-    Returns ``True`` when the direct (SIMT) kernel is expected to be faster
-    than the tensor-core split-K kernel on B200 / B300 hardware without
-    autotuning.  The three bands are a compact fit to an empirical sweep:
+    Returns ``True`` when the direct (SIMT) kernel is expected to beat both the
+    tensor-core split-K kernel and cuBLAS on B200 / B300 hardware without
+    autotuning.  The bands are a compact fit to empirical sweeps of CUDA-graph
+    replay cost measured with a **cold L2** (each call reads a different weight
+    from a pool several times the cache size), because a decode iteration
+    streams every layer's weights past between two uses of any one of them.
 
-    * ``M=1, N≤4608``  — single-row decode; split-K N-parallelism too thin.
+    Single-row decode (``M=1``), any supported K:
+
+    * ``N≤2048``          — split-K N-parallelism is far too thin here, and
+                            cuBLAS additionally pairs every GEMM with a separate
+                            reduce kernel.  Measured 1.35x-2.70x on GB300.
+    * ``K≥4096, N≤4608``  — a deeper K amortises the register prefetch, so the
+                            crossover moves out in N.  Measured 1.21x-2.20x.
+
+    Small batch, ``K=8192`` only:
+
     * ``M≤4, N≤512``   — small batch, narrow projection (e.g. GQA kv_proj).
     * ``M≤8, N≤256``   — very narrow outputs only.
 
-    Only applies to ``K=8192``; for other K values the autotuner decides.
+    Wider N is deliberately excluded even where a cold sweep showed the direct
+    kernel marginally ahead: past these bands the two kernels land within ~25%
+    of each other and the ordering flips with cache state, so an untuned
+    selection there is not safe.  Outside the bands the caller keeps its default
+    GEMM (cuBLAS, or the autotuner's pick when the low-M dispatcher is enabled).
     """
-    return k == 8192 and ((m == 1 and n <= 4608) or (m <= 4 and n <= 512) or (m <= 8 and n <= 256))
+    if m == 1:
+        return n <= 2048 or (k >= 4096 and n <= 4608)
+    return k == 8192 and ((m <= 4 and n <= 512) or (m <= 8 and n <= 256))
 
 
 class _DirectDenseGemmKernel:
@@ -164,8 +194,15 @@ class _DirectDenseGemmKernel:
         k_extent: int,
         tactic: DirectTactic,
         use_pdl: bool,
+        epilogue_mode: str = "none",
+        epilogue_scale: float = 1.0,
+        epilogue_prefix: int = 0,
     ) -> None:
         validate_tactic(tactic, num_rows, tactic.outputs_per_block, k_extent)
+        if epilogue_mode not in _EPILOGUE_MODES:
+            raise ValueError(f"unsupported epilogue_mode={epilogue_mode}")
+        if epilogue_mode == "silu_prefix" and epilogue_prefix <= 0:
+            raise ValueError(f"silu epilogue_prefix must be positive, got {epilogue_prefix}")
         self.element_type = element_type
         self.num_rows = num_rows
         self.rows_per_block = tactic.rows_per_block
@@ -174,6 +211,9 @@ class _DirectDenseGemmKernel:
         self.outputs_per_block = tactic.outputs_per_block
         self.vector_width = _VECTOR_WIDTH
         self.use_pdl = use_pdl
+        self.epilogue_mode = epilogue_mode
+        self.epilogue_scale = epilogue_scale
+        self.epilogue_prefix = epilogue_prefix
         self.num_warps = tactic.block_size // cute.arch.WARP_SIZE
         self.num_k_tiles = k_extent // (tactic.block_size * _VECTOR_WIDTH)
 
@@ -304,7 +344,16 @@ class _DirectDenseGemmKernel:
                     total = cutlass.Float32(0.0)
                     for warp in cutlass.range_constexpr(num_warps):
                         total = total + partials[mi, ni, warp]
-                    gC[m_base + mi, n_base + ni] = total.to(self.element_type)
+                    value = total.to(self.element_type)
+                    if const_expr(self.epilogue_mode == "silu_prefix"):
+                        if n_base + ni < self.epilogue_prefix:
+                            # Round the accumulator to the output type before the
+                            # activation: the fused epilogue then reproduces a
+                            # separate activation kernel reading this GEMM's own
+                            # output, rather than shifting its rounding point.
+                            scaled = value.to(cutlass.Float32) * self.epilogue_scale
+                            value = (scaled * _sigmoid_f32(scaled)).to(self.element_type)
+                    gC[m_base + mi, n_base + ni] = value
 
         if const_expr(self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()
@@ -334,6 +383,9 @@ def _get_compiled_direct_kernel(
     k: int,
     tactic: DirectTactic,
     use_pdl: bool,
+    epilogue_mode: str = "none",
+    epilogue_scale: float = 1.0,
+    epilogue_prefix: int = 0,
 ):
     """JIT-compile and cache a specialised ``_DirectDenseGemmKernel``."""
     if dtype != _torch.bfloat16:
@@ -344,6 +396,9 @@ def _get_compiled_direct_kernel(
         k_extent=k,
         tactic=tactic,
         use_pdl=use_pdl,
+        epilogue_mode=epilogue_mode,
+        epilogue_scale=epilogue_scale,
+        epilogue_prefix=epilogue_prefix,
     )
     tensors = _make_compile_repr_tensors(dtype, m, n, k)
     stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
@@ -409,8 +464,55 @@ def run_direct_dense(
     Returns:
         The ``out`` tensor filled with the GEMM result.
     """
+    return _run(a, b, out, pdl, tactic)
+
+
+def run_direct_dense_silu_prefix(
+    a: _torch.Tensor,
+    b: _torch.Tensor,
+    out: _torch.Tensor,
+    pdl: bool,
+    tactic: DirectTactic,
+    scale: float,
+    prefix: int,
+) -> _torch.Tensor:
+    """Apply ``silu(scale * x)`` to an output prefix while retaining a raw suffix.
+
+    Serves projections that pack an activated low-rank block and unactivated
+    logits into one weight matrix: the first ``prefix`` columns of ``out`` get
+    the activation, the rest are stored as a plain GEMM result.  Fusing the
+    activation here removes an elementwise kernel whose launch dominates its
+    work at decode row counts.
+
+    Args:
+        a, b, out, pdl, tactic: as for :func:`run_direct_dense`.
+        scale:  Multiplier applied before the activation.
+        prefix: Number of leading output columns to activate, in ``[1, N]``.
+    """
+    if not 0 < prefix <= b.shape[1]:
+        raise ValueError(f"prefix must be in [1, {b.shape[1]}], got {prefix}")
+    return _run(
+        a,
+        b,
+        out,
+        pdl,
+        tactic,
+        epilogue_mode="silu_prefix",
+        epilogue_scale=scale,
+        epilogue_prefix=prefix,
+    )
+
+
+def _run(
+    a: _torch.Tensor,
+    b: _torch.Tensor,
+    out: _torch.Tensor,
+    pdl: bool,
+    tactic: DirectTactic,
+    **epilogue,
+) -> _torch.Tensor:
     m, n, k = _validate_runtime_tensors(a, b, out, tactic)
-    compiled = _get_compiled_direct_kernel(a.dtype, m, n, k, tactic, pdl)
+    compiled = _get_compiled_direct_kernel(a.dtype, m, n, k, tactic, pdl, **epilogue)
     # Pass b.T (row-major [N, K]) so the kernel sees gB[N, K].
     tensors = tuple(_from_dlpack_static(t) for t in (a, b.T, out))
     stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
@@ -425,5 +527,6 @@ __all__ = [
     "default_tactic",
     "prefer_direct_bf16_gemm_sm100",
     "run_direct_dense",
+    "run_direct_dense_silu_prefix",
     "validate_tactic",
 ]

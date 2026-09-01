@@ -33,13 +33,12 @@ from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
-from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
+from .low_m_gemm import (LOW_M_GEMM_ACTIVE, apply_direct_low_m_gemm,
+                         apply_low_m_gemm)
 
 
-def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
-    """Fast pre-filter: check the global enable flag and M upper bound only."""
-    if not LOW_M_GEMM_ACTIVE:
-        return False
+def _is_low_m_input(input: torch.Tensor) -> bool:
+    """Fast pre-filter: M upper bound only, no backend selection."""
     if input.ndim < 1:
         return False
     k = int(input.shape[-1])
@@ -531,10 +530,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     BF16 GEMM dispatch (priority order, Blackwell SM100/SM103)
     ----------------------------------------------------------
-    1. **low-m GEMM** (``TRTLLM_LOW_M_GEMM_BACKEND=auto``, M ≤ 32)
-       CuTe-DSL low-m GEMM kernel for small-M decode batches on Blackwell.
-       Orthogonal to ``use_cute_dsl_bf16_gemm`` — must be enabled
-       independently via the env var.
+    1. **low-m GEMM** (M ≤ 32)
+       CuTe-DSL low-m GEMM kernels for small-M decode batches. With
+       ``TRTLLM_LOW_M_GEMM_BACKEND=auto`` the AutoTuner races cuBLAS against
+       both low-m kernels and caches the winner per shape; otherwise the
+       direct (SIMT) kernel is taken on the shapes
+       ``prefer_direct_bf16_gemm_sm100`` measures it winning on, and all other
+       shapes fall through. Orthogonal to ``use_cute_dsl_bf16_gemm``.
 
     2. **persistent GEMM** (``Linear(use_cute_dsl_bf16_gemm=True)``)
        ``trtllm::cute_dsl_bf16_gemm_blackwell`` persistent CuTe-DSL kernel.
@@ -573,14 +575,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
-        # kernel and returns None to fall through to the normal GEMM path.
-        # Skip when use_custom_cublas_mm is set: that path may allocate output
-        # in an NCCL symmetric-memory window for TP all-reduce fusion, which
-        # the low-M dispatcher does not support.
-        if _should_apply_low_m_gemm(input) and not getattr(
+        # Route low-M shapes to a CuTe-DSL low-m GEMM kernel; both entry points
+        # return None to fall through to the normal GEMM path. Skip when
+        # use_custom_cublas_mm is set: that path may allocate output in an NCCL
+        # symmetric-memory window for TP all-reduce fusion, which neither low-M
+        # entry point supports.
+        if _is_low_m_input(input) and not getattr(
                 module, "use_custom_cublas_mm", False):
-            output = apply_low_m_gemm(module, input, module.weight, bias)
+            # When the opt-in dispatcher is enabled it autotunes across cuBLAS
+            # and both low-M kernels per shape. Otherwise take the direct kernel
+            # only on the shapes it is measured to win on -- at low M cuBLAS
+            # splits K to manufacture parallelism and pairs every GEMM with a
+            # separate reduce kernel, which is pure overhead at these sizes.
+            output = (apply_low_m_gemm(module, input, module.weight, bias)
+                      if LOW_M_GEMM_ACTIVE else apply_direct_low_m_gemm(
+                          input, module.weight, bias))
             if output is not None:
                 return output
         # CuTe DSL BF16 GEMM path for Blackwell

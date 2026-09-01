@@ -8,7 +8,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.nn import functional as F
@@ -141,6 +141,88 @@ _model_extra_attrs = threading.local()
 
 def get_model_extra_attrs():
     return getattr(_model_extra_attrs, 'attrs', None)
+
+
+_device_work = threading.local()
+
+#: One deferred device operation: the callable, its positional arguments, and
+#: its keyword arguments (None when it takes none).
+DeviceWorkItem = Tuple[Callable[..., None], tuple, Optional[Dict]]
+
+#: Marks a region whose device work is already contained in a CUDA graph the
+#: caller is about to replay. Operations reached inside such a region are
+#: skipped rather than recorded: the replay is what performs them, and
+#: recording them again would only be thrown away.
+REPLAYING_DEVICE_WORK = object()
+
+
+def run_device_work(fn, /, *args, **kwargs) -> None:
+    """Issue one small device operation of a step's input preparation.
+
+    Preparing a decode step interleaves host bookkeeping with a handful of
+    tiny device operations -- a couple of copies, a gather, two Triton
+    kernels. Issued where they are reached, each pays a launch of its own
+    while the host walks on to the next piece of bookkeeping, and the device
+    idles in between. Routing them through here lets a caller open a
+    :func:`begin_device_work` region and get them back as one list, in issue
+    order, to run back to back -- close enough together to be replayed from a
+    CUDA graph.
+
+    Outside such a region this is just ``fn(*args, **kwargs)``.
+    """
+    work = getattr(_device_work, 'collector', None)
+    if work is None:
+        fn(*args, **kwargs)
+    elif work is not REPLAYING_DEVICE_WORK:
+        work.append((fn, args, kwargs))
+
+
+def run_device_work_items(work: List[DeviceWorkItem]) -> None:
+    """Issue operations collected by :func:`begin_device_work`, in order."""
+    for fn, args, kwargs in work:
+        if kwargs is None:
+            fn(*args)
+        else:
+            fn(*args, **kwargs)
+
+
+def begin_device_work(collect: bool = True) -> Optional[List[DeviceWorkItem]]:
+    """Collect, rather than issue, the device work of an input preparation.
+
+    Returns the list the operations are appended to; issuing them is the
+    caller's job, and until it does, nothing may read what they write. With
+    ``collect=False`` the operations are dropped instead of recorded and None
+    is returned -- for a caller that already holds a graph containing them.
+
+    Operations reached outside the region -- including any issued directly
+    rather than through :func:`run_device_work` -- are unaffected, so a region
+    whose body mixes the two moves the recorded ones after the direct ones;
+    only open one around a path whose device work is known to route through
+    here in full, or whose direct operations may legally run first.
+
+    Always pair with :func:`end_device_work` in a ``try``/``finally``. A
+    context manager would read better but costs more than the region it
+    guards: this runs on the decode step's critical path, where the deferral's
+    own host cost is a material part of what the deferral buys.
+
+    The collector is thread state rather than a parameter because the
+    operations are reached several call levels below the region, through
+    ``prepare()`` overrides that every attention backend implements. Regions
+    do not nest.
+    """
+    assert getattr(_device_work, 'collector', None) is None, \
+        "device-work regions do not nest"
+    if not collect:
+        _device_work.collector = REPLAYING_DEVICE_WORK
+        return None
+    work: List[DeviceWorkItem] = []
+    _device_work.collector = work
+    return work
+
+
+def end_device_work() -> None:
+    """Close the region opened by :func:`begin_device_work`."""
+    _device_work.collector = None
 
 
 def is_nvfp4_marlin_supported_sm(sm_version: int | None = None) -> bool:

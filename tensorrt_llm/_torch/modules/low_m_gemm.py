@@ -589,6 +589,53 @@ def prepare_low_m_gemm(
     return dispatcher
 
 
+def apply_direct_low_m_gemm(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Return a direct (SIMT) BF16 result, or ``None`` for the normal path.
+
+    Unlike :func:`apply_low_m_gemm` this needs no AutoTuner state and no
+    per-module preparation, so it also serves call sites that build their GEMM
+    by hand instead of going through :class:`~..modules.linear.Linear` — MoE
+    router gates in particular.  It takes the direct kernel exactly on the
+    shapes :func:`prefer_direct_bf16_gemm_sm100` measures it winning on and
+    defers to the caller's default GEMM everywhere else, which keeps the cost of
+    covering a new deployment at one JIT compile per admitted shape instead of a
+    full tactic sweep, at the price of not adapting to shapes outside the bands.
+
+    Bias is not handled: the direct kernel has no bias epilogue, and adding one
+    as a separate elementwise kernel would give back the launch this saves.
+    """
+    if bias is not None or not LowMGemmDispatcher._is_candidate_shape(input_tensor, weight, None):
+        return None
+
+    from ..cute_dsl_kernels.blackwell.low_m_bf16_direct import (
+        default_tactic,
+        prefer_direct_bf16_gemm_sm100,
+        run_direct_dense,
+    )
+
+    k = int(input_tensor.shape[-1])
+    m, n = input_tensor.numel() // k, int(weight.shape[0])
+    if not prefer_direct_bf16_gemm_sm100(m, n, k):
+        return None
+    try:
+        tactic = default_tactic(m, n, k)
+    except ValueError:
+        # No supported block size divides K, or N is unusable for this tactic.
+        return None
+
+    input_2d = input_tensor.view(m, k)
+    # A fresh output each call: inside a CUDA-graph capture this comes from the
+    # graph's own pool and is therefore stable across replays, and outside one
+    # the caller may retain it past the next forward.
+    out = torch.empty((m, n), dtype=input_2d.dtype, device=input_2d.device)
+    run_direct_dense(input_2d, weight.detach().t(), out, get_env_enable_pdl(), tactic)
+    return out.view(*input_tensor.shape[:-1], n)
+
+
 def apply_low_m_gemm(
     module: torch.nn.Module,
     input_tensor: torch.Tensor,
@@ -614,6 +661,7 @@ def apply_low_m_gemm(
 __all__ = [
     "LOW_M_GEMM_ACTIVE",
     "_MAX_M",
+    "apply_direct_low_m_gemm",
     "apply_low_m_gemm",
     "prepare_low_m_gemm",
 ]

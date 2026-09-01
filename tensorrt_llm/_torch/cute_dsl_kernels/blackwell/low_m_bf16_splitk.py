@@ -15,6 +15,11 @@ Each cluster rank accumulates an exact K slice in FP32. Peers publish partials
 to rank 0 through DSMEM; rank 0 reduces, casts, and stores once. The public
 ``A[M, K] @ B[K, N]`` problem is swapped internally, so tile dimensions below
 use kernel coordinates: kernel-M carries public N and kernel-N carries public M.
+
+A split needs whole CTA K tiles per rank, so it requires ``K`` to be a multiple
+of ``_CTA_K``. Unsplit (``split_k=1``), ``K`` is unconstrained: the TMA load
+zero-fills the residual tile, which then contributes nothing to the FP32
+accumulation.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import functools
 import cuda.bindings.driver as _cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.math as cute_math
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch as _torch
@@ -48,7 +54,11 @@ _SUPPORTED_MMA_M = (64, 128)
 _SUPPORTED_MMA_N = (8, 16, 32)
 
 #: Physical cluster-K sizes; split 1 compiles out the DSMEM path.
-_SUPPORTED_SPLIT_K = (1, 2, 3, 4)
+_SUPPORTED_SPLIT_K = (1, 2, 3, 4, 8, 16)
+
+#: Generic autotuning stays bounded to the established search space. Splits 8
+#: and 16 are available to explicitly selected fused epilogues only.
+_AUTOTUNE_SPLIT_K = (1, 2, 3, 4)
 
 #: Largest public M this low-M policy serves.
 MAX_M = 32
@@ -160,7 +170,11 @@ def validate_tactic(
         raise ValueError(f"this low-M policy requires 1 <= M <= {MAX_M}, got {m}")
     if n <= 0:
         raise ValueError(f"N must be positive, got {n}")
-    if k <= 0 or k % _CTA_K or (k // _CTA_K) % tactic.split_k:
+    if k <= 0:
+        raise ValueError(f"K must be positive, got {k}")
+    # A K tail is only representable unsplit: every cluster rank of a split must
+    # own the same number of whole CTA K tiles.
+    if tactic.split_k > 1 and (k % _CTA_K or (k // _CTA_K) % tactic.split_k):
         raise ValueError(
             f"K={k} with CTA_K={_CTA_K} does not divide evenly across split_k={tactic.split_k}"
         )
@@ -184,7 +198,7 @@ def autotune_tactics(
     tactics: list[SplitKTactic] = []
     for mma_m in _SUPPORTED_MMA_M:
         for mma_n in _SUPPORTED_MMA_N:
-            for split_k in _SUPPORTED_SPLIT_K:
+            for split_k in _AUTOTUNE_SPLIT_K:
                 min_stages = _MIN_AB_STAGES if k == _CTA_K else _DEFAULT_MIN_AB_STAGES
                 base = SplitKTactic(mma_m, mma_n, split_k, min_stages)
                 try:
@@ -225,7 +239,7 @@ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
             mma_m = 128 if k <= 1024 and m <= 24 else 64
             requested_split = 1
 
-    if k <= 4 * _CTA_K:
+    if k <= 4 * _CTA_K or k % _CTA_K:
         requested_split = 1
     split_k = next(
         split_k
@@ -256,6 +270,8 @@ __all__ = [
     "autotune_tactics",
     "default_tactic",
     "run_splitk_dense",
+    "run_splitk_dense_gate",
+    "run_splitk_dense_silu_prefix",
     "validate_tactic",
 ]
 
@@ -322,6 +338,20 @@ def _store_shared_remote_v4(
 OWNER_RANK = 0
 
 
+def _sigmoid_f32(value):
+    return 1.0 / (cute_math.exp(value * -1.0) + 1.0)
+
+
+#: Epilogue modes; "none" preserves the generic GEMM store path.
+_EPILOGUE_MODES = ("none", "silu_prefix", "gate")
+
+#: Named barrier for the gate epilogue's SMEM staging round-trip.
+_GATE_BARRIER_ID = 7
+
+#: Alignment of the gate epilogue SMEM tile.
+_GATE_TILE_ALIGN_BYTES = 16
+
+
 class SplitKDenseGemmKernel:
     """Standalone BF16/FP16 GEMM with a cluster-local split-K reduction."""
 
@@ -331,6 +361,10 @@ class SplitKDenseGemmKernel:
         tactic: SplitKTactic,
         use_pdl: bool,
         has_bias: bool,
+        epilogue_mode: str = "none",
+        epilogue_scale: float = 1.0,
+        epilogue_group: int = 1,
+        epilogue_prefix: int = 0,
     ) -> None:
         self.acc_dtype = cutlass.Float32
         self.cta_m = tactic.mma_m
@@ -340,6 +374,44 @@ class SplitKDenseGemmKernel:
         self.split_k = tactic.split_k
         self.use_pdl = use_pdl
         self.has_bias = has_bias
+        self.epilogue_mode = epilogue_mode
+        self.epilogue_scale = epilogue_scale
+        self.epilogue_group = epilogue_group
+        self.epilogue_prefix = epilogue_prefix
+
+        if epilogue_mode not in _EPILOGUE_MODES:
+            raise ValueError(f"unsupported epilogue_mode={epilogue_mode}")
+        if epilogue_mode == "silu_prefix" and (
+            epilogue_prefix <= 0 or epilogue_prefix % tactic.mma_m
+        ):
+            raise ValueError(
+                f"silu epilogue_prefix={epilogue_prefix} must be a positive "
+                f"multiple of mma_m={tactic.mma_m}"
+            )
+        if epilogue_mode == "gate":
+            if tactic.split_k != 1:
+                raise ValueError("gate epilogue requires split_k=1")
+            if has_bias:
+                raise ValueError("gate epilogue does not support bias")
+            if epilogue_group < 2 or tactic.mma_m % epilogue_group:
+                raise ValueError(
+                    f"gate epilogue_group={epilogue_group} must divide mma_m={tactic.mma_m}"
+                )
+            gate_out_elements = (tactic.mma_m // epilogue_group) * tactic.mma_n
+            if gate_out_elements % 128:
+                raise ValueError(
+                    f"gate tile ({tactic.mma_m}, {tactic.mma_n}) gives "
+                    f"{gate_out_elements} outputs; must be a multiple of 128"
+                )
+            gate_smem = (
+                _align_up(_smem_bytes(tactic, tactic.ab_stages), _GATE_TILE_ALIGN_BYTES)
+                + tactic.mma_m * tactic.mma_n * _FP32_BYTES
+            )
+            if gate_smem > _SMEM_CAPACITY_BYTES:
+                raise ValueError(
+                    f"gate epilogue needs {gate_smem} B of shared memory; "
+                    f"only {_SMEM_CAPACITY_BYTES} B available"
+                )
 
         self.threads_per_cta = 256
         self.epilog_threads = 128
@@ -365,10 +437,12 @@ class SplitKDenseGemmKernel:
         b: cute.Tensor,
         c: cute.Tensor,
         bias: cute.Tensor,
+        x: cute.Tensor,
+        out: cute.Tensor,
         stream: _cuda.CUstream,
     ):
         # Grid-y packs output-N tile and cluster rank.
-        self.kernel(a, b, c, bias).launch(
+        self.kernel(a, b, c, bias, x, out).launch(
             grid=(
                 cute.ceil_div(c.layout.shape[0], self.cta_m),
                 cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
@@ -388,6 +462,8 @@ class SplitKDenseGemmKernel:
         mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         mBias: cute.Tensor,  # Broadcast bias; dead when has_bias=False
+        mX: cute.Tensor,  # Gate activation; dead unless epilogue_mode="gate"
+        mOut: cute.Tensor,  # Gate output; dead unless epilogue_mode="gate"
     ):
         """Allocate storage and dispatch the specialized warps."""
         stages = self.num_ab_stage
@@ -482,6 +558,16 @@ class SplitKDenseGemmKernel:
             mailbox = sA
             bar_reduce = bar_mma_epilog
 
+        if cutlass.const_expr(self.epilogue_mode == "gate"):
+            gate_tile = cute_ext.allocate(
+                cutlass.Float32,
+                cute.AddressSpace.smem,
+                cute.make_layout((self.cta_m, self.cta_n)),
+                alignment=_GATE_TILE_ALIGN_BYTES,
+            )
+        else:
+            gate_tile = mailbox
+
         if warp_idx == 0:
             with cute.arch.elect_one():
                 for i in range(stages):
@@ -502,8 +588,12 @@ class SplitKDenseGemmKernel:
         else:
             cute.arch.barrier()
 
-        # Host validation guarantees an equal, tail-free K partition.
-        k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
+        if cutlass.const_expr(self.split_k == 1):
+            # The last tile may run past K; the TMA load zero-fills it.
+            k_tile_count = cute.ceil_div(cute.size(mA, mode=[1]), self.cta_k)
+        else:
+            # Host validation guarantees an equal, tail-free K partition.
+            k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
         k_tile_start = split_rank * k_tile_count
 
         if cutlass.const_expr(self.split_k > 1):
@@ -563,6 +653,11 @@ class SplitKDenseGemmKernel:
                 mailbox,
                 bar_reduce,
                 split_rank,
+                gate_tile,
+                mX,
+                mOut,
+                bidx,
+                n_idx,
             )
 
     @cute.experimental.jit
@@ -690,6 +785,11 @@ class SplitKDenseGemmKernel:
         mailbox,
         bar_reduce,
         split_rank: cutlass.Int32,
+        gate_tile,
+        mX: cute.Tensor,
+        mOut: cute.Tensor,
+        bidx: cutlass.Int32,
+        n_idx: cutlass.Int32,
     ):
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
@@ -802,9 +902,58 @@ class SplitKDenseGemmKernel:
             if cutlass.const_expr(self.has_bias):
                 rAcc.store(rAcc.load() + rBiasAcc.load())
 
-            rD.store(rAcc.load().to(c_dtype))
-            # Preserve TMEM coordinates; the copy predicates output tails.
-            cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+            if cutlass.const_expr(self.epilogue_mode == "silu_prefix"):
+                if bidx * self.cta_m < self.epilogue_prefix:
+                    scaled = rAcc.load() * self.epilogue_scale
+                    rAcc.store(scaled * _sigmoid_f32(scaled))
+
+            if cutlass.const_expr(self.epilogue_mode == "gate"):
+                group = self.epilogue_group
+                rSigmoid = cute_ext.allocate(
+                    self.acc_dtype,
+                    cute.AddressSpace.rmem,
+                    rmem_layout,
+                    alignment=32,
+                )
+                rSigmoid.store(_sigmoid_f32(rAcc.load()))
+                sGate_epi = cute.flat_divide(gate_tile, epi_tile)
+                cute_ext.partition_and_copy(
+                    thr_t2r,
+                    rSigmoid,
+                    sGate_epi[None, None, 0, 0],
+                )
+                cute.arch.barrier(
+                    barrier_id=_GATE_BARRIER_ID,
+                    number_of_threads=self.epilog_threads,
+                )
+
+                rows = cute.size(mOut, mode=[0])
+                hidden_size = cute.size(mOut, mode=[1])
+                hidden_per_tile = self.cta_m // group
+                output_elements = hidden_per_tile * self.cta_n
+                for iteration in cutlass.range_constexpr(output_elements // self.epilog_threads):
+                    element = iteration * self.epilog_threads + epi_tid
+                    hidden_local = element % hidden_per_tile
+                    row_local = element // hidden_per_tile
+                    row_global = n_idx * self.cta_n + row_local
+                    hidden_global = bidx * hidden_per_tile + hidden_local
+                    if row_global < rows:
+                        gated = cutlass.Float32(0.0)
+                        for stream_idx in cutlass.range_constexpr(group):
+                            sigmoid = gate_tile[
+                                hidden_local * group + stream_idx,
+                                row_local,
+                            ]
+                            value = mX[
+                                row_global,
+                                stream_idx * hidden_size + hidden_global,
+                            ].to(cutlass.Float32)
+                            gated = gated + sigmoid * value
+                        mOut[row_global, hidden_global] = (gated * self.epilogue_scale).to(c_dtype)
+            else:
+                rD.store(rAcc.load().to(c_dtype))
+                # Preserve TMEM coordinates; the copy predicates output tails.
+                cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
 
         # The reduction mbarrier covers remote stores; no cluster barrier needed.
 
@@ -826,6 +975,8 @@ def _bmm_no_bias(
         cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
         c,
         cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
+        c,
+        c,
         stream,
     )
 
@@ -839,11 +990,36 @@ def _bmm_bias(
     bias: cute.Tensor,
     stream: _cuda.CUstream,
 ):
+    c_swapped = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
     gemm_op(
         cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0])),
         cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
-        cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0])),
+        c_swapped,
         cute.make_tensor(bias.iterator, cute.select(bias.layout, mode=[1, 2, 0])),
+        c_swapped,
+        c_swapped,
+        stream,
+    )
+
+
+@cute.experimental.jit
+def _bmm_gate(
+    gemm_op: cutlass.Constexpr,
+    a: cute.Tensor,
+    b: cute.Tensor,
+    c: cute.Tensor,
+    x: cute.Tensor,
+    out: cute.Tensor,
+    stream: _cuda.CUstream,
+):
+    c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
+    gemm_op(
+        cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0])),
+        cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
+        c,
+        cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
+        x,
+        out,
         stream,
     )
 
@@ -877,6 +1053,7 @@ def _make_compile_repr_tensors(
     a_leading: int,
     b_leading: int,
     c_leading: int,
+    epilogue_mode: str = "none",
 ):
     m, n, k, batch = 64, 8, _CTA_K, 1
     tensors = tuple(
@@ -887,6 +1064,18 @@ def _make_compile_repr_tensors(
             ((batch, n, m), c_leading),
         )
     )
+    if epilogue_mode == "gate":
+        return (
+            *tensors,
+            _from_dlpack_dynamic(
+                _torch.empty((n, m), dtype=dtype, device="cuda"),
+                1,
+            ),
+            _from_dlpack_dynamic(
+                _torch.empty((n, m), dtype=dtype, device="cuda"),
+                1,
+            ),
+        )
     if not has_bias:
         return (*tensors, None)
     return (
@@ -930,6 +1119,10 @@ def _get_compiled_splitk_kernel(
     use_pdl: bool,
     has_bias: bool,
     leading_dims: tuple[int, int, int],
+    epilogue_mode: str = "none",
+    epilogue_scale: float = 1.0,
+    epilogue_group: int = 1,
+    epilogue_prefix: int = 0,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}")
@@ -938,10 +1131,21 @@ def _get_compiled_splitk_kernel(
         tactic=tactic,
         use_pdl=use_pdl,
         has_bias=has_bias,
+        epilogue_mode=epilogue_mode,
+        epilogue_scale=epilogue_scale,
+        epilogue_group=epilogue_group,
+        epilogue_prefix=epilogue_prefix,
     )
-    compile_tensors = _make_compile_repr_tensors(dtype, has_bias, *leading_dims)
+    compile_tensors = _make_compile_repr_tensors(
+        dtype,
+        has_bias,
+        *leading_dims,
+        epilogue_mode=epilogue_mode,
+    )
     stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
-    if has_bias:
+    if epilogue_mode == "gate":
+        compiled = cute_ext.compile(_bmm_gate, kernel, *compile_tensors, stream)
+    elif has_bias:
         compiled = cute_ext.compile(_bmm_bias, kernel, *compile_tensors, stream)
     else:
         compiled = cute_ext.compile(_bmm_no_bias, kernel, *compile_tensors[:3], stream)
@@ -958,8 +1162,18 @@ def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
         raise ValueError("all tensors must be on the same CUDA device")
     if a.dtype not in _SUPPORTED_TORCH_DTYPES or any(tensor.dtype != a.dtype for tensor in tensors):
         raise ValueError("a, b, out, and bias must share BF16 or FP16 dtype")
-    if any(not (tensor.is_contiguous() or tensor.t().is_contiguous()) for tensor in (a, b, out)):
-        raise ValueError("a, b, and out must be dense row-major or column-major matrices")
+
+    def _is_dense_2d(tensor: _torch.Tensor) -> bool:
+        rows, columns = tensor.shape
+        return (tensor.stride(1) == 1 and tensor.stride(0) >= columns) or (
+            tensor.stride(0) == 1 and tensor.stride(1) >= rows
+        )
+
+    if any(not _is_dense_2d(tensor) for tensor in (a, b, out)):
+        raise ValueError(
+            "a, b, and out must be row-major or column-major matrices "
+            "with optional padded leading strides"
+        )
     if any(tensor.data_ptr() % 32 for tensor in (a, b, out)):
         raise ValueError("a, b, and out must be 32-byte aligned")
     # cute_ext.tma_load is used for a and b (not out, which uses partition_and_copy).
@@ -1028,4 +1242,87 @@ def run_splitk_dense(
         compiled(*cute_tensors[:4], stream)
     else:
         compiled(*cute_tensors[:3], stream)
+    return out
+
+
+def run_splitk_dense_silu_prefix(
+    a: _torch.Tensor,
+    b: _torch.Tensor,
+    out: _torch.Tensor,
+    pdl: bool,
+    tactic: SplitKTactic,
+    scale: float,
+    prefix: int,
+) -> _torch.Tensor:
+    """Apply SiLU to an output prefix while retaining a raw GEMM suffix."""
+    m, n, _ = _validate_runtime_tensors(a, b, None, out)
+    if not 0 < prefix <= n:
+        raise ValueError(f"prefix must be in [1, {n}], got {prefix}")
+    validate_tactic(tactic, m, n, a.shape[1])
+    cute_tensors = _to_cute_swap(a, b, out, None)
+    compiled = _get_compiled_splitk_kernel(
+        dtype=a.dtype,
+        tactic=tactic,
+        use_pdl=pdl,
+        has_bias=False,
+        leading_dims=cute_tensors[4],
+        epilogue_mode="silu_prefix",
+        epilogue_scale=scale,
+        epilogue_prefix=prefix,
+    )
+    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+    compiled(*cute_tensors[:3], stream)
+    return out
+
+
+def run_splitk_dense_gate(
+    a: _torch.Tensor,
+    b: _torch.Tensor,
+    x: _torch.Tensor,
+    out: _torch.Tensor,
+    pdl: bool,
+    tactic: SplitKTactic,
+    scale: float,
+    group: int,
+) -> _torch.Tensor:
+    """Fuse an up projection with sigmoid-gated HC stream reduction."""
+    m, n, k = _validate_runtime_tensors(a, b, None, x)
+    validate_tactic(tactic, m, n, k)
+    if n % group:
+        raise ValueError(f"N={n} must be divisible by group={group}")
+    if n % tactic.mma_m:
+        raise ValueError(f"gate epilogue requires N={n} divisible by mma_m={tactic.mma_m}")
+    hidden_size = n // group
+    if (
+        out.ndim != 2
+        or out.shape != (m, hidden_size)
+        or out.dtype != a.dtype
+        or out.device != a.device
+        or out.stride(1) != 1
+        or out.stride(0) < hidden_size
+        or out.data_ptr() % 32
+        or x.stride(1) != 1
+    ):
+        raise ValueError(
+            f"gate out must be a 32-byte-aligned row-major {(m, hidden_size)} "
+            "tensor matching a, and x must be row-major"
+        )
+    cute_tensors = _to_cute_swap(a, b, x, None)
+    compiled = _get_compiled_splitk_kernel(
+        dtype=a.dtype,
+        tactic=tactic,
+        use_pdl=pdl,
+        has_bias=False,
+        leading_dims=cute_tensors[4],
+        epilogue_mode="gate",
+        epilogue_scale=scale,
+        epilogue_group=group,
+    )
+    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+    compiled(
+        *cute_tensors[:3],
+        _from_dlpack_dynamic(x, 1),
+        _from_dlpack_dynamic(out, 1),
+        stream,
+    )
     return out

@@ -124,6 +124,19 @@ class TopK(nn.Module):
                 row_ends,
                 output_indices,
             )
+        if self.prefill_implementation == TopKImplementation.CUTE_DSL_RADIX:
+            # GB300 tuning favors 128-bit copies for the high-row-count QSA
+            # prefill shape. The exact REREAD policy remains the custom op's
+            # default.
+            torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
+                scores,
+                row_starts,
+                row_ends,
+                output_indices,
+                self.top_k,
+                128,
+            )
+            return output_indices
         if self.prefill_implementation != TopKImplementation.CUDA_RADIX:
             raise NotImplementedError(
                 f"{self.prefill_implementation.value} does not support prefill Top-K"

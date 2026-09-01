@@ -51,6 +51,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.logger import logger
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -107,9 +108,15 @@ class KVRegionExtractorV1(RegionExtractorBase):
         assert layer_stride is not None
         assert slot_stride is not None
 
-        local_layer_ids = sorted(set(int(e["local_layer_id"]) for e in pv.buffer_entries))
+        layer_offsets: dict[int, int] = {}
+        for entry in pv.buffer_entries:
+            local_layer_id = int(entry["local_layer_id"])
+            offset = int(entry["offset"])
+            if local_layer_id not in layer_offsets or offset < layer_offsets[local_layer_id]:
+                layer_offsets[local_layer_id] = offset
+        local_layer_offsets = sorted(layer_offsets.items(), key=lambda item: item[1])
         ptrs = np.array(
-            [base_ptr + lid * layer_stride + slot_id * slot_stride for lid in local_layer_ids],
+            [base_ptr + offset + slot_id * slot_stride for _, offset in local_layer_offsets],
             dtype=np.int64,
         )
         memory = MemRegionGroup(ptrs=ptrs, bytes_per_region=pool.slot_bytes)
@@ -157,7 +164,23 @@ class KVRegionExtractorV1(RegionExtractorBase):
 # ---------------------------------------------------------------------------
 
 
-def _build_mamba_pool_views(conv_pool, ssm_pool, local_layers):
+def _build_mamba_state_entries(layer_ids, pool):
+    layer_stride = pool.layer_stride_bytes
+    assert layer_stride is not None
+    return np.array(
+        [
+            (
+                int(local_layer_id),
+                int(offset) * int(layer_stride),
+                int(pool.slot_bytes),
+            )
+            for offset, local_layer_id in enumerate(layer_ids)
+        ],
+        dtype=BUFFER_ENTRY_DTYPE,
+    )
+
+
+def _build_mamba_pool_views(conv_pool, ssm_pool, local_layers, side_pool_specs=None):
     """Build pool_views for mamba: conv at pool_idx=0, ssm at pool_idx=1.
 
     Conv uses mapper_kind=SECTIONED (section-level granularity for TP split),
@@ -167,26 +190,43 @@ def _build_mamba_pool_views(conv_pool, ssm_pool, local_layers):
     sorted_lids = [
         ll.local_layer_id for ll in sorted(local_layers, key=lambda ll: ll.local_layer_id)
     ]
-    return [
+    pool_views = [
         PoolView(
             pool_idx=0,
-            buffer_entries=np.array(
-                [(lid, 0, conv_pool.slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
+            buffer_entries=_build_mamba_state_entries(sorted_lids, conv_pool),
             pool_role=MAMBA_CONV_ROLE,
             mapper_kind=MapperKind.SECTIONED,
             bytes_per_layer=conv_pool.slot_bytes,
         ),
         PoolView(
             pool_idx=1,
-            buffer_entries=np.array(
-                [(lid, 0, ssm_pool.slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
+            buffer_entries=_build_mamba_state_entries(sorted_lids, ssm_pool),
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=ssm_pool.slot_bytes,
         ),
     ]
+    if side_pool_specs is None:
+        return pool_views
+
+    local_id_by_global = {ll.global_layer_id: ll.local_layer_id for ll in local_layers}
+    for role, pool_idx, pool, global_layer_ids in side_pool_specs:
+        missing = sorted(set(global_layer_ids) - set(local_id_by_global))
+        if missing:
+            raise ValueError(
+                f"V2 recurrent side state {role!r} refers to non-local layers {missing}"
+            )
+        side_lids = [local_id_by_global[layer_id] for layer_id in global_layer_ids]
+        pool_views.append(
+            PoolView(
+                pool_idx=pool_idx,
+                buffer_entries=_build_mamba_state_entries(side_lids, pool),
+                pool_role=frozenset({str(role)}),
+                mapper_kind=MapperKind.REPLICATED,
+                bytes_per_layer=pool.slot_bytes,
+            )
+        )
+    return pool_views
 
 
 def _build_layer_group_for_mamba(
@@ -255,12 +295,16 @@ def _build_v2_mamba_state_pool(states: Sequence[torch.Tensor]) -> PhysicalPool:
     slot_stride_bytes = _slot_stride_bytes(first_state)
 
     num_layers = len(states)
-    if slot_stride_bytes % num_layers != 0:
-        raise ValueError("V2 Mamba physical slot must divide evenly across layers")
-    # Each role appears once per layer in its size-class pool. Equal-size SSM
-    # and convolution states share that pool and are interleaved, so their
-    # layer stride includes both role payloads.
-    layer_stride_bytes = slot_stride_bytes // num_layers
+    # Derive this role's layer stride from its views instead of assuming the
+    # physical slot contains only this role. V2 may coalesce unrelated,
+    # equal-size side-state roles into one size-class pool.
+    layer_stride_bytes = (
+        int(states[1].data_ptr()) - base_address if num_layers > 1 else slot_stride_bytes
+    )
+    if layer_stride_bytes < slot_bytes:
+        raise ValueError("V2 Mamba state tensors must have a valid layer stride")
+    if (num_layers - 1) * layer_stride_bytes + slot_bytes > slot_stride_bytes:
+        raise ValueError("V2 Mamba state tensors must fit inside one physical slot")
 
     for layer_offset, state in enumerate(states):
         state_slot_bytes = int(state[0].numel() * state.element_size())
@@ -313,11 +357,36 @@ def _build_layer_group_for_v2_mamba(
     ssm_elem_size = first_ssm_state.element_size()
     ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
 
-    pool_group = PhysicalPoolGroup(pools=[conv_pool, ssm_pool])
+    pools = [conv_pool, ssm_pool]
+    side_pool_specs = []
+    for role, states_by_layer in manager.get_disagg_recurrent_side_states().items():
+        role_name = str(role)
+        if not role_name:
+            raise ValueError("V2 recurrent side-state role names must be non-empty")
+        if not states_by_layer:
+            continue
+        layer_ids = sorted(int(layer_id) for layer_id in states_by_layer)
+        states = [states_by_layer[layer_id] for layer_id in layer_ids]
+        pool = _build_v2_mamba_state_pool(states)
+        if pool.num_slots != conv_pool.num_slots:
+            raise ValueError(
+                f"V2 recurrent side state {role_name!r} must have the same number "
+                "of slots as the standard recurrent state"
+            )
+        side_pool_specs.append((role_name, len(pools), pool, layer_ids))
+        pools.append(pool)
+    if side_pool_specs:
+        role_summary = ", ".join(
+            f"{role}:layers={layers}:slot_bytes={pool.slot_bytes}"
+            for role, _, pool, layers in side_pool_specs
+        )
+        logger.info(f"V2 recurrent side-state transfer roles registered: {role_summary}")
+
+    pool_group = PhysicalPoolGroup(pools=pools)
     layer_group = MambaLayerGroup(
         pool_group_idx=pool_group_idx,
         local_layers=local_layers,
-        pool_views=_build_mamba_pool_views(conv_pool, ssm_pool, local_layers),
+        pool_views=_build_mamba_pool_views(conv_pool, ssm_pool, local_layers, side_pool_specs),
         conv_section_bytes=conv_section_bytes,
         ssm_bytes_per_head=ssm_bytes_per_head,
         slot_major_layout=True,

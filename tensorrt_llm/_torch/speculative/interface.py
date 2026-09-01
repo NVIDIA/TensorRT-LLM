@@ -1419,6 +1419,22 @@ class SpecWorkerBase(nn.Module, ABC):
         # seed/offset pattern in `_sample_tokens_for_batch`).
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
+        self._auxiliary_state_handlers: list[nn.Module] = []
+
+    def register_auxiliary_state_handler(self, handler: nn.Module) -> None:
+        """Register state without adding a duplicate torch module path."""
+        self._auxiliary_state_handlers.append(handler)
+
+    def commit_auxiliary_speculative_states(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_contexts: int,
+    ) -> None:
+        """Promote registered model-side states using accepted token counts."""
+        for handler in self._auxiliary_state_handlers:
+            handler.commit_speculative_states(num_accepted_tokens,
+                                              state_indices, num_contexts)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)

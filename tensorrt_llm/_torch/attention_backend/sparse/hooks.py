@@ -12,7 +12,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import replace
 from importlib import import_module
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -106,6 +106,34 @@ class AttentionSparseHooks:
     def initialize(self, attention: "Attention") -> None:
         """Initialize algorithm-specific Attention state."""
 
+    def prepare_qkv(
+        self,
+        attention: "Attention",
+        prepare_qkv: Callable[
+            [],
+            tuple[
+                "torch.Tensor",
+                Optional["torch.Tensor"],
+                Optional["torch.Tensor"],
+                Optional["torch.Tensor"],
+            ],
+        ],
+        hidden_states: "torch.Tensor",
+        position_ids: Optional["torch.Tensor"],
+        attn_metadata: "AttentionMetadata",
+    ) -> tuple[
+        tuple[
+            "torch.Tensor",
+            Optional["torch.Tensor"],
+            Optional["torch.Tensor"],
+            Optional["torch.Tensor"],
+        ],
+        Optional[object],
+    ]:
+        """Prepare Q/K/V and optionally return algorithm-private state."""
+        del attention, hidden_states, position_ids, attn_metadata
+        return prepare_qkv(), None
+
     def forward(
         self,
         attention: "Attention",
@@ -143,6 +171,7 @@ _MLA_HOOK_MODULE_PATHS = {
     "deepseek_v4": ".deepseek_v4.module",
 }
 _ATTENTION_HOOK_MODULE_PATHS = {
+    "qsa": ".qsa.module",
     "rocket": ".rocket.module",
 }
 _MLA_HOOKS: dict[str, type[MLASparseHooks]] = {}

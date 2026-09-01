@@ -916,6 +916,95 @@ def test_greedy_occurrence_penalties_bypass_stable_path(penalty_name: str, penal
     assert new_tokens_host.reshape(-1)[0].item() == 2
 
 
+class _TookGeneralSamplingPath(Exception):
+    """Stands in for the general path, so a test can name the branch that ran."""
+
+
+def _served_request(sampling_params: SamplingParams) -> LlmRequest:
+    """A request whose sampling config is built the way a served one is."""
+    return LlmRequest(
+        request_id=0,
+        max_new_tokens=4,
+        input_tokens=[1],
+        sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+        seq_slot=0,
+        is_streaming=False,
+    )
+
+
+def _process_one_greedy_request(
+    request: LlmRequest, monkeypatch: pytest.MonkeyPatch
+) -> tuple[torch.Tensor, bool]:
+    """Run ``_process_requests`` for one generation request without a device.
+
+    Same harness as test_stable_greedy_cache_key_includes_sequence_slots: only
+    the attributes the stable-greedy branch reads are populated and the CUDA hop
+    is redirected to the host, so the branch selection is testable on any
+    architecture. The general path is replaced by a raise, because a sampler
+    built this way has none of the state that path needs.
+    """
+    sampler = object.__new__(TorchSampler)
+    sampler.max_beam_width = 1
+    sampler._stable_greedy_request_ids = []
+    sampler._stable_greedy_seq_slots = []
+    sampler._stable_greedy_seq_slots_host = None
+    sampler._stable_greedy_seq_slots_cuda = None
+    monkeypatch.setattr(sampler, "_copy_to_host", lambda tensor: tensor.clone())
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.sampler.sampler.prefer_pinned", lambda: False
+    )
+
+    original_tensor_to = torch.Tensor.to
+
+    def copy_without_cuda(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return original_tensor_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", copy_without_cuda)
+
+    def _general_path(*args: Any, **kwargs: Any) -> Any:
+        raise _TookGeneralSamplingPath
+
+    monkeypatch.setattr(TorchSampler, "_select_generated_logits", staticmethod(_general_path))
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.generation_requests = [request]
+    *_, new_tokens_host, single_step_greedy = sampler._process_requests(
+        scheduled_requests,
+        {"logits": torch.tensor([[0.0, 10.0, 9.0]])},
+        torch.zeros((1, 1, 1), dtype=torch.int32),
+        [0],
+    )
+    return new_tokens_host, single_step_greedy
+
+
+def test_greedy_zero_min_tokens_uses_stable_path(monkeypatch: pytest.MonkeyPatch):
+    """A request with no minimum length still carries ``min_length == [0]``.
+
+    ``min_tokens`` defaults to ``0`` on the OpenAI request models and is
+    forwarded as-is, so the config that reaches the sampler holds a one-element
+    list even though no minimum was asked for. A bare truthiness test reads
+    "has a minimum" for every such request and keeps them all off the stable
+    greedy path.
+    """
+    request = _served_request(SamplingParams(min_tokens=0))
+    assert request.py_min_length == [0], "precondition: min_tokens=0 arrives as [0], not None"
+
+    new_tokens_host, single_step_greedy = _process_one_greedy_request(request, monkeypatch)
+
+    assert single_step_greedy
+    assert new_tokens_host.reshape(-1)[0].item() == 1
+
+
+def test_greedy_positive_min_tokens_bypasses_stable_path(monkeypatch: pytest.MonkeyPatch):
+    request = _served_request(SamplingParams(min_tokens=4))
+    assert request.py_min_length == [4], "precondition: min_tokens reaches the sampler"
+
+    with pytest.raises(_TookGeneralSamplingPath):
+        _process_one_greedy_request(request, monkeypatch)
+
+
 class TestFinishReasons:
     NOT_FINISHED = FinishReason.NOT_FINISHED
     STOP_WORDS = FinishReason.STOP_WORDS

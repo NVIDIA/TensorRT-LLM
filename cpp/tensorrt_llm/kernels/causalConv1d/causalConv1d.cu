@@ -20,6 +20,7 @@
  */
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include <cub/block/block_load.cuh>
 #include <cub/block/block_store.cuh>
 
@@ -493,6 +494,14 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
     using input_t = typename Ktraits::input_t;
     using weight_t = typename Ktraits::weight_t;
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // Wait for the projection that produced x. The launch is programmatic, so
+    // these blocks are scheduled while that producer is still draining rather
+    // than after it retires. The wait stays ahead of every early exit below so
+    // that all threads reach it.
+    cudaGridDependencySynchronize();
+#endif
+
     int const tidx = threadIdx.x;
     int const batch_id = blockIdx.x;
     int const channel_id = blockIdx.y * kNThreads + tidx;
@@ -542,6 +551,45 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
 }
 
 template <int kNThreads, int kWidth, typename input_t, typename weight_t>
+void causal_conv1d_update_sl1_launch(ConvParamsBase& params, cudaStream_t stream)
+{
+    using Ktraits = Causal_conv1d_update_kernel_traits<kNThreads, kWidth, input_t, weight_t>;
+    dim3 const grid(params.batch, (params.dim + kNThreads - 1) / kNThreads);
+    BOOL_SWITCH(params.conv_state_indices_ptr != nullptr, kHasCSI,
+        [&]
+        {
+            auto kernel = &causal_conv1d_update_kernel_sl1<Ktraits, kHasCSI>;
+            tensorrt_llm::common::launchWithPdlWhenEnabled(
+                "causal_conv1d_update_sl1", kernel, grid, kNThreads, 0, stream, params);
+        });
+}
+
+// The seqlen-1 kernel gives each thread one channel and the threads never
+// cooperate, so its block width only decides how the fixed channel work is
+// spread over the SMs. Take the widest block whose grid still covers the
+// device: at generation batch sizes the 128-wide default leaves most SMs with
+// nothing to run, while wider blocks keep the block count - and its scheduling
+// cost - down once there are enough channels to fill the device anyway.
+template <int kWidth, typename input_t, typename weight_t>
+void causal_conv1d_update_sl1_dispatch(ConvParamsBase& params, cudaStream_t stream)
+{
+    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    auto const blocks = [&](int nThreads) { return params.batch * ((params.dim + nThreads - 1) / nThreads); };
+    if (blocks(128) >= smCount)
+    {
+        causal_conv1d_update_sl1_launch<128, kWidth, input_t, weight_t>(params, stream);
+    }
+    else if (blocks(64) >= smCount)
+    {
+        causal_conv1d_update_sl1_launch<64, kWidth, input_t, weight_t>(params, stream);
+    }
+    else
+    {
+        causal_conv1d_update_sl1_launch<32, kWidth, input_t, weight_t>(params, stream);
+    }
+}
+
+template <int kNThreads, int kWidth, typename input_t, typename weight_t>
 void causal_conv1d_update_launch(ConvParamsBase& params, cudaStream_t stream)
 {
     using Ktraits = Causal_conv1d_update_kernel_traits<kNThreads, kWidth, input_t, weight_t>;
@@ -553,12 +601,7 @@ void causal_conv1d_update_launch(ConvParamsBase& params, cudaStream_t stream)
     // conv_state holds exactly width-1 elements (no extra trailing padding to shift).
     if (params.seqlen == 1 && !isCircularBuffer && params.silu_activation && params.conv_state_len == params.width - 1)
     {
-        BOOL_SWITCH(hasConvStateIndices, kHasCSI,
-            [&]
-            {
-                auto kernel = &causal_conv1d_update_kernel_sl1<Ktraits, kHasCSI>;
-                kernel<<<grid, Ktraits::kNThreads, 0, stream>>>(params);
-            });
+        causal_conv1d_update_sl1_dispatch<kWidth, input_t, weight_t>(params, stream);
     }
     else
     {

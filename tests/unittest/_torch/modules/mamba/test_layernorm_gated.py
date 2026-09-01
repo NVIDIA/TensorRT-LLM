@@ -15,6 +15,7 @@
 
 import pytest
 import torch
+import triton
 
 from tensorrt_llm._torch.modules.mamba.layernorm_gated import RMSNorm
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, unswizzle_sf
@@ -212,6 +213,105 @@ class TestRMSNormBasic:
 
         assert actual.dtype == torch.float8_e4m3fn
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+    @pytest.mark.parametrize("num_tokens,heads,N", [(1, 48, 128), (7, 8, 256), (2048, 48, 128)])
+    def test_token_major_row_grouping_is_bitwise_invariant(self, num_tokens, heads, N):
+        """The row grouping only spreads the work; it must not change a value.
+
+        Each row is reduced inside one program whatever the grouping, so every
+        supported rows-per-program (with its matching warp count) has to give
+        the same bits as the widest one.
+        """
+        from tensorrt_llm._torch.modules.mamba.layernorm_gated import (
+            _MULTIROW_ROW_CHOICES,
+            _rms_norm_gated_fwd_multirow_kernel,
+        )
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        torch.manual_seed(11)
+        M = num_tokens * heads
+        x = torch.randn(M, N, device=device, dtype=dtype)
+        weight = torch.randn(N, device=device, dtype=dtype) * 0.1 + 1.0
+        wide = torch.randn(num_tokens, heads * N + 128, device=device, dtype=dtype)
+        z = wide[:, 128:].view(num_tokens, heads, N)
+
+        outputs = {}
+        for rows in _MULTIROW_ROW_CHOICES:
+            out = torch.empty_like(x)
+            _rms_norm_gated_fwd_multirow_kernel[(triton.cdiv(M, rows),)](
+                x,
+                out,
+                weight,
+                z,
+                None,
+                None,
+                x.stride(0),
+                out.stride(0),
+                z.stride(0),
+                M,
+                1e-6,
+                N=N,
+                ROWS=rows,
+                HEADS_PER_TOK=heads,
+                GATE_IS_SIGMOID=True,
+                WEIGHT_IS_DELTA=False,
+                LAUNCH_WITH_PDL=False,
+                num_warps=rows,
+            )
+            outputs[rows] = out
+        widest = outputs[max(_MULTIROW_ROW_CHOICES)]
+        for rows, out in outputs.items():
+            assert torch.equal(out, widest), f"rows={rows} differs from the widest grouping"
+
+    @pytest.mark.parametrize("gate_is_sigmoid", [False, True])
+    def test_token_major_decode_shape_under_cuda_graph(self, gate_is_sigmoid):
+        """The decode launch is captured into a CUDA graph in production.
+
+        Covers the grouping and the PDL launch the decode shape selects, and
+        checks the replayed result against the eager one.
+        """
+        from tensorrt_llm._torch.modules.mamba.layernorm_gated import (
+            _multirow_launch,
+            _multirow_pdl,
+            rms_norm_gated_token_major,
+        )
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        num_tokens, heads, N = 1, 48, 128
+        M = num_tokens * heads
+        torch.manual_seed(12)
+        x = torch.randn(M, N, device=device, dtype=dtype)
+        weight = torch.randn(N, device=device, dtype=dtype) * 0.1 + 1.0
+        wide = torch.randn(num_tokens, 16384, device=device, dtype=dtype)
+        z = wide[:, : heads * N].view(num_tokens, heads, N)
+
+        rows, grid = _multirow_launch(M, x.device.index)
+        assert grid >= triton.cdiv(M, max(rows, 1))
+        assert (
+            _multirow_pdl(grid, x.device.index)
+            or grid >= torch.cuda.get_device_properties(x.device.index).multi_processor_count
+        )
+
+        eager = rms_norm_gated_token_major(x, z, weight, 1e-6, gate_is_sigmoid=gate_is_sigmoid)
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                rms_norm_gated_token_major(x, z, weight, 1e-6, gate_is_sigmoid=gate_is_sigmoid)
+        torch.cuda.current_stream().wait_stream(side)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = rms_norm_gated_token_major(
+                x, z, weight, 1e-6, gate_is_sigmoid=gate_is_sigmoid
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(replayed, eager)
 
 
 @skip_no_cuda

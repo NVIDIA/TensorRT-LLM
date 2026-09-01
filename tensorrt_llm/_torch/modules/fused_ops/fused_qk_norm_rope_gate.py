@@ -23,11 +23,15 @@ unchanged avoids coupling the optimization to weight loading, quantization,
 LoRA, or attention-backend fallback behavior.
 """
 
+import functools
+import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+from tensorrt_llm._utils import get_sm_version
 
 
 @triton.jit
@@ -332,6 +336,25 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _multi_processor_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _pdl_enabled(num_blocks: int, device_index: int) -> bool:
+    """Whether to launch the output gate with PDL.
+
+    PDL hides the serial launch dependency on the attention kernel that
+    produced ``attention_output``, but its synchronization is only worth paying
+    while the grid is too small to supply that overlap by itself.
+    """
+    return (
+        num_blocks < _multi_processor_count(device_index)
+        and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+        and get_sm_version() >= 90
+    )
+
+
 @triton.jit
 def _fused_sigmoid_mul_kernel(
     output_ptr,
@@ -344,6 +367,7 @@ def _fused_sigmoid_mul_kernel(
     hidden_size: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
+    launch_with_pdl: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     block = tl.program_id(1)
@@ -352,6 +376,8 @@ def _fused_sigmoid_mul_kernel(
     head = offsets // head_dim
     dim = offsets - head * head_dim
 
+    if launch_with_pdl:
+        tl.extra.cuda.gdc_wait()
     attention = tl.load(
         attention_ptr + token * attention_stride_token + offsets,
         mask=mask,
@@ -367,6 +393,10 @@ def _fused_sigmoid_mul_kernel(
         attention * tl.sigmoid(gate),
         mask=mask,
     )
+    if launch_with_pdl:
+        # Released only after the store, so a dependent grid that waits on it
+        # observes the whole output.
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @torch.library.custom_op(
@@ -400,6 +430,7 @@ def fused_sigmoid_mul_inplace(
     max_block_size = 1024 if num_tokens < 1024 else 2048
     block_size = min(triton.next_power_of_2(hidden_size), max_block_size)
     grid = (num_tokens, triton.cdiv(hidden_size, block_size))
+    launch_with_pdl = _pdl_enabled(grid[0] * grid[1], attention_output.device.index)
     _fused_sigmoid_mul_kernel[grid](
         attention_output,
         attention_output,
@@ -411,5 +442,7 @@ def fused_sigmoid_mul_inplace(
         hidden_size=hidden_size,
         head_dim=head_dim,
         block_size=block_size,
+        launch_with_pdl=launch_with_pdl,
         num_warps=4,
+        launch_pdl=launch_with_pdl,
     )

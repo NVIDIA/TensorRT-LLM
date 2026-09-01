@@ -274,6 +274,17 @@ constexpr int kDsActWarpsPerCta = 4;
 constexpr int kDsActPermutedNumThreadsPerCta = kDsActWarpSize * kDsActWarpsPerCta;
 constexpr float kDsActAmaxEpsilon = 1.0e-10F;
 
+// The 640-wide expert projection used by the target high-throughput workload
+// has five 128-element scale blocks. Assign one 16-thread subgroup to each
+// block so a CTA consumes a complete permuted row without the generic kernel's
+// per-task 64-bit divide/mod. Each lane moves eight adjacent FP8 elements;
+// five subgroups require 80 threads (three physical warps).
+constexpr int kDsAct640OutputDim = 640;
+constexpr int kDsAct640ThreadsPerGroup = 16;
+constexpr int kDsAct640EltsPerThread = kDsActEltsPerSf / kDsAct640ThreadsPerGroup;
+constexpr int kDsAct640GroupsPerCta = kDsAct640OutputDim / kDsActEltsPerSf;
+constexpr int kDsAct640NumThreadsPerCta = kDsAct640ThreadsPerGroup * kDsAct640GroupsPerCta;
+
 constexpr bool shouldUsePermutedActivation(int innerDim, int numTokens, int topK, int numExperts, int tileTokensDim)
 {
     int const outputDim = innerDim / 2;
@@ -378,6 +389,202 @@ __global__ void activationDeepSeekPermutedKernel(KernelParams params)
         }
         *reinterpret_cast<PackedIo*>(params.outPtr + static_cast<int64_t>(permutedIdx) * outputDim + hiddenBase)
             = packedOut;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams>
+__global__ void activationDeepSeekPermuted640Kernel(KernelParams params)
+{
+    using Type = typename KernelParams::Type;
+    using PackedIo = uint64_t; // kDsAct640EltsPerThread x 8-bit elements
+
+    static_assert(kDsAct640EltsPerThread == 8, "PackedIo assumes 8 elements per thread");
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
+    }
+#endif
+
+    float constexpr kE4m3MaxVal{448.F};
+
+    int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+    int const laneInGroup = threadIdx.x % kDsAct640ThreadsPerGroup;
+    int const sfBlock = threadIdx.x / kDsAct640ThreadsPerGroup;
+    int const hiddenBase = sfBlock * kDsActEltsPerSf + laneInGroup * kDsAct640EltsPerThread;
+    int const lane = threadIdx.x % kDsActWarpSize;
+    uint32_t const subgroupMask = 0xFFFFU << ((lane / kDsAct640ThreadsPerGroup) * kDsAct640ThreadsPerGroup);
+
+    bool const hasSwigluLimit = params.hasSwigluLimit;
+    float const swigluLimit = params.swigluLimit;
+
+    for (int permutedIdx = blockIdx.x; permutedIdx < totalNumPaddedTokens; permutedIdx += gridDim.x)
+    {
+        float const scale1 = params.inDqSfsPtr[permutedIdx + totalNumPaddedTokens * sfBlock];
+        float const scale2 = params.inDqSfsPtr[permutedIdx + totalNumPaddedTokens * (sfBlock + kDsAct640GroupsPerCta)];
+
+        int64_t const baseIdx = static_cast<int64_t>(permutedIdx) * params.innerDim + hiddenBase;
+        PackedIo const packed1 = *reinterpret_cast<PackedIo const*>(params.inPtr + baseIdx);
+        PackedIo const packed2 = *reinterpret_cast<PackedIo const*>(params.inPtr + baseIdx + kDsAct640OutputDim);
+
+        Type const* elts1 = reinterpret_cast<Type const*>(&packed1);
+        Type const* elts2 = reinterpret_cast<Type const*>(&packed2);
+
+        float out[kDsAct640EltsPerThread];
+        float aMax = 0.F;
+#pragma unroll
+        for (int i = 0; i < kDsAct640EltsPerThread; ++i)
+        {
+            float x1 = scale1 * static_cast<float>(elts1[i]);
+            float x2 = scale2 * static_cast<float>(elts2[i]);
+            if (hasSwigluLimit)
+            {
+                x2 = fminf(x2, swigluLimit);
+                x1 = fmaxf(fminf(x1, swigluLimit), -swigluLimit);
+            }
+            out[i] = silu(x2) * x1;
+            aMax = fmaxf(aMax, fabsf(out[i]));
+        }
+
+#pragma unroll
+        for (int offset = kDsAct640ThreadsPerGroup / 2; offset > 0; offset >>= 1)
+        {
+            aMax = fmaxf(aMax, __shfl_xor_sync(subgroupMask, aMax, offset, kDsAct640ThreadsPerGroup));
+        }
+
+        float const scaleOut = fmaxf(aMax, kDsActAmaxEpsilon) / kE4m3MaxVal;
+        if (laneInGroup == 0)
+        {
+            params.outDqSfsPtr[permutedIdx + totalNumPaddedTokens * sfBlock] = scaleOut;
+        }
+
+        PackedIo packedOut;
+        Type* outElts = reinterpret_cast<Type*>(&packedOut);
+#pragma unroll
+        for (int i = 0; i < kDsAct640EltsPerThread; ++i)
+        {
+            outElts[i] = static_cast<Type>(out[i] / scaleOut);
+        }
+        *reinterpret_cast<PackedIo*>(
+            params.outPtr + static_cast<int64_t>(permutedIdx) * kDsAct640OutputDim + hiddenBase)
+            = packedOut;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Expanded-space SwiGLU for the four-token launch used by medium and large
+// decode batches. One warp owns one token and one 128-element scale block, so
+// the four warps in a CTA process the same four tokens as the generic kernel
+// without a shared-memory block reduction. Each lane moves four adjacent FP8
+// elements, matching the packed-I/O layout of the permuted-space kernel.
+template <typename KernelParams>
+__global__ void activationDeepSeekExpandedPackedKernel(KernelParams params)
+{
+    using Type = typename KernelParams::Type;
+    using PackedIo = uint32_t; // kDsActEltsPerThread x 8-bit elements
+
+    static_assert(kDsActEltsPerThread == 4, "PackedIo assumes 4 elements per thread");
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
+    }
+#endif
+
+    float constexpr kE4m3MaxVal{448.F};
+
+    int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+    int const outputDim = params.innerDim / 2;
+    int const numSfBlocks = outputDim / kDsActEltsPerSf;
+    int const lane = threadIdx.x % kDsActWarpSize;
+    int const tokenInCta = threadIdx.x / kDsActWarpSize;
+    int const hiddenBase = blockIdx.x * kDsActEltsPerSf + lane * kDsActEltsPerThread;
+    constexpr int kNumTokensPerCta = KernelParams::NumTokensPerCta;
+
+    // LAUNCH_ACTIVATION instantiates every supported token-count specialization
+    // even though this kernel is selected with four at runtime.
+    if (tokenInCta >= kNumTokensPerCta)
+    {
+        return;
+    }
+
+    bool const hasSwigluLimit = params.hasSwigluLimit;
+    float const swigluLimit = params.swigluLimit;
+
+    for (int k = blockIdx.z; k < params.topK; k += gridDim.z)
+    {
+        for (int tokenCtaIdx = blockIdx.y * kNumTokensPerCta; tokenCtaIdx < params.numTokens;
+             tokenCtaIdx += gridDim.y * kNumTokensPerCta)
+        {
+            int const tokenIdx = tokenCtaIdx + tokenInCta;
+            if (tokenIdx >= params.numTokens)
+            {
+                continue;
+            }
+
+            int const expandedIdx = tokenIdx * params.topK + k;
+            int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+            if (permutedIdx == -1)
+            {
+                continue;
+            }
+
+            int const sfBlock = blockIdx.x;
+            float const scale1 = params.inDqSfsPtr[permutedIdx + totalNumPaddedTokens * sfBlock];
+            float const scale2 = params.inDqSfsPtr[permutedIdx + totalNumPaddedTokens * (sfBlock + numSfBlocks)];
+
+            int64_t const baseIdx = static_cast<int64_t>(permutedIdx) * params.innerDim + hiddenBase;
+            PackedIo const packed1 = *reinterpret_cast<PackedIo const*>(params.inPtr + baseIdx);
+            PackedIo const packed2 = *reinterpret_cast<PackedIo const*>(params.inPtr + baseIdx + outputDim);
+
+            Type const* elts1 = reinterpret_cast<Type const*>(&packed1);
+            Type const* elts2 = reinterpret_cast<Type const*>(&packed2);
+
+            float out[kDsActEltsPerThread];
+            float aMax = 0.F;
+#pragma unroll
+            for (int i = 0; i < kDsActEltsPerThread; ++i)
+            {
+                float x1 = scale1 * static_cast<float>(elts1[i]);
+                float x2 = scale2 * static_cast<float>(elts2[i]);
+                if (hasSwigluLimit)
+                {
+                    x2 = fminf(x2, swigluLimit);
+                    x1 = fmaxf(fminf(x1, swigluLimit), -swigluLimit);
+                }
+                out[i] = silu(x2) * x1;
+                aMax = fmaxf(aMax, fabsf(out[i]));
+            }
+
+#pragma unroll
+            for (int offset = kDsActWarpSize / 2; offset > 0; offset >>= 1)
+            {
+                aMax = fmaxf(aMax, __shfl_xor_sync(0xffffffffu, aMax, offset));
+            }
+
+            float const scaleOut = fmaxf(aMax, kDsActAmaxEpsilon) / kE4m3MaxVal;
+            if (lane == 0)
+            {
+                params.outDqSfsPtr[permutedIdx + totalNumPaddedTokens * sfBlock] = scaleOut;
+            }
+
+            PackedIo packedOut;
+            Type* outElts = reinterpret_cast<Type*>(&packedOut);
+#pragma unroll
+            for (int i = 0; i < kDsActEltsPerThread; ++i)
+            {
+                outElts[i] = static_cast<Type>(out[i] / scaleOut);
+            }
+            *reinterpret_cast<PackedIo*>(params.outPtr + static_cast<int64_t>(permutedIdx) * outputDim + hiddenBase)
+                = packedOut;
+        }
     }
 }
 
@@ -610,22 +817,44 @@ void run(Data const& data, void* stream)
         // expert's real rows do not even fill the tile that must be swept for it.
         if (shouldUsePermutedActivation(data.innerDim, data.numTokens, data.topK, data.numExperts, data.tileTokensDim))
         {
-            int64_t const maxTasks = static_cast<int64_t>(data.numTokens) * data.topK * (outputDim / kDsActEltsPerSf);
-            int64_t const ctasForAllTasks = (maxTasks + kDsActWarpsPerCta - 1) / kDsActWarpsPerCta;
+            int64_t const maxRows = static_cast<int64_t>(data.numTokens) * data.topK;
             // Persistent grid: totalNumPaddedTokens is a device-side value, so the
             // host can only bound it. Cap at a few waves and let the grid stride
             // absorb the difference rather than launching the (numTokens x topK)
             // worst case that the expanded-space kernel pays unconditionally.
-            int const numCtas = static_cast<int>(std::min<int64_t>(ctasForAllTasks, int64_t{numSms} * 32));
+            int64_t const ctasForAllTasks
+                = (maxRows * (outputDim / kDsActEltsPerSf) + kDsActWarpsPerCta - 1) / kDsActWarpsPerCta;
+            int64_t const ctasForAllRows = maxRows;
+            int64_t const maxCtas = int64_t{numSms} * 32;
+            int const numCtas = static_cast<int>(
+                std::min(outputDim == kDsAct640OutputDim ? ctasForAllRows : ctasForAllTasks, maxCtas));
             dim3 const permutedGrid(std::max(numCtas, 1), 1, 1);
 
-            LAUNCH_ACTIVATION(
-                data, activationDeepSeekPermutedKernel, 1, permutedGrid, kDsActPermutedNumThreadsPerCta, 0, stream);
+            if (outputDim == kDsAct640OutputDim)
+            {
+                LAUNCH_ACTIVATION(
+                    data, activationDeepSeekPermuted640Kernel, 1, permutedGrid, kDsAct640NumThreadsPerCta, 0, stream);
+            }
+            else
+            {
+                LAUNCH_ACTIVATION(
+                    data, activationDeepSeekPermutedKernel, 1, permutedGrid, kDsActPermutedNumThreadsPerCta, 0, stream);
+            }
         }
         else
         {
-            LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
-                DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
+            bool const usePackedExpanded
+                = numTokensPerCta == kDsActWarpsPerCta && outputDim % kDsActEltsPerSf == 0 && data.innerDim % 8 == 0;
+            if (usePackedExpanded)
+            {
+                LAUNCH_ACTIVATION(data, activationDeepSeekExpandedPackedKernel, kDsActWarpsPerCta, grid,
+                    kDsActPermutedNumThreadsPerCta, 0, stream);
+            }
+            else
+            {
+                LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
+                    DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
+            }
         }
     }
     else
@@ -966,9 +1195,20 @@ __global__ void finalizeKernel(KernelParams params)
             params.outPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
         }
     }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // Release the dependent grid here rather than leaving it to this grid's
+    // completion. It cannot move above the loop: the consumer reads outPtr, and
+    // its cudaGridDependencySynchronize() is what orders it after these stores.
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
 }
 
 constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
+constexpr static int FINALIZE_SINGLE_PASS_BF16_THREADS_PER_BLOCK = 320;
 
 __device__ float4 vectorizedLoadPtx(float4 const* ptr)
 {
@@ -1002,7 +1242,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
     int64_t const hiddenBlockIdx = blockIdx.y;
     int64_t const tokenIdx = blockIdx.x;
     int64_t const startOffset = threadIdx.x + hiddenBlockIdx * params.hiddenDimPerBlock / FINALIZE_ELEM_PER_THREAD;
-    int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+    int64_t const stride = blockDim.x;
     int64_t const numElemsInPaddedCol = params.hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
     int64_t const numElemsInColPerBlock = (hiddenBlockIdx + 1) * params.hiddenDimPerBlock / FINALIZE_ELEM_PER_THREAD;
 
@@ -1047,6 +1287,14 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
         OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
         outElemPtr[elemIndex] = outputElem;
     }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // See finalizeKernel: the trigger belongs after the stores it publishes.
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1163,8 +1411,14 @@ void run(Data const& data, void* stream)
         }
         else
         {
+            // A 2560-element BF16 row contains 320 128-bit vectors. Use one
+            // thread per vector for this high-occupancy Qwen MoE shape so the
+            // finalize kernel does not need a second loop iteration.
+            int const vectorThreads = data.mDtypeElt == tg::Dtype::Bfloat16 && data.hiddenDim == 2560 && data.topK == 10
+                ? FINALIZE_SINGLE_PASS_BF16_THREADS_PER_BLOCK
+                : FINALIZE_THREADS_PER_BLOCK;
             LAUNCH_EXPW(data, finalizeKernelVecLoad, true, /*numBlocks=*/data.numTokens,
-                /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
+                /*numThreads=*/vectorThreads, 0, stream);
         }
     }
 }

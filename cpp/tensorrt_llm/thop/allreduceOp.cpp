@@ -1599,6 +1599,14 @@ constexpr std::array<int64_t, 14> kAllReduceTuningBuckets
 constexpr size_t kAllReduceNumTuningBuckets = kAllReduceTuningBuckets.size();
 constexpr size_t kAllReduceNumInputs = 6;
 
+constexpr AllReduceStrategyType getAllReduceCacheMissTactic(int smVersion)
+{
+    return smVersion == 103 ? AllReduceStrategyType::NCCL : AllReduceStrategyType::NCCL_SYMMETRIC;
+}
+
+static_assert(getAllReduceCacheMissTactic(103) == AllReduceStrategyType::NCCL);
+static_assert(getAllReduceCacheMissTactic(100) == AllReduceStrategyType::NCCL_SYMMETRIC);
+
 using AllReduceInputShape = c10::SmallVector<int64_t, 8>;
 using AllReduceInputShapes = std::array<AllReduceInputShape, kAllReduceNumInputs>;
 
@@ -1804,7 +1812,9 @@ std::vector<torch::Tensor> autotunedAllreduce(torch::Tensor const& input,
     int64_t tactic;
     if (!defaultTactic.has_value() && !windowTactic.has_value())
     {
-        tactic = static_cast<int64_t>(AllReduceStrategyType::NCCL_SYMMETRIC);
+        // Keep the native cache-miss policy aligned with the Python AUTO
+        // tactic set. Explicit NCCL_SYMMETRIC remains available on SM103.
+        tactic = static_cast<int64_t>(getAllReduceCacheMissTactic(tensorrt_llm::common::getSMVersion()));
     }
     else if (!defaultTactic.has_value())
     {

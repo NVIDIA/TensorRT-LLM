@@ -393,10 +393,13 @@ class PeerRegistrar:
         # the mapper must slice only the overlapping subset.
         extra_kwargs = {}
         if self_lg.kind == CacheKind.STATE:
-            # Position of each overlapping layer in the full sorted local_layer_ids
-            # used by extract_slot. These are indices into the ptrs array.
-            self_all_lids = sorted(set(int(e["local_layer_id"]) for e in self_pv.buffer_entries))
-            peer_all_lids = sorted(set(int(e["local_layer_id"]) for e in peer_pv.buffer_entries))
+            # Position of each overlapping layer in the full offset-ordered
+            # local_layer_ids used by extract_slot. These are indices into the
+            # ptrs array.
+            self_starts, _ = get_layer_byte_ranges(self_pv)
+            peer_starts, _ = get_layer_byte_ranges(peer_pv)
+            self_all_lids = sorted(self_starts, key=lambda lid: self_starts[lid])
+            peer_all_lids = sorted(peer_starts, key=lambda lid: peer_starts[lid])
             self_lid_to_pos = {lid: i for i, lid in enumerate(self_all_lids)}
             peer_lid_to_pos = {lid: i for i, lid in enumerate(peer_all_lids)}
             # overlapping_layers are global IDs; map them to local_layer_ids

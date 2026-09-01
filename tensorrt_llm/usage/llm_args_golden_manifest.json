@@ -1533,6 +1533,7 @@
         "dsa",
         "deepseek_v4",
         "minimax_m3",
+        "qsa",
         "rocket",
         "skip_softmax"
       ],
@@ -1540,6 +1541,13 @@
       "converter": "",
       "kind": "categorical",
       "path": "sparse_attention_config.algorithm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.compress_ratio"
     },
     {
       "allowed_values": [],
@@ -1571,6 +1579,13 @@
       "converter": "",
       "kind": "value",
       "path": "sparse_attention_config.index_head_dim"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.index_kv_heads"
     },
     {
       "allowed_values": [],
@@ -1750,6 +1765,13 @@
       "converter": "",
       "kind": "value",
       "path": "sparse_attention_config.sparse_topk_blocks"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.token_topk"
     },
     {
       "allowed_values": [],

@@ -402,7 +402,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 pool = get_physical_pool(pt, lg_id, pv.pool_idx)
                 if lg.kind == CacheKind.STATE:
                     # STATE: n=1 (one slot), but transfer covers all layers.
-                    num_layers = len(lg.local_layers)
+                    num_layers = len({int(e["local_layer_id"]) for e in pv.buffer_entries})
                     total += num_layers * pool.slot_bytes
                 else:
                     # Attention: n blocks, each slot covers all layers.

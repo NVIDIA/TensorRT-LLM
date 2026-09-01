@@ -672,9 +672,17 @@ class CUDAGraphRunner:
         self.memory_pool = graph.pool()
         return graph_output
 
-    def replay(self, key: KeyType,
-               current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
-        """Replays a previously captured graph."""
+    def replay(self,
+               key: KeyType,
+               current_inputs: Dict[str, Any],
+               stage_inputs: bool = True) -> Optional[torch.Tensor]:
+        """Replays a previously captured graph.
+
+        Set `stage_inputs` to False when the caller has already copied the
+        token and position inputs into `shared_static_tensors`. Copying them
+        here costs a launch each; a caller that issues them alongside the rest
+        of its input preparation can put them in a graph of its own instead.
+        """
         key = KeyType(*key)
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
@@ -684,23 +692,26 @@ class CUDAGraphRunner:
 
         static_tensors = self.shared_static_tensors
 
-        input_ids = current_inputs["input_ids"]
-        seqlen = input_ids.shape[0]
-        static_tensors["input_ids"][:seqlen].copy_(input_ids)
+        if stage_inputs:
+            input_ids = current_inputs["input_ids"]
+            seqlen = input_ids.shape[0]
+            static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
-        position_ids = current_inputs["position_ids"]
-        if self.config.use_mrope:
-            static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
-            mrope_delta_read_seq_slots = current_inputs.get(
-                'mrope_delta_read_seq_slots')
-            if mrope_delta_read_seq_slots is not None:
-                static_tensors[
-                    'mrope_delta_read_seq_slots'][:mrope_delta_read_seq_slots.
-                                                  shape[0]].copy_(
-                                                      mrope_delta_read_seq_slots,
-                                                      non_blocking=True)
-        else:
-            static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
+            position_ids = current_inputs["position_ids"]
+            if self.config.use_mrope:
+                static_tensors["position_ids"][:, :, :seqlen].copy_(
+                    position_ids)
+                mrope_delta_read_seq_slots = current_inputs.get(
+                    'mrope_delta_read_seq_slots')
+                if mrope_delta_read_seq_slots is not None:
+                    static_tensors[
+                        'mrope_delta_read_seq_slots'][:
+                                                      mrope_delta_read_seq_slots
+                                                      .shape[0]].copy_(
+                                                          mrope_delta_read_seq_slots,
+                                                          non_blocking=True)
+            else:
+                static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:

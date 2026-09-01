@@ -16,6 +16,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -66,8 +69,9 @@ def _layer_norm_fwd_1pass_kernel(
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
-    GATE_SIGMOID: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
+    GATE_IS_SIGMOID: tl.constexpr,
+    WEIGHT_IS_DELTA: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -89,9 +93,7 @@ def _layer_norm_fwd_1pass_kernel(
     x = tl.load(X + cols, mask=cols < N, other=0.0).to(tl.float32)
     if HAS_Z and not NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=cols < N).to(tl.float32)
-        gate = tl.sigmoid(z)
-        if not GATE_SIGMOID:
-            gate *= z
+        gate = tl.sigmoid(z) if GATE_IS_SIGMOID else z * tl.sigmoid(z)
         x *= gate
     if not IS_RMS_NORM:
         mean = tl.sum(x, axis=0) / N
@@ -106,15 +108,15 @@ def _layer_norm_fwd_1pass_kernel(
     # Normalize and apply linear transformation
     mask = cols < N
     w = tl.load(W + cols, mask=mask).to(tl.float32)
+    if WEIGHT_IS_DELTA:
+        w += 1.0
     if HAS_BIAS:
         b = tl.load(B + cols, mask=mask).to(tl.float32)
     x_hat = (x - mean) * rstd if not IS_RMS_NORM else x * rstd
     y = x_hat * w + b if HAS_BIAS else x_hat * w
     if HAS_Z and NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
-        gate = tl.sigmoid(z)
-        if not GATE_SIGMOID:
-            gate *= z
+        gate = tl.sigmoid(z) if GATE_IS_SIGMOID else z * tl.sigmoid(z)
         y *= gate
     if OUTPUT_FP8:
         # Match the existing two-kernel path: RMSNorm first stores to the
@@ -126,13 +128,47 @@ def _layer_norm_fwd_1pass_kernel(
     tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
 
 
-# Rows per program of the multi-row gated-RMSNorm kernel. At the GDN decode
-# shape (thousands of 128-element rows) one row per CTA leaves the kernel
-# launch-limited; 4 rows with 4 warps reproduces the single-row kernel's
-# reduction order (bitwise-identical output) at ~2x the throughput.
-_MULTIROW_ROWS = 4
-_MULTIROW_NUM_WARPS = 4
+# Rows per program of the multi-row gated-RMSNorm kernel, with one warp per
+# row so that a whole row is reduced inside a single warp: that is what makes
+# the grouped kernel reproduce the single-row kernel's reduction order
+# (bitwise-identical output). Grouping rows amortizes the launch when there are
+# thousands of them, but a decode step contributes one row per value head - a
+# few dozen - and grouping those leaves most of the device idle, so a grouping
+# is only taken while the grid it implies still covers every SM.
+# ``tl.arange`` needs a power of two, hence the choices.
+_MULTIROW_ROW_CHOICES = (4, 2, 1)
 _MULTIROW_MAX_N = 256
+
+
+@functools.lru_cache(maxsize=None)
+def _multi_processor_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _multirow_launch(M: int, device_index: int) -> tuple[int, int]:
+    """Rows per program and the grid it implies for ``M`` rows.
+
+    Picks the widest grouping whose grid still covers every SM, and one row per
+    program when none does.
+    """
+    sm_count = _multi_processor_count(device_index)
+    rows = next(
+        (rows for rows in _MULTIROW_ROW_CHOICES if M >= rows * sm_count),
+        _MULTIROW_ROW_CHOICES[-1],
+    )
+    return rows, triton.cdiv(M, rows)
+
+
+def _multirow_pdl(grid: int, device_index: int) -> bool:
+    """Whether to launch the multi-row kernel with PDL.
+
+    PDL hides the serial launch dependency on the kernel that produced ``x``,
+    but its synchronization is only worth paying while the grid is too small to
+    supply that overlap by itself.
+    """
+    return (grid < _multi_processor_count(device_index)
+            and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+            and get_sm_version() >= 90)
 
 
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
@@ -153,9 +189,11 @@ def _rms_norm_gated_fwd_multirow_kernel(
     N: tl.constexpr,  # row length; power of two, whole row per program
     ROWS: tl.constexpr,  # rows per program
     HEADS_PER_TOK: tl.constexpr,
-    GATE_SIGMOID: tl.constexpr,
     SAVE_RSTD: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
+    GATE_IS_SIGMOID: tl.constexpr,
+    WEIGHT_IS_DELTA: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
 ):
     """Gated rmsnorm(x), several short rows per program.
 
@@ -170,6 +208,8 @@ def _rms_norm_gated_fwd_multirow_kernel(
     row_mask = rows < M
     cols = tl.arange(0, N)
     mask2d = row_mask[:, None]
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
     x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
     x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=1) / N
@@ -177,15 +217,15 @@ def _rms_norm_gated_fwd_multirow_kernel(
     if SAVE_RSTD:
         tl.store(Rstd + rows, rstd, mask=row_mask)
     w = tl.load(W + cols).to(tl.float32)
+    if WEIGHT_IS_DELTA:
+        w += 1.0
     y = x * rstd[:, None] * w[None, :]
     tok = rows // HEADS_PER_TOK
     head = rows % HEADS_PER_TOK
     z_off = (tok[:, None].to(tl.int64) * stride_z_tok + head[:, None] * N +
              cols[None, :])
     z = tl.load(Z + z_off, mask=mask2d, other=0.0).to(tl.float32)
-    gate = tl.sigmoid(z)
-    if not GATE_SIGMOID:
-        gate *= z
+    gate = tl.sigmoid(z) if GATE_IS_SIGMOID else z * tl.sigmoid(z)
     y *= gate
     if OUTPUT_FP8:
         # Match the existing two-kernel path: RMSNorm first stores to the
@@ -195,6 +235,10 @@ def _rms_norm_gated_fwd_multirow_kernel(
         y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
     y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
     tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
+    if LAUNCH_WITH_PDL:
+        # Released only after the store, so a dependent grid that waits on it
+        # observes the whole output.
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
@@ -211,6 +255,7 @@ def rms_norm_gated_token_major(
     eps: float,
     fp8_scale: torch.Tensor | None = None,
     gate_activation: str = "silu",
+    gate_is_sigmoid: bool = False,
 ) -> torch.Tensor:
     """Gated rmsnorm(x) with z read from a 3D token-major view.
 
@@ -223,13 +268,15 @@ def rms_norm_gated_token_major(
     When fp8_scale (a scalar fp32 tensor holding the downstream static input
     scale) is given, the output is quantized to float8_e4m3fn in the same
     kernel. ``gate_activation`` is ``"silu"`` for GDN's ``z * sigmoid(z)``
-    gate or ``"sigmoid"`` for KDA's ``sigmoid(z)`` gate.
+    gate or ``"sigmoid"`` for KDA-style ``sigmoid(z)`` gates. The
+    ``gate_is_sigmoid`` boolean is kept as a compatibility alias for optimized
+    call sites.
     """
     if gate_activation not in ("silu", "sigmoid"):
         raise ValueError(
             f"gate_activation must be 'silu' or 'sigmoid', got {gate_activation!r}"
         )
-    gate_sigmoid = gate_activation == "sigmoid"
+    resolved_gate_is_sigmoid = gate_is_sigmoid or gate_activation == "sigmoid"
     M, N = x.shape
     num_tokens, heads, n_z = z.shape
     assert n_z == N and num_tokens * heads == M, (
@@ -248,13 +295,15 @@ def rms_norm_gated_token_major(
             is_rms_norm=True,
             fp8_scale=fp8_scale,
             gate_activation=gate_activation,
+            gate_is_sigmoid=resolved_gate_is_sigmoid,
         )
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
-    grid = (triton.cdiv(M, _MULTIROW_ROWS), )
+    rows_per_program, grid_x = _multirow_launch(M, x.device.index)
+    launch_with_pdl = _multirow_pdl(grid_x, x.device.index)
     with torch.cuda.device(x.device.index):
-        _rms_norm_gated_fwd_multirow_kernel[grid](
+        _rms_norm_gated_fwd_multirow_kernel[(grid_x, )](
             x,
             out,
             weight,
@@ -267,10 +316,13 @@ def rms_norm_gated_token_major(
             M,
             eps,
             N=N,
-            ROWS=_MULTIROW_ROWS,
+            ROWS=rows_per_program,
             HEADS_PER_TOK=heads,
-            GATE_SIGMOID=gate_sigmoid,
-            num_warps=_MULTIROW_NUM_WARPS,
+            GATE_IS_SIGMOID=resolved_gate_is_sigmoid,
+            WEIGHT_IS_DELTA=False,
+            LAUNCH_WITH_PDL=launch_with_pdl,
+            num_warps=rows_per_program,
+            launch_pdl=launch_with_pdl,
         )
     return out
 
@@ -283,8 +335,9 @@ def _(
     eps: float,
     fp8_scale: torch.Tensor | None = None,
     gate_activation: str = "silu",
+    gate_is_sigmoid: bool = False,
 ) -> torch.Tensor:
-    del z, weight, eps, gate_activation
+    del z, weight, eps, gate_activation, gate_is_sigmoid
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     return torch.empty_like(x, dtype=out_dtype)
 
@@ -301,12 +354,14 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     fp8_scale=None,
     gate_activation="silu",
+    gate_is_sigmoid=False,
+    weight_is_delta=False,
 ):
     if gate_activation not in ("silu", "sigmoid"):
         raise ValueError(
             f"gate_activation must be 'silu' or 'sigmoid', got {gate_activation!r}"
         )
-    gate_sigmoid = gate_activation == "sigmoid"
+    resolved_gate_is_sigmoid = gate_is_sigmoid or gate_activation == "sigmoid"
     M, N = x.shape
     if group_size is None:
         group_size = N
@@ -337,9 +392,10 @@ def _layer_norm_fwd(
     rstd = torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
     if _multirow_gated_rmsnorm_eligible(group_size, ngroups, bias, z,
                                         norm_before_gate, is_rms_norm):
-        grid = (triton.cdiv(M, _MULTIROW_ROWS), )
+        rows_per_program, grid_x = _multirow_launch(M, x.device.index)
+        launch_with_pdl = _multirow_pdl(grid_x, x.device.index)
         with torch.cuda.device(x.device.index):
-            _rms_norm_gated_fwd_multirow_kernel[grid](
+            _rms_norm_gated_fwd_multirow_kernel[(grid_x, )](
                 x,
                 out,
                 weight,
@@ -352,10 +408,13 @@ def _layer_norm_fwd(
                 M,
                 eps,
                 N=group_size,
-                ROWS=_MULTIROW_ROWS,
+                ROWS=rows_per_program,
                 HEADS_PER_TOK=1,
-                GATE_SIGMOID=gate_sigmoid,
-                num_warps=_MULTIROW_NUM_WARPS,
+                GATE_IS_SIGMOID=resolved_gate_is_sigmoid,
+                WEIGHT_IS_DELTA=weight_is_delta,
+                LAUNCH_WITH_PDL=launch_with_pdl,
+                num_warps=rows_per_program,
+                launch_pdl=launch_with_pdl,
             )
         return out, mean, rstd
     # Less than 64KB per feature: enqueue fused kernel
@@ -386,7 +445,8 @@ def _layer_norm_fwd(
             BLOCK_N=BLOCK_N,
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
-            GATE_SIGMOID=gate_sigmoid,
+            GATE_IS_SIGMOID=resolved_gate_is_sigmoid,
+            WEIGHT_IS_DELTA=weight_is_delta,
             num_warps=num_warps,
         )
     return out, mean, rstd
@@ -403,6 +463,7 @@ class RMSNorm(torch.nn.Module):
         device=None,
         dtype=None,
         is_nvfp4: bool = False,
+        weight_is_delta: bool = False,
     ):
         """If group_size is not None, we do GroupNorm with each group having group_size elements.
         group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
@@ -416,8 +477,12 @@ class RMSNorm(torch.nn.Module):
         self.register_parameter("bias", None)
         self.group_size = group_size if group_size is not None else hidden_size
         self.norm_before_gate = norm_before_gate
+        self.weight_is_delta = weight_is_delta
 
         self.is_nvfp4 = is_nvfp4
+        if self.is_nvfp4 and self.weight_is_delta:
+            raise ValueError(
+                "NVFP4 RMSNorm does not support delta-form weights")
         # nvfp4_scale will be set externally if is_nvfp4 is True
         self.nvfp4_scale: torch.Tensor | None = None
         # fp8_scale will be attached from the downstream static FP8 linear.
@@ -484,5 +549,6 @@ class RMSNorm(torch.nn.Module):
             norm_before_gate=self.norm_before_gate,
             is_rms_norm=True,
             fp8_scale=fp8_scale,
+            weight_is_delta=self.weight_is_delta,
         )
         return y.reshape(x_shape_og)

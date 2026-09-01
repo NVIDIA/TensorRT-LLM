@@ -17,6 +17,7 @@
 min-length EOS suppression) in
 tensorrt_llm/_torch/pyexecutor/sampler/token_ban.py."""
 
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -26,7 +27,35 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.sampler.token_ban import (
     OverlappedTokenBanHandler,
     SynchronousTokenBanHandler,
+    has_min_length,
 )
+
+
+class TestHasMinLength:
+    """Unit tests for the min-length predicate.
+
+    py_min_length is a list mirroring SamplingConfig.minLength, so a request
+    that asked for no minimum still arrives carrying [0] -- truthy as a list,
+    but not a constraint.
+    """
+
+    @pytest.mark.parametrize(
+        ("min_length", "expected"),
+        [
+            (None, False),
+            ([], False),
+            ([0], False),  # the default a served request carries
+            ([-1], False),
+            ([1], True),
+            ([5], True),
+        ],
+    )
+    def test_only_a_positive_minimum_counts(self, min_length, expected):
+        request = cast(LlmRequest, SimpleNamespace(py_min_length=min_length))
+        assert has_min_length(request) is expected
+
+    def test_missing_attribute_is_no_constraint(self):
+        assert has_min_length(cast(LlmRequest, SimpleNamespace())) is False
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -501,6 +530,15 @@ class TestAddMinLengthBans:
     def test_no_min_length_untouched(self):
         active = self.MockLlmRequest(num_tokens=1, min_length=5)
         disabled = self.MockLlmRequest(num_tokens=1, min_length=None)
+        logits = self._run([active, disabled])
+        assert self._banned_cols(logits[0]) == {self.END_ID}
+        assert self._banned_cols(logits[1]) == set()
+
+    def test_zero_min_length_untouched(self):
+        # min_length [0] is what a request with no minimum actually carries;
+        # every generated length is >= 0, so it can never ban anything.
+        active = self.MockLlmRequest(num_tokens=1, min_length=5)
+        disabled = self.MockLlmRequest(num_tokens=1, min_length=0)
         logits = self._run([active, disabled])
         assert self._banned_cols(logits[0]) == {self.END_ID}
         assert self._banned_cols(logits[1]) == set()

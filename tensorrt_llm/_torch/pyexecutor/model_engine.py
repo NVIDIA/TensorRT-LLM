@@ -106,6 +106,7 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
 from .sampler import SampleStateTensors
 from .sampler.ops.flashinfer import warmup_sampling_module
 from .scheduler import ScheduledRequests
+from .steady_gen_prep_graph import SteadyGenPrepGraph
 from .trace_log_utils import log_mem_snapshot
 
 
@@ -965,6 +966,10 @@ class PyTorchModelEngine(ModelEngine):
             (self.max_num_tokens, ),
             dtype=torch.int,
             pin_memory=prefer_pinned())
+        self._steady_gen_prep_graph = SteadyGenPrepGraph()
+        # Whether the last prepare staged the model's inputs into the decode
+        # graph's static buffers itself; read once, by the replay that follows.
+        self._steady_gen_inputs_prestaged = False
         if self.use_mrope:
             self.mrope_position_ids_cuda = torch.empty(
                 (3, 1, self.max_num_tokens), dtype=torch.int, device='cuda')
@@ -4346,6 +4351,15 @@ class PyTorchModelEngine(ModelEngine):
         top_level_model = getattr(model, "model", model)
         return getattr(top_level_model, "_orig_mod", top_level_model)
 
+    def _model_uses_ple_recurrent_state(self) -> bool:
+        """Detect PLE on text-only and multimodal model wrappers."""
+        top_level_model = self._get_top_level_model()
+        if getattr(top_level_model, "has_ple", False):
+            return True
+        llm = getattr(top_level_model, "llm", None)
+        text_model = getattr(llm, "model", llm)
+        return bool(getattr(text_model, "has_ple", False))
+
     def _get_position_id_offset(self) -> int:
         offset = getattr(self._get_top_level_model(), "position_id_offset", 0)
         return 0 if offset is None else int(offset)
@@ -5290,10 +5304,12 @@ class PyTorchModelEngine(ModelEngine):
 
     @nvtx_range("_apply_steady_gen_fast_prepare")
     def _apply_steady_gen_fast_prepare(
-            self, kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+            self,
+            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
             attn_metadata: AttentionMetadata,
             new_tensors_device: SampleStateTensors,
-            resource_manager: Optional[ResourceManager]):
+            resource_manager: Optional[ResourceManager],
+            maybe_graph: bool = False):
         """Prepare inputs for an unchanged generation-only batch.
 
         Every request advanced by exactly one committed token since the last
@@ -5303,6 +5319,14 @@ class PyTorchModelEngine(ModelEngine):
         refreshes only the per-step metadata. For mrope models (recorded only
         for batches with no actual mrope work) the (3,1,N) broadcast buffer
         the model reads is the one advanced.
+
+        The device operations this issues -- its own two plus the metadata's --
+        are collected rather than issued where they are reached, so that one
+        graph replay can stand in for the whole set instead of each paying a
+        launch of its own. When `maybe_graph` says the step will replay a
+        decode graph, the model's inputs are staged into that graph's static
+        buffers from here as well, so those copies join the same set; the
+        caller then tells the runner not to stage them again.
         """
         cache = self._steady_gen_cache
         num_requests = cache['num_requests']
@@ -5320,76 +5344,139 @@ class PyTorchModelEngine(ModelEngine):
         use_mrope = cache['use_mrope']
         positions = self._steady_gen_positions_pinned[:num_requests]
         positions.add_(1)
-        if use_mrope:
-            # Text-only batch on an mrope model: the recording pass broadcast
-            # the scalar positions onto all three axes of the (3,1,N) buffer,
-            # which is what the model (and any captured CUDA graph) reads, so
-            # advance it in place. position_ids_cuda is reseeded by the next
-            # full pass.
-            self.mrope_position_ids_cuda[:, :, :num_requests].add_(1)
-        else:
-            self.position_ids_cuda[:num_requests].add_(1)
         num_cached_tokens_per_seq = positions.tolist()
 
-        # Gather this step's input tokens from the previous iteration's device
-        # sample buffer; the seq-slot indices in previous_batch_indices_cuda
-        # are unchanged since the last full pass.
-        previous_slots = self.previous_batch_indices_cuda[:num_requests]
-        new_tokens = new_tensors_device.new_tokens[:1, previous_slots, :self.
-                                                   max_beam_width]
-        self.input_ids_cuda[:num_requests * self.max_beam_width].copy_(
-            new_tokens.flatten(), non_blocking=True)
+        new_tokens = new_tensors_device.new_tokens
+        prestage = maybe_graph and bool(
+            self.cuda_graph_runner.shared_static_tensors)
+        # A replay repeats the operations exactly as they were traced, so the
+        # key covers everything a trace bakes in that this path can still
+        # change: which metadata is being prepared, which buffer the committed
+        # tokens are gathered from, and the batch the work was built for --
+        # the request ids because the block-offset copy resolves them to cache
+        # slots on the host, which a replay does not redo.
+        prep_key = (id(attn_metadata), num_requests, use_mrope, prestage,
+                    cache['request_ids_key'], new_tokens.data_ptr())
+        prep_graph = self._steady_gen_prep_graph
+        device_work = prep_graph.begin(prep_key)
+        try:
+            if device_work is not None:
+                if use_mrope:
+                    # Text-only batch on an mrope model: the recording pass
+                    # broadcast the scalar positions onto all three axes of the
+                    # (3,1,N) buffer, which is what the model (and any captured
+                    # CUDA graph) reads, so advance it in place.
+                    # position_ids_cuda is reseeded by the next full pass.
+                    positions_cuda = \
+                        self.mrope_position_ids_cuda[:, :, :num_requests]
+                else:
+                    positions_cuda = self.position_ids_cuda[:num_requests]
+                device_work.append((positions_cuda.add_, (1, ), None))
 
-        if not attn_metadata.is_cuda_graph:
-            attn_metadata.seq_lens = cache['seq_lens_ones']
-        attn_metadata.beam_width = 1
-        attn_metadata.request_ids = cache['request_ids']
-        attn_metadata.prompt_lens = cache['prompt_lens']
-        attn_metadata.num_contexts = 0
-        attn_metadata.num_chunked_ctx_requests = 0
-        attn_metadata.kv_cache_params = KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=get_num_extra_kv_tokens(None))
-        attn_metadata.kv_cache_manager = kv_cache_manager
-        if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
-            attn_metadata.mamba_chunk_size = \
-                self.model.model_config.pretrained_config.chunk_size
-        with nvtx_range("steady_gen_metadata_prepare"):
-            attn_metadata.prepare()
+                # Gather this step's input tokens from the previous iteration's
+                # device sample buffer straight into the model's input buffer;
+                # the seq-slot indices in previous_batch_indices_cuda are
+                # unchanged since the last full pass. Advanced indexing would
+                # materialize the gathered tokens in a temporary and copy that
+                # over, which at decode batch sizes costs a second device
+                # transfer for a handful of bytes; index_select writes the
+                # destination directly.
+                device_work.append((
+                    torch.index_select,
+                    (new_tokens[0, :, :self.max_beam_width], 0,
+                     self.previous_batch_indices_cuda[:num_requests]),
+                    {
+                        'out':
+                        self.input_ids_cuda[:num_requests *
+                                            self.max_beam_width].view(
+                                                num_requests,
+                                                self.max_beam_width)
+                    },
+                ))
 
-        attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
-        padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = \
-            self._get_padding_params(num_requests, 0, attn_all_rank_num_tokens)
-        set_per_request_prefill_cuda_graph_flag(can_run_piecewise_cuda_graph)
-        attn_metadata.padded_num_tokens = (
-            padded_num_tokens if padded_num_tokens != num_requests else None)
-        virtual_num_tokens = num_requests
-        if attn_metadata.padded_num_tokens is not None:
-            self.input_ids_cuda[num_requests:padded_num_tokens].fill_(0)
-            # Zero-fill the padding tail of whichever position layout the
-            # model consumes, matching the full pass.
+            if not attn_metadata.is_cuda_graph:
+                attn_metadata.seq_lens = cache['seq_lens_ones']
+            attn_metadata.beam_width = 1
+            attn_metadata.request_ids = cache['request_ids']
+            attn_metadata.prompt_lens = cache['prompt_lens']
+            attn_metadata.num_contexts = 0
+            attn_metadata.num_chunked_ctx_requests = 0
+            attn_metadata.kv_cache_params = KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+                num_extra_kv_tokens=get_num_extra_kv_tokens(None))
+            attn_metadata.kv_cache_manager = kv_cache_manager
+            if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
+                attn_metadata.mamba_chunk_size = \
+                    self.model.model_config.pretrained_config.chunk_size
+            with nvtx_range("steady_gen_metadata_prepare"):
+                attn_metadata.prepare()
+
+            attn_all_rank_num_tokens = self._get_all_rank_num_tokens(
+                attn_metadata)
+            padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = \
+                self._get_padding_params(num_requests, 0, attn_all_rank_num_tokens)
+            set_per_request_prefill_cuda_graph_flag(
+                can_run_piecewise_cuda_graph)
+            attn_metadata.padded_num_tokens = (padded_num_tokens
+                                               if padded_num_tokens
+                                               != num_requests else None)
+            virtual_num_tokens = num_requests
+            if attn_metadata.padded_num_tokens is not None:
+                # Issued rather than collected: these write only the padding
+                # tail, which the collected operations above do not touch and
+                # the staging below reads, so running first is the order they
+                # need and keeps the collected sequence independent of padding.
+                self.input_ids_cuda[num_requests:padded_num_tokens].fill_(0)
+                # Zero-fill the padding tail of whichever position layout the
+                # model consumes, matching the full pass.
+                if use_mrope:
+                    self.mrope_position_ids_cuda[:, :, num_requests:
+                                                 padded_num_tokens].fill_(0)
+                else:
+                    self.position_ids_cuda[
+                        num_requests:padded_num_tokens].fill_(0)
+                virtual_num_tokens = padded_num_tokens
+
             if use_mrope:
-                self.mrope_position_ids_cuda[:, :, num_requests:
-                                             padded_num_tokens].fill_(0)
+                final_position_ids = \
+                    self.mrope_position_ids_cuda[:, :, :virtual_num_tokens]
             else:
-                self.position_ids_cuda[num_requests:padded_num_tokens].fill_(0)
-            virtual_num_tokens = padded_num_tokens
+                final_position_ids = \
+                    self.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
+            final_input_ids = self.input_ids_cuda[:virtual_num_tokens]
+
+            if device_work is not None and prestage:
+                # The decode graph reads its inputs from static buffers the
+                # runner otherwise fills at replay time, one launch each.
+                # Staging them here puts them in the same graph as the rest of
+                # this step's device work; the caller passes stage_inputs=False
+                # so the runner does not do it again.
+                static_tensors = self.cuda_graph_runner.shared_static_tensors
+                device_work.append(
+                    (static_tensors["input_ids"][:virtual_num_tokens].copy_,
+                     (final_input_ids, ), None))
+                if use_mrope:
+                    static_positions = \
+                        static_tensors["position_ids"][:, :, :virtual_num_tokens]
+                else:
+                    static_positions = \
+                        static_tensors["position_ids"][:, :virtual_num_tokens]
+                device_work.append(
+                    (static_positions.copy_, (final_position_ids, ), None))
+        finally:
+            prep_graph.end()
+        prep_graph.issue(device_work)
+        self._steady_gen_inputs_prestaged = prestage
 
         self.iter_states['num_ctx_requests'] = 0
         self.iter_states['num_ctx_tokens'] = 0
         self.iter_states['num_generation_tokens'] = num_requests
         self.iter_states['cached_kv_tokens'] = sum(num_cached_tokens_per_seq)
 
-        if use_mrope:
-            final_position_ids = \
-                self.mrope_position_ids_cuda[:, :, :virtual_num_tokens]
-        else:
-            final_position_ids = \
-                self.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
         inputs = {
             'attn_metadata': attn_metadata,
-            'input_ids': self.input_ids_cuda[:virtual_num_tokens],
+            'input_ids': final_input_ids,
             'position_ids': final_position_ids,
             'inputs_embeds': None,
             'multimodal_params': [],
@@ -5465,7 +5552,8 @@ class PyTorchModelEngine(ModelEngine):
             return self._apply_steady_gen_fast_prepare(kv_cache_manager,
                                                        attn_metadata,
                                                        new_tensors_device,
-                                                       resource_manager)
+                                                       resource_manager,
+                                                       maybe_graph)
         # Any full pass invalidates the steady-state cache; it is re-recorded
         # at the end of this pass when the batch qualifies.
         self._steady_gen_cache = None
@@ -6714,6 +6802,11 @@ class PyTorchModelEngine(ModelEngine):
                     _n_gen,
                     'request_ids':
                     all_gen_request_ids,
+                    # Hashable snapshot of the request ids, built once here so
+                    # the per-step prepare can key on the batch without
+                    # rebuilding it every step.
+                    'request_ids_key':
+                    tuple(all_gen_request_ids),
                     'prompt_lens':
                     prompt_lengths,
                     'seq_lens_ones':
@@ -7631,7 +7724,11 @@ class PyTorchModelEngine(ModelEngine):
                 and not self._is_encoder_decoder_model()
                 and not self._is_encode_only
                 and not self.llm_args.mm_encoder_only
-                and self.mapping.cp_size == 1):
+                # PLE owns recurrent n-gram and convolution state. Reclassifying
+                # a fresh final-context row as generation would skip its reset
+                # and could replay a graph with stale cache-slot state.
+                and not self._model_uses_ple_recurrent_state() and
+                self.mapping.cp_size == 1):
             graph_requests, promoted_context_request_ids = \
                 _make_single_token_context_graph_batch(
                     scheduled_requests,
@@ -7703,6 +7800,7 @@ class PyTorchModelEngine(ModelEngine):
                     execution_requests.generation_requests,
                 )
 
+            self._steady_gen_inputs_prestaged = False
             inputs, gather_ids = self._prepare_inputs(
                 execution_requests,
                 kv_cache_manager,
@@ -7784,7 +7882,7 @@ class PyTorchModelEngine(ModelEngine):
                         saved_draft = prepare_attn_metadata_for_draft_replay(
                             attn_metadata, draft_kv_cache_manager)
                         try:
-                            outputs = self.cuda_graph_runner.replay(key, inputs)
+                            outputs = self._replay_decode_graph(key, inputs)
                         finally:
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
@@ -7793,8 +7891,7 @@ class PyTorchModelEngine(ModelEngine):
                             attn_metadata, draft_kv_cache_manager)
                         try:
                             with MoeLoadBalancerIterContext(moe_load_balancer):
-                                outputs = self.cuda_graph_runner.replay(
-                                    key, inputs)
+                                outputs = self._replay_decode_graph(key, inputs)
                         finally:
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
@@ -7805,6 +7902,23 @@ class PyTorchModelEngine(ModelEngine):
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
+
+    def _replay_decode_graph(self, key, inputs: Dict[str, Any]):
+        """Replay the decode graph for `key`.
+
+        The steady-state prepare stages the model's inputs into the graph's
+        static buffers itself, to keep those copies in a graph of its own; when
+        it has, the runner must not stage them again.
+        """
+        if self._steady_gen_inputs_prestaged:
+            return self.cuda_graph_runner.replay(key,
+                                                 inputs,
+                                                 stage_inputs=False)
+        return self.cuda_graph_runner.replay(key, inputs)
+
+    def _get_spec_worker(self):
+        """Access the spec_worker from DecoderModelForCausalLM (one-model spec dec)."""
+        return getattr(self.model, 'spec_worker', None)
 
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()

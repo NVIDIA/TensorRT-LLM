@@ -33,6 +33,11 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource import page
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
@@ -346,6 +351,122 @@ def test_mamba_receiver_payload_bytes_matched_tp():
     got = mamba_receiver_payload_bytes(sender_page_table=pt, receiver_page_table=pt, dst_slot=3)
     # Full per-rank slot bytes for 2 layers x (conv + ssm)
     assert got == 2 * (conv_slot_bytes + ssm_slot_bytes)
+
+
+def _make_rank_info() -> RankInfo:
+    return RankInfo(
+        instance_name="test",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[2],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+    )
+
+
+def _make_mamba_page_table(*, base_address: int, side_bytes: int = 8):
+    conv_pool = page.PhysicalPool(
+        base_address=base_address,
+        slot_bytes=16,
+        num_slots=4,
+        slot_stride_bytes=64,
+        layer_stride_bytes=16,
+    )
+    ssm_pool = page.PhysicalPool(
+        base_address=base_address + 256,
+        slot_bytes=16,
+        num_slots=4,
+        slot_stride_bytes=64,
+        layer_stride_bytes=16,
+    )
+    side_pool = page.PhysicalPool(
+        base_address=base_address + 512,
+        slot_bytes=side_bytes,
+        num_slots=4,
+        slot_stride_bytes=32,
+        layer_stride_bytes=side_bytes,
+    )
+    mamba_group = page.MambaLayerGroup(
+        pool_group_idx=0,
+        local_layers=[
+            page.LocalLayer(local_layer_id=0, global_layer_id=1),
+            page.LocalLayer(local_layer_id=1, global_layer_id=2),
+        ],
+        pool_views=[
+            page.PoolView(
+                pool_idx=0,
+                buffer_entries=np.array([(0, 0, 16), (1, 16, 16)], dtype=page.BUFFER_ENTRY_DTYPE),
+                pool_role=page.MAMBA_CONV_ROLE,
+                mapper_kind=page.MapperKind.SECTIONED,
+                bytes_per_layer=16,
+            ),
+            page.PoolView(
+                pool_idx=1,
+                buffer_entries=np.array([(0, 0, 16), (1, 16, 16)], dtype=page.BUFFER_ENTRY_DTYPE),
+                pool_role=page.MAMBA_SSM_ROLE,
+                mapper_kind=page.MapperKind.INDEXED,
+                bytes_per_layer=16,
+            ),
+            page.PoolView(
+                pool_idx=2,
+                buffer_entries=np.array([(1, 0, side_bytes)], dtype=page.BUFFER_ENTRY_DTYPE),
+                pool_role=frozenset({"recurrent_side"}),
+                mapper_kind=page.MapperKind.REPLICATED,
+                bytes_per_layer=side_bytes,
+            ),
+        ],
+        conv_section_bytes=[4, 4, 8],
+        ssm_bytes_per_head=16,
+        slot_major_layout=True,
+    )
+    return page.KVCachePageTable(
+        tokens_per_block=1,
+        layer_groups=[mamba_group],
+        pool_groups=[page.PhysicalPoolGroup(pools=[conv_pool, ssm_pool, side_pool])],
+    )
+
+
+def test_mamba_policy_transfers_replicated_recurrent_side_state():
+    self_page_table = _make_mamba_page_table(base_address=1000)
+    peer_page_table = _make_mamba_page_table(base_address=10000)
+    rank_info = _make_rank_info()
+    peer_rank_info = _make_rank_info()
+    peer_rank_info.page_table = peer_page_table
+
+    peer.MambaPolicy.validate_peer_compatible(
+        rank_info,
+        peer_rank_info,
+        self_page_table,
+        peer_page_table,
+    )
+    registrar = PeerRegistrar(rank_info, KVRegionExtractorV1(self_page_table))
+    mapper = registrar.get_kv_map(peer_rank_info, (0, 2), (0, 2))
+    src_region = KVRegionExtractorV1(self_page_table).extract_slot(1, 0, 2)
+    dst_region = KVRegionExtractorV1(peer_page_table).extract_slot(2, 0, 2)
+    region_pair = mapper.map(src_region, dst_region)
+
+    assert region_pair.src.memory.ptrs.tolist() == [1000 + 512 + 32]
+    assert region_pair.dst.memory.ptrs.tolist() == [10000 + 512 + 2 * 32]
+    assert region_pair.src.memory.bytes_per_region == 8
+    assert peer.mamba_receiver_payload_bytes(self_page_table, peer_page_table, dst_slot=2) == 72
+
+
+def test_mamba_policy_rejects_incompatible_recurrent_side_state():
+    self_page_table = _make_mamba_page_table(base_address=1000)
+    peer_page_table = _make_mamba_page_table(base_address=10000, side_bytes=16)
+    rank_info = _make_rank_info()
+
+    with pytest.raises(ValueError, match="side-state role.*slot_bytes differs"):
+        peer.MambaPolicy.validate_peer_compatible(
+            rank_info,
+            rank_info,
+            self_page_table,
+            peer_page_table,
+        )
 
 
 # ---------------------------------------------------------------------------
