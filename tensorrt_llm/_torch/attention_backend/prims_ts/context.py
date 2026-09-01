@@ -883,7 +883,14 @@ def _resolve_paged_one_shot_inputs(
     window_left: int,
     output_dtype: torch.dtype,
 ) -> tuple[_PagedContextOneShotGeometry, _PagedContextOneShotMetadata]:
-    """Validate FlashInfer CSR inputs and translate one immediate launch."""
+    """Validate and translate one paged-context convenience launch.
+
+    This adapter bridges the public FlashInfer CSR representation accepted by
+    :func:`batch_prefill_with_paged_kv_cache` to the static geometry consumed
+    by the wrapper's compile-only :meth:`BatchPrefillPagedTSWrapper.plan` and
+    the dense native metadata consumed by its
+    :meth:`~BatchPrefillPagedTSWrapper.run`.
+    """
 
     _validate_mask(mask_type)
     if mask_type == "variable_window":
@@ -2137,8 +2144,10 @@ class BatchPrefillPagedTSWrapper:
     def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
         """Create an unplanned paged-context wrapper.
 
-        Args:
-            kv_layout: K/V layout. Only ``"HND"`` is supported.
+        Parameters
+        ----------
+        kv_layout : {"HND"}
+            K/V layout. Only ``"HND"`` is supported.
         """
 
         _validate_kv_layout(kv_layout)
@@ -2289,18 +2298,36 @@ class BatchPrefillPagedTSWrapper:
         ----------
         q : torch.Tensor
             Runtime packed query tensor matching the plan.
-        k_cache, v_cache : torch.Tensor
-            Runtime HND key and value page pools matching the plan.
+        k_cache : torch.Tensor
+            Runtime HND key page pool matching the plan.
+        v_cache : torch.Tensor
+            Runtime HND value page pool matching the plan.
+        qo_indptr : torch.Tensor
+            Cumulative packed-query offsets with shape ``[B + 1]``.
+        logical_kv_indptr : torch.Tensor
+            Cumulative logical K/V token offsets with shape ``[B + 1]``.
+        dense_page_idx_kv : torch.Tensor
+            Dense native K/V page table with shape
+            ``[B, 2, max_num_pages_per_seq_kv]``.
+        seq_lens_kv : torch.Tensor
+            Logical K/V lengths with shape ``[B]``.
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
-        qo_indptr, logical_kv_indptr, dense_page_idx_kv, seq_lens_kv : torch.Tensor
-            Required native live metadata.
-        scale_softmax_log2, output_scale : torch.Tensor, optional
-            Live one-element float32 scale tensors.
+        scale_softmax_log2 : torch.Tensor, optional
+            Live one-element float32 softmax scale in base-2 form. Defaults to
+            the scale retained by the plan.
+        output_scale : torch.Tensor, optional
+            Live one-element float32 output scale. Defaults to the scale
+            retained by the plan.
         validate : bool
             Run explicit storage, shape, dtype, device, scale, output, and
             aliasing validators. Disable only when the caller guarantees the
-            complete runtime contract.
+            complete runtime contract. Defaults to ``True``.
+
+        Returns
+        -------
+        torch.Tensor
+            The packed attention output.
         """
 
         state = self._plan_state
@@ -2416,9 +2443,15 @@ def batch_prefill(
     output_scale : float
         Scale applied to the attention output.
     out_dtype : torch.dtype, optional
-        Requested output dtype.
+        Output dtype; defaults to ``out.dtype`` when ``out`` is provided,
+        otherwise the query dtype.
     out : torch.Tensor, optional
         Caller-owned output tensor.
+
+    Returns
+    -------
+    torch.Tensor
+        The fixed or packed attention output.
     """
 
     resolved_out_dtype = (
@@ -2493,9 +2526,15 @@ def batch_prefill_with_paged_kv_cache(
     output_scale : float
         Scale applied to the attention output.
     out_dtype : torch.dtype, optional
-        Requested output dtype.
+        Output dtype; defaults to ``out.dtype`` when ``out`` is provided,
+        otherwise the query dtype.
     out : torch.Tensor, optional
         Caller-owned output tensor.
+
+    Returns
+    -------
+    torch.Tensor
+        The packed attention output.
     """
 
     resolved_out_dtype = (
