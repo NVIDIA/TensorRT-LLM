@@ -249,10 +249,18 @@ class TestArchRecipe:
         cfg = SimpleNamespace(hidden_act="silu", qk_norm_for_text=True)
         assert resolve_arch_recipe(cfg) is QWEN3_RECIPE
 
-    def test_edge_export_resolves_from_complete_signature_without_backbone_type(self):
+    def test_edge_export_resolves_from_complete_signature_without_backbone_type(self, monkeypatch):
+        import tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 as tf_module
+
+        warnings = []
+        monkeypatch.setattr(tf_module.logger, "warning", warnings.append)
         cfg = _reduced_edge_config()
         cfg.backbone_type = None
         assert resolve_arch_recipe(cfg) is NEMOTRON_DENSE_RECIPE
+        assert warnings == [
+            "Cosmos3 config omits backbone_type; inferred "
+            f"{COSMOS3_EDGE_BACKBONE_TYPE!r} from the config signature."
+        ]
 
     def test_unknown_backbone_raises(self):
         cfg = _reduced_edge_config()

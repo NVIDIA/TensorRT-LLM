@@ -152,6 +152,11 @@ def resolve_arch_recipe(pretrained_config: SimpleNamespace) -> Cosmos3ArchRecipe
     backbone_type = getattr(pretrained_config, "backbone_type", None)
     if backbone_type is None:
         backbone_type = backbone_type_heuristic(pretrained_config)
+        if backbone_type is not None:
+            logger.warning(
+                f"Cosmos3 config omits backbone_type; inferred {backbone_type!r} "
+                "from the config signature."
+            )
     if backbone_type is None:
         recipe = QWEN3_RECIPE
         expected_flags = {
