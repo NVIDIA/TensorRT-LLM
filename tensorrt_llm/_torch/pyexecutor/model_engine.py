@@ -107,8 +107,10 @@ from .trace_log_utils import log_mem_snapshot
 
 def _get_context_prompt_lookahead_token(request: LlmRequest,
                                         chunk_end: int) -> int:
-    """Read the prompt token immediately following a context chunk."""
-    if chunk_end >= request.py_prompt_len:
+    """Prompt token immediately following a context chunk. Uses the live C++
+    ``mPromptLen``; ``py_prompt_len`` goes stale after a non-recompute preemption.
+    """
+    if request.is_last_context_chunk:
         return INVALID_PROMPT_LOOKAHEAD_TOKEN
     return request.get_token(0, chunk_end)
 
