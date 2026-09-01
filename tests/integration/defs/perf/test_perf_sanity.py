@@ -1175,6 +1175,7 @@ class ClientConfig:
         model_name: str,
         env_vars: str = "",
         spec_decoding: bool = False,
+        warmup: bool = False,
     ):
         self.model_name = model_name
         self.concurrency = client_config_data.get("concurrency", 1)
@@ -1205,6 +1206,20 @@ class ClientConfig:
         # agentx_client.py. Reported only -- see the s_benchmark_client note in
         # to_db_data for why it is not a match key.
         self.benchmark_client = client_config_data.get("benchmark_client", "")
+        # Deliberately a constructor argument and NOT a client_config_data key:
+        # b_warmup is not a baseline match key, which is only sound while the
+        # value stays fully determined by benchmark_mode. Reading it from
+        # client_config_data would let any lane yaml enable it and silently fork
+        # that lane's baseline history.
+        #
+        # Recorded as the EFFECTIVE value, the same convention as
+        # b_disable_overlap_scheduler. Only the built-in benchmark_serving client
+        # has an initial test request to reuse as a warmup; the agentx and nv_sa
+        # clients are built by separate to_cmd branches that emit no such flag,
+        # so a requested warmup there would never run while b_warmup claimed it
+        # did -- and a later investigator would rule warmup out as a cause it
+        # never had.
+        self.warmup = warmup and not (self.benchmark_client or self.use_nv_sa_benchmark)
         self.env_vars = env_vars
         # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
         # is now always passed; output-length stability with spec decoding comes from
@@ -1311,11 +1326,15 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
             "--ignore-eos",
         ]
+        # benchmark_serving's initial single-prompt test run is excluded from the
+        # reported metrics, which is exactly what makes it usable as a warmup
+        # request. Keep it suppressed unless the lane asked for one.
+        if not self.warmup:
+            benchmark_cmd.append("--no-test-input")
         if dataset_path:
             benchmark_cmd.append("--dataset-name")
             benchmark_cmd.append("trtllm_custom")
@@ -1369,6 +1388,7 @@ class ClientConfig:
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
+            "b_warmup": self.warmup,
             # Reported, not matched. Case identity is keyed on s_test_case_name
             # (plus GPU type, runtime, branch), and a disagg case name embeds its
             # config stem, so an agentx lane already forms its own population by
@@ -2540,11 +2560,36 @@ class PerfSanityTestConfig:
                 "accuracy_config": accuracy_data,
                 "only_run_accuracy": only_run_accuracy,
             }
+            # Two disagg lanes want benchmark_serving's initial test request, for
+            # two different reasons that come to the same thing: a one-time
+            # cold-start cost that otherwise lands inside the measured window.
+            #
+            # * e2e pays for the KV cache transceiver's lazy connection setup
+            #   (ZMQ mesh + NIXL metadata registration) on the first ctx->gen
+            #   handover; until that has happened once the transfer runs at a
+            #   fraction of steady-state bandwidth, so every measured request in
+            #   a short lane is charged for it.
+            # * ctx_only forces osl=1, so the very first (cold) prefill lands
+            #   directly in the headline TTFT with nothing to amortize it.
+            #
+            # gen_only is deliberately excluded: it does not measure TTFT, and
+            # the extra handover leaves a stale mSenderFutures entry that the CTX
+            # worker's blocking idle KV-transfer poll then waits on (see #18011).
+            #
+            # Unlike gen_only there is no concurrency restriction here, because
+            # the GEN fill gate (TLLM_BENCHMARK_REQ_QUEUES_SIZE) is only injected
+            # for gen_only lanes, so a lone warmup request cannot stall behind it.
+            #
+            # Passed as an argument rather than folded into client_config_data
+            # above, so that no lane yaml can reach it -- b_warmup is not a
+            # baseline match key, and that is only sound while the value stays
+            # fully determined by benchmark_mode.
             client_config = ClientConfig(
                 client_config_data,
                 model_name,
                 env_vars=client_env_var,
                 spec_decoding=spec_decoding,
+                warmup=benchmark_mode in ("e2e", "ctx_only"),
             )
             client_configs.append(client_config)
 
