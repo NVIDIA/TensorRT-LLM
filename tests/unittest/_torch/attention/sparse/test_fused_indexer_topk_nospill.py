@@ -173,3 +173,82 @@ def test_fused_indexer_topk_nospill(batch, n_comp, k_top, weight_mode):
         assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
             f"row {i}: max value err {float(dv.max()):.4f}"
         )
+
+
+@pytest.mark.parametrize("batch", [4, 16])
+@pytest.mark.parametrize("k_top", [512, 1024])
+def test_fused_indexer_topk_nospill_cuda_graph(batch, k_top):
+    """The op must be CUDA-graph capturable: capture one launch after a
+    warm-up (compile happens on first call and must stay outside capture),
+    replay, and require the replay's VALUE SET to match eager. Indices may
+    legally differ inside boundary-tie classes (atomic claim order), so the
+    contract is value-set equality plus index validity, same as the base
+    test. Measured motivation: graph replay removes ~6-7us of host/launch
+    overhead per call at small batch (B<=32)."""
+    # Exercise the registered custom op when the full package is
+    # importable (CI); fall back to the kernel entry point under the
+    # stub-injected local runner -- the captured/replayed launch is the
+    # same either way.
+    try:
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import (  # noqa: F401,E501
+            custom_ops as _dsa_custom_ops,
+        )
+
+        _use_op = True
+    except Exception:
+        _use_op = False
+
+    device = torch.device("cuda")
+    n_comp = 8192
+    inp = _build_inputs(batch, n_comp, k_top, "signed", seed=77, device=device)
+    indices = torch.full((batch, k_top), -3, dtype=torch.int32, device=device)
+    values = torch.full((batch, k_top), float("nan"), dtype=torch.float32, device=device)
+
+    def call():
+        if _use_op:
+            torch.ops.trtllm.dsa_fused_indexer_topk_decode(
+                inp["q_fp4"],
+                inp["sf_q"],
+                inp["kv_cache"],
+                inp["weights"],
+                inp["context_lens"],
+                inp["block_table"],
+                indices,
+                values,
+            )
+        else:
+            fused_indexer_topk_nospill.run(
+                inp["q_fp4"],
+                inp["sf_q"],
+                inp["kv_cache"],
+                inp["weights"],
+                inp["context_lens"],
+                inp["block_table"],
+                None,
+                indices,
+                values,
+            )
+
+    call()  # warm-up: compile + autotune outside capture
+    torch.cuda.synchronize()
+    eager_vals = values.clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    indices.fill_(-3)
+    values.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for i in range(batch):
+        row = indices[i]
+        assert int(row.min()) >= 0
+        assert int(row.max()) < int(inp["context_lens"][i])
+        assert row.unique().numel() == k_top, "duplicate indices after replay"
+        got, _ = torch.sort(values[i], descending=True)
+        want, _ = torch.sort(eager_vals[i], descending=True)
+        dv = (got - want).abs()
+        assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
+            f"row {i}: replay value set diverged, max err {float(dv.max()):.4f}"
+        )
