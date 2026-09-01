@@ -1118,13 +1118,12 @@ public:
 
     [[nodiscard]] bool returnLogProbs() const
     {
-        return mSamplingConfig.outputLogProbs.has_value() ? mSamplingConfig.outputLogProbs->at(0) : false;
+        return mReturnLogProbs;
     }
 
     void setReturnLogProbs(bool returnLogProbs)
     {
-        mSamplingConfig.outputLogProbs = {{returnLogProbs}};
-        mSamplingConfig.cumLogProbs = {{returnLogProbs}};
+        mReturnLogProbs = returnLogProbs;
     }
 
     [[nodiscard]] std::vector<VecLogProbs> const& getLogProbs() const
@@ -2153,7 +2152,7 @@ protected:
     // Save logits
     bool mReturnContextLogits;
     bool mReturnGenerationLogits;
-    bool mReturnLogProbs;
+    bool mReturnLogProbs{false};
     TensorPtr mContextLogitsHost;    // [mPromptLen, vocabSizePadded]
     TensorPtr mGenerationLogitsHost; // [beamSize, mMaxNewTokens, vocabSizePadded]
     std::vector<TensorPtr> mGenerationLogitsFragments;

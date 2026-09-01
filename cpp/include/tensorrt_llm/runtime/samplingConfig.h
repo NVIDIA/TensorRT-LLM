@@ -189,10 +189,6 @@ public:
     OptVec<SizeType32> promptIgnoreLength; // [1] or [batchSize]
     OptVec<SizeType32> noRepeatNgramSize;  // [1] or [batchSize]
 
-    // probs
-    OptVec<bool> outputLogProbs;
-    OptVec<bool> cumLogProbs;
-
     // sampling layers
     OptVec<SizeType32> topK;          // [1] or [batchSize]
     OptVec<FloatType> topP;           // [1] or [batchSize]
@@ -221,8 +217,7 @@ public:
             && noRepeatNgramSize == other.noRepeatNgramSize && topK == other.topK && topP == other.topP
             && randomSeed == other.randomSeed && topPDecay == other.topPDecay && topPMin == other.topPMin
             && topPResetIds == other.topPResetIds && beamSearchDiversityRate == other.beamSearchDiversityRate
-            && lengthPenalty == other.lengthPenalty && earlyStopping == other.earlyStopping
-            && outputLogProbs == other.outputLogProbs && cumLogProbs == other.cumLogProbs && minP == other.minP
+            && lengthPenalty == other.lengthPenalty && earlyStopping == other.earlyStopping && minP == other.minP
             && beamWidthArray == other.beamWidthArray;
     }
 
