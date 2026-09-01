@@ -17,6 +17,7 @@
 import types
 from typing import Optional
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.sampler import penalties as penalty_ops
@@ -172,6 +173,96 @@ def test_uniform_verify_window_keeps_runtime_draft_length():
 
     assert SpecSampler._snapshot_verify_lens([request]) is None
     assert SpecSampler._verified_len(request, 5, None) == 5
+
+
+def test_device_verify_window_wins_over_host_shape_split():
+    request = types.SimpleNamespace(py_request_id=7, py_seq_slot=1, py_verify_len=4)
+
+    assert SpecSampler._verified_len(request, 5, {7: 4}, [0, 3]) == 2
+
+
+class _RequestsMustNotBeScanned:
+    def __iter__(self):
+        raise AssertionError("policy-window request scan reached the hot path")
+
+
+def test_native_marker_ignores_next_overlap_window():
+    request = types.SimpleNamespace(py_request_id=7, py_verify_len=2)
+    snapshot = SpecSampler._snapshot_policy_windows_for_step(
+        _RequestsMustNotBeScanned(),
+        native_uniform=True,
+        host_snapshot_required=False,
+        device_verify_lens_available=False,
+    )
+
+    assert snapshot == {}
+    assert SpecSampler._verified_len(request, 5, snapshot) == 5
+
+
+def test_device_window_source_does_not_scan_requests():
+    snapshot = SpecSampler._snapshot_policy_windows_for_step(
+        _RequestsMustNotBeScanned(),
+        native_uniform=False,
+        host_snapshot_required=False,
+        device_verify_lens_available=True,
+    )
+
+    assert snapshot is None
+
+
+def test_host_marker_preserves_current_overlap_window():
+    request = types.SimpleNamespace(py_request_id=7, py_verify_len=2)
+    snapshot = SpecSampler._snapshot_policy_windows_for_step(
+        [request],
+        native_uniform=False,
+        host_snapshot_required=True,
+        device_verify_lens_available=False,
+    )
+    request.py_verify_len = 5
+
+    assert snapshot == {7: 2}
+    assert SpecSampler._verified_len(request, 5, snapshot) == 2
+
+
+def test_dspark_forward_publishes_one_verify_window_source():
+    from tensorrt_llm._torch.speculative.dspark import _publish_policy_window_output
+    from tensorrt_llm._torch.speculative.dspark_schedule import (
+        HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT,
+        NATIVE_UNIFORM_VERIFY_OUTPUT,
+    )
+
+    native_outputs = {}
+    _publish_policy_window_output(native_outputs, None, batch_size=3)
+    assert native_outputs == {NATIVE_UNIFORM_VERIFY_OUTPUT: True}
+
+    host_outputs = {}
+    _publish_policy_window_output(host_outputs, torch.tensor([3, 5]), batch_size=3)
+    assert host_outputs == {HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT: True}
+
+    device_outputs = {}
+    verify_lens = torch.tensor([3, 5, 2])
+    _publish_policy_window_output(device_outputs, verify_lens, batch_size=3)
+    assert torch.equal(device_outputs["verify_lens"], verify_lens)
+
+
+@pytest.mark.parametrize(
+    ("native_uniform", "host_snapshot_required", "device_verify_lens_available"),
+    [
+        (True, True, False),
+        (True, False, True),
+        (False, True, True),
+    ],
+)
+def test_conflicting_verify_window_sources_fail_closed(
+    native_uniform, host_snapshot_required, device_verify_lens_available
+):
+    with pytest.raises(RuntimeError, match="published"):
+        SpecSampler._snapshot_policy_windows_for_step(
+            [],
+            native_uniform=native_uniform,
+            host_snapshot_required=host_snapshot_required,
+            device_verify_lens_available=device_verify_lens_available,
+        )
 
 
 def test_ragged_strict_acceptance_stops_at_each_request_window():
