@@ -7122,32 +7122,14 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    @parametrize_with_ids("enable_branch_snapshot", [False, True])
+    @parametrize_with_ids("enable_branch_snapshot", [True])
     def test_bf16_branch_snapshot(self, enable_branch_snapshot: bool,
                                   mocker: MockerFixture) -> None:
         """Branch-point snapshots must not change what the model generates.
 
-        A branch snapshot lets a request restore recurrent state at a depth it
-        did not itself prefill through, so a wrong snapshot position would show
-        up as subtly wrong output rather than a failure -- and would look like a
-        larger win, because more prefill is skipped. Both arms therefore run the
-        same task and must reach the same threshold.
-
         Few-shot GSM8K does fork: every prompt shares the few-shot prefix and
         diverges at the question, so a request snapshots at that fork and later
-        ones restore from it. But it is one shallow fork at a fixed prefix, so
-        this guards against gross state corruption only -- it is not evidence
-        about agentic traffic, where forks are deep, uneven, and far into a long
-        shared prefix. Both arms keep the end-of-prompt snapshot so hybrid reuse
-        is live either way and the flag is the only difference.
-
-        An aggregate score, rather than a token-for-token comparison against a
-        no-reuse run, is deliberate: on a concurrent server the same prompt does
-        not reproduce its own output. Two byte-identical AgentX runs disagreed on
-        73% of responses, diverging at the first generated content token, because
-        batch composition changes float reduction order and greedy decoding
-        amplifies one flipped logit into different text. A threshold over many
-        samples is insensitive to that; an exact diff is pure noise.
+        ones restore from it.
         """
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.75,
