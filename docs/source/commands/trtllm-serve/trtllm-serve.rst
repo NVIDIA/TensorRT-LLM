@@ -247,7 +247,7 @@ You can deploy `DeepSeek-V3 <https://huggingface.co/deepseek-ai/DeepSeek-V3>`_ m
 
 .. code-block:: bash
 
-    echo -e "enable_attention_dp: true\npytorch_backend_config:\n  enable_overlap_scheduler: true" > config.yml
+    echo -e "enable_attention_dp: true" > config.yml
 
     srun -N 2 -w [NODES] \
         --output=benchmark_2node.log \
