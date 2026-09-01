@@ -60,6 +60,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa.cache_manager import (
 from tensorrt_llm._torch.attention_backend.sparse.dsa.indexer import (
     transform_local_topk_and_prepare_pool_view_grouped,
 )
+from tensorrt_llm._torch.attention_backend.sparse.dsa.params import use_self_sampling_gvr
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
@@ -125,11 +126,15 @@ def _set_torch_top_k(indexer: Indexer) -> None:
     )
 
 
-def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
+@pytest.mark.parametrize("use_self_sampling", [True, False])
+def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_sampling):
     sparse_config = DeepSeekV4SparseAttentionConfig(
         compress_ratios=[1, 4, 128],
         index_head_dim=96,
+        index_topk=512,
         indexer_k_dtype="fp8",
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=use_self_sampling,
     )
     sparse_metadata_params = sparse_config.to_sparse_metadata_params()
     metadata = object.__new__(DSAtrtllmAttentionMetadata)
@@ -143,8 +148,18 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     metadata.create_buffers_for_mla_rope_append = Mock()
     metadata.create_buffers_for_indexer = Mock()
 
-    with patch(
-        "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
+            return_value=100,
+        ),
     ):
         DSAtrtllmAttentionMetadata.__post_init__(metadata)
 
@@ -152,6 +167,35 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     assert metadata.compress_ratios == [1, 4, 128]
     assert metadata._indexer_compress_ratio == 4
     assert metadata._tokens_per_block == 64
+    # The metadata mirror of the two-level dispatch drives prior allocation.
+    assert metadata.use_self_sampling_topk == use_self_sampling
+    assert metadata.needs_gvr_prior == (not use_self_sampling)
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        (dict(), True),
+        (dict(sm_version=103, index_topk=2048, compress_ratio=4), True),
+        (dict(enable_heuristic_topk=False), False),
+        (dict(use_self_sampling_topk=False), False),
+        (dict(is_cute_dsl_available=False), False),
+        (dict(sm_version=120), False),
+        (dict(index_topk=256), False),
+        (dict(compress_ratio=2), False),
+    ],
+)
+def test_use_self_sampling_gvr(kwargs, expected):
+    base = dict(
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=True,
+        index_topk=512,
+        compress_ratio=1,
+        is_cute_dsl_available=True,
+        sm_version=100,
+    )
+    base.update(kwargs)
+    assert use_self_sampling_gvr(**base) is expected
 
 
 @pytest.mark.parametrize(
@@ -217,8 +261,7 @@ def test_kv_lens_row_reorder_threshold():
         kv_lens_cuda = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
         row_order_buffer = torch.zeros(64, dtype=torch.int32, device="cuda")
         return SimpleNamespace(
-            enable_gvr_topk=True,
-            use_cute_dsl_topk=True,
+            needs_gvr_prior=True,
             num_generations=num_generations,
             num_sms=num_sms,
             max_draft_tokens=next_n - 1,
@@ -277,7 +320,9 @@ def test_gvr_prior_writeback_uses_aux_stream():
             enable_indexer_skip=True,
         )
         indexer = create_indexer(sparse_config)
-        indexer._enable_heuristic_topk = True
+        # temporal GVR consumes the prior; force it independent of hardware
+        indexer.top_k.decode_implementation = TopKImplementation.CUTE_DSL_GVR
+        indexer.top_k.gvr_self_sampling = False
         indexer.aux_stream = torch.cuda.Stream()
         metadata.gvr_prior_indices = torch.zeros(
             (cache_manager.num_local_layers, batch_size, index_topk),
@@ -342,6 +387,7 @@ def test_shared_topk_lifecycle(monkeypatch):
     metadata.enable_context_mla_with_cached_kv = False
     metadata.enable_indexer_skip = False
     metadata.enable_gvr_topk = False
+    metadata.needs_gvr_prior = False
     metadata.get_empty = Mock(
         side_effect=lambda _, shape, **kwargs: torch.empty(tuple(shape), dtype=kwargs["dtype"])
     )
@@ -444,7 +490,7 @@ def test_indexer_post_load_weights_caches_fused_weight():
     [
         (False, False, TopKImplementation.CUDA_RADIX),
         (True, False, TopKImplementation.CUTE_DSL_RADIX),
-        (False, True, TopKImplementation.CUDA_GVR),
+        (False, True, TopKImplementation.CUTE_DSL_GVR),
         (True, True, TopKImplementation.CUTE_DSL_GVR),
     ],
 )
@@ -490,7 +536,7 @@ def test_indexer_configures_one_top_k_module(
         (True, False, TopKImplementation.CUTE_DSL_GVR),
         (True, True, TopKImplementation.CUTE_DSL_GVR),
         (False, True, TopKImplementation.CUTE_DSL_GVR),
-        (False, False, TopKImplementation.CUDA_GVR),
+        (False, False, TopKImplementation.CUTE_DSL_GVR),
     ],
 )
 def test_indexer_two_level_gvr_dispatch(
@@ -4021,8 +4067,8 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
         index_topk,
         prefill_implementation=TopKImplementation.CUDA_RADIX,
         decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_self_sampling=False,
     )
-    indexer._enable_heuristic_topk = True
     metadata_skip.gvr_prior_indices = torch.zeros(
         (cache_manager.num_local_layers, batch_size, index_topk),
         device="cuda",
