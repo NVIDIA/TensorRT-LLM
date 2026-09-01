@@ -40,7 +40,6 @@ set(SRCS
     rnnStateManager.cpp
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp
-    sequenceSlotManager.cpp
     utils/staticThreadPool.cpp
     evictionPolicy.cpp
     cacheTransBuffer.cpp
