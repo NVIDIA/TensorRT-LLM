@@ -373,12 +373,6 @@ class Mamba2Metadata:
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
-        # KDA's CuTe verify kernel requires a 16-byte-aligned DLPack pointer.
-        # A generation slice that follows context rows may not be aligned, so
-        # prepare one stable, aligned copy per batch for all KDA layers.
-        self.generation_state_indices = torch.zeros(max_batch_size,
-                                                    dtype=torch.int32,
-                                                    device="cuda")
         # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
@@ -512,12 +506,6 @@ class Mamba2Metadata:
                                     dtype=self.state_indices_cpu.dtype))
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
-
-        if (getattr(kv_cache_manager, "use_kda_replay_update", False)
-                and batch_size > num_contexts):
-            num_generations = batch_size - num_contexts
-            self.generation_state_indices[:num_generations].copy_(
-                self.state_indices[num_contexts:batch_size])
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)

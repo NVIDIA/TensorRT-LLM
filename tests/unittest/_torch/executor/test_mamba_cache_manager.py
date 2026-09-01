@@ -12,6 +12,7 @@ import torch
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MambaLayerGroup
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.modules.kimi_kda.kda_metadata import KDAMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -32,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
+    MambaCacheManager,
     MambaHybridCacheManagerV2,
     MambaRole,
     MixedMambaHybridCacheManager,
@@ -3447,6 +3449,30 @@ def test_v2_kda_replay_validates_configuration(
             conv_state_layout=conv_state_layout,
             kda_replay_num_spec=num_spec,
         )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    ("use_kda_replay_update", "expected_type"),
+    [(False, Mamba2Metadata), (True, KDAMetadata)],
+)
+def test_mamba_metadata_factory_selects_replay_specialization(
+    use_kda_replay_update,
+    expected_type,
+):
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._use_kda_replay_update = use_kda_replay_update
+
+    metadata = mgr.create_mamba_metadata(max_batch_size=2, chunk_size=8)
+
+    assert type(metadata) is expected_type
+
+
+def test_mamba_cache_manager_delegates_kda_replay_capability():
+    mgr = object.__new__(MambaCacheManager)
+    mgr._impl = SimpleNamespace(use_kda_replay_update=True)
+
+    assert mgr.use_kda_replay_update
 
 
 def test_v2_kda_replay_records_acceptance_and_skips_dummy_rows():
