@@ -47,7 +47,9 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64
 
+from .fc1_fc2_fuse_sched import minimum_phase_interleave_hint
 from .kernel_fc12 import Sm100SwapABSwigluFp4Fc12Kernel
+from .non_clc_mixed_cga import NonClcMixedCgaConfig
 from .token_comm import CombineFormat
 from .token_comm import TokenCommArgs as ExtractedTokenCommArgs
 from .token_comm import TokenInPullTokenBackPush, TokenSrcMetadata
@@ -187,14 +189,21 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         situ_linear_beta: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
+        fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None,
+        schedule_policy: Optional[Tuple[str, Optional[int]]] = None,
+        work_id_mode: Optional[str] = None,
+        launch_cluster_count: Optional[int] = None,
+        preferred_cluster_count: Optional[int] = None,
+        fallback_cluster_count: Optional[int] = None,
+        fc2_tma_stages: Optional[int] = None,
     ) -> None:
         # The combine wire format drives the fc2 epilogue encoder, token_comm
         # push, and the combine_quant/combine_sf workspace sizing. The dataflow
         # (workspace carve, views, arg threading, epilogue encode, topk_reduce
         # receiver) is wired for every format, quantized included -- see the
         # closed-loop note above the fused launch in __call__. The guards below
-        # only reject combinations the kernel cannot express
-        # (in_kernel_fc2_reduce is bf16-only; FP4 needs non_ubulk_fc2_store).
+        # only reject combinations the kernel cannot express: in-kernel FC2
+        # reduction is bf16-only, and peer UBLK cannot carry packed FP4.
         self.combine_format = combine_format
         if in_kernel_fc2_reduce and combine_format.is_quantized:
             raise ValueError(
@@ -205,14 +214,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 "in_kernel_fc2_reduce requires apply_topk_in_fc1=True; "
                 "the REDG path can only atomic-add terms whose topk score "
                 "was already absorbed before fc2.")
-        if (combine_format.act_dtype is cutlass.Float4E2M1FN
-                and not non_ubulk_fc2_store):
-            raise ValueError(
-                f"{combine_format} combine requires non_ubulk_fc2_store=True "
-                "(the UBLK fc2 store path cannot scalar-dereference FP4).")
         if static_expert_shape is None:
             raise NotImplementedError(
-                "Sm100MegaMoEKernel currently requires "
+                "MegaMoEKernel currently requires "
                 "static_expert_shape != None (dynamic-shape MegaMoE is "
                 "not wired).")
         # Keep the explicit ``hidden`` kwarg in lockstep with static shape;
@@ -235,6 +239,66 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 f"token_back_mode must be 'epi_warps', 'standalone_warps', "
                 f"or 'reuse_dispatch_warps'; got {token_back_mode!r}.")
         token_back_by_dispatch = token_back_mode != "epi_warps"  # nosec B105
+        if (combine_format.act_dtype is cutlass.Float4E2M1FN
+                and not non_ubulk_fc2_store and not token_back_by_dispatch):
+            raise ValueError(
+                f"{combine_format} combine cannot use peer UBLK FC2 store; "
+                "select a non-bulk store or non-epi local-TMA token back.")
+
+        if launch_cluster_count is None:
+            raise ValueError(
+                "MegaMoEKernel requires launch_cluster_count so its "
+                "persistent scheduler and token communication use the same "
+                "hardware occupancy.")
+        if self.architecture == "sm_107" and epi_flag_batch is not None:
+            if any(batch < 1 or batch > 4 for batch in epi_flag_batch):
+                raise ValueError(
+                    "SM107 asynchronous epi_flag_batch values must be in [1, 4]."
+                )
+        mixed_cga_config = NonClcMixedCgaConfig(
+            preferred_cluster_shape=cluster_shape_mnk[:2],
+            fallback_cluster_shape=fallback_cluster_shape_mn,
+            launch_cluster_count=launch_cluster_count,
+            preferred_cluster_count=preferred_cluster_count,
+            fallback_cluster_count=fallback_cluster_count,
+        )
+        if (launch_cluster_count
+                != mixed_cga_config.launch_cluster_cnt_merge_as_preferred):
+            raise ValueError(
+                "launch_cluster_count must equal the canonical preferred-"
+                "cluster slot count resolved from the preferred and fallback "
+                "physical cluster counts.")
+        resolved_schedule_policy = (("grouped", group_hint) if schedule_policy
+                                    is None else schedule_policy)
+        if resolved_schedule_policy[0] == "phase_interleave":
+            cluster_feature_tile = (mma_tiler_mnk[0] //
+                                    (2 if use_2cta_instrs else 1) *
+                                    cluster_shape_mnk[0])
+            blocks_fc1 = _round_up(static_expert_shape[1],
+                                   cluster_feature_tile) // cluster_feature_tile
+            blocks_fc2 = _round_up(hidden,
+                                   cluster_feature_tile) // cluster_feature_tile
+            minimum_hint = minimum_phase_interleave_hint(
+                blocks_fc1=blocks_fc1,
+                blocks_fc2=blocks_fc2,
+                launch_cluster_cnt_merge_as_preferred=(
+                    mixed_cga_config.launch_cluster_cnt_merge_as_preferred),
+            )
+            fc1_flag_batch = (1
+                              if epi_flag_batch is None else epi_flag_batch[0])
+            minimum_hint = _round_up(minimum_hint, fc1_flag_batch)
+            requested_hint = resolved_schedule_policy[1]
+            if requested_hint is None:
+                requested_hint = minimum_hint
+            elif requested_hint < minimum_hint:
+                raise ValueError(
+                    f"phase_interleave hint {requested_hint} is unsafe with "
+                    f"fc1 epi flag batch {fc1_flag_batch}; use at least "
+                    f"{minimum_hint}.")
+            resolved_schedule_policy = (
+                "phase_interleave",
+                requested_hint,
+            )
 
         super().__init__(
             mma_tiler_mnk=mma_tiler_mnk,
@@ -260,7 +324,15 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             epi_flag_batch=epi_flag_batch,
+            fallback_cluster_shape_mn=(mixed_cga_config.fallback_cluster_shape),
+            schedule_policy=resolved_schedule_policy,
+            work_id_mode=work_id_mode,
+            launch_cluster_count=launch_cluster_count,
+            preferred_cluster_count=(mixed_cga_config.preferred_cluster_count),
+            fallback_cluster_count=(mixed_cga_config.fallback_cluster_count),
+            fc2_tma_stages=fc2_tma_stages,
         )
+        self.mixed_cga_config = mixed_cga_config
 
         self.enable_token_comm = True
         self.dispatch_warp_id = (8, 9, 10, 11)
@@ -564,13 +636,28 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                         (1, ),
                         16,
                     ))
-        if self.load_balance_mode == "atomic_counter":
+        if self.work_id_mode == "atomic_counter":
             specs.append(
                 _RegionSpec(
                     "load_balance_counter",
                     cutlass.Int32,
-                    (1, ),
+                    (2 if self.schedule_mode == "phase_interleave" else 1, ),
                     16,
+                ))
+            if self.mixed_cga_config.is_mixed:
+                specs.extend((
+                    _RegionSpec(
+                        "fallback_registration_counter",
+                        cutlass.Int32,
+                        (1, ),
+                        16,
+                    ),
+                    _RegionSpec(
+                        "fallback_group_token",
+                        cutlass.Int64,
+                        (self.mixed_cga_config.fallback_cluster_count, ),
+                        16,
+                    ),
                 ))
 
         # === Data buffers (overwritten each launch; NOT zeroed) ====================
@@ -877,8 +964,16 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             self.static_expert_shape)) if self.static_expert_shape else "dyn"
         epiflag = "x".join(map(
             str, self.epi_flag_batch)) if self.epi_flag_batch else "none"
+        fallback = ("none" if not self.mixed_cga_config.is_mixed else "x".join(
+            map(str, self.mixed_cga_config.fallback_cluster_shape)))
+        schedule = f"{self.schedule_mode}x{self.schedule_hint}"
         cta = "2_cta" if self.use_2cta_instrs else "1_cta"
-        fc2store = "fc2store_stg" if self.non_ubulk_fc2_store else "fc2store_ublk"
+        if self.non_ubulk_fc2_store:
+            fc2store = "fc2store_stg"
+        elif self.token_back_by_dispatch:
+            fc2store = "fc2store_tma"
+        else:
+            fc2store = "fc2store_ublk"
         inkred = "inkernel_redg" if self.in_kernel_fc2_reduce else "no_inkernel_redg"
         apply_topk = "apply_topk_fc1_pre_quant" if self.apply_topk_in_fc1 else "apply_topk_after_fc2"
         token_back = {
@@ -888,13 +983,22 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         }.get(self.token_back_mode, self.token_back_mode)
         return (
             "megamoe_nvfp4"
-            f"_mmatiler_{m}x{n}x{k}_cluster_{cm}x{cn}_{cta}_sched_{self.load_balance_mode}"
+            f"_{self.arch}_{self.mma_k_mode}_inst"
+            f"{self.mma_instruction_mnk[0]}x{self.mma_instruction_mnk[1]}x"
+            f"{self.mma_instruction_mnk[2]}"
+            f"_mmatiler_{m}x{n}x{k}_cluster_{cm}x{cn}_fallback_{fallback}_{cta}"
+            f"_sched_{schedule}_workid_{self.work_id_mode}"
+            f"_prefclusters_{self.mixed_cga_config.preferred_cluster_count}"
+            f"_fallbackclusters_{self.mixed_cga_config.fallback_cluster_count}"
+            f"_launchclusters_{self.launch_cluster_count}"
+            f"_ctas_{self.mixed_cga_config.total_cta_cnt}"
             f"_expert_shape_{exp}_grouphint_{self.group_hint}"
             f"_padding_{self.token_padding_block}x{self.sf_padding_block}"
             f"_{fc2store}_{inkred}_token_back_by_{token_back}_{apply_topk}"
             f"_fc2out{self.fc2_output_dtype.__name__}_combine{self.combine_format}_sfvec{self.sf_vec_size}"
             f"_acc{self.acc_dtype.__name__}_clamp{self.gate_up_clamp}"
             f"_situ{self.situ_beta}x{self.situ_linear_beta}_epiflag{epiflag}"
+            f"_fc2tmastages{self.fc2_tma_stages}"
             # MegaMoE-specific constexpr:
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}")
@@ -957,12 +1061,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         contract may be tightened later to have the kernel take
         ownership of the reset.
         """
-        # ``max_active_clusters`` and ``cluster_size`` are both Python ints
-        # at trace time, so the product folds to a Python int that flows
-        # cleanly to every dispatch primitive's ``num_sms: Constexpr[int]``
-        # slot.
-        cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
-        sm_count = max_active_clusters * cluster_size
+        # Token communication is indexed by physical CTAs, whereas the mixed-
+        # CGA scheduler grid is expressed in canonical preferred-cluster slots.
+        sm_count = self.mixed_cga_config.total_cta_cnt
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_obj()
 
         pool_token_capacity = self.pool_token_capacity
@@ -1042,11 +1143,22 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         )
 
         load_balance_counter: Optional[cute.Tensor] = None
-        if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
+        fallback_registration_counter: Optional[cute.Tensor] = None
+        fallback_group_token: Optional[cute.Tensor] = None
+        if cutlass.const_expr(self.work_id_mode == "atomic_counter"):
             load_balance_counter = self._view_local(
                 local_workspace,
                 "load_balance_counter",
             )
+            if cutlass.const_expr(self.mixed_cga_config.is_mixed):
+                fallback_registration_counter = self._view_local(
+                    local_workspace,
+                    "fallback_registration_counter",
+                )
+                fallback_group_token = self._view_local(
+                    local_workspace,
+                    "fallback_group_token",
+                )
 
         # Shared regions.
         src_token_topk_idx = self._view_shared(
@@ -1258,7 +1370,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # (fc2_output_sf); the token-back warps push that SF plane
         # token-contiguously to the peers' combine_sf (and the data plane too in
         # the dispatch modes); TopkReduce below dequantizes and reduces.
-        super().__call__(
+        # Anchor super for CuTe DSL tracing when self is the SM107 subclass.
+        super(Sm100MegaMoEKernel, self).__call__(
             activation=l1_token_buffer_nvfp4,
             fc1_weight=fc1_weight,
             activation_sf=l1_sf_buffer_fp8,
@@ -1277,6 +1390,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             max_active_clusters=max_active_clusters,
             stream=stream,
             load_balance_counter=load_balance_counter,
+            fallback_registration_counter=fallback_registration_counter,
+            fallback_group_token=fallback_group_token,
             expert_token_sizes=expert_token_sizes,
             token_comm_args=token_comm_args,
         )
@@ -1394,3 +1509,10 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             lane_idx=lane_idx,
             tidx=tidx,
         )
+
+
+class Sm107MegaMoEKernel(Sm100MegaMoEKernel):
+    """Rubin SM107 NVFP4 MegaMoE using native 2x-K TCGen05 instructions."""
+
+    architecture = "sm_107"
+    mma_k_mode = "2x"

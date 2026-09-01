@@ -29,7 +29,7 @@ from cutlass.cutlass_dsl import Float32, Int64, T
 
 from .contract import Contract, FunctionMapping, Space, eval_function_mapping
 from .fc1_fc2_fuse_sched import BlockPhase
-from .flag_batch import GpuReleaseFlagBatchTracker
+from .flag_batch import make_flag_batch_tracker
 from .iket_compat import iket
 from .megamoe_constants import (Fp8E4M3RcpLimit, Fp32Max, Nvfp4BlockSize,
                                 Nvfp4E2M1RcpLimit)
@@ -964,7 +964,8 @@ class NvFp4OptinalEpiArgs:
     fc2_alpha: Optional[cute.Tensor]
     fc1_norm_const: Optional[cute.Tensor]
     # -----------------------------------
-    # MoE domain (token, topk), deepgemm graph only? for transformer graph, we want reduce kernel to perform the score mul.
+    # MoE domain (token, topk), deepgemm graph only? For transformer graphs,
+    # the reduce kernel should perform the score multiplication.
     topk_scores: Optional[cute.Tensor]
 
 
@@ -993,54 +994,57 @@ class SwapABSwigluFp4Epilogue:
     _EpilogueFc2HiddenTileSize = 128  # Fundamentally epi_tile_m
     _EpilogueWarpCnt = 4
     _TmemColsTotal = 512  # TODO: Remove this hardcode for future arch
+    # A 144 B FP8 stride rotates each row by four SMEM banks.
+    _Fc2UblkFp8RowStrideBytes = 144
 
     def __init__(
-            self,
-            *,
-            mma_tiler_mnk: Tuple[int, int, int],
-            cluster_shape_mn: Tuple[int, int],
-            use_2cta_instrs: bool,
-            sf_vec_size: int,
-            fc1_output_dtype: Type[cutlass.Numeric],
-            combine_format:
+        self,
+        *,
+        mma_tiler_mnk: Tuple[int, int, int],
+        cluster_shape_mn: Tuple[int, int],
+        use_2cta_instrs: bool,
+        sf_vec_size: int,
+        fc1_output_dtype: Type[cutlass.Numeric],
+        combine_format:
         CombineFormat,  # fc2 combine wire: act_dtype (data) + scale_dtype (sf)
-            non_ubulk_fc2_store:
+        non_ubulk_fc2_store:
         bool,  # Whether epilogue warps use STG or UBLK in fc2
-            in_kernel_fc2_reduce:
+        in_kernel_fc2_reduce:
         bool,  # Whether epilogue warps reduce fc2 output to peer
-            token_back_by_dispatch:
+        token_back_by_dispatch:
         bool = False,  # Whether epilogue warps store fc2 to local or peer
-            acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
-            fc1_output_sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
-            allow_overlap_acc: bool = True,
-            static_expert_shape: Optional[Tuple[
-                int, int, int]] = None,  # [expert, intermediate, hidden]
-            gate_up_clamp: Optional[float] = None,  # Swiglu style only
-            # SiTU (Kimi K3). Both None -> SwiGLU. Both set -> SiTU, and
-            # ``gate_up_clamp`` must be None (SiTU has no clamp, matching
-            # DeepGEMM's ``DG_HOST_ASSERT(not use_situ or not
-            # activation_clamp_opt.has_value())``). Baked in as codegen-time
-            # constants exactly like ``gate_up_clamp``, so they must also be
-            # part of the compiled-kernel cache key.
+        communication_enabled: bool = False,
+        acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+        fc1_output_sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
+        allow_overlap_acc: bool = True,
+        static_expert_shape: Optional[Tuple[
+            int, int, int]] = None,  # [expert, intermediate, hidden]
+        gate_up_clamp: Optional[float] = None,  # Swiglu style only
         situ_beta: Optional[float] = None,
-            situ_linear_beta: Optional[float] = None,
-            epi_flag_batch: Optional[Tuple[int, int]] = (
-                1, 1),  # (fc1, fc2) done-counter publish batch
+        situ_linear_beta: Optional[float] = None,
+        epi_flag_batch: Optional[Tuple[int, int]] = (
+            1, 1),  # (fc1, fc2) done-counter publish batch
+        fc2_tma_stages: Optional[int] = None,
+        use_async_flag_batch: bool = False,
+        num_acc_stage: Optional[int] = None,
     ) -> None:
         if fc1_output_dtype is not cutlass.Float4E2M1FN:
             raise NotImplementedError(
                 "SwapABSwigluFp4Epilogue currently assumes fc1 output in "
                 f"sC is NVFP4 Float4E2M1FN; got {fc1_output_dtype}. "
-                "Changing this dtype requires redesigning the fixed 8KB "
+                "Changing this dtype requires redesigning the "
                 "shared epilogue scratch layout.")
-        if token_back_by_dispatch and not non_ubulk_fc2_store:
-            raise ValueError(
-                "token_back_by_dispatch=True requires non_ubulk_fc2_store=True; "
-                "bulk fc2 store is incompatible with dispatch-warp token back "
-                "(STG is strictly more efficient for that pipeline).")
         if token_back_by_dispatch:
             in_kernel_fc2_reduce = False
         self.fc2_use_bulk = not non_ubulk_fc2_store
+        self.communication_enabled = communication_enabled
+        self.fc2_output_is_local = (not communication_enabled
+                                    or token_back_by_dispatch)
+        self.fc2_use_tma = self.fc2_use_bulk and self.fc2_output_is_local
+        self.fc2_use_ublk = self.fc2_use_bulk and not self.fc2_output_is_local
+        if self.fc2_use_ublk and combine_format.act_dtype.width == 4:
+            raise ValueError(
+                "FC2 UBLK does not support an FP4 combine payload.")
         self.reduce_topk_in_kernel = in_kernel_fc2_reduce
         self.token_back_by_dispatch = token_back_by_dispatch
         self.combine_format = combine_format
@@ -1068,8 +1072,10 @@ class SwapABSwigluFp4Epilogue:
                                  float(situ_linear_beta))
         # Done-counter publish batch granularity
         _fc1_eb, _fc2_eb = (1, 1) if epi_flag_batch is None else epi_flag_batch
-        self.fc1_epi_flag_batch = max(1, min(32, int(_fc1_eb)))
-        self.fc2_epi_flag_batch = max(1, min(32, int(_fc2_eb)))
+        self.use_async_flag_batch = use_async_flag_batch
+        max_epi_flag_batch = self._EpilogueWarpCnt if use_async_flag_batch else 32
+        self.fc1_epi_flag_batch = max(1, min(max_epi_flag_batch, int(_fc1_eb)))
+        self.fc2_epi_flag_batch = max(1, min(max_epi_flag_batch, int(_fc2_eb)))
         self.cluster_tile_intermediate_downproj = self._EpilogueFc1IntermediateDownTileSize * cluster_shape_mn[
             0]
 
@@ -1098,14 +1104,53 @@ class SwapABSwigluFp4Epilogue:
             self.intermediate_downproj: Optional[int] = None
 
         self.subtile_cnt = self.cta_tile_n // self._EpilogueTokenTileSize
+        if (fc2_tma_stages is not None
+                and not 1 <= fc2_tma_stages <= self.subtile_cnt):
+            raise ValueError(
+                f"fc2_tma_stages must be in [1, {self.subtile_cnt}], "
+                f"got {fc2_tma_stages}.")
+        if self.fc2_use_bulk:
+            self.fc2_tma_stages = (fc2_tma_stages
+                                   if fc2_tma_stages is not None else 1)
+            if self.fc2_use_tma:
+                self.fc2_staging_row_stride_elements = 0
+                self.fc2_staging_stage_elements = (
+                    self._EpilogueTokenTileSize *
+                    self._EpilogueFc2HiddenTileSize)
+            else:
+                self.fc2_staging_row_stride_elements = (
+                    self._Fc2UblkFp8RowStrideBytes
+                    if combine_format.act_dtype.width == 8 else
+                    self._EpilogueFc2HiddenTileSize)
+                self.fc2_staging_stage_elements = (
+                    (self._EpilogueTokenTileSize - 1) *
+                    self.fc2_staging_row_stride_elements +
+                    self._EpilogueFc2HiddenTileSize)
+            fc2_staging_stage_bytes = (self.fc2_staging_stage_elements *
+                                       combine_format.act_dtype.width // 8)
+            if self.fc2_use_ublk and fc2_staging_stage_bytes % 16 != 0:
+                raise ValueError(
+                    "Each FC2 UBLK staging stage must occupy a multiple of 16 bytes."
+                )
+        else:
+            self.fc2_tma_stages = 0
+            self.fc2_staging_row_stride_elements = 0
+            self.fc2_staging_stage_elements = 0
+            fc2_staging_stage_bytes = 0
         self.overlapping_accum = allow_overlap_acc and (
             self.acc_tmem_cols + self.acc_sf_cols > self._TmemColsTotal // 2)
-        self.num_acc_stage = 2
+        self.num_acc_stage = 2 if num_acc_stage is None else int(num_acc_stage)
+        if self.num_acc_stage <= 0:
+            raise ValueError(
+                f"num_acc_stage must be positive, got {self.num_acc_stage}.")
         self.num_acc_pipeline_stages = 1 if self.overlapping_accum else self.num_acc_stage
         self.overlapped_tmem_cols = self._EpilogueTokenTileSize if self.overlapping_accum else 0
         assert (not self.overlapping_accum
                 or self.overlapped_tmem_cols >= self.acc_sf_cols)
-        self.epi_smem_bytes = 8 * 1024
+        self.epi_smem_bytes = max(
+            8 * 1024,
+            self.fc2_tma_stages * fc2_staging_stage_bytes,
+        )
         if self.fc1_output_dtype.width > 4:
             raise NotImplementedError(
                 "Remember to adjust the smem size when switch to mxfp8 support")
@@ -1141,6 +1186,79 @@ class SwapABSwigluFp4Epilogue:
             return cute.select(layout, mode=[0, 1])
         return layout
 
+    def fc2_tma_staged_smem_spec(
+        self,
+        n_stages: int,
+    ) -> Tuple[Tuple, Tuple, Tuple[int, int, int]]:
+        """Return the bank-conflict-free token-major FC2 TMA layout."""
+        stage_stride = (self._EpilogueTokenTileSize *
+                        self._EpilogueFc2HiddenTileSize)
+        wire_dtype = self.combine_format.act_dtype
+        if wire_dtype is cutlass.BFloat16:
+            shape = ((32, 2), (64, 2), n_stages)
+            stride = ((64, 2048), (1, 4096),
+                      stage_stride if n_stages > 1 else 0)
+            swizzle = (3, 4, 3)
+        elif wire_dtype.width == 8:
+            shape = ((32, 2), 128, n_stages)
+            stride = ((128, 4096), 1, stage_stride if n_stages > 1 else 0)
+            swizzle = (3, 4, 3)
+        elif wire_dtype.width == 4:
+            shape = ((32, 2), 128, n_stages)
+            stride = ((128, 4096), 1, stage_stride if n_stages > 1 else 0)
+            swizzle = (2, 4, 3)
+        else:
+            raise ValueError(f"Unsupported FC2 TMA staging dtype {wire_dtype}.")
+        return shape, stride, swizzle
+
+    def fc2_tma_staged_smem_layout(
+        self,
+        n_stages: int,
+        without_stage_mode: bool = False,
+    ) -> cute.ComposedLayout:
+        shape, stride, swizzle = self.fc2_tma_staged_smem_spec(n_stages)
+        layout = cute.make_composed_layout(
+            cute.make_swizzle(*swizzle),
+            0,
+            cute.make_layout(shape, stride=stride),
+        )
+        if without_stage_mode:
+            return cute.select(layout, mode=[0, 1])
+        return layout
+
+    def prepare_fc2_tma_store_params(
+        self,
+        fc2_output_template: cute.Tensor,
+    ) -> Tuple[Optional[cute.CopyAtom], Optional[cute.Tensor]]:
+        """Build the optional local FC2 TMA store descriptor."""
+        if cutlass.const_expr(not self.fc2_use_tma):
+            return None, None
+
+        # Keep tiled rest modes dynamic so a single static tile cannot collapse
+        # to stride zero. Local output has a singleton top-k dimension.
+        runtime_token_extent = cutlass.Int32(fc2_output_template.shape[0])
+        runtime_hidden_extent = cutlass.Int32(fc2_output_template.shape[2])
+        token_major_template = cute.make_tensor(
+            fc2_output_template.iterator,
+            cute.make_layout(
+                (runtime_token_extent, runtime_hidden_extent, cutlass.Int32(1)),
+                stride=(fc2_output_template.stride[0],
+                        fc2_output_template.stride[2], 0),
+            ),
+        )
+        operation = cpasync.CopyBulkTensorTileS2GOp()
+        smem_layout = self.fc2_tma_staged_smem_layout(
+            1,
+            without_stage_mode=True,
+        )
+        tile = (self._EpilogueTokenTileSize, self._EpilogueFc2HiddenTileSize)
+        return cpasync.make_tiled_tma_atom(
+            operation,
+            token_major_template,
+            smem_layout,
+            tile,
+        )
+
     @cute.jit
     def run(
             self,
@@ -1154,6 +1272,9 @@ class SwapABSwigluFp4Epilogue:
             tma_atom_fc1_output: cute.CopyAtom,
             fc1_output: cute.Tensor,  # Domain of fake (m, n, l)
             fc1_output_sf: cute.Tensor,  # Domain of fake (m, n, l)
+            tma_atom_fc2_output: Optional[cute.CopyAtom],
+            fc2_tma_output: Optional[
+                cute.Tensor],  # Domain (physical_token, hidden, l=1)
             fc2_output: cute.Tensor,  # MoE domain (token, topk, hidden)
             fc1_done_counter: cute.Tensor,  # 1D tensor
             tidx: cutlass.Int32,
@@ -1168,6 +1289,12 @@ class SwapABSwigluFp4Epilogue:
                 fc1_norm_const=None,
                 topk_scores=None,
             )
+        if cutlass.const_expr(
+                self.fc2_use_tma
+                and (tma_atom_fc2_output is None or fc2_tma_output is None)):
+            raise ValueError(
+                "FC2 TMA store requires a TMA atom and token-major output tensor."
+            )
         tmem_acc = cute.make_tensor(
             cute.recast_ptr(tmem_ptr, dtype=cutlass.Float32),
             cute.make_layout(
@@ -1180,8 +1307,16 @@ class SwapABSwigluFp4Epilogue:
                                     tma_atom_fc1_output, fc1_output,
                                     fc1_output_sf, fc1_done_counter,
                                     optional_epi_args)
-        fc2_epi = SwapABFc2Epilogue(self, tidx, epi_smem_storage, fc2_output,
-                                    token_comm_args, optional_epi_args)
+        fc2_epi = SwapABFc2Epilogue(
+            self,
+            tidx,
+            epi_smem_storage,
+            tma_atom_fc2_output,
+            fc2_tma_output,
+            fc2_output,
+            token_comm_args,
+            optional_epi_args,
+        )
 
         acc_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_acc_pipeline_stages)
@@ -1192,7 +1327,8 @@ class SwapABSwigluFp4Epilogue:
         is_odd_turn = cutlass.Int32(1)
         work_tile_info = sched_consumer.consume_work()
 
-        flag_tracker = GpuReleaseFlagBatchTracker(
+        flag_tracker = make_flag_batch_tracker(
+            self.use_async_flag_batch,
             flag_addr=Int64(0),
             cumulated_flags=cutlass.Int32(0),
             phase=cutlass.Int32(work_tile_info.phase),
@@ -1235,10 +1371,11 @@ class SwapABSwigluFp4Epilogue:
 
             work_tile_info = sched_consumer.consume_work()
 
-            # Drain fc1 TMA stores and sf stores before publishing the fc1-done counter.
+            # FC1 commits here; FC2 UBLK commits each staged subtile at issue.
             if cur_was_linear1:
                 cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            # Drain before publishing completion or reusing staged scratch.
+            cute.arch.cp_async_bulk_wait_group(0)
             wait_only_named_barrier.arrive_and_wait()
 
             # Publish completion for the work tile snapshotted above.
@@ -1522,9 +1659,10 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             up_token_0_32 = cute.make_rmem_tensor((16, ), cutlass.Float32)
             gate_token_32_64 = cute.make_rmem_tensor((16, ), cutlass.Float32)
             up_token_32_64 = cute.make_rmem_tensor((16, ), cutlass.Float32)
-            # Although hardcode is not right, but since the whole tmem transpose is too tricky, I have to hardcode...
+            # The tmem transpose is currently hardcoded because generalizing
+            # this layout transformation is nontrivial.
             # (epi_tile_m, epi_tile_n) -> (warp_local_epi_tile_m, epi_tile_n)
-            # tmem_subtile_tensor_per_warp = cute.logical_divide(tmem_subtile_tensor, (32, None))[(None, self.warp_idx), None]
+            # The general form indexes the divided tensor by self.warp_idx.
             tmem_subtile_tensor_per_warp = cute.logical_divide(
                 tmem_subtile_tensor, (32, None))[(None, 0), None]
             # (warp_local_epi_tile_m, epi_tile_n) -> (((16, 32), 1), (2, 2))
@@ -1574,8 +1712,10 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
         # Transpose output: each lane holds (token_1, intermediate_16); tmem_dp
         # = lane_idx (token), tmem_col = elem_idx (intermediate output idx).
-        gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act = token_32_64_tmem_trans.from_r1_perm_until_last_store(
-        )
+        (
+            gate_token_32_64_trans_pre_act,
+            up_token_32_64_trans_pre_act,
+        ) = token_32_64_tmem_trans.from_r1_perm_until_last_store()
 
         token_32_64_pre_quant = self.alpha_swiglu_clamp(
             gate_token_32_64_trans_pre_act,
@@ -1942,6 +2082,8 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         base: SwapABSwigluFp4Epilogue,
         tidx: cutlass.Int32,
         epi_smem_storage,
+        tma_atom_fc2_output: Optional[cute.CopyAtom],
+        fc2_tma_output: Optional[cute.Tensor],
         fc2_output: cute.Tensor,  # MoE domain (token, topk, hidden)
         token_comm_args: TokenCommArgs,
         optional_epi_args: NvFp4OptinalEpiArgs,
@@ -1950,24 +2092,54 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
         self.warp_idx = self.tidx // 32
         self.lane_idx = self.tidx % 32
+        self.tma_atom_fc2_output = tma_atom_fc2_output
+        self.fc2_tma_output = fc2_tma_output
         self.fc2_output = fc2_output
         self.token_comm_args = token_comm_args
         self.optional_epi_args = optional_epi_args
-        if cutlass.const_expr(base.fc2_use_bulk):
+        if cutlass.const_expr(base.fc2_use_tma):
             wire_dtype = base.combine_format.act_dtype
-            fc2_smem_rows = 32
-            if cutlass.const_expr(fc2_smem_rows *
-                                  base._EpilogueFc2HiddenTileSize *
-                                  wire_dtype.width // 8 > base.epi_smem_bytes):
-                raise ValueError("fc2 UBLK data smem exceeds epi_smem budget.")
+            fc2_smem_bytes = (base.fc2_tma_stages *
+                              base.fc2_staging_stage_elements *
+                              wire_dtype.width // 8)
+            if cutlass.const_expr(fc2_smem_bytes > base.epi_smem_bytes):
+                raise ValueError(
+                    "fc2 TMA staged data smem exceeds epi_smem budget.")
+            _, _, fc2_smem_swizzle = base.fc2_tma_staged_smem_spec(
+                base.fc2_tma_stages)
+            self.smem_tensor = cute.make_tensor(
+                cute.recast_ptr(
+                    epi_smem_storage.epi_smem.data_ptr(),
+                    cute.make_swizzle(*fc2_smem_swizzle),
+                    dtype=wire_dtype,
+                ),
+                base.fc2_tma_staged_smem_layout(base.fc2_tma_stages).outer,
+            )
+            self.process_pipeline = make_fc2_tma_process_pipeline(
+                combine_format=base.combine_format,
+                cta_token_tile_size=base.cta_tile_n,
+                cta_hidden_tile_size=base.cta_tile_m,
+            )
+        elif cutlass.const_expr(base.fc2_use_ublk):
+            wire_dtype = base.combine_format.act_dtype
+            fc2_stage_stride = (base.fc2_staging_stage_elements
+                                if base.fc2_tma_stages > 1 else 0)
+            fc2_smem_bytes = (base.fc2_tma_stages *
+                              base.fc2_staging_stage_elements *
+                              wire_dtype.width // 8)
+            if cutlass.const_expr(fc2_smem_bytes > base.epi_smem_bytes):
+                raise ValueError(
+                    "fc2 UBLK staged data smem exceeds epi_smem budget.")
             self.smem_tensor = cute.make_tensor(
                 cute.recast_ptr(
                     epi_smem_storage.epi_smem.data_ptr(),
                     dtype=wire_dtype,
                 ),
                 cute.make_layout(
-                    (fc2_smem_rows, base._EpilogueFc2HiddenTileSize),
-                    stride=(base._EpilogueFc2HiddenTileSize, 1),
+                    (base._EpilogueTokenTileSize,
+                     base._EpilogueFc2HiddenTileSize, base.fc2_tma_stages),
+                    stride=(base.fc2_staging_row_stride_elements, 1,
+                            fc2_stage_stride),
                 ),
             )
             self.process_pipeline = make_fc2_ublk_process_pipeline(
@@ -2156,6 +2328,8 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
                 if subtile_idx_pair[i] * cutlass.Int32(
                         self._EpilogueTokenTileSize) < valid_tokens:
                     self.run_subtile(
+                        work_tile_info=work_tile_info,
+                        epilogue_iter_idx=cutlass.Int32(i),
                         subtile_idx=subtile_idx_pair[i],
                         tmem_subtile_tensor=tmem_acc_tensor_tiled_by_epi_tile[
                             None, None, subtile_idx_second],
@@ -2183,6 +2357,8 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
             if subtile_idx * cutlass.Int32(
                     self._EpilogueTokenTileSize) < valid_tokens:
                 self.run_subtile(
+                    work_tile_info=work_tile_info,
+                    epilogue_iter_idx=real_i,
                     subtile_idx=subtile_idx,
                     tmem_subtile_tensor=tmem_acc_tensor_tiled_by_epi_tile[
                         None, None, subtile_idx],
@@ -2203,6 +2379,8 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
     @cute.jit
     def run_subtile(
         self,
+        work_tile_info: MoEWorkTileInfo,
+        epilogue_iter_idx: cutlass.Int32,
         subtile_idx: cutlass.Int32,
         # (hidden_tile, token_subtile), fundamentally (epi_tile_m, epi_tile_n)
         tmem_subtile_tensor: cute.Tensor,
@@ -2239,6 +2417,8 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         process_pipeline.store_function(
             epi=self,
             subtile=pre_store,
+            work_tile_info=work_tile_info,
+            epilogue_iter_idx=epilogue_iter_idx,
             subtile_idx=subtile_idx,
             fc2_output_router=fc2_output_router,
         )
@@ -2331,7 +2511,8 @@ class Fc2OutputRouter:
         valid = cute.make_rmem_tensor((copy_iters, ), cutlass.Int32)
         dst_ptrs = cute.make_rmem_tensor((copy_iters, ), cutlass.Int64)
 
-        # Compiler should be able to optimize the same token_copy_group's offset add. (Fundamental cse + strength_reduce)
+        # The compiler should optimize repeated token_copy_group offset adds
+        # through common-subexpression elimination and strength reduction.
         # We should check the SASS to ensure this happens.
         for iter_idx in cutlass.range_constexpr(copy_iters):
             coord = eval_function_mapping(
@@ -2606,51 +2787,28 @@ def make_fc2_ublk_store_out_contract(combine_format: CombineFormat,
                 "hidden_in_cta_tile":
                 elem_idx % cta_hidden_tile_size,
             }))
+    # One row per thread covers two 64-row subtiles per iteration.
+    copy_iters = (cta_token_tile_size + 127) // 128
     store_out_mapping = Contract(
-        domain=Space(("epi_tid", "iter_idx"), (128, 2)),
+        domain=Space(("epi_tid", "iter_idx"), (128, copy_iters)),
         codomain=Space(("token_in_cta_tile", "hidden_in_cta_tile"),
                        (max_token_cta_tile, cta_hidden_tile_size)),
         mapping=FunctionMapping(
             lambda epi_tid, iter_idx: {
-                "token_in_cta_tile":
-                iter_idx * 32 + epi_tid % 8 + epi_tid // 32 * 8 +
-                ((epi_tid % 32) // 8) * 64,
+                "token_in_cta_tile": (iter_idx * 128 + ((epi_tid % 32) // 16) *
+                                      64 + (epi_tid // 32) * 16 + epi_tid % 16),
                 "hidden_in_cta_tile":
                 0,
             }))
-    # SF mapping: each lane owns one hidden across a 64-token subtile, and the
-    # sf_vec lanes of a block share the CREDUX scale -- so they split the block's
-    # tokens. sf_iter flattens (subtile, slot) to keep the whole cta-tile domain.
-    sf_store_out_mapping = None
     if combine_format.is_quantized:
-        sf_vec = combine_format.scale_block
-        lanes_per_block = sf_vec
-        subtile_tokens = SwapABSwigluFp4Epilogue._EpilogueTokenTileSize
-        iters_per_subtile = subtile_tokens // lanes_per_block
-        n_subtiles = cta_token_tile_size // subtile_tokens
-
-        def ublk_sf_mapping(epi_tid, iter_idx):
-            subtile_idx = iter_idx // iters_per_subtile
-            slot = iter_idx % iters_per_subtile
-            lane = epi_tid % 32
-            warp = epi_tid // 32
-            lane_in_block = lane % lanes_per_block
-            block_in_warp = lane // lanes_per_block
-            return {
-                "token_in_cta_tile":
-                subtile_idx * subtile_tokens + lane_in_block +
-                slot * lanes_per_block,
-                "hidden_in_cta_tile":
-                warp * 32 + block_in_warp * sf_vec,
-            }
-
-        sf_store_out_mapping = Contract(
-            domain=Space(("epi_tid", "iter_idx"),
-                         (128, n_subtiles * iters_per_subtile)),
-            codomain=Space(("token_in_cta_tile", "hidden_in_cta_tile"),
-                           (max_token_cta_tile, cta_hidden_tile_size)),
-            mapping=FunctionMapping(ublk_sf_mapping),
+        # Quantized UBLK reuses hidden-contiguous STG mappings for 128-bit R2S.
+        _, sf_store_out_mapping, fundamental_mapping = make_fc2_stg_cta_store_out_contract(
+            combine_format,
+            cta_token_tile_size,
+            cta_hidden_tile_size,
         )
+    else:
+        sf_store_out_mapping = None
     return store_out_mapping, sf_store_out_mapping, fundamental_mapping
 
 
@@ -2920,10 +3078,113 @@ def fc2_stg_store_function(
 
 
 @cute.jit
+def fc2_tma_store_function(
+    *,
+    epi,
+    subtile: cute.Tensor,  # Always bf16 before quantization
+    work_tile_info: MoEWorkTileInfo,
+    epilogue_iter_idx: cutlass.Int32,
+    subtile_idx: cutlass.Int32,
+    fc2_output_router: Fc2OutputRouter,
+    **_,
+):
+    if cutlass.const_expr(epi.smem_tensor is None
+                          or epi.tma_atom_fc2_output is None
+                          or epi.fc2_tma_output is None):
+        raise ValueError(
+            "FC2 TMA store requires staged SMEM, a TMA atom, and a token-major output tensor."
+        )
+
+    if cutlass.const_expr(epi.combine_format.is_quantized):
+        data_subtile, sf_regs = QuantImpl(epi.combine_format,
+                                          "regs_in_thread")(subtile)
+    else:
+        data_subtile = subtile
+        sf_regs = None
+
+    if cutlass.const_expr(sf_regs is not None):
+        sf_scales_per_stg: cutlass.Constexpr[
+            int] = 32 // epi.combine_format.scale_block
+        token_groups_per_subtile: cutlass.Constexpr[
+            int] = epi._EpilogueTokenTileSize // 32
+        for token_group in cutlass.range_constexpr(token_groups_per_subtile):
+            sf_iter = cutlass.Int32(subtile_idx) * cutlass.Int32(
+                token_groups_per_subtile) + token_group
+            sf_ptr, sf_pred = fc2_output_router.get_sf_dst(sf_iter)
+            if sf_pred != cutlass.Int32(0):
+                sf_dst = cute.make_tensor(
+                    sf_ptr, cute.make_layout((sf_scales_per_stg, )))
+                for scale_idx in cutlass.range_constexpr(sf_scales_per_stg):
+                    sf_dst[scale_idx] = sf_regs[token_group * sf_scales_per_stg
+                                                + scale_idx]
+
+    vector_elements: cutlass.Constexpr[
+        int] = 128 // data_subtile.element_type.width
+    if cutlass.const_expr(
+            cute.rank(data_subtile) != 1 or cute.size(data_subtile) != 2 * 32
+            or data_subtile.stride[0] != 1 or 32 % vector_elements != 0):
+        raise ValueError(
+            "FC2 TMA store requires a contiguous two-token by 32-hidden register fragment."
+        )
+
+    stage_idx = epilogue_iter_idx % cutlass.Int32(epi.fc2_tma_stages)
+    smem_stage = epi.smem_tensor[None, None, stage_idx]
+    store_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(),
+        data_subtile.element_type,
+        num_bits_per_copy=128,
+    )
+    tiler_mn = (64, 128)
+    layout_copy_tv = cute.make_layout(
+        ((32, 4), (32, 2)),
+        stride=((1, 2048), (64, 32)),
+    )
+    tiled_store = cute.make_tiled_copy(store_atom, layout_copy_tv, tiler_mn)
+    thread_store = tiled_store.get_slice(epi.tidx)
+    smem_partition = thread_store.partition_D(smem_stage)
+    register_partition = cute.composition(
+        data_subtile,
+        cute.make_layout(smem_partition.shape),
+    )
+    cute.copy(tiled_store, register_partition, smem_partition)
+
+    token_tile_idx = (work_tile_info.cumulative_data_physical_row +
+                      work_tile_info.tile_n_idx * cutlass.Int32(epi.cta_tile_n)
+                      + subtile_idx * cutlass.Int32(epi._EpilogueTokenTileSize)
+                      ) // cutlass.Int32(epi._EpilogueTokenTileSize)
+    tiled_output = cute.flat_divide(
+        epi.fc2_tma_output,
+        (epi._EpilogueTokenTileSize, epi._EpilogueFc2HiddenTileSize),
+    )
+    gmem_subtile = tiled_output[None, None, token_tile_idx,
+                                work_tile_info.tile_m_idx, 0]
+    tma_smem_src, tma_gmem_dst = cpasync.tma_partition(
+        epi.tma_atom_fc2_output,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(smem_stage, 0, 2),
+        cute.group_modes(gmem_subtile, 0, 2),
+    )
+
+    epilogue_barrier = pipeline.NamedBarrier(
+        barrier_id=SwapABSwigluFp4Epilogue._EpilogueSyncWaitBarId,
+        num_threads=SwapABSwigluFp4Epilogue._EpilogueWarpCnt * 32,
+    )
+    cute.arch.fence_proxy("async.shared", space="cta")
+    epilogue_barrier.arrive_and_wait()
+    if epi.warp_idx == cutlass.Int32(0):
+        cute.copy(epi.tma_atom_fc2_output, tma_smem_src, tma_gmem_dst)
+        cute.arch.cp_async_bulk_commit_group()
+        cute.arch.cp_async_bulk_wait_group(epi.fc2_tma_stages - 1, read=True)
+    epilogue_barrier.arrive_and_wait()
+
+
+@cute.jit
 def fc2_ublk_store_function_impl(
     *,
     epi,
     subtile: cute.Tensor,  # Always bf16 pre-quant tensor
+    epilogue_iter_idx: cutlass.Int32,
     subtile_idx: cutlass.Int32,
     fc2_output_router: Fc2OutputRouter,
     **_,
@@ -2933,14 +3194,25 @@ def fc2_ublk_store_function_impl(
         raise ValueError("fc2 UBLK store requires epi.smem_tensor.")
     quantized: cutlass.Constexpr[bool] = epi.combine_format.is_quantized
     if cutlass.const_expr(quantized):
-        data_subtile, selected_sf = QuantImpl(
-            epi.combine_format,
-            "threads_with_the_same_reg",
-            lane_idx=epi.lane_idx,
-        )(subtile)
+        # The transposed fragment gives each thread complete hidden-axis blocks.
+        data_subtile, sf_regs = QuantImpl(epi.combine_format,
+                                          "regs_in_thread")(subtile)
+        sf_scales_per_stg: cutlass.Constexpr[
+            int] = 32 // epi.combine_format.scale_block
+        token_groups_per_subtile: cutlass.Constexpr[
+            int] = epi._EpilogueTokenTileSize // 32
+        for token_group in cutlass.range_constexpr(token_groups_per_subtile):
+            sf_iter = cutlass.Int32(subtile_idx) * cutlass.Int32(
+                token_groups_per_subtile) + token_group
+            sf_ptr, sf_pred = fc2_output_router.get_sf_dst(sf_iter)
+            if sf_pred != cutlass.Int32(0):
+                sf_dst = cute.make_tensor(
+                    sf_ptr, cute.make_layout((sf_scales_per_stg, )))
+                for scale_idx in cutlass.range_constexpr(sf_scales_per_stg):
+                    sf_dst[scale_idx] = sf_regs[token_group * sf_scales_per_stg
+                                                + scale_idx]
     else:
         data_subtile = subtile
-        selected_sf = None
 
     smem_read_write_bar = pipeline.NamedBarrier(
         barrier_id=SwapABSwigluFp4Epilogue._EpilogueSyncWaitBarId,
@@ -2948,90 +3220,82 @@ def fc2_ublk_store_function_impl(
     )
     warp_idx = epi.warp_idx
     lane_idx = epi.lane_idx
-    warp_hidden_base = cutlass.Int32(warp_idx * 32)
-
-    regs_per_thread: cutlass.Constexpr[int] = cute.size(data_subtile)
-    tokens_per_smem_slice: cutlass.Constexpr[int] = cute.size(smem_tensor,
-                                                              mode=[0])
-    if cutlass.const_expr(regs_per_thread % tokens_per_smem_slice != 0):
-        raise ValueError(
-            "fc2 UBLK store requires pre-store regs per thread to be divisible "
-            f"by scratch token rows, got {regs_per_thread} and {tokens_per_smem_slice}."
-        )
-    loop_cnt: cutlass.Constexpr[int] = regs_per_thread // tokens_per_smem_slice
-
-    # SF straight out (no smem): the sf_vec lanes of a block share the CREDUX
-    # result, so each emits its slice -- one scale per slot. The sf mapping owns
-    # the (lane, slot) -> (token, hidden) layout; selected_sf[slot] is this
-    # lane's slot-th scale, aligned to sf_iter = subtile_idx*iters_per_subtile+slot.
-    if cutlass.const_expr(quantized):
-        # A scale block = sf_vec hidden = sf_vec lanes (UBLK), and those lanes
-        # split the subtile's tokens, so each emits subtile_tokens // lanes_per_block.
-        lanes_per_block: cutlass.Constexpr[int] = epi.combine_format.scale_block
-        iters_per_subtile: cutlass.Constexpr[
-            int] = epi._EpilogueTokenTileSize // lanes_per_block
-        for slot in cutlass.range_constexpr(iters_per_subtile):
-            sf_iter = cutlass.Int32(subtile_idx) * cutlass.Int32(
-                iters_per_subtile) + slot
-            sf_ptr, sf_pred = fc2_output_router.get_sf_dst(sf_iter)
-            if sf_pred != cutlass.Int32(0):
-                sf_dst = cute.make_tensor(sf_ptr, cute.make_layout((1, )))
-                sf_dst[0] = selected_sf[slot]
-
-    for token32_group_idx in cutlass.range_constexpr(loop_cnt):
-        if cutlass.const_expr(token32_group_idx > 0):
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
-            smem_read_write_bar.arrive_and_wait()
-
-        # R2S transpose: each lane writes its hidden column's 32 token rows for
-        # this group. (SF already went straight out above; only DATA transposes
-        # through smem here.)
-        for token_i in cutlass.range_constexpr(tokens_per_smem_slice):
-            src_reg = token_i + tokens_per_smem_slice * token32_group_idx
-            smem_tensor[token_i,
-                        warp_hidden_base + lane_idx] = data_subtile[src_reg]
-
-        cute.arch.fence_proxy("async.shared", space="cta")
-        smem_read_write_bar.arrive_and_wait()
-
-        # ublk_iter_idx is constexpr so get_dst indexes a constexpr slot (no spill).
-        # Gate / scratch_row specialize the store-out mapping: lane_idx//8 picks the
-        # subtile, warp_idx*8 + lane_idx%8 is the token's row within the 32-group.
-        ublk_iter_idx = token32_group_idx
-        # SF already went straight out above; here only the DATA row is pushed.
-        dst_ptr, pred = fc2_output_router.get_data_dst(ublk_iter_idx)
-        if pred != cutlass.Int32(0) and (lane_idx //
-                                         cutlass.Int32(8)) == subtile_idx:
-            scratch_row = warp_idx * cutlass.Int32(
-                8) + lane_idx % cutlass.Int32(8)
-            copy_elems = cutlass.Int32(128)
-            if cutlass.const_expr(epi.fc2_hidden_needs_predicate):
-                copy_elems = cutlass.Int32(
-                    fc2_output_router.valid_hidden_this_cta_tile)
-            # smem_tensor holds the combine wire dtype, so the bulk byte count
-            # scales with the wire width, not the bf16 compute dtype.
-            copy_bytes = copy_elems * epi.combine_format.act_dtype.width // 8
-
-            src_row = cute.slice_(smem_tensor, (scratch_row, None))
-            if cutlass.const_expr(epi.reduce_topk_in_kernel):
-                _cp_reduce_async_bulk_add_noftz_bf16_s2g(
-                    dst_ptr,
-                    src_row.iterator,
-                    copy_bytes,
-                )
-            else:
-                _cp_async_bulk_s2g(
-                    dst_ptr,
-                    src_row.iterator,
-                    copy_bytes,
-                )
-
-        cute.arch.cp_async_bulk_commit_group()
-
-    # Drain the final bulk op before the fixed scratch tile is reused by the
-    # next subtile / task tile.
-    cute.arch.cp_async_bulk_wait_group(0, read=True)
+    stage_cnt: cutlass.Constexpr[int] = epi.fc2_tma_stages
+    stage_idx = epilogue_iter_idx % cutlass.Int32(stage_cnt)
+    smem_stage = smem_tensor[None, None, stage_idx]
+    # Wait before overwriting this stage so the previous copy overlaps compute.
+    cute.arch.cp_async_bulk_wait_group(stage_cnt - 1, read=True)
     smem_read_write_bar.arrive_and_wait()
+
+    if cutlass.const_expr(quantized):
+        vector_elements: cutlass.Constexpr[
+            int] = 128 // data_subtile.element_type.width
+        if cutlass.const_expr(
+                cute.rank(data_subtile) != 1
+                or cute.size(data_subtile) != 2 * 32
+                or data_subtile.stride[0] != 1 or 32 % vector_elements != 0):
+            raise ValueError(
+                "FC2 UBLK store requires a contiguous two-token by "
+                "32-hidden register fragment.")
+        store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            data_subtile.element_type,
+            num_bits_per_copy=128,
+        )
+        tiler_mn = (64, 128)
+        layout_copy_tv = cute.make_layout(
+            ((32, 4), (32, 2)),
+            stride=((1, 2048), (64, 32)),
+        )
+        tiled_store = cute.make_tiled_copy(store_atom, layout_copy_tv, tiler_mn)
+        thread_store = tiled_store.get_slice(epi.tidx)
+        smem_partition = thread_store.partition_D(smem_stage)
+        register_partition = cute.composition(
+            data_subtile, cute.make_layout(smem_partition.shape))
+        cute.copy(tiled_store, register_partition, smem_partition)
+    else:
+        if cutlass.const_expr(
+                cute.size(data_subtile) != epi._EpilogueTokenTileSize):
+            raise ValueError(
+                "BF16 UBLK staging requires one register per token in the "
+                "64-token subtile.")
+        warp_hidden_base = cutlass.Int32(warp_idx * 32)
+        for token_idx in cutlass.range_constexpr(epi._EpilogueTokenTileSize):
+            smem_stage[token_idx,
+                       warp_hidden_base + lane_idx] = data_subtile[token_idx]
+
+    cute.arch.fence_proxy("async.shared", space="cta")
+    smem_read_write_bar.arrive_and_wait()
+
+    copy_elems = cutlass.Int32(epi._EpilogueFc2HiddenTileSize)
+    if cutlass.const_expr(epi.fc2_hidden_needs_predicate):
+        copy_elems = cutlass.Int32(fc2_output_router.valid_hidden_this_cta_tile)
+    copy_bytes = copy_elems * epi.combine_format.act_dtype.width // 8
+    scratch_row = (warp_idx * cutlass.Int32(16) + lane_idx % cutlass.Int32(16))
+    iter_axis = fc2_output_router.data_mapping.domain.names.index("iter_idx")
+    copy_iters: cutlass.Constexpr[
+        int] = fc2_output_router.data_mapping.domain.sizes[iter_axis]
+    for ublk_iter_idx in cutlass.range_constexpr(copy_iters):
+        owned_subtile = (cutlass.Int32(ublk_iter_idx * 2) +
+                         lane_idx // cutlass.Int32(16))
+        if owned_subtile == subtile_idx:
+            dst_ptr, pred = fc2_output_router.get_data_dst(ublk_iter_idx)
+            if pred != cutlass.Int32(0):
+                src_row = cute.slice_(smem_stage, (scratch_row, None))
+                if cutlass.const_expr(epi.reduce_topk_in_kernel):
+                    _cp_reduce_async_bulk_add_noftz_bf16_s2g(
+                        dst_ptr,
+                        src_row.iterator,
+                        copy_bytes,
+                    )
+                else:
+                    _cp_async_bulk_s2g(
+                        dst_ptr,
+                        src_row.iterator,
+                        copy_bytes,
+                    )
+
+    cute.arch.cp_async_bulk_commit_group()
 
 
 @cute.jit
@@ -3092,6 +3356,29 @@ def make_fc2_stg_process_pipeline(
     )
 
 
+def make_fc2_tma_process_pipeline(
+    *,
+    combine_format: CombineFormat,
+    cta_token_tile_size: int,
+    cta_hidden_tile_size: int,
+) -> Fc2ProcessPipeline:
+    store_out_mapping, sf_store_out_mapping, fundamental_mapping = make_fc2_stg_cta_store_out_contract(
+        combine_format,
+        cta_token_tile_size,
+        cta_hidden_tile_size,
+    )
+    return Fc2ProcessPipeline(
+        tmem_acc_load=fc2_stg_tmem_acc_load,
+        f2fp=fc2_f2fp,
+        post_f2fp_reorder=fc2_stg_post_f2fp_reorder,
+        store_function=fc2_tma_store_function,
+        fc2_cta_tile_contract=fundamental_mapping,
+        store_out_mapping=store_out_mapping,
+        sf_store_out_mapping=sf_store_out_mapping,
+        require_tmem_trans=True,
+    )
+
+
 def make_fc2_redg_process_pipeline(
     *,
     combine_format: CombineFormat,
@@ -3121,18 +3408,29 @@ def make_fc2_ublk_process_pipeline(
     cta_token_tile_size: int,
     cta_hidden_tile_size: int,
 ) -> Fc2ProcessPipeline:
+    if combine_format.act_dtype.width == 4:
+        raise ValueError("FC2 UBLK does not support an FP4 combine payload.")
     store_out_mapping, sf_store_out_mapping, fundamental_mapping = make_fc2_ublk_store_out_contract(
         combine_format,
         cta_token_tile_size,
         cta_hidden_tile_size,
     )
+    if combine_format.is_quantized:
+        if combine_format.act_dtype.width != 8:
+            raise ValueError(
+                "FC2 UBLK quantization requires an FP8 combine payload.")
+        tmem_acc_load = fc2_stg_tmem_acc_load
+        post_f2fp_reorder = fc2_stg_post_f2fp_reorder
+    else:
+        tmem_acc_load = fc2_ublk_tmem_acc_load
+        post_f2fp_reorder = post_f2fp_reorder_identity
     return Fc2ProcessPipeline(
-        tmem_acc_load=fc2_ublk_tmem_acc_load,
+        tmem_acc_load=tmem_acc_load,
         f2fp=fc2_f2fp,
-        post_f2fp_reorder=post_f2fp_reorder_identity,
+        post_f2fp_reorder=post_f2fp_reorder,
         store_function=fc2_ublk_store_function_impl,
         fc2_cta_tile_contract=fundamental_mapping,
         store_out_mapping=store_out_mapping,
         sf_store_out_mapping=sf_store_out_mapping,
-        require_tmem_trans=False,
+        require_tmem_trans=combine_format.is_quantized,
     )

@@ -15,7 +15,7 @@
 """MegaMoE CuteDSL NVFP4 backend.
 
 ConfigurableMoE-compatible MoE backend wrapping the ported
-``Sm100MegaMoEKernel`` (fused dispatch + FC1 + activation + FC2 +
+architecture-specific MegaMoE kernel (fused dispatch + FC1 + activation + FC2 +
 combine) from
 ``tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4``. The kernel is
 invoked through the standard CuteDSL TunableRunner / torch op pattern;
@@ -31,8 +31,9 @@ file only owns:
   * BF16 -> NVFP4 activation quantization (``quantize_input``)
   * ``run_moe`` boundary: stage activation + topk into the kernel ABI,
     build the ``MegaMoECuteDslWeightView`` from the quant method, call
-    ``torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell``, return the
-    ``(T, hidden)`` output (the kernel collapses the top-k axis).
+    ``torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell`` (a historical
+    name; the op dispatches by active SM), return the ``(T, hidden)`` output
+    (the kernel collapses the top-k axis).
 
 ``run_moe`` is a single unified path for both topologies. Only the
 SOURCE of the kernel's input/output buffers branches on ``ep_size``:
@@ -85,7 +86,7 @@ import torch.distributed as dist
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     megamoe_activation_sf_bytes_per_row,
 )
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -122,11 +123,11 @@ __all__ = [
 
 class MegaMoeCuteDslUnavailable(RuntimeError):
     """Raised when the active environment cannot import the symbols required by
-    the ported ``Sm100MegaMoEKernel`` (cu13 Cutlass DSL + cute_nvgpu MMA
+    the active MegaMoE kernel (cu13 Cutlass DSL + cute_nvgpu MMA
     atoms / cutlass._mlir APIs used by sym_buffer)."""
 
 
-_RUNTIME_PROBE_CACHE: Optional[Union[bool, str]] = None
+_RUNTIME_PROBE_CACHE: Dict[int, Union[bool, str]] = {}
 
 
 def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
@@ -135,29 +136,27 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
 
     Stricter than ``IS_CUTLASS_DSL_AVAILABLE``, which only confirms that
     ``cutlass`` / ``cutlass.cute`` import cleanly. The MegaMoE kernel
-    ABI also requires ``cutlass.torch.from_dlpack``, ``cutlass._mlir``
-    APIs used by ``sym_buffer.py``, the ``cute_nvgpu`` MMA atoms used
-    by ``kernel_fc12.py``, and the async-copy helpers used by
-    ``dispatch_kernel.py``. PR
-    https://github.com/NVIDIA/TensorRT-LLM/pull/14354 pins
-    ``nvidia-cutlass-dsl[cu13]==4.6.1``; version 4.5.0 was the first release
-    that shipped all of them, and older wheels return ``(False, reason)``.
+    ABI also requires ``cutlass.torch.from_dlpack``, ``cutlass._mlir``,
+    ``cute_nvgpu`` MMA atoms, and async-copy helpers. SM107 additionally
+    requires ``cutlass.utils.rubin_helpers``. Older builds return
+    ``(False, reason)``.
 
     Returns ``(True, None)`` on success or ``(False, reason)`` with an
     actionable message. The result is cached for the process lifetime.
     """
-    global _RUNTIME_PROBE_CACHE
-    if _RUNTIME_PROBE_CACHE is True:
+    sm_version = get_sm_version() if torch.cuda.is_available() else -1
+    cached = _RUNTIME_PROBE_CACHE.get(sm_version)
+    if cached is True:
         return True, None
-    if isinstance(_RUNTIME_PROBE_CACHE, str):
-        return False, _RUNTIME_PROBE_CACHE
+    if isinstance(cached, str):
+        return False, cached
 
     if not IS_CUTLASS_DSL_AVAILABLE:
         reason = (
             "Cutlass DSL is not importable on this environment; install "
             "nvidia-cutlass-dsl[cu13] to enable MegaMoECuteDsl."
         )
-        _RUNTIME_PROBE_CACHE = reason
+        _RUNTIME_PROBE_CACHE[sm_version] = reason
         return False, reason
 
     try:
@@ -181,7 +180,7 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
             f"ImportError={e!r}. Install nvidia-cutlass-dsl[cu13]>=4.5.0 "
             f"(see PR #14354)."
         )
-        _RUNTIME_PROBE_CACHE = reason
+        _RUNTIME_PROBE_CACHE[sm_version] = reason
         return False, reason
 
     try:
@@ -191,8 +190,42 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
             f"MegaMoECuteDsl requires cutlass.cute.nvgpu.tcgen05 + cpasync; "
             f"missing {e!r}. Install a Blackwell-capable cutlass-dsl wheel."
         )
-        _RUNTIME_PROBE_CACHE = reason
+        _RUNTIME_PROBE_CACHE[sm_version] = reason
         return False, reason
+
+    if sm_version == 107:
+        try:
+            try:
+                import cutlass.memory as cutlass_memory
+            except ImportError:
+                import cutlass.utils as cutlass_memory
+            import cutlass.utils.rubin_helpers as rubin_helpers
+
+            if not hasattr(rubin_helpers, "make_blockscaled_trivial_tiled_mma"):
+                raise ImportError(
+                    "cutlass.utils.rubin_helpers lacks make_blockscaled_trivial_tiled_mma"
+                )
+            if not hasattr(cutlass_memory, "get_smem_capacity_in_bytes"):
+                raise ImportError("Cutlass DSL lacks get_smem_capacity_in_bytes")
+            if cutlass_memory.get_smem_capacity_in_bytes("sm_107") <= 0:
+                raise ValueError("invalid SM107 shared-memory capacity")
+            if cute.arch.get_max_tmem_alloc_cols("sm_107") <= 0:
+                raise ValueError("invalid SM107 tensor-memory capacity")
+        except (
+            AttributeError,
+            ImportError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as e:
+            reason = (
+                f"MegaMoECuteDsl on SM107 requires Rubin support in the "
+                f"Cutlass DSL wheel; missing {e!r}. Use a Rubin-capable "
+                f"Cutlass DSL build."
+            )
+            _RUNTIME_PROBE_CACHE[sm_version] = reason
+            return False, reason
 
     try:
         # mega_moe_cute_dsl.py lives at
@@ -210,10 +243,10 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
             f"{e!r}. Verify tensorrt_llm/_torch/cute_dsl_kernels/"
             f"mega_moe_nvfp4 is in the install tree."
         )
-        _RUNTIME_PROBE_CACHE = reason
+        _RUNTIME_PROBE_CACHE[sm_version] = reason
         return False, reason
 
-    _RUNTIME_PROBE_CACHE = True
+    _RUNTIME_PROBE_CACHE[sm_version] = True
     return True, None
 
 
@@ -326,7 +359,7 @@ class _MegaMoeBuffers:
 class MegaMoECuteDsl(MoEImplBase):
     """MoE backend wrapping the ported MegaMoE CuteDSL NVFP4 fused kernel.
 
-    Capability gate (``can_implement``): SM100 family + NVFP4 +
+    Capability gate (``can_implement``): SM100/SM103/SM107 + NVFP4 +
     bfloat16 activation + CUDA 13 Cutlass DSL runtime present.
 
     Topology source-of-truth: :meth:`_acquire_buffers`.
@@ -361,10 +394,10 @@ class MegaMoECuteDsl(MoEImplBase):
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         """Check static eligibility; runtime providers and tensor values are validated later."""
-        if not is_sm_100f(d.env.sm):
+        if d.env.sm not in (100, 103, 107):
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
-                f"MegaMoECuteDsl requires SM100 family (SM100 or SM103); got SM{d.env.sm}.",
+                f"MegaMoECuteDsl requires SM100, SM103, or SM107; got SM{d.env.sm}.",
             )
         if p.dtype_act not in cls._SUPPORTED_ACTIVATION_DTYPES:
             return _reject(
@@ -406,7 +439,7 @@ class MegaMoECuteDsl(MoEImplBase):
         if not d.env.has_dep(MoEDep.MEGAMOE_CUTEDSL_RUNTIME):
             return _reject(
                 MoERejectReason.DEP_MISSING,
-                "MegaMoECuteDsl requires nvidia-cutlass-dsl[cu13] >= 4.5.0",
+                "MegaMoECuteDsl requires a compatible Cutlass DSL runtime (Rubin-enabled on SM107)",
             )
         # The fused path also requires the ``trtllm::cute_dsl_megamoe_nvfp4_*``
         # custom ops to be registered (strict import of every kernel symbol in
@@ -831,11 +864,12 @@ class MegaMoECuteDsl(MoEImplBase):
         """
         if not dist.is_available() or dist.is_initialized():
             return
-        from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+        from tensorrt_llm._utils import local_mpi_comm, mpi_comm, mpi_rank, mpi_world_size
 
         try:
             world = mpi_world_size()
             rank = mpi_rank()
+            local_rank = local_mpi_comm().Get_rank()
         except Exception as e:  # not under MPI either -> leave uninitialized
             logger.debug(
                 f"[MegaMoECuteDsl] MPI rank query failed ({e!r}); "
@@ -880,13 +914,24 @@ class MegaMoECuteDsl(MoEImplBase):
         host, port = mpi_comm().bcast(_pick_rendezvous() if rank == 0 else None, root=0)
         os.environ["MASTER_ADDR"] = str(host)
         os.environ["MASTER_PORT"] = str(port)
+        device_id = None
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            device_index = local_rank % torch.cuda.device_count()
+            torch.cuda.set_device(device_index)
+            device_id = torch.device("cuda", device_index)
         logger.info(
             f"[MegaMoECuteDsl] torch.distributed not initialized under MPI; "
             f"bootstrapping NCCL WORLD group (rank={rank}/{world}, "
+            f"local_rank={local_rank}, device={device_id}, "
             f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}) for the "
             f"EP rendezvous."
         )
-        dist.init_process_group(backend="cuda:nccl,cpu:gloo", rank=rank, world_size=world)
+        dist.init_process_group(
+            backend="cuda:nccl,cpu:gloo",
+            rank=rank,
+            world_size=world,
+            device_id=device_id,
+        )
 
     def _resolve_ep_pg(self):
         """Return the torch.distributed ProcessGroup for the EP sub-world.

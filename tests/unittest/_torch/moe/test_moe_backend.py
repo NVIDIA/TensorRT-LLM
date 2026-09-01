@@ -17,7 +17,8 @@
 import importlib
 import itertools
 import logging
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock
 
@@ -726,6 +727,42 @@ def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
     assert moe._weights_transformed is True
 
 
+def test_megamoe_cutedsl_mpi_bootstrap_binds_local_cuda_device(monkeypatch):
+    import tensorrt_llm._utils as utils
+
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    moe.ep_size = 8
+    mpi_comm = MagicMock()
+    mpi_comm.bcast.return_value = ("127.0.0.1", "29500")
+    local_mpi_comm = MagicMock()
+    local_mpi_comm.Get_rank.return_value = 5
+    init_process_group = MagicMock()
+    set_device = MagicMock()
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(utils, "mpi_world_size", lambda: 8)
+    monkeypatch.setattr(utils, "mpi_rank", lambda: 3)
+    monkeypatch.setattr(utils, "mpi_comm", lambda: mpi_comm)
+    monkeypatch.setattr(utils, "local_mpi_comm", lambda: local_mpi_comm)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.cuda, "set_device", set_device)
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+
+    moe._maybe_init_torch_dist_under_mpi()
+
+    set_device.assert_called_once_with(1)
+    init_process_group.assert_called_once_with(
+        backend="cuda:nccl,cpu:gloo",
+        rank=3,
+        world_size=8,
+        device_id=torch.device("cuda", 1),
+    )
+
+
 def test_megamoe_load_weights_invalidates_cached_deepgemm_views():
     method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
     hidden_size = 128
@@ -990,10 +1027,24 @@ def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
 def test_megamoe_cutedsl_tactic_autotune_defaults_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Standard serving must not pay for the 36-tactic sweep by default.
+    # Standard serving must not pay for the curated tactic sweep by default.
     monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
     moe = _make_megamoe_cutedsl_for_ctor_test()
     assert moe.tactic_autotune is False
+
+
+_MEGAMOE_LOCAL_TMA_STAGE2_TACTIC = (
+    [256, 256, 256],
+    [2, 1, 1],
+    None,
+    ("grouped", 512),
+    "grid_stride",
+    "reuse_dispatch_warps",
+    True,
+    2,
+    4,
+    (1, 1),
+)
 
 
 def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
@@ -1001,16 +1052,92 @@ def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
 
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
-    assert len(decode) == len(prefill) == 36
+    assert len(decode) == 36
+    assert len(prefill) == 40
     assert {t[-1] for t in decode} == {(1, 1)}
     assert {t[-1] for t in prefill} == {(2, 4)}
-    # The deterministic fallback stays inside the curated axes.
     for num_tokens in (64, 4096, 16384):
         megamoe_op.validate_megamoe_tactic(megamoe_op.default_megamoe_tactic(num_tokens))
-    invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
-    invalid_tactic[2] = 511
-    with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
-        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
+
+
+def test_megamoe_sm107_dsv4_selector_matches_runner_key() -> None:
+    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    for tactic in megamoe_op._SM107_DSV4_PRO_DEFAULT_TACTICS.values():
+        megamoe_op.validate_megamoe_tactic(tactic, sm_version=107)
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON)
+
+    for world_size, num_experts_per_rank in ((4, 96), (8, 48)):
+        runner = megamoe_op.Sm100MegaMoENvfp4Runner.__new__(megamoe_op.Sm100MegaMoENvfp4Runner)
+        runner.sm_version = 107
+        runner.world_size = world_size
+        runner.num_topk = 6
+        runner.num_experts_per_rank = num_experts_per_rank
+        runner.hidden_size = 7168
+        runner.intermediate_size_per_partition = 3072
+        runner.expand_intermediate_size_per_partition = 6144
+        runner.max_tokens_per_rank = 256
+        runner.output_dtype = torch.bfloat16
+        runner.apply_topk_in_fc1 = True
+        runner.gate_up_clamp = 10.0
+        runner.situ_beta = None
+        runner.situ_linear_beta = None
+        runner.in_kernel_fc2_reduce = False
+        runner.combine_format = "bf16"
+
+        assert runner.unique_id() in megamoe_op._SM107_DSV4_PRO_DEFAULT_TACTICS
+
+
+@pytest.mark.parametrize(
+    ("sm", "eligible"),
+    [(100, True), (103, True), (107, True), (101, False), (109, False)],
+)
+def test_megamoe_cutedsl_sm_support(sm: int, eligible: bool) -> None:
+    verdict = MegaMoECuteDsl.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=torch.bfloat16,
+            hidden_size=256,
+            intermediate_size=256,
+            num_experts=8,
+            top_k=2,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=8,
+            env=MoEEnvironment(
+                sm=sm,
+                available_deps=("megamoe_cutedsl_runtime", "megamoe_cutedsl_op"),
+            ),
+        ),
+    )
+
+    assert verdict.eligible is eligible
+    if not eligible:
+        assert verdict.reject_reason == MoERejectReason.SM_UNSUPPORTED
+
+
+def test_megamoe_kernel_arch_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.cute_dsl_kernels import mega_moe_nvfp4
+
+    sm100_kernel = object()
+    sm107_kernel = object()
+    module_name = f"{mega_moe_nvfp4.__name__}.megamoe_kernel"
+    fake_module = ModuleType(module_name)
+    fake_module.Sm100MegaMoEKernel = sm100_kernel
+    fake_module.Sm107MegaMoEKernel = sm107_kernel
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+
+    assert mega_moe_nvfp4.import_kernel(100) is sm100_kernel
+    assert mega_moe_nvfp4.import_kernel(103) is sm100_kernel
+    assert mega_moe_nvfp4.import_kernel(107) is sm107_kernel
+    with pytest.raises(ValueError, match="supports SM100, SM103, or SM107"):
+        mega_moe_nvfp4.import_kernel(101)
 
 
 def run_backend_moe(
@@ -1400,6 +1527,24 @@ def test_moe_backend(
     hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
 
+    local_tma_default = None
+    if (
+        backend_type == MoeBackendType.MEGAMOE_CUTEDSL
+        and dtype_activation == torch.bfloat16
+        and quant_algo == QuantAlgo.NVFP4
+        and seq_len == 8
+        and (num_experts, top_k, hidden_size, intermediate_size) == (8, 1, 512, 512)
+        and routing_method_cls is RenormalizeMoeRoutingMethod
+        and activation_type == ActivationType.Swiglu
+        and not swiglu_gptoss_style
+    ):
+        from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+        monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "0")
+        monkeypatch.setenv("MEGAMOE_COMBINE_FORMAT", "bf16")
+        local_tma_default = MagicMock(return_value=_MEGAMOE_LOCAL_TMA_STAGE2_TACTIC)
+        monkeypatch.setattr(megamoe_op, "default_megamoe_tactic", local_tma_default)
+
     skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype_activation)
 
     # Create mapping
@@ -1562,6 +1707,9 @@ def test_moe_backend(
             with torch.inference_mode():
                 output = run_moe()
                 ref_fused_moe.check_accuracy(output, ref_output)
+
+        if local_tma_default is not None:
+            assert any(call.args[0] > 0 for call in local_tma_default.call_args_list)
 
 
 # ============================================================================
