@@ -102,23 +102,16 @@ fails earlier can send a terminal report without an initial report.
 ##### Architecture privacy policy
 
 `architectureClassName` and `architectureClassHash` are mutually exclusive.
-Telemetry reports an architecture in plaintext only when it exactly matches a
-name in `tensorrt_llm/usage/architecture_allowlist.py`. The raw unknown name is
-neither logged nor added to the payload; the hash field contains `"sha256:"`
-followed by SHA-256 over `"trtllm-architecture-class-v1"`, one NUL byte, and the
-UTF-8 architecture name. This allows recurring unknown architectures to be
-grouped without transmitting their free-form names.
+Plaintext is reported only for an exact match in
+`tensorrt_llm/usage/architecture_allowlist.py`. Other valid names are omitted and
+represented by `sha256:` plus SHA-256 of
+`"trtllm-architecture-class-v1\0<UTF-8 name>"`, allowing repeated unknown names to
+be grouped without transmitting them.
 
-The plural Hugging Face `architectures` field uses its first item, matching the
-model loader's selection semantics; later items are ignored. Legacy singular
-TRT-LLM architecture values and nested engine configs remain supported. Empty,
-whitespace-only, non-string, or non-UTF-8-encodable values emit empty sentinels
-for both fields. Allowlist matching is exact and does not trim or case-fold.
-
-The checked-in allowlist is a conservative snapshot of public architectures
-from the PyTorch model index and supported-model documentation. It is maintained
-manually; custom or externally registered names remain absent until their public
-status is reviewed.
+Extraction uses the first Hugging Face `architectures` value and also supports
+legacy singular values and nested engine configs. Invalid or empty values leave
+both fields empty. The conservative allowlist is maintained manually; custom
+names remain excluded until reviewed.
 
 #### Aggregate LLM lifecycle counters
 
