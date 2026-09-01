@@ -1558,6 +1558,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 action_mode=normalized_action_mode,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
+                guidance_interval=None,
                 max_sequence_length=max_sequence_length,
             )
             num_inference_steps = resolved["num_inference_steps"]
@@ -1571,6 +1572,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 num_frames=num_frames,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
+                guidance_interval=None,
                 max_sequence_length=max_sequence_length,
                 frame_rate=frame_rate,
             )
@@ -1582,6 +1584,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             max_sequence_length = resolved["max_sequence_length"]
             frame_rate = resolved["frame_rate"]
 
+        guidance_interval = resolved["guidance_interval"]
         self.sampling.validate_request(num_inference_steps, guidance_scale)
 
         # Skipped for action: its dims resolve from the embodiment below, and
@@ -1636,7 +1639,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     "pass the conditioning clip as the 'video' extra param instead."
                 )
 
-        guidance_interval = None
         resolved_action_fps: Optional[float] = None
         if is_t2i:
             if image is not None:
@@ -1649,7 +1651,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # T2I force-disables audio instead of rejecting it, so an image
             # request never trips the audio-weight presence check below.
             enable_audio = False
-            guidance_interval = mode_params["guidance_interval"]
 
         if do_action:
             # num_frames is derived from the action chunk, never taken from the
@@ -1694,7 +1695,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             frame_rate = action_cfg["frame_rate"]
             resolved_action_fps = action_cfg["action_fps"]
             use_state = action_cfg["use_state"]
-            guidance_interval = mode_params.get("guidance_interval")
             enable_audio = False
 
         # Flow shift is a mode table fact unless the request overrides it, and

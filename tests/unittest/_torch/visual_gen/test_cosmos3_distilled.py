@@ -984,6 +984,28 @@ class TestForwardConditioningWiring:
         self._forward(pipeline, image=None)
         assert captured["post_step_fn"] is None
 
+    def test_resolved_guidance_interval_reaches_denoise(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pipeline, captured = self._wiring_pipeline()
+        original_resolver = pipeline._resolve_generation_params
+        expected_interval = (123.0, 456.0)
+
+        def resolve_with_interval(
+            mode: str, **values: int | float | None
+        ) -> dict[str, int | float | tuple[float, float] | None]:
+            assert values["guidance_interval"] is None
+            return {
+                **original_resolver(mode, **values),
+                "guidance_interval": expected_interval,
+            }
+
+        monkeypatch.setattr(pipeline, "_resolve_generation_params", resolve_with_interval)
+
+        self._forward(pipeline, image=None)
+
+        assert captured["guidance_interval"] == expected_interval
+
 
 class TestSystemPromptDefault:
     """use_system_prompt defaults are checkpoint-declared via model_index.json."""

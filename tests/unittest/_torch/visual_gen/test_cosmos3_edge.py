@@ -40,6 +40,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_EXTRA_SPECS,
     COSMOS3_GENERATION_DEFAULTS,
     COSMOS3_POLICY_SAMPLING_PARAMS,
+    COSMOS3_T2I_PARAMS,
     resolve_checkpoint_policy_defaults,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
@@ -833,6 +834,18 @@ class TestEdgeDefaults:
         assert policy["num_inference_steps"] == 4
         assert policy["guidance_scale"] == 3.0
         assert policy["guidance_interval"] == COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"]
+        resolved_policy = pipeline._resolve_generation_params(
+            "action",
+            action_mode=ACTION_MODE_POLICY,
+            num_inference_steps=None,
+            guidance_scale=None,
+            guidance_interval=None,
+        )
+        assert resolved_policy == {
+            "num_inference_steps": 4,
+            "guidance_scale": 3.0,
+            "guidance_interval": COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"],
+        }
         assert (
             pipeline._mode_params("action", action_mode=ACTION_MODE_FORWARD_DYNAMICS)
             is COSMOS3_ACTION_PARAMS
@@ -847,9 +860,25 @@ class TestEdgeDefaults:
                 action_mode=action_mode,
                 num_inference_steps=None,
                 guidance_scale=None,
+                guidance_interval=None,
             )
-            assert resolved == {"num_inference_steps": 30, "guidance_scale": 1.0}
+            assert resolved == {
+                "num_inference_steps": 30,
+                "guidance_scale": 1.0,
+                "guidance_interval": None,
+            }
         assert pipeline._mode_params("video") is COSMOS3_EDGE_VIDEO_PARAMS
+
+    def test_guidance_interval_resolves_for_visual_and_audio_modes(self) -> None:
+        pipeline = _bare_pipeline(QWEN3_RECIPE.name)
+
+        # Audio is an extra stream on a video request and therefore shares the
+        # video request's resolved CFG interval.
+        video_and_audio = pipeline._resolve_generation_params("video", guidance_interval=None)
+        image = pipeline._resolve_generation_params("image", guidance_interval=None)
+
+        assert video_and_audio["guidance_interval"] is None
+        assert image["guidance_interval"] == COSMOS3_T2I_PARAMS["guidance_interval"]
 
     def test_policy_manifest_declares_policy_as_the_action_mode_default(self):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
