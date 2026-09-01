@@ -12,6 +12,22 @@ l0_b200:
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
+      backend: cpp
+  tests:
+  # ------------- CPP tests ---------------
+  - cpp/test_unit_tests.py::test_kv_cache_compression_unit_tests[100]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*b100*'
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
@@ -137,6 +153,7 @@ l0_b200:
   - unittest/_torch/modules/test_fp4_num_tokens_slice.py
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
+  - unittest/_torch/modules/test_mxfp8_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_rotary_embedding.py
   - unittest/_torch/modules/test_low_m_gemm.py
