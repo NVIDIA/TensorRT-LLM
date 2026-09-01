@@ -388,6 +388,10 @@ class TopK(nn.Module):
             gvr_prior_indices: Caller-owned previous-selection state;
                 defines the emission state's row capacity and device.
         """
+        # the emission/xstate writes are undeclared mutations (see the op's
+        # schema note), so the tier is eager / CUDA-graph only
+        if torch.compiler.is_dynamo_compiling():
+            return {}
         from ..cute_dsl_kernels.blackwell.top_k.gvr_emission import (
             LIST_EMIT_MIN_N,
             GvrEmissionState,
