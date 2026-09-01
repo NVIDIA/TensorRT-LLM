@@ -39,7 +39,12 @@ import grpc  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
 
-pytestmark = pytest.mark.cpu_only
+# grpc.aio starts a `_poll_wrapper` daemon thread on server start and tears it
+# down only once its internal state is released, which happens after the event
+# loop closes -- later than pytest-threadleak's teardown snapshot. The thread is
+# grpc's to own, not this test's, so exempt the module the same way the SMG
+# adapter tests do.
+pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
 
 def test_format_bind_address_brackets_ipv6() -> None:
