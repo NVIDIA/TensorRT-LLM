@@ -770,8 +770,8 @@ int numMatchedTokens(std::vector<BlockRadixTree::MatchResult> const& matched, in
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
-    drainPendingRootErases();
-
+    // Read-only: probeReuse() runs this under a shared lock, so probes may overlap. A root still
+    // awaiting erasure is childless, so it yields no match.
     std::vector<MatchResult> results;
 
     // Lazily compute one key per iteration — no wasted hashing on early miss.

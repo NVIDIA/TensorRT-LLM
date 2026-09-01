@@ -127,7 +127,9 @@ class PlannedDropHandle
 public:
     // Deduplicates `pages` by identity, stores weak references, and increments
     // each page's plannedDropCount.
-    explicit PlannedDropHandle(std::vector<CommittedPage*> const& pages);
+    //
+    // `manager` owns the API lock this handle takes, and must outlive it.
+    PlannedDropHandle(KvCacheManager& manager, std::vector<CommittedPage*> const& pages);
 
     // Mirrors Python's __del__: applies the plan if not already dropped.
     ~PlannedDropHandle();
@@ -143,6 +145,7 @@ public:
     void drop();
 
 private:
+    KvCacheManager* mManager;
     // nullopt once dropped (mirrors Python's `_page_refs is None`).
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
 };
