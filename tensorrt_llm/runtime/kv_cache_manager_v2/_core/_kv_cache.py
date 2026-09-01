@@ -2118,6 +2118,7 @@ class _KVCache:
         return ret
 
     def _setup_for_reuse(self, match: ReuseMatch) -> None:
+        """Initialize cache blocks and attribute reused tokens by storage tier from a reuse match."""
         manager = self.manager
         matched = match.blocks
         tokens_per_block = manager.tokens_per_block
@@ -2145,13 +2146,13 @@ class _KVCache:
         )
 
         self._reused_tokens_by_tier = {"gpu": 0, "host": 0, "disk": 0, "remote": 0}
-        attn_lc_idx = None
-        for lc_idx, lc in life_cycles.items():
-            if isinstance(lc, AttnLifeCycle):
-                attn_lc_idx = lc_idx
-                break
+        attn_lc_indices = [
+            lc_idx for lc_idx, lc in life_cycles.items()
+            if isinstance(lc, AttnLifeCycle)
+        ]
 
-        if attn_lc_idx is not None and matched:
+        if attn_lc_indices and matched:
+            num_attn_lcs = len(attn_lc_indices)
             for ordinal in range(len(matched)):
                 tokens_in_block = min(
                     tokens_per_block,
@@ -2159,17 +2160,29 @@ class _KVCache:
                 )
                 if tokens_in_block <= 0:
                     break
-                page = matched[ordinal].get_page(attn_lc_idx)
-                if page is not None and getattr(page, "cache_level", None) is not None:
-                    tier = manager.cache_tier_list[page.cache_level]
-                    if tier == CacheTier.HOST_MEM:
-                        self._reused_tokens_by_tier["host"] += tokens_in_block
-                    elif tier == CacheTier.DISK:
-                        self._reused_tokens_by_tier["disk"] += tokens_in_block
+
+                tier_page_counts = {"gpu": 0, "host": 0, "disk": 0, "remote": 0}
+                for lc_idx in attn_lc_indices:
+                    page = matched[ordinal].get_page(lc_idx)
+                    if page is not None and getattr(page, "cache_level", None) is not None:
+                        tier = manager.cache_tier_list[page.cache_level]
+                        if tier == CacheTier.HOST_MEM:
+                            tier_page_counts["host"] += 1
+                        elif tier == CacheTier.DISK:
+                            tier_page_counts["disk"] += 1
+                        else:
+                            tier_page_counts["gpu"] += 1
                     else:
-                        self._reused_tokens_by_tier["gpu"] += tokens_in_block
-                else:
-                    self._reused_tokens_by_tier["gpu"] += tokens_in_block
+                        tier_page_counts["gpu"] += 1
+
+                assigned_tokens = 0
+                for tier_name in ("disk", "host"):
+                    count = tier_page_counts[tier_name]
+                    if count > 0:
+                        allocated = (tokens_in_block * count) // num_attn_lcs
+                        self._reused_tokens_by_tier[tier_name] += allocated
+                        assigned_tokens += allocated
+                self._reused_tokens_by_tier["gpu"] += (tokens_in_block - assigned_tokens)
         elif num_tokens > 0:
             self._reused_tokens_by_tier["gpu"] += num_tokens
 

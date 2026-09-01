@@ -42,7 +42,8 @@ def clean_registry():
 
 
 @pytest.fixture
-def collector():
+def collector() -> MetricsCollector:
+    """Return a MetricsCollector instance for unit tests."""
     labels = {"model_name": "test_model"}
     return MetricsCollector(labels)
 
@@ -1202,8 +1203,8 @@ class TestPromptCacheMetrics:
         assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="remote") == 128
         assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 0
 
-    def test_cached_tokens_ctx_usage_tier_recovery(self, collector: MetricsCollector) -> None:
-        """Test tier recovery from ctx_usage prompt_tokens_details payload."""
+    def test_cached_tokens_direct_tier_mapping(self, collector: MetricsCollector) -> None:
+        """Test direct tier-map collection via PROMPT_CACHE_CACHED_TOKENS_BY_TIER."""
         metrics = {
             MetricsCollector.labelname_finish_reason: "end_id",
             MetricNames.PROMPT_CACHE_CACHED_TOKENS: 200,
@@ -1216,6 +1217,25 @@ class TestPromptCacheMetrics:
         assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 200
         assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 120
         assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="host") == 80
+
+    def test_cached_tokens_ctx_usage_recovery_path(self, collector: MetricsCollector) -> None:
+        """Exercise the ctx_usage prompt_tokens_details conversion to request metrics."""
+        ctx_usage = {
+            "prompt_tokens_details": {
+                "cached_tokens": 160,
+                "cached_tokens_by_tier": {"gpu": 100, "host": 60},
+            }
+        }
+        details = ctx_usage.get("prompt_tokens_details", {})
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: details.get("cached_tokens", 0),
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER: details.get("cached_tokens_by_tier", {}),
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 160
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 100
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="host") == 60
 
 
 class TestPerPositionSpecDecodeMetrics:
