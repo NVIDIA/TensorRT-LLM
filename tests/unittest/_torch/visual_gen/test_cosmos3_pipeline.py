@@ -60,6 +60,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3Sampli
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import TRTLLM_USE_DIFFUSER_VAE_ENV
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
+from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
@@ -291,7 +292,9 @@ def _make_test_image() -> PIL.Image.Image:
 @pytest.fixture
 def cosmos3_format_pipeline():
     """Minimal pipeline for prompt formatting helpers (no checkpoint)."""
-    return Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+    pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+    pipeline._device = torch.device("cpu")
+    return pipeline
 
 
 def _format_prompt_with_metadata(
@@ -877,6 +880,7 @@ class TestCosmos3V2V:
 
     def test_v2v_flow_shift_override_request_path(self):
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = False
         # Bypassing __init__ means the generation-default family has to be set
@@ -946,6 +950,7 @@ class TestCosmos3V2V:
         the checkpoint's flow shift / Karras sigmas and the streams step on
         different schedules."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = True
         # Bypassing __init__ means the generation-default family has to be set
@@ -1007,6 +1012,7 @@ class TestCosmos3V2V:
         the system prompt, so the same frame would tokenize differently
         depending on whether it was passed as an image or a one-frame clip."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(
             device=torch.device("cpu"), num_embodiment_domains=32
         )
@@ -1064,6 +1070,7 @@ class TestCosmos3V2V:
         instance outlives the request. An action request that followed a V2V one
         would otherwise keep V2V's uniform sigmas instead of the checkpoint's."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(
             device=torch.device("cpu"), num_embodiment_domains=32
         )
@@ -1176,6 +1183,7 @@ class TestCosmos3TransferRouting:
         from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
 
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.action_gen = False
         # __new__ skips __init__, where the real pipeline resolves this.
@@ -1230,6 +1238,7 @@ class TestCosmos3TransferRouting:
         from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
 
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.action_gen = False
         # __new__ skips __init__, where the real pipeline resolves this.
@@ -1602,6 +1611,10 @@ class TestCosmos3TextGuardrailBlocked:
     @staticmethod
     def _blocked_pipeline():
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        # __new__ skips BasePipeline.__init__, which sets the device and offloader.
+        pipeline._device = torch.device("cpu")
+        pipeline.pipeline_config = SimpleNamespace(cpu_offload_config=None)
+        pipeline.offloader = PipelineOffloader(pipeline)
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = False
         pipeline.audio_scheduler = None
@@ -1609,10 +1622,10 @@ class TestCosmos3TextGuardrailBlocked:
         # All-None policy is the documented pre-load placeholder.
         pipeline.sampling = Cosmos3SamplingPolicy()
         pipeline.default_use_system_prompt = False
-        # ``rank`` and ``device`` are read-only properties: rank resolves to 0
-        # with no distributed init, device comes off the transformer stub.
-        # The guardrail model is not under test, so a checker that reports
-        # "unsafe" for any input drives the path without an unsafe prompt.
+        # ``rank`` is a read-only property that resolves to 0 with no
+        # distributed init. The guardrail model is not under test, so a
+        # checker that reports "unsafe" for any input drives the path
+        # without an unsafe prompt.
         pipeline.safety_checker = SimpleNamespace(check_text_safety=lambda _prompt: False)
         pipeline._scheduler_for = lambda *args, **kwargs: None
         return pipeline
@@ -1641,7 +1654,7 @@ class TestCosmos3FP8Load:
         checkpoint = _require_checkpoint()
         pipeline = _load_pipeline(checkpoint, quant_config=COSMOS3_FP8_QUANT_CONFIG)
         try:
-            assert pipeline.transformer.model_config.quant_config.quant_algo is not None
+            assert pipeline.pipeline_config.quant_config.quant_algo is not None
             result = _run_forward(pipeline, image=None, num_frames=NUM_FRAMES)
             _assert_valid_video(result.video, num_frames=NUM_FRAMES)
             assert result.frame_rate == FRAME_RATE
