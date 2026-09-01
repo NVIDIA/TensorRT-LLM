@@ -3872,25 +3872,50 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 // [TEMP] DLFW 26.08 bring-up diagnostic -- REVERT BEFORE MERGE.
 //
 // Under the 26.08 base image (Open MPI 5 replaces Open MPI 4) every
-// MPIPoolSession worker spawn in the K8s test pods hangs: the identity
+// MPIPoolSession worker spawn in the K8s test pods fails: the identity
 // barrier times out at 300s with 0/N workers and the worker side prints
 // nothing at all. The minimal repro is
 // unittest/llmapi/test_mpi_session.py::test_mpi_session_basic, which hangs on
 // a CPU-only pod, so it is neither GPU- nor model-related.
 //
-// docker/common/switch_to_ompi5.sh only strips ompi4 from ld.so.conf.d; it
-// does not touch PATH or LD_LIBRARY_PATH, and LD_LIBRARY_PATH takes
-// precedence over the ldconfig cache. The build pods never exercised this
-// because the NGC entrypoint (/opt/nvidia/entrypoint.d/*.sh) that assembles
-// LD_LIBRARY_PATH only runs when the container starts under docker.
+// What the first round of this probe established (CI run 7786):
+//   * COMM_WORLD.Dup and Split_type(SHARED) both succeed, so communicator
+//     creation in general is fine.
+//   * A raw MPI.COMM_SELF.Spawn does NOT hang -- it fails in 0.1s with
+//     MPI_ERR_UNKNOWN. The 300s timeout is mpi4py.futures swallowing that
+//     exception in its _manager_spawn thread, so the future never resolves.
+//   * The singleton forks a prte DVM, connects to it over tcp4://127.0.0.1,
+//     sends CONNECT ACK, and the DVM closes the socket
+//     ("ptl:base:recv_blocking: remote closed connection"), i.e. the PMIx
+//     tool-connection handshake is rejected. The reason is not printed at
+//     plm/ptl verbosity.
+//   * ompi4 leakage, /dev/shm size and Split_type are all ruled out.
+//   * Suspicious: PRRTE resolves its default hostfile to
+//     /build-result/hpcx-.../ompi5/etc/prte-default-hostfile -- a build-machine
+//     path absent from the container -- and `prte --version` fails to find its
+//     help files. hpcx's ompi5 installdirs look wrong (no OPAL_PREFIX).
 //
-// This dumps the resolved MPI stack and runs a bounded spawn probe with the
-// PRRTE/PMIx launch plumbing made verbose. Never fails the stage.
+// Round 2 therefore (a) raises verbosity on psec/server, which is where a
+// rejected handshake is decided, (b) dumps the resolved installdirs, and
+// (c) runs the candidate fixes and the non-singleton controls as variants so
+// one CI run answers "which knob makes spawn work". Never fails the stage.
 def mpiStackDiagnostics(pipeline, stageName)
 {
     pipeline.sh """
         set +e
         echo "===== [TEMP][mpi-diag] BEGIN (${stageName}) ====="
+
+        echo "--- identity, limits, session dirs ---"
+        id 2>&1
+        echo "hostname=\$(hostname) length=\$(echo -n "\$(hostname)" | wc -c)"
+        echo "TMPDIR=\${TMPDIR:-<unset>}"
+        ls -ld /tmp /dev/shm 2>&1
+        ulimit -n 2>&1 | sed 's/^/nofile=/'
+        ulimit -u 2>&1 | sed 's/^/nproc=/'
+        cat /sys/fs/cgroup/pids.max 2>/dev/null | sed 's/^/cgroup pids.max=/'
+
+        echo "--- MPI-related environment already in the pod ---"
+        env | grep -E '^(OMPI|OPAL|PMIX|PMI|PRTE|PRRTE|HYDRA|SLURM|UCX|HCOLL)_' | sort 2>&1
 
         echo "--- search paths ---"
         echo "PATH=\$PATH"
@@ -3900,6 +3925,14 @@ def mpiStackDiagnostics(pipeline, stageName)
         ls -l /opt/hpcx 2>&1
         readlink -f /opt/hpcx/ompi /usr/local/mpi 2>&1
 
+        echo "--- resolved installdirs (does PRRTE point inside the container?) ---"
+        echo "OPAL_PREFIX=\${OPAL_PREFIX:-<unset>} PRTE_PREFIX=\${PRTE_PREFIX:-<unset>}"
+        ompi_info --path all 2>&1 | head -20
+        prte_info --path all 2>&1 | head -20
+        echo "--- do the files PRRTE looks for actually exist? ---"
+        ls -l /opt/hpcx/ompi5/etc/prte-default-hostfile /opt/hpcx/ompi5/etc/prte-mca-params.conf 2>&1
+        ls -ld /build-result 2>&1
+
         echo "--- ld.so.conf.d entries mentioning hpcx ---"
         grep -rn hpcx /etc/ld.so.conf.d/ 2>&1
 
@@ -3907,7 +3940,7 @@ def mpiStackDiagnostics(pipeline, stageName)
         ldconfig -p | grep -E 'libmpi\\.|libpmix|libopen-pal|libprrte' 2>&1
 
         echo "--- launcher binaries ---"
-        which mpirun prte prted orted ompi_info 2>&1
+        which mpirun prte prted orted ompi_info prte_info 2>&1
         mpirun --version 2>&1 | head -2
         prte --version 2>&1 | head -2
 
@@ -3918,17 +3951,25 @@ def mpiStackDiagnostics(pipeline, stageName)
         echo "--- tensorrt_llm bindings linkage ---"
         ldd \$(python3 -c "import tensorrt_llm.bindings as b; print(b.__file__)" 2>/dev/null) 2>&1 | grep -E 'mpi|pmix|open-pal|prrte'
 
-        echo "--- /dev/shm ---"
-        df -h /dev/shm 2>&1
-
-        echo "--- bounded spawn probe (verbose PRRTE/PMIx) ---"
         cat > /tmp/mpi_spawn_probe.py <<'PROBE_EOF'
+import os
 import sys
 import time
 
 from mpi4py import MPI
 
+
+def describe(exc):
+    if isinstance(exc, MPI.Exception):
+        return (f"MPI.Exception class={exc.Get_error_class()} "
+                f"code={exc.Get_error_code()} msg={str(exc)!r}")
+    return repr(exc)
+
+
 print("[probe] library: " + MPI.Get_library_version().strip().splitlines()[0], flush=True)
+print(f"[probe] COMM_WORLD size={MPI.COMM_WORLD.Get_size()} "
+      f"rank={MPI.COMM_WORLD.Get_rank()} "
+      f"under_mpirun={'OMPI_COMM_WORLD_SIZE' in os.environ}", flush=True)
 
 for name, make in (
         ("COMM_WORLD.Dup", lambda: MPI.COMM_WORLD.Dup()),
@@ -3940,10 +3981,10 @@ for name, make in (
         print(f"[probe] {name} OK size={comm.Get_size()}", flush=True)
         comm.Free()
     except Exception as e:
-        print(f"[probe] {name} FAILED: {e!r}", flush=True)
+        print(f"[probe] {name} FAILED: {describe(e)}", flush=True)
 
 # Raw MPI_Comm_spawn, no mpi4py.futures: separates the MPI runtime from the
-# executor's manager thread, which is where the CI hang swallows the error.
+# executor's manager thread, which is where the CI failure gets swallowed.
 t0 = time.time()
 try:
     child = MPI.COMM_SELF.Spawn(
@@ -3953,9 +3994,15 @@ try:
     print(f"[probe] raw Comm_spawn OK in {time.time() - t0:.1f}s", flush=True)
     child.Disconnect()
 except Exception as e:
-    print(f"[probe] raw Comm_spawn FAILED after {time.time() - t0:.1f}s: {e!r}", flush=True)
+    print(f"[probe] raw Comm_spawn FAILED after {time.time() - t0:.1f}s: "
+          f"{describe(e)}", flush=True)
 
-# The exact CI path: constructor submits _worker_identity_barrier to the pool.
+# The 120s MpiPoolSession leg is the expensive one; only the variants that
+# need the full CI path switch it on.
+if os.environ.get("PROBE_POOL") != "1":
+    print("[probe] MpiPoolSession skipped (PROBE_POOL != 1)", flush=True)
+    sys.exit(0)
+
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
 t0 = time.time()
@@ -3965,16 +4012,72 @@ try:
           f"identities={session._worker_identities}", flush=True)
     session.shutdown()
 except Exception as e:
-    print(f"[probe] MpiPoolSession FAILED after {time.time() - t0:.1f}s: {e!r}", flush=True)
+    print(f"[probe] MpiPoolSession FAILED after {time.time() - t0:.1f}s: "
+          f"{describe(e)}", flush=True)
 PROBE_EOF
+
+        # Quiet variant runner: only the [probe] verdicts plus any traceback,
+        # so the variants stay comparable at a glance.
+        run_variant() {
+            label="\$1"; shift
+            echo "----- [mpi-diag] variant \$label -----"
+            env "\$@" timeout -k 10 240 python3 -u /tmp/mpi_spawn_probe.py > /tmp/probe_variant.out 2>&1
+            echo "[mpi-diag] variant \$label exit=\$?"
+            grep -a -E '^\\[probe\\]|Traceback|Exception|Error' /tmp/probe_variant.out | head -30
+        }
+
+        echo "--- variant A: baseline singleton, MAXIMUM verbosity (psec + server) ---"
+        echo "--- this is the leg that should print WHY the DVM closes the socket ---"
+        PROBE_POOL=1 \
         TRTLLM_MPI_IDENTITY_TIMEOUT=120 \
         PRTE_MCA_plm_base_verbose=100 \
         PRTE_MCA_state_base_verbose=10 \
+        PRTE_MCA_prte_debug=1 \
+        PRTE_MCA_prte_debug_daemons=1 \
         OMPI_MCA_dpm_base_verbose=100 \
         PMIX_MCA_pmix_client_verbose=100 \
+        PMIX_MCA_pmix_server_verbose=100 \
         PMIX_MCA_ptl_base_verbose=100 \
+        PMIX_MCA_psec_base_verbose=100 \
             timeout -k 10 300 python3 -u /tmp/mpi_spawn_probe.py 2>&1
-        echo "[TEMP][mpi-diag] probe exit status: \$?"
+        echo "[mpi-diag] variant A exit=\$?"
+
+        echo "--- variants B..E: candidate fixes, spawn leg only, quiet ---"
+        # B tests the installdirs hypothesis: PRRTE currently resolves its data
+        # files against the hpcx build machine's /build-result prefix.
+        # B is the leading hypothesis, so it also runs the full MpiPoolSession
+        # leg -- if it is the fix, this run already proves the CI path recovers.
+        run_variant "B (OPAL_PREFIX/PRTE_PREFIX pinned to the container)" \
+            OPAL_PREFIX=/opt/hpcx/ompi5 PRTE_PREFIX=/opt/hpcx/ompi5 \
+            PROBE_POOL=1 TRTLLM_MPI_IDENTITY_TIMEOUT=60
+        # C tests the security-module hypothesis for the rejected handshake.
+        run_variant "C (psec=native)" PMIX_MCA_psec=native
+        # D moves the PMIx rendezvous files off /tmp.
+        run_variant "D (TMPDIR=/dev/shm)" TMPDIR=/dev/shm
+        # E forces the launcher away from the slurm plm component, which is
+        # present in the image but meaningless in a K8s pod.
+        run_variant "E (plm=ssh)" PRTE_MCA_plm=ssh
+
+        echo "--- control F: does a plain mpirun launch work at all (no spawn)? ---"
+        timeout -k 10 120 mpirun --allow-run-as-root -n 2 python3 -c \\
+            "from mpi4py import MPI; print('[ctrl] rank', MPI.COMM_WORLD.Get_rank(), 'of', MPI.COMM_WORLD.Get_size(), flush=True)" > /tmp/probe_ctrl_f.out 2>&1
+        echo "[mpi-diag] control F exit=\$?"
+        tail -20 /tmp/probe_ctrl_f.out
+
+        echo "--- control G: full CI path under an mpirun-provided DVM ---"
+        echo "--- if this passes, wrapping pytest in mpirun -n 1 is a WAR that ---"
+        echo "--- needs no TensorRT-LLM source change ---"
+        PROBE_POOL=1 TRTLLM_MPI_IDENTITY_TIMEOUT=120 \
+            timeout -k 10 300 mpirun --allow-run-as-root -n 1 \
+            python3 -u /tmp/mpi_spawn_probe.py > /tmp/probe_ctrl_g.out 2>&1
+        echo "[mpi-diag] control G exit=\$?"
+        grep -a -E '^\\[probe\\]|Traceback|Exception|Error' /tmp/probe_ctrl_g.out | head -30
+
+        echo "--- leftovers from the probes, then cleanup ---"
+        ls -la /tmp 2>&1 | grep -E 'prte|pmix' | head -20
+        pkill -x prte 2>/dev/null
+        pkill -x prted 2>/dev/null
+        rm -rf /tmp/prte.* /tmp/pmix.* /tmp/probe_variant.out /tmp/probe_ctrl_f.out /tmp/probe_ctrl_g.out 2>/dev/null
 
         echo "===== [TEMP][mpi-diag] END (${stageName}) ====="
         exit 0
