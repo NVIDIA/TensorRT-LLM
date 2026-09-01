@@ -640,6 +640,27 @@ class TestImageGeneration:
         assert _server_timing_ms(resp.headers, "denoise") == 750.0
         assert _server_timing_ms(resp.headers, "total") > 0
 
+    def test_image_generation_total_anchored_to_server_arrival(self, image_client, monkeypatch):
+        """``total`` measures from the middleware's arrival stamp, not from a
+        handler-local clock — this route is handed an already-parsed
+        ``ImageGenerationRequest``, so stamping in the handler would silently
+        exclude body parsing.
+
+        Backdating only the middleware's clock leaves the handler's end
+        reading on the real one, so ``total`` must absorb the full offset.
+        """
+        import tensorrt_llm.serve.responses_utils as _ru
+
+        real = _ru.get_steady_clock_now_in_seconds
+        monkeypatch.setattr(_ru, "get_steady_clock_now_in_seconds", lambda: real() - 5.0)
+
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={"prompt": "timing", "response_format": "b64_json", "size": "64x64"},
+        )
+        assert resp.status_code == 200
+        assert _server_timing_ms(resp.headers, "total") >= 5000.0
+
     def test_image_generation_with_optional_params(self, image_client):
         resp = image_client.post(
             "/v1/images/generations",
@@ -3010,6 +3031,36 @@ class TestAsyncVideoTransport:
         assert _server_timing_ms(content.headers, "generation") == 1250.0
         assert _server_timing_ms(content.headers, "denoise") == 750.0
         assert _server_timing_ms(content.headers, "total") > 0
+
+    @pytest.mark.asyncio
+    async def test_async_total_anchored_to_server_arrival(self, async_video_client, monkeypatch):
+        """The async path round-trips the arrival stamp through
+        ``VideoJob.request_started`` and closes ``total`` out in a background
+        task, so the stamp and the end reading must stay on one clock.
+        """
+        import tensorrt_llm.serve.responses_utils as _ru
+
+        real = _ru.get_steady_clock_now_in_seconds
+        monkeypatch.setattr(_ru, "get_steady_clock_now_in_seconds", lambda: real() - 5.0)
+
+        resp = await async_video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "timing",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "avi",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+        assert await _adrive_job_to_completion(async_video_client, video_id) == "completed"
+
+        content = await async_video_client.get(f"/v1/videos/{video_id}/content")
+        assert content.status_code == 200
+        assert _server_timing_ms(content.headers, "total") >= 5000.0
 
     @pytest.mark.asyncio
     async def test_async_file_still_returns_file_response(self, async_video_client):
