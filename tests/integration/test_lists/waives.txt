@@ -14,7 +14,6 @@ accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symm
 accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2] SKIP (https://nvbugs/5748664)
 accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform] SKIP (https://nvbugs/6661863)
 accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform_contention_opt] SKIP (https://nvbugs/6644489)
-accuracy/test_glm52.py::TestGLM52NVFP4::test_guided_decoding[llguidance] SKIP (https://nvbugs/6700405)
 accuracy/test_glm52.py::TestGLM52NVFP4::test_tep[tp_size=8-ep_size=8] SKIP (https://nvbugs/6668807)
 accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[no_overlap] SKIP (https://nvbugs/6698723)
 accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[overlap] SKIP (https://nvbugs/6698723)

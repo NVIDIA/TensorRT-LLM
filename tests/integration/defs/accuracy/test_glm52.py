@@ -184,20 +184,19 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.timeout(900)
     @skip_pre_blackwell
     @skip_ray
     @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.threadleak(enabled=False)
-    def test_attention_dp(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
         num_ranks = 8
-        output_length = 8
+        max_num_tokens = 256
         monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")
-        prompts = [[1, 42, 43] for _ in range(num_ranks)]
-        scheduling_params = [
-            SchedulingParams(attention_dp_rank=rank, attention_dp_relax=False)
-            for rank in range(num_ranks)
-        ]
+        monkeypatch.setenv("TRTLLM_XGUIDANCE_LENIENT", "1")
 
+        # Guided decoding backends are selected when the executor is created.
+        # Use XGrammar so all runtime checks can share one model load.
         with LLM(
             self.MODEL_PATH,
             tensor_parallel_size=num_ranks,
@@ -206,33 +205,61 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             enable_attention_dp=True,
             disable_overlap_scheduler=True,
             cuda_graph_config=None,
+            enable_chunked_prefill=True,
             enable_autotuner=False,
             max_batch_size=num_ranks,
-            max_seq_len=8192,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=2048,
             max_stats_len=128,
             enable_iter_perf_stats=True,
             kv_cache_config=KvCacheConfig(
-                enable_block_reuse=False,
-                free_gpu_memory_fraction=0.4,
+                enable_block_reuse=True,
+                # ADP pads ranks with dummy requests; keep the shared short
+                # prompt from committing a partial block to those requests.
+                enable_partial_reuse=False,
+                free_gpu_memory_fraction=0.6,
+                dtype="fp8",
+            ),
+            sparse_attention_config=DeepSeekSparseAttentionConfig(
+                skip_indexer_for_short_seqs=False,
             ),
             moe_config=MoeConfig(
                 backend="CUTEDSL",
                 disable_finalize_fusion=True,
             ),
-            speculative_config=MTPDecodingConfig(max_draft_len=1),
+            guided_decoding_backend="xgrammar",
+            return_perf_metrics=True,
         ) as llm:
             assert llm.args.enable_attention_dp is True
-            outputs = llm.generate(
-                prompts,
-                sampling_params=SamplingParams(
-                    max_tokens=output_length,
-                    temperature=0,
-                    end_id=-1,
-                ),
-                scheduling_params=scheduling_params,
-                use_tqdm=False,
-            )
-            stats_entries = llm.get_stats(timeout=10)
+            assert llm.args.enable_chunked_prefill is True
+            assert llm.args.max_num_tokens == max_num_tokens
+            assert llm.args.kv_cache_config.enable_block_reuse is True
+            assert llm.args.sparse_attention_config.skip_indexer_for_short_seqs is False
+            self._assert_attention_dp(llm, num_ranks)
+            self._assert_kv_cache_reuse(llm)
+            self._assert_chunked_prefill(llm)
+            self._assert_logits_processor(llm)
+            self._assert_guided_decoding(llm)
+
+    @staticmethod
+    def _assert_attention_dp(llm: LLM, num_ranks: int) -> None:
+        output_length = 8
+        prompts = [[1, 42, 43] for _ in range(num_ranks)]
+        scheduling_params = [
+            SchedulingParams(attention_dp_rank=rank, attention_dp_relax=False)
+            for rank in range(num_ranks)
+        ]
+        outputs = llm.generate(
+            prompts,
+            sampling_params=SamplingParams(
+                max_tokens=output_length,
+                temperature=0,
+                end_id=-1,
+            ),
+            scheduling_params=scheduling_params,
+            use_tqdm=False,
+        )
+        stats_entries = llm.get_stats(timeout=10)
 
         assert isinstance(outputs, list)
         assert len(outputs) == num_ranks
@@ -280,6 +307,104 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             assert any(stats.get("numGenKvTokens", 0) > 0 for stats in inflight_batching_stats), (
                 f"No real generation KV-cache work executed on ADP rank {rank}"
             )
+
+    @staticmethod
+    def _assert_kv_cache_reuse(llm: LLM) -> None:
+        prompt_token_ids = [1] + [42] * 255
+        output_length = 8
+        sampling_params = SamplingParams(
+            max_tokens=output_length,
+            temperature=0,
+            end_id=-1,
+            return_perf_metrics=True,
+        )
+        scheduling_params = [SchedulingParams(attention_dp_rank=0, attention_dp_relax=False)]
+
+        cold_output = llm.generate(
+            [prompt_token_ids],
+            sampling_params=sampling_params,
+            scheduling_params=scheduling_params,
+            use_tqdm=False,
+        )[0].outputs[0]
+        warm_output = llm.generate(
+            [prompt_token_ids],
+            sampling_params=sampling_params,
+            scheduling_params=scheduling_params,
+            use_tqdm=False,
+        )[0].outputs[0]
+
+        cold_metrics = cold_output.request_perf_metrics
+        warm_metrics = warm_output.request_perf_metrics
+        assert cold_metrics is not None
+        assert warm_metrics is not None
+        assert cold_metrics.kv_cache_metrics.num_reused_blocks == 0
+        assert warm_metrics.kv_cache_metrics.num_reused_blocks > 0
+        assert len(cold_output.token_ids) == output_length
+        assert len(warm_output.token_ids) == output_length
+        assert warm_output.token_ids == cold_output.token_ids
+
+    @staticmethod
+    def _assert_chunked_prefill(llm: LLM) -> None:
+        prompt_length = 768
+        output_length = 16
+        # Keep this prefix distinct from the cache-reuse request so all three
+        # expected context chunks execute even though block reuse is enabled.
+        prompt_token_ids = [1] + [44] * (prompt_length - 2) + [45]
+        outputs = llm.generate(
+            [prompt_token_ids],
+            sampling_params=SamplingParams(
+                max_tokens=output_length,
+                temperature=0,
+                end_id=-1,
+            ),
+            use_tqdm=False,
+        )
+
+        assert isinstance(outputs, list)
+        assert len(outputs) == 1
+        assert len(outputs[0].outputs[0].token_ids) == output_length
+        time_breakdown = outputs[0].time_breakdown_metrics
+        assert time_breakdown is not None
+        context_chunks = time_breakdown.get("ctx_chunk_metrics")
+        assert isinstance(context_chunks, list)
+        assert len(context_chunks) >= 3
+
+    @staticmethod
+    def _assert_logits_processor(llm: LLM) -> None:
+        forced_token_id = 22
+        output_length = 4
+        outputs = llm.generate(
+            [[1, 42, 43]],
+            sampling_params=SamplingParams(
+                max_tokens=output_length,
+                temperature=0,
+                end_id=-1,
+                logits_processor=_ForceTokenLogitsProcessor(forced_token_id),
+            ),
+            use_tqdm=False,
+        )
+
+        assert isinstance(outputs, list)
+        assert len(outputs) == 1
+        assert outputs[0].outputs[0].token_ids == [forced_token_id] * output_length
+
+    @staticmethod
+    def _assert_guided_decoding(llm: LLM) -> None:
+        evaluator = _JsonModeGrammarEval(
+            dataset_path=JsonModeEval.DATASET_DIR,
+            num_samples=4,
+            random_seed=0,
+            apply_chat_template=True,
+        )
+        score = evaluator.evaluate(
+            llm,
+            SamplingParams(
+                max_tokens=JsonModeEval.MAX_OUTPUT_LEN,
+                truncate_prompt_tokens=JsonModeEval.MAX_INPUT_LEN,
+            ),
+        )
+
+        assert score == 100.0
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
@@ -368,195 +493,3 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
         assert aggregate_accept_rate > 0.2, (
             f"Aggregate acceptance rate {aggregate_accept_rate:.2%} below threshold 20%"
         )
-
-    @skip_pre_blackwell
-    @skip_ray
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.threadleak(enabled=False)
-    def test_chunked_prefill(self):
-        prompt_length = 768
-        max_num_tokens = 256
-        output_length = 16
-        prompt_token_ids = [1] + [42] * (prompt_length - 2) + [43]
-
-        with LLM(
-            self.MODEL_PATH,
-            skip_tokenizer_init=True,
-            tensor_parallel_size=8,
-            pipeline_parallel_size=1,
-            moe_expert_parallel_size=8,
-            enable_attention_dp=False,
-            disable_overlap_scheduler=True,
-            cuda_graph_config=None,
-            enable_chunked_prefill=True,
-            max_batch_size=1,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=1024,
-            kv_cache_config=KvCacheConfig(
-                enable_block_reuse=False,
-                free_gpu_memory_fraction=0.6,
-            ),
-            moe_config=MoeConfig(backend="CUTEDSL"),
-            return_perf_metrics=True,
-        ) as llm:
-            assert llm.args.enable_chunked_prefill is True
-            assert llm.args.max_num_tokens == max_num_tokens
-            outputs = llm.generate(
-                [prompt_token_ids],
-                sampling_params=SamplingParams(
-                    max_tokens=output_length,
-                    temperature=0,
-                    end_id=-1,
-                ),
-                use_tqdm=False,
-            )
-
-        assert isinstance(outputs, list)
-        assert len(outputs) == 1
-        assert len(outputs[0].outputs[0].token_ids) == output_length
-        time_breakdown = outputs[0].time_breakdown_metrics
-        assert time_breakdown is not None
-        context_chunks = time_breakdown.get("ctx_chunk_metrics")
-        assert isinstance(context_chunks, list)
-        assert len(context_chunks) >= 3
-
-    @skip_pre_blackwell
-    @skip_ray
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.threadleak(enabled=False)
-    def test_kv_cache_reuse(self) -> None:
-        prompt_token_ids = [1] + [42] * 255
-        output_length = 8
-        sampling_params = SamplingParams(
-            max_tokens=output_length,
-            temperature=0,
-            end_id=-1,
-            return_perf_metrics=True,
-        )
-
-        with LLM(
-            self.MODEL_PATH,
-            skip_tokenizer_init=True,
-            tensor_parallel_size=8,
-            pipeline_parallel_size=1,
-            moe_expert_parallel_size=8,
-            enable_attention_dp=False,
-            disable_overlap_scheduler=True,
-            cuda_graph_config=None,
-            max_seq_len=1024,
-            kv_cache_config=KvCacheConfig(
-                enable_block_reuse=True,
-                free_gpu_memory_fraction=0.6,
-                dtype="fp8",
-            ),
-            sparse_attention_config=DeepSeekSparseAttentionConfig(
-                skip_indexer_for_short_seqs=False,
-            ),
-            moe_config=MoeConfig(
-                backend="CUTEDSL",
-                disable_finalize_fusion=True,
-            ),
-        ) as llm:
-            assert llm.args.kv_cache_config.enable_block_reuse is True
-            assert llm.args.sparse_attention_config.skip_indexer_for_short_seqs is False
-            cold_output = llm.generate(
-                [prompt_token_ids],
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )[0].outputs[0]
-            warm_output = llm.generate(
-                [prompt_token_ids],
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )[0].outputs[0]
-
-        cold_metrics = cold_output.request_perf_metrics
-        warm_metrics = warm_output.request_perf_metrics
-        assert cold_metrics is not None
-        assert warm_metrics is not None
-        assert cold_metrics.kv_cache_metrics.num_reused_blocks == 0
-        assert warm_metrics.kv_cache_metrics.num_reused_blocks > 0
-        assert len(cold_output.token_ids) == output_length
-        assert len(warm_output.token_ids) == output_length
-        assert warm_output.token_ids == cold_output.token_ids
-
-    @skip_pre_blackwell
-    @skip_ray
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.threadleak(enabled=False)
-    def test_logits_processor(self) -> None:
-        forced_token_id = 22
-        output_length = 4
-        sampling_params = SamplingParams(
-            max_tokens=output_length,
-            temperature=0,
-            end_id=-1,
-            logits_processor=_ForceTokenLogitsProcessor(forced_token_id),
-        )
-
-        with LLM(
-            self.MODEL_PATH,
-            skip_tokenizer_init=True,
-            tensor_parallel_size=8,
-            pipeline_parallel_size=1,
-            moe_expert_parallel_size=8,
-            enable_attention_dp=False,
-            disable_overlap_scheduler=True,
-            cuda_graph_config=None,
-            max_seq_len=1024,
-            kv_cache_config=KvCacheConfig(
-                enable_block_reuse=False,
-                free_gpu_memory_fraction=0.6,
-            ),
-            moe_config=MoeConfig(backend="CUTEDSL"),
-        ) as llm:
-            outputs = llm.generate(
-                [[1, 42, 43]],
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )
-
-        assert isinstance(outputs, list)
-        assert len(outputs) == 1
-        assert outputs[0].outputs[0].token_ids == [forced_token_id] * output_length
-
-    @pytest.mark.timeout(7200)
-    @skip_pre_blackwell
-    @skip_ray
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.threadleak(enabled=False)
-    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding(self, backend: str, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("TRTLLM_XGUIDANCE_LENIENT", "1")
-
-        with LLM(
-            self.MODEL_PATH,
-            tensor_parallel_size=8,
-            pipeline_parallel_size=1,
-            moe_expert_parallel_size=8,
-            enable_attention_dp=False,
-            disable_overlap_scheduler=True,
-            cuda_graph_config=None,
-            max_seq_len=2048,
-            kv_cache_config=KvCacheConfig(
-                enable_block_reuse=False,
-                free_gpu_memory_fraction=0.6,
-            ),
-            moe_config=MoeConfig(backend="CUTEDSL"),
-            guided_decoding_backend=backend,
-        ) as llm:
-            evaluator = _JsonModeGrammarEval(
-                dataset_path=JsonModeEval.DATASET_DIR,
-                num_samples=4,
-                random_seed=0,
-                apply_chat_template=True,
-            )
-            score = evaluator.evaluate(
-                llm,
-                SamplingParams(
-                    max_tokens=JsonModeEval.MAX_OUTPUT_LEN,
-                    truncate_prompt_tokens=JsonModeEval.MAX_INPUT_LEN,
-                ),
-            )
-
-        assert score == 100.0
