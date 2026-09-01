@@ -748,11 +748,12 @@ def test_cosmos3_edge_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.getsize(output_path) > 0, f"Example produced an empty video at {output_path}"
 
 
-# Edge LPIPS gates compare against diffusers-main reference goldens with the
-# scheduler patched to the cosmos-framework native flow schedule; full
+# Edge LPIPS gates compare against TRT-LLM self-goldens (originally cut from
+# diffusers-main references, re-baselined as self-goldens when the fp32-matmul
+# pin landed; cross-stack correctness is covered by TestDiffusersParity); full
 # provenance in golden/visual_gen_lpips/cosmos3_edge_*.json. The I2V gate runs
-# 10 steps (cross-stack drift accumulates per step; the deployed 50-step shape
-# is covered by test_cosmos3_edge_i2v_example).
+# 10 steps (drift accumulates per step; the deployed 50-step shape is covered
+# by test_cosmos3_edge_i2v_example).
 COSMOS3_EDGE_LPIPS_SEED = 42
 COSMOS3_EDGE_LPIPS_FRAME_RATE = 24.0
 COSMOS3_EDGE_LPIPS_NUM_FRAMES = 29
