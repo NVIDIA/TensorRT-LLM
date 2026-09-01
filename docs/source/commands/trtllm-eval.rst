@@ -85,7 +85,7 @@ Here are some examples:
    trtllm-eval --model <model> --max_seq_len 36864 aime25
    trtllm-eval --model <model> --max_seq_len 36864 aime26
 
-The ``--model`` argument accepts either a Hugging Face model ID or a local checkpoint path. By default, ``trtllm-eval`` runs the model with the PyTorch backend; you can pass ``--backend tensorrt`` to switch to the TensorRT backend.
+The ``--model`` argument accepts either a Hugging Face model ID or a local checkpoint path. By default, ``trtllm-eval`` runs the model with the PyTorch backend.
 
 Alternatively, the ``--model`` argument also accepts a local path to pre-built TensorRT engines. In this case, you should pass the Hugging Face tokenizer path to the ``--tokenizer`` argument.
 

@@ -19,7 +19,7 @@ trtllm-eval --model meta-llama/Llama-3.1-8B-Instruct gsm8k
 trtllm-eval --model meta-llama/Llama-3.3-70B-Instruct gpqa_diamond
 ```
 
-The `--model` argument accepts either a Hugging Face model ID or a local checkpoint path. By default, `trtllm-eval` runs the model with the PyTorch backend; pass `--backend tensorrt` to switch to the TensorRT backend. Alternatively, the `--model` argument also accepts a local path to pre-built TensorRT engines; in that case, please pass the Hugging Face tokenizer path to the `--tokenizer` argument.
+The `--model` argument accepts either a Hugging Face model ID or a local checkpoint path. By default, `trtllm-eval` runs the model with the PyTorch backend. Alternatively, the `--model` argument also accepts a local path to pre-built TensorRT engines; in that case, please pass the Hugging Face tokenizer path to the `--tokenizer` argument.
 
 See more details by `trtllm-eval --help`.
 
