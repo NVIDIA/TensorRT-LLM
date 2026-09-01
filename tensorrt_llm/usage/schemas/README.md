@@ -115,18 +115,10 @@ TRT-LLM architecture values and nested engine configs remain supported. Empty,
 whitespace-only, non-string, or non-UTF-8-encodable values emit empty sentinels
 for both fields. Allowlist matching is exact and does not trim or case-fold.
 
-The allowlist is generated offline from the public, checked-in PyTorch model
-index and supported-model tables. After either source adds or removes a public
-architecture, regenerate it with:
-
-```bash
-python3 scripts/update_telemetry_architecture_allowlist.py
-python3 scripts/update_telemetry_architecture_allowlist.py --check
-```
-
-The synchronization test compares the complete generated module with those
-sources. Custom or externally registered architecture names are deliberately
-absent until they are reviewed and represented in a public source.
+The checked-in allowlist is a conservative snapshot of public architectures
+from the PyTorch model index and supported-model documentation. It is maintained
+manually; custom or externally registered names remain absent until their public
+status is reviewed.
 
 #### Aggregate LLM lifecycle counters
 

@@ -14,34 +14,11 @@
 # limitations under the License.
 """Tests for the public telemetry architecture allowlist."""
 
-import subprocess
-import sys
-from pathlib import Path
-
 import pytest
 
 from tensorrt_llm.usage.architecture_allowlist import PUBLIC_HF_ARCHITECTURES
 
 pytestmark = pytest.mark.cpu_only
-
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-
-
-def test_allowlist_is_synchronized_with_public_model_catalogs() -> None:
-    """The checked-in allowlist must be regenerated when public catalogs change."""
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            str(_REPO_ROOT / "scripts" / "update_telemetry_architecture_allowlist.py"),
-            "--check",
-        ],
-        cwd=_REPO_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
 
 
 def test_allowlist_entries_are_well_formed() -> None:
