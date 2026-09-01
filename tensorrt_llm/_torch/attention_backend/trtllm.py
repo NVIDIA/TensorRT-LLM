@@ -1258,18 +1258,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 # Dynamic tree: use _internal_buf_dim which may be larger
                 # than max_total_draft_tokens+1 to accommodate K*max_draft_len.
                 # 1D layout for flexible view() in the drafting loop.
-                buf_dim = (spec_tree_manager._internal_buf_dim
-                           if spec_tree_manager is not None else
-                           max_total_draft_tokens + 1)
+                buf_dim = spec_tree_manager._internal_buf_dim
                 self.spec_decoding_position_offsets = torch.empty(
                     (self.max_num_requests * buf_dim, ),
                     dtype=torch.int,
                     device='cuda',
                 )
             if is_spec_dec_tree and self.spec_decoding_packed_mask is None:
-                buf_dim = (spec_tree_manager._internal_buf_dim
-                           if spec_tree_manager is not None else
-                           max_total_draft_tokens + 1)
+                buf_dim = spec_tree_manager._internal_buf_dim
                 # Zero-init: dynamic-tree dst has inner dim
                 # ceil(buf_dim/32) but only ceil((max_total_draft_tokens+1)/32)
                 # is written each step. Unwritten cols would otherwise feed the
