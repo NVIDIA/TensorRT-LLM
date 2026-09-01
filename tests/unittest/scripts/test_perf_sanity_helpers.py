@@ -198,6 +198,104 @@ def test_missing_device_step_time_appends_nothing(
     assert benchmark_log.read_text(encoding="utf-8") == "benchmark output"
 
 
+def test_append_time_breakdown_metrics_reads_the_configured_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The breakdown directory is a DisaggTestCmds *field*, not a method.
+
+    PerfSanityTestConfig.time_breakdown_dir() computes the path and hands it over
+    as perf_metrics_output_dir. Calling that method on DisaggTestCmds instead
+    raises AttributeError -- and this runs after benchmark_status is written, so
+    the whole measurement would be thrown away at the very last step.
+    """
+    breakdown_dir = tmp_path / "perf_metrics"
+    breakdown_dir.mkdir()
+    benchmark_log = tmp_path / "trtllm-benchmark.0.0.log"
+    benchmark_log.write_text("benchmark output", encoding="utf-8")
+    outputs = ["benchmark output"]
+    pending = [
+        {
+            "output_index": 0,
+            "benchmark_file_path": str(benchmark_log),
+            "benchmark_mode": perf_sanity.E2E_TIME_BREAKDOWN_MODE,
+        }
+    ]
+    commands = perf_sanity.DisaggTestCmds(
+        server_cmds=[],
+        client_cmds={},
+        timeout=1,
+        hostname="localhost",
+        disagg_serving_type="BENCHMARK",
+        num_ctx_servers=1,
+        num_gen_servers=2,
+        output_dir=str(tmp_path),
+        test_output_dir=str(tmp_path),
+        perf_metrics_output_dir=str(breakdown_dir),
+    )
+
+    discover_calls: list[str] = []
+
+    def discover(directory: str) -> list[str]:
+        discover_calls.append(directory)
+        return [str(breakdown_dir / "perf_metrics-server-0.jsonl")]
+
+    monkeypatch.setattr(perf_sanity, "discover_perf_metrics_files", discover)
+    monkeypatch.setattr(
+        perf_sanity,
+        "compute_time_breakdown_metrics",
+        lambda paths, case_type: (
+            {"d_tb_ctx_queue_mean": 4.5},
+            {"warnings": [], "counts": {"ctx": 1}},
+        ),
+    )
+
+    commands._append_time_breakdown_metrics(pending, outputs)
+
+    assert discover_calls == [str(breakdown_dir)]
+    assert "Time Breakdown ctx_queue mean (ms): 4.500000" in outputs[0]
+    assert "Time Breakdown ctx_queue mean (ms): 4.500000" in benchmark_log.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_append_time_breakdown_metrics_without_any_jsonl_is_not_fatal(tmp_path: Path) -> None:
+    """The real discovery path over an empty directory, with no stubs.
+
+    Deliberately unmonkeypatched so the attribute access on self is exercised for
+    real: a stubbed discover would still pass if the directory came from nowhere.
+    """
+    benchmark_log = tmp_path / "trtllm-benchmark.0.0.log"
+    benchmark_log.write_text("benchmark output", encoding="utf-8")
+    outputs = ["benchmark output"]
+    commands = perf_sanity.DisaggTestCmds(
+        server_cmds=[],
+        client_cmds={},
+        timeout=1,
+        hostname="localhost",
+        disagg_serving_type="BENCHMARK",
+        num_ctx_servers=1,
+        num_gen_servers=2,
+        output_dir=str(tmp_path),
+        test_output_dir=str(tmp_path),
+        perf_metrics_output_dir=str(tmp_path / "perf_metrics"),
+    )
+
+    commands._append_time_breakdown_metrics(
+        [
+            {
+                "output_index": 0,
+                "benchmark_file_path": str(benchmark_log),
+                "benchmark_mode": perf_sanity.E2E_TIME_BREAKDOWN_MODE,
+            }
+        ],
+        outputs,
+    )
+
+    assert outputs == ["benchmark output"]
+    assert benchmark_log.read_text(encoding="utf-8") == "benchmark output"
+
+
 # ---------------------------------------------------------------------------
 # Gen-worker per-iteration device step time
 # ---------------------------------------------------------------------------

@@ -2072,7 +2072,11 @@ class DisaggTestCmds(NamedTuple):
         if not pending_time_breakdown:
             return
 
-        breakdown_dir = self.time_breakdown_dir()
+        # PerfSanityTestConfig.time_breakdown_dir() is what *computed* this path;
+        # it is handed to DisaggTestCmds as a field (see the construction site) and
+        # is not a method here. Calling the method on self would raise
+        # AttributeError after the whole benchmark has already run.
+        breakdown_dir = self.perf_metrics_output_dir
         for record in pending_time_breakdown:
             case_type = TIME_BREAKDOWN_CASE_TYPE[record["benchmark_mode"]]
             paths = discover_perf_metrics_files(breakdown_dir)
