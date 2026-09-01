@@ -29,6 +29,8 @@ from mpi4py import MPI
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraManager, LoraModelConfig
 from tensorrt_llm._utils import (get_size_in_bytes, mpi_comm, mpi_disabled,
                                  prefer_pinned, torch_comm,
                                  torch_dtype_to_binding)
@@ -36,8 +38,6 @@ from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
-from tensorrt_llm.lora_helper import LoraConfig
-from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
                                                 KV_CACHE_HASH_ALGO_V1)
@@ -49,7 +49,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
                        nvtx_range)
 from ...logger import logger
-from ...mapping import CpType, Mapping
+from ...mapping import Mapping
+from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
@@ -149,6 +150,29 @@ class BaseResourceManager(ABC):
     @abstractmethod
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         raise NotImplementedError
+
+    def get_request_kv_block_budget(
+            self, request: LlmRequest) -> Optional[Tuple[int, int]]:
+        """Return required and capacity KV block counts for admission.
+
+        ``None`` indicates that this resource manager does not support the
+        request-level KV block feasibility check. Opting in is deliberate:
+        a manager must only return a pair once it is known that the request
+        cannot possibly be served when ``required > capacity``, since the
+        executor rejects such requests outright.
+        """
+        return None
+
+    def kv_block_budget_applies(self) -> bool:
+        """Whether ``get_request_kv_block_budget`` reports a budget at all.
+
+        Request-independent, so startup can ask before any request exists --
+        see ``PyExecutor._warn_if_kv_block_budget_unchecked``, which reports
+        the pools that beam search runs against unchecked. A manager that
+        opts into the check must override this too, or it will be reported as
+        unchecked while in fact rejecting requests.
+        """
+        return False
 
     def add_dummy_requests(self, request_ids: List[int]):
         pass
@@ -466,8 +490,7 @@ class KVCacheManager(BaseResourceManager):
         # Determine if this is VSWA (Variable Sliding Window Attention).
         # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
         # values (negative) used by hybrid linear attention models.
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(
-            w > 0 for w in self.max_attention_window_vec)
+        self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
         self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size
@@ -583,7 +606,6 @@ class KVCacheManager(BaseResourceManager):
             blocks_per_window=blocks_per_window,
             tokens_per_block=tokens_per_block,
             max_seq_len=self.max_seq_len,
-            max_beam_width=max_beam_width,
         )
 
         # Rewrite each pool's window_size to match the post-clamp window.
@@ -789,6 +811,66 @@ class KVCacheManager(BaseResourceManager):
         # LlmRequest.get_num_tokens is out of sync with GenerationRequest when overlap scheduler is enabled.
         return self.impl.get_token_count(request.py_request_id)
 
+    def _num_blocks_to_completion(self, prompt_len: int, max_new_tokens: int,
+                                  beam_width: int) -> int:
+        # Beam-aware block estimate mirroring the C++ shared/unshared cost model
+        # (getNeededBlocksOneStep in kvCacheManager.cpp): the full prompt blocks
+        # are shared across all beams, while the partial-last-prompt block and
+        # the generated tokens are private to each beam.
+        shared_context_blocks = prompt_len // self.tokens_per_block
+        per_beam_tokens = prompt_len % self.tokens_per_block + max_new_tokens
+        per_beam_blocks = self.get_num_kv_blocks(per_beam_tokens) * beam_width
+        return shared_context_blocks + per_beam_blocks
+
+    def kv_block_budget_applies(self) -> bool:
+        # Restricted to the exact base manager: the estimate below assumes every
+        # token of the sequence occupies a block of this pool. Subclasses break
+        # that assumption in ways that would make it wrong in either direction
+        # -- sparse/compressed KV managers (RocketKVCacheManager,
+        # DSACacheManager) retain less than the full sequence and would be
+        # over-estimated into false rejections, while the mamba hybrids split
+        # capacity across an extra state cache this single required/capacity
+        # pair cannot express. A subclass opts into the dense estimate by
+        # overriding this method once its own cost model has been checked
+        # against it, or supplies a cost model of its own by overriding both
+        # this and `get_request_kv_block_budget`.
+        if type(self) is not KVCacheManager:
+            return False
+        if self.kv_cache_type == CacheTypeCpp.CROSS:
+            return True
+        # Multi-window and linear-attention managers have per-pool capacity
+        # semantics that cannot be represented by one required/capacity pair.
+        # Uniform sliding-window managers also require window-aware accounting.
+        return not (self.kv_cache_type != CacheTypeCpp.SELF or self.is_vswa
+                    or self.is_linear_attention
+                    or any(window < self.max_seq_len
+                           for window in self.max_attention_window_vec))
+
+    def get_request_kv_block_budget(
+            self, request: LlmRequest) -> Optional[Tuple[int, int]]:
+        """Required and available KV blocks under the dense full-attention cost
+        model, or ``None`` if this manager is not covered by it."""
+        if not self.kv_block_budget_applies():
+            return None
+
+        if self.kv_cache_type == CacheTypeCpp.CROSS:
+            if request.encoder_output_len is None:
+                logger.warning(
+                    f"Encoder output length is not set for request {request.request_id}"
+                )
+                return None
+            required_blocks = self.get_num_kv_blocks(request.encoder_output_len)
+            return required_blocks, self.blocks_in_primary_pool
+
+        extra_tokens = (self.num_extra_kv_tokens +
+                        self._kv_reserve_draft_tokens)
+        required_blocks = self._num_blocks_to_completion(
+            request.orig_prompt_len, request.max_new_tokens + extra_tokens,
+            request.py_beam_width)
+        # Use GPU-primary capacity only. Secondary/offloaded blocks cannot make
+        # an otherwise impossible request schedulable on the GPU.
+        return required_blocks, self.blocks_in_primary_pool
+
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # TODO: the C++ implementation of this method can be used, but the
         # Python and C++ schedulers currently do not agree on what "needed
@@ -797,12 +879,12 @@ class KVCacheManager(BaseResourceManager):
         # the Python scheduler needs to be fixed.
         #
         # return self.impl.get_remaining_blocks_to_completion(request)
-        context_token_count = request.orig_prompt_len
-        num_context_blocks = context_token_count // self.tokens_per_block
-        remaining_tokens = context_token_count + request.max_new_tokens - num_context_blocks * self.tokens_per_block
-        need_blocks = num_context_blocks + math.ceil(
-            remaining_tokens / self.tokens_per_block)
-        return need_blocks
+        #
+        # This intentionally uses beam_width=1 to preserve the historical
+        # beam-unaware value the Python scheduler expects.
+        return self._num_blocks_to_completion(request.orig_prompt_len,
+                                              request.max_new_tokens,
+                                              beam_width=1)
 
     @staticmethod
     def _has_mm_bidirectional_block(req: LlmRequest) -> bool:
@@ -982,8 +1064,8 @@ class KVCacheManager(BaseResourceManager):
             # its budget is handled separately.
             self.fit_token_budget(scheduled_batch)
 
-    def _context_seq_len(self, req: LlmRequest, is_cross: bool,
-                         is_star_cp: bool) -> Optional[int]:
+    def _context_seq_len(self, req: LlmRequest,
+                         is_cross: bool) -> Optional[int]:
         """Return the sequence length to pass to add_sequence_batch, or None to skip this request."""
         if req.py_request_id in self._preprepared_dummy_request_ids:
             return None
@@ -998,12 +1080,6 @@ class KVCacheManager(BaseResourceManager):
                     "Cross KV cache allocation requires "
                     f"encoder_output_len for request {req.py_request_id}.")
             return int(encoder_output_len)
-        if is_star_cp:
-            if req.ctx_iters != 0:
-                return None
-            seq_len = sum(len(ctx_block) for ctx_block in req.ctx_blocks)
-            return seq_len + (len(req.query_id) if self.mapping.cp_rank
-                              == self.mapping.cp_size - 1 else 0)
         if not req.is_first_context_chunk or not self._kv_connector_should_add_sequence(
                 req):
             return None
@@ -1015,8 +1091,6 @@ class KVCacheManager(BaseResourceManager):
         if self.kv_cache_type == CacheTypeCpp.CROSS:
             return self._prepare_cross_resources(scheduled_batch)
 
-        is_star_cp = ('cp_type' in self.mapping.cp_config
-                      and CpType.STAR == self.mapping.cp_config['cp_type'])
         with request_context(self.is_draft, scheduled_batch):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
@@ -1026,7 +1100,7 @@ class KVCacheManager(BaseResourceManager):
             # claim-then-onboard strategy that prevents host offloading from
             # evicting reusable blocks in the radix tree.
             batch_request_infos, batch_llm_requests = self._collect_context_sequences(
-                scheduled_batch, is_cross=False, is_star_cp=is_star_cp)
+                scheduled_batch, is_cross=False)
 
             if batch_request_infos:
                 self.impl.add_sequence_batch(batch_request_infos,
@@ -1085,7 +1159,7 @@ class KVCacheManager(BaseResourceManager):
                 scheduled_batch, self)
 
     def _collect_context_sequences(self, scheduled_batch: ScheduledRequests,
-                                   is_cross: bool, is_star_cp: bool):
+                                   is_cross: bool):
         """Build the (request_info, llm_request) lists for add_sequence_batch.
 
         Cross (encoder) sequences are sized from encoder_output_len with a beam
@@ -1095,7 +1169,7 @@ class KVCacheManager(BaseResourceManager):
         batch_request_infos = []
         batch_llm_requests = []
         for req in scheduled_batch.context_requests:
-            seq_len = self._context_seq_len(req, is_cross, is_star_cp)
+            seq_len = self._context_seq_len(req, is_cross)
             if seq_len is None:
                 continue
             beam_width = 1 if is_cross else req.py_beam_width
@@ -1115,7 +1189,7 @@ class KVCacheManager(BaseResourceManager):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
             batch_request_infos, batch_llm_requests = self._collect_context_sequences(
-                scheduled_batch, is_cross=True, is_star_cp=False)
+                scheduled_batch, is_cross=True)
             if batch_request_infos:
                 self.impl.add_sequence_batch(batch_request_infos,
                                              batch_llm_requests)
@@ -1148,12 +1222,8 @@ class KVCacheManager(BaseResourceManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        # For capturable drafting loops. During normal inference, the draft model always
-        # has enough KV cache space to fit all of our draft tokens. During warmup, however,
-        # we need to make the KV cache manager aware that multiple autoregressive steps will
-        # occur.
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
+        capture_sampling_params: Optional[SamplingParams] = None,
     ):
         _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         available_blocks = self.get_num_free_blocks()
@@ -1169,9 +1239,17 @@ class KVCacheManager(BaseResourceManager):
         draft_batch_llm_requests = []
         for i, req_id in enumerate(request_ids):
             # exact choice of n can be ignored for dummy requests
-            sampling_params = SamplingParams(n=beam_width,
-                                             best_of=beam_width,
-                                             use_beam_search=beam_width > 1)
+            sampling_params = SamplingParams(
+                n=beam_width,
+                best_of=beam_width,
+                use_beam_search=beam_width > 1,
+                temperature=capture_sampling_params.temperature
+                if capture_sampling_params is not None else None,
+                top_k=capture_sampling_params.top_k
+                if capture_sampling_params is not None else None,
+                top_p=capture_sampling_params.top_p
+                if capture_sampling_params is not None else None,
+            )
             # Here 1+max_num_draft_tokens is used to extend the prompt length to
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
@@ -1217,8 +1295,6 @@ class KVCacheManager(BaseResourceManager):
                                              batch_llm_requests)
                 for req_id, token_num, _ in batch_request_infos:
                     for _ in range(self.num_extra_kv_tokens):
-                        self.impl.add_token(req_id)
-                    for _ in range(num_extra_decoding_steps):
                         self.impl.add_token(req_id)
 
             if draft_batch_request_infos and draft_kv_cache_manager is not None:
@@ -1567,20 +1643,6 @@ class KVCacheManager(BaseResourceManager):
         blocks_in_secondary_pool = int(max_tokens_secondary // tokens_per_block)
 
         return blocks_in_primary_pool, blocks_in_secondary_pool
-
-    def get_max_atten_window_upper_bound(self, blocks_in_primary_pool,
-                                         tokens_per_block, max_beam_width,
-                                         max_seq_len: Optional[int]):
-        token_capacity = blocks_in_primary_pool * tokens_per_block
-        max_blocks_per_seq = math.floor(token_capacity /
-                                        (max_beam_width * tokens_per_block))
-        assert max_blocks_per_seq > 0, "Impossible to fit in any sequence in kvCache"
-
-        max_atten_window_upper_bound = max_blocks_per_seq * tokens_per_block
-        if max_seq_len is not None and max_seq_len > max_atten_window_upper_bound and max_beam_width > 1:
-            max_atten_window_upper_bound -= tokens_per_block
-        assert max_atten_window_upper_bound > 0, "Impossible to fit in any sequence in kvCache"
-        return max_atten_window_upper_bound
 
     def _resolve_window_size(
             self,
@@ -2408,7 +2470,6 @@ class KVCacheManager(BaseResourceManager):
         blocks_per_window: BlocksPerWindow,
         tokens_per_block: int,
         max_seq_len: int,
-        max_beam_width: int,
     ) -> Tuple[BlocksPerWindow, int, List[int], Dict[int, int]]:
         """
         Validate and adjust attention windows against their upper bounds if needed.
@@ -2434,11 +2495,8 @@ class KVCacheManager(BaseResourceManager):
                           _) in blocks_per_window.items():
             if window_size < 0:
                 continue
-            upper_bound = self.get_max_atten_window_upper_bound(
-                blocks_in_primary_pool=blocks_in_primary_pool,
-                tokens_per_block=tokens_per_block,
-                max_beam_width=max_beam_width,
-                max_seq_len=max_seq_len)
+            upper_bound = blocks_in_primary_pool * tokens_per_block
+            assert upper_bound > 0, "Impossible to fit in any sequence in kvCache"
             if window_size > upper_bound:
                 logger.warning(
                     f"Attention window size {window_size} exceeds upper bound {upper_bound} "
@@ -2860,6 +2918,13 @@ class KVCacheCompressionManager(BaseResourceManager):
 
 class ResourceManager:
 
+    # KV pools a request's block demand is charged against.
+    _KV_BUDGET_RESOURCE_TYPES = (
+        ResourceManagerType.KV_CACHE_MANAGER,
+        ResourceManagerType.DRAFT_KV_CACHE_MANAGER,
+        ResourceManagerType.CROSS_KV_CACHE_MANAGER,
+    )
+
     def __init__(self, resource_managers: dict[ResourceManagerType,
                                                BaseResourceManager]):
         self.resource_managers = OrderedDict(resource_managers)
@@ -2874,6 +2939,36 @@ class ResourceManager:
     def get_resource_manager(
             self, type: ResourceManagerType) -> Optional[BaseResourceManager]:
         return self.resource_managers.get(type)
+
+    def get_request_kv_block_budgets(
+            self,
+            request: LlmRequest) -> List[Tuple[ResourceManagerType, int, int]]:
+        budgets = []
+        for resource_type in self._KV_BUDGET_RESOURCE_TYPES:
+            kv_cache_manager = self.get_resource_manager(resource_type)
+            if kv_cache_manager is None:
+                continue
+            budget = kv_cache_manager.get_request_kv_block_budget(request)
+            if budget is not None:
+                required_blocks, primary_capacity = budget
+                budgets.append(
+                    (resource_type, required_blocks, primary_capacity))
+            else:
+                logger.warning_once(
+                    f"Resource manager {resource_type} does not provide a per-request KV block budget",
+                    key=f"missing_kv_block_budget:{resource_type.value}",
+                )
+        return budgets
+
+    def get_unchecked_kv_block_budget_pools(self) -> List[ResourceManagerType]:
+        """KV pools present but excluded from the admission check, i.e. those
+        whose ``get_request_kv_block_budget`` returns ``None`` for every
+        request."""
+        return [
+            resource_type for resource_type in self._KV_BUDGET_RESOURCE_TYPES
+            if (manager := self.get_resource_manager(resource_type)) is not None
+            and not manager.kv_block_budget_applies()
+        ]
 
     @nvtx_range("maybe_fit_token_budget")
     def maybe_fit_token_budget(self, scheduled_batch: ScheduledRequests):

@@ -66,8 +66,12 @@ def _make_minimal_nano_model_config():
 
 @pytest.mark.cpu_only
 def test_nemotron_nano_registers_native_multimodal_epd_components():
-    """Native Nano VL/Omni classes advertise MM EPD support."""
-    for arch in ("NemotronH_Nano_VL_V2", "NemotronH_Nano_Omni_Reasoning_V3"):
+    """Every arch served by the native Nano VL class advertises MM EPD support."""
+    for arch in (
+        "NemotronH_Nano_VL_V2",
+        "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronH_Omni_Reasoning_V3",
+    ):
         vision_encoder_cls, vlm_base_model = MODEL_CLASS_VISION_ENCODER_MAPPING[arch]
         assert vision_encoder_cls is NanoV2VLMultimodalEncoder
         assert vlm_base_model is None
@@ -281,9 +285,9 @@ def nano_llm_model():
         torch.cuda.empty_cache()
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("condition", ["single", "multiple"])
 @pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.cpu_only
 def test_nemotron_nano_v2_vl_input_processor(data_dict_fixture, condition, modality):
     # Create input processor for NemotronH_Nano_VL_V2.
     tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
@@ -422,7 +426,7 @@ def test_nemotron_nano_v2_vl_image_batch_equivalence(nano_llm_model):
 
     Two distinct image+prompt requests are sent (a) together in one
     `generate` call so the engine batches them in a single forward step
-    (and thus a single `_encode_multimodal` invocation with two
+    (and thus a single `_encode_image_group` invocation with two
     multimodal_params), and (b) separately in two `generate` calls. With
     greedy decoding, the resulting token IDs must be identical and the
     logprobs must match within bf16 tolerance. This is intended to detect
@@ -564,68 +568,6 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
 
 
 @pytest.mark.cpu_only
-class TestEncodeMultimodalDispatch:
-    def _make_mock_model(self):
-        """Create a minimal mock with the attributes `_encode_multimodal` needs."""
-        model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
-        model.vision_encoder = mock.MagicMock(spec=NanoV2VLVisionEncoder)
-        model.sound_encoder = mock.MagicMock(spec=ProjectedParakeet)
-        return model
-
-    @staticmethod
-    def _assert_compatible_with_chunked_prefill(multimodal_embeddings):
-        # NOTE: `multimodal_embeddings` is expected to be the output of `_encode_multimodal`.
-        # The below checks help verify that we can make use of `get_multimodal_embeddings` and its
-        # caching feature. Otherwise, we would be re-encoding the items each chunk during chunked
-        # prefill.
-        assert len(multimodal_embeddings) == 1
-        assert isinstance(multimodal_embeddings[0], torch.Tensor)
-
-    def test_encode_multimodal_dispatches_audio(self):
-        model = self._make_mock_model()
-        fake_audio_embeds = torch.randn(10, 128)
-        # All audio is encoded via the batched `_encode_audio` helper.
-        model._encode_audio = mock.MagicMock(return_value=[(fake_audio_embeds, [10])])
-
-        mm_param = mock.MagicMock()
-        audio_data = {"foo": "bar"}
-        mm_param.multimodal_data = {"modality_type": "audio", "audio": audio_data}
-
-        # Call the real method on our mock
-        result = NemotronH_Nano_VL_V2._encode_multimodal(model, [mm_param])
-
-        model._encode_audio.assert_called_once_with([audio_data])
-        model.vision_encoder.assert_not_called()
-        self._assert_compatible_with_chunked_prefill(result)
-        assert torch.equal(result[0], fake_audio_embeds)
-
-    def test_encode_multimodal_dispatches_image(self):
-        model = self._make_mock_model()
-        fake_image_embeds = torch.randn(10, 128)
-        model.vision_encoder.return_value = ([fake_image_embeds], [None])
-
-        mm_param = mock.MagicMock()
-        mm_param.multimodal_data = {
-            "modality_type": "image",
-            "image": {"pixel_values": torch.randn(1, 100, 768)},
-        }
-
-        result = NemotronH_Nano_VL_V2._encode_multimodal(model, [mm_param])
-
-        model.vision_encoder.assert_called_once_with([mm_param])
-        self._assert_compatible_with_chunked_prefill(result)
-
-    def test_encode_multimodal_unknown_modality_raises(self):
-        """Unknown modality raises ValueError."""
-        model = self._make_mock_model()
-        mm_param = mock.MagicMock()
-        mm_param.multimodal_data = {"modality_type": "smell"}
-
-        with pytest.raises(ValueError, match="Unknown modality"):
-            NemotronH_Nano_VL_V2._encode_multimodal(model, [mm_param])
-
-
-@pytest.mark.cpu_only
 class TestSoundPlaceholderInjection:
     """Test the sound placeholder token's injection points.
 
@@ -693,126 +635,6 @@ class TestSoundPlaceholderInjection:
             f"  Expected: {expected!r}\n"
             f"  Got:      {result!r}"
         )
-
-
-@pytest.mark.cpu_only
-class TestEncodeMultimodalAudioOrder:
-    """Test video / audio embedding order in multi-item scenarios."""
-
-    def _make_video_param(self, *, has_audio: bool) -> MultimodalParams:
-        """Create a MultimodalParams for a video, optionally with audio."""
-        audio_data = None
-        if has_audio:
-            audio_data = {
-                "input_audio_features": torch.randn(1, 80, 100),
-                "feature_attention_mask": torch.ones(1, 100),
-                "has_audio": [True],
-                "audio_num_clips": torch.tensor([1]),
-            }
-        video_payload = {"audio": audio_data} if audio_data else {}
-        param = MagicMock(spec=MultimodalParams)
-        param.multimodal_data = {
-            "modality_type": "video",
-            "video": video_payload,
-        }
-        return param
-
-    def test_multi_video_audio_interleaving(self):
-        # Two videos with audio: each returned embedding should be
-        # [vision_i, audio_i], not [vision_1 + vision_2, audio_1 + audio_2]."""
-        hidden = 16
-        v1_len, a1_len = 10, 3
-        v2_len, a2_len = 8, 4
-
-        v1_emb = torch.randn(v1_len, hidden)
-        a1_emb = torch.randn(a1_len, hidden)
-        v2_emb = torch.randn(v2_len, hidden)
-        a2_emb = torch.randn(a2_len, hidden)
-
-        # All video params are encoded in a single batched call; the encoder
-        # returns one embedding per param, in input order.
-        vision_return = (
-            [v1_emb, v2_emb],
-            [list(range(v1_len)), list(range(v2_len))],
-        )
-
-        # All audio (across both videos) is encoded in a single batched call;
-        # the helper returns one (emb, per_clip_counts) per input in order.
-        audio_returns = [(a1_emb, [a1_len]), (a2_emb, [a2_len])]
-
-        params = [
-            self._make_video_param(has_audio=True),
-            self._make_video_param(has_audio=True),
-        ]
-
-        # Build a minimal mock of NemotronH_Nano_VL_V2 with only the attributes `_encode_multimodal`
-        # touches.
-        model = MagicMock()
-        model.vision_encoder = MagicMock(return_value=vision_return)
-        model.sound_encoder = MagicMock()  # not None -> audio path taken
-        model._encode_audio = MagicMock(return_value=audio_returns)
-        # Mock the interleaver to simply concatenate vision + audio, since this test only verifies
-        # per-param dispatch, not interleaving math.
-        model._interleave_video_audio_embeddings = MagicMock(
-            side_effect=lambda v, a, *args, **kwargs: torch.cat([v, a], dim=0)
-        )
-
-        # Call the real method, bound to our mock.
-        # `_encode_multimodal` now returns a single-element list whose tensor
-        # concatenates per-request embeddings in order.
-        result = NemotronH_Nano_VL_V2._encode_multimodal(model, params)
-
-        assert len(result) == 1, "Should return a single concatenated tensor"
-        combined = result[0]
-
-        # First video: [v1, a1]
-        expected_0 = torch.cat([v1_emb, a1_emb], dim=0)
-        assert torch.equal(combined[: v1_len + a1_len], expected_0), (
-            "Video 1 slice should be [vision_1, audio_1]"
-        )
-
-        # Second video: [v2, a2]
-        expected_1 = torch.cat([v2_emb, a2_emb], dim=0)
-        assert torch.equal(combined[v1_len + a1_len :], expected_1), (
-            "Video 2 slice should be [vision_2, audio_2]"
-        )
-
-    def test_video_without_audio_skips_audio_concat(self):
-        """A video param with no audio should return vision-only embeddings."""
-        hidden = 16
-        v_len = 6
-        v_emb = torch.randn(v_len, hidden)
-
-        param = self._make_video_param(has_audio=False)
-
-        model = MagicMock()
-        model.vision_encoder = MagicMock(return_value=([v_emb], [list(range(v_len))]))
-        model.sound_encoder = MagicMock()
-        model._encode_audio = MagicMock()
-
-        result = NemotronH_Nano_VL_V2._encode_multimodal(model, [param])
-
-        assert len(result) == 1
-        assert torch.equal(result[0], v_emb), "Vision-only video should not have audio appended"
-        model._encode_audio.assert_not_called()
-
-    def test_no_audio_concat_when_sound_encoder_is_none(self):
-        hidden = 16
-        v_len = 5
-        v_emb = torch.randn(v_len, hidden)
-
-        param = self._make_video_param(has_audio=True)
-
-        model = MagicMock()
-        model.vision_encoder = MagicMock(return_value=([v_emb], [list(range(v_len))]))
-        model.sound_encoder = None  # no audio support
-        model._encode_audio = MagicMock()
-
-        result = NemotronH_Nano_VL_V2._encode_multimodal(model, [param])
-
-        assert len(result) == 1
-        assert torch.equal(result[0], v_emb)
-        model._encode_audio.assert_not_called()
 
 
 @pytest.mark.cpu_only
@@ -1022,109 +844,15 @@ class TestEncodeAudio:
 
 
 @pytest.mark.cpu_only
-class TestEncodeMultimodalContract:
-    """Verify `_encode_multimodal` conforms to the contract expected by `get_multimodal_embeddings`.
-
-    The key assumption is that the `encoder_forward_fn` passed to it returns something whose length
-    is 1, and can be indexed by `[0]` to return a single `torch.Tensor`.
-    """
-
-    HIDDEN = 128
-
-    def _make_mock_model(self):
-        model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
-        model.vision_encoder = mock.MagicMock(spec=NanoV2VLVisionEncoder)
-        model.sound_encoder = mock.MagicMock(spec=ProjectedParakeet)
-        return model
-
-    def _make_mm_param(self, modality_type, **extra):
-        # Mirror the shape produced by the input processor: a nested dict keyed
-        # by `modality_type` holds per-modality side-channel data (e.g. audio
-        # payload for video). Extra kwargs override / extend that nested dict.
-        param = mock.MagicMock()
-        nested = extra.pop(modality_type, {})
-        param.multimodal_data = {
-            "modality_type": modality_type,
-            modality_type: nested,
-            **extra,
-        }
-        return param
-
-    def test_returns_list_with_a_single_element(self):
-        model = self._make_mock_model()
-        model.vision_encoder.return_value = ([torch.randn(5, self.HIDDEN)], [None])
-
-        param = self._make_mm_param("image")
-        result = NemotronH_Nano_VL_V2._encode_multimodal(model, [param])
-
-        assert isinstance(result, list)
-        assert len(result) == 1
-
-    def test_single_concatenated_tensor_for_multiple_multimodal_items(self):
-        """Multiple multimodal items must be concatenated into a single tensor.
-
-        `get_multimodal_embeddings` requires `len(embeddings) == 1` and splits by per-request token
-        counts in order to cache the embeddings.
-
-        Image params are batched into a single `vision_encoder` call that
-        returns a per-param embedding list.
-        """
-        model = self._make_mock_model()
-        emb_a = torch.randn(5, self.HIDDEN)
-        emb_b = torch.randn(3, self.HIDDEN)
-        model.vision_encoder.return_value = ([emb_a, emb_b], [None, None])
-
-        params = [self._make_mm_param("image"), self._make_mm_param("image")]
-        result = NemotronH_Nano_VL_V2._encode_multimodal(model, params)
-
-        # All image params go through a single batched vision_encoder call.
-        assert model.vision_encoder.call_count == 1
-        assert model.vision_encoder.call_args.args == (params,)
-        assert len(result) == 1
-        assert result[0].shape == (8, self.HIDDEN)
-        # Verify concatenation order is preserved.
-        assert torch.equal(result[0][:5], emb_a)
-        assert torch.equal(result[0][5:], emb_b)
-
-    def test_mixed_modalities_still_single_tensor(self):
-        """Image + audio requests produce one concatenated tensor."""
-        model = self._make_mock_model()
-        img_emb = torch.randn(5, self.HIDDEN)
-        audio_emb = torch.randn(3, self.HIDDEN)
-        model.vision_encoder.return_value = ([img_emb], [None])
-        model._encode_audio = mock.MagicMock(return_value=[(audio_emb, [3])])
-
-        params = [
-            self._make_mm_param("image"),
-            self._make_mm_param("audio", audio={}),
-        ]
-        result = NemotronH_Nano_VL_V2._encode_multimodal(model, params)
-
-        assert len(result) == 1
-        assert result[0].shape == (8, self.HIDDEN)
-
-    def test_empty_params_returns_empty_list(self):
-        model = self._make_mock_model()
-        result = NemotronH_Nano_VL_V2._encode_multimodal(model, [])
-        assert result == []
-
-
-@pytest.mark.cpu_only
 class TestChunkedPrefillCaching:
-    """Verify that `_encode_multimodal` output is compatible with `get_multimodal_embeddings`.
+    """Verify chunked-prefill caching still works through the group encoder path.
 
-    Specifically, we want to test that the caching functionality is exercised and not skipped due
-    to the return type not being compatible.
-
-    The test structure for each modality:
-
-    1. Build `MultimodalParams` with a real `MultimodalRuntimeData` (past_seen_token_num=0,
-       simulating the first chunk).
-    2. Call `get_multimodal_embeddings` with the real _encode_multimodal wired to mock sub-encoders
-       -> encoder MUST be invoked.
-    3. Verify embeddings were cached in `multimodal_data`.
-    4. Call `get_multimodal_embeddings` again with the SAME params (simulating a second chunk) ->
-       encoder must NOT be invoked.
+    On the first chunk `get_multimodal_embeddings` runs the encoder and
+    caches the returned tensor into `multimodal_data["multimodal_embedding"]`.
+    A second call with the same params must skip the encoder. The
+    encoder_fn here is `encode_multimodal_by_groups` bound to the model's
+    three per-modality groups — the shape all Nemotron production forwards
+    take.
     """
 
     HIDDEN = 128
@@ -1136,35 +864,56 @@ class TestChunkedPrefillCaching:
         model.sound_encoder = mock.MagicMock(spec=ProjectedParakeet)
         return model
 
-    def _make_param_with_runtime(self, modality_type, num_tokens, **extra):
-        """Build a real MultimodalParams with runtime data for caching."""
-        # Single contiguous mm block of `num_tokens` tokens, none cached yet:
-        # mask = all-True over the chunk, cumsum = [1, 2, ..., num_tokens].
+    def _make_param_with_runtime(self, modality, num_tokens, **extra):
+        """`MultimodalParams` with per-modality bucket + runtime metadata.
+
+        `multimodal_embedding_lengths` is required for the group encoder path:
+        `_lengths_by_modality` uses it to slice the encoder output back into
+        per-modality tensors. Single-item request → single-entry list.
+        """
         embed_mask_cumsum = torch.arange(1, num_tokens + 1, dtype=torch.int64)
         runtime = MultimodalRuntimeData(
             past_seen_token_num=0,
             chunk_end_pos=num_tokens,
             embed_mask_cumsum=embed_mask_cumsum,
         )
-        # Mirror the nested shape produced by the input processor: a dict
-        # keyed by `modality_type` holds per-modality side-channel data.
-        nested = extra.pop(modality_type, {})
+        nested = extra.pop(modality, {})
         return MultimodalParams(
             multimodal_data={
-                "modality_type": modality_type,
-                modality_type: nested,
+                "modality_type": modality,
+                modality: nested,
+                "multimodal_embedding_lengths": [num_tokens],
                 **extra,
             },
             multimodal_runtime=runtime,
         )
 
     def _make_encoder_fn(self, model):
-        """Wrap `_encode_multimodal` as a callable for get_multimodal_embeddings."""
+        """Route through `encode_multimodal_by_groups` with real group methods
+        bound to the mock's stubbed sub-encoders — matches the production
+        `NemotronH_Nano_VL_V2.forward` path.
 
-        def encoder_fn(params):
-            return NemotronH_Nano_VL_V2._encode_multimodal(model, params)
+        The group encoder_fns are invoked via `**build_batched_input(...)`,
+        which spreads the pack dict as kwargs — so the wrappers must accept
+        `multimodal_params` by keyword.
+        """
+        from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+            EncoderGroup,
+            encode_multimodal_by_groups,
+        )
 
-        return encoder_fn
+        def _pack(params):
+            return {"multimodal_params": params}
+
+        def _run_group(method):
+            return lambda multimodal_params: method(model, multimodal_params)
+
+        groups = (
+            EncoderGroup(("image",), _run_group(NemotronH_Nano_VL_V2._encode_image_group), _pack),
+            EncoderGroup(("video",), _run_group(NemotronH_Nano_VL_V2._encode_video_group), _pack),
+            EncoderGroup(("audio",), _run_group(NemotronH_Nano_VL_V2._encode_audio_group), _pack),
+        )
+        return lambda params: encode_multimodal_by_groups(groups, params)
 
     @pytest.mark.parametrize("modality", ["image", "video"])
     def test_vision_encoder_not_called_on_second_chunk(self, modality):
@@ -1175,7 +924,7 @@ class TestChunkedPrefillCaching:
         param = self._make_param_with_runtime(modality, self.NUM_TOKENS)
         encoder_fn = self._make_encoder_fn(model)
 
-        # First call: encoder must run and cache the result.
+        # First call: encoder runs and caches.
         result = get_multimodal_embeddings(
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param],
@@ -1183,33 +932,26 @@ class TestChunkedPrefillCaching:
         assert len(result) == 1
         assert result[0].shape == (self.NUM_TOKENS, self.HIDDEN)
         assert model.vision_encoder.call_count == 1
-
-        # Embedding is now cached in multimodal_data.
         assert "multimodal_embedding" in param.multimodal_data
 
-        # Second call: encoder must NOT run - embeddings come from cache.
+        # Second call: comes from cache.
         result2 = get_multimodal_embeddings(
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param],
         )
         assert model.vision_encoder.call_count == 1, (
-            "`vision_encoder` was called again on the second chunk. "
-            "Caching is broken - `_encode_multimodal` likely violates the "
-            "`get_multimodal_embeddings` return type contract."
+            "`vision_encoder` was called again on the second chunk. Caching is broken."
         )
-        assert len(result2) == 1
         assert torch.equal(result2[0], result[0])
 
     def test_audio_encoder_not_called_on_second_chunk(self):
         model = self._make_mock_model()
         fake_emb = torch.randn(self.NUM_TOKENS, self.HIDDEN)
-        # Audio is encoded via the batched `_encode_audio` helper.
         model._encode_audio = mock.MagicMock(return_value=[(fake_emb, [self.NUM_TOKENS])])
 
         param = self._make_param_with_runtime("audio", self.NUM_TOKENS, audio={})
         encoder_fn = self._make_encoder_fn(model)
 
-        # First call.
         result = get_multimodal_embeddings(
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param],
@@ -1217,15 +959,12 @@ class TestChunkedPrefillCaching:
         assert len(result) == 1
         assert model._encode_audio.call_count == 1
 
-        # Second call - should use cache.
         result2 = get_multimodal_embeddings(
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param],
         )
         assert model._encode_audio.call_count == 1, (
-            "`_encode_audio` was called again on the second chunk. "
-            "Caching is broken - `_encode_multimodal` likely violates the "
-            "`get_multimodal_embeddings` return type contract."
+            "`_encode_audio` was called again on the second chunk. Caching is broken."
         )
         assert torch.equal(result2[0], result[0])
 
@@ -1234,14 +973,12 @@ class TestChunkedPrefillCaching:
         model = self._make_mock_model()
         emb_a = torch.randn(5, self.HIDDEN)
         emb_b = torch.randn(3, self.HIDDEN)
-        # All image params are encoded in a single batched call.
         model.vision_encoder.return_value = ([emb_a, emb_b], [None, None])
 
         param_a = self._make_param_with_runtime("image", 5)
         param_b = self._make_param_with_runtime("image", 3)
         encoder_fn = self._make_encoder_fn(model)
 
-        # First call: encoder runs once for the whole image batch.
         result = get_multimodal_embeddings(
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param_a, param_b],
@@ -1251,19 +988,14 @@ class TestChunkedPrefillCaching:
         assert model.vision_encoder.call_count == 1, (
             "image params should be encoded in a single batched vision_encoder call"
         )
-
-        # Both should be cached.
         assert "multimodal_embedding" in param_a.multimodal_data
         assert "multimodal_embedding" in param_b.multimodal_data
 
-        # Second call: encoder must not run again.
         result2 = get_multimodal_embeddings(
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param_a, param_b],
         )
         assert model.vision_encoder.call_count == 1, (
-            "`vision_encoder` was called again on the second chunk. "
-            "Caching is broken - `_encode_multimodal` likely violates the "
-            "`get_multimodal_embeddings` return type contract."
+            "`vision_encoder` was called again on the second chunk. Caching is broken."
         )
         assert torch.equal(result2[0], result[0])

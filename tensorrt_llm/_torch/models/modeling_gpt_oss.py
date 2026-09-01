@@ -24,9 +24,8 @@ from ..modules.embedding import Embedding
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
-from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
-                                 RenormalizeMoeRoutingMethod, TritonFusedMoE,
-                                 create_moe)
+from ..moe.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
+                             TritonFusedMoE, create_moe, is_moe_weight_owner)
 # isort: on
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
@@ -697,13 +696,13 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             # We need to use parent module name (without .backend) to match saved weight names.
             # After MoE refactoring is fully complete, all paths will follow this branch.
             names = name.split('.')
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 # Backend is under experts module (ConfigurableMoE wrapper)
                 name = '.'.join(names[:-1])
 
             module_weights = filter_weights(name, weights)
 
-            if isinstance(module, MoE):
+            if is_moe_weight_owner(module):
                 try:
                     # For BF16 ckpt.
                     # Deinterleave for gate and up.
@@ -826,13 +825,13 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                 name = name.replace(k, v)
 
             names = name.split('.')
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 # Backend is under experts module (ConfigurableMoE wrapper)
                 name = '.'.join(names[:-1])
 
             module_weights = filter_weights(name, weights)
 
-            if isinstance(module, MoE):
+            if is_moe_weight_owner(module):
                 assert getattr(module, "quant_config", None) is not None and \
                    module.quant_config.quant_mode.has_nvfp4()
                 gate_up = module_weights.get('gate_up_proj', None)

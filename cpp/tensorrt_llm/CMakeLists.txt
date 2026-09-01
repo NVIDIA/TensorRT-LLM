@@ -142,7 +142,6 @@ endif()
 
 add_subdirectory(common)
 add_subdirectory(kernels)
-add_subdirectory(layers)
 add_subdirectory(runtime)
 
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
@@ -181,6 +180,7 @@ set(TRTLLM_LINK_LIBS
     decoder_attention_src
     trtllm_gen_fmha
     trtllm_gen_fp8_block_scale_moe
+    trtllm_gen_fp8_block_scale_moe_routing
     trtllm_gen_gemm
     trtllm_gen_gemm_gated_act
     trtllm_gen_batched_gemm
@@ -196,7 +196,6 @@ set(TRTLLM_LINK_LIBS
     gemm_swiglu_sm90_src
     cutlass_src
     cute_dsl_src
-    layers_src
     runtime_src
     compressorKernels_src
     mhcKernels_src

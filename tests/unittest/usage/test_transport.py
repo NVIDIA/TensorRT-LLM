@@ -250,7 +250,15 @@ class TestStagingEndpoint:
         import platform as plat
         import uuid
 
-        for context_value in ("cli_serve", "cli_bench", "cli_eval", "llm_class", "unknown", ""):
+        for context_value in (
+            "cli_serve",
+            "cli_bench",
+            "cli_eval",
+            "llm_class",
+            "disaggregated",
+            "unknown",
+            "",
+        ):
             report = schema.TrtllmInitialReport(
                 trtllmVersion="0.0.0-test",
                 platform=plat.platform(),

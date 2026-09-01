@@ -14,7 +14,7 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
-from tensorrt_llm._torch.peft.lora.layer import LoraLayer, add_lora_result
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
@@ -31,8 +31,19 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
+from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
+from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
+
+
+def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
+    """Fast pre-filter: check the global enable flag and M upper bound only."""
+    if not LOW_M_GEMM_ACTIVE:
+        return False
+    if input.ndim < 1:
+        return False
+    k = int(input.shape[-1])
+    return k > 0 and input.numel() <= _LOW_M_GEMM_MAX_M * k
 
 
 class WeightMode(str, enum.Enum):
@@ -516,6 +527,25 @@ class LinearMethodBase(ABC):
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
+    """Linear method for unquantized (BF16 / FP16 / FP32) weights.
+
+    BF16 GEMM dispatch (priority order, Blackwell SM100/SM103)
+    ----------------------------------------------------------
+    1. **low-m GEMM** (``TRTLLM_LOW_M_GEMM_BACKEND=auto``, M ≤ 32)
+       CuTe-DSL low-m GEMM kernel for small-M decode batches on Blackwell.
+       Orthogonal to ``use_cute_dsl_bf16_gemm`` — must be enabled
+       independently via the env var.
+
+    2. **persistent GEMM** (``Linear(use_cute_dsl_bf16_gemm=True)``)
+       ``trtllm::cute_dsl_bf16_gemm_blackwell`` persistent CuTe-DSL kernel.
+
+    3. **cublas_mm** (``Linear(use_custom_cublas_mm=True)``)
+       ``trtllm::cublas_mm``; use when TP AllReduce fuse via NCCL
+       symmetric-memory window is needed (``output_buffer_kind=NCCL_WINDOW``).
+
+    4. **F.linear** (default)
+       PyTorch cuBLASLt; general-purpose fallback for all other cases.
+    """
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
@@ -543,6 +573,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
+        # kernel and returns None to fall through to the normal GEMM path.
+        # Skip when use_custom_cublas_mm is set: that path may allocate output
+        # in an NCCL symmetric-memory window for TP all-reduce fusion, which
+        # the low-M dispatcher does not support.
+        if _should_apply_low_m_gemm(input) and not getattr(
+                module, "use_custom_cublas_mm", False):
+            output = apply_low_m_gemm(module, input, module.weight, bias)
+            if output is not None:
+                return output
         # CuTe DSL BF16 GEMM path for Blackwell
         if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
                 and module.weight.dtype == torch.bfloat16):
@@ -858,11 +898,14 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         """
         weight_mode = module.weights_loading_config.weight_mode
         shard_key_to_index = weight_mode.shard_key_to_index
+        compute_device = module.weight.device
+        if compute_device.type == "cpu" and torch.cuda.is_available():
+            compute_device = torch.device("cuda")
 
         # Handle input_scale
         if hasattr(module, "has_static_input_scale"):
             # Compute max and replace input_scale with a new parameter
-            max_input_scale = module.tmp_input_scales.max()
+            max_input_scale = module.tmp_input_scales.to(compute_device).max()
             module.input_scale.data.copy_(max_input_scale)
             # Also update inv_input_scale for static quantization
             if hasattr(
@@ -876,13 +919,13 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 module.inv_input_scale = None
 
         # Compute max weight_scale
-        max_weight_scale = module.tmp_weight_scales.max()
+        max_weight_scale = module.tmp_weight_scales.to(compute_device).max()
         module.weight_scale.data.copy_(max_weight_scale)
 
         # Rescale each weight shard: (weight * original_scale) / max_scale
         for shard_key in weight_mode.shard_keys:
             idx = shard_key_to_index[shard_key]
-            original_scale = module.tmp_weight_scales[idx]
+            original_scale = module.tmp_weight_scales[idx].to(compute_device)
 
             # Get shard position from mapping
             shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
@@ -891,12 +934,14 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             # Rescale: FP8 -> BF16 -> multiply by original_scale -> divide by max_scale -> FP8
             weight_shard = module.weight.data[shard_offset:shard_offset +
                                               shard_size]
-            rescaled_weight = weight_shard.to(module.dtype).mul_(original_scale)
+            rescaled_weight = weight_shard.to(compute_device).to(
+                module.dtype).mul_(original_scale)
             rescaled_weight = rescaled_weight.div_(
                 max_weight_scale.to(rescaled_weight.device)).to(
                     torch.float8_e4m3fn)
             module.weight.data[shard_offset:shard_offset +
-                               shard_size] = rescaled_weight
+                               shard_size] = rescaled_weight.to(
+                                   module.weight.device)
 
         delattr(module, "tmp_input_scales")
         delattr(module, "tmp_weight_scales")
@@ -2078,7 +2123,7 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         input, original_shape = self._prepare_input(module, input)
-        from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import \
+        from tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4 import \
             dequant_nvfp4_2d_triton
         weight_deq = dequant_nvfp4_2d_triton(
             module.weight.view(torch.uint8),
@@ -3512,10 +3557,10 @@ class Linear(nn.Module):
         elif method_type is NVFP4LinearMethod:
             # The Marlin kernel is W4A16, so an explicit opt-in on a W4A4
             # checkpoint runs the weight-only method, which pads N/K to the
-            # tile sizes the kernel requires.
-            if ("marlin" in self.nvfp4_allowed_backends
-                    and is_nvfp4_marlin_supported_sm()
-                    and MarlinNVFP4LinearMethod.is_supported(self)):
+            # tile sizes the kernel requires. Reuse the same predicate the
+            # ``uses_marlin_nvfp4`` property reads, so the method chosen here
+            # and that property can never disagree on the SM.
+            if _uses_marlin_nvfp4_backend(self):
                 return MarlinNVFP4LinearMethod()
         return quant_method
 
@@ -3782,10 +3827,16 @@ class Linear(nn.Module):
                      bias,
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
-        output = self.quant_method.apply(self, input, bias)
         if self.lora is not None and bool(lora_params):
-            lora_result = self.lora(input, lora_params, layer_idx)
-            output = add_lora_result(output, lora_result)
+            output = LoraLayer.forward_with_base(
+                lambda: self.quant_method.apply(self, input, bias),
+                (self.lora, ),
+                input,
+                lora_params,
+                layer_idx,
+            )
+        else:
+            output = self.quant_method.apply(self, input, bias)
         return output
 
     def apply_linear_allreduce(self,

@@ -227,6 +227,21 @@ def _detect_external_launch() -> Optional[Tuple[int, int, int, str, int]]:
     return None
 
 
+def _cuda_memory_logging_enabled() -> bool:
+    """Whether per-request CUDA peak-memory logging is enabled.
+
+    This is a development-only knob exposed as an environment variable
+    (rather than a public ``VisualGenArgs`` field) to keep the engine
+    config surface clean, mirroring the nsys trace knob
+    ``TLLM_PROFILE_VISUAL_GEN_START_STOP``.
+    """
+    return os.environ.get("TLLM_VISUAL_GEN_LOG_CUDA_MEMORY", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 @dataclass
 class DiffusionRequest:
     """Request for diffusion inference.
@@ -369,6 +384,7 @@ class DiffusionExecutor:
                         "status": "READY",
                         "default_generation_params": self.pipeline.default_generation_params,
                         "extra_param_specs": self.pipeline.extra_param_specs,
+                        "supports_image_edit": self.pipeline.supports_image_edit,
                     },
                 )
             )
@@ -436,6 +452,9 @@ class DiffusionExecutor:
 
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
+        log_cuda_memory = _cuda_memory_logging_enabled()
+        if log_cuda_memory:
+            self._reset_cuda_peak_memory_stats()
         try:
             self._merge_defaults(req)
             # Include request preparation in executor-side generation latency.
@@ -457,7 +476,10 @@ class DiffusionExecutor:
                     f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
                 )
             output = self.pipeline.run_inference(req)
+            if log_cuda_memory:
+                self._log_cuda_peak_memory(req.request_id)
             generation = time.perf_counter() - generation_start  # seconds
+
             if self.rank == 0:
                 # CUDA IPC handles are invalid within the producing process, so
                 # a same-process client takes the media via in-process handoff.
@@ -470,6 +492,8 @@ class DiffusionExecutor:
                     )
                 )
         except Exception as e:
+            if log_cuda_memory:
+                self._log_cuda_peak_memory(req.request_id)
             logger.error(f"Worker {self.device_id}: Error: {e}")
             logger.error(traceback.format_exc())
             if self.rank == 0:
@@ -480,6 +504,36 @@ class DiffusionExecutor:
                         error_type=self.pipeline.classify_request_failure(e),
                     )
                 )
+
+    def _reset_cuda_peak_memory_stats(self) -> None:
+        """Reset CUDA peak memory stats for this worker if CUDA is available."""
+        if not torch.cuda.is_available():
+            return
+
+        try:
+            torch.cuda.reset_peak_memory_stats(self.device_id)
+        except RuntimeError as e:
+            logger.warning(
+                f"Worker {self.device_id} rank {self.rank}: "
+                f"Unable to reset CUDA peak memory stats: {e}"
+            )
+
+    def _log_cuda_peak_memory(self, request_id: int) -> None:
+        """Log peak CUDA memory observed for one request."""
+        if not torch.cuda.is_available():
+            return
+
+        try:
+            peak_allocated = torch.cuda.max_memory_allocated(self.device_id)
+            logger.info(
+                f"Worker {self.device_id} rank {self.rank}: "
+                f"Request {request_id} peak CUDA memory: {peak_allocated / 2**30:.2f} GiB"
+            )
+        except RuntimeError as e:
+            logger.warning(
+                f"Worker {self.device_id} rank {self.rank}: "
+                f"Unable to log CUDA peak memory for request {request_id}: {e}"
+            )
 
 
 def run_diffusion_worker(
@@ -534,19 +588,6 @@ def run_diffusion_worker(
                     f"The worker will run without NUMA pinning, which may impact "
                     f"performance."
                 )
-
-        # NCCL_NVLS_ENABLE=0 is required to prevent a hang on Blackwell when
-        # VSA (CuTeDSL) + Ulysses is active
-        if torch.cuda.is_available() and visual_gen_args is not None:
-            _attn = visual_gen_args.attention_config
-            _sa = getattr(_attn, "sparse_attention_config", None)
-            _is_vsa = (
-                getattr(_attn, "backend", "") == "CUTEDSL"
-                and getattr(_sa, "algorithm", "") == "vsa"
-            )
-            _has_ulysses = getattr(visual_gen_args.parallel_config, "ulysses_size", 1) > 1
-            if _is_vsa and _has_ulysses:
-                os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
         dist.init_process_group(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
@@ -679,6 +720,7 @@ class DiffusionRemoteClient:
         # Pipeline metadata — populated by _wait_ready from the READY signal.
         self.default_generation_params: Dict = {}
         self.extra_param_specs: Dict = {}
+        self.supports_image_edit: bool = False
 
         # --- Launch workers ---
         self.worker_processes = []
@@ -1034,6 +1076,7 @@ class DiffusionRemoteClient:
                             "default_generation_params", {}
                         )
                         self.extra_param_specs = payload.get("extra_param_specs", {})
+                        self.supports_image_edit = bool(payload.get("supports_image_edit", False))
                     elapsed = time.time() - start_time
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return

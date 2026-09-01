@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Performance metrics manager for PyExecutor.
 
 Encapsulates GPU/CPU timing instrumentation: event creation, recording,
@@ -156,7 +159,7 @@ class PerfMetricsManager:
             req.py_perf_timing.sample_start_time = sample_start_time
             req.py_perf_timing.sample_end_time = sample_end_time
 
-    def compute_batch_gpu_times(self, requests):
+    def compute_batch_gpu_times(self, requests, gpu_times_cache=None):
         """Compute GPU times once per batch for the last ctx chunk or gen step.
 
         Reads events from perf fields, computes elapsed_time once per batch,
@@ -164,11 +167,17 @@ class PerfMetricsManager:
         either ``ctx_chunk_metrics`` or ``step_metrics``.
         For ctx chunks, also accumulates ``ctx_gpu_forward_time`` across all
         chunks.
+
+        Args:
+            requests: Requests whose latest timing entry should be updated.
+            gpu_times_cache: Optional cache shared by multiple calls within one
+                response-processing pass. Its lifetime must not span executor
+                iterations because the timing events are reused.
         """
         if not self.enabled:
             return
-        batch_gpu_forward_time = None
-        batch_gpu_sample_time = None
+        if gpu_times_cache is None:
+            gpu_times_cache = {}
         for req in requests:
             perf = req.py_perf_timing
             if perf is None or perf.gpu_forward_start_event is None:
@@ -189,8 +198,15 @@ class PerfMetricsManager:
             if target is None:
                 continue
 
-            # Compute once per batch, reuse for all requests
-            if batch_gpu_forward_time is None:
+            # Ping-pong events are reused across iterations, so the CPU start
+            # timestamp is part of the batch identity.
+            cache_key = (
+                id(perf.gpu_forward_start_event),
+                id(perf.gpu_forward_end_event),
+                id(perf.gpu_sample_end_event),
+                perf.forward_start_time,
+            )
+            if cache_key not in gpu_times_cache:
                 if not perf.gpu_forward_end_event.query():
                     perf.gpu_forward_end_event.synchronize()
                 if perf.gpu_sample_end_event and not perf.gpu_sample_end_event.query():
@@ -216,6 +232,12 @@ class PerfMetricsManager:
                     )
                     batch_gpu_forward_time = 0.0
                     batch_gpu_sample_time = 0.0
+                gpu_times_cache[cache_key] = (
+                    batch_gpu_forward_time,
+                    batch_gpu_sample_time,
+                )
+
+            batch_gpu_forward_time, batch_gpu_sample_time = gpu_times_cache[cache_key]
 
             target["gpu_forward_time"] = batch_gpu_forward_time
             target["gpu_sample_time"] = batch_gpu_sample_time

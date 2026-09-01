@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TxSession,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import CtxTransferStatus, GenTransferStatus
 from tensorrt_llm.bindings import LlmRequestState
 
 
@@ -189,7 +191,9 @@ def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued(
         Mock(),
     )
 
-    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=1)
+    status = transceiver.check_context_transfer_status(at_least_request_num=1)
+    assert isinstance(status, CtxTransferStatus)
+    completed, failed = status
 
     assert completed == []
     assert failed == []
@@ -350,7 +354,9 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._gen_consensus_outcome = Mock(return_value=([], [], []))
     transceiver._close_failed_sessions = Mock()
 
-    completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
+    status = transceiver.check_gen_transfer_status(at_least_request_num=0)
+    assert isinstance(status, GenTransferStatus)
+    completed, failed, cancelled = status
 
     assert completed == []
     assert failed == []
@@ -1002,3 +1008,132 @@ def test_prepare_context_requests_skips_consensus_when_nothing_waiting() -> None
 
     transceiver.prepare_context_requests([])
     transceiver._ctx_consensus.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _poll_sessions_for_interval clamp (nvbugs 6647405)
+#
+# The idle executor loop calls check_context_transfer_status(1) on every
+# iteration where no batch is scheduled. The poll's exit condition
+# (completed + failed >= wait_num) can only ever count in-flight sessions, so
+# with _send_sessions empty the target used to be unsatisfiable and the helper
+# slept out the full kv_transfer_sender_future_timeout_ms (default 1000 ms)
+# per idle iteration, delaying scheduling of newly arrived requests.
+# ---------------------------------------------------------------------------
+
+
+def _make_bare_transceiver() -> KvCacheTransceiverV2:
+    """Bare instance; _poll_sessions_for_interval only needs _collect_done."""
+    return object.__new__(KvCacheTransceiverV2)
+
+
+class _PollFakeSession:
+    """Session stub that flips to completed after an optional wall-clock delay."""
+
+    def __init__(self, complete_after_s: Optional[float] = None, failed: bool = False) -> None:
+        self._failed = failed
+        self._complete_at = (
+            time.monotonic() + complete_after_s if complete_after_s is not None else None
+        )
+
+    def is_completed(self) -> bool:
+        return self._complete_at is not None and time.monotonic() >= self._complete_at
+
+    def has_failed(self) -> bool:
+        return self._failed
+
+    def wait_complete(self, blocking: bool = False) -> None:
+        pass
+
+
+class _PumpDrivenSession(_PollFakeSession):
+    """Completes only after wait_complete has been pumped, never by wall clock."""
+
+    def __init__(self, pumps_to_complete: int) -> None:
+        super().__init__()
+        self._pumps_left = pumps_to_complete
+        self._done = False
+
+    def is_completed(self) -> bool:
+        return self._done
+
+    def wait_complete(self, blocking: bool = False) -> None:
+        self._pumps_left -= 1
+        if self._pumps_left <= 0:
+            self._done = True
+
+
+_POLL_INTERVAL_MS = 1000
+
+
+def test_poll_interval_empty_sessions_returns_immediately() -> None:
+    """No in-flight session: the unsatisfiable target must not sleep out the interval."""
+    tc = _make_bare_transceiver()
+    start = time.monotonic()
+    tc._poll_sessions_for_interval({}, {}, 1, _POLL_INTERVAL_MS)
+    assert time.monotonic() - start < 0.1
+
+
+def test_poll_interval_wait_num_clamped_to_session_count() -> None:
+    """A target above len(sessions) waits only for what can actually complete."""
+    tc = _make_bare_transceiver()
+    sessions = {1: _PollFakeSession(complete_after_s=0.05)}
+    start = time.monotonic()
+    tc._poll_sessions_for_interval(sessions, {1: object()}, 2, _POLL_INTERVAL_MS)
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.5
+    assert sessions[1].is_completed()
+
+
+def test_poll_interval_waits_for_inflight_completion() -> None:
+    """An in-flight session is still awaited (the PR #17535 semantics are kept)."""
+    tc = _make_bare_transceiver()
+    sessions = {1: _PollFakeSession(complete_after_s=0.05)}
+    start = time.monotonic()
+    tc._poll_sessions_for_interval(sessions, {1: object()}, 1, _POLL_INTERVAL_MS)
+    elapsed = time.monotonic() - start
+    assert 0.04 <= elapsed < 0.5
+    assert sessions[1].is_completed()
+
+
+def test_poll_interval_deadline_bounds_never_completing_session() -> None:
+    """A session that never completes releases the caller at the deadline."""
+    tc = _make_bare_transceiver()
+    sessions = {1: _PollFakeSession(complete_after_s=None)}
+    start = time.monotonic()
+    tc._poll_sessions_for_interval(sessions, {1: object()}, 1, 100)
+    elapsed = time.monotonic() - start
+    assert 0.09 <= elapsed < 1.0
+
+
+def test_poll_interval_failed_session_counts_toward_target() -> None:
+    """A failed session satisfies the exit condition without waiting."""
+    tc = _make_bare_transceiver()
+    sessions = {1: _PollFakeSession(failed=True)}
+    start = time.monotonic()
+    tc._poll_sessions_for_interval(sessions, {1: object()}, 1, _POLL_INTERVAL_MS)
+    assert time.monotonic() - start < 0.1
+
+
+def test_poll_interval_completed_session_releases_despite_inflight_peer() -> None:
+    """One already-completed session satisfies wait_num=1 even with an in-flight peer."""
+    tc = _make_bare_transceiver()
+    sessions = {
+        1: _PollFakeSession(complete_after_s=0.0),
+        2: _PollFakeSession(complete_after_s=None),
+    }
+    reqs = {1: object(), 2: object()}
+    start = time.monotonic()
+    tc._poll_sessions_for_interval(sessions, reqs, 1, _POLL_INTERVAL_MS)
+    assert time.monotonic() - start < 0.1
+
+
+def test_poll_interval_pump_drives_completion() -> None:
+    """Completion observed only through the wait_complete(blocking=False) pump exits the poll."""
+    tc = _make_bare_transceiver()
+    session = _PumpDrivenSession(pumps_to_complete=3)
+    start = time.monotonic()
+    tc._poll_sessions_for_interval({1: session}, {1: object()}, 1, _POLL_INTERVAL_MS)
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.5
+    assert session.is_completed()

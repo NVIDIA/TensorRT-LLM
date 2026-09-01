@@ -56,6 +56,7 @@ except (ImportError, ModuleNotFoundError):
 # ---------------------------------------------------------------------------
 if TRTLLM_AVAILABLE:
     from tensorrt_llm.quantization.modelopt_config import (
+        canonicalize_quant_algo,
         is_modelopt_quant_config,
         read_modelopt_quant_config,
     )
@@ -75,6 +76,15 @@ else:
         ("int", 8): "INT8",
     }
     _KV_SCHEME_STRING_ALGOS = {"FP8", "NVFP4", "INT8"}
+
+    # Keep in sync with ``tensorrt_llm.quantization.modelopt_config``.
+    _QUANT_ALGO_ALIASES = {"fp8_pb_wo": "FP8_BLOCK_SCALES"}
+
+    def canonicalize_quant_algo(value: Any) -> Any:
+        """Map a ModelOpt ``quant_algo`` spelling onto its ``QuantAlgo`` name."""
+        if not isinstance(value, str):
+            return value
+        return _QUANT_ALGO_ALIASES.get(value.lower(), value)
 
     def _kv_cache_scheme_to_algo(scheme: Any) -> Optional[str]:
         if scheme is None:
@@ -112,8 +122,20 @@ else:
                 f"Not a modelopt quant config (producer={raw.get('producer')!r}, "
                 f"quant_method={raw.get('quant_method')!r})"
             )
-        if result.get("quant_algo") == "fp8_pb_wo":
-            result["quant_algo"] = "FP8_BLOCK_SCALES"
+        # Canonicalize both the top-level algo and the per-layer entries:
+        # MIXED_PRECISION checkpoints carry the real names in quantized_layers.
+        if "quant_algo" in result:
+            result["quant_algo"] = canonicalize_quant_algo(result["quant_algo"])
+        layers = result.get("quantized_layers")
+        if isinstance(layers, dict):
+            result["quantized_layers"] = {
+                name: (
+                    {**cfg, "quant_algo": canonicalize_quant_algo(cfg["quant_algo"])}
+                    if isinstance(cfg, dict) and "quant_algo" in cfg
+                    else cfg
+                )
+                for name, cfg in layers.items()
+            }
         return result
 
 
