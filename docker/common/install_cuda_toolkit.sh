@@ -5,6 +5,12 @@ set -ex
 # This script is used for reinstalling CUDA on Rocky Linux 8 with the run file.
 # CUDA version is usually aligned with the latest NGC CUDA image tag.
 # Only use when public CUDA image is not ready.
+#
+# This must stay in step with the Rocky base image
+# (nvcr.io/nvidia/cuda:13.2.1-devel-rockylinux8, docker/Makefile) -- when it
+# matches, check_cuda_version below skips the reinstall entirely. Do NOT raise it
+# to the DLFW 26.08 CUDA 13.4: that is still a developer preview, so there is no
+# public cuda_13.4.*_linux.run local installer to download.
 CUDA_VER="13.2.1_595.58.03"
 CUDA_VER_SHORT="${CUDA_VER%_*}"
 
