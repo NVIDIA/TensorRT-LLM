@@ -36,7 +36,6 @@ set(SRCS
     kvCacheManagerV2Utils.cu
     llmRequest.cpp
     microBatchScheduler.cpp
-    pauseRequests.cpp
     peftCacheManager.cpp
     rnnStateManager.cpp
     rnnCacheFormatter.cpp
