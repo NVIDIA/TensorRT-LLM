@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_ty
     , mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV)
     , mFusesDsv4InvRopeFp8Quant(fusesDsv4InvRopeFp8Quant)
 {
-    TLLM_CHECK_WITH_INFO(mSM == kSM_100 || mSM == kSM_103, "Unsupported architecture");
+    TLLM_CHECK_WITH_INFO(tensorrt_llm::common::isSM100Family(mSM), "Unsupported architecture");
     TLLM_CHECK_WITH_INFO(mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16
             || mDtypeQ == DATA_TYPE_INT8,
         "Unsupported Q data type");

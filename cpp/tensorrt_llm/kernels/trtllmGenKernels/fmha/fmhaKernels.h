@@ -73,8 +73,8 @@ namespace kernels
 // Returns true only if one is a family version and the other is a compatible specific version
 constexpr bool isFamilySpecificSMPair(int sm1, int sm2)
 {
-    if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103))
-        || (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103)))
+    if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103 || sm2 == kSM_107))
+        || (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103 || sm1 == kSM_107)))
     {
         return true;
     }
@@ -90,6 +90,10 @@ constexpr bool isSMCompatible(int gpuSM, int kernelSM)
     else if (gpuSM == kSM_100)
     {
         return kernelSM == kSM_100f || kernelSM == kSM_100;
+    }
+    else if (gpuSM == kSM_107)
+    {
+        return kernelSM == kSM_100f || kernelSM == kSM_107;
     }
 
     return gpuSM == kernelSM;
@@ -615,7 +619,7 @@ private:
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
         bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax, bool groupsHeadsQ,
-        bool groupsTokensHeadsQ, int numInstsQ, int numInstsKv) const
+        bool groupsTokensHeadsQ, int numInstsQ, int numInstsKv, bool fp16Softmax, bool usesSpcompress) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -653,6 +657,8 @@ private:
         // Bit 59 - 59: groupsTokensHeadsQ.
         // Bit 60 - 60: (numInstsQ == 2). Distinguishes Q128Kv256 vs Q256Kv128 cubins that share tile sizes.
         // Bit 61 - 61: (numInstsKv == 2).
+        // Bit 62 - 62: fp16Softmax. Distinguishes fp16-softmax Sm107a cubins from their bf16-softmax siblings.
+        // Bit 63 - 63: usesSpcompress. Distinguishes 2:4 activation-sparsity Sm107a cubins from dense siblings.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
@@ -663,7 +669,8 @@ private:
             | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseAttention) << 55)
             | (static_cast<uint64_t>(skipsSoftmax) << 57) | (static_cast<uint64_t>(groupsHeadsQ) << 58)
             | (static_cast<uint64_t>(groupsTokensHeadsQ) << 59) | (static_cast<uint64_t>(numInstsQ == 2) << 60)
-            | (static_cast<uint64_t>(numInstsKv == 2) << 61);
+            | (static_cast<uint64_t>(numInstsKv == 2) << 61) | (static_cast<uint64_t>(fp16Softmax) << 62)
+            | (static_cast<uint64_t>(usesSpcompress) << 63);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -678,7 +685,8 @@ private:
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
             kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible, kernelMeta.mGroupsHeadsQ,
-            kernelMeta.mGroupsTokensHeadsQ, numInstsQ, numInstsKv);
+            kernelMeta.mGroupsTokensHeadsQ, numInstsQ, numInstsKv, kernelMeta.mFp16Softmax,
+            kernelMeta.mUsesSpcompress);
     }
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
@@ -714,6 +722,18 @@ private:
                                                  : "plain");
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
+
+        // The fp16-softmax and 2:4 activation-sparsity variants are Rubin-only kernel selectors; the
+        // FmhaOptions fields carrying them exist only under TLLM_RUBIN_FEATURES. They must be hashed
+        // consistently with hashID(KernelMeta) so the Sm107a plain/fp16/spcompress siblings dispatch to
+        // distinct cubins (and register without hashId collisions).
+#ifdef TLLM_RUBIN_FEATURES
+        bool const fp16Softmax = options.mEnablesFp16Softmax;
+        bool const usesSpcompress = options.mUsesSpcompress;
+#else
+        bool const fp16Softmax = false;
+        bool const usesSpcompress = false;
+#endif
         return std::make_pair(
             hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
                 static_cast<int>(options.mFmhaKernelType), static_cast<int>(options.mTileScheduler),
@@ -722,7 +742,8 @@ private:
                 static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
                 static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
                 static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible, options.mGroupsHeadsQ,
-                options.mGroupsTokensHeadsQ, options.mNumInstsQ, options.mNumInstsKv),
+                options.mGroupsTokensHeadsQ, options.mNumInstsQ, options.mNumInstsKv, fp16Softmax,
+                usesSpcompress),
             info);
     }
 
@@ -1283,7 +1304,8 @@ private:
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
                 selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
                 selectKernelParams.mSkipsSoftmaxWhenPossible, /* groupsHeadsQ */ false,
-                /* groupsTokensHeadsQ */ false, /* numInstsQ */ 1, /* numInstsKv */ 1),
+                /* groupsTokensHeadsQ */ false, /* numInstsQ */ 1, /* numInstsKv */ 1,
+                selectKernelParams.mFp16Softmax, selectKernelParams.mUsesSpcompress),
             info);
     }
 
@@ -1294,6 +1316,9 @@ private:
         case 90: return tg::CudaArch::Sm90a;
         case 100: return tg::CudaArch::Sm100a;
         case 103: return tg::CudaArch::Sm103a;
+#ifdef TLLM_RUBIN_FEATURES
+        case 107: return tg::CudaArch::Sm107a;
+#endif // TLLM_RUBIN_FEATURES
         default: assert(false && "Unsupported CUDA architecture"); return tg::CudaArch::Sm100a;
         }
     }
@@ -1306,6 +1331,9 @@ private:
         case tg::CudaArch::Sm100a: return 100;
         case tg::CudaArch::Sm100f: return 100;
         case tg::CudaArch::Sm103a: return 103;
+#ifdef TLLM_RUBIN_FEATURES
+        case tg::CudaArch::Sm107a: return 107;
+#endif // TLLM_RUBIN_FEATURES
         default: assert(false && "Unsupported CUDA architecture"); return 100;
         }
     }
