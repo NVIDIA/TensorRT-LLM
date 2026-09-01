@@ -58,6 +58,8 @@ class FallbackFmha(Fmha):
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
+        if attn.is_mla_enable and attn.has_fp4_kv_cache:
+            return False
         sparse_algorithm = getattr(attn.sparse_params, "algorithm", None)
         if sparse_algorithm in ("deepseek_v4", "dsa"):
             if getattr(attn, "kv_cache_dtype", None) == "fp8_ds_mla":
@@ -77,10 +79,8 @@ class FallbackFmha(Fmha):
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
         del q, k, v, phase
-        attn = self.attn
-        return not (attn.is_mla_enable and attn.has_fp4_kv_cache) and (
-            forward_args.attention_mask != CustomAttentionMask.CUSTOM
-            and (forward_args.update_kv_cache or metadata.is_cross)
+        return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
+            forward_args.update_kv_cache or metadata.is_cross
         )
 
     def forward(
