@@ -2394,7 +2394,10 @@ def get_kernel_code(kspec, kname, lname):
     params_str = 'reinterpret_cast<bert::Fused_multihead_attention_params_v2 &>(params)' if generate_cu_trtllm else 'params'
     attn_mask_type_str = 'using Attention_mask_type = ContextAttentionMaskType;' if generate_cu_trtllm else 'using Attention_mask_type = fmha::Attention_mask_type;'
     bert_launch_params = '' if generate_cu_trtllm else 'using Launch_params = bert::Fused_multihead_attention_launch_params;'
-    include_str = '#include "../fused_multihead_attention_common.h"\n' if generate_cu_trtllm else ''
+    # No "../" prefix: the generated .cu may live outside the source tree
+    # (TRTLLM_FMHA_GEN_DIR); the consuming CMake target puts the
+    # contextFusedMultiHeadAttention directory on the include path.
+    include_str = '#include "fused_multihead_attention_common.h"\n' if generate_cu_trtllm else ''
     include_str += '#include "tensorrt_llm/common/config.h"' if generate_cu_trtllm else ''
     num_compute_groups_str = '' if generate_cu_trtllm else 'static constexpr int NUM_COMPUTE_GROUPS = 2;'
     fused_multihead_attention_params_v2_str = 'Fused_multihead_attention_params_v2' if generate_cu_trtllm else f'{params_type}'
@@ -6810,7 +6813,7 @@ def enumerate_kernels():
         enumerate_qmma_flash_kernels(specs,
                                      sm=120,
                                      dtype='e4m3_fp32',
-                                     head_sizes=[64, 128, 192, 576],
+                                     head_sizes=[64, 128, 192, 256, 576],
                                      output_dtype="bf16")
 
     if 'ENABLE_HMMA_FP32' in os.environ:

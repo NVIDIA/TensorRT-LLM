@@ -368,6 +368,12 @@ public:
         int numTokens;
         // Total query length passed to match() (== len(tokens)).
         int numLookupTokens;
+        // Internal diagnostic: the prefix the attention pages alone would
+        // support, i.e. before recurrent-state (SSM) snapshot availability
+        // shortens it. Equal to numTokens when the model has no SSM life
+        // cycle. Separates "attention prefix matched N tokens" from
+        // "recurrent-snapshot pruning cut it to M".
+        int numTokensBeforeHybridPruning;
     };
 
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
@@ -413,7 +419,10 @@ private:
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
     std::vector<MatchResult> matchTokenPath(
         ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const;
-    std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched) const;
+    // Shorten `matched` to the prefix that is actually reusable. Passing
+    // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
+    // yields the attention-only prefix (used for numTokensBeforeHybridPruning).
+    std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const;
 
     // Erase any pending empty root blocks from mRoots.
     // Const-qualified: deferred cleanup is not a logical mutation.
@@ -432,13 +441,28 @@ private:
 // ---------------------------------------------------------------------------
 
 // Add a block to prev's `next` map, or return the existing one on collision.
-// Throws UselessBlockError (with the sibling block) if the block's tokens are a
-// prefix of an existing sibling — mirrors Python's UselessBlockError.
+// A partial block whose tokens are a prefix of an existing sibling returns that longer
+// sibling instead of inserting a redundant node.
 // If isNew is non-null, *isNew is set to true if a new block was created, false
 // if an existing block was returned.
 // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
 SharedPtr<Block> addOrGetExistingBlock(
     NodeBase* prev, std::vector<TokenIdExt> tokens, bool knownNoDigest, bool* isNew = nullptr);
+
+// Query: the block already in the tree that supersedes inserting `key`/`tokens` under
+// `prev` -- an exact-key match, or a longer sibling covering these tokens -- else nullptr.
+// Pure; lets callers avoid building a block they would discard.
+SharedPtr<Block> getExistingBlock(NodeBase* prev, BlockKey const& key, TokenIdExt const* tokens, size_t numTokens);
+
+// Mutation: link `block` under `prev` and absorb any covered shorter sibling.
+// Precondition (debug-asserted): getExistingBlock() returns nullptr for it.
+void attachBlock(NodeBase* prev, SharedPtr<Block> const& block);
+
+// The above two composed, for a caller that already holds a Block. Returns the block now
+// in the tree, which may be a pre-existing one; `attached` reports whether `block` itself
+// went in. Used by KvCache::_reattachOrphanTreeBlocks() to re-insert a block the tail-prune
+// walk detached while the request still held it -- see https://nvbugs/6625710.
+SharedPtr<Block> attachOrGetExistingBlock(NodeBase* prev, SharedPtr<Block> block, bool* attached = nullptr);
 
 // Post-order traversal: remove a subtree rooted at `root` from its parent's
 // next map. ~Block() handles page cleanup. Mirrors Python's remove_subtree().

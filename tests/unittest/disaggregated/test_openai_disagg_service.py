@@ -234,6 +234,20 @@ def test_get_gen_request_uses_ctx_response_prompt_token_ids_for_chat():
     assert gen_request.conversation_params.conversation_id == "conv-chat"
 
 
+def test_get_ctx_request_preserves_conversation_params_on_wire():
+    service = _make_service("context_first")
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(conversation_id="conv-completion"),
+    )
+
+    ctx_request = service._get_ctx_request(request, 42)
+
+    wire_request = ctx_request.model_dump(exclude_unset=True)
+    assert wire_request["conversation_params"]["conversation_id"] == "conv-completion"
+
+
 @pytest.mark.asyncio
 async def test_create_chat_response_sets_prompt_token_ids_for_context_only():
     from tensorrt_llm.serve.openai_server import OpenAIServer

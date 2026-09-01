@@ -26,16 +26,18 @@ skip_unless_marlin_flashinfer = pytest.mark.skipif(
 marlin_attrs = {"nvfp4_gemm_allowed_backends": ["marlin"]}
 
 
+@skip_unless_marlin_flashinfer
 def test_marlin_flashinfer_rmsnorm_gate_is_enabled_by_default():
     with model_extra_attrs(marlin_attrs):
         assert allow_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin()
 
 
+@skip_unless_marlin_flashinfer
 def test_marlin_flashinfer_rmsnorm_gate_can_be_explicitly_disabled():
     with model_extra_attrs(
         {
             **marlin_attrs,
-            "enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin": False,
+            "disable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin": True,
         }
     ):
         assert not allow_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin()
@@ -68,7 +70,7 @@ def test_marlin_flashinfer_fused_add_rmsnorm_matches_aten_fallback():
     with model_extra_attrs(
         {
             **marlin_attrs,
-            "enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin": False,
+            "disable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin": True,
         }
     ):
         expected, expected_residual = norm(hidden_states.clone(), residual.clone())
@@ -77,4 +79,4 @@ def test_marlin_flashinfer_fused_add_rmsnorm_matches_aten_fallback():
         actual, actual_residual = norm(hidden_states.clone(), residual.clone())
 
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(actual_residual, expected_residual, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_residual, expected_residual, rtol=1e-3, atol=1e-3)

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -353,26 +353,6 @@ _allowed_configs = {
                vocab_size=49152,
                hidden_act='gelu',
                n_positions=8192,
-           )),
-    "starcoder2_3b":
-    Config(name="starcoder2_3b",
-           family="gpt",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=256,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=30,
-               num_heads=24,
-               num_kv_heads=2,
-               hidden_size=3072,
-               vocab_size=49152,
-               hidden_act='gelu',
-               n_positions=16384,
-               position_embedding_type='rope_gpt_neox',
-               rotary_pct=1.0,
            )),
     "llama_13b":
     Config(name="llama_13b",
@@ -1176,98 +1156,6 @@ _allowed_configs = {
                inter_size=13824,
                bias=False,
            )),
-    "qwen_7b_chat":
-    Config(name="qwen_7b_chat",
-           family="qwen",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=128,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=32,
-               num_heads=32,
-               hidden_size=4096,
-               vocab_size=151936,
-               hidden_act='silu',
-               n_positions=8192,
-               inter_size=22016,
-               bias=False,
-           )),
-    "qwen_14b_chat":
-    Config(name="qwen_14b_chat",
-           family="qwen",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=64,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=40,
-               num_heads=40,
-               hidden_size=5120,
-               vocab_size=152064,
-               hidden_act='silu',
-               n_positions=8192,
-               inter_size=27392,
-           )),
-    "qwen1.5_7b_chat":
-    Config(name="qwen1.5_7b_chat",
-           family="qwen2",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=128,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=32,
-               num_heads=32,
-               hidden_size=4096,
-               vocab_size=151936,
-               hidden_act='silu',
-               n_positions=8192,
-               inter_size=11008,
-               bias=False,
-           )),
-    "qwen1.5_14b_chat":
-    Config(name="qwen1.5_14b_chat",
-           family="qwen2",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=64,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=40,
-               num_heads=40,
-               hidden_size=5120,
-               vocab_size=152064,
-               hidden_act='silu',
-               n_positions=8192,
-               inter_size=13696,
-           )),
-    "qwen2_7b_instruct":
-    Config(name="qwen2_7b_instruct",
-           family="qwen2",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=64,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=28,
-               num_heads=28,
-               hidden_size=3584,
-               vocab_size=152064,
-               hidden_act='silu',
-               n_positions=32768,
-               inter_size=18944,
-           )),
     "mamba_2.8b":
     Config(name="mamba_2.8b",
            family="mamba",
@@ -1507,106 +1395,7 @@ _allowed_configs = {
                hidden_act='silu',
                n_positions=8192,
                inter_size=14336,
-           )),
-    "mistral_7b_v0.1":
-    Config(name="mistral_7b_v0.1",
-           family="llama",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=64,
-               max_input_len=1024,
-               max_seq_len=2048,
-           ),
-           model_config=ModelConfig(
-               num_layers=32,
-               num_heads=32,
-               num_kv_heads=8,
-               hidden_size=4096,
-               vocab_size=32000,
-               hidden_act='silu',
-               n_positions=32768,
-               inter_size=14336,
-           )),
-    "mixtral_8x7b":
-    Config(name="mixtral_8x7b",
-           family="llama",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=128,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=32,
-               num_heads=32,
-               num_kv_heads=8,
-               hidden_size=4096,
-               vocab_size=32000,
-               hidden_act='swiglu',
-               n_positions=32768,
-               inter_size=14336,
-               moe_num_experts=8,
-               moe_top_k=2,
-           )),
-    "mixtral_8x22b_v0.1":
-    Config(name="mixtral_8x22b_v0.1",
-           family="llama",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=128,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=56,
-               num_heads=48,
-               num_kv_heads=8,
-               hidden_size=6144,
-               vocab_size=32000,
-               hidden_act='swiglu',
-               n_positions=65536,
-               inter_size=16384,
-               moe_num_experts=8,
-               moe_top_k=2,
-           )),
-    "phi_3_mini_4k_instruct":
-    Config(name="phi_3_mini_4k_instruct",
-           family="phi3",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=64,
-               max_input_len=1024,
-               max_seq_len=2048,
-           ),
-           model_config=ModelConfig(
-               num_layers=32,
-               num_heads=32,
-               num_kv_heads=32,
-               hidden_size=3072,
-               vocab_size=32064,
-               hidden_act='silu',
-               n_positions=4096,
-               inter_size=8192,
-           )),
-    "phi_3_mini_128k_instruct":
-    Config(name="phi_3_mini_128k_instruct",
-           family="phi3",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=64,
-               max_input_len=1024,
-               max_seq_len=2048,
-           ),
-           model_config=ModelConfig(
-               num_layers=32,
-               num_heads=32,
-               num_kv_heads=8,
-               hidden_size=4096,
-               vocab_size=128256,
-               hidden_act='silu',
-               n_positions=131072,
-               inter_size=14336,
-           )),
+           ))
 }
 
 

@@ -421,6 +421,11 @@ def get_tokenizer(
     custom_tokenizer: str = None,
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    # Registers TRT-LLM's out-of-tree configs into transformers' CONFIG_MAPPING;
+    # without it AutoTokenizer falls back to a bare PreTrainedConfig and dies in
+    # rope standardization on a missing max_position_embeddings.
+    import tensorrt_llm._torch.configs  # noqa: F401
+
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
             raise ValueError(

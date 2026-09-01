@@ -1,0 +1,199 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# DEP8 throughput recipe: four CTX TP4 replicas feeding one GEN TP8/EP8
+# attention-DP worker. TRTLLM is the M3 MoE backend supported by this branch.
+metadata:
+  model_name: minimax_m3_fp4
+  precision: fp4
+  model_dir_name: MiniMax-M3-NVFP4
+  supported_gpus:
+  - GB300
+  script_file: disaggr_torch.slurm
+  benchmark_type: 8k1k
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 02:00:00
+  job_name: unified-benchmark
+  extra_args: --gres=gpu:4
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  multi_round: 10
+  benchmark_ratio: 0.0
+  streaming: true
+  concurrency_list: '256'
+  input_length: 8192
+  output_length: 1024
+  dataset_file: <dataset_file>
+hardware:
+  # Four CTX nodes plus two nodes for the DEP8 generation worker.
+  gpus_per_node: 4
+  num_ctx_servers: 4
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  worker_env_var: >-
+    TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1
+    TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes
+    NCCL_GRAPH_MIXING_SUPPORT=0 MIMALLOC_PURGE_DELAY=0
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    TRTLLM_KV_TRANSFER_NUM_THREADS=4
+    TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=0
+    TRTLLM_SERVE_ENABLE_MSGSPEC=1 TRTLLM_SERVE_CHAT_TEMPLATE=auto
+    TRTLLM_SERVE_TOOL_PARSER=minimax_m3 TRTLLM_USE_PY_NIXL_KVCACHE=0
+    TRTLLM_NIXL_BOUNCE_ENABLE=1
+    TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES=1GiB
+    TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES=32MiB
+    TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST=8
+    TRTLLM_NIXL_BOUNCE_COPY_STREAM_COUNT=8
+    TRTLLM_NIXL_BOUNCE_SCATTER_WORKER_COUNT=4
+    TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT=1024
+    TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES=16KiB
+    TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER=1
+    TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS=0
+    TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS=1
+  ctx_worker_env_var: TRTLLM_TORCH_COMPILE_CONTEXT_ONLY=1
+  gen_worker_env_var: >-
+    TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL=0
+    TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1.78
+  server_env_var: >-
+    TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_SERVE_ENABLE_MSGSPEC=1
+profiling:
+  nsys_on: false
+accuracy:
+  enable_accuracy_test: false
+  env_var:
+    HF_HOME: <hf_home_path>
+  tasks:
+    gsm8k_local:
+      model: local-completions
+      model_args_extra: num_concurrent=256,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
+      extra_kwargs:
+        trust_remote_code: true
+        custom_config: tests/integration/lm_eval_configs/gsm8k_local.yaml
+worker_config:
+  gen:
+    print_iter_log: true
+    max_batch_size: 32
+    max_num_tokens: 64
+    max_seq_len: 9236
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: true
+    enable_lm_head_tp_in_adp: false
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 32
+      batch_sizes: [1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32]
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+      dtype: nvfp4
+      tokens_per_block: 128
+      use_kv_cache_manager_v2: true
+      event_buffer_max_size: 0
+      avg_seq_len: 8192
+    moe_config:
+      backend: TRTLLM
+      use_low_precision_moe_combine: true
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      kv_transfer_timeout_ms: 600000
+      kv_cache_bounce_size_mb: 0
+    disable_overlap_scheduler: false
+    trust_remote_code: true
+    sparse_attention_config:
+      algorithm: minimax_m3
+      implementation: msa
+      indexer_kv_dtype: fp8
+      fuse_qkv_index_projection: true
+      sparse_disable_index_value: true
+    speculative_config: &eagle3_config
+      decoding_type: Eagle3
+      max_draft_len: 3
+      eagle3_one_model: true
+      speculative_model: inferact_minimax-m3-eagle3-gqa/hf/hf-9669248_orig
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+    num_postprocess_workers: 4
+    stream_interval: 100
+    enable_autotuner: true
+  ctx:
+    print_iter_log: true
+    max_batch_size: 64
+    max_num_tokens: 32768
+    max_seq_len: 9236
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: false
+    enable_lm_head_tp_in_adp: false
+    enable_chunked_prefill: true
+    cuda_graph_config: null
+    torch_compile_config:
+      enable_fullgraph: true
+      enable_inductor: false
+      enable_piecewise_cuda_graph: true
+      capture_num_tokens: [256, 384, 512, 1024, 2048, 4096, 6144, 8192]
+      enable_userbuffers: true
+      max_num_streams: 3
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+      dtype: nvfp4
+      tokens_per_block: 128
+      use_kv_cache_manager_v2: true
+      event_buffer_max_size: 0
+    moe_config:
+      backend: TRTLLM
+      use_low_precision_moe_combine: true
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      kv_transfer_timeout_ms: 600000
+      kv_cache_bounce_size_mb: 0
+    disable_overlap_scheduler: false
+    trust_remote_code: true
+    sparse_attention_config:
+      algorithm: minimax_m3
+      implementation: msa
+      indexer_kv_dtype: fp8
+      fuse_qkv_index_projection: true
+      sparse_disable_index_value: true
+    speculative_config: *eagle3_config
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+    stream_interval: 32
+    enable_autotuner: true
+router_config:
+  type: conversation
+  max_sessions: 65536
+server_config_extra:
+  gen_strip_message_history: true
+  gen_tokids_ctxbytes: true
+  tool_parser: minimax_m3

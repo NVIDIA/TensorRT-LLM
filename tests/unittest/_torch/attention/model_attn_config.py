@@ -3,14 +3,14 @@
 """Model-derived attention configurations for the backend test sweep.
 
 Instead of an arbitrary ``itertools.product`` of head counts and dims, the sweep
-is driven by the *distinct* attention configurations actually used by the
-supported models under ``tensorrt_llm/_torch/models/`` and
-``tensorrt_llm/_torch/visual_gen/models/``. Each entry records the
+is driven by the *distinct* attention configurations used by supported models
+under ``tensorrt_llm/_torch/models/`` and
+``tensorrt_llm/_torch/visual_gen/models/``, plus family-neutral dimensional
+shapes retained when model-specific coverage is pruned. Each entry records the
 ``(num_heads, num_kv_heads, head_dim, rope, mask, sliding_window, is_mla,
-is_cross)`` tuple and names the model family it comes from, so a failure points
-at real workloads.
+is_cross)`` tuple and names its model family or generic coverage purpose.
 
-Many models collapse onto the same tuple (e.g. Llama/Mistral/Qwen-1.5 all use
+Many models collapse onto the same tuple (e.g. Llama and Mistral both use
 32 Q / 8 KV / 128); only the distinct tuples are listed. Numeric values are the
 canonical-checkpoint values for that family. Where a family's distinguishing
 feature is a RoPE *table* variant (yarn, longrope, mrope) the attention math is
@@ -41,9 +41,8 @@ part of the attention architecture.
 Deliberate exclusions (not distinct at the dense-backend level, or covered
 elsewhere):
 - Per-layer-varying models decompose into the per-layer tuples listed here. A
-  config value such as ``sliding_window`` is ignored when the PyTorch model path
-  does not pass it to the dense attention backend (for example Qwen2 /
-  Qwen2.5-VL with ``use_sliding_window=False``).
+  config value such as ``sliding_window`` is ignored when its PyTorch model path
+  does not pass it to the dense attention backend.
 - Vision/text encoders (SigLip/Radio/CLIP/Parakeet, MiniMax-VL tower) collapse
   onto the bidirectional MHA tuples already listed (e.g. 16x64 / 12x64 full).
 - Sparse/DSA indexer attention (GLM-DSA, NSA, RocketKV) is a separate paradigm
@@ -96,7 +95,7 @@ _STANDARD = [
     ),
     ModelAttnConfig(
         "llama3_70b_qwen3_32b_gqa",
-        "Llama-3 70B, Qwen3-32B, Qwen2/Qwen2.5-72B, MiniMax-M1, Step-3.5/3.7 full layers",
+        "Llama-3 70B, Qwen3-32B, MiniMax-M1, Step-3.5/3.7 full layers",
         num_heads=64,
         num_kv_heads=8,
         head_dim=128,
@@ -110,7 +109,7 @@ _STANDARD = [
     ),
     ModelAttnConfig(
         "llama4_gqa",
-        "Llama-4, Qwen3-14B, Qwen2.5-14B/32B, Nemotron Nano 4B/9B/12B",
+        "Llama-4, Qwen3-14B, Nemotron Nano 4B/9B/12B",
         num_heads=40,
         num_kv_heads=8,
         head_dim=128,
@@ -144,31 +143,10 @@ _STANDARD = [
         head_dim=128,
     ),
     ModelAttnConfig(
-        "qwen2_7b_gqa",
-        "Qwen2-7B, Qwen2.5-VL-7B, Qwen2-MoE-57B, LLaVA-OneVision-Qwen2",
+        "generic_28h_4kv_gqa",
+        "Generic GQA backend shape retained for dimensional coverage",
         num_heads=28,
         num_kv_heads=4,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
-        "qwen2_0_5b_gqa_hd64",
-        "Qwen2/Qwen2.5-0.5B",
-        num_heads=14,
-        num_kv_heads=2,
-        head_dim=64,
-    ),
-    ModelAttnConfig(
-        "qwen2_1_5b_gqa",
-        "Qwen2/Qwen2.5-1.5B",
-        num_heads=12,
-        num_kv_heads=2,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
-        "qwen2_3b_gqa",
-        "Qwen2.5-3B, Qwen2.5-VL-3B",
-        num_heads=16,
-        num_kv_heads=2,
         head_dim=128,
     ),
     ModelAttnConfig(
@@ -242,22 +220,15 @@ _STANDARD = [
         head_dim=256,
     ),
     ModelAttnConfig(
-        "llama2_7b_qwen1_5_7b_mha",
-        "Llama-2-7B, Qwen1.5-7B, DeciLM-7B",
+        "llama2_7b_decilm_7b_mha",
+        "Llama-2-7B, DeciLM-7B",
         num_heads=32,
         num_kv_heads=32,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "vila1_5_3b_mha",
-        "VILA1.5-3B LLM",
-        num_heads=20,
-        num_kv_heads=20,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
-        "llama2_13b_qwen1_5_14b_mha",
-        "Llama-2-13B, Qwen1.5-14B",
+        "llama2_13b_mha",
+        "Llama-2-13B",
         num_heads=40,
         num_kv_heads=40,
         head_dim=128,
@@ -270,8 +241,8 @@ _STANDARD = [
         head_dim=128,
     ),
     ModelAttnConfig(
-        "llama_65b_qwen1_5_72b_mha",
-        "Llama-65B, Qwen1.5-72B",
+        "llama_65b_mha",
+        "Llama-65B",
         num_heads=64,
         num_kv_heads=64,
         head_dim=128,
@@ -284,15 +255,15 @@ _STANDARD = [
         head_dim=128,
     ),
     ModelAttnConfig(
-        "qwen1_5_0_5b_mha_hd64",
-        "Qwen1.5-0.5B",
+        "generic_16h_mha_hd64",
+        "Generic RoPE MHA backend shape retained for head-dimension coverage",
         num_heads=16,
         num_kv_heads=16,
         head_dim=64,
     ),
     ModelAttnConfig(
-        "qwen1_5_moe_mha",
-        "Qwen1.5-MoE-A2.7B",
+        "generic_16h_mha",
+        "Generic RoPE MHA backend shape retained for dimensional coverage",
         num_heads=16,
         num_kv_heads=16,
         head_dim=128,
@@ -492,15 +463,6 @@ _STANDARD = [
         head_dim=128,
         mask="sliding",
         sliding_window=512,
-    ),
-    ModelAttnConfig(
-        "starcoder2_3b_gqa_swa4096",
-        "StarCoder2-3B",
-        num_heads=24,
-        num_kv_heads=2,
-        head_dim=128,
-        mask="sliding",
-        sliding_window=4096,
     ),
     ModelAttnConfig(
         "starcoder2_7b_gqa_swa4096",
@@ -797,8 +759,8 @@ _NO_CACHE = [
     # Vision towers with non-standard head_dims (the production kernels pad
     # these to a supported cubin size; here they exercise the head_dim directly).
     ModelAttnConfig(
-        "qwen2vl_mha_hd80_nope_vision",
-        "Qwen2-VL vision tower (head_dim=80)",
+        "generic_mha_hd80_nope_vision",
+        "Generic vision backend shape retained for head_dim=80 coverage",
         num_heads=16,
         num_kv_heads=16,
         head_dim=80,

@@ -5,6 +5,7 @@ import contextlib
 import functools
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Dict, List, Optional
@@ -61,8 +62,13 @@ class ActivationType(IntEnum):
     Geglu = 6
     SwigluBias = 7
     Relu2 = 8
+    SiTu = 9
 
 
+# TRTLLM-Gen-local activation encoding, kept separate from the shared
+# ActivationType above: ActivationType mirrors the CUTLASS enum in common.h,
+# while ActType_TrtllmGen mirrors the independent batched-GEMM encoding below.
+# SiTu is supported by both backends, but its numeric value is backend-local.
 # Keep this in sync with the ActType enum in
 # cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
 class ActType_TrtllmGen(IntEnum):
@@ -82,7 +88,8 @@ class ActType_TrtllmGen(IntEnum):
 # And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
 def is_gated_activation(activation_type: ActivationType) -> bool:
     return activation_type in [
-        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu
+        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu,
+        ActivationType.SiTu
     ]
 
 
@@ -94,6 +101,22 @@ def set_torch_compiling(enable: bool):
 def is_torch_compiling() -> bool:
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+@contextlib.contextmanager
+def torch_compiling(enable: bool):
+    """Scope `is_torch_compiling()` to a region, restoring the prior value.
+
+    The flag is a plain module global, not thread- or context-local, so it
+    outlives the engine that set it. Code running a model region outside an
+    engine forward must establish the value rather than inherit it.
+    """
+    prev_enable = is_torch_compiling()
+    set_torch_compiling(enable)
+    try:
+        yield
+    finally:
+        set_torch_compiling(prev_enable)
 
 
 def set_piecewise_running(enable: bool):
@@ -140,15 +163,15 @@ def allow_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin() -> bool:
     """Whether the FlashInfer fused BF16 add+RMSNorm path is allowed.
 
     For non-Marlin BF16/FP16 paths FlashInfer is always eligible (unchanged
-    behaviour). For NVFP4 Marlin, the path is default-on but can be set false
-    via enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin to retain the
+    behaviour). For NVFP4 Marlin, the path is default-on but can be disabled
+    via disable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin to retain the
     ATen fallback for A/B comparison or troubleshooting.
     """
     if not is_nvfp4_marlin_enabled():
         return True
     attrs = get_model_extra_attrs()
-    return bool(attrs is None or attrs.get(
-        'enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin', True))
+    return bool(attrs is None or not attrs.get(
+        'disable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin', False))
 
 
 @contextlib.contextmanager
@@ -185,8 +208,8 @@ def make_weak_ref(x):
     elif isinstance(x, list):
         return [make_weak_ref(i) for i in x]
     elif isinstance(x, dict):
-        return {k: make_weak_ref(v) for k, v in x.items()}
-    elif isinstance(x, (int, float, bool)):
+        return {make_weak_ref(k): make_weak_ref(v) for k, v in x.items()}
+    elif x is None or isinstance(x, (int, float, str, bool)):
         return x
     else:
         raise TypeError(f"Invalid type {type(x)} to make weak ref")
@@ -208,6 +231,53 @@ class Fp4QuantizedTensor:
     @property
     def shape(self):
         return self.fp4_tensor.shape
+
+
+@dataclass
+class MxFp8QuantizedTensor:
+    """MXFP8 activation and its per-1x32 UE8M0 scaling factors.
+
+    Attributes:
+        fp8_tensor: Row-major E4M3 activation with shape
+            ``[num_tokens, hidden_size]``.
+        scaling_factor: Row-major UE8M0 scales stored as ``torch.uint8`` with
+            shape ``[num_tokens, ceil(hidden_size / 32)]``. Each value scales
+            one contiguous group of 32 activation elements.
+        is_sf_swizzled: Whether ``scaling_factor`` uses a backend-specific
+            swizzled layout. The carrier's ``split`` method requires the
+            default row-major layout and only supports the token dimension.
+    """
+
+    fp8_tensor: torch.Tensor
+    scaling_factor: torch.Tensor
+    is_sf_swizzled: bool = False
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.fp8_tensor.shape
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.fp8_tensor.dtype
+
+    def numel(self) -> int:
+        return self.fp8_tensor.numel()
+
+    def split(
+        self,
+        split_size_or_sections: int | list[int],
+        dim: int = 0,
+    ) -> tuple["MxFp8QuantizedTensor", ...]:
+        """Split activation rows and their scales along the token dimension."""
+        if dim != 0:
+            raise ValueError(
+                "MxFp8QuantizedTensor can only be split along the token dimension"
+            )
+        fp8_chunks = self.fp8_tensor.split(split_size_or_sections, dim=dim)
+        sf_chunks = self.scaling_factor.split(split_size_or_sections, dim=dim)
+        return tuple(
+            MxFp8QuantizedTensor(fp8_chunk, sf_chunk, self.is_sf_swizzled)
+            for fp8_chunk, sf_chunk in zip(fp8_chunks, sf_chunks))
 
 
 def compute_swizzled_sf_shape(row: int, col: int):
@@ -412,12 +482,14 @@ def piecewise_cuda_graph(enable: bool):
         set_piecewise_cuda_graph_flag(prev_enable)
 
 
-def set_per_request_piecewise_cuda_graph_flag(enable: bool):
-    _global_attrs.per_request_piecewise_cuda_graph_flag = enable
+def set_per_request_prefill_cuda_graph_flag(enable: bool):
+    """Set whether the current batch can use its prefill CUDA graph backend."""
+    _global_attrs.per_request_prefill_cuda_graph_flag = enable
 
 
-def get_per_request_piecewise_cuda_graph_flag() -> bool:
-    return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)
+def get_per_request_prefill_cuda_graph_flag() -> bool:
+    """Return whether the current batch can use its prefill CUDA graph backend."""
+    return getattr(_global_attrs, 'per_request_prefill_cuda_graph_flag', True)
 
 
 def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
@@ -503,7 +575,32 @@ def split(x: torch.Tensor,
     return torch.split(x, split_size, dim=dim)[idx]
 
 
+@functools.lru_cache(maxsize=1)
+def _fused_relu2_impl() -> (tuple[Callable[[torch.Tensor], torch.Tensor],
+                                  Callable[[torch.Tensor], bool]] | None):
+    """Resolve the fused relu2 kernel once, or None if it is unavailable.
+
+    Kept lazy so importing this module does not pull in Triton, and so a build
+    without a working Triton falls back instead of failing at import time.
+    """
+    if os.environ.get("TRTLLM_FUSED_RELU2", "1") != "1":
+        return None
+    try:
+        from .fused_relu2_triton import fused_relu2, is_eligible
+        return fused_relu2, is_eligible
+    except ImportError:
+        return None
+
+
 def relu2(x: torch.Tensor) -> torch.Tensor:
+    # Fusing the two elementwise passes halves the activation's memory traffic.
+    # Bit-identical to the eager form: both round once from the same fp32
+    # product -- the kernel squares in fp32 before the store, and PyTorch's
+    # eager mul on half types computes in fp32 opmath before rounding.
+    # Set TRTLLM_FUSED_RELU2=0 to disable.
+    impl = _fused_relu2_impl()
+    if impl is not None and impl[1](x):
+        return impl[0](x)
     return torch.square(F.relu(x))
 
 

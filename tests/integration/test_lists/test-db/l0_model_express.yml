@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 0.0.1
+l0_model_express:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+        lte: 2
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  - model_express/test_model_express.py::test_mx_donor_receiver[llama-bf16-tp1]
+  - model_express/test_model_express.py::test_mx_donor_receiver[qwen2-bf16-tp1]
+  - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-bf16-tp1]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  - model_express/test_model_express.py::test_mx_donor_receiver[llama-bf16-tp2]
+  - model_express/test_model_express.py::test_mx_donor_receiver[qwen2-bf16-tp2]
+  - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-bf16-tp2]
