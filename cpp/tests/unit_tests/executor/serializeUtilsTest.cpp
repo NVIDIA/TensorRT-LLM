@@ -769,47 +769,6 @@ TEST(SerializeUtilsTest, GuidedDecodingParams)
     EXPECT_EQ(guidedDecodingParams.getGuide(), guidedDecodingParams2.getGuide());
 }
 
-TEST(SerializeUtilsTest, ExecutorConfig)
-{
-    texec::ExecutorConfig executorConfig(2, texec::SchedulerConfig(texec::CapacitySchedulerPolicy::kMAX_UTILIZATION),
-        texec::KvCacheConfig(true), true, false, 500, 200, texec::BatchingType::kSTATIC, 128, 64,
-        texec::PeftCacheConfig(10),
-        texec::DecodingConfig(texec::DecodingMode::Lookahead(), texec::LookaheadDecodingConfig(3, 5, 7)), false, 0.5f,
-        8, texec::ExtendedRuntimePerfKnobConfig(true), 60000000, 180000000,
-        texec::GuidedDecodingConfig(
-            texec::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR, std::initializer_list<std::string>{"eos"}),
-        std::vector{tensorrt_llm::executor::AdditionalModelOutput{"output_name"}},
-        texec::CacheTransceiverConfig(std::nullopt, 1024, 100, 1000), true, true, true);
-    auto executorConfig2 = serializeDeserialize(executorConfig);
-
-    EXPECT_EQ(executorConfig.getMaxBeamWidth(), executorConfig2.getMaxBeamWidth());
-    EXPECT_EQ(executorConfig.getSchedulerConfig(), executorConfig2.getSchedulerConfig());
-    EXPECT_EQ(executorConfig.getKvCacheConfig().getEnableBlockReuse(),
-        executorConfig2.getKvCacheConfig().getEnableBlockReuse());
-    EXPECT_EQ(executorConfig.getEnableChunkedContext(), executorConfig2.getEnableChunkedContext());
-    EXPECT_EQ(executorConfig.getNormalizeLogProbs(), executorConfig2.getNormalizeLogProbs());
-    EXPECT_EQ(executorConfig.getIterStatsMaxIterations(), executorConfig2.getIterStatsMaxIterations());
-    EXPECT_EQ(executorConfig.getRequestStatsMaxIterations(), executorConfig2.getRequestStatsMaxIterations());
-    EXPECT_EQ(executorConfig.getBatchingType(), executorConfig2.getBatchingType());
-    EXPECT_EQ(executorConfig.getMaxBatchSize(), executorConfig2.getMaxBatchSize());
-    EXPECT_EQ(executorConfig.getMaxNumTokens(), executorConfig2.getMaxNumTokens());
-    EXPECT_EQ(executorConfig.getPeftCacheConfig(), executorConfig2.getPeftCacheConfig());
-    EXPECT_EQ(executorConfig.getDecodingConfig(), executorConfig2.getDecodingConfig());
-    EXPECT_EQ(executorConfig.getUseGpuDirectStorage(), executorConfig2.getUseGpuDirectStorage());
-    EXPECT_EQ(executorConfig.getGpuWeightsPercent(), executorConfig2.getGpuWeightsPercent());
-    EXPECT_EQ(executorConfig.getMaxQueueSize(), executorConfig2.getMaxQueueSize());
-    EXPECT_EQ(executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig2.getExtendedRuntimePerfKnobConfig());
-    EXPECT_EQ(executorConfig.getRecvPollPeriodMs(), executorConfig2.getRecvPollPeriodMs());
-    EXPECT_EQ(executorConfig.getMaxSeqIdleMicroseconds(), executorConfig2.getMaxSeqIdleMicroseconds());
-    EXPECT_EQ(executorConfig.getSpecDecConfig(), executorConfig2.getSpecDecConfig());
-    EXPECT_EQ(executorConfig.getGuidedDecodingConfig(), executorConfig2.getGuidedDecodingConfig());
-    EXPECT_EQ(executorConfig.getAdditionalModelOutputs(), executorConfig2.getAdditionalModelOutputs());
-    EXPECT_EQ(executorConfig.getCacheTransceiverConfig(), executorConfig2.getCacheTransceiverConfig());
-    EXPECT_EQ(executorConfig.getGatherGenerationLogits(), executorConfig2.getGatherGenerationLogits());
-    EXPECT_EQ(executorConfig.getPromptTableOffloading(), executorConfig2.getPromptTableOffloading());
-    EXPECT_EQ(executorConfig.getEnableTrtOverlap(), executorConfig2.getEnableTrtOverlap());
-}
-
 TEST(SerializeUtilsTest, RequestStats)
 {
     tensorrt_llm::executor::DisServingRequestStats disServingRequestStats{0.56222, 78643200};

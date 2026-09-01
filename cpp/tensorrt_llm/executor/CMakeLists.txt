@@ -26,7 +26,6 @@ set(SRCS
     cache_transmission/rnnCacheSplitConcat.cu
     contextPhaseParams.cpp
     decodingConfig.cpp
-    executorConfig.cpp
     executorKVCacheEventManager.cpp
     extendedRuntimePerfKnobConfig.cpp
     guidedDecodingConfig.cpp

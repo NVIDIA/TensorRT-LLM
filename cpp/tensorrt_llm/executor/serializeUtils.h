@@ -557,10 +557,6 @@ T deserialize(std::istream& is)
     {
         return Serialization::deserializeIterationStats(is);
     }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::ExecutorConfig>)
-    {
-        return Serialization::deserializeExecutorConfig(is);
-    }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::DisServingRequestStats>)
     {
         return Serialization::deserializeDisServingRequestStats(is);

@@ -92,7 +92,6 @@ class BaseWorker(GenerationExecutor):
     def __init__(
         self,
         engine: Path,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
@@ -109,7 +108,6 @@ class BaseWorker(GenerationExecutor):
 
         # inputs
         self._engine = engine
-        self._executor_config = executor_config
         self._batched_logits_processor = batched_logits_processor
         self._postproc_worker_config = postproc_worker_config
         self._is_llm_executor = is_llm_executor
@@ -424,9 +422,7 @@ class BaseWorker(GenerationExecutor):
 
         assert request.id is not None
 
-        def _deduce_max_tokens(request: GenerationRequest,
-                               executor_config: tllm.ExecutorConfig,
-                               llm_args: Optional[BaseLlmArgs] = None) -> int:
+        def _deduce_max_tokens(request: GenerationRequest) -> int:
             # deduce max_tokens when it's not set by user
             max_tokens = request.sampling_params.max_tokens
             output_prefix_len = len(
@@ -435,20 +431,9 @@ class BaseWorker(GenerationExecutor):
                 max_tokens -= output_prefix_len
 
             cp_size = 1
-            max_seq_len = None
-            if llm_args is not None:
-                # deduce max_tokens by llm args
-                assert executor_config is None, "An empty executor_config in _deduce_max_tokens is expected when LLM arguments are defined."
-                if hasattr(self,
-                           "mapping") and self.mapping.cp_size is not None:
-                    cp_size = self.mapping.cp_size
-                max_seq_len = getattr(self, "max_seq_len", None)
-            else:
-                # deduce max_tokens by executor config
-                if hasattr(executor_config, "mapping"
-                           ) and executor_config.mapping.cp_size is not None:
-                    cp_size = executor_config.mapping.cp_size
-                max_seq_len = getattr(executor_config, "max_seq_len", None)
+            if hasattr(self, "mapping") and self.mapping.cp_size is not None:
+                cp_size = self.mapping.cp_size
+            max_seq_len = getattr(self, "max_seq_len", None)
             if max_seq_len is None:
                 logger.warning("`default_max_tokens` cannot be deduced")
                 if max_tokens is None:
@@ -458,10 +443,6 @@ class BaseWorker(GenerationExecutor):
                 else:
                     # use max_tokens if can't deduce default_max_tokens
                     return max_tokens
-            if executor_config is not None:
-                assert (
-                    len(prompt_token_ids) <= executor_config.max_seq_len
-                ), f"`prompt_token_ids` length ({len(prompt_token_ids)}) is greater than `max_seq_len` ({executor_config.max_seq_len})"
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
@@ -490,10 +471,7 @@ class BaseWorker(GenerationExecutor):
             executor_request = tllm.Request(
                 client_id=request.id,
                 input_token_ids=prompt_token_ids,
-                max_tokens=_deduce_max_tokens(
-                    request,
-                    self._executor_config if not self.llm_args else None,
-                    self.llm_args),
+                max_tokens=_deduce_max_tokens(request),
                 streaming=request.streaming,
                 sampling_config=request.sampling_params._get_sampling_config(),
                 end_id=-1 if request.sampling_params.ignore_eos else

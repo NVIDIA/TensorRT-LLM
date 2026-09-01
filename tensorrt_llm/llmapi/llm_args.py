@@ -59,7 +59,6 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  ContextChunkingPolicy as _ContextChunkingPolicy,
                                  DecodingConfig,
                                  DynamicBatchConfig as _DynamicBatchConfig,
-                                 ExecutorConfig as _ExecutorConfig,
                                  ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig,
                                  KvCacheConfig as _KvCacheConfig,
                                  LookaheadDecodingConfig as _LookaheadDecodingConfig,
@@ -6592,15 +6591,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 "sampler_force_async_worker=True; the speculative path "
                 "bypasses the sampler's async D2H worker.")
         return self
-
-    def get_executor_config(
-        self,
-        _hf_model_dir: Optional[Path] = None,
-        tokenizer: Optional[TokenizerBase] = None,
-    ) -> _ExecutorConfig:
-        executor_config = super().get_executor_config(_hf_model_dir, tokenizer)
-        executor_config.mm_encoder_only = self.mm_encoder_only
-        return executor_config
 
 
 def update_llm_args_with_extra_dict(

@@ -3245,23 +3245,6 @@ class TestPyTorchBackendModelDefaults:
             assert modified_args.kv_cache_config.free_gpu_memory_fraction == 0.75
 
 
-@pytest.mark.cpu_only
-def test_executor_config_consistency():
-    """Verify that BaseLlmArgs exposes all ExecutorConfig options."""
-    # max_beam_width is not included since vague behavior due to lacking the support for dynamic beam width during
-    # generation
-    black_list = set(["max_beam_width"])
-    executor_config_attrs = set(attr for attr in dir(tle.ExecutorConfig)
-                                if not attr.startswith('_')
-                                and callable(getattr(tle.ExecutorConfig, attr)))
-    executor_config_attrs -= black_list
-    llm_args_attr = set(BaseLlmArgs.model_fields.keys())
-    # NOTE: When cpp ExecutorConfig add new options, please add the new options into `LlmArgs` with docs as well
-    # ASK chunweiy for help if you are not sure about the new options.
-    assert executor_config_attrs.issubset(llm_args_attr), \
-        f"New options found in underlying ExecutorConfig: {executor_config_attrs - llm_args_attr}"
-
-
 def _get_all_llm_args_classes():
     """Get all subclasses of BaseLlmArgs by traversing the class hierarchy."""
     subclasses = []

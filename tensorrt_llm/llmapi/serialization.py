@@ -75,9 +75,8 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.bindings.executor": [
         "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy",
         "ContextPhaseParams", "ContextChunkingPolicy", "DynamicBatchConfig",
-        "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
-        "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
-        "KvCacheRetentionConfig",
+        "ExtendedRuntimePerfKnobConfig", "Response", "Result", "FinishReason",
+        "KvCacheConfig", "KvCacheTransferMode", "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig"
     ],

@@ -1988,7 +1988,6 @@ class _TorchLLM(BaseLLM):
         return_logits = self.args.gather_generation_logits
         self._executor = self._executor_cls.create(
             self._engine_dir,
-            executor_config=None,
             batched_logits_processor=self.args.batched_logits_processor,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
