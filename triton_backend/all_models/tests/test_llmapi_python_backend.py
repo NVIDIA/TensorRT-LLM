@@ -26,6 +26,7 @@
 
 import asyncio
 import sys
+import types
 from dataclasses import dataclass
 from typing import Dict, List, Union
 from unittest.mock import MagicMock, patch
@@ -494,3 +495,68 @@ def test_build_multimodal_prompt_uses_shared_inputs_primitives():
     assert captured["model_type"] == "qwen2_5_vl"
     assert captured["placeholder_args"][1] == "Describe this."
     assert captured["template_kwargs"]["add_generation_prompt"] is True
+
+
+def test_build_multimodal_prompt_falls_back_on_older_trtllm():
+    # The backend template is copied out of a git checkout, so it can run
+    # against a TRT-LLM older than the one it was written for. On <= v1.2.1
+    # there is no async_apply_chat_template, the tracker has no item_order(),
+    # and add_multimodal_placeholders takes three arguments.
+    model = _make_multimodal_model(enabled=True)
+    captured = {}
+
+    class OldTracker:
+
+        def __init__(self, model_type):
+            self.items = []
+
+        def add_data(self, modality, data):
+            self.items.append(data)
+
+        def placeholder_counts(self):
+            return {"<|image_pad|>": len(self.items)}
+
+        async def retrieve_all_async(self):
+            return ({"image": [await data for data in self.items]}, None)
+
+    async def fake_async_load_image(url):
+        return f"decoded:{url}"
+
+    def fake_add_placeholders(model_type, text, counts):
+        captured["placeholder_argcount"] = 3
+        return "<|image_pad|>" + text
+
+    def fake_apply_chat_template(**kwargs):
+        captured["used_sync_template"] = True
+        return "rendered:" + kwargs["conversation"][0]["content"]
+
+    # SimpleNamespace, not MagicMock: the missing attribute must raise
+    # ImportError so the compatibility path is the one under test.
+    utils_mod = types.SimpleNamespace(
+        ConversationMessage=dict,
+        MultimodalDataTracker=OldTracker,
+        add_multimodal_placeholders=fake_add_placeholders,
+        apply_chat_template=fake_apply_chat_template,
+        async_load_image=fake_async_load_image,
+    )
+    inputs_mod = MagicMock()
+    inputs_mod.prompt_inputs = lambda prompt: {"prompt": prompt}
+
+    with patch.dict(
+            sys.modules, {
+                "tensorrt_llm": MagicMock(),
+                "tensorrt_llm.inputs": inputs_mod,
+                "tensorrt_llm.inputs.utils": utils_mod,
+            }):
+        prompt = asyncio.run(
+            model._build_multimodal_prompt(
+                "Describe this.", np.array([b"https://example.com/a.jpg"])))
+
+    assert prompt == {
+        "prompt": "rendered:<|image_pad|>Describe this.",
+        "multi_modal_data": {
+            "image": ["decoded:https://example.com/a.jpg"]
+        },
+    }
+    assert "mm_item_order" not in prompt
+    assert captured == {"placeholder_argcount": 3, "used_sync_template": True}

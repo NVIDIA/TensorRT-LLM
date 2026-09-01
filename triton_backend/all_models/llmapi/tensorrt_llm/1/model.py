@@ -53,11 +53,7 @@ from helpers import (get_input_tensor_by_name, get_lora_request_from_request,
 
 @dataclass
 class MultimodalContext:
-    """Startup-resolved state needed to turn media URLs into engine inputs.
-
-    Resolved once in `initialize` so that per-request parsing stays cheap, the
-    same way `trtllm-serve` resolves them in `OpenAIServer.__init__`.
-    """
+    """State resolved once at startup and reused for every request."""
     tokenizer: Any
     processor: Any
     model_config: Any
@@ -264,8 +260,6 @@ class TritonPythonModel:
             self._response_thread = threading.Thread(target=self._response_loop)
             self._response_thread.start()
 
-            # Opt-in: a deployment that already defines an `image_url` input
-            # for another purpose keeps its behavior unless this is enabled.
             self.multimodal_enabled = bool(
                 triton_config.get("multimodal", False))
             self._multimodal_context = None
@@ -604,11 +598,7 @@ class TritonPythonModel:
                     del self.triton_user_id_to_req_ids[triton_user_id]
 
     def _init_multimodal_context(self):
-        """Resolve the tokenizer, HF processor and pretrained config once.
-
-        Loading these per request would re-read the checkpoint on every forward
-        pass, so they are resolved at model load time and reused.
-        """
+        """Resolve the tokenizer, HF processor and pretrained config once."""
         from transformers import AutoProcessor
 
         from tensorrt_llm._torch.pyexecutor.config_utils import \
@@ -636,12 +626,8 @@ class TritonPythonModel:
                 f"triton_config.multimodal is enabled but the HF processor/config "
                 f"for '{hf_model_dir}' could not be loaded: {e}")
 
-        # Read `model_type` from the config class, not the instance: composite
-        # configs such as Qwen2_5_VLConfig delegate the instance attribute to
-        # `text_config` and would report "qwen2_5_vl_text" instead of the
-        # "qwen2_5_vl" key used by the multimodal placeholder registry. This
-        # matches `tensorrt_llm.serve.chat_utils.resolve_top_level_model_type`,
-        # inlined to keep the backend off the `tensorrt_llm.serve` import path.
+        # Composite configs (e.g. Qwen2_5_VLConfig) delegate the instance
+        # attribute to `text_config`, so prefer the class attribute.
         model_type = getattr(type(model_config), "model_type", None) or getattr(
             model_config, "model_type", "")
         self._multimodal_context = MultimodalContext(tokenizer=tokenizer,
@@ -654,19 +640,26 @@ class TritonPythonModel:
     async def _build_multimodal_prompt(self, text, image_url):
         """Build a multimodal PromptInputs from a text prompt and image URLs.
 
-        Runs the same sequence `trtllm-serve` uses for `v1/chat/completions`,
-        but calls the shared `tensorrt_llm.inputs` primitives directly rather
-        than going through `tensorrt_llm.serve.chat_utils`: importing anything
-        under `tensorrt_llm.serve` executes `tensorrt_llm/serve/__init__.py`,
-        which pulls in the whole OpenAI server stack (FastAPI, the `openai`
-        SDK) that a Triton deployment neither needs nor is guaranteed to have.
+        Runs the same sequence `trtllm-serve` uses for `v1/chat/completions`.
         """
         from tensorrt_llm.inputs import prompt_inputs
         from tensorrt_llm.inputs.utils import (ConversationMessage,
                                                MultimodalDataTracker,
                                                add_multimodal_placeholders,
-                                               async_apply_chat_template,
+                                               apply_chat_template,
                                                async_load_image)
+
+        # This directory is not shipped in the tensorrt_llm wheel, so operators
+        # copy it out of a git checkout into their model repository. The TRT-LLM
+        # it runs against is therefore not necessarily the one it was written
+        # for, and the multimodal helpers below gained their current shape after
+        # v1.2.1. Degrade to the older equivalents rather than fail at runtime.
+        try:
+            from tensorrt_llm.inputs.utils import async_apply_chat_template
+        except ImportError:
+
+            async def async_apply_chat_template(**kwargs):
+                return await asyncio.to_thread(apply_chat_template, **kwargs)
 
         ctx = self._multimodal_context
         media = [
@@ -675,17 +668,23 @@ class TritonPythonModel:
         ]
 
         # `add_data` takes the un-awaited fetch, so several images on one
-        # request are fetched concurrently when the tracker is drained below.
+        # request are fetched concurrently.
         mm_data_tracker = MultimodalDataTracker(ctx.model_type)
         for url in media:
             mm_data_tracker.add_data("image", async_load_image(url))
         mm_placeholder_counts = mm_data_tracker.placeholder_counts()
-        item_order = mm_data_tracker.item_order()
+        # `item_order`, and the argument it feeds, also post-date v1.2.1.
+        item_order = getattr(mm_data_tracker, "item_order", lambda: None)()
 
-        # The chat template needs the per-architecture image placeholders in
-        # the message text, so callers send a plain question as `text_input`.
-        content = add_multimodal_placeholders(ctx.model_type, text,
-                                              mm_placeholder_counts, item_order)
+        # The chat template inserts the per-architecture image placeholders,
+        # so callers send a plain question as `text_input`.
+        if item_order:
+            content = add_multimodal_placeholders(ctx.model_type, text,
+                                                  mm_placeholder_counts,
+                                                  item_order)
+        else:
+            content = add_multimodal_placeholders(ctx.model_type, text,
+                                                  mm_placeholder_counts)
         conversation = [
             ConversationMessage(role="user", content=content, media=[])
         ]
@@ -738,9 +737,8 @@ class TritonPythonModel:
         if isinstance(prompt, bytes):
             prompt = prompt.decode("utf-8")
 
-        # `image_url` is only consulted when the operator opts in, so an existing
-        # deployment that already declares an input with this name for another
-        # purpose keeps its current behavior after an upgrade.
+        # Only read `image_url` when the operator opts in, so a deployment
+        # already declaring that input keeps its behavior after an upgrade.
         if self.multimodal_enabled:
             image_url = get_input_tensor_by_name(request, 'image_url')
             if image_url is not None and image_url.size > 0:
