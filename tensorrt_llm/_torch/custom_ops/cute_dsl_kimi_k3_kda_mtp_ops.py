@@ -122,6 +122,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         USE_ZERO_ACCEPTED: cutlass.Constexpr[bool],
         FUSE_PRECOMPUTE: cutlass.Constexpr[bool],
         RUNTIME_PRECOMPUTE_FLAG: cutlass.Constexpr[bool],
+        USE_PDL: cutlass.Constexpr[bool],
         PROFILE_STAGES: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
@@ -170,9 +171,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             USE_ZERO_ACCEPTED,
             FUSE_PRECOMPUTE,
             RUNTIME_PRECOMPUTE_FLAG,
+            USE_PDL,
             stage_timing,
             PROFILE_STAGES,
-        ).launch(grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream)
+        ).launch(
+            grid=(HV, N, 1),
+            block=[NUM_THREADS, 1, 1],
+            stream=stream,
+            use_pdl=USE_PDL,
+        )
 
 
 def _require_stride_layout(
@@ -412,6 +419,7 @@ def kda_mtp_decode_impl(
     out: Optional[torch.Tensor] = None,
     zero_accepted_hint: bool = False,
     regular_metadata_hint: bool = False,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Launch the fused KDA MTP verify kernel. See the module docstring.
 
@@ -438,6 +446,9 @@ def kda_mtp_decode_impl(
         regular_metadata_hint: caller asserts ``cu_seqlens`` is the uniform
             ``arange * (2*num_spec+1)`` pattern and ``ssm_state_indices``
             is ``arange(N)`` (benchmark identity layout).
+        enable_pdl: use programmatic dependent launch. The KDA dispatch reads
+            its default with ``get_env_enable_pdl``; direct op calls default
+            off.
 
     Returns the output ``[1, T_total, H, V]`` bf16 (rows for replayed
     positions are zero; only new-token rows are written).
@@ -566,6 +577,7 @@ def kda_mtp_decode_impl(
         use_regular_metadata,
         use_reg_q_weights,
         use_zero_accepted,
+        enable_pdl,
     )
 
     if key not in _compiled_cache:
@@ -573,7 +585,7 @@ def kda_mtp_decode_impl(
             f"kda_mtp_decode: compiling variant N={N} H={HV} T={T_total} "
             f"num_spec={num_spec} zero_accepted={use_zero_accepted} "
             f"regular_metadata={use_regular_metadata} "
-            f"static_shape={is_benchmark_static_shape}"
+            f"static_shape={is_benchmark_static_shape} pdl={enable_pdl}"
         )
         _compiled_cache[key] = cute.compile(
             _run_kda_decode_mtp,
@@ -617,6 +629,7 @@ def kda_mtp_decode_impl(
             USE_ZERO_ACCEPTED=use_zero_accepted,
             FUSE_PRECOMPUTE=True,
             RUNTIME_PRECOMPUTE_FLAG=False,
+            USE_PDL=enable_pdl,
             PROFILE_STAGES=profile_stages,
             stream=stream,
         )
@@ -694,6 +707,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scale: Optional[float] = None,
         zero_accepted_hint: bool = False,
         regular_metadata_hint: bool = False,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         """Fused KDA multi-token verify with in-place state commit."""
         return kda_mtp_decode_impl(
@@ -722,6 +736,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             scale=scale,
             zero_accepted_hint=zero_accepted_hint,
             regular_metadata_hint=regular_metadata_hint,
+            enable_pdl=enable_pdl,
         )
 
     @kda_mtp_decode.register_fake
@@ -751,5 +766,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scale: Optional[float] = None,
         zero_accepted_hint: bool = False,
         regular_metadata_hint: bool = False,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         return x_q.new_empty(x_v.shape)

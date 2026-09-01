@@ -106,6 +106,7 @@ def kda_decode_mtp_kernel(
     USE_ZERO_ACCEPTED: cutlass.Constexpr[bool],
     FUSE_PRECOMPUTE: cutlass.Constexpr[bool],
     RUNTIME_PRECOMPUTE_FLAG: cutlass.Constexpr[bool],
+    USE_PDL: cutlass.Constexpr[bool],
     stage_timing: cute.Tensor,
     PROFILE_STAGES: cutlass.Constexpr[bool],
 ):
@@ -227,6 +228,8 @@ def kda_decode_mtp_kernel(
                                     w_q[hk_off + _i * 32 + in_warp_tid, _w]
                                 )
                 cute.arch.barrier()
+                if cutlass.const_expr(USE_PDL):
+                    cute.arch.griddepcontrol_wait()
                 if cutlass.const_expr(USE_SETMAXREG):
                     cute.arch.warpgroup_reg_dealloc(64)
                 if warp_idx < 3:
@@ -778,3 +781,5 @@ def kda_decode_mtp_kernel(
                 stage_timing[timing_base + 1] = t_stage2 - t_stage1
                 stage_timing[timing_base + 2] = t_stage2 - t_stage0
                 stage_timing[timing_base + 3] = t_stage0
+    if cutlass.const_expr(USE_PDL):
+        cute.arch.griddepcontrol_launch_dependents()

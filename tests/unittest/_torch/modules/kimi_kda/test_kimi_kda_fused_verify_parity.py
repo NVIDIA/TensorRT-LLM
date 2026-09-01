@@ -181,10 +181,12 @@ def _rep(name, a, b):
     return cos > 0.999 and rel < 3e-2
 
 
+@pytest.mark.parametrize("enable_pdl", [False, True], ids=["pdl-off", "pdl-on"])
 @torch.no_grad()
-def test_fused_vs_sequential_two_rounds():
+def test_fused_vs_sequential_two_rounds(monkeypatch, enable_pdl):
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", str(int(enable_pdl)))
     torch.manual_seed(0)
     B = 4
     T = M + 1

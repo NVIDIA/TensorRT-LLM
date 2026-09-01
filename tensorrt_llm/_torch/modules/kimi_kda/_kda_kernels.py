@@ -30,6 +30,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ...flashinfer_utils import get_env_enable_pdl
 from ..fla.index import prepare_chunk_indices
 from . import _kda_decode
 
@@ -389,6 +390,7 @@ class KDAKernelDispatch:
         self.verify_kernel_path = "fla"
         if use_optimized_verify and optimized_supported and is_intree_mtp_available():
             self.verify_kernel_path = "optimized"
+        self.use_pdl = get_env_enable_pdl()
         # One line per process so runs record which paths actually executed
         # (the fallback is otherwise silent).
         if not KDAKernelDispatch._selection_logged:
@@ -401,7 +403,7 @@ class KDAKernelDispatch:
                 logger.info(
                     f"KDA kernel dispatch: prefill={self.prefill_kernel_path} "
                     f"decode={self.decode_kernel_path} "
-                    f"verify={self.verify_kernel_path}"
+                    f"verify={self.verify_kernel_path} verify_pdl={self.use_pdl}"
                 )
 
     def mtp_verify(self, **kwargs) -> torch.Tensor:
@@ -419,6 +421,7 @@ class KDAKernelDispatch:
                 "sequential FLA verify fallback instead."
             )
         _load_mtp_module()  # registers trtllm::kda_mtp_decode
+        kwargs.setdefault("enable_pdl", self.use_pdl)
         return torch.ops.trtllm.kda_mtp_decode(**kwargs)
 
     def can_use_indexed_prefill(
