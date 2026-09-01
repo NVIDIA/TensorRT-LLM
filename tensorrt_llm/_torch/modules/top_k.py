@@ -22,15 +22,9 @@ class TopKImplementation(str, Enum):
     CUTE_DSL_RADIX = "cute_dsl_radix"
     CUDA_GVR = "cuda_gvr"
     CUTE_DSL_GVR = "cute_dsl_gvr"
-    CUTE_DSL_GVR_V2 = "cute_dsl_gvr_v2"
 
 
 _GVR_IMPLEMENTATIONS = {
-    TopKImplementation.CUDA_GVR,
-    TopKImplementation.CUTE_DSL_GVR,
-    TopKImplementation.CUTE_DSL_GVR_V2,
-}
-_TEMPORAL_GVR_IMPLEMENTATIONS = {
     TopKImplementation.CUDA_GVR,
     TopKImplementation.CUTE_DSL_GVR,
 }
@@ -53,6 +47,7 @@ class TopK(nn.Module):
         prefill_implementation: TopKImplementation | None = None,
         decode_implementation: TopKImplementation | None = None,
         compress_ratio: int = 1,
+        gvr_self_sampling: bool = True,
     ) -> None:
         super().__init__()
         self.top_k = top_k
@@ -63,10 +58,12 @@ class TopK(nn.Module):
             decode_implementation or TopKImplementation.CUDA_RADIX
         )
         self.compress_ratio = compress_ratio
-        # emission-assisted GVR (opt-in via prepare_gvr_emission): the
-        # module owns the closed-loop emission state; the caller passes
-        # the returned kwargs to the scoring op, and the consume side is
-        # injected into the GVR Top-K call while the step stays armed
+        # Second-level GVR dispatch for CUTE_DSL_GVR: True selects the
+        # hint-free self-sampling engine, False the temporal-hint engine.
+        self.gvr_self_sampling = gvr_self_sampling
+        # emission-assisted GVR (opt-in via prepare_gvr_emission): the module
+        # owns the closed-loop emission state; only reachable on the temporal
+        # (gvr_self_sampling=False) V1 path.
         self._gvr_emission_state = None
         self._gvr_emission_route = None
         self._gvr_emission_armed = False
@@ -74,7 +71,12 @@ class TopK(nn.Module):
     @property
     def needs_gvr_prior(self) -> bool:
         """Return whether decode consumes previous-step Top-K indices."""
-        return self.decode_implementation in _TEMPORAL_GVR_IMPLEMENTATIONS
+        if self.decode_implementation == TopKImplementation.CUDA_GVR:
+            return True
+        return (
+            self.decode_implementation == TopKImplementation.CUTE_DSL_GVR
+            and not self.gvr_self_sampling
+        )
 
     def forward(
         self,
@@ -103,10 +105,11 @@ class TopK(nn.Module):
             next_n: Number of decode rows per request.
             max_seq_len: Maximum decode score width used for GVR kernel tuning.
             gvr_ext_kwargs: GVR-only keyword arguments. ``gvr_prior_indices``
-                is required by the temporal CUDA and CuTe DSL GVR paths. It is
+                is required by the temporal GVR paths (``CUDA_GVR``, or
+                ``CUTE_DSL_GVR`` with ``gvr_self_sampling=False``). It is
                 caller-owned int32 previous selection with shape
-                ``[num_requests, top_k]`` on ``scores.device``. GVR V2 does
-                not consume this state.
+                ``[num_requests, top_k]`` on ``scores.device``. The
+                self-sampling engine does not consume this state.
                 ``gvr_row_order`` is an optional int32 request ordering with
                 shape ``[num_requests]`` on the same device.
 
@@ -279,7 +282,7 @@ class TopK(nn.Module):
         gvr_prior_indices: torch.Tensor | None = None,
         gvr_row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR_V2:
+        if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR and self.gvr_self_sampling:
             assert max_seq_len is not None
             if (
                 # engine hardware-format gate (falls through otherwise):
@@ -306,7 +309,7 @@ class TopK(nn.Module):
                     f"next_n={next_n}, hint-free).",
                     key="selfsampling_topk_engaged",
                 )
-                # Self-sampling GVR varlen engine (TRTLLM_GVR_SELF_SAMPLING=1):
+                # Self-sampling GVR varlen engine:
                 # one launch for the batch; per-row n from device kv_lens,
                 # capture-stable tuning from the max-seq-len engine constant
                 # (no host reads — CUDA-graph safe). The module receives
@@ -323,7 +326,7 @@ class TopK(nn.Module):
                 )
                 return output_indices
             logger.warning_once(
-                "TRTLLM_GVR_SELF_SAMPLING=1 but the decode scores do not "
+                "self-sampling GVR is selected but the decode scores do not "
                 "satisfy the engine's hardware-format gate "
                 f"(dtype={scores.dtype}, strides={tuple(scores.stride())}); "
                 "falling back to the CUDA insertion/radix Top-K path.",

@@ -690,16 +690,17 @@ class Indexer(nn.Module):
         self._enable_heuristic_topk = (
             sparse_params.enable_heuristic_topk and get_sm_version() >= 100
         )
-        # Opt-in self-sampling GVR top-K decode (CuTeDSL, env-gated:
-        # TRTLLM_GVR_SELF_SAMPLING=1). Same operator contract as the tiered
-        # heuristic path (per-request device kv_lens, raw prev-top-K hints,
-        # per-row MTP window, in-kernel n <= topK short path); tuning is
-        # frozen from indexer_max_seq_len at capture time, so the launch is
-        # CUDA-graph-replay safe. The TopK module's hardware-format gate
-        # falls through to the CUDA GVR path with a one-time warning;
-        # contract violations inside the engine raise.
+        # Two-level GVR dispatch: enable_heuristic_topk selects the GVR
+        # family over the exact radix path; use_self_sampling_topk (default
+        # True) selects the hint-free self-sampling engine over the
+        # temporal-hint engines. Tuning is frozen from indexer_max_seq_len
+        # at capture time, so the launch is CUDA-graph-replay safe. The
+        # TopK module's hardware-format gate falls back to the exact
+        # insertion/radix path with a one-time warning; contract violations
+        # inside the engine raise.
         self._use_self_sampling_topk = (
-            os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") == "1"
+            sparse_params.use_self_sampling_topk
+            and self._enable_heuristic_topk
             and IS_CUTLASS_DSL_AVAILABLE
             # datacenter Blackwell only; consumer Blackwell (sm_120/121)
             # lacks thread-block clusters
@@ -707,6 +708,29 @@ class Indexer(nn.Module):
             and sparse_params.index_topk in (512, 1024, 2048)
             and compress_ratio in (1, 4)
         )
+        if os.environ.get("TRTLLM_GVR_SELF_SAMPLING") is not None:
+            logger.warning_once(
+                "TRTLLM_GVR_SELF_SAMPLING is retired and ignored: the "
+                "self-sampling GVR engine is selected by the "
+                "use_self_sampling_topk sparse-attention config field "
+                "(default True) when enable_heuristic_topk is set.",
+                key="gvr_self_sampling_env_retired",
+            )
+        if (
+            self._enable_heuristic_topk
+            and sparse_params.use_self_sampling_topk
+            and not self._use_self_sampling_topk
+        ):
+            logger.warning_once(
+                "use_self_sampling_topk=True but the self-sampling GVR "
+                "prerequisites are not met "
+                f"(cutlass_dsl={IS_CUTLASS_DSL_AVAILABLE}, "
+                f"sm={get_sm_version()}, "
+                f"index_topk={sparse_params.index_topk}, "
+                f"compress_ratio={compress_ratio}); using the temporal GVR "
+                "path instead.",
+                key="gvr_self_sampling_prereq_fallback",
+            )
         self.mtp_index_share = sparse_params.mtp_index_share
 
         if self.use_cute_dsl_topk:
@@ -719,15 +743,16 @@ class Indexer(nn.Module):
             decode_top_k_implementation = TopKImplementation.CUDA_GVR
         else:
             decode_top_k_implementation = TopKImplementation.CUDA_RADIX
-        if self._use_self_sampling_topk and self._enable_heuristic_topk:
-            # env opt-in overrides the decode implementation; the GVR prior
-            # contract is identical
-            decode_top_k_implementation = TopKImplementation.CUTE_DSL_GVR_V2
+        if self._use_self_sampling_topk:
+            # The self-sampling engine overrides the temporal decode
+            # implementation regardless of use_cute_dsl_topk.
+            decode_top_k_implementation = TopKImplementation.CUTE_DSL_GVR
         self.top_k = TopK(
             self.index_topk,
             prefill_implementation=TopKImplementation.CUDA_RADIX,
             decode_implementation=decode_top_k_implementation,
             compress_ratio=self.compress_ratio,
+            gvr_self_sampling=self._use_self_sampling_topk,
         )
         # GVR emission-assisted decode (opt-in, experimental): the FP4/FP8
         # indexer epilogue emits candidates the GVR Top-K consumes (see
