@@ -49,6 +49,13 @@ class _AlignmentToyModule(nn.Module):
         self.alignment_sensitive = nn.Parameter(torch.ones((3,), dtype=torch.bfloat16))
 
 
+class _ChannelsLast3dToyModule(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        weight = torch.arange(2 * 3 * 4 * 5 * 6, dtype=torch.float32).reshape(2, 3, 4, 5, 6)
+        self.weight = nn.Parameter(weight.contiguous(memory_format=torch.channels_last_3d))
+
+
 class _ToyTransformer(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -347,6 +354,25 @@ def test_packed_tensor_views_are_sufficiently_aligned():
     manager.stage("stage")
     assert stage.prefix.data_ptr() % 16 == 0
     assert stage.alignment_sensitive.data_ptr() % 16 == 0
+
+
+def test_offload_preserves_channels_last_3d_layout():
+    stage = _ChannelsLast3dToyModule()
+    expected = stage.weight.detach().clone()
+    expected_stride = stage.weight.stride()
+    manager = ModuleOffloadManager(
+        stages={"stage": stage},
+        device="cpu",
+        pin_memory=False,
+    )
+
+    manager.initialize()
+    assert stage.weight.stride() == expected_stride
+    torch.testing.assert_close(stage.weight, expected)
+
+    manager.stage("stage")
+    assert stage.weight.stride() == expected_stride
+    torch.testing.assert_close(stage.weight, expected)
 
 
 def test_offload_pipeline_context_stages_requested_stage():
