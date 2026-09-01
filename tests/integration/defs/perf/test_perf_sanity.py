@@ -316,6 +316,15 @@ E2E_TIME_BREAKDOWN_CONFIGS = (
     "gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL",
 )
 
+# Same allowlist discipline for ctx_only. Kept separate from
+# E2E_TIME_BREAKDOWN_CONFIGS rather than reused: ctx_only runs on the aggregated
+# runtime with a single server on a fraction of the nodes, so whether a config is
+# worth a time_breakdown lane is a different question per mode, and the two lists
+# are expected to diverge as lanes are added.
+CTX_ONLY_TIME_BREAKDOWN_CONFIGS = (
+    "gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL",
+)
+
 # The names and statistics come from .time_breakdown_metrics, which is the single
 # source of truth for both -- it computes them and formats the log lines this
 # module parses back, so the producer and consumer cannot drift.
@@ -1599,6 +1608,66 @@ class DisaggConfig:
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
 
+def append_time_breakdown_metrics(
+    pending_time_breakdown: List[dict],
+    outputs: List[str],
+    breakdown_dir: str,
+) -> None:
+    """Aggregate the workers' perf_metrics JSONLs into log lines the parser reads.
+
+    Shared by both runtimes: the disaggregated path (ctx + gen workers each write
+    their own file) and the aggregated path used by ctx_only and plain aggr (a
+    single server writes one file). The reduction in time_breakdown_metrics is
+    mode-agnostic -- it classifies each file by content, not by filename -- so the
+    only difference between the two callers is which directory to scan.
+
+    Must be called *after* benchmark_status is written, for the same reason the
+    gen_only device step time is (nvbugs 6487036 / 6487040): the workers keep
+    appending to their JSONLs until their process exits, and reading early would
+    silently aggregate a truncated run.
+
+    Failures are reported and skipped rather than raised: the resulting absence of
+    parsed ``Time Breakdown ...`` lines is what check_test_failure hard-fails on,
+    which keeps the diagnosis in one place instead of tearing down the whole
+    session from inside a post-benchmark hook.
+    """
+    if not pending_time_breakdown:
+        return
+    paths = discover_perf_metrics_files(breakdown_dir)
+    if not paths:
+        print_info(
+            f"No perf_metrics-*.jsonl under {breakdown_dir}; skipping time breakdown aggregation"
+        )
+        return
+    for record in pending_time_breakdown:
+        # The benchmark mode *is* the parser's case type now that the
+        # time_breakdown modifier is a separate id segment. Checked rather
+        # than assumed: an unsupported case type would otherwise upload 108
+        # zeros and look exactly like a run that measured nothing.
+        case_type = record["benchmark_mode"]
+        if case_type not in TIME_BREAKDOWN_MODE_GROUPS:
+            print_info(
+                f"No time breakdown groups defined for benchmark mode {case_type!r}; "
+                "skipping aggregation"
+            )
+            continue
+        try:
+            metrics, info = compute_time_breakdown_metrics(paths, case_type)
+        except (OSError, ValueError, KeyError) as exc:
+            print_info(f"Time breakdown aggregation failed for {breakdown_dir}: {exc}")
+            continue
+
+        for warning in info["warnings"]:
+            print_info(f"Time breakdown: {warning}")
+        print_info(f"Time breakdown ({case_type}) from {len(paths)} file(s): {info['counts']}")
+
+        summary_lines = "\n".join(format_metric_log_lines(metrics))
+        with open(record["benchmark_file_path"], "a") as benchmark_ctx:
+            benchmark_ctx.write(f"\n{summary_lines}\n")
+        idx = record["output_index"]
+        outputs[idx] = f"{outputs[idx]}\n{summary_lines}\n"
+
+
 class AggrTestCmds(NamedTuple):
     """Commands for aggregated server perf sanity tests."""
 
@@ -1610,6 +1679,15 @@ class AggrTestCmds(NamedTuple):
     client_configs: Dict[int, List["ClientConfig"]] = {}
     model_name: str = ""
     server_configs: List["ServerConfig"] = []
+    # Non-empty exactly when the time_breakdown modifier is on: it is
+    # PerfSanityTestConfig.time_breakdown_dir(), the single master switch. The
+    # aggregated runtime serves both plain `aggr*` cases and `ctx_only` (which is
+    # parsed by the disagg config parser but executed here), and in both the one
+    # server process writes the perf_metrics JSONL this directory collects.
+    perf_metrics_output_dir: str = ""
+    # Parser case type for the reduction (ctx_only / gen_only / e2e). Carried as a
+    # field because the aggregated path has no per-client config to read it from.
+    benchmark_mode: str = ""
 
     def get_server_logs(self, server_idx) -> List[str]:
         server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
@@ -1630,6 +1708,12 @@ class AggrTestCmds(NamedTuple):
         server_proc = None
         server_cmd = self.server_cmds[server_idx]
         client_configs = self.client_configs.get(server_idx, [])
+        # Deferred for the same reason as on the disagg path (nvbugs 6487036 /
+        # 6487040): PerfMetricsJsonlWriter drains its queue on a background task
+        # and only flushes the tail in close(), so the JSONL is complete just
+        # after the server exits -- i.e. after the finally below, not before it.
+        pending_time_breakdown: List[dict] = []
+        collect_time_breakdown = bool(self.perf_metrics_output_dir)
 
         try:
             server_hostname = "localhost"
@@ -1692,6 +1776,14 @@ class AggrTestCmds(NamedTuple):
                         client_file_path,
                     )
                     outputs.append(output)
+                    if collect_time_breakdown:
+                        pending_time_breakdown.append(
+                            {
+                                "output_index": len(outputs) - 1,
+                                "benchmark_file_path": client_file_path,
+                                "benchmark_mode": self.benchmark_mode,
+                            }
+                        )
                 else:
                     print_info(
                         f"Skipping perf benchmark for client {client_idx}: only_run_accuracy=True"
@@ -1715,6 +1807,12 @@ class AggrTestCmds(NamedTuple):
             if server_proc:
                 server_proc.terminate()
                 server_proc.wait()
+
+        # The server has been reaped, so its perf_metrics JSONL is closed and
+        # complete. terminate() is SIGTERM, which trtllm-serve handles as a
+        # graceful shutdown, so PerfMetricsJsonlWriter.close() has run and the
+        # tail of the queue is on disk.
+        append_time_breakdown_metrics(pending_time_breakdown, outputs, self.perf_metrics_output_dir)
 
         return outputs
 
@@ -1904,7 +2002,7 @@ class DisaggTestCmds(NamedTuple):
             # (time_breakdown_dir) to find the combined record. A yaml that
             # redirected it would not fail -- it would upload no breakdown at
             # all, which looks exactly like a case that has none. Non-empty only
-            # only with the time_breakdown modifier, so no other lane is affected.
+            # with the time_breakdown modifier, so no other lane is affected.
             server_config["perf_metrics_output_dir"] = self.perf_metrics_output_dir
         config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
         with open(config_path, "w") as f:
@@ -2059,72 +2157,19 @@ class DisaggTestCmds(NamedTuple):
         pending_time_breakdown: List[dict],
         outputs: List[str],
     ) -> None:
-        """Aggregate the per-request time breakdown and append it to each client's log.
+        """Disagg entry point for the shared aggregation; see the module function.
 
         Deferred to after benchmark_status is written, for the same reason the
         gen_only device step time is (nvbugs 6487036 / 6487040): the ctx and gen
         workers keep appending to their perf_metrics JSONLs until their srun
         exits, and reading early would silently aggregate a truncated run.
 
-        Reads the worker JSONLs rather than the client's copy of the disagg
-        combined file, because the per-chunk and per-step detail exists only in
-        the worker files -- the worker->disagg header transport carries
-        durations, not the absolute timestamps those breakdowns need. The
-        lifecycle spans are computed from the same records either way.
-
-        A parse failure is reported and left to check_test_failure, which fails
-        the run before anything is uploaded. It must not raise here: the
-        measurement itself already succeeded and its ordinary metrics are worth
-        keeping for triage.
+        PerfSanityTestConfig.time_breakdown_dir() is what *computed* this path; it
+        is handed to DisaggTestCmds as a field (see the construction site) and is
+        not a method here. Calling the method on self would raise AttributeError
+        after the whole benchmark has already run.
         """
-        if not pending_time_breakdown:
-            return
-
-        # PerfSanityTestConfig.time_breakdown_dir() is what *computed* this path;
-        # it is handed to DisaggTestCmds as a field (see the construction site) and
-        # is not a method here. Calling the method on self would raise
-        # AttributeError after the whole benchmark has already run.
-        breakdown_dir = self.perf_metrics_output_dir
-        # Globbed once: the JSONLs are lane-scoped, not client-scoped, so every
-        # record would rediscover the identical set. _parse_disagg_config_file
-        # rejects a multi-client time_breakdown lane, so this loop is normally a
-        # single iteration anyway.
-        paths = discover_perf_metrics_files(breakdown_dir)
-        if not paths:
-            print_info(
-                f"No perf_metrics-*.jsonl under {breakdown_dir}; "
-                "skipping time breakdown aggregation"
-            )
-            return
-        for record in pending_time_breakdown:
-            # The benchmark mode *is* the parser's case type now that the
-            # time_breakdown modifier is a separate id segment. Checked rather
-            # than assumed: an unsupported case type would otherwise upload 108
-            # zeros and look exactly like a run that measured nothing. Reported
-            # and skipped rather than raised (see the docstring); the resulting
-            # absence of parsed lines is what check_test_failure hard-fails on.
-            case_type = record["benchmark_mode"]
-            if case_type not in TIME_BREAKDOWN_MODE_GROUPS:
-                print_info(
-                    f"No time breakdown groups defined for benchmark mode {case_type!r}; "
-                    "skipping aggregation"
-                )
-                continue
-            try:
-                metrics, info = compute_time_breakdown_metrics(paths, case_type)
-            except (OSError, ValueError, KeyError) as exc:
-                print_info(f"Time breakdown aggregation failed for {breakdown_dir}: {exc}")
-                continue
-
-            for warning in info["warnings"]:
-                print_info(f"Time breakdown: {warning}")
-            print_info(f"Time breakdown ({case_type}) from {len(paths)} file(s): {info['counts']}")
-
-            summary_lines = "\n".join(format_metric_log_lines(metrics))
-            with open(record["benchmark_file_path"], "a") as benchmark_ctx:
-                benchmark_ctx.write(f"\n{summary_lines}\n")
-            idx = record["output_index"]
-            outputs[idx] = f"{outputs[idx]}\n{summary_lines}\n"
+        append_time_breakdown_metrics(pending_time_breakdown, outputs, self.perf_metrics_output_dir)
 
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
@@ -2487,7 +2532,7 @@ def parse_test_string(test_case_name: str):
     The modifier segment is optional and drawn from the closed TEST_ID_MODIFIERS
     vocabulary, so mode and instrumentation are orthogonal. It is unambiguous
     against the config stem because no config stem's first "-"-segment is a
-    modifier -- get_disagg_test_cases asserts that at collection time.
+    modifier -- get_disagg_test_cases enforces that at collection time.
 
     Returns:
         tuple: (config_base_name, select_pattern, runtime_mode, benchmark_mode,
@@ -2498,7 +2543,12 @@ def parse_test_string(test_case_name: str):
     """
     labels = test_case_name.split("-")
 
-    assert len(labels) > 1, "perf_sanity test must have a config file!"
+    # ValueError rather than assert throughout: these are test-id grammar
+    # violations, and `python -O` (or a future PYTHONOPTIMIZE in a CI image)
+    # removes assert statements, which would turn a malformed id into a silent
+    # IndexError or a run against the wrong config instead of a clear rejection.
+    if len(labels) <= 1:
+        raise ValueError(f"perf_sanity test must have a config file: {test_case_name}")
 
     prefix = labels[0]
     is_disagg_prefix = "disagg" in prefix
@@ -2509,16 +2559,17 @@ def parse_test_string(test_case_name: str):
         time_breakdown = bool(rest) and rest[0] == TIME_BREAKDOWN_MODIFIER
         if time_breakdown:
             rest = rest[1:]
-        assert rest, f"Test name has a modifier but no config: {test_case_name}"
+        if not rest:
+            raise ValueError(f"Test name has a modifier but no config: {test_case_name}")
         return time_breakdown, "-".join(rest)
 
     if is_disagg_prefix:
         # disagg_upload-{e2e|gen_only}[-{modifier}]-{config_base}
-        assert len(labels) > 2, "Disagg test must have benchmark_mode and config!"
+        if len(labels) <= 2:
+            raise ValueError(f"Disagg test must have benchmark_mode and config: {test_case_name}")
         benchmark_mode = labels[1]
-        assert benchmark_mode in ("e2e", "gen_only"), (
-            f"Invalid benchmark_mode for disagg: {benchmark_mode}"
-        )
+        if benchmark_mode not in ("e2e", "gen_only"):
+            raise ValueError(f"Invalid benchmark_mode for disagg: {benchmark_mode}")
         runtime_mode = "disaggregated"
         time_breakdown, config_base_name = split_modifiers(labels[2:])
         select_pattern = None
@@ -2787,6 +2838,12 @@ class PerfSanityTestConfig:
                 "gpus_per_node": gpus_per_node,
                 "disagg_run_type": "aggr",  # Run as aggr
                 **ctx_config,
+                # ctx_only is parsed here but *executed* on the aggregated path,
+                # so this lone server is the only process that can emit the
+                # per-request timing events. Applied last so the modifier wins
+                # over anything the yaml's ctx block happens to set: without it
+                # the case would run green and upload 44 zeros.
+                **self._time_breakdown_worker_overrides(),
             }
 
             # ctx_only runs the ctx worker in aggregated mode; use the merged
@@ -2947,7 +3004,12 @@ class PerfSanityTestConfig:
         return os.path.join(self._output_dir, self._test_param_labels, "perf_metrics")
 
     def _time_breakdown_worker_overrides(self) -> dict:
-        """worker_config keys the time_breakdown modifier forces on ctx and gen.
+        """worker_config keys the time_breakdown modifier forces on each server.
+
+        Applied to the ctx and gen workers of a disaggregated case and to the lone
+        aggregated server of a ctx_only case -- in every mode, to whichever
+        processes actually serve requests, since those are the only ones that can
+        observe a request's timestamps.
 
         Applied after the yaml's worker_config splat, so these win over the
         shared config -- which is the point: the yaml is shared with the e2e,
@@ -2957,11 +3019,14 @@ class PerfSanityTestConfig:
           headers at all (PerfMetricsMiddleware is installed with
           expose_headers=return_perf_metrics), and those headers are the only
           way worker-side timestamps reach the disagg server's combined JSONL,
-          which is the one file the benchmark client reads.
+          which is the one file the benchmark client reads. In ctx_only there is
+          no disagg server, so this flag is what makes the single server record
+          its own requests at all.
         - perf_metrics_output_dir makes each worker also keep its own record.
-          The client ignores these (_perf_metrics_files prefers the "disagg"
-          file), but they carry per-step and per-chunk detail the header
-          transport cannot express, for offline drill-down.
+          On the disagg path the client ignores these (_perf_metrics_files
+          prefers the "disagg" file) but they carry per-step and per-chunk detail
+          the header transport cannot express; in ctx_only they are the only
+          record, and _perf_metrics_files falls back to the "server" kind.
         - num_postprocess_workers=0 preserves that detail: PostprocWorker.Output
           forwards request_perf_metrics but not time_breakdown_metrics, so a
           non-zero value silently flattens the per-step bars. This measurably
@@ -3050,6 +3115,12 @@ class PerfSanityTestConfig:
             client_configs=self.server_client_configs,
             model_name=agg_model_name,
             server_configs=list(self.server_configs),
+            # Empty unless the time_breakdown modifier is on, which is what makes
+            # run_cmd skip the aggregation entirely. benchmark_mode is None for a
+            # plain aggr case; "" then fails the MODE_GROUPS membership check with
+            # a diagnostic instead of reducing against an arbitrary mode.
+            perf_metrics_output_dir=self.time_breakdown_dir(),
+            benchmark_mode=self.benchmark_mode or "",
         )
 
     def _get_disagg_commands(self, output_dir: str, test_output_dir: str):
@@ -3206,7 +3277,7 @@ class PerfSanityTestConfig:
                     # Last match wins, unlike every other metric here. Two
                     # producers write these lines: benchmark_serving prints the
                     # lifecycle spans it can derive from the client's copy of the
-                    # disagg combined file, and _append_time_breakdown_metrics
+                    # server-written file, and append_time_breakdown_metrics
                     # then appends the full set aggregated from the worker files.
                     # The two agree on the spans they share, but taking the
                     # appended set wholesale keeps every uploaded field from a
@@ -3345,15 +3416,13 @@ class PerfSanityTestConfig:
                 # absent when its endpoints were never populated); total absence
                 # cannot be.
                 #
-                # Scoped to the disagg runtime because that is the only runtime
-                # the modifier currently attaches to. A future
-                # ctx_only-time_breakdown runs aggregated and would need this
-                # guard widened to reach it.
-                if (
-                    self.runtime == "multi_node_disagg_server"
-                    and self.time_breakdown
-                    and not any(k.startswith("tb_") for k in (metrics or {}))
-                ):
+                # Keyed on the modifier alone, not on the runtime: e2e runs
+                # disaggregated while ctx_only runs on the aggregated runtime, and
+                # both collect. A runtime predicate here would have silently
+                # exempted ctx_only -- the exact failure this check exists to
+                # catch. Ids that cannot collect never reach here, because only
+                # the two allowlists above mint a modified id.
+                if self.time_breakdown and not any(k.startswith("tb_") for k in (metrics or {})):
                     error_msg += (
                         f"{TIME_BREAKDOWN_MODIFIER} test Server {server_idx} Client "
                         f"{client_idx} parsed no 'Time Breakdown ...' lines from the "
@@ -3414,6 +3483,12 @@ class PerfSanityTestConfig:
                         new_data,
                         server_perf_results[client_idx],
                         spec_decoding=client_config.spec_decoding,
+                        # ctx_only rides this runtime (see parse_test_string), so
+                        # the modifier reaches the aggregated branch too. Both
+                        # arguments stay falsy for a plain aggr lane, which is why
+                        # they were previously omitted.
+                        benchmark_mode=self.benchmark_mode,
+                        time_breakdown=self.time_breakdown,
                     )
 
                     new_data_dict[cmd_idx] = new_data
@@ -3609,11 +3684,12 @@ def get_disagg_test_cases() -> List[str]:
     # loud collection error instead of a run of the wrong config.
     for config_yml in basenames:
         first_segment = config_yml.split("-")[0]
-        assert first_segment not in TEST_ID_MODIFIERS, (
-            f"Disagg config {config_yml}.yaml starts with the reserved test-id "
-            f"modifier {first_segment!r}; rename it or the generated test id is "
-            f"ambiguous (see parse_test_string)."
-        )
+        if first_segment in TEST_ID_MODIFIERS:
+            raise ValueError(
+                f"Disagg config {config_yml}.yaml starts with the reserved test-id "
+                f"modifier {first_segment!r}; rename it or the generated test id is "
+                f"ambiguous (see parse_test_string)."
+            )
 
     test_cases = []
     for config_yml in basenames:
@@ -3629,6 +3705,10 @@ def get_disagg_test_cases() -> List[str]:
         # ctx_only test cases (uses aggr prefix)
         for test_type in AGG_TEST_TYPES:
             test_cases.append(f"{test_type}-ctx_only-{config_yml}")
+            # Allowlisted, for the same reason the e2e ids are.
+            if config_yml in CTX_ONLY_TIME_BREAKDOWN_CONFIGS:
+                label = format_test_label("ctx_only", time_breakdown=True)
+                test_cases.append(f"{test_type}-{label}-{config_yml}")
 
     return test_cases
 

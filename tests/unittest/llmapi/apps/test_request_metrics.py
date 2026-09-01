@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from typing import Optional
 
 import pytest
 
@@ -325,7 +326,7 @@ def test_jsonl_record_keeps_header_derived_kv_transfer_timestamps():
 
 
 @pytest.mark.parametrize("absent", [None, 0, 0.0])
-def test_jsonl_record_still_strips_absent_kv_transfer_timestamps(absent):
+def test_jsonl_record_still_strips_absent_kv_transfer_timestamps(absent: Optional[float]) -> None:
     """A request that never transferred KV must not gain zero-width KV fields.
 
     ``0`` is not hypothetical: the aggregated path reads these off a default-

@@ -34,6 +34,8 @@ The mode has a three-hop contract, and each hop fails *silently* if it drifts:
 """
 
 import importlib.util
+import json
+import os
 import pathlib
 import sys
 import types
@@ -299,3 +301,327 @@ def test_add_perf_metric_value_skips_a_missing_span():
         time_breakdown=True,
     )
     assert "d_tb_gen_kv_transfer_median" not in new_data
+
+
+# A disaggregated yaml reduced to what the parser actually reads. ctx_only runs
+# only the `ctx:` worker, but `gen:` has to be present because the same file is
+# what the e2e and gen_only ids read.
+_DISAGG_YAML = """
+metadata:
+  model_name: deepseek-ai/DeepSeek-R1
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+  nodes_per_ctx_server: 1
+  nodes_per_gen_server: 1
+  gpus_per_node_per_ctx_server: 4
+  gpus_per_node_per_gen_server: 4
+benchmark:
+  input_length: 8192
+  output_length: 1024
+  concurrency_list: "666"
+worker_config:
+  ctx:
+    tensor_parallel_size: 4
+    cache_transceiver_config:
+      backend: NIXL
+  gen:
+    tensor_parallel_size: 4
+"""
+
+
+def _parsed_config(tmp_path, benchmark_mode: str, time_breakdown: bool):
+    """Drive the real parser without constructing a whole pytest fixture graph.
+
+    ``PerfSanityTestConfig.__init__`` derives everything under test from the test
+    id; setting the four derived attributes directly keeps the case about the
+    parser instead of about id parsing, which the round-trip tests already cover.
+    """
+    config_path = tmp_path / "gb300_stem-NIXL.yaml"
+    config_path.write_text(_DISAGG_YAML, encoding="utf-8")
+    config = object.__new__(_sanity.PerfSanityTestConfig)
+    config.benchmark_mode = benchmark_mode
+    config.time_breakdown = time_breakdown
+    config._output_dir = str(tmp_path)
+    config._test_param_labels = "case"
+    config._parse_disagg_config_file(str(config_path), config_path.name)
+    return config
+
+
+def test_ctx_only_time_breakdown_instruments_its_one_server(tmp_path):
+    """The regression this guards: ctx_only runs on the *aggregated* runtime.
+
+    ctx_only is parsed by the disagg parser but executed by AggrTestCmds, so it
+    takes the ``else`` branch's worker overrides nowhere -- it builds its own
+    single ServerConfig. Without the splat in that branch the case runs perfectly
+    green, the server is simply never asked to record any timings, and all 44
+    ctx_only ``d_tb_*`` fields upload as 0.0. Nothing downstream can tell that
+    apart from a lane that genuinely measured nothing.
+    """
+    config = _parsed_config(tmp_path, "ctx_only", time_breakdown=True)
+
+    assert len(config.server_configs) == 1
+    extra = config.server_configs[0].extra_llm_api_config_data
+    assert extra["return_perf_metrics"] is True
+    assert extra["num_postprocess_workers"] == 0
+    assert extra["perf_metrics_output_dir"] == config.time_breakdown_dir()
+    # The directory both halves have to agree on: the server writes here, and
+    # append_time_breakdown_metrics scans here.
+    assert config.time_breakdown_dir().endswith(os.path.join("case", "perf_metrics"))
+
+
+def test_ctx_only_without_the_modifier_stays_untouched(tmp_path):
+    """The plain ctx_only lane must not acquire any of the three keys.
+
+    num_postprocess_workers: 0 measurably changes throughput, so leaking it into
+    the unmodified lane would move that lane's baseline rather than fork a new
+    series -- a regression that looks like a real one.
+    """
+    config = _parsed_config(tmp_path, "ctx_only", time_breakdown=False)
+
+    extra = config.server_configs[0].extra_llm_api_config_data
+    for key in ("return_perf_metrics", "perf_metrics_output_dir", "num_postprocess_workers"):
+        assert key not in extra
+    assert config.time_breakdown_dir() == ""
+
+
+def test_ctx_only_client_records_the_breakdown(tmp_path):
+    """The other half of the contract: the client has to be told to read it back.
+
+    The server writing a JSONL is useless on its own -- benchmark_serving is what
+    prints the ``Time Breakdown`` lines the harness scrapes, and it only does that
+    when handed --save-request-time-breakdown.
+    """
+    config = _parsed_config(tmp_path, "ctx_only", time_breakdown=True)
+    client_cmd = config.server_client_configs[0][0].to_cmd()
+
+    assert "--save-request-time-breakdown" in client_cmd
+    assert client_cmd[client_cmd.index("--save-request-time-breakdown") + 1] == (
+        config.time_breakdown_dir()
+    )
+
+
+def test_the_no_lines_guard_is_not_scoped_to_the_disagg_runtime(tmp_path):
+    """A runtime predicate on that guard would have exempted exactly ctx_only.
+
+    check_test_failure's "parsed no Time Breakdown lines" check is the only thing
+    that turns a silently uninstrumented modified run into a red build. It used to
+    be gated on runtime == multi_node_disagg_server, which is false for ctx_only.
+    """
+    config = _parsed_config(tmp_path, "ctx_only", time_breakdown=True)
+    config.runtime = "aggr_server"
+    config.gpu_type = "gb300"
+    config._perf_results = {0: [_parsed_metrics()]}
+
+    with pytest.raises(RuntimeError, match="parsed no 'Time Breakdown"):
+        config.check_test_failure()
+
+
+def test_the_no_lines_guard_passes_once_a_span_is_present(tmp_path):
+    """Same lane, one parsed span: the guard must not fire.
+
+    Individual spans stay ungated on purpose -- a span whose endpoints were never
+    populated is legitimately absent -- so presence of any one of them is the
+    whole condition.
+    """
+    config = _parsed_config(tmp_path, "ctx_only", time_breakdown=True)
+    config.runtime = "aggr_server"
+    config.gpu_type = "gb300"
+    config._perf_results = {0: [_parsed_metrics(tb_ctx_queue_mean=1.5)]}
+
+    config.check_test_failure()
+
+
+def test_get_commands_hands_the_breakdown_dir_to_the_aggregated_runner(tmp_path):
+    """ctx_only dispatches to _get_aggr_commands, so AggrTestCmds must carry the dir.
+
+    DisaggTestCmds reads perf_metrics_output_dir off its disagg config; the
+    aggregated runner had no equivalent, so this is the hop that decides whether
+    run_cmd aggregates at all. An empty string here means every ctx_only
+    breakdown run silently skips the reduction.
+    """
+    config = _parsed_config(tmp_path, "ctx_only", time_breakdown=True)
+    config.runtime = "aggr_server"
+
+    cmds = config.get_commands()
+
+    assert isinstance(cmds, _sanity.AggrTestCmds)
+    assert cmds.perf_metrics_output_dir == config.time_breakdown_dir()
+    assert cmds.benchmark_mode == "ctx_only"
+
+    # And the plain ctx_only lane must leave it empty, which is what makes run_cmd
+    # skip the aggregation rather than reduce an empty directory every run.
+    plain = _parsed_config(tmp_path, "ctx_only", time_breakdown=False)
+    plain.runtime = "aggr_server"
+    assert plain.get_commands().perf_metrics_output_dir == ""
+
+
+def _ctx_worker_jsonl(directory, count=3):
+    """A context worker's perf_metrics JSONL, in the shape the server really writes.
+
+    Only the fields the reduction reads: the request-level timing metrics and one
+    prefill chunk per request.
+    """
+    os.makedirs(directory, exist_ok=True)
+    lines = []
+    for i in range(count):
+        t0 = 1000.0 + i
+        chunk_start = t0 + 0.010
+        lines.append(
+            json.dumps(
+                {
+                    "request_id": i,
+                    "perf_metrics": {
+                        "timing_metrics": {
+                            "server_arrival_time": t0,
+                            "arrival_time": t0 + 0.001,
+                            "first_scheduled_time": t0 + 0.003,
+                            "first_token_time": t0 + 0.130,
+                            "server_first_token_time": t0 + 0.131,
+                            "last_token_time": t0 + 0.130,
+                        }
+                    },
+                    "time_breakdown_metrics": {
+                        "ctx_chunk_metrics": [
+                            {
+                                "forward_start_time": chunk_start,
+                                "forward_end_time": chunk_start + 0.100,
+                                "sample_start_time": chunk_start + 0.102,
+                                "sample_end_time": chunk_start + 0.103,
+                                "token_time": t0 + 0.130,
+                                "gpu_forward_time": 98.0,
+                                "gpu_sample_time": 0.9,
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+    path = os.path.join(directory, "perf_metrics-server-hostA-0-run.jsonl")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return path
+
+
+def test_append_time_breakdown_metrics_reduces_a_single_aggregated_worker(tmp_path):
+    """The aggregated path has one server file, not a ctx/gen pair.
+
+    The reduction classifies files by content, so it needs no changes for this --
+    but the caller does, and this is what proves the shared entry point works
+    with a lone ctx-role file and emits lines in the format the scraper matches.
+    """
+    breakdown_dir = str(tmp_path / "perf_metrics")
+    _ctx_worker_jsonl(breakdown_dir)
+    benchmark_file = tmp_path / "benchmark.log"
+    benchmark_file.write_text("existing client output\n", encoding="utf-8")
+    outputs = ["existing client output\n"]
+
+    _sanity.append_time_breakdown_metrics(
+        [
+            {
+                "output_index": 0,
+                "benchmark_file_path": str(benchmark_file),
+                "benchmark_mode": "ctx_only",
+            }
+        ],
+        outputs,
+        breakdown_dir,
+    )
+
+    # Both sinks must be written: the parser reads the captured stdout, and the
+    # benchmark file is what a human reads afterwards.
+    assert "Time Breakdown ctx_processing mean (ms):" in outputs[0]
+    assert "Time Breakdown ctx_processing mean (ms):" in benchmark_file.read_text()
+
+    # The whole point of the wiring: the real consumer regex now finds populated
+    # ctx spans in what the run captured. Scraped with the harness's own pattern
+    # rather than a copy, so a producer/consumer format drift fails here.
+    scraped = {}
+    for line in outputs[0].splitlines():
+        match = _sanity.TIME_BREAKDOWN_METRIC_LOG_QUERY.search(line)
+        if match:
+            span, stat, value = match.groups()
+            scraped[_sanity.time_breakdown_metric_name(span, stat)] = float(value)
+
+    # Every field is emitted every run, so the OpenSearch doc schema never varies.
+    assert set(scraped) == set(_sanity.TIME_BREAKDOWN_METRICS)
+    assert scraped["tb_ctx_processing_mean"] > 0.0
+    assert scraped["tb_chunk_forward_mean"] > 0.0
+    # ctx_only populates 44 of the 108; the gen-side groups stay 0.0.
+    assert scraped["tb_gen_kv_transfer_mean"] == 0.0
+    assert len([v for v in scraped.values() if v != 0.0]) <= 44
+
+
+def test_append_time_breakdown_metrics_is_a_no_op_without_files(tmp_path):
+    """A missing directory must not raise: it is diagnosed by the "no lines" check.
+
+    Aggregation runs inside the test's teardown path. Raising here would replace a
+    clear "parsed no Time Breakdown lines" failure with a traceback from cleanup,
+    and on the disagg path it would mask whatever actually killed the workers.
+    """
+    outputs = ["client output\n"]
+    benchmark_file = tmp_path / "benchmark.log"
+    benchmark_file.write_text("client output\n", encoding="utf-8")
+
+    _sanity.append_time_breakdown_metrics(
+        [
+            {
+                "output_index": 0,
+                "benchmark_file_path": str(benchmark_file),
+                "benchmark_mode": "ctx_only",
+            }
+        ],
+        outputs,
+        str(tmp_path / "absent"),
+    )
+
+    assert outputs == ["client output\n"]
+
+
+def _listed_time_breakdown_ids():
+    """Every ``time_breakdown`` perf-sanity id referenced by a CI lane list."""
+    test_db = _REPO_ROOT / "tests" / "integration" / "test_lists" / "test-db"
+    found = []
+    for path in sorted(test_db.glob("*.yml")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- perf/test_perf_sanity.py::"):
+                continue
+            if f"-{_sanity.TIME_BREAKDOWN_MODIFIER}-" not in stripped:
+                continue
+            found.append((path.name, stripped.split("[", 1)[1].split("]", 1)[0]))
+    return found
+
+
+def test_every_listed_breakdown_lane_is_an_id_the_harness_generates():
+    """A lane id the collector never produces is an error at collection, not a skip.
+
+    The modified ids are allowlisted per config stem, so a lane list and an
+    allowlist can disagree in either direction: an id in a list but not in the
+    allowlist fails the whole stage, and an allowlisted stem no list references
+    is a case that is generated but never run. Both are invisible until CI runs,
+    which for a post_merge perf stage is a slow way to find out.
+    """
+    listed = _listed_time_breakdown_ids()
+    assert listed, "no time_breakdown lane found; did the lists move?"
+
+    allowlists = {
+        "e2e": _sanity.E2E_TIME_BREAKDOWN_CONFIGS,
+        "ctx_only": _sanity.CTX_ONLY_TIME_BREAKDOWN_CONFIGS,
+    }
+    seen = set()
+    for list_name, test_id in listed:
+        stem, _pattern, _runtime, mode, time_breakdown = _sanity.parse_test_string(test_id)
+        assert time_breakdown, f"{list_name}: {test_id} did not parse as a modified id"
+        assert mode in allowlists, f"{list_name}: {test_id} has unsupported mode {mode!r}"
+        assert stem in allowlists[mode], (
+            f"{list_name}: {test_id} is not generated -- {stem!r} is missing from the "
+            f"{mode} allowlist"
+        )
+        seen.add((mode, stem))
+
+    # And the reverse direction: nothing is allowlisted but unreferenced.
+    for mode, stems in allowlists.items():
+        for stem in stems:
+            assert (mode, stem) in seen, f"{mode} breakdown case {stem!r} is in no lane list"

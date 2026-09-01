@@ -55,6 +55,13 @@ DISAGG_CONFIG_FOLDER = os.environ.get(
 TIME_BREAKDOWN_MODIFIER = "time_breakdown"
 TEST_ID_MODIFIERS = (TIME_BREAKDOWN_MODIFIER,)
 
+# Benchmark modes test_perf_sanity.py actually mints a time_breakdown test id
+# for. gen_only is deliberately absent: its regression metric is the gen-worker
+# device step time, so the lifecycle spans add nothing there, and the collector
+# generates no such id. Keep in sync with the two *_TIME_BREAKDOWN_CONFIGS loops
+# in test_perf_sanity.py:get_disagg_test_cases.
+TIME_BREAKDOWN_BENCHMARK_MODES = ("e2e", "ctx_only")
+
 
 def format_test_label(benchmark_mode: str, time_breakdown: bool = False) -> str:
     """Compose the mode segment(s) of a test id.
@@ -110,6 +117,7 @@ def parse_test_string(test_case_name: str):
     - Disagg e2e + lifecycle breakdown: disagg_upload-e2e-time_breakdown-{config_base}
     - Disagg gen_only: disagg_upload-gen_only-{config_base}
     - ctx_only: aggr_upload-ctx_only-{config_base} (runs aggr mode but reads disagg config)
+    - ctx_only + lifecycle breakdown: aggr_upload-ctx_only-time_breakdown-{config_base}
     - Regular aggr: aggr_upload-{config}-{server_name}
 
     The optional modifier segment (TEST_ID_MODIFIERS) sits between the benchmark
@@ -124,14 +132,21 @@ def parse_test_string(test_case_name: str):
     """
     labels = test_case_name.split("-")
 
-    assert len(labels) > 1, "perf_sanity test must have a config file!"
+    # ValueError rather than assert throughout: these are test-id grammar
+    # violations, and `python -O` removes assert statements, which would turn a
+    # malformed id into a silent IndexError or a submission against the wrong
+    # config instead of a clear rejection. Matches the sibling parser in
+    # jenkins/scripts/perf/submit.py, which already raises.
+    if len(labels) <= 1:
+        raise ValueError(f"perf_sanity test must have a config file: {test_case_name}")
 
     def split_modifiers(rest):
         """Peel the optional modifier segment off the front of the stem."""
         time_breakdown = bool(rest) and rest[0] == TIME_BREAKDOWN_MODIFIER
         if time_breakdown:
             rest = rest[1:]
-        assert rest, f"Test name has a modifier but no config: {test_case_name}"
+        if not rest:
+            raise ValueError(f"Test name has a modifier but no config: {test_case_name}")
         return time_breakdown, "-".join(rest)
 
     prefix = labels[0]
@@ -141,11 +156,11 @@ def parse_test_string(test_case_name: str):
 
     if is_disagg_prefix:
         # Disagg format: disagg_upload-{e2e|gen_only}[-{modifier}]-{config_base}
-        assert len(labels) > 2, "Disagg test must have benchmark_mode and config!"
+        if len(labels) <= 2:
+            raise ValueError(f"Disagg test must have benchmark_mode and config: {test_case_name}")
         benchmark_mode = labels[1]  # e2e or gen_only
-        assert benchmark_mode in ("e2e", "gen_only"), (
-            f"Invalid benchmark_mode for disagg: {benchmark_mode}"
-        )
+        if benchmark_mode not in ("e2e", "gen_only"):
+            raise ValueError(f"Invalid benchmark_mode for disagg: {benchmark_mode}")
         runtime_mode = "disaggregated"
         time_breakdown, config_base_name = split_modifiers(labels[2:])
         select_pattern = None
@@ -814,6 +829,17 @@ def main():
                 runtime_mode = "disaggregated"
             select_pattern = None
             time_breakdown = args.time_breakdown
+            # Refuse here rather than at collection: the id this would compose
+            # (e.g. `disagg-gen_only-time_breakdown-<stem>`) is well-formed and
+            # parses fine, but test_perf_sanity.py never generates it, so pytest
+            # would exit "no tests ran" after the whole job has been queued,
+            # built and allocated.
+            if time_breakdown and benchmark_mode not in TIME_BREAKDOWN_BENCHMARK_MODES:
+                raise ValueError(
+                    f"--time-breakdown is not supported for --benchmark_mode "
+                    f"{benchmark_mode!r}; supported modes are "
+                    f"{', '.join(TIME_BREAKDOWN_BENCHMARK_MODES)}"
+                )
         else:
             # Aggr config
             runtime_mode = "aggregated"

@@ -1427,6 +1427,16 @@ def test_parse_args_still_rejects_an_unknown_benchmark_mode(tmp_path, mode):
     than silently resolving to the e2e plan. The fused spelling
     `e2e_time_breakdown` and a bare modifier are rejected for the same reason: a
     caller passing either is a caller that has not split the axis.
+
+    `ctx_only` is in this list rather than the accepted one, which looks odd next
+    to the harness where ctx_only is a real benchmark mode. It is deliberate and
+    not reachable in production: the precheck gate is spliced only into the
+    *disaggregated* launch draft (jenkins/scripts/perf/submit.py, and
+    slurm_ct_precheck_gate.sh's run_cache_transceiver_precheck), and ctx_only runs
+    on the aggregated runtime, so this script is never invoked with it. There is
+    also nothing for it to precheck -- a ctx_only lane has no gen server, so no KV
+    transfer. Rejecting it keeps that assumption falsifiable: the day someone
+    wires the gate into the aggregated path, this test fails and says so.
     """
     with pytest.raises(SystemExit):
         rp.parse_args(

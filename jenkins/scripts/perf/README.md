@@ -151,12 +151,14 @@ perf/test_perf_sanity.py::test_e2e[<runtime>-<mode>[-<modifier>]-<yaml-stem>[-<s
 ```
 
 - `<runtime>` = `disagg` | `aggr`
-- `<mode>` (disagg) = `e2e` | `gen_only` | `ctx_only`
+- `<mode>` = `e2e` | `gen_only` with `disagg`, or `ctx_only` with `aggr`.
+  `ctx_only` reads a disaggregated YAML but runs its ctx worker as a single
+  aggregated server, so it is spelled `aggr-ctx_only-<yaml-stem>`
 - `<modifier>` — optional instrumentation flag, orthogonal to `<mode>`; the only
   one today is `time_breakdown`, which additionally uploads the per-request
   lifecycle spans as `d_tb_<span>_<stat>`. It changes what the run *records*,
   never the workload or the launch topology, so `--benchmark-mode` is still
-  handed the bare `<mode>`
+  handed the bare `<mode>`. Supported for `disagg-e2e` and `aggr-ctx_only`
 - `<yaml-stem>` matches a YAML file in `tests/scripts/perf-sanity/disaggregated/`
   (or `aggregated/`)
 - `<server-cfg>` — only for normal aggregated tests — the `name:` field of one of

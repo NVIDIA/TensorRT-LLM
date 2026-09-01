@@ -16,9 +16,9 @@
 
 import importlib.util
 import json
-import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Optional, Tuple
 
 import pytest
 from pytest_split.algorithms import LeastDurationAlgorithm
@@ -553,7 +553,9 @@ TEST_ID_GRAMMAR = (
 )
 
 
-def _parse_with_module(module: ModuleType, tmp_path: Path, test_id: str):
+def _parse_with_module(
+    module: ModuleType, tmp_path: Path, test_id: str
+) -> Tuple[str, Optional[str], str, bool]:
     """Normalise the two generators' parsers to one tuple.
 
     The CI parser takes a test-list line and resolves the yaml on disk; the local
@@ -588,7 +590,8 @@ def test_both_generators_parse_the_id_grammar(
     tmp_path: Path,
     test_id: str,
     stem: str,
-    benchmark_mode,
+    # None for a plain aggregated id, which has no mode segment.
+    benchmark_mode: Optional[str],
     runtime_mode: str,
     time_breakdown: bool,
 ) -> None:
@@ -611,7 +614,10 @@ def test_all_three_parsers_agree_on_the_id_grammar(
     else in the tree notices.
     """
     pytest.importorskip("torch._inductor")
-    sys.path.insert(0, str(REPO_ROOT / "tests" / "integration"))
+    # syspath_prepend rather than sys.path.insert: monkeypatch undoes it at
+    # teardown, so a later test in the same session cannot accidentally resolve
+    # `defs.*` through this entry.
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tests" / "integration"))
     from defs.perf import test_perf_sanity as runner
 
     modules = [_load_module(path, monkeypatch) for path in SUBMIT_PATHS]

@@ -2174,12 +2174,21 @@ class RequestTimeBreakdown:
         ``0.0``: :meth:`TimingMetric.calculate_duration` returns 0 when an endpoint
         timestamp is missing, so 0 means "not measured", not "took no time".
         Reporting it as 0.0 would silently fabricate a data point.
+
+        Negative durations are kept. Only exactly-zero is the "not measured"
+        sentinel; a negative value is a real measurement of two events that
+        overlapped, which is normal for ``step_preprocessing`` when the overlap
+        scheduler is on (step N is prepared before step N-1's token is emitted).
+        Dropping those requests would bias the surviving mean towards the
+        non-overlapped tail -- worst of all silently, since the span would still
+        be reported with a plausible-looking positive value.
         """
         stats: Dict[str, Dict[str, float]] = {}
         for metric in self.config.metrics:
             key = f'{metric.name}_time'
             valid = [
-                data[key] * 1000 for data in timing_data if data.get(key, 0) > 0
+                data[key] * 1000 for data in timing_data
+                if data.get(key) is not None and data[key] != 0
             ]
             if not valid:
                 continue

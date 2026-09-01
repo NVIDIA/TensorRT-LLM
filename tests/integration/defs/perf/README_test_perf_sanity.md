@@ -298,22 +298,34 @@ perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-deepseek-r1-fp4_1k1k_ctx1_g
 The three shapes that read a disaggregated config (2, 3 and 4 above) take one
 **optional** extra segment between the benchmark mode and the config stem:
 
-```
+```text
 perf/test_perf_sanity.py::test_e2e[<prefix>-<mode>[-<modifier>]-<disagg config file base name>]
 ```
 
 `<modifier>` comes from a closed vocabulary (`TEST_ID_MODIFIERS` in
-`test_perf_sanity.py`), and the only member today is `time_breakdown`:
+`test_perf_sanity.py`), and the only member today is `time_breakdown`. It is
+generated for shapes 4 (`disagg-e2e`) and 2 (`aggr-ctx_only`):
 
-```
+```text
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-time_breakdown-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-time_breakdown-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
 ```
+
+Not for shape 3 (`disagg-gen_only`): its regression signal is the gen-worker
+device step time, and the lifecycle spans describe request admission and prefill,
+which a gen_only run does not perform. The grammar would accept it; the collector
+does not mint it, and `local/submit.py` rejects `--time-breakdown` there rather
+than queueing a job that ends in "no tests ran".
 
 A modifier is **orthogonal to the mode**. It selects extra instrumentation — for
-`time_breakdown`, `return_perf_metrics` plus `num_postprocess_workers: 0` on the
-workers, `--save-request-time-breakdown` on the client, and the 108 `d_tb_*`
-lifecycle-span fields on the uploaded document — while the mode continues to
-decide *what workload runs*. Shape 1 has no modifier slot: there, the segment
+`time_breakdown`, `return_perf_metrics` plus `num_postprocess_workers: 0` on every
+request-serving process (the ctx and gen workers in `e2e`, the single aggregated
+server in `ctx_only`), `--save-request-time-breakdown` on the client, and the
+`d_tb_*` lifecycle-span fields on the uploaded document — while the mode continues
+to decide *what workload runs*. Which of the 108 fields are populated follows from
+the mode (`MODE_GROUPS` in `time_breakdown_metrics.py`): 108 for `e2e`, 44 for
+`ctx_only`; the rest upload as `0.0` so the column exists on every row of the
+series. Shape 1 has no modifier slot: there, the segment
 after the prefix is the config stem itself and the remainder is the server-config
 name. Anything downstream that needs a benchmark mode
 (notably `run_precheck.py --benchmark-mode`) is handed the bare `<mode>`, which is
@@ -324,8 +336,9 @@ Two consequences worth knowing:
 - **The stem is whatever follows the mode and the optional modifier**, not a fixed
   segment count. Disagg stems routinely contain `-` (`..._ccb-NIXL`), so the
   grammar is only decidable because no config file stem begins with a modifier
-  name. `get_disagg_test_cases` asserts that at import time, so a future colliding
-  filename fails collection loudly instead of resolving to the wrong YAML.
+  name. `get_disagg_test_cases` raises at import time if a stem collides, so a
+  future colliding filename fails collection loudly instead of resolving to the
+  wrong YAML.
 - **A modified case is its own baseline series.** The modifier is part of
   `s_test_case_name`, and for `time_breakdown` that is required rather than
   incidental: `num_postprocess_workers: 0` measurably changes throughput, so its

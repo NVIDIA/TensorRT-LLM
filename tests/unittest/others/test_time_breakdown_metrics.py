@@ -17,6 +17,9 @@
 import importlib.util
 import json
 import os
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Dict, List
 
 import pytest
 
@@ -38,7 +41,7 @@ _MODULE_PATH = os.path.join(
 )
 
 
-def _load_time_breakdown_metrics():
+def _load_time_breakdown_metrics() -> ModuleType:
     spec = importlib.util.spec_from_file_location("perf_time_breakdown_metrics", _MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -108,7 +111,7 @@ def _write(tmp_path, name, records):
     return str(path)
 
 
-def _read(path):
+def _read(path: str) -> List[Dict[str, Any]]:
     """Read a JSONL back without leaking the handle into the test's teardown."""
     with open(path, encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
@@ -206,7 +209,7 @@ def test_ctx_only_needs_no_disagg_server(tmp_path):
     assert metrics["d_tb_chunk_forward_mean"] > 0.0
 
 
-def test_stage_groups_never_borrow_the_other_roles_records(tmp_path):
+def test_stage_groups_never_borrow_the_other_roles_records(tmp_path: Path) -> None:
     """Without a combined file each stage must fall back to its *own* role's workers.
 
     _RecordView aliases both .ctx and .gen to the raw record for a single-role worker

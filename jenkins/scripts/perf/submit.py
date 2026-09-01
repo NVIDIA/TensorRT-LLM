@@ -45,6 +45,7 @@ import os
 import re
 import shlex
 import sys
+from typing import List, Optional, Tuple
 
 import yaml
 from benchmark_utils import parse_positive_concurrency
@@ -327,7 +328,7 @@ def select_test_case_line(test_list_path, llm_src, script_prefix_lines, split_gr
     return selected[0]
 
 
-def _split_modifiers(rest, bracket_content):
+def _split_modifiers(rest: List[str], bracket_content: str) -> Tuple[bool, str]:
     """Peel the optional modifier segment off the front of the config stem.
 
     Mirrors test_perf_sanity.py:parse_test_string.split_modifiers.
@@ -341,11 +342,15 @@ def _split_modifiers(rest, bracket_content):
     return time_breakdown, "-".join(rest)
 
 
-def parse_test_case_name(llm_src, selected_line):
+def parse_test_case_name(
+    llm_src: str, selected_line: str
+) -> Tuple[str, Optional[str], Optional[str], str, bool]:
     """Parse the selected test-list line.
 
     Returns (config_yaml_path, server_name, benchmark_mode, runtime_mode,
-    time_breakdown). See the module docstring for the supported test name shapes.
+    time_breakdown). server_name is None for every disagg shape and for ctx_only;
+    benchmark_mode is None for a normal aggregated case. See the module docstring
+    for the supported test name shapes.
     """
     line = selected_line
 
