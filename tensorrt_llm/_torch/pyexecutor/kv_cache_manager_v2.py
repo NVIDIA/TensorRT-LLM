@@ -2531,6 +2531,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return self._prepare_context_impl(req)
 
     def _prepare_context_impl(self, req: LlmRequest) -> bool:
+        """Internal helper to create or verify KV cache, handle block reuse, and resume."""
         if req.is_first_context_chunk:
             if self.conversation_manager is not None:
                 self.conversation_manager.prepare_request(req)

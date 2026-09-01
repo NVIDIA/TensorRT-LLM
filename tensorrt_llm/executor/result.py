@@ -179,6 +179,7 @@ class GenerationResultBase:
                  sampling_params: SamplingParams,
                  background_error_handler: Optional[Callable] = None,
                  postproc_params: "Optional[PostprocParams]" = None):
+        """Initialize GenerationResultBase instance tracking request outputs and metrics."""
         self.id = id
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
@@ -512,6 +513,7 @@ class GenerationResultBase:
     def _handle_response(self,
                          response: Union["PostprocWorker.Output", tllm.Response,
                                          ResponseWrapper, ErrorResponse]):
+        """Process incoming response, updating outputs, metrics, and completion state."""
         req_perf_metrics_dict = None
         if isinstance(response, ResponseWrapper):
             req_perf_metrics_dict = response.request_perf_metrics
