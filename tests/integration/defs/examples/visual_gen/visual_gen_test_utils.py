@@ -49,7 +49,8 @@ VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP = os.path.join(
 )
 VISUAL_GEN_OUTPUT_VIDEO = "trtllm_output.mp4"
 
-QuantizationMode = Literal["none", "FP8_BLOCK_SCALES", "NVFP4"]
+QuantizationMode = Literal["none", "FP8", "FP8_BLOCK_SCALES", "NVFP4"]
+QuantizationSource = Literal["dynamic", "static"]
 
 
 @dataclass(frozen=True)
@@ -58,13 +59,29 @@ class FeatureConfigState:
 
     ``quantization="none"`` means the unquantized BF16 VisualGen path. Model
     test modules remain responsible for validating which combinations they
-    support and for mapping this state to ``VisualGenArgs``. ``torch.compile``
-    is intentionally omitted because all feature tests disable it to match the
-    existing upstream LPIPS baseline configuration.
+    support and for mapping this state to ``VisualGenArgs``.
+    ``quantization_source="dynamic"`` quantizes a high-precision checkpoint at
+    load time. ``quantization_source="static"`` preserves the checkpoint's
+    embedded static quantization recipe, including its calibrated activation
+    scales and excluded modules. ``mha_quantize=True`` additionally selects
+    CUTEDSL static E4M3 attention and therefore requires calibrated Q/K/V amax
+    tensors from ModelOpt ``--quantize-mha``. ``torch.compile`` is intentionally
+    omitted because all feature tests disable it to match the existing upstream
+    LPIPS baseline configuration.
     """
 
     quantization: QuantizationMode = "none"
+    quantization_source: QuantizationSource = "dynamic"
+    mha_quantize: bool = False
     cuda_graph: bool = False
+
+    def __post_init__(self):
+        if self.quantization == "FP8" and self.quantization_source != "static":
+            raise ValueError("Per-tensor FP8 VisualGen quantization requires a static checkpoint")
+        if self.mha_quantize and not (
+            self.quantization in ("FP8", "NVFP4") and self.quantization_source == "static"
+        ):
+            raise ValueError("MHA quantization requires a static FP8 or static NVFP4 checkpoint")
 
 
 def _enabled_feature_ids(features):
@@ -73,6 +90,7 @@ def _enabled_feature_ids(features):
     if features.quantization != "none":
         enabled.append(
             {
+                "FP8": "fp8",
                 "FP8_BLOCK_SCALES": "fp8-blockwise",
                 "NVFP4": "nvfp4",
             }[features.quantization]
@@ -109,18 +127,38 @@ def _build_single_device_feature_args(
         CompilationConfig,
         CudaGraphConfig,
         ParallelConfig,
+        QuantAttentionConfig,
         TorchCompileConfig,
         VisualGenArgs,
     )
 
     if features.quantization == "none":
         quant_config = QuantConfig()
-    else:
+    elif features.quantization_source == "dynamic":
         quant_config = {
             "quant_algo": features.quantization,
             "dynamic": True,
             **(quantization_kwargs or {}),
         }
+    else:
+        if quantization_kwargs:
+            raise ValueError(
+                "Static feature cases must use the checkpoint's embedded quantization config"
+            )
+        quant_config = QuantConfig()
+    attention_config = AttentionConfig(backend="VANILLA")
+    if features.mha_quantize:
+        attention_config = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="fp8",
+                v_dtype="fp8",
+                q_block_size=0,
+                k_block_size=0,
+                v_block_size=0,
+            ),
+        )
+
     kwargs = dict(
         model=model_path,
         quant_config=quant_config,
@@ -128,7 +166,7 @@ def _build_single_device_feature_args(
             resolutions=[resolution],
             num_frames=[num_frames],
         ),
-        attention_config=AttentionConfig(backend="VANILLA"),
+        attention_config=attention_config,
         parallel_config=ParallelConfig(
             parallel_vae_size=1,
             cfg_size=1,
@@ -139,7 +177,10 @@ def _build_single_device_feature_args(
             tp_size=1,
         ),
         cuda_graph_config=CudaGraphConfig(enable=features.cuda_graph),
-        torch_compile_config=TorchCompileConfig(enable=False),
+        torch_compile_config=TorchCompileConfig(
+            enable=False,
+            enable_autotune=features.quantization_source != "static",
+        ),
     )
     if pipeline_config is not None:
         kwargs["pipeline_config"] = pipeline_config
@@ -159,17 +200,35 @@ def _assert_resolved_single_device_feature_config(
     config = pipeline.pipeline_config
     expected_quant_algo = {
         "none": None,
+        "FP8": QuantAlgo.FP8,
         "FP8_BLOCK_SCALES": QuantAlgo.FP8_BLOCK_SCALES,
         "NVFP4": QuantAlgo.NVFP4,
     }[features.quantization]
     assert config.quant_config.quant_algo == expected_quant_algo
-    assert config.dynamic_weight_quant is (expected_quant_algo is not None)
-    if features.quantization == "NVFP4":
-        assert config.force_dynamic_quantization is True
+    expected_dynamic_quantization = (
+        expected_quant_algo is not None and features.quantization_source == "dynamic"
+    )
+    assert config.dynamic_weight_quant is expected_dynamic_quantization
+    if features.quantization in ("FP8", "NVFP4"):
+        assert config.force_dynamic_quantization is expected_dynamic_quantization
+
+    expected_autotune = features.quantization_source != "static"
+    assert config.torch_compile.enable_autotune is expected_autotune
 
     assert config.cache_backend is None
     assert pipeline.cache_accelerator is None
-    assert config.attention.backend == "VANILLA"
+    expected_attention_backend = "CUTEDSL" if features.mha_quantize else "VANILLA"
+    assert config.attention.backend == expected_attention_backend
+    quant_attention_config = config.attention.quant_attention_config
+    if features.mha_quantize:
+        assert quant_attention_config is not None
+        assert quant_attention_config.qk_dtype == "fp8"
+        assert quant_attention_config.v_dtype == "fp8"
+        assert quant_attention_config.q_block_size == 0
+        assert quant_attention_config.k_block_size == 0
+        assert quant_attention_config.v_block_size == 0
+    else:
+        assert quant_attention_config is None
     assert config.attention.sparse_attention_config is None
 
     assert config.cuda_graph.enable is features.cuda_graph
@@ -190,7 +249,7 @@ def _transformer_components(pipeline):
 
 
 def _assert_feature_quantization_installed(pipeline, features):
-    """Verify that requested dynamic quantization changed real Linear modules."""
+    """Verify that requested quantization configured real Linear modules."""
     from tensorrt_llm._torch.modules.linear import Linear
 
     linears = [
@@ -205,6 +264,7 @@ def _assert_feature_quantization_installed(pipeline, features):
         return
 
     predicate = {
+        "FP8": lambda module: module.has_fp8_qdq,
         "FP8_BLOCK_SCALES": lambda module: module.has_fp8_block_scales,
         "NVFP4": lambda module: module.has_nvfp4,
     }[features.quantization]
@@ -213,13 +273,35 @@ def _assert_feature_quantization_installed(pipeline, features):
     sample = quantized_linears[0]
     assert getattr(sample, "weight", None) is not None
     assert getattr(sample, "weight_scale", None) is not None
-    if features.quantization == "FP8_BLOCK_SCALES":
+    if features.quantization in ("FP8", "FP8_BLOCK_SCALES"):
         assert sample.weight.dtype == torch.float8_e4m3fn
-        assert sample.weight_scale.ndim == 2
+        expected_scale_ndim = 0 if features.quantization == "FP8" else 2
+        assert sample.weight_scale.ndim == expected_scale_ndim
+        if features.quantization == "FP8":
+            assert sample.input_scale is not None
+            assert sample.force_dynamic_quantization is False
     else:
         assert sample.weight.shape[-1] * 2 == sample.in_features
         assert sample.scaling_vector_size == 16
         assert getattr(sample, "weight_scale_2", None) is not None
+        if features.quantization_source == "static":
+            assert sample.input_scale is not None
+            assert sample.pre_quant_scale is None
+            assert sample.force_dynamic_quantization is False
+
+    static_e4m3_attention_modules = [
+        module
+        for component in _transformer_components(pipeline)
+        for module in component.modules()
+        if getattr(module, "requires_static_e4m3_attention", False)
+    ]
+    if features.mha_quantize:
+        assert static_e4m3_attention_modules, "No static E4M3 attention modules were installed"
+        assert all(
+            module.static_e4m3_attention_scales_loaded for module in static_e4m3_attention_modules
+        )
+    else:
+        assert not static_e4m3_attention_modules
 
 
 def _assert_single_device_feature_executed(pipeline, features):
@@ -476,28 +558,22 @@ def _lpips_deterministic_algorithms(*, fully_eager=False):
 
 @contextlib.contextmanager
 def _fixed_nvfp4_quantization_backend(features):
-    """Pin NVFP4 golden runs to deterministic TRT-LLM and CUTLASS paths.
+    """Pin NVFP4 activation quantization to the TRT-LLM implementation.
 
     VisualGen normally autotunes between the TRT-LLM and FlashInfer activation
-    quantizers and among several GEMM backends. Those performance choices can
-    vary between processes, while fixed accuracy goldens require a stable
-    numerical path. Backend selection and parity are covered by the NVFP4
-    operator unit tests.
+    quantizers. Static accuracy cases disable GEMM autotuning separately; this
+    context only fixes the activation-quantization implementation.
     """
     if features.quantization != "NVFP4":
         yield
         return
 
     from tensorrt_llm._torch.custom_ops import torch_custom_ops
-    from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 
     previous_flashinfer_available = torch_custom_ops.IS_FLASHINFER_AVAILABLE
-    extra_attrs = dict(get_model_extra_attrs() or {})
-    extra_attrs["nvfp4_gemm_allowed_backends"] = ["cutlass"]
     try:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = False
-        with model_extra_attrs(extra_attrs):
-            yield
+        yield
     finally:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = previous_flashinfer_available
 

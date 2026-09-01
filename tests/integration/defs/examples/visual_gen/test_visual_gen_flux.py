@@ -50,7 +50,7 @@ FLUX_LPIPS_GUIDANCE_SCALE = 3.5
 FLUX_LPIPS_SEED = 42
 FLUX_LPIPS_THRESHOLD = 0.05
 FLUX_FEATURE_LPIPS_THRESHOLD = 0.05
-FLUX_SUPPORTED_FEATURES = frozenset({"fp8-blockwise", "nvfp4", "cuda-graph"})
+FLUX_SUPPORTED_FEATURES = frozenset({"fp8", "fp8-blockwise", "nvfp4", "cuda-graph"})
 
 
 @dataclass(frozen=True)
@@ -100,6 +100,51 @@ FLUX_FEATURE_PROFILES = (
     ),
 )
 
+FLUX_STATIC_QUANT_ACCURACY_CASES = (
+    FluxAccuracyCase(
+        id="flux1-fp8-static",
+        checkpoint_subdir="FLUX.1-dev-FP8",
+        golden_file="flux1_fp8_static_lpips_golden.png",
+        features=FeatureConfigState(
+            quantization="FP8",
+            quantization_source="static",
+        ),
+        lpips_threshold=FLUX_FEATURE_LPIPS_THRESHOLD,
+    ),
+    FluxAccuracyCase(
+        id="flux1-fp8-static-mha-quantize",
+        checkpoint_subdir="FLUX.1-dev-FP8",
+        golden_file="flux1_fp8_static_mha_quantize_lpips_golden.png",
+        features=FeatureConfigState(
+            quantization="FP8",
+            quantization_source="static",
+            mha_quantize=True,
+        ),
+        lpips_threshold=FLUX_FEATURE_LPIPS_THRESHOLD,
+    ),
+    FluxAccuracyCase(
+        id="flux1-nvfp4-static",
+        checkpoint_subdir="FLUX.1-dev-NVFP4",
+        golden_file="flux1_nvfp4_static_lpips_golden.png",
+        features=FeatureConfigState(
+            quantization="NVFP4",
+            quantization_source="static",
+        ),
+        lpips_threshold=FLUX_FEATURE_LPIPS_THRESHOLD,
+    ),
+    FluxAccuracyCase(
+        id="flux1-nvfp4-static-mha-quantize",
+        checkpoint_subdir="FLUX.1-dev-NVFP4",
+        golden_file="flux1_nvfp4_static_mha_quantize_lpips_golden.png",
+        features=FeatureConfigState(
+            quantization="NVFP4",
+            quantization_source="static",
+            mha_quantize=True,
+        ),
+        lpips_threshold=FLUX_FEATURE_LPIPS_THRESHOLD,
+    ),
+)
+
 
 def _build_flux_accuracy_cases():
     cases = []
@@ -123,6 +168,9 @@ def _build_flux_accuracy_cases():
                     id=case_id,
                 )
             )
+    for case in FLUX_STATIC_QUANT_ACCURACY_CASES:
+        _validate_single_feature_config(case.features, FLUX_SUPPORTED_FEATURES, "FLUX")
+        cases.append(pytest.param(case, id=case.id))
     return cases
 
 

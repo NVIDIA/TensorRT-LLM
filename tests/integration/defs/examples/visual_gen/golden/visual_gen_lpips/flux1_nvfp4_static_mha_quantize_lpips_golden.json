@@ -1,0 +1,38 @@
+{
+  "image": "flux1_nvfp4_static_mha_quantize_lpips_golden.png",
+  "model": "FLUX.1-dev-NVFP4",
+  "source": "TensorRT-LLM VisualGen",
+  "prompt": "a tiny astronaut hatching from an egg on the moon",
+  "height": 256,
+  "width": 256,
+  "num_inference_steps": 4,
+  "guidance_scale": 3.5,
+  "seed": 42,
+  "feature_config": {
+    "quantization": "NVFP4",
+    "quantization_source": "static",
+    "mha_quantize": true,
+    "cuda_graph": false
+  },
+  "attention_backend": "CUTEDSL",
+  "quant_attention_config": {
+    "qk_dtype": "fp8",
+    "v_dtype": "fp8",
+    "q_block_size": 0,
+    "k_block_size": 0,
+    "v_block_size": 0
+  },
+  "nvfp4_gemm_backend": "cutlass",
+  "torch_compile": false,
+  "autotune": false,
+  "deterministic_algorithms": true,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05,
+  "checkpoint_quantization_producer": "modelopt 0.46.0",
+  "diffusers_version": "0.39.0",
+  "torch_version": "2.12.0a0+5aff3928d8.nv26.05",
+  "tensorrt_llm_version": "1.3.0rc26",
+  "tensorrt_llm_commit": "f0b97da63ce7",
+  "container_image": "gitlab-master.nvidia.com:5005/jhaotingc/container-registry/tekit_source:260827",
+  "sha256": "df216cc164c9f0ee279acbfd4a639bfb06d52961550e21a1e5fbea4b648d86c1"
+}
