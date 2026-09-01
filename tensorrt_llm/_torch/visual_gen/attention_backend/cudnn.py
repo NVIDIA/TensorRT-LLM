@@ -246,8 +246,6 @@ class CuDNNAttention(AttentionBackend):
         if quant_attention_config is None:
             return "no_quant"
         qk_dtype, v_dtype = quant_attention_config.qk_dtype, quant_attention_config.v_dtype
-        if qk_dtype == "bf16":
-            return "no_quant"
         if qk_dtype != v_dtype:
             raise ValueError(
                 f"cuDNN backend requires qk_dtype == v_dtype; got qk_dtype={qk_dtype!r}, "
