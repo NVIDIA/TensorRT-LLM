@@ -513,7 +513,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
         transformer_weights = self.load_transformer_weights(self._checkpoint_dir)
         transformer.load_weights(transformer_weights)
         transformer.post_load_weights()
-        self._fp8_step_transformer = transformer.to(self._device)
+        self._fp8_step_transformer = transformer.to(self.device)
 
     def load_standard_components(
         self,

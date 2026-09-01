@@ -8,6 +8,7 @@ from typing import Any, Literal
 import flashinfer
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ...attention_backend.interface import PredefinedAttentionMask
@@ -409,6 +410,29 @@ class FlashInferAttention(AttentionBackend):
             and qk_dtype == "nvfp4"
             and quant_config.v_dtype == "nvfp4"
         ):
+            sequence_length = q.shape[1]
+            if sequence_length % 128 != 0:
+                logger.warning_once(
+                    "FlashInfer SM120/SM121 NVFP4 attention requires sequence length "
+                    f"to be a multiple of 128, got {sequence_length}; falling back to "
+                    "the non-quantized FlashInfer prefill path for this attention call.",
+                    key=("visual-gen-nvfp4-sm12x-seqlen-fallback", sequence_length),
+                )
+                if q.shape[0] == 1:
+                    return self._run_single_prefill(
+                        q,
+                        k,
+                        v,
+                        is_causal=is_causal,
+                        key_padding_mask=None,
+                    )
+                return self._run_batch_prefill(
+                    q,
+                    k,
+                    v,
+                    is_causal=is_causal,
+                    key_padding_mask=None,
+                )
             return self._run_nvfp4_sm12x(q, k, v, is_causal=is_causal)
         raise RuntimeError(
             "Unsupported FlashInfer quantized attention recipe for "
