@@ -88,6 +88,7 @@ class MockBenchmarkExecutor:
         kv_cache_transceiver=None,
         enable_attention_dp: bool = False,
         tp_size: int = 1,
+        pp_size: int = 1,
         rank: int = 0,
         num_fetch_requests: int = 0,
         is_warmup: bool = False,
@@ -102,6 +103,7 @@ class MockBenchmarkExecutor:
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
         self._disagg_gen_transfer_made_progress = False
         self._benchmark_transfer_progress_global = False
+        self._benchmark_completed_gen_transfer_ids = set()
         self._fill_admit_cap = 0
         self.enable_attention_dp = enable_attention_dp
         self.max_num_active_requests = max_num_active_requests
@@ -112,6 +114,7 @@ class MockBenchmarkExecutor:
         self.dist = Mock()
         self.dist.rank = rank
         self.dist.tp_size = tp_size
+        self.dist.pp_size = pp_size
         self.dist.world_size = tp_size
 
         # State the gate's stall bound reads. 0 disables the bound, which is
@@ -439,11 +442,13 @@ class TestCheckBenchmarkDisaggGate:
             active_requests=reqs,
         )
         assert ex._benchmark_fill_phase_active is True
+        ex._benchmark_completed_gen_transfer_ids = {17}
 
         can_forward, should_retry = ex._check_benchmark_disagg_gate(ScheduledRequests(), False)
         assert can_forward is True
         assert should_retry is False
         assert ex._benchmark_fill_phase_active is False
+        assert ex._benchmark_completed_gen_transfer_ids == set()
         mock_time.sleep.assert_not_called()
 
     @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
@@ -480,23 +485,29 @@ class TestCheckBenchmarkDisaggGate:
         mock_time.sleep.assert_not_called()
 
     @pytest.mark.parametrize(
-        "completed_request_ids",
+        "completion_signal",
         [
-            pytest.param([17], id="python_runtime"),
-            pytest.param([], id="cpp_runtime"),
+            pytest.param("completed_ids", id="python_completed_ids"),
+            pytest.param("request_state", id="cpp_request_state"),
         ],
     )
     @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
-    def test_async_completion_resets_fill_stall_watchdog(self, mock_time, completed_request_ids):
+    def test_async_completion_resets_fill_stall_watchdog(self, mock_time, completion_signal):
         completed_req = _make_active_request(in_transfer=True)
         completed_req.py_request_id = 17
+        completed_req.request_id = 17
+        completed_req.py_disaggregated_params = Mock(disagg_request_id=117)
         blocked_req = _make_active_request(in_init=True)
         transceiver = _make_transceiver(transfer_complete=False)
 
         def complete_request(_at_least_num):
-            completed_req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-            completed_req.is_disagg_generation_transmission_in_progress = False
-            return GenTransferStatus(completed_request_ids, [], [])
+            if completion_signal == "request_state":
+                completed_req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+                completed_req.is_disagg_generation_transmission_in_progress = False
+                return GenTransferStatus([], [], [])
+            # Isolate the Python transceiver's completed-ID signal: leave the
+            # request state unchanged so this branch cannot pass via mutation.
+            return GenTransferStatus([117], [], [])
 
         transceiver.check_gen_transfer_status.side_effect = complete_request
         ex = MockBenchmarkExecutor(
@@ -513,14 +524,105 @@ class TestCheckBenchmarkDisaggGate:
         mock_time.monotonic.return_value = 1006.0
 
         ex._check_disagg_gen_cache_transfer_status(0)
+        assert ex._disagg_gen_transfer_made_progress is True
         can_forward, should_retry = ex._check_benchmark_disagg_gate(ScheduledRequests(), False)
 
         assert can_forward is False
         assert should_retry is True
         assert ex._benchmark_fill_stall_since is None
         assert ex._disagg_gen_transfer_made_progress is False
+        assert ex._benchmark_completed_gen_transfer_ids == {117}
         mock_time.sleep.assert_not_called()
         transceiver.check_gen_transfer_status.assert_called_once_with(0)
+
+    @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
+    def test_zero_async_completions_do_not_reset_fill_stall_watchdog(self, mock_time):
+        in_progress_req = _make_active_request(in_transfer=True)
+        in_progress_req.py_request_id = 17
+        transceiver = _make_transceiver(transfer_complete=False)
+        transceiver.check_gen_transfer_status.return_value = GenTransferStatus([], [], [])
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=1,
+            kv_cache_transceiver=transceiver,
+            num_fetch_requests=1,
+            active_requests=[in_progress_req],
+        )
+        ex._benchmark_fill_stall_timeout_sec = 5.0
+        ex._benchmark_fill_stall_since = 1000.0
+        ex.canceled_req_ids = []
+        ex._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        ex._check_cache_transfer_errors = Mock()
+        mock_time.monotonic.return_value = 1006.0
+
+        ex._check_disagg_gen_cache_transfer_status(0)
+        assert ex._disagg_gen_transfer_made_progress is False
+        with pytest.raises(RuntimeError, match="made no progress for 6s"):
+            ex._check_benchmark_disagg_gate(ScheduledRequests(), False)
+
+        assert ex._benchmark_completed_gen_transfer_ids == set()
+        assert ex._benchmark_fill_stall_since is None
+        assert ex._disagg_gen_transfer_made_progress is False
+        mock_time.sleep.assert_called_once_with(0.1)
+        transceiver.check_gen_transfer_status.assert_called_once_with(0)
+
+    @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
+    def test_same_async_completion_is_counted_once_across_signals(self, mock_time):
+        in_progress_req = _make_active_request(in_transfer=True)
+        in_progress_req.py_request_id = 17
+        in_progress_req.request_id = 17
+        in_progress_req.py_disaggregated_params = Mock(disagg_request_id=117)
+        transceiver = _make_transceiver(transfer_complete=False)
+
+        def report_completion(_at_least_num):
+            if transceiver.check_gen_transfer_status.call_count == 1:
+                return GenTransferStatus([117], [], [])
+            in_progress_req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            in_progress_req.is_disagg_generation_transmission_in_progress = False
+            return GenTransferStatus([], [], [])
+
+        transceiver.check_gen_transfer_status.side_effect = report_completion
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=2,
+            kv_cache_transceiver=transceiver,
+            num_fetch_requests=1,
+            active_requests=[in_progress_req],
+        )
+        ex._benchmark_fill_stall_timeout_sec = 5.0
+        ex.canceled_req_ids = []
+        ex._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        ex._check_cache_transfer_errors = Mock()
+
+        ex._check_disagg_gen_cache_transfer_status(0)
+        assert ex._disagg_gen_transfer_made_progress is True
+        ex._check_benchmark_disagg_gate(ScheduledRequests(), False)
+
+        ex._benchmark_fill_stall_since = 1000.0
+        mock_time.monotonic.return_value = 1006.0
+        ex._check_disagg_gen_cache_transfer_status(0)
+        assert ex._disagg_gen_transfer_made_progress is False
+        with pytest.raises(RuntimeError, match="made no progress for 6s"):
+            ex._check_benchmark_disagg_gate(ScheduledRequests(), False)
+
+        assert ex._benchmark_completed_gen_transfer_ids == {117}
+        mock_time.sleep.assert_called_once_with(0.1)
+
+    def test_pp_loop_does_not_scan_or_record_unused_fill_progress(self):
+        transceiver = _make_transceiver(transfer_complete=False)
+        transceiver.check_gen_transfer_status.return_value = GenTransferStatus([17], [], [])
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=1,
+            kv_cache_transceiver=transceiver,
+            pp_size=2,
+            active_requests=Mock(),
+        )
+        ex.canceled_req_ids = []
+        ex._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        ex._check_cache_transfer_errors = Mock()
+
+        ex._check_disagg_gen_cache_transfer_status(0)
+
+        assert ex._disagg_gen_transfer_made_progress is False
+        assert ex._benchmark_completed_gen_transfer_ids == set()
 
     @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
     def test_gate_skips_sleep_on_all_adp_ranks_when_peer_makes_progress(self, mock_time):

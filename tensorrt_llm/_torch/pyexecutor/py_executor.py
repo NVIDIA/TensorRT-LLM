@@ -51,6 +51,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
 
+from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.executor.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.executor.pp_termination import DisaggPPTerminationHandler
@@ -935,6 +936,10 @@ class PyExecutor:
         # unnecessary polling delay after transfer progress.
         self._disagg_gen_transfer_made_progress = False
         self._benchmark_transfer_progress_global = False
+        # A completion can surface through a status ID or request-state
+        # mutation. Credit each logical request once across both signals so it
+        # cannot reset the benchmark fill watchdog more than once.
+        self._benchmark_completed_gen_transfer_ids: set[int] = set()
         # Slow-start admission cap for benchmark disagg fill (see
         # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
         # seeds it to tp_size and each subsequent iter doubles it.
@@ -3598,7 +3603,7 @@ class PyExecutor:
 
         Args:
             local_status: Caller-defined ``(state, flag)`` pair from this rank.
-                The fill gate uses ``(ready, synchronous_progress)`` and the
+                The fill gate uses ``(ready, transfer_progress)`` and the
                 fail-fast path uses ``(all_fetched, terminal_no_fit)``.
 
         Returns:
@@ -4022,6 +4027,7 @@ class PyExecutor:
                 self._benchmark_fill_phase_active = False
                 self._fill_admit_cap = 0
                 self._benchmark_fill_stall_since = None
+                self._benchmark_completed_gen_transfer_ids.clear()
             elif not transfer_made_progress:
                 time.sleep(0.1)
             if not can_forward:
@@ -7638,19 +7644,34 @@ class PyExecutor:
         # mutates request state. Capture both forms of completion so the fill
         # watchdog remains independent of the selected transceiver runtime.
         tracked_requests = ()
-        is_benchmark_fill = (self.is_benchmark_disagg
-                             and self._benchmark_fill_phase_active)
-        if is_benchmark_fill:
+        track_benchmark_fill_progress = (self.is_benchmark_disagg
+                                         and not self.is_warmup
+                                         and self._dist_size(
+                                             self.dist, "pp_size") == 1
+                                         and self._benchmark_fill_phase_active)
+        if track_benchmark_fill_progress:
             tracked_requests = tuple(
                 req for req in self.active_requests
                 if req.is_disagg_generation_transmission_in_progress)
 
         gen_status = self.kv_cache_transceiver.check_gen_transfer_status(
             atLeastNum)
-        if (is_benchmark_fill and (gen_status.completed_request_ids or any(
-                req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-                for req in tracked_requests))):
-            self._disagg_gen_transfer_made_progress = True
+        if track_benchmark_fill_progress:
+            completed_request_ids = set(gen_status.completed_request_ids)
+            for req in tracked_requests:
+                if (req.state
+                        != LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE):
+                    continue
+                request_id = get_unique_rid(req)
+                if request_id is not None:
+                    completed_request_ids.add(request_id)
+            new_completed_request_ids = (
+                completed_request_ids -
+                self._benchmark_completed_gen_transfer_ids)
+            if new_completed_request_ids:
+                self._benchmark_completed_gen_transfer_ids.update(
+                    new_completed_request_ids)
+                self._disagg_gen_transfer_made_progress = True
         if gen_status.cancelled_requests:
             user_canceled_set = set(self.canceled_req_ids)
             for req in gen_status.cancelled_requests:
