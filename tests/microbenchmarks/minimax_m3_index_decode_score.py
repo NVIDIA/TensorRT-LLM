@@ -17,7 +17,7 @@ import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import _proxy_max_score
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3_kernels.msa_utils import (
     build_kv_page_indices,
     msa_package_available,
 )
@@ -28,15 +28,7 @@ HEAD_DIM = 128
 
 def _flat_page_table(block_table: torch.Tensor, kv_lens_cpu: torch.Tensor) -> torch.Tensor:
     """Flatten a block table into the per-request page ids fmha_sm100 consumes."""
-    batch, max_pages = block_table.shape
-    intra = torch.arange(PAGE_SIZE, dtype=torch.int32)
-    req_to_token = (block_table.cpu().to(torch.int32) * PAGE_SIZE).unsqueeze(2) + intra
-    return build_kv_page_indices(
-        req_to_token.reshape(batch, max_pages * PAGE_SIZE),
-        torch.arange(batch, dtype=torch.int32),
-        kv_lens_cpu,
-        PAGE_SIZE,
-    )
+    return build_kv_page_indices(block_table.cpu().to(torch.int32), kv_lens_cpu, PAGE_SIZE)
 
 
 def _time_us(fn, warmup: int = 20, iters: int = 100) -> float:

@@ -28,7 +28,7 @@ from typing import Dict, List
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode import (
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3_kernels.trtllm_gen_dense_decode import (
     dense_decode_unsupported_reason,
     minimax_m3_trtllm_gen_dense_decode,
     subpage_block_table,
@@ -40,7 +40,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 PAGE_SIZE = 32
 HEAD_DIM = 128
-# The bmm1 scale, spelled as run_msa_paged_gqa spells it at q_scaling 1.
+# The bmm1 scale, spelled as run_msa_prefill_gqa spells it at q_scaling 1.
 SM_SCALE = HEAD_DIM**-0.5
 
 

@@ -11,15 +11,27 @@ from typing import Optional, Tuple
 
 import torch
 
-from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm._torch.attention_backend.interface import AttentionInputType
+from tensorrt_llm._utils import is_sm_100f, maybe_pin_memory
 
-from .common import write_kv_slots
+from .paged_cache import write_kv_slots
 
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
 # selects topk 16. Callers enforce these early so a misconfiguration fails
 # with a clear message rather than a cryptic shape error inside the kernel.
 MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
+
+
+def is_msa_layer(attn) -> bool:
+    """Whether this layer's attention is served by the MiniMax-M3 MSA kernels."""
+    sparse_params = attn.sparse_params
+    return (
+        is_sm_100f()
+        and sparse_params is not None
+        and sparse_params.algorithm == "minimax_m3"
+        and getattr(sparse_params, "implementation", None) == "msa"
+    )
 
 
 def _install_msa_cutlass_compatibility() -> None:
@@ -106,6 +118,40 @@ def write_msa_main_kv(
     )
     write_kv_slots(
         v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+    )
+
+
+def write_msa_step_kv(
+    attn,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    metadata,
+    attention_input_type,
+) -> None:
+    """Write this step's new-token main K/V for one layer, at most once.
+
+    Both the decode kernels and fmha_sm100 read the paged cache directly, so
+    the new-token K/V has to be resident before either runs. The write covers
+    every token of the step, so it belongs to the layer rather than to a phase
+    of it, and both FMHA libraries call it; msa_mark_kv_written keeps a mixed
+    batch's second phase from repeating it.
+    """
+    if attention_input_type != AttentionInputType.mixed:
+        raise NotImplementedError(
+            "MiniMax-M3 MSA attention requires the mixed attention input type, "
+            f"but this call passed {attention_input_type!r}. Its cache slots and "
+            "top-k block table are indexed by whole-step token position."
+        )
+    if k is None or v is None:
+        return
+    if not metadata.msa_mark_kv_written(attn.layer_idx):
+        return
+    write_msa_main_kv(
+        metadata.kv_cache_manager,
+        attn.layer_idx,
+        metadata.msa_out_cache_loc[: int(k.shape[0])],
+        k,
+        v,
     )
 
 
@@ -217,4 +263,5 @@ __all__ = [
     "require_msa_module",
     "select_blocks_from_maxscore",
     "write_msa_main_kv",
+    "write_msa_step_kv",
 ]
