@@ -82,7 +82,6 @@ class _BlockSparseCompileKey:
     use_persistent_scheduler: bool
     use_parallel_sparse_kv_loads: bool
     page_size: int | None = None
-    use_variable_seqlens_kv: bool = False
 
 
 @dataclass(frozen=True)
@@ -457,7 +456,6 @@ def _resolve_block_sparse_launch_spec(
     use_kv_valid_bits: bool,
     max_row_route_capacity: int,
     page_size: int | None = None,
-    use_variable_seqlens_kv: bool = False,
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
@@ -502,7 +500,6 @@ def _resolve_block_sparse_launch_spec(
             use_persistent_scheduler=use_persistent_scheduler,
         ),
         page_size=page_size,
-        use_variable_seqlens_kv=use_variable_seqlens_kv,
     )
     try:
         _make_block_sparse_config(compile_key)
@@ -526,12 +523,7 @@ def _resolve_block_sparse_launch_spec(
         ("tile_size_kv", kv_route_size),
     ]
     if page_size is not None:
-        policy_entries.extend(
-            (
-                ("page_size", page_size),
-                ("use_variable_seqlens_kv", use_variable_seqlens_kv),
-            )
-        )
+        policy_entries.append(("page_size", page_size))
     policy_entries.extend(
         (
             ("use_persistent_scheduler", compile_key.use_persistent_scheduler),

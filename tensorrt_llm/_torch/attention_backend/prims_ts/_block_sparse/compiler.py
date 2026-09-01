@@ -53,7 +53,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         kv_route_size=key.kv_route_size,
         has_token_bits=key.use_kv_valid_bits,
         page_size=key.page_size,
-        use_variable_seqlens_kv=key.use_variable_seqlens_kv,
+        mask_type=key.mask_type,
     )
     Int32 = cutlass.Int32
     Int64 = cutlass.Int64
@@ -183,7 +183,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             static_config,
             static_seq_len_kv,
             seq_lens_kv.iterator,
-            key.use_variable_seqlens_kv,
+            True,
             num_physical_kv_pages,
             k_page_stride,
             v_page_stride,
@@ -249,7 +249,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             valid_bits_fake,
             row_route_offsets_fake,
             route_workspace_fake,
-            Int32(-1),
+            Int32(0),
             Float32(1.0),
         )
     else:
@@ -307,7 +307,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             seq_lens_kv_fake,
             row_route_offsets_fake,
             route_workspace_fake,
-            Int32(-1),
+            Int32(0),
             Int64(1),
             Int64(1),
             Int64(1),

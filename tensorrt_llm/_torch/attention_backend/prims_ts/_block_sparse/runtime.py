@@ -14,10 +14,9 @@
 
 """Runtime validation and launch adapter for block-sparse attention."""
 
-from collections.abc import Callable
 from dataclasses import dataclass
 import math
-from typing import Protocol
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -31,6 +30,9 @@ from ..decode import (
 )
 from .common import _SIGNED_INT32_MAX
 
+if TYPE_CHECKING:
+    from .plan import _BlockSparsePlanState
+
 
 @dataclass(frozen=True)
 class _ContiguousKVStorage:
@@ -42,17 +44,21 @@ class _ContiguousKVStorage:
 
 @dataclass(frozen=True)
 class _PagedKVStorage:
-    """Live paged-K/V runtime storage validated against one frozen paged plan."""
+    """Paged K/V storage and request metadata consumed by one live run."""
 
     paged_kv_cache: PagedKVCache
+    paged_kv_indptr: torch.Tensor
     paged_kv_indices: torch.Tensor
+    seq_lens_kv: torch.Tensor
 
 
 @dataclass(frozen=True)
 class _PagedKVLaunchPayload:
     """Launch-only live paged metadata derived during shared validation."""
 
+    paged_kv_indptr: torch.Tensor
     paged_kv_indices: torch.Tensor
+    seq_lens_kv: torch.Tensor
     num_physical_kv_pages: int
     k_page_stride: int
     v_page_stride: int
@@ -72,80 +78,6 @@ class _BlockSparseRunArgs:
     kv_valid_bits_is_live: bool
     sm_scale: float
     paged_kv: _PagedKVLaunchPayload | None
-
-
-class _PagedKVPlanMetadataLike(Protocol):
-    """Minimal paged-plan metadata consumed by shared runtime validation."""
-
-    @property
-    def page_size(self) -> int: ...
-
-    @property
-    def paged_kv_indptr(self) -> torch.Tensor: ...
-
-    @property
-    def seq_lens_kv(self) -> torch.Tensor: ...
-
-    @property
-    def num_page_indices(self) -> int: ...
-
-
-class _BlockSparsePlanStateLike(Protocol):
-    """Structural launch state shared by contiguous and paged wrappers."""
-
-    @property
-    def device(self) -> torch.device: ...
-
-    @property
-    def batch_size(self) -> int: ...
-
-    @property
-    def seq_len_q(self) -> int: ...
-
-    @property
-    def seq_len_kv(self) -> int: ...
-
-    @property
-    def num_qo_heads(self) -> int: ...
-
-    @property
-    def num_kv_heads(self) -> int: ...
-
-    @property
-    def head_dim(self) -> int: ...
-
-    @property
-    def q_block_size(self) -> int: ...
-
-    @property
-    def q_dtype(self) -> torch.dtype: ...
-
-    @property
-    def kv_dtype(self) -> torch.dtype: ...
-
-    @property
-    def output_dtype(self) -> torch.dtype: ...
-
-    @property
-    def use_kv_valid_bits(self) -> bool: ...
-
-    @property
-    def dummy_kv_valid_bits(self) -> torch.Tensor | None: ...
-
-    @property
-    def row_route_offsets(self) -> torch.Tensor: ...
-
-    @property
-    def route_workspace(self) -> torch.Tensor: ...
-
-    @property
-    def max_blocks_per_row(self) -> int: ...
-
-    @property
-    def compiled(self) -> Callable[..., object]: ...
-
-    @property
-    def paged_kv(self) -> _PagedKVPlanMetadataLike | None: ...
 
 
 def _validate_metadata_tensor(
@@ -227,6 +159,31 @@ def validate_block_sparse_metadata(
         raise ValueError("kv_valid_bits must be None when use_kv_valid_bits=False")
 
 
+def validate_paged_kv_metadata(
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    seq_lens_kv: torch.Tensor,
+    *,
+    device: torch.device,
+    batch_size: int,
+) -> None:
+    """Validate the shared structural ABI for live paged request metadata."""
+
+    for tensor, name, shape in (
+        (paged_kv_indptr, "paged_kv_indptr", (batch_size + 1,)),
+        (paged_kv_indices, "paged_kv_indices", None),
+        (seq_lens_kv, "seq_lens_kv", (batch_size,)),
+    ):
+        _validate_metadata_tensor(
+            tensor,
+            name,
+            ndim=1,
+            dtype=torch.int32,
+            expected_device=device,
+            expected_shape=shape,
+        )
+
+
 def _validate_bshd_tensor(
     tensor: torch.Tensor,
     name: str,
@@ -252,44 +209,11 @@ def _validate_bshd_tensor(
     _validate_16byte_alignment(tensor, name)
 
 
-def _resolve_effective_kv_valid_bits(
-    *,
-    kv_valid_bits: torch.Tensor | None,
-    dummy_kv_valid_bits: torch.Tensor | None,
-    use_kv_valid_bits: bool,
-    missing_dummy_message: str,
-) -> torch.Tensor:
-    """Resolve the always-present runtime mask tensor for one launch."""
-
-    if use_kv_valid_bits:
-        assert kv_valid_bits is not None
-        return kv_valid_bits
-    if dummy_kv_valid_bits is None:
-        raise RuntimeError(missing_dummy_message)
-    return dummy_kv_valid_bits
-
-
-def _require_contiguous_plan_state(
-    state: _BlockSparsePlanStateLike,
-) -> None:
-    if state.paged_kv is not None:
-        raise TypeError("contiguous K/V storage requires a contiguous plan state")
-
-
-def _require_paged_plan_state(
-    state: _BlockSparsePlanStateLike,
-) -> _PagedKVPlanMetadataLike:
-    paged_kv = state.paged_kv
-    if paged_kv is None:
-        raise TypeError("paged K/V storage requires a paged plan state")
-    return paged_kv
-
-
 def validate_block_sparse_run(
     q: torch.Tensor,
     kv_storage: _ContiguousKVStorage | _PagedKVStorage,
     *,
-    state: _BlockSparsePlanStateLike,
+    state: "_BlockSparsePlanState",
     block_indptr: torch.Tensor,
     block_indices: torch.Tensor,
     kv_valid_bits: torch.Tensor | None,
@@ -317,12 +241,13 @@ def validate_block_sparse_run(
         q_block_size=state.q_block_size,
         use_kv_valid_bits=state.use_kv_valid_bits,
     )
-    effective_kv_valid_bits = _resolve_effective_kv_valid_bits(
-        kv_valid_bits=kv_valid_bits,
-        dummy_kv_valid_bits=state.dummy_kv_valid_bits,
-        use_kv_valid_bits=state.use_kv_valid_bits,
-        missing_dummy_message="unmasked block-sparse plan is missing its dummy mask",
-    )
+    if state.use_kv_valid_bits:
+        assert kv_valid_bits is not None
+        effective_kv_valid_bits = kv_valid_bits
+    else:
+        effective_kv_valid_bits = state.dummy_kv_valid_bits
+        if effective_kv_valid_bits is None:
+            raise RuntimeError("unmasked block-sparse plan is missing its dummy mask")
 
     q_shape = (state.batch_size, state.seq_len_q, state.num_qo_heads, state.head_dim)
     _validate_bshd_tensor(
@@ -335,7 +260,8 @@ def validate_block_sparse_run(
     paged_kv: _PagedKVLaunchPayload | None = None
     overlap_inputs: tuple[tuple[str, torch.Tensor], ...]
     if isinstance(kv_storage, _ContiguousKVStorage):
-        _require_contiguous_plan_state(state)
+        if state.page_size is not None:
+            raise TypeError("contiguous K/V storage requires a contiguous plan state")
         kv_shape = (
             state.batch_size,
             state.seq_len_kv,
@@ -363,7 +289,9 @@ def validate_block_sparse_run(
             ("route_workspace", state.route_workspace),
         )
     elif isinstance(kv_storage, _PagedKVStorage):
-        paged_plan = _require_paged_plan_state(state)
+        page_size = state.page_size
+        if page_size is None:
+            raise TypeError("paged K/V storage requires a paged plan state")
         (
             k,
             v,
@@ -384,7 +312,7 @@ def validate_block_sparse_run(
         )
         expected_geometry = (
             state.num_kv_heads,
-            paged_plan.page_size,
+            page_size,
             state.head_dim,
         )
         if runtime_geometry != expected_geometry:
@@ -396,16 +324,17 @@ def validate_block_sparse_run(
             raise ValueError(
                 f"K/V dtype must match the plan ({state.kv_dtype}), got {k.dtype}"
             )
-        _validate_metadata_tensor(
+        validate_paged_kv_metadata(
+            kv_storage.paged_kv_indptr,
             kv_storage.paged_kv_indices,
-            "paged_kv_indices",
-            ndim=1,
-            dtype=torch.int32,
-            expected_device=state.device,
-            expected_shape=(paged_plan.num_page_indices,),
+            kv_storage.seq_lens_kv,
+            device=state.device,
+            batch_size=state.batch_size,
         )
         paged_kv = _PagedKVLaunchPayload(
+            paged_kv_indptr=kv_storage.paged_kv_indptr,
             paged_kv_indices=kv_storage.paged_kv_indices,
+            seq_lens_kv=kv_storage.seq_lens_kv,
             num_physical_kv_pages=num_physical_kv_pages,
             k_page_stride=k_page_stride,
             v_page_stride=v_page_stride,
@@ -417,9 +346,9 @@ def validate_block_sparse_run(
             ("block_indptr", block_indptr),
             ("block_indices", block_indices),
             ("kv_valid_bits", effective_kv_valid_bits),
-            ("paged_kv_indptr", paged_plan.paged_kv_indptr),
+            ("paged_kv_indptr", kv_storage.paged_kv_indptr),
             ("paged_kv_indices", kv_storage.paged_kv_indices),
-            ("seq_lens_kv", paged_plan.seq_lens_kv),
+            ("seq_lens_kv", kv_storage.seq_lens_kv),
             ("row_route_offsets", state.row_route_offsets),
             ("route_workspace", state.route_workspace),
         )
@@ -470,18 +399,19 @@ def record_block_sparse_run_args(
     if run_args.kv_valid_bits_is_live:
         run_args.kv_valid_bits.record_stream(stream)
     if run_args.paged_kv is not None:
+        run_args.paged_kv.paged_kv_indptr.record_stream(stream)
         run_args.paged_kv.paged_kv_indices.record_stream(stream)
+        run_args.paged_kv.seq_lens_kv.record_stream(stream)
 
 
 def launch_block_sparse(
     run_args: _BlockSparseRunArgs,
     *,
-    state: _BlockSparsePlanStateLike,
+    state: "_BlockSparsePlanState",
 ) -> torch.Tensor:
     """Invoke the exact contiguous or paged ABI chosen by validated payload."""
 
     if run_args.paged_kv is None:
-        _require_contiguous_plan_state(state)
         state.compiled(
             run_args.q,
             run_args.k,
@@ -496,7 +426,6 @@ def launch_block_sparse(
             run_args.sm_scale,
         )
     else:
-        paged_plan = _require_paged_plan_state(state)
         state.compiled(
             run_args.q,
             run_args.k,
@@ -505,9 +434,9 @@ def launch_block_sparse(
             run_args.block_indptr,
             run_args.block_indices,
             run_args.kv_valid_bits,
-            paged_plan.paged_kv_indptr,
+            run_args.paged_kv.paged_kv_indptr,
             run_args.paged_kv.paged_kv_indices,
-            paged_plan.seq_lens_kv,
+            run_args.paged_kv.seq_lens_kv,
             state.row_route_offsets,
             state.route_workspace,
             state.max_blocks_per_row,
@@ -528,4 +457,5 @@ __all__ = [
     "record_block_sparse_run_args",
     "validate_block_sparse_metadata",
     "validate_block_sparse_run",
+    "validate_paged_kv_metadata",
 ]

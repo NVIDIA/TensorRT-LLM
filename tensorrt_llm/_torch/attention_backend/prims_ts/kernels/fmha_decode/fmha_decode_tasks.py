@@ -654,9 +654,6 @@ def _load_prepared_sparse_row_warp(
         loaded_route_count = cutlass.Int32(row_route_counts[row_address])
     row_route_begin = _warp_broadcast_i32(loaded_row_route_begin, 0)
     route_count = _warp_broadcast_i32(loaded_route_count, 0)
-    # Prepare encodes an invalid range or capacity overflow as a negative
-    # header. Fail closed without touching that row's metadata slice.
-    route_count = cute.math.max(route_count, cutlass.Int32(0))
     return row_route_begin, route_count
 
 
