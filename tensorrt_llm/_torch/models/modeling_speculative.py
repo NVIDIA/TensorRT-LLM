@@ -409,30 +409,37 @@ def build_markov_head(*, markov_head_type: str, vocab_size: int,
 
 
 class DSparkConfidenceHead(nn.Module):
-    """Per-position acceptance-confidence predictor (DeepSpec
-    AcceptRatePredictor).
+    """Per-position acceptance-confidence predictor.
 
-    Input features are the backbone hidden state, optionally concatenated with
-    the Markov head's previous-token embedding. Output is a single logit per
-    position.
+    Emits one raw logit per position. :meth:`apply_sts` converts logits to
+    calibrated conditional acceptance probabilities.
     """
 
     def __init__(self,
                  *,
                  hidden_size: int,
                  markov_rank: int = 0,
-                 with_markov: bool = False):
+                 with_markov: bool = False,
+                 bias: bool = False,
+                 block_size: int = 0):
         super().__init__()
         self.with_markov = bool(with_markov)
         input_dim = int(hidden_size) + (int(markov_rank) if with_markov else 0)
-        # The checkpoint stores ``proj`` as a bias-free bf16 weight, but the
-        # confidence score is computed in fp32 (mirrors the DeepSpec reference
-        # ``Linear(input_dim, 1, dtype=torch.float32)`` with the fp32 matmul).
-        self.proj = nn.Linear(input_dim, 1, bias=False, dtype=torch.float32)
+        self.proj = nn.Linear(input_dim,
+                              1,
+                              bias=bool(bias),
+                              dtype=torch.float32)
+        self.register_buffer(
+            "sts_temperatures",
+            torch.ones(max(int(block_size), 1), dtype=torch.float32),
+            persistent=False,
+        )
+        self._sts_temperatures_host: Optional[torch.Tensor] = None
 
     def forward(self,
                 hidden_states: torch.Tensor,
                 prev_embeddings: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return raw, uncalibrated logits with shape ``[..., block]``."""
         if self.with_markov:
             assert prev_embeddings is not None
             features = torch.cat(
@@ -444,20 +451,57 @@ class DSparkConfidenceHead(nn.Module):
         # fp32 matmul for a stable confidence score (mirrors the reference).
         return self.proj(features.float()).squeeze(-1)
 
+    def apply_sts(self, confidence_logits: torch.Tensor) -> torch.Tensor:
+        """Convert raw logits to calibrated acceptance probabilities."""
+        temperatures = self.sts_temperatures
+        if temperatures.device != confidence_logits.device:
+            if confidence_logits.device.type == "cpu":
+                temperatures = self._host_sts_temperatures()
+            else:
+                temperatures = temperatures.to(confidence_logits.device)
+        return torch.sigmoid(confidence_logits.float() / temperatures)
 
-def confident_prefix_length(confidence_logits: torch.Tensor, *, block_size: int,
-                            threshold: float) -> int:
-    """First position k where ``sigmoid(confidence_k) < threshold``.
+    def _host_sts_temperatures(self) -> torch.Tensor:
+        """Return a lazily materialized CPU mirror of the STS table."""
+        cached = self._sts_temperatures_host
+        if cached is None:
+            cached = self.sts_temperatures.detach().to("cpu")
+            self._sts_temperatures_host = cached
+        return cached
 
-    Returns ``block_size`` when threshold<=0 (no truncation) or all positions
-    are confident. Assumes batch size 1 (functional-first scope).
-    """
-    if threshold <= 0.0:
-        return int(block_size)
-    below = confidence_logits.sigmoid() < threshold
-    if not bool(below[0].any().item()):
-        return int(block_size)
-    return int(torch.nonzero(below[0], as_tuple=False)[0].item())
+    @torch.no_grad()
+    def load_sts_temperatures(self, temperatures: torch.Tensor) -> None:
+        """Update the fixed-address STS table in place."""
+        flat = temperatures.reshape(-1).to(device=self.sts_temperatures.device,
+                                           dtype=torch.float32)
+        if flat.numel() != self.sts_temperatures.numel():
+            raise ValueError(
+                f"STS temperature table has {flat.numel()} entries but the confidence "
+                f"head expects {self.sts_temperatures.numel()} (one per block position)"
+            )
+        if not bool(torch.all(flat > 0.0)):
+            raise ValueError("STS temperatures must be strictly positive")
+        self.sts_temperatures.copy_(flat)
+        self._sts_temperatures_host = None
+
+    def load_weights(self, weights: list) -> None:
+        """Load every confidence-head checkpoint parameter strictly."""
+        (module_weights, ) = weights
+        expected = dict(self.named_parameters())
+        unexpected = [key for key in module_weights if key not in expected]
+        missing = [key for key in expected if key not in module_weights]
+        if unexpected:
+            raise ValueError(
+                f"DSpark confidence head checkpoint has unsupported key(s) {sorted(unexpected)}; "
+                f"the module exposes {sorted(expected)}. A checkpoint bias requires constructing "
+                "DSparkConfidenceHead(bias=True); silently dropping it would bias every score."
+            )
+        if missing:
+            raise ValueError(
+                f"DSpark confidence head checkpoint is missing key(s) {sorted(missing)}"
+            )
+        for name, param in expected.items():
+            param.data.copy_(module_weights[name][:])
 
 
 class Eagle3Attention(Attention):
