@@ -261,7 +261,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         kv_cost_offset = int(os.environ.get("TLLM_V2_CTX_COST_KV_OFFSET", "0"))
         kv_depth_threshold = int(os.environ.get("TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD", "0"))
         self._cost_chunking_enabled = (
-            kv_cost_offset > 0 and kv_depth_threshold > 0 and max_num_tokens is not None
+            kv_cost_offset > 0 and kv_depth_threshold > 0
+            and max_num_tokens is not None and self.chunking_enabled
         )
         self._kv_cost_offset = kv_cost_offset
         self._ctx_cost_budget: Optional[float] = None
@@ -492,6 +493,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
                 budget.commit(req, tokens, peft_pages)
+                if self._cost_chunking_enabled:
+                    # Charged at the same site as the token commit so the two
+                    # ledgers can never diverge. context_current_position is
+                    # still the chunk start (it advances after the forward),
+                    # i.e. the same value the cost cap priced this chunk at.
+                    budget.commit_ctx_cost(
+                        float(self._kv_cost_offset + req.context_current_position) * tokens
+                    )
 
         # Deadlock detection: if generation requests exist but none were
         # scheduled and none were evicted, no forward pass will run and no
@@ -754,11 +763,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         if cross_action is not ScheduleAction.SCHEDULED:
             self._suspend_request(req)
             return cross_action, 0, False
-
-        if self._cost_chunking_enabled:
-            budget.commit_ctx_cost(
-                float(self._kv_cost_offset + req.context_current_position) * chunk_tokens
-            )
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
