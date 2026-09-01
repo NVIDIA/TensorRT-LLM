@@ -501,7 +501,17 @@ def resolve_moe_impl(
 def impl_class_for(report: MoEResolutionReport) -> MoEImplClass:
     """The class a report's winner names, or raise with the whole trail."""
     if report.winner is None:
-        raise ValueError(f"no MoE implementation can serve this layer. {report.describe()}")
+        # describe() prints reason codes only. With nothing left to run, the
+        # operator needs the details too -- that is all the error can offer.
+        details = "; ".join(
+            f"{rejection.legacy_backend}: {rejection.detail}"
+            for rejection in report.rejected
+            if rejection.detail
+        )
+        raise ValueError(
+            f"no MoE implementation can serve this layer. {report.describe()}"
+            + (f" Details: {details}" if details else "")
+        )
     for candidate in IMPL_PRIORITY:
         if _legacy_backend_name(candidate) == report.winner:
             return candidate
