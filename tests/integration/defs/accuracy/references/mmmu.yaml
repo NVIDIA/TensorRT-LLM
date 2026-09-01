@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 google/gemma-3-27b-it:
   - accuracy: 52.0
   - quant_algo: FP8
@@ -78,3 +80,14 @@ moonshotai/Kimi-K2.5:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 81.56
+# Kimi K3 VL multimodal (MoonViT3d vision tower + KimiLinear KDA/MLA hybrid
+# backbone). bf16 checkpoint with MXFP4-packed routed experts, DEP16 on 4x4
+# GB300; single-run reference (lm-eval stderr +/-1.16 at n=900). A score at or
+# below the K2.5 floor above with clean logs signals the kimi_k3_mmmu
+# extractor silently falling back (truncated CoT) — a harness failure, not a
+# model regression. No quant_algo key: the checkpoint's quantization lives in
+# the nested text_config.quantization_config (compressed-tensors), which the
+# LLM-args layer does not surface — the reference matcher sees
+# quant_algo=None.
+moonshotai/Kimi-K3:
+  - accuracy: 84.89

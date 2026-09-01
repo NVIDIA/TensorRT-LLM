@@ -139,9 +139,9 @@ def _run_production_decode(
     if conv_pool is None:
         conv_pool = torch.cat(
             [
-                initial_cache.conv_state_q,
-                initial_cache.conv_state_k,
-                initial_cache.conv_state_v,
+                initial_cache.conv_state_q[:, :, 1:],
+                initial_cache.conv_state_k[:, :, 1:],
+                initial_cache.conv_state_v[:, :, 1:],
             ],
             dim=1,
         ).clone()
@@ -165,9 +165,20 @@ def _run_production_decode(
     )
     selected_conv = conv_pool.index_select(0, slot_indices)
     return output.unsqueeze(1), KimiKDATestCachedState(
-        conv_state_q=selected_conv[:, :projection_size],
-        conv_state_k=selected_conv[:, projection_size : 2 * projection_size],
-        conv_state_v=selected_conv[:, 2 * projection_size :],
+        conv_state_q=torch.cat(
+            [initial_cache.conv_state_q[:, :, 1:2], selected_conv[:, :projection_size]], dim=-1
+        ),
+        conv_state_k=torch.cat(
+            [
+                initial_cache.conv_state_k[:, :, 1:2],
+                selected_conv[:, projection_size : 2 * projection_size],
+            ],
+            dim=-1,
+        ),
+        conv_state_v=torch.cat(
+            [initial_cache.conv_state_v[:, :, 1:2], selected_conv[:, 2 * projection_size :]],
+            dim=-1,
+        ),
         recurrent_state=state_pool.index_select(0, slot_indices),
     )
 
@@ -320,7 +331,7 @@ def test_optimized_decode_updates_indexed_recurrent_state_pool_in_place(
     conv_pool = torch.randn(
         slots,
         3 * NUM_HEADS * HEAD_DIM,
-        CONV_KERNEL_SIZE,
+        CONV_KERNEL_SIZE - 1,
         dtype=torch.bfloat16,
         device="cuda",
     )
@@ -329,9 +340,9 @@ def test_optimized_decode_updates_indexed_recurrent_state_pool_in_place(
         slot_indices.long(),
         torch.cat(
             [
-                initial_cache.conv_state_q,
-                initial_cache.conv_state_k,
-                initial_cache.conv_state_v,
+                initial_cache.conv_state_q[:, :, 1:],
+                initial_cache.conv_state_k[:, :, 1:],
+                initial_cache.conv_state_v[:, :, 1:],
             ],
             dim=1,
         ),

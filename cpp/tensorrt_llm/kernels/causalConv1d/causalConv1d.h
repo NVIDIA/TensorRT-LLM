@@ -3,7 +3,7 @@
  * and https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/static_switch.h
  * Copyright (c) 2023, Tri Dao.
  *
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -213,6 +213,19 @@ struct Allreduce<2>
 
 template <typename input_t, typename weight_t>
 void causal_conv1d_fwd_cuda(ConvParamsBase& params, cudaStream_t stream);
+
+//! Forward pass for a channel-last (token-major) layout, i.e. x_c_stride == out_c_stride == 1.
+//!
+//! Callers whose activations are laid out as [tokens, channels] can feed a transposed *view*
+//! straight in instead of materialising the channel-major copy that causal_conv1d_fwd_cuda
+//! requires (and transposing the result back).
+//!
+//! Requirements (checked by the caller):
+//!  - x and out are both channel-contiguous (c_stride == 1) with a token stride > 1;
+//!  - out does not alias x - the kernel splits a sequence into token chunks and each chunk reads
+//!    a (width-1)-token halo produced by the previous one, so in-place operation would race.
+template <typename input_t, typename weight_t>
+void causal_conv1d_channellast_fwd_cuda(ConvParamsBase& params, cudaStream_t stream);
 
 template <typename input_t, typename weight_t>
 void causal_conv1d_update_cuda(ConvParamsBase& params, cudaStream_t stream);

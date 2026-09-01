@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -494,15 +494,24 @@ def process_and_upload_test_results(
             data.update(extra_fields)
         add_id(data)
 
-    # Step 3: Find common values to narrow query scope
-    common_values_dict = get_common_values(new_data_dict, match_keys)
+    # Step 3: For pre-merge, look history up against the baseline branch
+    lookup_data_dict = new_data_dict
+    if not is_post_merge and "s_branch" in match_keys:
+        baseline_branch = os.environ.get("PERF_BASELINE_BRANCH", "main")
+        lookup_data_dict = {
+            cmd_idx: {**data, "s_branch": baseline_branch}
+            for cmd_idx, data in new_data_dict.items()
+        }
 
-    # Step 4: Query history data
+    # Step 4: Find common values to narrow query scope
+    common_values_dict = get_common_values(lookup_data_dict, match_keys)
+
+    # Step 5: Query history data
     latest_history_data_dict, latest_baseline_threshold_dict, history_data_dict = get_history_data(
-        new_data_dict, match_keys, common_values_dict
+        lookup_data_dict, match_keys, common_values_dict
     )
 
-    # Step 5: Compute regression info
+    # Step 6: Compute regression info
     prepare_regressive_test_cases(
         latest_history_data_dict,
         latest_baseline_threshold_dict,
@@ -513,17 +522,17 @@ def process_and_upload_test_results(
         regression_metrics,
     )
 
-    # Step 6: For post-merge, embed baseline fields
+    # Step 7: For post-merge, embed baseline fields
     if is_post_merge:
         add_baseline_fields_to_post_merge_data(
             latest_baseline_threshold_dict, new_data_dict, maximize_metrics, minimize_metrics
         )
 
-    # Step 7: Upload to DB
+    # Step 8: Upload to DB
     if upload_to_db:
         post_new_perf_data(new_data_dict)
 
-    # Step 8: Check regression (auto-detect fail behavior if not specified)
+    # Step 9: Check regression (auto-detect fail behavior if not specified)
     if fail_on_regression is None:
         fail_on_regression = not is_post_merge
     check_perf_regression(new_data_dict, fail_on_regression=fail_on_regression)

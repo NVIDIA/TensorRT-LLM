@@ -51,6 +51,12 @@ class PipelineOutput:
             ``(B, channels, T_audio)``, dtype ``float32``. Populated by LTX-2.
             The leading batch dim is always present, even for single-prompt
             requests (size 1).
+        action: Predicted or refined action trajectory as ``torch.Tensor``
+            shape ``(B, T_action, D_raw)``, dtype ``float32``. Populated by
+            Cosmos3 action generation (``policy`` / ``forward_dynamics`` /
+            ``inverse_dynamics``), already sliced to the embodiment's real
+            degrees of freedom, so ``D_raw`` states them; no VAE decode.
+            ``None`` when action generation was not requested.
         frame_rate: Video frame rate in fps. Populated by video pipelines
             (Wan T2V/I2V emit ``16.0``; LTX-2 emits ``params.frame_rate``).
             ``None`` for image-only pipelines.
@@ -72,6 +78,7 @@ class PipelineOutput:
     image: Optional[torch.Tensor] = None
     video: Optional[torch.Tensor] = None
     audio: Optional[torch.Tensor] = None
+    action: Optional[torch.Tensor] = None
     frame_rate: Optional[float] = None
     audio_sample_rate: Optional[int] = None
     pre_denoise: float = 0.0
@@ -201,6 +208,7 @@ def to_visual_gen_output(resp: "DiffusionResponse") -> "VisualGenOutput":
         image=out.image,
         video=out.video,
         audio=out.audio,
+        action=out.action,
         frame_rate=out.frame_rate,
         audio_sample_rate=out.audio_sample_rate,
         metrics=metrics,
@@ -245,6 +253,10 @@ def split_visual_gen_output(resp: "DiffusionResponse", batch_size: int) -> List[
         assert out.audio.shape[0] == batch_size, (
             f"audio leading dim {out.audio.shape[0]} != batch_size {batch_size}"
         )
+    if out.action is not None:
+        assert out.action.shape[0] == batch_size, (
+            f"action leading dim {out.action.shape[0]} != batch_size {batch_size}"
+        )
     metrics = VisualGenMetrics(
         generation=resp.generation,
         pre_denoise=out.pre_denoise,
@@ -259,6 +271,7 @@ def split_visual_gen_output(resp: "DiffusionResponse", batch_size: int) -> List[
                 image=out.image[i] if out.image is not None else None,
                 video=out.video[i] if out.video is not None else None,
                 audio=out.audio[i] if out.audio is not None else None,
+                action=out.action[i] if out.action is not None else None,
                 frame_rate=out.frame_rate,
                 audio_sample_rate=out.audio_sample_rate,
                 metrics=metrics,
