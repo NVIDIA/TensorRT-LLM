@@ -142,6 +142,9 @@ def test_block_table_uses_native_p128_copy(monkeypatch):
 
 def test_hybrid_view_uses_the_draft_layers_actual_fp8_pool():
     manager = _FakeHybridManager()
+    # A heterogeneous source pool reports its first layer's page scale, not
+    # the rerooted draft layer's flat-pool stride.
+    manager.index_scales[1] = SCALE + 11
     view = MiniMaxM3DraftKVCacheView(manager, [DRAFT_LAYER])
 
     assert view.dtype == DataType.FP8
@@ -203,9 +206,9 @@ def test_view_rejects_multiple_draft_layers():
         MiniMaxM3DraftKVCacheView(_FakeManager(), [DRAFT_LAYER, DRAFT_LAYER + 1])
 
 
-def test_view_rejects_incompatible_source_pool_geometry():
+def test_view_rejects_incompatible_source_pool_kv_offset():
     manager = _FakeHybridManager()
-    manager.index_scales[1] += 1
+    manager.kv_offset[1] += 1
     with pytest.raises(ValueError, match="block-table mapping is unavailable"):
         MiniMaxM3DraftKVCacheView(manager, [DRAFT_LAYER])
 

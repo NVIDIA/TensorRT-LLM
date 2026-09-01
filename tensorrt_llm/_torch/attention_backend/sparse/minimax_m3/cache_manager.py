@@ -916,11 +916,7 @@ class MiniMaxM3DraftKVCacheView:
         source_pool_id = int(manager.kv_cache_pool_mapping[int(local_layer_id), 0])
 
         flat_pool, slot_stride = manager.get_kv_subpage_pool(layer_id, "HND")
-        if (
-            int(manager.index_scales[source_pool_id]) != slot_stride
-            or int(manager.kv_offset[source_pool_id]) != 1
-            or manager._stream is None
-        ):
+        if int(manager.kv_offset[source_pool_id]) != 1 or manager._stream is None:
             raise ValueError("MiniMax-M3's native P128 draft block-table mapping is unavailable")
 
         self._source_pool_id = source_pool_id
@@ -935,7 +931,13 @@ class MiniMaxM3DraftKVCacheView:
         )
         self.kv_cache_pool_mapping = manager.kv_cache_pool_mapping.clone()
         self.kv_cache_pool_mapping[int(local_layer_id)] = 0
-        self.index_scales = manager.index_scales[source_pool_id : source_pool_id + 1]
+        # The view is rooted at this layer's K page, so its block-table scale
+        # is the layer-local stride of ``flat_pool``.  The source pool's scale
+        # is measured in the first layer's page units and can differ for a
+        # heterogeneous NVFP4 mega-slot (for example, 171 versus 8 here).
+        self.index_scales = torch.tensor(
+            [slot_stride], dtype=torch.int32, pin_memory=prefer_pinned()
+        )
         self.kv_offset = manager.kv_offset[source_pool_id : source_pool_id + 1]
         self.host_kv_cache_block_offsets = manager.host_kv_cache_block_offsets[
             source_pool_id : source_pool_id + 1
