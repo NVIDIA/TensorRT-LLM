@@ -15,15 +15,6 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  # TEMPORARY (REMOVE BEFORE MERGE): these two tests are post_merge-gated, so a
-  # PR pipeline never schedules them and --extra-stage cannot pull them in (the
-  # gate is in the test-db terms). Listed here only to prove the relaxed
-  # thresholds pass on the B200 CI lane before merge; the post_merge block
-  # below remains their permanent home. Drop this block only AFTER reading the
-  # B200 stage verdict (nvbugs/6655359 exists because the last such proof-run
-  # result landed after the listing was already dropped and went unread).
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_v2v_lpips_against_golden TIMEOUT (10)
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
