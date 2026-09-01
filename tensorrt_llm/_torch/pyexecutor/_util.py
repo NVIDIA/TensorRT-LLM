@@ -2245,8 +2245,8 @@ def _create_kv_cache_manager(
         head_dim: Optional[int] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
+        cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None) -> KVCacheManager:
-        cold_page_codec_provider: Optional[object] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2383,14 +2383,14 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        manager_extra_kwargs[
+            "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
     elif kv_events_config is not None and kv_events_config.enable_kv_cache_events:
         logger.warning(
             "kv_cache_config.kv_events_config is set but streaming KV event "
             "publishing requires KV cache manager V2; events will not be "
             f"published for {kv_cache_manager_cls.__name__}.")
-        manager_extra_kwargs[
-            "cold_page_codec_provider"] = cold_page_codec_provider
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
