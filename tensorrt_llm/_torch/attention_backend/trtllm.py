@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     from ..model_config import ModelConfig
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
-    from .fmha import Fmha, PhasedFmha
 
 from tensorrt_llm._torch.attention_backend.fmha.interface import (
     MlaBackendPolicy, _CuteDslMlaStagingKey)
@@ -51,7 +50,6 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
-
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
@@ -1459,10 +1457,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # that needs batch-dependent selection (e.g. Kimi K3's MLA module)
         # installs a policy on the attention instances it owns; it lives on
         # the backend object rather than the FMHA lib instances because
-        # ``FmhaManager.rebuild`` may recreate those after model construction.
+        # ``update_quant_config`` may recreate the manager after model
+        # construction.
         self.mla_backend_policy: Optional[MlaBackendPolicy] = None
 
         self.is_mla_enable = mla_params is not None
+        sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
+        if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
+                and get_sm_version() in (120, 121)
+                and self.kv_cache_dtype != "fp8_ds_mla"):
+            raise ValueError(
+                "DeepSeek-V4/DSA sparse MLA on SM120/SM121 requires "
+                "kv_cache_config.dtype='fp8_ds_mla'.")
         self.mla_params = mla_params or MLAParams()
         self.v_head_dim = self.mla_params.v_head_dim if self.is_mla_enable else head_dim
 
@@ -1518,33 +1524,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
 
         self.local_layer_idx: Optional[int] = None
-        self._fmha_manager = FmhaManager(self)
+        self._fmha_manager: FmhaManager
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
-
-    @property
-    def fmha_libs(self) -> List["Fmha"]:
-        return self._fmha_manager.fmha_libs
-
-    @fmha_libs.setter
-    def fmha_libs(self, value: List["Fmha"]) -> None:
-        self._fmha_manager.fmha_libs = value
-
-    @property
-    def phased_fmha_libs(self) -> List["PhasedFmha"]:
-        return self._fmha_manager.phased_fmha_libs
-
-    @phased_fmha_libs.setter
-    def phased_fmha_libs(self, value: List["PhasedFmha"]) -> None:
-        self._fmha_manager.phased_fmha_libs = value
-
-    @property
-    def non_phased_fmha_libs(self) -> List["Fmha"]:
-        return self._fmha_manager.non_phased_fmha_libs
-
-    @non_phased_fmha_libs.setter
-    def non_phased_fmha_libs(self, value: List["Fmha"]) -> None:
-        self._fmha_manager.non_phased_fmha_libs = value
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
@@ -1565,7 +1547,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
             self.has_w4a8_nvfp4_fp8 = self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
             )
-        self.create_fmha_libs()
+        self._fmha_manager = FmhaManager(self)
 
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",
@@ -1821,10 +1803,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     @property
     def rope_original_max_positions(self) -> int:
         return self.rope_params.original_max_positions
-
-    def create_fmha_libs(self) -> None:
-        """Rebuild this attention instance\'s FMHA libraries and selection cache."""
-        self._fmha_manager.rebuild()
 
     def forward(
         self,
@@ -2131,7 +2109,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
 
-        fmha = self._fmha_manager.select(q, k, v, metadata, forward_args)
+        fmha = self._fmha_manager.select(self, q, k, v, metadata, forward_args)
 
         if fmha is None:
             raise RuntimeError(

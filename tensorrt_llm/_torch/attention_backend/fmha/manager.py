@@ -21,7 +21,6 @@ import bisect
 import functools
 import inspect
 import os
-import weakref
 from dataclasses import fields, is_dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, NamedTuple
@@ -33,7 +32,6 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType,
     CustomAttentionMask,
 )
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
@@ -298,52 +296,15 @@ class FmhaManager:
     """Own the FMHA libraries, dispatch policy, and selection cache for one attention layer."""
 
     def __init__(self, attn: TrtllmAttention) -> None:
-        self._attn_ref: weakref.ReferenceType[TrtllmAttention] = weakref.ref(attn)
-        self.fmha_libs: list[Fmha] = []
-        self.phased_fmha_libs: list[PhasedFmha] = []
-        self.non_phased_fmha_libs: list[Fmha] = []
         self._cache: dict[_FmhaCacheKey, Fmha] = {}
         self._cache_inputs: dict[_FmhaCacheKey, _FmhaCacheInputs] = {}
-        # Environment configuration is fixed until rebuilding so normal
-        # forwarding never pays for an environment lookup.
+        # Environment configuration is fixed for the manager lifetime so
+        # normal forwarding never pays for an environment lookup.
         self._cache_sanity_check_enabled = _is_fmha_cache_sanity_check_enabled()
-
-    @property
-    def attn(self) -> TrtllmAttention:
-        """Return the owning attention backend."""
-        attn = self._attn_ref()
-        if attn is None:
-            raise RuntimeError("The owning TrtllmAttention instance has been garbage collected.")
-        return attn
-
-    def rebuild(self) -> None:
-        """Recreate the enabled FMHA libraries and invalidate cached selections."""
-        self._cache = {}
-        self._cache_inputs = {}
-        self._cache_sanity_check_enabled = _is_fmha_cache_sanity_check_enabled()
-
-        attn = self.attn
-        sparse_algorithm = getattr(attn.sparse_params, "algorithm", None)
-        if (
-            attn.is_mla_enable
-            and sparse_algorithm in ("deepseek_v4", "dsa")
-            and get_sm_version() in (120, 121)
-            and getattr(attn, "kv_cache_dtype", None) != "fp8_ds_mla"
-        ):
-            raise ValueError(
-                "DeepSeek-V4/DSA sparse MLA on SM120/SM121 requires "
-                "kv_cache_config.dtype='fp8_ds_mla'."
-            )
-
-        self.fmha_libs = []
+        self.fmha_libs: list[Fmha] = []
         for fmha_cls in get_enabled_fmha_lib_classes():
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
-
-        self.phased_fmha_libs = [fmha for fmha in self.fmha_libs if isinstance(fmha, PhasedFmha)]
-        self.non_phased_fmha_libs = [
-            fmha for fmha in self.fmha_libs if not isinstance(fmha, PhasedFmha)
-        ]
 
     def _make_cache_key(
         self,
@@ -354,7 +315,7 @@ class FmhaManager:
         """Build the dynamic FMHA cache key for one attention instance.
 
         FMHA cache inputs not represented here must remain invariants for
-        the cache lifetime. Rebuilding the FMHA library list starts a new one.
+        the manager lifetime. Constructing a new manager starts a new cache.
 
         Batch size and generation Q length use ceiling grid buckets based on
         TRTLLM-Gen JIT warmup candidates. Each candidate and its predecessor
@@ -412,6 +373,7 @@ class FmhaManager:
 
     def select(
         self,
+        attn: TrtllmAttention,
         q: torch.Tensor,
         k: torch.Tensor | None,
         v: torch.Tensor | None,
@@ -419,19 +381,14 @@ class FmhaManager:
         forward_args: AttentionForwardArgs,
     ) -> Fmha | None:
         """Select an FMHA library for one forward request."""
-        if not self.fmha_libs:
-            # Preserve the pre-manager lazy-initialization extension point:
-            # downstream attention subclasses may override this method.
-            self.attn.create_fmha_libs()
-
         if not _is_fmha_cache_enabled():
-            return self._select_uncached(q, k, v, metadata, forward_args)
+            return self._select_uncached(attn, q, k, v, metadata, forward_args)
 
         cache_key = self._make_cache_key(q, metadata, forward_args)
         fmha = self._cache.get(cache_key)
         if fmha is not None:
             if self._cache_sanity_check_enabled:
-                uncached_fmha = self._select_uncached(q, k, v, metadata, forward_args)
+                uncached_fmha = self._select_uncached(attn, q, k, v, metadata, forward_args)
                 if not _fmha_cache_values_match(fmha, uncached_fmha):
                     uncached_inputs = _snapshot_fmha_cache_inputs(q, k, v, metadata, forward_args)
                     input_diff = _format_fmha_cache_input_diff(
@@ -453,7 +410,7 @@ class FmhaManager:
                     )
             return fmha
 
-        fmha = self._select_uncached(q, k, v, metadata, forward_args)
+        fmha = self._select_uncached(attn, q, k, v, metadata, forward_args)
         if fmha is None:
             return None
         self._cache[cache_key] = fmha
@@ -465,18 +422,20 @@ class FmhaManager:
 
     def _select_uncached(
         self,
+        attn: TrtllmAttention,
         q: torch.Tensor,
         k: torch.Tensor | None,
         v: torch.Tensor | None,
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Fmha | None:
-        if self.attn.is_mla_enable:
+        if attn.is_mla_enable:
             return self._select_mla(q, k, v, metadata, forward_args)
-        return self._select_non_mla(q, k, v, metadata, forward_args)
+        return self._select_non_mla(attn, q, k, v, metadata, forward_args)
 
     def _select_non_mla(
         self,
+        attn: TrtllmAttention,
         q: torch.Tensor,
         k: torch.Tensor | None,
         v: torch.Tensor | None,
@@ -529,7 +488,7 @@ class FmhaManager:
             if context_fmha is generation_fmha:
                 continue
 
-            combined_fmha = CombinedFmha(self.attn)
+            combined_fmha = CombinedFmha(attn)
             combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
             return combined_fmha
         return None

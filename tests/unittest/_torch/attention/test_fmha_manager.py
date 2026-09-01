@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import weakref
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -30,11 +32,14 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 def _make_manager(*, sanity_check_enabled: bool = False) -> tuple[FakeAttention, FmhaManager]:
     attn = FakeAttention()
-    manager = FmhaManager(attn)
+    with patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=[]):
+        manager = FmhaManager(attn)
     manager._cache_sanity_check_enabled = sanity_check_enabled
     return attn, manager
 
@@ -54,32 +59,15 @@ def _make_metadata(
     )
 
 
-def test_attention_create_fmha_libs_delegates_to_manager() -> None:
-    manager = SimpleNamespace(rebuild=Mock())
-    attn = SimpleNamespace(_fmha_manager=manager)
-
-    TrtllmAttention.create_fmha_libs(attn)
-
-    manager.rebuild.assert_called_once_with()
-
-
-def test_manager_lazy_rebuild_uses_attention_extension_point() -> None:
-    events: list[tuple] = []
+def test_manager_does_not_retain_attention() -> None:
     attn, manager = _make_manager()
-    fmha = FakeFmha(attn, "fmha", events)
-    create_fmha_libs = Mock(side_effect=lambda: manager.fmha_libs.append(fmha))
-    attn.create_fmha_libs = create_fmha_libs
+    attn_ref = weakref.ref(attn)
 
-    selected = manager.select(
-        torch.empty((1, 4)),
-        None,
-        None,
-        _make_metadata(num_contexts=0, num_generations=1),
-        AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only),
-    )
+    del attn
+    gc.collect()
 
-    assert selected is fmha
-    create_fmha_libs.assert_called_once_with()
+    assert attn_ref() is None
+    assert manager.fmha_libs == []
 
 
 def test_select_non_mla_fmha_combines_supported_phases() -> None:
@@ -90,6 +78,7 @@ def test_select_non_mla_fmha_combines_supported_phases() -> None:
     manager.fmha_libs = [context_fmha, generation_fmha]
 
     selected = manager.select(
+        attn,
         torch.empty((2, 4)),
         None,
         None,
@@ -98,6 +87,7 @@ def test_select_non_mla_fmha_combines_supported_phases() -> None:
     )
 
     assert isinstance(selected, CombinedFmha)
+    assert selected.attn is attn
     assert selected._get_context_impl() is context_fmha
     assert selected._get_generation_impl() is generation_fmha
     assert events == [
@@ -117,6 +107,7 @@ def test_select_non_mla_fmha_checks_followup_support() -> None:
     manager.fmha_libs = [context_fmha, unsupported_followup]
 
     selected = manager.select(
+        attn,
         torch.empty((2, 4)),
         None,
         None,
@@ -146,6 +137,7 @@ def test_select_non_mla_fmha_reuses_one_implementation() -> None:
     manager.fmha_libs = [fmha]
 
     selected = manager.select(
+        attn,
         torch.empty((2, 4)),
         None,
         None,
@@ -170,6 +162,7 @@ def test_select_non_mla_fmha_skips_same_phased_implementation_after_full_rejecti
     manager.fmha_libs = [phased_fmha, fallback_fmha]
 
     selected = manager.select(
+        attn,
         torch.empty((2, 4)),
         None,
         None,
@@ -193,6 +186,7 @@ def test_select_non_mla_fmha_uses_context_only_phased_implementation() -> None:
     manager.fmha_libs = [context_fmha]
 
     selected = manager.select(
+        attn,
         torch.empty((2, 4)),
         None,
         None,
@@ -220,6 +214,7 @@ def test_select_non_mla_fmha_preserves_registry_order() -> None:
     manager.fmha_libs = [non_phased_fmha, phased_fmha]
 
     selected = manager.select(
+        attn,
         torch.empty((2, 4)),
         None,
         None,
@@ -260,14 +255,19 @@ def test_fmha_cache_separates_generation_q_boundaries(
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
         selected_by_q_length = {
             q_length: manager.select(
-                torch.empty((batch_size * q_length, 4)), None, None, metadata, forward_args
+                attn, torch.empty((batch_size * q_length, 4)), None, None, metadata, forward_args
             )
             for q_length in request_order
         }
         for q_length in request_order:
             assert (
                 manager.select(
-                    torch.empty((batch_size * q_length, 4)), None, None, metadata, forward_args
+                    attn,
+                    torch.empty((batch_size * q_length, 4)),
+                    None,
+                    None,
+                    metadata,
+                    forward_args,
                 )
                 is selected_by_q_length[q_length]
             )
@@ -313,6 +313,7 @@ def test_fmha_cache_separates_generation_batch_boundaries(
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
         selected_by_batch_size = {
             batch_size: manager.select(
+                attn,
                 torch.empty((batch_size * q_length, 4)),
                 None,
                 None,
@@ -324,6 +325,7 @@ def test_fmha_cache_separates_generation_batch_boundaries(
         for batch_size in request_order:
             assert (
                 manager.select(
+                    attn,
                     torch.empty((batch_size * q_length, 4)),
                     None,
                     None,
@@ -361,6 +363,7 @@ def test_fmha_cache_reuses_grid_cell() -> None:
         for batch_size, q_length in ((57, 5), (63, 7)):
             assert (
                 manager.select(
+                    attn,
                     torch.empty((batch_size * q_length, 4)),
                     None,
                     None,
@@ -371,6 +374,7 @@ def test_fmha_cache_reuses_grid_cell() -> None:
             )
         assert (
             manager.select(
+                attn,
                 torch.empty((64 * 8, 4)),
                 None,
                 None,
@@ -397,6 +401,7 @@ def test_context_fmha_cache_uses_batch_grid_only() -> None:
 
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
         first = manager.select(
+            attn,
             torch.empty((57 * 3, 4)),
             None,
             None,
@@ -404,6 +409,7 @@ def test_context_fmha_cache_uses_batch_grid_only() -> None:
             forward_args,
         )
         second = manager.select(
+            attn,
             torch.empty((63 * 17, 4)),
             None,
             None,
@@ -411,6 +417,7 @@ def test_context_fmha_cache_uses_batch_grid_only() -> None:
             forward_args,
         )
         same_batch_different_q_length = manager.select(
+            attn,
             torch.empty((63 * 3, 4)),
             None,
             None,
@@ -452,12 +459,26 @@ def test_fmha_cache_separates_compacted_mla_phases(generation_first: bool) -> No
 
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
         selected_by_phase = {
-            phase: manager.select(requests[phase][0], None, None, metadata, requests[phase][1])
+            phase: manager.select(
+                attn,
+                requests[phase][0],
+                None,
+                None,
+                metadata,
+                requests[phase][1],
+            )
             for phase in request_order
         }
         for phase in request_order:
             assert (
-                manager.select(requests[phase][0], None, None, metadata, requests[phase][1])
+                manager.select(
+                    attn,
+                    requests[phase][0],
+                    None,
+                    None,
+                    metadata,
+                    requests[phase][1],
+                )
                 is selected_by_phase[phase]
             )
 
@@ -502,7 +523,7 @@ def test_fmha_cache_tracks_attention_mask_data() -> None:
 
         with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
             selected = [
-                manager.select(q, None, None, metadata, forward_args)
+                manager.select(attn, q, None, None, metadata, forward_args)
                 for forward_args in request_order
             ]
 
@@ -510,8 +531,10 @@ def test_fmha_cache_tracks_attention_mask_data() -> None:
             [fallback, implicit_mask_only] if mask_data_first else [implicit_mask_only, fallback]
         )
         assert selected == expected
-        assert manager.select(q, None, None, metadata, implicit_mask_args) is implicit_mask_only
-        assert manager.select(q, None, None, metadata, mask_data_args) is fallback
+        assert (
+            manager.select(attn, q, None, None, metadata, implicit_mask_args) is implicit_mask_only
+        )
+        assert manager.select(attn, q, None, None, metadata, mask_data_args) is fallback
         assert len(manager._cache) == 2
 
 
@@ -546,6 +569,7 @@ def test_fmha_cache_separates_speculative_decoding(speculative_first: bool) -> N
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
         selected_by_mode = {
             use_spec_decoding: manager.select(
+                attn,
                 q,
                 None,
                 None,
@@ -557,6 +581,7 @@ def test_fmha_cache_separates_speculative_decoding(speculative_first: bool) -> N
         for use_spec_decoding in request_order:
             assert (
                 manager.select(
+                    attn,
                     q,
                     None,
                     None,
@@ -600,11 +625,11 @@ def test_fmha_cache_tracks_lora_output_representation() -> None:
 
         with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
             selected = [
-                manager.select(q, None, None, metadata, forward_args)
+                manager.select(attn, q, None, None, metadata, forward_args)
                 for forward_args in request_order
             ]
-            assert manager.select(q, None, None, metadata, lora_args) is unpacked_only
-            assert manager.select(q, None, None, metadata, base_args) is fallback
+            assert manager.select(attn, q, None, None, metadata, lora_args) is unpacked_only
+            assert manager.select(attn, q, None, None, metadata, base_args) is fallback
 
         expected = [unpacked_only, fallback] if lora_first else [fallback, unpacked_only]
         assert selected == expected
@@ -641,6 +666,7 @@ def test_fmha_cache_sanity_check_logs_mismatched_inputs() -> None:
     ):
         assert (
             manager.select(
+                attn,
                 torch.empty((1, 4)),
                 torch.empty((1, 2)),
                 None,
@@ -651,6 +677,7 @@ def test_fmha_cache_sanity_check_logs_mismatched_inputs() -> None:
         )
         with pytest.raises(RuntimeError, match="FMHA cache sanity check failed"):
             manager.select(
+                attn,
                 torch.empty((1, 8)),
                 torch.empty((1, 3)),
                 torch.empty((1, 3)),
@@ -679,8 +706,8 @@ def test_fmha_cache_sanity_check_accepts_equivalent_combined_fmha() -> None:
     q = torch.empty((2, 4))
 
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
-        first = manager.select(q, None, None, metadata, forward_args)
-        second = manager.select(q, None, None, metadata, forward_args)
+        first = manager.select(attn, q, None, None, metadata, forward_args)
+        second = manager.select(attn, q, None, None, metadata, forward_args)
 
     assert isinstance(first, CombinedFmha)
     assert second is first
@@ -740,10 +767,12 @@ def test_fmha_cache_keeps_combined_selections_immutable() -> None:
     large_metadata = _make_metadata(num_contexts=26, num_generations=26, num_ctx_tokens=52)
 
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
-        small = manager.select(torch.empty((3, 4)), None, None, small_metadata, forward_args)
-        large = manager.select(torch.empty((78, 4)), None, None, large_metadata, forward_args)
+        small = manager.select(attn, torch.empty((3, 4)), None, None, small_metadata, forward_args)
+        large = manager.select(attn, torch.empty((78, 4)), None, None, large_metadata, forward_args)
         num_events_after_misses = len(events)
-        small_again = manager.select(torch.empty((3, 4)), None, None, small_metadata, forward_args)
+        small_again = manager.select(
+            attn, torch.empty((3, 4)), None, None, small_metadata, forward_args
+        )
 
     assert isinstance(small, CombinedFmha)
     assert isinstance(large, CombinedFmha)
@@ -784,16 +813,16 @@ def test_fmha_cache_is_bypassed_while_autotuning() -> None:
         q = torch.empty((num_q_tokens, 4))
 
         with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=False):
-            assert manager.select(q, None, None, metadata, forward_args) is fmha
-            assert manager.select(q, None, None, metadata, forward_args) is fmha
+            assert manager.select(attn, q, None, None, metadata, forward_args) is fmha
+            assert manager.select(attn, q, None, None, metadata, forward_args) is fmha
         assert not manager._cache
         with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
-            assert manager.select(q, None, None, metadata, forward_args) is fmha
-            assert manager.select(q, None, None, metadata, forward_args) is fmha
+            assert manager.select(attn, q, None, None, metadata, forward_args) is fmha
+            assert manager.select(attn, q, None, None, metadata, forward_args) is fmha
         with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=False):
-            assert manager.select(q, None, None, metadata, forward_args) is fmha
+            assert manager.select(attn, q, None, None, metadata, forward_args) is fmha
         with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
-            assert manager.select(q, None, None, metadata, forward_args) is fmha
+            assert manager.select(attn, q, None, None, metadata, forward_args) is fmha
 
         assert events == [
             ("support", "fmha", None),
@@ -813,8 +842,8 @@ def test_fmha_cache_does_not_cache_failed_selection() -> None:
     q = torch.empty((1, 4))
 
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
-        assert manager.select(q, None, None, metadata, forward_args) is None
-        assert manager.select(q, None, None, metadata, forward_args) is None
+        assert manager.select(attn, q, None, None, metadata, forward_args) is None
+        assert manager.select(attn, q, None, None, metadata, forward_args) is None
 
     assert events == [
         ("support", "unsupported", None),
@@ -824,20 +853,21 @@ def test_fmha_cache_does_not_cache_failed_selection() -> None:
     ]
 
 
-def test_rebuild_invalidates_fmha_cache() -> None:
+def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
     events: list[tuple] = []
+    quant_states_during_construction: list[bool] = []
 
     class _OldFmha(FakeFmha):
-        def __init__(self, attn: FakeAttention) -> None:
+        def __init__(self, attn: TrtllmAttention) -> None:
             super().__init__(attn, "old", events)
 
     class _NewFmha(FakeFmha):
-        def __init__(self, attn: FakeAttention) -> None:
+        def __init__(self, attn: TrtllmAttention) -> None:
+            quant_states_during_construction.append(attn.has_fp8_kv_cache)
             super().__init__(attn, "new", events)
 
-    attn, manager = _make_manager()
-    attn.sparse_params = None
-    attn.kv_cache_dtype = "auto"
+    attn = TrtllmAttention.__new__(TrtllmAttention)
+    attn.is_mla_enable = False
     metadata = _make_metadata(num_contexts=0, num_generations=1)
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
     q = torch.empty((1, 4))
@@ -846,37 +876,21 @@ def test_rebuild_invalidates_fmha_cache() -> None:
         patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=[_OldFmha]),
         patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True),
     ):
-        manager.rebuild()
-        old = manager.select(q, None, None, metadata, forward_args)
+        attn.update_quant_config(None)
+        old_manager = attn._fmha_manager
+        old = old_manager.select(attn, q, None, None, metadata, forward_args)
 
-    with (
-        patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=[_NewFmha]),
-        patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True),
+    with patch.object(
+        fmha_manager,
+        "get_enabled_fmha_lib_classes",
+        return_value=[_NewFmha],
     ):
-        manager.rebuild()
-        new = manager.select(q, None, None, metadata, forward_args)
+        attn.update_quant_config(QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8))
 
     assert isinstance(old, _OldFmha)
-    assert isinstance(new, _NewFmha)
-    assert events == [
-        ("support", "old", None),
-        ("support", "new", None),
-    ]
-
-
-@pytest.mark.parametrize("algorithm", ["dsa", "deepseek_v4"])
-@pytest.mark.parametrize("sm", [120, 121])
-def test_sparse_mla_rebuild_requires_packed_cache_dtype(algorithm: str, sm: int) -> None:
-    attn, manager = _make_manager()
-    attn.is_mla_enable = True
-    attn.kv_cache_dtype = "auto"
-    attn.sparse_params = SimpleNamespace(algorithm=algorithm)
-
-    with (
-        patch.object(fmha_manager, "get_sm_version", return_value=sm),
-        pytest.raises(
-            ValueError,
-            match=r"requires kv_cache_config\.dtype='fp8_ds_mla'",
-        ),
-    ):
-        manager.rebuild()
+    assert len(old_manager._cache) == 1
+    assert attn._fmha_manager is not old_manager
+    assert attn._fmha_manager._cache == {}
+    assert isinstance(attn._fmha_manager.fmha_libs[0], _NewFmha)
+    assert quant_states_during_construction == [True]
+    assert events == [("support", "old", None)]

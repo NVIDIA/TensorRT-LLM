@@ -306,10 +306,10 @@ The main differences across backends:
 
 Each `TrtllmAttention` owns a per-instance `FmhaManager`. The manager builds
 the ordered list of internal FMHA libraries, performs phase-aware selection,
-and caches request-dependent selections. Rebuilding the manager's libraries
-also invalidates its selection cache. The selected FMHA instances still belong
-to the `TrtllmAttention` owner, which prepares the complete per-forward state
-before asking the manager to select a library and then executing it.
+and caches request-dependent selections. `update_quant_config()` replaces the
+manager, rebuilding the library list and starting with an empty selection
+cache. `TrtllmAttention` prepares the complete per-forward state, passes itself
+to the manager for selection, and then executes the selected library.
 
 `TritonCustomMaskFmha` provides Triton context attention for custom masks,
 `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,

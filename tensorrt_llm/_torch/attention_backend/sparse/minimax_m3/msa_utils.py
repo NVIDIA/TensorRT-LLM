@@ -43,8 +43,8 @@ def msa_package_available() -> bool:
     """Prepare and report whether the packaged fmha_sm100 module can be imported.
 
     Cached: each call scans sys.path until fmha_sm100 is first imported, and
-    FmhaManager.rebuild checks once per attention layer. Whether the package
-    is installed cannot change within a process.
+    FmhaManager construction checks once per attention layer. Whether the
+    package is installed cannot change within a process.
     """
     if importlib.util.find_spec("fmha_sm100") is None:
         return False
