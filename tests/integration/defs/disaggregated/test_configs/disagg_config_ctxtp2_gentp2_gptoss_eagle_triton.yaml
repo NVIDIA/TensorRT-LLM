@@ -29,6 +29,7 @@ context_servers:
     backend: NIXL
     transceiver_runtime: PYTHON
     max_tokens_in_buffer: 16384
+    kv_cache_bounce_size_mb: 2048
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 4
@@ -67,3 +68,4 @@ generation_servers:
     backend: NIXL
     transceiver_runtime: PYTHON
     max_tokens_in_buffer: 16384
+    kv_cache_bounce_size_mb: 2048

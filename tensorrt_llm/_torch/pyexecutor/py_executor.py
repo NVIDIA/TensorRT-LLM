@@ -6845,6 +6845,14 @@ class PyExecutor:
             self._disagg_inflight_cancel_unsupported_logged = True
         return False
 
+    def _request_remote_kv_transfer_abort(self, request: LlmRequest) -> None:
+        """Best-effort abort request to the peer; failures are retried later."""
+        try:
+            self.kv_cache_transceiver.request_remote_abort(request)
+        except Exception as error:
+            logger.warning(f"KV transfer abort request failed for request "
+                           f"{request.py_request_id}: {error}")
+
     def _request_kv_transfer_cancellation(self, request: LlmRequest) -> bool:
         """Best-effort cancellation that leaves ownership intact on errors."""
         try:
@@ -6973,6 +6981,10 @@ class PyExecutor:
                     f"cache transfer timeout: elapsed {elapsed_time:.0f}ms > "
                     f"kv_transfer_timeout_ms={timeout_ms}ms")
                 req.py_kv_transfer_timed_out = True
+                if type == "generation":
+                    # Only the sender can end this transfer, and it may not know
+                    # the request exists. Ask it rather than decide locally.
+                    self._request_remote_kv_transfer_abort(req)
 
         # Context requests start their clock on the last chunk, which is also when
         # they enter the transfer manager, so this covers the whole context side.
@@ -7785,33 +7797,29 @@ class PyExecutor:
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
             self._end_transfer_and_maybe_terminate(request)
 
-        # The set of requests in transfer may have changed since we terminated some requests.
-        requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
-        )
+        # Otherwise observe-only, matching the C++ transceiver: this deadline
+        # spans the receiver's admission wait, so expiry does not mean the peer
+        # is gone. A receiver that gave up asks for the abort itself.
+        if self._is_disagg_inflight_cancel_active():
+            # The set of requests in transfer may have changed since we
+            # terminated some requests.
+            requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
+            )
 
-        for request_id in list(requests_in_transfer.keys()):
-            request = requests_in_transfer[request_id]
-            if (not request.py_kv_transfer_timed_out
-                    or request_id in completed_req_ids
-                    or request_id in self._disagg_timed_out_ctx_cancelled_ids):
-                continue
+            for request_id in list(requests_in_transfer.keys()):
+                request = requests_in_transfer[request_id]
+                if (not request.py_kv_transfer_timed_out
+                        or request_id in completed_req_ids or request_id
+                        in self._disagg_timed_out_ctx_cancelled_ids):
+                    continue
 
-            is_cancelled = self._request_kv_transfer_cancellation(request)
-            if not is_cancelled:
-                continue
+                if not self._request_kv_transfer_cancellation(request):
+                    continue
 
-            if self._is_disagg_inflight_cancel_active():
                 self._disagg_timed_out_ctx_cancelled_ids.add(request_id)
                 logger.warning(f"Cancelled timed-out context KV transfer for "
                                f"request {request.py_request_id}; waiting for "
                                "C++ transfer status to report final cleanup")
-            else:
-                # Preserve the legacy timeout behavior when in-flight
-                # cancellation is disabled: a queued transfer that can be
-                # cancelled is immediately released from the async manager.
-                request.py_kv_transfer_start_time = None
-                request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-                self._end_transfer_and_maybe_terminate(request)
 
         self._check_cache_transfer_errors("context requests")
 

@@ -1115,6 +1115,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"_try_schedule_disagg_gen_init."
             )
 
+    def request_remote_abort(self, req: LlmRequest) -> None:
+        """Ask the sender to abort; unlike cancel_request() nothing is given up
+        locally, since only the sender knows if a write is in flight."""
+        rid = get_unique_rid(req)
+        session = self._recv_sessions.get(rid)
+        if session is not None:
+            session.notify_senders_abort()
+
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 

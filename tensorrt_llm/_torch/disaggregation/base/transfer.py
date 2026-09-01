@@ -101,12 +101,23 @@ class SessionArgsBase:
     beam_width: int = 1
 
 
+def resolve_transfer_rid(params, fallback: Optional[int] = None) -> Optional[int]:
+    """The transfer key both sides of a request must agree on.
+
+    ``ctx_request_id`` first: an orchestrator retry regenerates
+    ``disagg_request_id`` for the generation request only, leaving it different
+    from the id the context session registered under.
+    """
+    if params is not None:
+        if params.ctx_request_id is not None:
+            return params.ctx_request_id
+        if params.disagg_request_id is not None:
+            return params.disagg_request_id
+    return fallback
+
+
 def get_unique_rid(request: LlmRequest) -> Optional[int]:
-    if request.py_disaggregated_params:
-        rid = request.py_disaggregated_params.disagg_request_id
-        if rid is not None:
-            return rid
-    return request.request_id
+    return resolve_transfer_rid(request.py_disaggregated_params, request.request_id)
 
 
 class SenderBase(ABC):
@@ -129,7 +140,7 @@ class _SessionBase(ABC):
 
     @property
     def disagg_request_id(self) -> int:
-        return cast(int, self._base_args.params.disagg_request_id)
+        return cast(int, resolve_transfer_rid(self._base_args.params))
 
     @abstractmethod
     def is_completed(self) -> bool: ...
