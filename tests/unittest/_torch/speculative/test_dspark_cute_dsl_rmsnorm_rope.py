@@ -7,11 +7,13 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not IS_CUTLASS_DSL_AVAILABLE or not is_sm_100f(),
-    reason="DSpark fused RMSNorm+RoPE requires an SM100-family CUDA GPU",
+    not torch.cuda.is_available()
+    or not IS_CUTLASS_DSL_AVAILABLE
+    or get_sm_version() not in (100, 103),
+    reason="DSpark fused RMSNorm+RoPE requires an SM100 or SM103 CUDA GPU",
 )
 
 
