@@ -44,7 +44,7 @@ def is_nanojet_available() -> bool:
         _AVAILABLE = True
         logger.info(f"nanojet is available: {nanojet_kernels.__version__}")
     except ImportError:
-        logger.warning("nanojet requested but not importable; nanojet passes will not apply")
+        logger.debug("nanojet is not importable; nanojet passes will not apply")
     except AttributeError:
         # Installed but without the integration contract: too old to drive from here.
         logger.warning(
@@ -64,15 +64,17 @@ def _register_compilation_passes() -> None:
 
 
 def initialize_nanojet(model_config: "ModelConfig") -> None:
-    """Validate NanoJet's checkpoint contract and initialize its Python ops."""
+    """Initialize NanoJet for a compatible checkpoint when it is available."""
     from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    if (model_config.get_quant_config().quant_algo != QuantAlgo.FP8
+            or not is_nanojet_available()):
+        return
 
     from .custom_ops.nanojet import register_nanojet_ops
 
-    if model_config.get_quant_config().quant_algo != QuantAlgo.FP8:
-        raise ValueError("NanoJet requires a prequantized per-tensor FP8 checkpoint")
     if not register_nanojet_ops():
-        raise RuntimeError("NanoJet requested, but nanojet_kernels is not importable")
+        return
     _register_compilation_passes()
     model_config.extra_attrs["nanojet_enabled"] = True
     ensure_tune_configs(model_config)

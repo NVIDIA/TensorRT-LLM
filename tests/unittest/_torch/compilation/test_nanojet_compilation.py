@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 from operator import getitem
 
 import torch
@@ -28,6 +29,14 @@ from tensorrt_llm._torch.compilation.patterns.nanojet import register_nanojet_fu
 from tensorrt_llm._torch.utils import model_extra_attrs
 
 aten = torch.ops.aten
+
+
+def test_nanojet_package_is_optional(monkeypatch) -> None:
+    monkeypatch.setattr(nanojet_utils, "_AVAILABLE", None)
+    monkeypatch.setattr(nanojet_utils, "_CONTRACT", None)
+    monkeypatch.setitem(sys.modules, "nanojet_kernels", None)
+
+    assert not nanojet_utils.is_nanojet_available()
 
 
 def _nanojet_pass(pass_name: str, monkeypatch):

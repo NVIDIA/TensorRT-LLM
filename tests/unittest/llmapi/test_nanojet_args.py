@@ -19,9 +19,7 @@ from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
 @pytest.mark.cpu_only
-def test_nanojet_environment_does_not_enable_torch_compile(monkeypatch) -> None:
-    monkeypatch.setenv("TLLM_ENABLE_NANOJET", "1")
-
+def test_nanojet_default_does_not_enable_torch_compile() -> None:
     args = TorchLlmArgs(model="/tmp/dummy_model")
 
     assert args.torch_compile_config is None

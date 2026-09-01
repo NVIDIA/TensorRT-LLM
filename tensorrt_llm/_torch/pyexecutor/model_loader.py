@@ -1559,7 +1559,7 @@ class ModelLoader:
             update_spec_config_from_model_config(self.spec_config,
                                                  config.pretrained_config)
         if (self.llm_args.torch_compile_config is not None
-                and os.environ.get("TLLM_ENABLE_NANOJET", "0") == "1"):
+                and os.environ.get("TLLM_DISABLE_NANOJET", "0") != "1"):
             from ..nanojet_utils import initialize_nanojet
 
             initialize_nanojet(config)
