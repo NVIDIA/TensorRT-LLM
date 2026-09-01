@@ -24,7 +24,9 @@
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -32,6 +34,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 namespace
 {
+
+constexpr size_t kCloseProgressInterval = 256;
 
 int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleId lifeCycle)
 {
@@ -562,10 +566,29 @@ void KvCache::close()
 {
     TLLM_CHECK_DEBUG(_checkSanity());
     if (mStatus == Status::CLOSED)
+    {
         return;
+    }
+
+    auto const closeStarted = std::chrono::steady_clock::now();
+    auto const elapsedMs = [&closeStarted]() -> long long
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - closeStarted)
+            .count();
+    };
+    TLLM_LOG_INFO(
+        "[KVCM V2 close C++] start: cache=%p, status=%d, commit_state=%d, capacity=%d, history_length=%d, "
+        "blocks=%zu, cuda_stream_set=%d",
+        static_cast<void*>(this), static_cast<int>(mStatus), static_cast<int>(mCommitState), mCapacity, mHistoryLength,
+        mBlocks.stdSize(), static_cast<int>(mCudaStream.has_value()));
 
     discardPendingStats();
+    TLLM_LOG_INFO(
+        "[KVCM V2 close C++] cache=%p pending stats discarded: elapsed_ms=%lld", static_cast<void*>(this), elapsedMs());
+    TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p stopCommitting start", static_cast<void*>(this));
     stopCommitting();
+    TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p stopCommitting complete: blocks=%zu, elapsed_ms=%lld",
+        static_cast<void*>(this), mBlocks.stdSize(), elapsedMs());
     TLLM_CHECK_DEBUG(_checkSanity());
 
     // Dummy/warmup caches are reserved at the model's full declared context, not at a realistic
@@ -580,15 +603,24 @@ void KvCache::close()
         mManager->incrementNumSampledKvCaches();
         mManager->tryUpdateTargetRatios();
     }
+    TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p statistics update complete: elapsed_ms=%lld", static_cast<void*>(this),
+        elapsedMs());
 
     // Record event scope — mirrors Python's `with self._record_event()`.
     // Python always enters _record_event() here; _cuda_stream is valid for both ACTIVE and SUSPENDED.
+    TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p CUDA finish-event scope creation start", static_cast<void*>(this));
     {
         auto scope = recordEventScope();
+        TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p CUDA finish-event scope creation complete: elapsed_ms=%lld",
+            static_cast<void*>(this), elapsedMs());
         _clearBlocks();
     }
+    TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p block cleanup scope complete: elapsed_ms=%lld",
+        static_cast<void*>(this), elapsedMs());
     mStatus = Status::CLOSED;
+    TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p manager unregister start", static_cast<void*>(this));
     mManager->unregisterKvCache(this);
+    TLLM_LOG_INFO("[KVCM V2 close C++] complete: cache=%p, elapsed_ms=%lld", static_cast<void*>(this), elapsedMs());
 }
 
 KVCacheStatsDelta KvCache::commitPendingStats()
@@ -785,16 +817,40 @@ bool KvCache::_hasReuseSource(BlockPage const& page)
 
 void KvCache::_clearBlocks()
 {
+    size_t const initialBlocks = mBlocks.stdSize();
+    TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p block release start: blocks=%zu, tokens_per_block=%d",
+        static_cast<void*>(this), initialBlocks, mTokensPerBlock);
     // Drop last block first (mirrors Python: while self._blocks: self._blocks.pop()).
+    size_t releasedBlocks = 0;
     while (!mBlocks.empty())
+    {
+        if (releasedBlocks == 0 || releasedBlocks % kCloseProgressInterval == 0)
+        {
+            TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p block release progress before pop: released=%zu, remaining=%zu",
+                static_cast<void*>(this), releasedBlocks, mBlocks.stdSize());
+        }
         mBlocks.pop_back();
+        ++releasedBlocks;
+        if (releasedBlocks == 1)
+        {
+            TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p first block released: remaining=%zu", static_cast<void*>(this),
+                mBlocks.stdSize());
+        }
+    }
+    TLLM_LOG_INFO(
+        "[KVCM V2 close C++] cache=%p block release complete: released=%zu", static_cast<void*>(this), releasedBlocks);
     _freeScratchSlots();
     // Clear SSM blocks.
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     if (ssmLcId.has_value())
     {
+        TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p SSM block release start: beams=%zu", static_cast<void*>(this),
+            mSsmBlocks.stdSize());
         for (auto& beamBlock : mSsmBlocks)
+        {
             beamBlock[*ssmLcId] = std::monostate{};
+        }
+        TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p SSM block release complete", static_cast<void*>(this));
     }
 }
 
@@ -1862,12 +1918,15 @@ void KvCache::stopCommitting()
 {
     TLLM_CHECK_DEBUG(mStatus != Status::CLOSED);
     if (mCommitState == CommitState::USER_STOP)
+    {
         return;
+    }
     TLLM_CHECK_DEBUG(_checkSanity());
 
     // Mirrors Python's stop_committing() which calls _commit_block(ordinal, True).
     if (mCommitState == CommitState::VIRTUAL_STOP)
     {
+        TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p stopCommitting virtual-stop transition", static_cast<void*>(this));
         mCommitState = CommitState::USER_STOP;
         return;
     }
@@ -1877,15 +1936,21 @@ void KvCache::stopCommitting()
     int tokensLeft = static_cast<int>(mCommittedTokens.size()) - mNumCommittedBlocks * mTokensPerBlock;
     if (tokensLeft > 0)
     {
+        TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p final partial-block commit start: tokens_left=%d",
+            static_cast<void*>(this), tokensLeft);
         TLLM_CHECK_DEBUG(BlockOrdinal{mNumCommittedBlocks} < mBlocks.size());
         auto scope = recordEventScope();
+        TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p final partial-block event scope created", static_cast<void*>(this));
         // isLast=true: _commitBlock handles USER_STOP + _onStopCommitting() internally.
         _commitBlock(mNumCommittedBlocks, /*isLast=*/true);
+        TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p final partial-block commit complete", static_cast<void*>(this));
     }
     else
     {
         mCommitState = CommitState::USER_STOP;
+        TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p onStopCommitting start", static_cast<void*>(this));
         _onStopCommitting();
+        TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p onStopCommitting complete", static_cast<void*>(this));
     }
     TLLM_CHECK_DEBUG(mCommitState == CommitState::USER_STOP);
 }
@@ -2661,12 +2726,42 @@ void KvCache::_recoverExcessScratchSlots(TypedVec<LifeCycleId, std::vector<Scrat
 
 void KvCache::_freeScratchSlots()
 {
-    for (auto& lcSlots : mScratchSlots)
+    size_t totalSlots = 0;
+    for (auto const& lcSlots : mScratchSlots)
     {
-        for (auto& lock : lcSlots)
-            lock.unlock();
-        lcSlots.clear();
+        totalSlots += lcSlots.size();
     }
+    TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p scratch release start: life_cycles=%zu, slots=%zu",
+        static_cast<void*>(this), mScratchSlots.stdSize(), totalSlots);
+    for (LifeCycleId lcId{0}; lcId < mScratchSlots.size(); ++lcId)
+    {
+        auto& lcSlots = mScratchSlots[lcId];
+        size_t const lifeCycleSlots = lcSlots.size();
+        if (lifeCycleSlots > 0)
+        {
+            TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p scratch life_cycle=%d release start: slots=%zu",
+                static_cast<void*>(this), lcId.value(), lifeCycleSlots);
+        }
+        size_t releasedSlots = 0;
+        for (auto& lock : lcSlots)
+        {
+            if (releasedSlots > 0 && releasedSlots % kCloseProgressInterval == 0)
+            {
+                TLLM_LOG_INFO(
+                    "[KVCM V2 close C++] cache=%p scratch progress: life_cycle=%d, released=%zu, remaining=%zu",
+                    static_cast<void*>(this), lcId.value(), releasedSlots, lifeCycleSlots - releasedSlots);
+            }
+            lock.unlock();
+            ++releasedSlots;
+        }
+        lcSlots.clear();
+        if (lifeCycleSlots > 0)
+        {
+            TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p scratch life_cycle=%d release complete",
+                static_cast<void*>(this), lcId.value());
+        }
+    }
+    TLLM_LOG_INFO("[KVCM V2 close C++] cache=%p scratch release complete", static_cast<void*>(this));
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
