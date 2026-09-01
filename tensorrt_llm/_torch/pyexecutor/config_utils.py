@@ -162,16 +162,14 @@ def get_layer_attention_window(
 
 
 def is_gemma4_hybrid(config: transformers.PretrainedConfig) -> bool:
-    """True for Gemma4 models with hybrid attention (different head_dim per layer type)."""
+    """True when Gemma4 requires per-layer attention geometry."""
     model_type = str(getattr(config, "model_type", "")).lower()
     if model_type not in _GEMMA4_TEXT_MODEL_TYPES:
         return False
 
     per_layer_attributes = getattr(config, "per_layer_attributes", None)
-    if per_layer_attributes is not None and "head_dim" in per_layer_attributes:
-        per_layer_config = config.per_layer_config
-        head_dims = {layer_config.head_dim for layer_config in per_layer_config}
-        return len(head_dims) > 1
+    if per_layer_attributes is not None:
+        return bool({"head_dim", "num_key_value_heads"} & per_layer_attributes)
 
     global_head_dim = getattr(config, 'global_head_dim', None)
     head_dim = getattr(config, 'head_dim', None)

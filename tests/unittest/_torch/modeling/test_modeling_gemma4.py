@@ -1078,24 +1078,12 @@ def _build_gemma4_kv_cache_manager(
         kv_dtype = tensorrt_llm.bindings.DataType.BF16
 
     layer_types = config.layer_types
-    attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
-    head_dim_per_layer = []
-    num_kv_heads_per_layer = []
-    for lt in layer_types:
-        is_sliding = lt == "sliding_attention"
-        use_k_eq_v = attention_k_eq_v and not is_sliding
-        if is_sliding:
-            head_dim_per_layer.append(config.head_dim)
-            num_kv_heads_per_layer.append(config.num_key_value_heads)
-        else:
-            head_dim_per_layer.append(getattr(config, "global_head_dim", config.head_dim))
-            if use_k_eq_v:
-                num_kv_heads_per_layer.append(
-                    getattr(config, "num_global_key_value_heads", None)
-                    or config.num_key_value_heads
-                )
-            else:
-                num_kv_heads_per_layer.append(config.num_key_value_heads)
+    head_dim_per_layer = [
+        get_gemma4_layer_head_dim(config, layer_idx) for layer_idx in range(len(layer_types))
+    ]
+    num_kv_heads_per_layer = [
+        get_gemma4_layer_num_kv_heads(config, layer_idx) for layer_idx in range(len(layer_types))
+    ]
 
     # Use scalar if all layers have same value
     head_dim = head_dim_per_layer if len(set(head_dim_per_layer)) > 1 else head_dim_per_layer[0]
