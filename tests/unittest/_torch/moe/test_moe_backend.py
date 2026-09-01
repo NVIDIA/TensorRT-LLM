@@ -39,8 +39,11 @@ from _torch.moe.moe_test_utils import (
 from _torch.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
 
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
+from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
@@ -237,10 +240,13 @@ def create_test_backend(
     swiglu_limit: Optional[torch.Tensor] = None,
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     activation_type: ActivationType = ActivationType.Swiglu,
+    locality_domain_policy: Optional[LocalityDomainPolicy] = None,
     n_shared_experts: int = 0,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
+    if locality_domain_policy is None:
+        locality_domain_policy = LocalityDomainPolicy(enabled=False)
 
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = num_experts
@@ -264,6 +270,7 @@ def create_test_backend(
         quant_config=quant_config,
         mapping=mapping,
         moe_backend=moe_backend_value,
+        locality_domain_policy=locality_domain_policy,
     )
     if n_shared_experts > 0:
         # The shared-expert-fusion gate runs after the eager create_weights()
@@ -1173,6 +1180,73 @@ CI_SWIGLU_COMBOS = [
 SWIGLU_COMBOS = CI_SWIGLU_COMBOS if IS_CI_MODE else LOCAL_SWIGLU_COMBOS
 
 
+def should_skip_locality_domain_param(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo],
+    activation_type: ActivationType,
+    swiglu_gptoss_style: bool,
+) -> Optional[str]:
+    """Return a static skip reason for locality domain MoE backend params."""
+    if backend_type != MoeBackendType.CUTEDSL:
+        return "locality domain MoE backend test only supports CuteDSL"
+    if quant_algo not in (QuantAlgo.NVFP4, None):
+        return "locality domain MoE backend test only supports NVFP4 or BF16"
+    if activation_type != ActivationType.Swiglu:
+        return "locality domain MoE backend test only supports SwiGLU"
+    if swiglu_gptoss_style:
+        return "locality domain MoE backend test does not cover GPT-OSS SwiGLU style"
+    return None
+
+
+def should_skip_locality_domain_runtime(enable_locality_domains: bool) -> Optional[str]:
+    """Return a runtime skip reason for locality domain MoE backend params."""
+    if not enable_locality_domains:
+        return None
+    if not torch.cuda.is_available():
+        return "CUDA is not available"
+    sm_version = get_sm_version()
+    if sm_version != 107:
+        return f"Rubin (SM 107) required, got SM {sm_version}"
+    if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        return "public CuteDSL Rubin kernels are not available"
+    is_locality_domain_enabled.cache_clear()
+    if not is_locality_domain_enabled():
+        return "locality domain is not enabled/supported on this system"
+    return None
+
+
+def test_ci_acceleration_keeps_only_locality_domain_cutedsl_bf16(monkeypatch: pytest.MonkeyPatch):
+    from _torch.moe import moe_test_utils
+
+    monkeypatch.setattr(moe_test_utils, "IS_CI_MODE", True)
+    model_config = MoeModelConfig(60, 4, 2048, 1408)
+    common_kwargs = {
+        "backend_type": MoeBackendType.CUTEDSL,
+        "quant_algo": None,
+        "model_config": model_config,
+        "routing_method_cls": RenormalizeMoeRoutingMethod,
+        "activation_type": ActivationType.Swiglu,
+    }
+
+    assert should_skip_to_accelerate_ci(dtype=torch.bfloat16, **common_kwargs) is not None
+    assert (
+        should_skip_to_accelerate_ci(
+            dtype=torch.bfloat16,
+            enable_locality_domains=True,
+            **common_kwargs,
+        )
+        is None
+    )
+    assert (
+        should_skip_to_accelerate_ci(
+            dtype=torch.float16,
+            enable_locality_domains=True,
+            **common_kwargs,
+        )
+        is not None
+    )
+
+
 def generate_test_params() -> List:
     """
     Generate test parameter combinations, filtering out unsupported configurations.
@@ -1217,8 +1291,40 @@ def generate_test_params() -> List:
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            False,
         )
         params.append(create_test_param(param_values, test_id))
+
+        if quant_algo in (QuantAlgo.NVFP4, None):
+            swiglu_gptoss_style = (
+                swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+            )
+            locality_domain_skip_reason = should_skip_locality_domain_param(
+                backend_type,
+                quant_algo,
+                ActivationType.Swiglu,
+                swiglu_gptoss_style,
+            )
+            locality_domain_param_values = (
+                dtype,
+                backend_type,
+                quant_algo,
+                seq_len,
+                model_config,
+                routing_method_cls,
+                ActivationType.Swiglu,
+                swiglu_alpha,
+                swiglu_beta,
+                swiglu_limit,
+                True,
+            )
+            params.append(
+                create_test_param(
+                    locality_domain_param_values,
+                    f"locality_domain=enabled-{test_id}",
+                    locality_domain_skip_reason,
+                )
+            )
 
     return params
 
@@ -1271,6 +1377,7 @@ def generate_element_wise_test_params() -> List:
                 None,
                 None,
                 None,
+                False,
             )
             params.append(create_test_param(param_values, test_id))
     return params
@@ -1340,7 +1447,8 @@ TEST_PARAMS += generate_element_wise_test_params()
 # =============================================================================
 @pytest.mark.parametrize(
     "dtype_activation,backend_type,quant_algo,seq_len,model_config,"
-    "routing_method_cls,activation_type,swiglu_alpha,swiglu_beta,swiglu_limit",
+    "routing_method_cls,activation_type,swiglu_alpha,swiglu_beta,swiglu_limit,"
+    "enable_locality_domains",
     TEST_PARAMS,
 )
 def test_moe_backend(
@@ -1355,6 +1463,8 @@ def test_moe_backend(
     swiglu_beta: Optional[float],
     swiglu_limit: Optional[float],
     monkeypatch: pytest.MonkeyPatch,
+    enable_locality_domains: bool,
+    tmp_path,
 ):
     """
     Test MoE backend with autotune to capture all tactics.
@@ -1381,6 +1491,11 @@ def test_moe_backend(
         # Default values: alpha=1, beta=0, limit=inf
         swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
 
+    locality_domain_runtime_skip = should_skip_locality_domain_runtime(enable_locality_domains)
+    if locality_domain_runtime_skip:
+        pytest.skip(locality_domain_runtime_skip)
+    locality_domain_policy = LocalityDomainPolicy(enabled=enable_locality_domains)
+
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=backend_type,
         quant_algo=quant_algo,
@@ -1390,6 +1505,7 @@ def test_moe_backend(
         seq_len=seq_len,
         swiglu_gptoss_style=swiglu_gptoss_style,
         activation_type=activation_type,
+        enable_locality_domains=enable_locality_domains,
     )
     if ci_skip:
         pytest.skip(ci_skip)
@@ -1472,6 +1588,7 @@ def test_moe_backend(
             swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
             weight_loading_mode=weight_loading_mode,
             activation_type=activation_type,
+            locality_domain_policy=locality_domain_policy,
         )
 
         # W4A8_MXFP4_MXFP8 / W4A8_MXFP4_FP8 require backend-layout-aware
@@ -1492,6 +1609,9 @@ def test_moe_backend(
         backend.load_weights([weights])
         backend.post_load_weights()
         backend.cuda()
+        if enable_locality_domains:
+            assert backend._locality_domain_runtime is not None
+            assert backend._locality_domain_weight_shards is not None
 
         # Create reference
         if ref_cls is not None:
@@ -1505,6 +1625,8 @@ def test_moe_backend(
 
         # Clear autotuner cache before autotune phase
         AutoTuner.get().clear_cache()
+        if enable_locality_domains:
+            AutoTuner.get().reset_statistics()
 
         # Get reference output first
         with torch.inference_mode():
@@ -1533,8 +1655,26 @@ def test_moe_backend(
 
         # Autotune phase: tune kernels to find best tactics
         # Use cache_path to speed up subsequent runs by reusing tuning results
-        with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
+        cache_path = (
+            str(tmp_path / "moe_autotuner_cache.json")
+            if enable_locality_domains
+            else "/tmp/moe_autotuner_cache.json"
+        )
+        with torch.inference_mode(), autotune(cache_path=cache_path):
             _ = run_moe()
+        if enable_locality_domains:
+            quant_name = "nvfp4" if quant_algo == QuantAlgo.NVFP4 else "bf16"
+            expected_tuning_ops = (
+                f"CuteDslFusedMoE::run_moe_{quant_name}::locality_domain_end_to_end",
+                f"trtllm::cute_dsl_{quant_name}_gather_grouped_gemm_"
+                f"{'act_fusion' if quant_algo == QuantAlgo.NVFP4 else 'swiglu'}"
+                "_rubin::locality_domain_concurrent",
+                f"trtllm::cute_dsl_{quant_name}_grouped_gemm_finalize_"
+                "inplace_rubin::locality_domain_concurrent",
+            )
+            for op_name in expected_tuning_ops:
+                assert autotuner.stats.tuned_op_profiled_configs.get(op_name, 0) > 0
+                assert not autotuner.stats.failed_profiling_count.get(op_name, set())
 
         # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
         use_flashinfer = getattr(backend, "use_flashinfer", False)
@@ -1544,6 +1684,40 @@ def test_moe_backend(
             # Capture phase: record which tactics are used (requires actual execution)
             with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
                 _ = run_moe()
+
+            # Replaying every outer tile is deliberately exhaustive and would
+            # multiply the inner FC tactic replay for every matrix member. One
+            # representative production shape per locality domain path covers that
+            # outer-tile contract; all matrix members still validate their
+            # tuned/failed statistics and replay the tactics selected for their
+            # own shape below.
+            representative_outer_tile_replay = (
+                enable_locality_domains
+                and quant_algo in (QuantAlgo.NVFP4, None)
+                and seq_len == 1
+                and (num_experts, top_k, hidden_size, intermediate_size) == (60, 4, 2048, 1408)
+            )
+            if representative_outer_tile_replay:
+                # The regular Cartesian replay contains inner FC tactics only
+                # for the selected outer tile. Exercise every outer tile
+                # directly after tuning, when all corresponding FC caches have
+                # been prepared, so a non-winning tile cannot silently regress.
+                outer_context = all_tactics._captured_contexts[0]
+                outer_runner = outer_context["runners"][0]
+                outer_tactics = outer_runner.get_valid_tactics(
+                    outer_context["inputs"], OptimizationProfile()
+                )
+                expected_outer_tactics = (
+                    {128, 256, 512} if quant_algo == QuantAlgo.NVFP4 else {64, 128, 256}
+                )
+                assert set(outer_tactics) == expected_outer_tactics
+                for outer_tactic in outer_tactics:
+                    # Direct runner replay reuses the captured inplace output;
+                    # reset it to the fresh-output baseline used by run_moe().
+                    with torch.inference_mode():
+                        outer_context["inputs"][-1].zero_()
+                        output = outer_runner(outer_context["inputs"], tactic=outer_tactic)
+                    ref_fused_moe.check_accuracy(output, ref_output)
 
             # Replay phase: test each tactic for correctness
             # Set fail_fast=True to stop on first failure, False to run all and report summary
