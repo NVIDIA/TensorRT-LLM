@@ -276,7 +276,7 @@ methods:
         default: null
         status: prototype
       kv_cache_compression_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig, NoneType]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.ColdPageQuantizationCompressionConfig, tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig, NoneType]
         default: null
         status: prototype
       otlp_traces_endpoint:
