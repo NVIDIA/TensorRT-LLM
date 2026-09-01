@@ -61,10 +61,10 @@ GB = 1 << 30
 
 class _PrefixReuseDiagnostics(Protocol):
 
-    def _get_num_tokens_before_hybrid_pruning(self) -> int:
+    def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int:
         ...
 
-    def _get_num_tokens_before_pruning(self) -> int:
+    def _get_num_reusable_tokens_before_pruning(self) -> int:
         ...
 
 
@@ -3230,9 +3230,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"request_id={request_id} "
                 f"request_total_tokens={request_total_tokens} "
                 f"longest_attention_match_tokens="
-                f"{prefix_reuse_diagnostics._get_num_tokens_before_hybrid_pruning()} "
+                f"{prefix_reuse_diagnostics._get_num_reusable_tokens_before_hybrid_pruning()} "
                 f"content_divergence_tokens="
-                f"{prefix_reuse_diagnostics._get_num_tokens_before_pruning()} "
+                f"{prefix_reuse_diagnostics._get_num_reusable_tokens_before_pruning()} "
                 f"latest_recurrent_snapshot_tokens="
                 f"{kv_cache.num_committed_tokens}")
         return kv_cache
@@ -3268,8 +3268,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
 
         diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
-        hybrid_depth = diagnostics._get_num_tokens_before_hybrid_pruning()
-        divergence = diagnostics._get_num_tokens_before_pruning()
+        hybrid_depth = diagnostics._get_num_reusable_tokens_before_hybrid_pruning(
+        )
+        divergence = diagnostics._get_num_reusable_tokens_before_pruning()
         reused = kv_cache.num_committed_tokens
         # Loss attributable to a missing recurrent snapshot, versus loss
         # attributable to attention pages having been evicted. These call for

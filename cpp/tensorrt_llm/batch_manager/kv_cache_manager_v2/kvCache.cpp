@@ -64,8 +64,9 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     , mHistoryLength(0)
     , mExpectedPromptLength(
           expectedPromptLength.has_value() ? std::optional<int>{std::max(*expectedPromptLength, 0)} : std::nullopt)
-    , mNumTokensBeforeHybridPruning(reuseMatch.has_value() ? reuseMatch->numTokensBeforeHybridPruning : 0)
-    , mNumTokensBeforePruning(reuseMatch.has_value() ? reuseMatch->numTokensBeforePruning : 0)
+    , mNumReusableTokensBeforeHybridPruning(
+          reuseMatch.has_value() ? reuseMatch->numReusableTokensBeforeHybridPruning : 0)
+    , mNumReusableTokensBeforePruning(reuseMatch.has_value() ? reuseMatch->numReusableTokensBeforePruning : 0)
     , mEnableRequestStats(enableRequestStats)
     , mNumCommittedBlocks(0)
     , mTokensPerBlock(manager.tokensPerBlock())

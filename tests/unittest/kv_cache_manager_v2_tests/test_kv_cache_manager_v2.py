@@ -2680,7 +2680,9 @@ class TestSSMSupport(unittest.TestCase):
         kv4.resume(stream)
         kv4.close()
 
-    def test_num_tokens_before_hybrid_pruning_isolates_recurrent_truncation(self) -> None:
+    def test_num_reusable_tokens_before_hybrid_pruning_isolates_recurrent_truncation(
+        self,
+    ) -> None:
         """The diagnostic separates a short attention match from recurrent pruning.
 
         Partial reuse is required for the two numbers to differ at all: without
@@ -2707,7 +2709,7 @@ class TestSSMSupport(unittest.TestCase):
         # attention match, is what cut the reuse.
         kv = self.manager.create_kv_cache(input_tokens=prompt[:48])
         self.assertEqual(kv.num_committed_tokens, 32)
-        self.assertEqual(kv._get_num_tokens_before_hybrid_pruning(), 48)
+        self.assertEqual(kv._get_num_reusable_tokens_before_hybrid_pruning(), 48)
         kv.resume(stream)
         kv.close()
 
@@ -2715,7 +2717,7 @@ class TestSSMSupport(unittest.TestCase):
         # collapse onto num_committed_tokens rather than reporting the lookup.
         kv = self.manager.create_kv_cache(input_tokens=prompt[:64])
         self.assertEqual(kv.num_committed_tokens, 64)
-        self.assertEqual(kv._get_num_tokens_before_hybrid_pruning(), 64)
+        self.assertEqual(kv._get_num_reusable_tokens_before_hybrid_pruning(), 64)
         kv.resume(stream)
         kv.close()
 
@@ -2738,8 +2740,8 @@ class TestSSMSupport(unittest.TestCase):
         # Duplicate lookup: the whole range matched, so there is no fork and the
         # divergence depth saturates at the lookup length.
         duplicate = self.manager.create_kv_cache(input_tokens=prompt[:64])
-        self.assertEqual(duplicate._get_num_tokens_before_pruning(), 64)
-        self.assertEqual(duplicate._get_num_tokens_before_hybrid_pruning(), 64)
+        self.assertEqual(duplicate._get_num_reusable_tokens_before_pruning(), 64)
+        self.assertEqual(duplicate._get_num_reusable_tokens_before_hybrid_pruning(), 64)
         duplicate.resume(stream)
         duplicate.close()
 
@@ -2747,16 +2749,16 @@ class TestSSMSupport(unittest.TestCase):
         # divergence depth stays below the lookup length.
         sibling = prompt[:64] + [self.next_token() for _ in range(32)]
         forked = self.manager.create_kv_cache(input_tokens=sibling)
-        self.assertEqual(forked._get_num_tokens_before_pruning(), 64)
-        self.assertLess(forked._get_num_tokens_before_pruning(), len(sibling))
+        self.assertEqual(forked._get_num_reusable_tokens_before_pruning(), 64)
+        self.assertLess(forked._get_num_reusable_tokens_before_pruning(), len(sibling))
         forked.resume(stream)
         forked.close()
 
         # Snapshot pruning shortens reuse to the last usable SSM snapshot, but
         # leaves the divergence depth untouched: attention matched all 48.
         partial = self.manager.create_kv_cache(input_tokens=prompt[:48])
-        self.assertEqual(partial._get_num_tokens_before_pruning(), 48)
-        self.assertEqual(partial._get_num_tokens_before_hybrid_pruning(), 48)
+        self.assertEqual(partial._get_num_reusable_tokens_before_pruning(), 48)
+        self.assertEqual(partial._get_num_reusable_tokens_before_hybrid_pruning(), 48)
         self.assertEqual(partial.num_committed_tokens, 32)
         partial.resume(stream)
         partial.close()
@@ -2778,8 +2780,8 @@ class TestSSMSupport(unittest.TestCase):
 
         for lookup_len in (16, 32, 48, 64, 80, 96, 112, 128):
             kv = self.manager.create_kv_cache(input_tokens=prompt[:lookup_len])
-            divergence = kv._get_num_tokens_before_pruning()
-            hybrid = kv._get_num_tokens_before_hybrid_pruning()
+            divergence = kv._get_num_reusable_tokens_before_pruning()
+            hybrid = kv._get_num_reusable_tokens_before_hybrid_pruning()
             self.assertLessEqual(kv.num_committed_tokens, hybrid, msg=f"len={lookup_len}")
             self.assertLessEqual(hybrid, divergence, msg=f"len={lookup_len}")
             self.assertLessEqual(divergence, lookup_len, msg=f"len={lookup_len}")
@@ -2814,15 +2816,15 @@ class TestSSMSupport(unittest.TestCase):
         # A sibling locates the fork at 64 but reuses nothing: the sole snapshot
         # is at 96, past the point where the content diverges.
         probe = self.manager.create_kv_cache(input_tokens=r3_prompt)
-        self.assertEqual(probe._get_num_tokens_before_pruning(), 64)
-        self.assertEqual(probe._get_num_tokens_before_hybrid_pruning(), 64)
+        self.assertEqual(probe._get_num_reusable_tokens_before_pruning(), 64)
+        self.assertEqual(probe._get_num_reusable_tokens_before_hybrid_pruning(), 64)
         self.assertEqual(probe.num_committed_tokens, 0)
         probe.resume(stream)
         probe.close()
 
         # R2 diverges at the same depth and snapshots there before continuing.
         kv2 = self.manager.create_kv_cache(input_tokens=r2_prompt)
-        self.assertEqual(kv2._get_num_tokens_before_pruning(), 64)
+        self.assertEqual(kv2._get_num_reusable_tokens_before_pruning(), 64)
         kv2.resume(stream)
         kv2.capacity = 64
         kv2.commit(r2_prompt[:64])
@@ -2852,7 +2854,7 @@ class TestSSMSupport(unittest.TestCase):
 
         unrelated = [self.next_token() for _ in range(64)]
         kv2 = self.manager.create_kv_cache(input_tokens=unrelated)
-        self.assertEqual(kv2._get_num_tokens_before_pruning(), 0)
+        self.assertEqual(kv2._get_num_reusable_tokens_before_pruning(), 0)
         self.assertEqual(kv2.num_committed_tokens, 0)
         kv2.resume(stream)
         kv2.close()
