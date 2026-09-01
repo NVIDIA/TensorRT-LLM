@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import pickle
 from collections.abc import Callable, Mapping
 
 import numpy as np
@@ -220,7 +221,10 @@ def load_logits_post_processors(
                 f"of the form 'module.path:attribute', got {spec!r}")
         try:
             obj = importlib.import_module(module_name)
-        except ImportError as e:
+        except Exception as e:
+            # not just ImportError: a module may raise anything at import
+            # time (config errors, missing GPU, ...) and it should surface
+            # as a clear model-load error naming the processor
             raise pb_utils.TritonModelException(
                 f"logits_post_processors['{name}']: cannot import module "
                 f"'{module_name}': {e}") from e
@@ -232,12 +236,29 @@ def load_logits_post_processors(
                     f"logits_post_processors['{name}']: module "
                     f"'{module_name}' has no attribute '{attr_path}'") from e
         if isinstance(obj, type):
-            obj = obj()
+            try:
+                obj = obj()
+            except Exception as e:
+                raise pb_utils.TritonModelException(
+                    f"logits_post_processors['{name}']: failed to "
+                    f"instantiate '{spec}' with no arguments: {e}. "
+                    f"Processors that need constructor arguments should be "
+                    f"exported as a module-level instance instead.") from e
         if not callable(obj):
             raise pb_utils.TritonModelException(
                 f"logits_post_processors['{name}']: '{spec}' resolved to a "
                 f"non-callable {type(obj).__name__}; expected a "
                 f"LogitsProcessor instance or class")
+        try:
+            pickle.dumps(obj)
+        except Exception as e:
+            # SamplingParams (and the processor with it) may be pickled to
+            # the executor worker per request; fail at model load with a
+            # clear message instead of on the first request
+            raise pb_utils.TritonModelException(
+                f"logits_post_processors['{name}']: processor is not "
+                f"picklable ({e}). Processors are serialized to the "
+                f"executor worker per request and must be picklable.") from e
         processors[name] = obj
     return processors
 

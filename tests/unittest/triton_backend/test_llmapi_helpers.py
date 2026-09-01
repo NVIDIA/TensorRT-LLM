@@ -101,6 +101,17 @@ class FakeProcessor:
 _FAKE_MODULE_NAME = "_llmapi_helpers_test_processors"
 
 
+class NeedsArgsProcessor:
+    """A processor class that cannot be instantiated without arguments."""
+
+    def __init__(self, bias_table: object) -> None:
+        self.bias_table = bias_table
+
+    def __call__(self, req_id: object, logits: object, ids: object,
+                 stream_ptr: object, client_id: object) -> None:
+        return None
+
+
 @pytest.fixture(autouse=True)
 def fake_processor_module() -> Iterator[types.ModuleType]:
     module = types.ModuleType(_FAKE_MODULE_NAME)
@@ -108,6 +119,10 @@ def fake_processor_module() -> Iterator[types.ModuleType]:
     module.processor_instance = FakeProcessor()
     module.nested = types.SimpleNamespace(processor=FakeProcessor())
     module.not_callable = object()
+    module.NeedsArgsProcessor = NeedsArgsProcessor
+    unpicklable = FakeProcessor()
+    unpicklable.hook = lambda logits: logits  # lambdas cannot be pickled
+    module.unpicklable_instance = unpicklable
     sys.modules[_FAKE_MODULE_NAME] = module
     yield module
     del sys.modules[_FAKE_MODULE_NAME]
@@ -161,11 +176,32 @@ def test_load_logits_post_processors_class_and_instance() -> None:
         ({
             "p": f"{_FAKE_MODULE_NAME}:not_callable"
         }, "non-callable"),
+        ({
+            "p": f"{_FAKE_MODULE_NAME}:NeedsArgsProcessor"
+        }, "failed to instantiate"),
+        ({
+            "p": f"{_FAKE_MODULE_NAME}:unpicklable_instance"
+        }, "not picklable"),
     ],
 )
 def test_load_logits_post_processors_errors(specs: object, match: str) -> None:
     with pytest.raises(_TritonModelException, match=match):
         helpers.load_logits_post_processors(specs)
+
+
+def test_load_logits_post_processors_wraps_non_import_errors(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A module that raises something other than ImportError at import time
+    (config error, missing GPU, ...) must still surface as a
+    TritonModelException naming the processor."""
+
+    def _boom(_module_name: str) -> types.ModuleType:
+        raise RuntimeError("module import side effect failed")
+
+    monkeypatch.setattr(helpers, "importlib",
+                        types.SimpleNamespace(import_module=_boom))
+    with pytest.raises(_TritonModelException, match="cannot import"):
+        helpers.load_logits_post_processors({"p": "whatever:attr"})
 
 
 def _name_request(name: bytes) -> _StubRequest:

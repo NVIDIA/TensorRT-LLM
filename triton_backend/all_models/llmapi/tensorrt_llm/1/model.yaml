@@ -16,6 +16,14 @@ pipeline_parallel_size: 1
 # instantiated once, with no arguments, at model load). The referenced module
 # must be importable on the Triton server (e.g. installed or on PYTHONPATH).
 #
+# Lifetime and serialization contract: the single instance is shared by all
+# concurrent requests, and depending on executor mode it is pickled to the
+# executor worker per request together with SamplingParams. Processors must
+# therefore be picklable and stateless across requests (state mutated inside
+# __call__ does not persist or propagate back), and large payloads (e.g. a
+# full-vocab bias tensor) pay that serialization cost on every request.
+# Picklability is checked once at model load.
+#
 # logits_post_processors:
 #   ban_bad_words: my_company.processors:BadWordsBanner
 #   json_only: my_company.processors:json_guard
