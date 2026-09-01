@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
