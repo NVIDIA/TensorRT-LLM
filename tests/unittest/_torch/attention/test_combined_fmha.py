@@ -306,6 +306,7 @@ def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
     assert not fmha._use_fp8_context_fmha(output, AttentionInputType.generation_only)
 
 
+@pytest.mark.parametrize("is_fused_qkv", [True, False], ids=["fused_qkv", "q_only"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("sm_version", [100, 103])
 @pytest.mark.parametrize("tokens_per_block", [32, 64])
@@ -316,6 +317,7 @@ def test_flashinfer_context_fallback_scope(
     sm_version: int,
     tokens_per_block: int,
     num_contexts: int,
+    is_fused_qkv: bool,
 ) -> None:
     monkeypatch.setattr(
         "tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen.get_sm_version",
@@ -323,7 +325,6 @@ def test_flashinfer_context_fallback_scope(
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = 2
-    q = torch.empty((num_contexts, 64), dtype=dtype)
     attn = SimpleNamespace(
         is_mla_enable=False,
         sparse_params=None,
@@ -332,6 +333,14 @@ def test_flashinfer_context_fallback_scope(
         num_heads=1,
         num_kv_heads=1,
     )
+    q_hidden_size = attn.num_heads * attn.head_dim
+    # Both layouts the trtllm-gen self-attention path accepts, wired the way
+    # TrtllmAttention.forward wires them: fused QKV carries K/V inline and writes
+    # the cache, while a Q-only input only reads an already-populated cache.
+    input_hidden_size = q_hidden_size
+    if is_fused_qkv:
+        input_hidden_size += 2 * attn.num_kv_heads * attn.head_dim
+    q = torch.empty((num_contexts, input_hidden_size), dtype=dtype)
     metadata = SimpleNamespace(
         num_contexts=num_contexts,
         helix_position_offsets=None,
@@ -346,8 +355,10 @@ def test_flashinfer_context_fallback_scope(
         beam_width=1,
     )
     forward_args = AttentionForwardArgs(
-        output=torch.empty_like(q),
+        output=torch.empty((num_contexts, q_hidden_size), dtype=dtype),
         attention_input_type=AttentionInputType.mixed,
+        is_fused_qkv=is_fused_qkv,
+        update_kv_cache=is_fused_qkv,
     )
 
     supported, reason = fmha._is_supported_with_reason(
