@@ -505,33 +505,6 @@ def test_Mpicomm():
     assert size2 == session_size
 
 
-def test_SamplingConfig_pickle():
-    config = _tb.SamplingConfig()
-    config.beam_width = 5
-    config.num_return_sequences = 1
-    config.top_k = [1, 2]
-    config.top_p = [0.1, 0.2]
-    config.top_p_min = [1.0, 2.0]
-    config.top_p_reset_ids = [1, 2]
-    config.top_p_decay = [1.0, 2.0]
-    config.random_seed = [1, 2]
-    config.temperature = [1.0, 2.0]
-    config.min_length = [32, 64]
-    config.beam_search_diversity_rate = [1.0, 2.0]
-    config.repetition_penalty = [1.0, 2.0]
-    config.presence_penalty = [1.0, 2.0]
-    config.frequency_penalty = [1.0, 2.0]
-    config.length_penalty = [1.0, 2.0]
-    config.early_stopping = [1, 2]
-    config.no_repeat_ngram_size = [4, 6]
-    config.num_return_sequences = 1
-    config.min_p = [0.5, 0.5]
-    config.beam_width_array = [[2, 3, 4, 5]]
-
-    config1 = pickle.loads(pickle.dumps(config))
-    assert config1 == config
-
-
 def test_KvCache_events_binding():
     stream = torch.cuda.Stream()
     max_sequence_length = 10

@@ -117,9 +117,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         sampling_config = request.sampling_config
         if sampling_config is None:
             return
-        # min_p lives on the C++ SamplingConfig as an optional singleton list.
+        # min_p lives on the C++ SamplingConfig as an optional scalar.
         min_p = sampling_config.min_p
-        if min_p and min_p[0] > 0.0:
+        if min_p and min_p > 0.0:
             raise ValueError(
                 "min_p is not supported with one-model speculative decoding. "
                 "Drop min_p from the request, or disable speculative decoding."
@@ -163,11 +163,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         frontend may forward a default explicitly.
         """
         # py_min_length mirrors the C++ SamplingConfig field, i.e. an optional
-        # singleton list. The OpenAI frontend always forwards min_tokens (default
-        # 0), so the list is routinely present and holds the neutral value --
-        # gate on the value, not on the list being non-empty.
+        # scalar. The OpenAI frontend always forwards min_tokens (default 0), so
+        # it is routinely present and holds the neutral value -- gate on the
+        # value, not on its presence.
         min_length = getattr(request, "py_min_length", None)
-        if min_length and min_length[0] > 0:
+        if min_length and min_length > 0:
             raise ValueError(
                 "min_length is not supported with one-model speculative decoding. "
                 "Drop min_length from the request, or disable speculative decoding."

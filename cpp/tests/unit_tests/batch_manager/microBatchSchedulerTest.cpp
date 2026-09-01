@@ -50,8 +50,8 @@ protected:
     static std::shared_ptr<LlmRequest> createRequest(int32_t promptLen, int32_t maxNewTokens,
         std::optional<uint64_t> optionalReqId, SizeType32 beamWidth = 1, int32_t draftTokensLen = 0)
     {
-        tensorrt_llm::runtime::SamplingConfig samplingConfig;
-        samplingConfig.beamWidth = beamWidth;
+        tensorrt_llm::executor::SamplingConfig samplingConfig;
+        samplingConfig.setBeamWidth(beamWidth);
         uint64_t reqId = optionalReqId.value_or((rand() % INT64_MAX) + 1);
         auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen, 1);
         std::optional<std::shared_ptr<std::vector<int32_t>>> draftTokens = std::nullopt;
@@ -1254,7 +1254,7 @@ protected:
     static std::shared_ptr<LlmRequest> createRequestWithTokens(
         std::shared_ptr<std::vector<int32_t>> inputTokens, int32_t maxNewTokens, uint64_t reqId)
     {
-        tensorrt_llm::runtime::SamplingConfig samplingConfig;
+        tensorrt_llm::executor::SamplingConfig samplingConfig;
         return std::make_shared<LlmRequest>(reqId, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false);
     }
 };

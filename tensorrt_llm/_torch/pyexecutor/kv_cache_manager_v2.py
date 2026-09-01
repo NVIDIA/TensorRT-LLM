@@ -92,7 +92,7 @@ from .kv_cache_stats import (
     KVCacheV2SsmLifeCycleIterationStats,
     KVCacheV2SsmSnapshotIterationStats,
 )
-from .llm_request import LlmRequest, LlmRequestState, SamplingConfig, get_draft_token_length
+from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
@@ -3526,7 +3526,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 request_id=req_id,
                 max_new_tokens=1,
                 input_tokens=input_tokens,
-                sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+                sampling_config=sampling_params._get_sampling_config(),
                 is_streaming=False,
                 encoder_input_tokens=encoder_input_tokens,
                 encoder_output_len=encoder_output_len,

@@ -37,15 +37,13 @@ Resolving a request's ``Strategy`` lives in ``sampler_strategy``.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, TypeAlias, TypeVar, cast
+from typing import Optional, TypeAlias, cast
 
 import torch
 
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..llm_request import LlmRequest
-
-T = TypeVar("T")
 
 # Beam index to use when no beam search is used but a beam index is required
 DEFAULT_BEAM_IDX = 0
@@ -118,13 +116,6 @@ def add_token(
     return new_token
 
 
-def _unwrap_singleton(p: Optional[List[T]]) -> Optional[T]:
-    if p is None:
-        return None
-    (t,) = p
-    return t
-
-
 def _get_beam_width_in(request: LlmRequest) -> int:
     return (
         1
@@ -141,20 +132,14 @@ def _get_max_beam_width(request: LlmRequest) -> int:
     sampling_config = request.sampling_config
     max_beam_width = cast(int, sampling_config.beam_width)
     # The array holds at most kMaxBeamWidthArrayLength (8) entries, so reduce it
-    # on the host. The C++ field is OptVec<vector<SizeType32>>, so it may arrive
-    # as [maxBeamWidthArrayLength] or [batchSize, maxBeamWidthArrayLength];
-    # unwrap the per-request row before reducing.
+    # on the host.
     #
-    # Both `[]` and `[[]]` mean "no schedule" -- checkBeamWidthArray bounds only
-    # the array's length, so an empty one passes admission -- and must fall
-    # through to beam_width rather than reduce over nothing. Hence truthiness
-    # rather than `is not None`, and hence a second guard after the unwrap:
-    # the same two checks LlmRequest.get_beam_width_by_iter and
+    # An empty array means "no schedule" -- checkBeamWidthArray bounds only the
+    # array's length, so an empty one passes admission -- and must fall through
+    # to beam_width rather than reduce over nothing. Hence truthiness rather
+    # than `is not None`, the same check LlmRequest.get_beam_width_by_iter and
     # PyExecutor._validate_request make.
     beam_width_array = sampling_config.beam_width_array
-    if beam_width_array:
-        if isinstance(beam_width_array[0], (list, tuple)):
-            beam_width_array = beam_width_array[0]
     if beam_width_array:
         max_beam_width = max(max_beam_width, *map(int, beam_width_array))
     return max_beam_width
@@ -176,7 +161,7 @@ def request_random_seed(request: LlmRequest) -> Optional[int]:
     opaque bit pattern, so this keeps distinct seeds distinct, and it avoids an
     overflow that would abort the whole sampling step rather than one request.
     """
-    seed = _unwrap_singleton(cast(Optional[list[int]], request.sampling_config.random_seed))
+    seed = request.sampling_config.seed
     if seed is None:
         return None
     return seed - (1 << 64) if seed >= (1 << 63) else seed
@@ -184,30 +169,22 @@ def request_random_seed(request: LlmRequest) -> Optional[int]:
 
 def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     sampling_config = request.sampling_config
-    # These sampling fields live on the C++ SamplingConfig as optional<vector<T>>
-    # (a shape inherited from the batched C++ decoder that has since been
-    # removed); the torch sampler consumes them per request, so we unwrap the
-    # singleton lists into scalars here.
-    # TODO: drop this SamplingConfig-based plumbing in favor of reading the
-    # values directly from the per-request params.
-    temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
-    top_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p))
-    top_k = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_k))
-    min_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.min_p))
-    top_p_decay = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p_decay))
-    top_p_min = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p_min))
-    top_p_reset_ids = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_p_reset_ids))
+    temperature = sampling_config.temperature
+    top_p = sampling_config.top_p
+    top_k = sampling_config.top_k
+    min_p = sampling_config.min_p
+    top_p_decay = sampling_config.top_p_decay
+    top_p_min = sampling_config.top_p_min
+    top_p_reset_ids = sampling_config.top_p_reset_ids
     beam_width_out = _get_beam_width_out(request)
     beam_width_in = _get_beam_width_in(request)
     # ModelEngine lays generation rows out at the static admission width; see
     # the row_stride note in _beam_step_preprocess.
     row_stride = 1 if request.is_context_init_state else request.py_beam_width
     use_beam_search = _get_max_beam_width(request) > 1
-    length_penalty = _unwrap_singleton(cast(Optional[list[float]], sampling_config.length_penalty))
-    beam_search_diversity_rate = _unwrap_singleton(
-        cast(Optional[list[float]], sampling_config.beam_search_diversity_rate)
-    )
-    early_stopping = _unwrap_singleton(cast(Optional[list[int]], sampling_config.early_stopping))
+    length_penalty = sampling_config.length_penalty
+    beam_search_diversity_rate = sampling_config.beam_search_diversity_rate
+    early_stopping = sampling_config.early_stopping
 
     return UtilsSamplingParams(
         temperature=temperature,

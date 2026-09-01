@@ -52,7 +52,7 @@ public:
     using LogitsPostProcessor = Base::LogitsPostProcessor;
 
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
-        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
+        executor::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,

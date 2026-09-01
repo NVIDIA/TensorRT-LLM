@@ -55,7 +55,7 @@ protected:
     {
         VecTokens inputTokens{1, 2, 3, 4, 5};
         SizeType32 maxNewTokens = 60;
-        tr::SamplingConfig samplingConfig(1);
+        tensorrt_llm::executor::SamplingConfig samplingConfig(1);
 
         return std::make_shared<tb::LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, false,
             std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,

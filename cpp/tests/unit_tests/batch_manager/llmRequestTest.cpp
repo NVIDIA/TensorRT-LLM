@@ -56,7 +56,7 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         EXPECT_EQ(llmReq.getTokens().size(), 1);
         EXPECT_EQ(llmReq.getTokens().at(0), inputTokens);
         EXPECT_EQ(llmReq.mMaxNewTokens, maxNewTokens);
-        EXPECT_EQ(llmReq.mSamplingConfig.numReturnSequences, execReq.getSamplingConfig().getNumReturnSequences());
+        EXPECT_EQ(llmReq.mSamplingConfig.getNumReturnSequences(), execReq.getSamplingConfig().getNumReturnSequences());
         EXPECT_EQ(llmReq.getOrigPromptLen(), inputTokens.size());
         EXPECT_EQ(llmReq.getMaxSentTokenLen(), inputTokens.size());
         EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kCONTEXT_INIT);
@@ -331,7 +331,7 @@ TEST_F(LlmRequestTest, pause)
     SizeType32 maxNewTokens(66);
     tb::LlmRequest::RequestIdType requestId{77};
 
-    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tr::SamplingConfig(1), false);
+    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tensorrt_llm::executor::SamplingConfig(1), false);
 
     llmReq.addNewToken(1, 0);
     llmReq.addNewToken(1, 0);
@@ -368,7 +368,7 @@ TEST_F(LlmRequestTest, testAllocateLogitsBuffer)
     SizeType32 maxNewTokens(60);
     tb::LlmRequest::RequestIdType requestId{77};
 
-    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tr::SamplingConfig(1), false);
+    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tensorrt_llm::executor::SamplingConfig(1), false);
 
     EXPECT_EQ(llmReq.mPromptLen, 5);
 
@@ -420,7 +420,8 @@ TEST_F(LlmRequestTest, testLastTokensSetIndependence)
         = {{1, 2, 3, 4, 5, 10, 20}, {1, 2, 3, 4, 5, 11, 21}, {1, 2, 3, 4, 5, 12, 22}};
     tb::LlmRequest::BeamTokens expectedOverwrittenOutput
         = {{1, 2, 3, 4, 5, 100, 200}, {1, 2, 3, 4, 5, 101, 201}, {1, 2, 3, 4, 5, 102, 202}};
-    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tr::SamplingConfig(beamWidth), streaming);
+    tb::LlmRequest llmReq(
+        requestId, maxNewTokens, inputTokens, tensorrt_llm::executor::SamplingConfig(beamWidth), streaming);
 
     // check individually set tokens
     llmReq.addNewToken(10, 0);
@@ -464,8 +465,8 @@ TEST_F(LlmRequestTest, testCreateRequests)
     SizeType32 vocabSize{32};
     tensorrt_llm::DataType dtype{tensorrt_llm::DataType::kHALF};
 
-    tr::SamplingConfig samplingConfig(1);
-    samplingConfig.randomSeed = std::vector<texec::RandomSeedType>{7};
+    tensorrt_llm::executor::SamplingConfig samplingConfig(1);
+    samplingConfig.setSeed(texec::RandomSeedType{7});
 
     tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, samplingConfig, false);
     try
@@ -478,7 +479,7 @@ TEST_F(LlmRequestTest, testCreateRequests)
         EXPECT_THAT(e.what(), testing::HasSubstr("Cannot create child requests more than"));
     }
 
-    samplingConfig.numReturnSequences = 3;
+    samplingConfig.setNumReturnSequences(3);
     tb::LlmRequest llmReq2(requestId, maxNewTokens, inputTokens, samplingConfig, false);
 
     auto childReq1 = llmReq2.createChildRequest(78);
@@ -491,8 +492,8 @@ TEST_F(LlmRequestTest, testCreateRequests)
         EXPECT_EQ(childReq1->getOrigPromptLen(), llmReq.getOrigPromptLen());
         EXPECT_EQ(childReq1->mMaxNewTokens, llmReq.mMaxNewTokens);
         EXPECT_EQ(childReq1->getState(), llmReq.getState());
-        EXPECT_EQ(childReq1->mSamplingConfig.randomSeed.value(), std::vector<texec::RandomSeedType>{8});
-        EXPECT_EQ(llmReq2.mSamplingConfig.randomSeed.value(), std::vector<texec::RandomSeedType>{7});
+        EXPECT_EQ(childReq1->mSamplingConfig.getSeed().value(), texec::RandomSeedType{8});
+        EXPECT_EQ(llmReq2.mSamplingConfig.getSeed().value(), texec::RandomSeedType{7});
         EXPECT_FALSE(childReq1->mSeqSlot);
     }
 
@@ -502,9 +503,9 @@ TEST_F(LlmRequestTest, testCreateRequests)
         EXPECT_EQ(childRequests.size(), 2);
         EXPECT_EQ(childRequests.at(0), childReq1);
         EXPECT_EQ(childRequests.at(1), childReq2);
-        EXPECT_EQ(childReq2->mSamplingConfig.randomSeed.value(), std::vector<texec::RandomSeedType>{9});
-        EXPECT_EQ(childReq1->mSamplingConfig.randomSeed.value(), std::vector<texec::RandomSeedType>{8});
-        EXPECT_EQ(llmReq2.mSamplingConfig.randomSeed.value(), std::vector<texec::RandomSeedType>{7});
+        EXPECT_EQ(childReq2->mSamplingConfig.getSeed().value(), texec::RandomSeedType{9});
+        EXPECT_EQ(childReq1->mSamplingConfig.getSeed().value(), texec::RandomSeedType{8});
+        EXPECT_EQ(llmReq2.mSamplingConfig.getSeed().value(), texec::RandomSeedType{7});
     }
 }
 
@@ -554,11 +555,11 @@ TEST_P(ParamTest, createResponse)
     SizeType32 maxNewTokens(66);
     tb::LlmRequest::RequestIdType requestId{77};
 
-    tr::SamplingConfig samplingConfig(beamWidth);
+    tensorrt_llm::executor::SamplingConfig samplingConfig(beamWidth);
     // numReturnSequences = nullopt, otherwise.
     if (beamWidth == 1 || numReturnSequences < beamWidth)
     {
-        samplingConfig.numReturnSequences = numReturnSequences;
+        samplingConfig.setNumReturnSequences(numReturnSequences);
     }
     auto numReturnBeams = samplingConfig.getNumReturnBeams();
     // Expect one sequence per request in beam search.

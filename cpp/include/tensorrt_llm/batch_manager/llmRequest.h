@@ -24,7 +24,6 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
-#include "tensorrt_llm/runtime/samplingConfig.h"
 
 #include <algorithm>
 #include <cassert>
@@ -120,8 +119,9 @@ public:
     using Duration = std::chrono::time_point<std::chrono::steady_clock>::duration;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
-        runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
-        std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+        executor::SamplingConfig const& samplingConfig, bool isStreaming,
+        std::optional<SizeType32> endId = std::nullopt, std::optional<SizeType32> padId = std::nullopt,
+        std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -172,7 +172,7 @@ public:
         , mClientId(clientId)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
-        , mNumPreDecodedTokens(samplingConfig.beamWidth, 0)
+        , mNumPreDecodedTokens(samplingConfig.getBeamWidth(), 0)
         , mMaxSentTokenLen(mPromptLen)
         , mEmbeddingBias(std::move(embeddingBias))
         , mPositionIds(std::move(positionIds))
@@ -195,18 +195,18 @@ public:
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
         , mContextChunkSizeTarget{mPromptLen}
         , mContextChunkSizeDraft{mPromptLen}
-        , mLogProbs(samplingConfig.beamWidth)
-        , mCumLogProbs(samplingConfig.beamWidth)
+        , mLogProbs(samplingConfig.getBeamWidth())
+        , mCumLogProbs(samplingConfig.getBeamWidth())
         , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
         , mDraftLogits(std::move(draftLogits))
-        , mReturnAllGeneratedTokens(isStreaming && (samplingConfig.beamWidth > 1))
+        , mReturnAllGeneratedTokens(isStreaming && (samplingConfig.getBeamWidth() > 1))
         , mReturnContextLogits(returnContextLogits)
         , mReturnGenerationLogits(returnGenerationLogits)
         , mExcludeInputFromOutput(excludeInputFromOutput)
         , mEncoderTokens(std::move(encoderInputTokens))
         , mReturnEncoderOutput(returnEncoderOutput)
         , mPriority(priority)
-        , mFinishReasons(samplingConfig.beamWidth)
+        , mFinishReasons(samplingConfig.getBeamWidth())
         , mEncoderInputFeatures(std::move(encoderInputFeatures))
         , mEncoderOutputLength(encoderOutputLength)
         , mCrossAttentionMask(std::move(crossAttentionMask))
@@ -233,8 +233,9 @@ public:
     }
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
-        runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
-        std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+        executor::SamplingConfig const& samplingConfig, bool isStreaming,
+        std::optional<SizeType32> endId = std::nullopt, std::optional<SizeType32> padId = std::nullopt,
+        std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -261,7 +262,7 @@ public:
         , mClientId(clientId)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
-        , mNumPreDecodedTokens(samplingConfig.beamWidth, 0)
+        , mNumPreDecodedTokens(samplingConfig.getBeamWidth(), 0)
         , mMaxSentTokenLen(mPromptLen)
         , mEmbeddingBias(std::move(embeddingBias))
         , mPositionIds(std::move(positionIds))
@@ -273,18 +274,18 @@ public:
         , mLookaheadConfig(lookaheadConfig)
         , mContextChunkSizeTarget(mPromptLen)
         , mContextChunkSizeDraft(mPromptLen)
-        , mLogProbs(samplingConfig.beamWidth)
-        , mCumLogProbs(samplingConfig.beamWidth)
+        , mLogProbs(samplingConfig.getBeamWidth())
+        , mCumLogProbs(samplingConfig.getBeamWidth())
         , mDraftTokens(std::make_shared<VecTokens>(draftTokens.value_or(VecTokens())))
         , mDraftLogits(draftLogits)
-        , mReturnAllGeneratedTokens(isStreaming && (samplingConfig.beamWidth > 1))
+        , mReturnAllGeneratedTokens(isStreaming && (samplingConfig.getBeamWidth() > 1))
         , mReturnContextLogits(returnContextLogits)
         , mReturnGenerationLogits(returnGenerationLogits)
         , mExcludeInputFromOutput(excludeInputFromOutput)
         , mEncoderTokens(std::make_shared<VecTokens>(encoderInputTokens.value_or(VecTokens())))
         , mReturnEncoderOutput(returnEncoderOutput)
         , mPriority(priority)
-        , mFinishReasons(samplingConfig.beamWidth)
+        , mFinishReasons(samplingConfig.getBeamWidth())
         , mContextPhaseParams(contextPhaseParams)
         , mNumReturnSequences(numReturnSequences)
         , mLanguageAdapterUid(languageAdapterUid)
@@ -308,12 +309,12 @@ public:
         , mClientId(req.getClientId())
         , mIsStreaming(req.getStreaming())
         , mOrigPromptLen(mPromptLen)
-        , mNumPreDecodedTokens(mSamplingConfig.beamWidth, 0)
+        , mNumPreDecodedTokens(mSamplingConfig.getBeamWidth(), 0)
         , mMaxSentTokenLen(mPromptLen)
         , mContextChunkSizeTarget{mPromptLen}
         , mContextChunkSizeDraft{mPromptLen}
-        , mLogProbs(mSamplingConfig.beamWidth)
-        , mCumLogProbs(mSamplingConfig.beamWidth)
+        , mLogProbs(mSamplingConfig.getBeamWidth())
+        , mCumLogProbs(mSamplingConfig.getBeamWidth())
         , mDraftTokens(std::make_shared<VecTokens>())
         , mReturnAllGeneratedTokens(req.getReturnAllGeneratedTokens())
         , mReturnContextLogits(req.getOutputConfig().returnContextLogits)
@@ -321,7 +322,7 @@ public:
         , mExcludeInputFromOutput(req.getOutputConfig().excludeInputFromOutput)
         , mReturnEncoderOutput(req.getOutputConfig().returnEncoderOutput)
         , mPriority(req.getPriority())
-        , mFinishReasons(mSamplingConfig.beamWidth)
+        , mFinishReasons(mSamplingConfig.getBeamWidth())
         , mEncoderOutputLength(req.getEncoderOutputLength())
         , mContextPhaseParams(req.getContextPhaseParams())
         , mEagleConfig(req.getEagleConfig())
@@ -335,7 +336,7 @@ public:
         {
             mState = LlmRequestState::kDISAGG_GENERATION_INIT;
         }
-        if (mIsStreaming && mSamplingConfig.beamWidth > 1 && !mReturnAllGeneratedTokens)
+        if (mIsStreaming && mSamplingConfig.getBeamWidth() > 1 && !mReturnAllGeneratedTokens)
         {
             TLLM_LOG_WARNING(
                 "Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. "
@@ -346,7 +347,7 @@ public:
             mReturnAllGeneratedTokens = true;
         }
 
-        if (mIsStreaming && mSamplingConfig.beamWidth > 1 && mReturnGenerationLogits)
+        if (mIsStreaming && mSamplingConfig.getBeamWidth() > 1 && mReturnGenerationLogits)
         {
             // In streaming mode with beam search, intermediate logits are returned before finalization,
             // so they cannot be reordered to match the final beam paths. Non-streaming mode handles
@@ -580,7 +581,7 @@ public:
     /// @return  The number of subrequests in total  request size.
     [[nodiscard]] SizeType32 getNumSubRequests() const
     {
-        return mSamplingConfig.beamWidth == 1 ? mSamplingConfig.numReturnSequences.value_or(1) : 1;
+        return mSamplingConfig.getBeamWidth() == 1 ? mSamplingConfig.getNumReturnSequences().value_or(1) : 1;
     }
 
     /// @brief Get child requests spawned by this req.
@@ -595,7 +596,7 @@ public:
     [[nodiscard]] SizeType32 getMaxBeamNumTokens() const
     {
         SizeType32 maxTokens = 0;
-        for (SizeType32 beam = 0; beam < mSamplingConfig.beamWidth; ++beam)
+        for (SizeType32 beam = 0; beam < mSamplingConfig.getBeamWidth(); ++beam)
         {
             maxTokens = std::max(maxTokens, getNumTokens(beam));
         }
@@ -786,7 +787,7 @@ public:
     ///                   beamTokens is expected to be of size beamWidth
     void addNewTokens(VecTokens const& beamTokens)
     {
-        assert(static_cast<size_t>(mSamplingConfig.beamWidth) == beamTokens.size());
+        assert(static_cast<size_t>(mSamplingConfig.getBeamWidth()) == beamTokens.size());
         mLastTokens = beamTokens;
         for (std::size_t beam = 0; beam < beamTokens.size(); ++beam)
         {
@@ -820,7 +821,7 @@ public:
     void setGeneratedTokens(BeamTokens const& generatedBeamTokens)
     {
         TLLM_LOG_DEBUG("Setting generated tokens for request %ld", mRequestId);
-        assert(generatedBeamTokens.size() == static_cast<size_t>(mSamplingConfig.beamWidth));
+        assert(generatedBeamTokens.size() == static_cast<size_t>(mSamplingConfig.getBeamWidth()));
 
         for (size_t beamId = 0; beamId < generatedBeamTokens.size(); ++beamId)
         {
@@ -846,7 +847,7 @@ public:
         TLLM_CHECK_WITH_INFO(mChildRequests.size() <= static_cast<size_t>(numReturnSequences),
             "Cannot set numReturnSequences %d smaller than the number %ld of child requests that have already created.",
             numReturnSequences, mChildRequests.size());
-        mSamplingConfig.numReturnSequences = numReturnSequences;
+        mSamplingConfig.setNumReturnSequences(numReturnSequences);
         mSequenceFinalVec->resize(numReturnSequences);
     }
 
@@ -879,7 +880,7 @@ public:
         // TODO: For beamWidth > 1, we would need to support swapping to avoid
         // recomputing from the start
         // As a temporary solution, we currently reset the tokens to the prompt
-        if (mSamplingConfig.beamWidth > 1)
+        if (mSamplingConfig.getBeamWidth() > 1)
         {
             for (std::size_t beam = 0; beam < mTokens.size(); ++beam)
             {
@@ -1410,7 +1411,7 @@ public:
 
     void setReturnAllGeneratedTokens(bool const returnAllGeneratedTokens)
     {
-        TLLM_CHECK_WITH_INFO(!mIsStreaming || mSamplingConfig.beamWidth == 1 || returnAllGeneratedTokens,
+        TLLM_CHECK_WITH_INFO(!mIsStreaming || mSamplingConfig.getBeamWidth() == 1 || returnAllGeneratedTokens,
             "returnAllGeneratedTokens must be true if streaming AND beam search are used.");
         mReturnAllGeneratedTokens = returnAllGeneratedTokens;
     }
@@ -1437,7 +1438,7 @@ public:
 
     void setReturnGenerationLogits(bool const returnGenerationLogits)
     {
-        TLLM_CHECK_WITH_INFO(!(mIsStreaming && mSamplingConfig.beamWidth > 1 && returnGenerationLogits),
+        TLLM_CHECK_WITH_INFO(!(mIsStreaming && mSamplingConfig.getBeamWidth() > 1 && returnGenerationLogits),
             "returnGenerationLogits must be false if streaming AND beam search are used.");
         mReturnGenerationLogits = returnGenerationLogits;
     }
@@ -1485,13 +1486,13 @@ public:
             // or [allGeneratedTokens, beamWidth, vocabSizePadded] if mReturnAllGeneratedTokens is True.
             // This could reduce unnecessary format conversions and allows the data to be returned directly.
             mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
-                runtime::ITensor::makeShape({mMaxNewTokens, mSamplingConfig.beamWidth, vocabSizePadded}),
+                runtime::ITensor::makeShape({mMaxNewTokens, mSamplingConfig.getBeamWidth(), vocabSizePadded}),
                 logitsDataType);
         }
         else
         {
             mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
-                runtime::ITensor::makeShape({mSamplingConfig.beamWidth, mMaxNewTokens, vocabSizePadded}),
+                runtime::ITensor::makeShape({mSamplingConfig.getBeamWidth(), mMaxNewTokens, vocabSizePadded}),
                 logitsDataType);
         }
     }
@@ -1560,7 +1561,7 @@ public:
                 outputTensorName.c_str());
             shape.d[0] = mMaxNewTokens;
             shape = runtime::ITensor::unsqueeze(shape, 0);
-            shape.d[0] = mSamplingConfig.beamWidth;
+            shape.d[0] = mSamplingConfig.getBeamWidth();
             auto tensor = runtime::BufferManager::pinnedPool(shape, dataType);
             outputTensor.second = std::move(tensor);
         }
@@ -1769,8 +1770,8 @@ public:
     }
 
     /// @brief Get the beam width of the current decoding step.
-    /// @details Return `mSamplingConfig.beamWidth` in decoding modes beside Variable-Beam-Width-Search (VBWS).
-    /// Or returns a scalar value from `mSamplingConfig.beamWidthArray` indexing by `mDecodingIter` in VBWS.
+    /// @details Return `mSamplingConfig.getBeamWidth()` in decoding modes beside Variable-Beam-Width-Search (VBWS).
+    /// Or returns a scalar value from `mSamplingConfig.getBeamWidth()Array` indexing by `mDecodingIter` in VBWS.
     ///
     /// Calling in context phase, it returns the beam width of the first generation step, which is used for copying
     /// logits (function `copyGenerationLogits` as example).
@@ -1969,7 +1970,7 @@ public:
             TLLM_LOG_DEBUG("Request %ld finished by cancel", mRequestId);
         }
 
-        for (int beam = 0; beam < mSamplingConfig.beamWidth; ++beam)
+        for (int beam = 0; beam < mSamplingConfig.getBeamWidth(); ++beam)
         {
             if (mFinishReasons.at(beam) == executor::FinishReason::kNOT_FINISHED)
             {
@@ -2052,7 +2053,7 @@ public:
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
-    runtime::SamplingConfig mSamplingConfig;
+    executor::SamplingConfig mSamplingConfig;
     std::optional<TokenIdType> mEndId{std::nullopt};
     std::optional<TokenIdType> mPadId{std::nullopt};
     std::optional<SizeType32> mSeqSlot{std::nullopt};
@@ -2268,11 +2269,11 @@ private:
         }
 
         // Scatter the input tokens to other beam
-        mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
+        mTokens = BeamTokens(mSamplingConfig.getBeamWidth(), inputTokens);
         // A request may legitimately have no input tokens on this rank (e.g. an "empty" Helix CP rank that owns zero KV
         // blocks for the sequence). Guard against calling .back() on an empty vector (undefined behavior).
-        mLastTokens = inputTokens.empty() ? VecTokens(mSamplingConfig.beamWidth)
-                                          : VecTokens(mSamplingConfig.beamWidth, inputTokens.back());
+        mLastTokens = inputTokens.empty() ? VecTokens(mSamplingConfig.getBeamWidth())
+                                          : VecTokens(mSamplingConfig.getBeamWidth(), inputTokens.back());
 
         // Init mUniqueTokens
         VecUniqueTokens uniqueTokens{inputTokens.size()};
@@ -2297,7 +2298,7 @@ private:
                     return UniqueToken{inputToken, 0};
                 });
         }
-        mUniqueTokens = BeamUniqueTokens(mSamplingConfig.beamWidth, uniqueTokens);
+        mUniqueTokens = BeamUniqueTokens(mSamplingConfig.getBeamWidth(), uniqueTokens);
 
         // Init mEncoderUniqueTokens
         // TODO: use real extra id instead of default zero value
@@ -2332,21 +2333,21 @@ private:
         // Handling the backward compatibility of numReturnSequences.
         if (mNumReturnSequences > 1)
         {
-            if (!mSamplingConfig.numReturnSequences)
+            if (!mSamplingConfig.getNumReturnSequences())
             {
                 TLLM_LOG_WARNING(
                     "In the Executor class, mNumReturnSequences is deprecated. Please set numReturnSequences in "
                     "SamplingConfig directly.");
             }
-            else if (mSamplingConfig.numReturnSequences
-                && mSamplingConfig.numReturnSequences.value() != mNumReturnSequences)
+            else if (mSamplingConfig.getNumReturnSequences()
+                && mSamplingConfig.getNumReturnSequences().value() != mNumReturnSequences)
             {
                 TLLM_THROW(
                     "In the Executor class, both mSamplingConfig.numReturnSequences (%d) and mNumReturnSequences (%d) "
                     "are provided but unmatched. Please use numReturnSequences in SamplingConfig directly.",
-                    mSamplingConfig.numReturnSequences.value(), mNumReturnSequences);
+                    mSamplingConfig.getNumReturnSequences().value(), mNumReturnSequences);
             }
-            mSamplingConfig.numReturnSequences = mNumReturnSequences;
+            mSamplingConfig.setNumReturnSequences(mNumReturnSequences);
         }
 
         if (!isChild())
@@ -2395,8 +2396,9 @@ public:
     using Base::Base;
 
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
-        runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
-        std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+        executor::SamplingConfig const& samplingConfig, bool isStreaming,
+        std::optional<SizeType32> endId = std::nullopt, std::optional<SizeType32> padId = std::nullopt,
+        std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,

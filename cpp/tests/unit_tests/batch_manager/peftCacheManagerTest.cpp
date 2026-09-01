@@ -28,7 +28,6 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/loraModule.h"
-#include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 

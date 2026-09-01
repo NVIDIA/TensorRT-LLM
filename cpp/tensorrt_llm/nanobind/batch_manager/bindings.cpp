@@ -387,7 +387,7 @@ void initBindings(nb::module_& m)
             "__init__",
             [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
                 tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
-                runtime::SamplingConfig sampling_config, bool is_streaming,
+                executor::SamplingConfig sampling_config, bool is_streaming,
                 std::optional<tb::LlmRequest::SizeType32> end_id, std::optional<tb::LlmRequest::SizeType32> pad_id,
                 std::optional<at::Tensor> embedding_bias,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> position_ids,

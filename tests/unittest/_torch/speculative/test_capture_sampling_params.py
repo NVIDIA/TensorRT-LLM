@@ -68,9 +68,9 @@ class TestAddDummyRequestsCaptureSamplingParams(unittest.TestCase):
             sampling_config = requests[0].sampling_config
             # Sampling params round-trip through a C++ binding as float32, so
             # compare with tolerance rather than exact equality.
-            self.assertAlmostEqual(sampling_config.temperature[0], CAPTURE_TEMPERATURE, places=6)
+            self.assertAlmostEqual(sampling_config.temperature, CAPTURE_TEMPERATURE, places=6)
             self.assertEqual(sampling_config.top_k, [CAPTURE_TOP_K])
-            self.assertAlmostEqual(sampling_config.top_p[0], CAPTURE_TOP_P, places=6)
+            self.assertAlmostEqual(sampling_config.top_p, CAPTURE_TOP_P, places=6)
         finally:
             kv_cache_manager.shutdown()
 

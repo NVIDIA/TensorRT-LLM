@@ -20,7 +20,7 @@ from tensorrt_llm.inputs.multimodal import strip_mm_encoder_inputs
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.sampling_params import LogprobMode
 
-SamplingConfig = tensorrt_llm.bindings.SamplingConfig
+SamplingConfig = tllm_executor.SamplingConfig
 
 MAX_SPEC_DECODE_POSITIONS = 16
 '''
@@ -39,7 +39,6 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
 ExecutorRequest = tllm_executor.Request
 ExecutorResponse = tllm_executor.Response
-ExecutorSamplingConfig = tllm_executor.SamplingConfig
 FinishReason = tllm_executor.FinishReason
 
 REQUEST_TYPE_MAPPING = {
@@ -966,7 +965,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
         self.py_end_id = self.end_id
-        self.py_min_length = self.sampling_config.min_length
+        self.py_min_length = self.sampling_config.min_tokens
         self.py_helix_is_inactive_rank = False
         # Manager-owned helix decode-step counter; see
         # KVCacheManagerV2._set_helix_rank_fields.
@@ -1309,7 +1308,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         assert py_request.is_child
         assert py_request.request_id == child.request_id
         assert py_request.parent_request_id == self.request_id
-        assert py_request.sampling_config.random_seed != self.sampling_config.random_seed
+        assert py_request.sampling_config.seed != self.sampling_config.seed
 
         self.child_requests.append(py_request)
 
@@ -1516,8 +1515,7 @@ def executor_request_to_llm_request(
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
         position_ids: Optional[List] = None) -> LlmRequest:
-    executor_sampling_config = executor_request.sampling_config
-    sampling_config = SamplingConfig(executor_sampling_config)
+    sampling_config = executor_request.sampling_config
 
     input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
 

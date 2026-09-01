@@ -153,6 +153,10 @@ void initRequestBindings(nb::module_& m)
             nb::arg("num_return_sequences") = nb::none(),
             nb::arg("min_p") = nb::none(),
             nb::arg("beam_width_array") = nb::none())               // clang-format on
+        // Copy constructor. LlmRequest used to take a distinct runtime::SamplingConfig built from
+        // an executor one, so callers spell `SamplingConfig(params._get_sampling_config())`; keep
+        // that form working now that both sides are the same type.
+        .def(nb::init<tle::SamplingConfig const&>(), nb::arg("sampling_config"))
         .def_prop_rw("beam_width", &tle::SamplingConfig::getBeamWidth, &tle::SamplingConfig::setBeamWidth)
         .def_prop_rw("top_k", &tle::SamplingConfig::getTopK, &tle::SamplingConfig::setTopK)
         .def_prop_rw("top_p", &tle::SamplingConfig::getTopP, &tle::SamplingConfig::setTopP)

@@ -3570,7 +3570,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         auto const numSharedBlocks = promptCacheLen / getTokensPerBlock();
         auto const numUnSharedTokens = promptCacheLen % getTokensPerBlock();
         auto const numUnSharedBlocks
-            = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.beamWidth;
+            = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.getBeamWidth();
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
 
         // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention
@@ -3631,7 +3631,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
 
         auto const numCurrBlocks = tc::ceilDiv(numCurrTokens, getTokensPerBlock());
         auto const numNextBlocks = tc::ceilDiv(numNextTokens, getTokensPerBlock());
-        auto const numRequiredBlocks = (numNextBlocks - numCurrBlocks) * req.mSamplingConfig.beamWidth;
+        auto const numRequiredBlocks = (numNextBlocks - numCurrBlocks) * req.mSamplingConfig.getBeamWidth();
         return numRequiredBlocks;
     }
 
@@ -3745,11 +3745,11 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     if (numAllocBlocksPerBeam < effectiveContextBlocks) // Still haven't allocated all context blocks
     {
         return effectiveContextBlocks - numAllocBlocksPerBeam
-            + (numGenBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+            + (numGenBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.getBeamWidth();
     }
 
     SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
-    return (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    return (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.getBeamWidth();
 }
 
 void BlockManager::updateSequenceCacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize)
