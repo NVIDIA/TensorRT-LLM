@@ -2286,8 +2286,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             def __init__(self, decisions):
                 self.decisions = decisions
 
-            def tp_allgather(self, value):
-                del value
+            def tp_allgather(self, value, *, small_payload: bool = False):
+                del value, small_payload
                 return self.decisions
 
         engine = object.__new__(PyTorchModelEngine)
