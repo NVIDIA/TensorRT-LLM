@@ -3603,6 +3603,48 @@ class DynamicBatchConfig(StrictBaseModel, PybindMirror):
             dynamic_batch_moving_average_window)
 
 
+class ContextCostBalancingConfig(StrictBaseModel):
+    """Equal-cost context chunking for the KV cache V2 scheduler.
+
+    On hybrid-attention models a context chunk of n tokens at KV depth kv
+    costs ~ (kv_cost_offset + kv) * n; capping each attention-DP rank's chunks
+    against the shared budget (kv_cost_offset + kv_depth_threshold) * max_num_tokens equalizes
+    lockstep iteration times. Requests shallower than kv_depth_threshold are unaffected.
+    """
+    mode: Literal["off", "auto", "manual"] = Field(
+        default="off",
+        description="'auto' calibrates both knobs online from measured "
+        "iteration times; 'manual' uses the values below verbatim.")
+
+    kv_depth_threshold_percentile: float = Field(
+        default=25.0,
+        ge=1.0,
+        le=99.0,
+        description="Auto mode: kv_depth_threshold is this percentile of the observed "
+        "token-weighted KV-depth distribution.")
+
+    kv_cost_offset: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="Manual mode: kv-token equivalents of the KV-independent "
+        "per-token work (the depth at which full-attention time matches all "
+        "other per-token work).")
+
+    kv_depth_threshold: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="Manual mode: KV depth above which chunks start to "
+        "shrink; shallower requests keep full-size chunks.")
+
+    @model_validator(mode="after")
+    def _validate_manual(self) -> "ContextCostBalancingConfig":
+        if self.mode == "manual" and (self.kv_cost_offset is None or self.kv_depth_threshold is None):
+            raise ValueError(
+                "context_cost_balancing mode='manual' requires both kv_cost_offset and kv_depth_threshold"
+            )
+        return self
+
+
 @PybindMirror.mirror_pybind_fields(_SchedulerConfig)
 class SchedulerConfig(StrictBaseModel, PybindMirror):
     capacity_scheduler_policy: CapacitySchedulerPolicy = Field(
@@ -3632,6 +3674,12 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
                      "duplicate-request deferral, and token-budget decisions. "
                      "This is orthogonal to "
                      "kv_cache_config.enable_block_reuse."))
+
+    context_cost_balancing: Optional[ContextCostBalancingConfig] = Field(
+        default=None,
+        description=("Equal-cost context chunking for attention-DP lockstep "
+                     "balance. KV cache manager V2 scheduler only; not "
+                     "forwarded to the C++ scheduler."))
 
     def _to_pybind(self) -> _SchedulerConfig:
         return _SchedulerConfig(

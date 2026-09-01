@@ -15,6 +15,7 @@
 
 import enum
 import os
+import time
 from typing import Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
@@ -70,9 +71,12 @@ class BudgetTracker:
         self.num_tokens = 0
         self.num_requests = 0
         # Equal-cost chunking budget in token*kv units; None keeps pure
-        # token budgeting. See KVCacheV2Scheduler.__init__.
+        # token budgeting. See KVCacheV2Scheduler.__init__. ctx_cost_features
+        # accumulates S = sum(n * (kv + n/2)) for online calibration and is
+        # tracked even while the cost cap itself is inactive.
         self.max_ctx_cost = max_ctx_cost
         self.ctx_cost = 0.0
+        self.ctx_cost_features = 0.0
 
         # PEFT accounting
         self._peft_cache_manager = peft_cache_manager
@@ -179,6 +183,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
         enable_prefix_aware_scheduling: bool = True,
         enable_recompute_pause: bool = True,
+        cost_balancing: object | None = None,  # ContextCostBalancingConfig
     ) -> None:
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
@@ -256,23 +261,48 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Capping each rank's chunks against the shared budget
         # B = (kv_cost_offset + kv_depth_threshold) * max_num_tokens equalizes attention-DP
         # lockstep iteration times with no cross-rank coordination; requests
-        # shallower than kv_depth_threshold are unaffected (the token cap binds first).
-        # TODO(perf): promote to a config field, calibrate kv_cost_offset online.
-        kv_cost_offset = int(os.environ.get("TLLM_V2_CTX_COST_KV_OFFSET", "0"))
-        kv_depth_threshold = int(os.environ.get("TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD", "0"))
-        self._cost_chunking_enabled = (
-            kv_cost_offset > 0 and kv_depth_threshold > 0
-            and max_num_tokens is not None and self.chunking_enabled
-        )
-        self._kv_cost_offset = kv_cost_offset
+        # shallower than kv_depth_threshold are unaffected (the token cap
+        # binds first). Configured via scheduler_config.context_cost_balancing
+        # ('manual' fixes both knobs, 'auto' calibrates them online); the env
+        # vars below are a debug path equivalent to manual mode.
+        self._cost_calibrator = None
+        self._kv_cost_offset = 0
         self._ctx_cost_budget: Optional[float] = None
-        if self._cost_chunking_enabled:
-            self._ctx_cost_budget = float((kv_cost_offset + kv_depth_threshold) * max_num_tokens)
-            logger.info(
-                f"KVCacheV2Scheduler: equal-cost context chunking ON, "
-                f"kv_cost_offset={kv_cost_offset}, kv_depth_threshold={kv_depth_threshold}, "
-                f"cost_budget={self._ctx_cost_budget:.4e} token*kv"
-            )
+        self._last_sched_ts: Optional[float] = None
+        self._prev_iter_tokens = 0
+        self._prev_iter_features = 0.0
+        mode = cost_balancing.mode if cost_balancing is not None else "off"
+        if mode == "off":
+            kv_cost_offset = int(os.environ.get("TLLM_V2_CTX_COST_KV_OFFSET", "0"))
+            kv_depth_threshold = int(
+                os.environ.get("TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD", "0"))
+            if kv_cost_offset > 0 and kv_depth_threshold > 0:
+                mode = "manual"
+        else:
+            kv_cost_offset = cost_balancing.kv_cost_offset or 0
+            kv_depth_threshold = cost_balancing.kv_depth_threshold or 0
+        # The cost cap only exists on the chunked path.
+        if max_num_tokens is not None and self.chunking_enabled:
+            if mode == "manual":
+                self._kv_cost_offset = kv_cost_offset
+                self._ctx_cost_budget = float(
+                    (kv_cost_offset + kv_depth_threshold) * max_num_tokens)
+                logger.info(
+                    f"KVCacheV2Scheduler: equal-cost context chunking ON, "
+                    f"kv_cost_offset={kv_cost_offset}, "
+                    f"kv_depth_threshold={kv_depth_threshold}, "
+                    f"cost_budget={self._ctx_cost_budget:.4e} token*kv"
+                )
+            elif mode == "auto":
+                from .cost_calibrator import ContextCostCalibrator
+
+                self._cost_calibrator = ContextCostCalibrator(
+                    max_num_tokens, cost_balancing.kv_depth_threshold_percentile
+                )
+                logger.info(
+                    "KVCacheV2Scheduler: equal-cost context chunking AUTO, "
+                    "calibrating (token budgeting until the fit converges)"
+                )
 
     @property
     def scheduling_state_range(
@@ -320,6 +350,23 @@ class KVCacheV2Scheduler(RequestScheduler):
         disagg_candidates: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
+
+        # Auto cost calibration: attribute the wall time since the previous
+        # schedule call (~ one lockstep iteration) to that iteration's
+        # scheduled features, then refresh the published budget. Runs before
+        # BudgetTracker construction so a refresh applies this iteration.
+        if self._cost_calibrator is not None:
+            now = time.monotonic()
+            if self._last_sched_ts is not None:
+                self._cost_calibrator.observe_iteration(
+                    self._prev_iter_tokens,
+                    self._prev_iter_features,
+                    (now - self._last_sched_ts) * 1000.0,
+                )
+                if self._cost_calibrator.maybe_refresh():
+                    self._kv_cost_offset = int(self._cost_calibrator.kv_cost_offset)
+                    self._ctx_cost_budget = self._cost_calibrator.budget
+            self._last_sched_ts = now
 
         budget = BudgetTracker(
             self.max_num_tokens,
@@ -493,14 +540,18 @@ class KVCacheV2Scheduler(RequestScheduler):
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
                 budget.commit(req, tokens, peft_pages)
-                if self._cost_chunking_enabled:
+                if self._cost_calibrator is not None or self._ctx_cost_budget is not None:
                     # Charged at the same site as the token commit so the two
                     # ledgers can never diverge. context_current_position is
                     # still the chunk start (it advances after the forward),
                     # i.e. the same value the cost cap priced this chunk at.
-                    budget.commit_ctx_cost(
-                        float(self._kv_cost_offset + req.context_current_position) * tokens
-                    )
+                    kv_start = req.context_current_position
+                    budget.ctx_cost_features += float(kv_start + tokens / 2) * tokens
+                    if self._cost_calibrator is not None:
+                        self._cost_calibrator.observe_chunk(kv_start, tokens)
+                    if self._ctx_cost_budget is not None:
+                        budget.commit_ctx_cost(
+                            float(self._kv_cost_offset + kv_start) * tokens)
 
         # Deadlock detection: if generation requests exist but none were
         # scheduled and none were evicted, no forward pass will run and no
@@ -530,6 +581,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"kv_cache_config.disk_cache_size, or increase "
                     f"kv_cache_config.max_tokens."
                 )
+
+        if self._cost_calibrator is not None:
+            self._prev_iter_tokens = budget.num_tokens
+            self._prev_iter_features = budget.ctx_cost_features
 
         return (
             scheduled_encoder,
@@ -709,7 +764,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Equal-cost chunking: also cap the chunk by the remaining cost
         # budget. context_current_position is valid here — prepare_context
         # above already advanced it past the reused prefix / prior chunks.
-        if self._cost_chunking_enabled:
+        # In auto mode _ctx_cost_budget stays None (cap inert) until calibrated.
+        if self._ctx_cost_budget is not None:
             cost_rate = self._kv_cost_offset + req.context_current_position
             affordable = int(budget.remaining_ctx_cost // cost_rate)
             if affordable < self.chunk_unit_size and budget.ctx_cost == 0.0:

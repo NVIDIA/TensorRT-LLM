@@ -204,6 +204,7 @@ def make_scheduler(
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
     enable_recompute_pause: bool = True,
+    cost_balancing: object | None = None,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -229,6 +230,7 @@ def make_scheduler(
             scheduler_capacity=scheduler_capacity,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             enable_recompute_pause=enable_recompute_pause,
+            cost_balancing=cost_balancing,
             **kwargs,
         )
 
@@ -2857,3 +2859,35 @@ class TestEqualCostChunking:
         self._make(env, max_num_tokens=1024).schedule_request([req], set())
         # affordable = 204_800 // 10_100 = 20 < unit -> floored to one unit
         assert req.context_chunk_size == 64
+
+    def _make_cfg(self, **kw):
+        cfg = Mock()
+        cfg.mode = kw.get("mode", "off")
+        cfg.kv_cost_offset = kw.get("kv_cost_offset")
+        cfg.kv_depth_threshold = kw.get("kv_depth_threshold")
+        cfg.kv_depth_threshold_percentile = kw.get("kv_depth_threshold_percentile", 25.0)
+        return cfg
+
+    def _make_with_cfg(self, cfg, max_num_tokens=8192):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        return make_scheduler(
+            mgr, max_num_tokens=max_num_tokens, ctx_chunk_config=(None, 64), cost_balancing=cfg
+        )
+
+    def test_config_manual_mode(self):
+        sched = self._make_with_cfg(self._make_cfg(mode="manual", kv_cost_offset=140_000, kv_depth_threshold=64_000))
+        req = self._deep_req(0, kv_start=500_000)
+        sched.schedule_request([req], set())
+        assert req.context_chunk_size == 2560
+
+    def test_auto_mode_inert_until_calibrated(self):
+        sched = self._make_with_cfg(self._make_cfg(mode="auto"))
+        req = self._deep_req(0, kv_start=500_000)
+        sched.schedule_request([req], set())
+        assert req.context_chunk_size == 8192  # budget not published yet
+        # Simulate a converged calibration; the cap applies on the next call.
+        sched._kv_cost_offset = 140_000
+        sched._ctx_cost_budget = float((140_000 + 64_000) * 8192)
+        req2 = self._deep_req(1, kv_start=500_000)
+        sched.schedule_request([req2], set())
+        assert req2.context_chunk_size == 2560
