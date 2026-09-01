@@ -21,9 +21,11 @@ plain integers, which is all the addressing arithmetic needs.
 
 import contextlib
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     RequestData,
@@ -52,9 +54,11 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     PageTransfer,
     RequestTransfers,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import plan_slot_geometry
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.validation import (
     validate_layout,
     validate_llm_args,
@@ -536,6 +540,246 @@ def test_worker_shutdown_closes_the_store(store_config, fake_store):
         assert fake_store.closed
         # Idempotent: a second call must not raise or reopen anything.
         worker.shutdown()
+
+
+# ---- host staging ----
+
+
+@contextlib.contextmanager
+def make_staged_worker(fake_store, store_config, *, layout, budget=None):
+    """A worker configured to pass pages through pinned host slots."""
+    raw = json.loads(store_config.read_text())
+    raw["stage_through_host"] = True
+    if budget is not None:
+        raw["staging_buffer_bytes"] = budget
+    store_config.write_text(json.dumps(raw))
+    with make_worker(fake_store, layout=layout) as worker:
+        yield worker
+
+
+@pytest.fixture
+def staged_copies(monkeypatch):
+    """Record the copies staging would issue, instead of running them."""
+    copies = []
+    monkeypatch.setattr(
+        staging_module,
+        "_memcpy_async",
+        lambda dst, src, size, kind, stream: copies.append((int(dst), int(src), int(size))),
+    )
+    # Imported into the worker by name, so the worker's binding is the one that
+    # has to be replaced.
+    monkeypatch.setattr(worker_module, "_sync_stream", lambda _stream: None)
+    return copies
+
+
+@pytest.fixture
+def fake_cuda(monkeypatch):
+    """Present a CUDA device on a host that has none, recording set_device calls.
+
+    Only safe for paths that do not allocate or launch; it exists to exercise the
+    device bookkeeping around the save thread.
+    """
+    recorded = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda index: recorded.append(index))
+    return recorded
+
+
+@pytest.mark.parametrize(
+    "page_bytes,batch,budget,expected_slots",
+    [
+        (1024, 64, 1 << 20, 64),  # budget is ample: the full batch stages
+        (1024, 64, 8 * 1024, 8),  # budget binds before the batch does
+        (1024, 8, 1 << 20, 8),  # batch binds before the budget does
+        (1024, 64, 1024, 1),  # exactly one page fits
+        (1024, 64, 1, 1),  # below one page, raised to one rather than refused
+    ],
+)
+def test_plan_slot_geometry(page_bytes, batch, budget, expected_slots):
+    slot_bytes, num_slots = plan_slot_geometry(page_bytes, batch, budget)
+    # A slot always holds a whole page; the budget bounds the count, not the width.
+    assert slot_bytes == page_bytes
+    assert num_slots == expected_slots
+
+
+@pytest.mark.parametrize("bad", [(0, 8, 1024), (-1, 8, 1024), (1024, 0, 1024)])
+def test_plan_slot_geometry_rejects_degenerate_inputs(bad):
+    with pytest.raises(ValueError):
+        plan_slot_geometry(*bad)
+
+
+def test_config_reads_staging_from_the_json(store_config):
+    raw = json.loads(store_config.read_text())
+    raw["stage_through_host"] = True
+    raw["staging_buffer_bytes"] = "256MiB"
+    store_config.write_text(json.dumps(raw))
+
+    config = MooncakeStoreConnectorConfig.from_env()
+    assert config.stage_through_host is True
+    assert config.staging_buffer_bytes == 256 * 1024**2
+
+
+def test_config_defaults_to_zero_copy(store_config):
+    assert MooncakeStoreConnectorConfig.from_env().stage_through_host is False
+
+
+@pytest.mark.parametrize(
+    "value,expected", [("1", True), ("true", True), ("on", True), ("0", False), ("off", False)]
+)
+def test_config_staging_env_override(store_config, monkeypatch, value, expected):
+    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST", value)
+    assert MooncakeStoreConnectorConfig.from_env().stage_through_host is expected
+
+
+def test_config_rejects_a_non_boolean_staging_env(store_config, monkeypatch):
+    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST", "sometimes")
+    with pytest.raises(ValueError, match="not a boolean"):
+        MooncakeStoreConnectorConfig.from_env()
+
+
+def test_staging_registers_host_buffers_and_never_the_pools(
+    store_config, fake_store, staged_copies
+):
+    layout = make_layout(regions_per_group=2)
+    with make_staged_worker(fake_store, store_config, layout=layout) as worker:
+        # Registering the pools is the step that needs GPUDirect, so staging must
+        # not do it at all -- that is the whole point of the mode.
+        pool_ranges = PageAddressing(layout).registration_ranges()
+        registered_starts = {address for address, _size in fake_store.registered}
+        assert registered_starts.isdisjoint({start for start, _end in pool_ranges})
+
+        # One pinned buffer per direction, since the default role is ``both``.
+        assert len(fake_store.registered) == 2
+        assert registered_starts == {
+            worker._load_staging.slot_address(0),
+            worker._save_staging.slot_address(0),
+        }
+
+
+def test_staging_put_hands_the_store_one_host_buffer_per_page(
+    store_config, fake_store, staged_copies
+):
+    layout = make_layout(regions_per_group=3)
+    with make_staged_worker(fake_store, store_config, layout=layout) as worker:
+        block_hash = b"\x07" * 16
+        worker._put([RequestTransfers(1, [PageTransfer(block_hash, 0, 2)])])
+
+        device_addresses, device_sizes = PageAddressing(layout).buffers(0, 2)
+        slot = worker._save_staging.slot_address(0)
+        (keys, addresses, sizes) = fake_store.put_calls[0]
+
+        assert keys == [worker._namespaces[0].key(block_hash)]
+        # The store sees one contiguous host buffer, and its length is the sum of
+        # the device regions. That equality is what keeps a staged write
+        # byte-identical to a zero-copy one, so either path can read the other's
+        # pages.
+        assert addresses == [[slot]]
+        assert sizes == [[sum(device_sizes)]]
+
+        # Every region was gathered, in order, into its place in the slot.
+        expected = []
+        offset = 0
+        for address, size in zip(device_addresses, device_sizes):
+            expected.append((slot + offset, address, size))
+            offset += size
+        assert staged_copies == expected
+
+
+def test_staging_get_scatters_back_to_the_device_regions(
+    store_config, fake_store, staged_copies
+):
+    layout = make_layout(regions_per_group=3)
+    with make_staged_worker(fake_store, store_config, layout=layout) as worker:
+        block_hash = b"\x03" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+
+        worker.bind_connector_meta(
+            SimpleNamespace(loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 5)])], saves=[])
+        )
+        worker.start_load_kv(None)
+
+        device_addresses, device_sizes = PageAddressing(layout).buffers(0, 5)
+        slot = worker._load_staging.slot_address(0)
+        (_keys, addresses, sizes) = fake_store.get_calls[0]
+        assert addresses == [[slot]]
+        assert sizes == [[sum(device_sizes)]]
+
+        # The scatter is the mirror of the gather: same split, opposite direction.
+        expected = []
+        offset = 0
+        for address, size in zip(device_addresses, device_sizes):
+            expected.append((address, slot + offset, size))
+            offset += size
+        assert staged_copies == expected
+
+
+def test_staging_does_not_scatter_a_failed_load(store_config, fake_store, staged_copies):
+    layout = make_layout()
+    with make_staged_worker(fake_store, store_config, layout=layout) as worker:
+        block_hash = b"\x09" * 16
+        key = worker._namespaces[0].key(block_hash)
+        fake_store.objects.add(key)
+        fake_store.fail_gets_for.add(key)
+
+        worker.bind_connector_meta(
+            SimpleNamespace(loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 1)])], saves=[])
+        )
+        with pytest.raises(RuntimeError, match="failed to load"):
+            worker.start_load_kv(None)
+
+        # A failed read leaves the slot holding whatever it held before. Copying
+        # that onto the page would put unrelated bytes where the runtime already
+        # promised computed KV.
+        assert staged_copies == []
+
+
+def test_worker_captures_the_ranks_device_at_registration(store_config, fake_store, fake_cuda):
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        # Read on the executor thread, where it is correct. torch's current
+        # device is thread-local, so the save thread cannot ask for it itself.
+        assert worker._device_index == 3
+
+
+def test_save_thread_adopts_the_ranks_device_not_the_thread_default(
+    store_config, fake_store, fake_cuda
+):
+    """Regression: the save thread must not run on torch's default device.
+
+    It issues staging copies against pointers owned by the rank's device. A
+    stream created on device 0 instead fails every copy with
+    cudaErrorInvalidValue, and only on ranks other than 0 -- which is exactly how
+    this escaped into a run.
+    """
+    with make_worker(fake_store, layout=make_layout()):
+        deadline = time.monotonic() + 5.0
+        while 3 not in fake_cuda and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert 3 in fake_cuda, f"save thread set devices {fake_cuda}, expected the rank's 3"
+        # Never the thread-local default, which is what the bug did.
+        assert 0 not in fake_cuda
+
+
+def test_staging_narrows_the_batch_to_the_budget(store_config, fake_store, staged_copies):
+    layout = make_layout(regions_per_group=2, num_slots=8)
+    page_bytes = PageAddressing(layout).bytes_per_page(0)
+    with make_staged_worker(
+        fake_store, store_config, layout=layout, budget=2 * page_bytes
+    ) as worker:
+        assert worker._save_staging.num_slots == 2
+        assert worker._batch_size == 2
+
+        hashes = [bytes([index]) * 16 for index in range(5)]
+        worker._put(
+            [
+                RequestTransfers(
+                    1, [PageTransfer(block_hash, 0, index) for index, block_hash in enumerate(hashes)]
+                )
+            ]
+        )
+        # Five pages through two slots: three calls, and no call wider than the
+        # slot count, which is the constraint staging adds.
+        assert [len(keys) for keys, _a, _s in fake_store.put_calls] == [2, 2, 1]
 
 
 # ---- scheduler ----

@@ -32,6 +32,7 @@ pinned until ``get_finished`` says the writes landed.
 """
 
 import threading
+import traceback
 from collections import defaultdict
 from queue import Queue
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -48,6 +49,14 @@ from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig
 from .keys import KeyNamespace
 from .metadata import MooncakeStoreMetadata, RequestTransfers
+from .staging import (
+    HostStagingPool,
+    describe_batch_for_get,
+    plan_slot_geometry,
+    stage_batch_for_put,
+    sync_stream as _sync_stream,
+    unstage_batch_after_get,
+)
 from .validation import validate_layout, validate_llm_args
 
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
@@ -129,6 +138,17 @@ def _batched(items: Sequence, size: int):
         yield items[start : start + size]
 
 
+def _stream_handle(stream) -> int:
+    """The raw CUDA stream handle behind a torch stream, or a handle as given.
+
+    ``None`` maps to 0, the default stream, which is what the runtime passes when
+    it has no stream of its own to offer.
+    """
+    if stream is None:
+        return 0
+    return int(getattr(stream, "cuda_stream", stream))
+
+
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
@@ -155,6 +175,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         )
         self._save_thread: Optional[threading.Thread] = None
         self._save_lock = threading.Lock()
+        # Host staging, when the pool cannot register device memory. One pool per
+        # direction so the executor thread and the save thread never share slots.
+        self._load_staging: Optional[HostStagingPool] = None
+        self._save_staging: Optional[HostStagingPool] = None
+        self._save_stream: Optional[torch.cuda.Stream] = None
+        # This rank's device, captured on the executor thread. The save thread
+        # cannot ask for it itself; see _drain_saves.
+        self._device_index: Optional[int] = None
+        # Pages per store call. Staging narrows this to the slots it can afford.
+        self._batch_size = self._config.transfer_batch_size
         # Save submissions still in flight, per request.
         self._outstanding_saves: Dict[int, int] = defaultdict(int)
         # Requests the runtime has told us are done producing KV. Their pages
@@ -167,12 +197,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         _LOCAL_WORKER_READY.set()
 
         logger.info(
-            "mooncake-store worker rank %d/%d ready (role=%s, model_key=%s, master=%s)",
-            self._rank,
-            self._world_size,
-            self._config.role.value,
-            self._model_key,
-            self._config.master_server_address,
+            f"mooncake-store worker rank {self._rank}/{self._world_size} ready "
+            f"(role={self._config.role.value}, model_key={self._model_key}, "
+            f"master={self._config.master_server_address})"
         )
 
     # ---- registration ----
@@ -200,14 +227,25 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         validate_layout(layout)
         addressing = PageAddressing(layout)
-        for start, end in addressing.registration_ranges():
-            status = self._store.register_buffer(start, end - start)
-            if status != 0:
-                raise RuntimeError(
-                    f"MooncakeDistributedStore.register_buffer failed with status "
-                    f"{status} for [{start:#x}, {end:#x}). Without registration "
-                    "the store cannot read or write these pages."
-                )
+        # Read here, on the executor thread, because it is thread-local and the
+        # save thread would otherwise see device 0 rather than this rank's.
+        if torch.cuda.is_available():
+            self._device_index = torch.cuda.current_device()
+        if self._config.stage_through_host:
+            self._open_staging(addressing)
+        else:
+            for start, end in addressing.registration_ranges():
+                status = self._store.register_buffer(start, end - start)
+                if status != 0:
+                    raise RuntimeError(
+                        f"MooncakeDistributedStore.register_buffer failed with status "
+                        f"{status} for [{start:#x}, {end:#x}). Without registration "
+                        "the store cannot read or write these pages. Registering "
+                        "device memory needs GPUDirect RDMA (nvidia_peermem or "
+                        "dma-buf); where that is unavailable, set "
+                        "stage_through_host to pass pages through pinned host "
+                        "memory instead."
+                    )
 
         self._addressing = addressing
         for layer_group_id in addressing.layer_group_ids:
@@ -229,10 +267,50 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             self._save_thread.start()
 
         logger.info(
-            "mooncake-store worker rank %d registered layout: %s",
-            self._rank,
-            addressing.describe(),
+            f"mooncake-store worker rank {self._rank} registered layout: "
+            f"{addressing.describe()}"
         )
+
+    def _open_staging(self, addressing: PageAddressing) -> None:
+        """Allocate and register the pinned slots pages will pass through.
+
+        Only the directions this role drives get a pool, since each one costs its
+        own pinned allocation and a consumer never gathers, nor a producer
+        scatter. The GPU pools are deliberately left unregistered: reaching them
+        is what staging exists to avoid needing.
+        """
+        max_bytes_per_page = max(
+            addressing.bytes_per_page(layer_group_id)
+            for layer_group_id in addressing.layer_group_ids
+        )
+        slot_bytes, num_slots = plan_slot_geometry(
+            max_bytes_per_page,
+            self._config.transfer_batch_size,
+            self._config.staging_buffer_bytes,
+        )
+        if self._config.role.loads:
+            self._load_staging = HostStagingPool(
+                slot_bytes=slot_bytes,
+                num_slots=num_slots,
+                store=self._store,
+                label="load",
+            )
+        if self._config.role.saves:
+            self._save_staging = HostStagingPool(
+                slot_bytes=slot_bytes,
+                num_slots=num_slots,
+                store=self._store,
+                label="save",
+            )
+        self._batch_size = min(self._config.transfer_batch_size, num_slots)
+        if self._batch_size < self._config.transfer_batch_size:
+            logger.warning(
+                f"mooncake-store rank {self._rank} reduced its transfer batch from "
+                f"{self._config.transfer_batch_size} to {self._batch_size} pages: "
+                f"staging {max_bytes_per_page} B pages within "
+                f"{self._config.staging_buffer_bytes} B does not fit more. Raise "
+                f"staging_buffer_bytes to restore the configured batch size."
+            )
 
     def _namespace(self, rank: int, layer_group_id: int, bytes_per_page: int) -> KeyNamespace:
         return KeyNamespace(
@@ -282,15 +360,17 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         try:
             present = self._store.batch_is_exist(keys)
-        except Exception:
-            logger.warning("mooncake-store lookup failed; treating as a miss", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                f"mooncake-store lookup failed; treating as a miss: "
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            )
             return 0
 
         if len(present) != len(keys):
             logger.warning(
-                "mooncake-store batch_is_exist returned %d results for %d keys; treating as a miss",
-                len(present),
-                len(keys),
+                f"mooncake-store batch_is_exist returned {len(present)} results for "
+                f"{len(keys)} keys; treating as a miss"
             )
             return 0
 
@@ -317,14 +397,21 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if not keys:
             return
 
+        staging = self._load_staging
+        handle = _stream_handle(stream) if staging is not None else 0
+
         for batch in zip(
-            _batched(keys, self._config.transfer_batch_size),
-            _batched(addresses, self._config.transfer_batch_size),
-            _batched(sizes, self._config.transfer_batch_size),
+            _batched(keys, self._batch_size),
+            _batched(addresses, self._batch_size),
+            _batched(sizes, self._batch_size),
         ):
             batch_keys, batch_addresses, batch_sizes = batch
+            if staging is None:
+                target_addresses, target_sizes = list(batch_addresses), list(batch_sizes)
+            else:
+                target_addresses, target_sizes = describe_batch_for_get(staging, batch_sizes)
             results = self._store.batch_get_into_multi_buffers(
-                list(batch_keys), list(batch_addresses), list(batch_sizes)
+                list(batch_keys), target_addresses, target_sizes
             )
             failed = [
                 key
@@ -340,8 +427,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                     f"{len(batch_keys)} pages; the affected KV slots were already "
                     f"reported as computed. First failure: {failed[:1]}"
                 )
+            if staging is not None:
+                # Only reached when every page in the batch landed, so no slot
+                # holding a failed read is copied over a device page.
+                unstage_batch_after_get(staging, batch_addresses, batch_sizes, handle)
+                # The slots are reused by the next batch and the forward pass
+                # reads these pages, so the scatter has to be complete before
+                # either happens.
+                _sync_stream(handle)
 
-        logger.debug("mooncake-store rank %d loaded %d pages", self._rank, total_pages)
+        logger.debug(f"mooncake-store rank {self._rank} loaded {total_pages} pages")
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
         """No-op: loads complete in ``start_load_kv``.
@@ -408,7 +503,20 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         return finished_saving, list(started_loading_req_ids)
 
     def _drain_saves(self) -> None:
-        torch.cuda.set_device(torch.cuda.current_device())
+        # Torch's current device is thread-local and a new thread starts at 0, so
+        # this has to be the device captured on the executor thread rather than
+        # whatever this one defaults to. Getting it wrong only shows up once the
+        # thread issues CUDA work of its own: the stream would belong to device 0
+        # while the KV pointers belong to the rank's device, and the copy fails
+        # with cudaErrorInvalidValue on every rank except 0.
+        if self._device_index is not None:
+            torch.cuda.set_device(self._device_index)
+        if self._save_staging is not None and torch.cuda.is_available():
+            # Owned by this thread so the gather never queues behind the
+            # executor's work, and created after set_device so it lands on the
+            # rank's device. Without a device there is nothing to order and the
+            # default stream handle stands in, which is what unit tests exercise.
+            self._save_stream = torch.cuda.Stream()
         while True:
             item = self._save_queue.get()
             if item is None:
@@ -421,7 +529,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 # Broad on purpose: this is the thread boundary. Anything that
                 # escapes here would be lost, so it is stashed and re-raised on
                 # the executor thread at the next connector call.
-                logger.error("mooncake-store save failed on rank %d: %s", self._rank, exc)
+                logger.error(
+                    f"mooncake-store save failed on rank {self._rank}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
                 with self._save_lock:
                     if self._save_error is None:
                         self._save_error = exc
@@ -439,10 +550,13 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if not keys:
             return
 
+        staging = self._save_staging
+        handle = _stream_handle(self._save_stream) if staging is not None else 0
+
         for batch in zip(
-            _batched(keys, self._config.transfer_batch_size),
-            _batched(addresses, self._config.transfer_batch_size),
-            _batched(sizes, self._config.transfer_batch_size),
+            _batched(keys, self._batch_size),
+            _batched(addresses, self._batch_size),
+            _batched(sizes, self._batch_size),
         ):
             batch_keys, batch_addresses, batch_sizes = batch
             # Skip pages another rank or another instance already wrote. The
@@ -456,20 +570,29 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             ]
             if not pending:
                 continue
+            source_addresses = [batch_addresses[i] for i in pending]
+            source_sizes = [batch_sizes[i] for i in pending]
+            if staging is not None:
+                # Gathering after the existence filter means a page that is
+                # already in the pool costs no copy.
+                source_addresses, source_sizes = stage_batch_for_put(
+                    staging, source_addresses, source_sizes, handle
+                )
+                # The store reads the slots on this thread, so they have to be
+                # filled first.
+                _sync_stream(handle)
             results = self._store.batch_put_from_multi_buffers(
                 [batch_keys[i] for i in pending],
-                [batch_addresses[i] for i in pending],
-                [batch_sizes[i] for i in pending],
+                source_addresses,
+                source_sizes,
             )
             failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
             if failures:
                 # A dropped write only costs a future cache miss, so it is worth
                 # a warning rather than failing a request that already answered.
                 logger.warning(
-                    "mooncake-store rank %d failed to save %d of %d pages",
-                    self._rank,
-                    failures,
-                    len(pending),
+                    f"mooncake-store rank {self._rank} failed to save {failures} of "
+                    f"{len(pending)} pages"
                 )
 
     # ---- shared ----
@@ -518,8 +641,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if store is not None:
             try:
                 store.close()
-            except Exception:
-                logger.warning("mooncake-store close failed", exc_info=True)
+            except Exception as exc:
+                logger.warning(
+                    f"mooncake-store close failed: {type(exc).__name__}: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
+        # Released only after the store is closed: it holds registrations against
+        # this memory, and the save thread was already joined above.
+        self._load_staging = None
+        self._save_staging = None
+        self._save_stream = None
         global _LOCAL_WORKER
         if _LOCAL_WORKER is self:
             _LOCAL_WORKER = None

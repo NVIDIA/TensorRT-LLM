@@ -33,6 +33,15 @@ Enable it with::
     kv_connector_config = KvCacheConnectorConfig(connector="mooncake-store")
 
 with ``MOONCAKE_CONFIG_PATH`` pointing at a Mooncake JSON config.
+
+By default the KV pools themselves are registered with Mooncake, so the store
+reads and writes device memory and no copy is added. That needs the HCA to be
+able to pin GPU pages -- GPUDirect RDMA, through ``nvidia_peermem`` or dma-buf.
+Where it is missing, registration fails on every pool range and the connector
+cannot start; ``"stage_through_host": true`` in the JSON config (or
+``TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST=1``) then routes pages through a
+pinned host buffer instead, so only host memory is ever registered. The stored
+bytes are the same either way, so the two modes can share a pool.
 """
 
 from .config import MooncakeStoreConnectorConfig, StoreRole

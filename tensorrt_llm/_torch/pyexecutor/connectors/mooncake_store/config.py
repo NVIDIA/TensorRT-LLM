@@ -34,6 +34,7 @@ __all__ = [
     "CONFIG_PATH_ENV",
     "MooncakeStoreConnectorConfig",
     "ROLE_ENV",
+    "STAGE_THROUGH_HOST_ENV",
     "StoreRole",
 ]
 
@@ -41,10 +42,15 @@ CONFIG_PATH_ENV = "MOONCAKE_CONFIG_PATH"
 ROLE_ENV = "TRTLLM_MOONCAKE_STORE_ROLE"
 CACHE_PREFIX_ENV = "TRTLLM_MOONCAKE_STORE_PREFIX"
 MODEL_KEY_ENV = "TRTLLM_MOONCAKE_STORE_MODEL_KEY"
+STAGE_THROUGH_HOST_ENV = "TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST"
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
 DEFAULT_CACHE_PREFIX = "trtllm"
+DEFAULT_STAGING_BUFFER_SIZE = 536870912
+
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off"}
 
 _SIZE_UNITS = {
     "": 1,
@@ -128,6 +134,15 @@ class MooncakeStoreConnectorConfig:
     #: How many page keys go into one store call. Bounds the size of a single
     #: RPC without bounding how much a request may transfer.
     transfer_batch_size: int = 64
+    #: Pass pages through a pinned host buffer instead of registering the KV
+    #: pools with Mooncake. Costs a copy in each direction and buys independence
+    #: from GPUDirect RDMA, without which registering device memory fails
+    #: outright. Leave off wherever the pool can reach GPU memory.
+    stage_through_host: bool = False
+    #: Ceiling on the pinned allocation per direction when staging. The pool is
+    #: sized from the layout's largest page, so this caps how many pages may be
+    #: in flight rather than how large one may be.
+    staging_buffer_bytes: int = DEFAULT_STAGING_BUFFER_SIZE
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -139,6 +154,8 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("global_segment_size must be >= 0")
         if self.transfer_batch_size <= 0:
             raise ValueError("transfer_batch_size must be > 0")
+        if self.stage_through_host and self.staging_buffer_bytes <= 0:
+            raise ValueError("staging_buffer_bytes must be > 0 when staging is on")
 
     @staticmethod
     def from_file(path: str) -> "MooncakeStoreConnectorConfig":
@@ -160,6 +177,10 @@ class MooncakeStoreConnectorConfig:
             cache_prefix=str(raw.get("cache_prefix", DEFAULT_CACHE_PREFIX)),
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
+            stage_through_host=bool(raw.get("stage_through_host", False)),
+            staging_buffer_bytes=_parse_size(
+                raw.get("staging_buffer_bytes", DEFAULT_STAGING_BUFFER_SIZE)
+            ),
         )
 
     @staticmethod
@@ -193,6 +214,18 @@ class MooncakeStoreConnectorConfig:
         model_key = os.getenv(MODEL_KEY_ENV)
         if model_key:
             updates["model_key"] = model_key
+        staging = os.getenv(STAGE_THROUGH_HOST_ENV)
+        if staging:
+            normalized = staging.strip().lower()
+            if normalized in _TRUE:
+                updates["stage_through_host"] = True
+            elif normalized in _FALSE:
+                updates["stage_through_host"] = False
+            else:
+                known = ", ".join(sorted(_TRUE | _FALSE))
+                raise ValueError(
+                    f"{STAGE_THROUGH_HOST_ENV}={staging!r} is not a boolean; use one of: {known}"
+                )
         return dataclasses.replace(self, **updates) if updates else self
 
     def resolve_model_key(self, model: Any) -> str:

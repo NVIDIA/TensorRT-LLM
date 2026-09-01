@@ -82,9 +82,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         self._worker: Optional[MooncakeStoreConnectorWorker] = None
 
         logger.info(
-            "mooncake-store leader ready (role=%s, tokens_per_block=%d)",
-            self._config.role.value,
-            self._tokens_per_block,
+            f"mooncake-store leader ready (role={self._config.role.value}, "
+            f"tokens_per_block={self._tokens_per_block})"
         )
 
     def wait_for_initialization(self):
@@ -139,10 +138,9 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         state.load_first_block = first_block
         state.load_blocks = hit_blocks
         logger.debug(
-            "mooncake-store matched %d blocks (%d tokens) for request %d",
-            hit_blocks,
-            hit_blocks * self._tokens_per_block,
-            request.request_id,
+            f"mooncake-store matched {hit_blocks} blocks "
+            f"({hit_blocks * self._tokens_per_block} tokens) "
+            f"for request {request.request_id}"
         )
         return hit_blocks * self._tokens_per_block, False
 
