@@ -57,13 +57,13 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     )
     target_sparsity: Optional[float] = PydanticField(
         default=None,
-        gt=0.0,
+        ge=0.0,
         le=1.0,
         description="Semantic target sparsity in [0, 1]; requires a calibration formula.",
     )
     disabled_until_timestep: Optional[float] = PydanticField(
         default=None,
-        gt=0.0,
+        ge=0.0,
         le=1.0,
         description="Normalized timestep cutoff below which skip-softmax is enabled.",
     )
@@ -226,7 +226,7 @@ class SolAttnAttentionConfig(BaseSparseAttentionConfig):
 
     Dynamic block routing + sparse computation + approximation correction in
     one online-softmax pass (arXiv:2607.24027). Kernel is CuTeDSL, sm100
-    (B200/GB200) and sm120 (RTX Blackwell) only, head_dim=128, bf16, MHA.
+    (B200/GB200) only, head_dim=128, bf16, MHA.
 
     On an unsupported *shape, dtype, or architecture* the kernel falls back to
     dense SDPA and counts the fallback, so setting this config on the wrong GPU
@@ -247,7 +247,7 @@ class SolAttnAttentionConfig(BaseSparseAttentionConfig):
     kv_splits: Literal["auto", "1"] = PydanticField(
         "auto",
         description=(
-            "KV split policy. Only 1 split is valid on the shipped sm100/sm120 "
+            "KV split policy. Only 1 split is valid on the shipped sm100 "
             "kernels, so 'auto' and '1' are equivalent; the 2/4 path was "
             "SM90-only and returns with that kernel. Constrained rather than a "
             "free string because any other value is rejected deep inside the "
@@ -301,7 +301,7 @@ class VideoSparseAttentionConfig(StrictBaseModel):
     )
     vsa_sparsity: float = PydanticField(
         0.9,
-        gt=0.0,
+        ge=0.0,
         le=1.0,
         description=(
             "Fraction of cubes dropped on the fine stage. 0.0 keeps all cubes "
