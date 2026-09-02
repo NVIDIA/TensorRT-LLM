@@ -469,6 +469,9 @@ class SpecMetadata:
     request_ids: Optional[List[int]] = None
     # Sequence length for each request.
     seq_lens: Optional[List[int]] = None
+    # Pinned copy of scalar position ids. These are sequential token indices regardless
+    # of rope flavor, so drafters can read a token's position without a D2H sync
+    host_position_ids: Optional[torch.Tensor] = None
     # The gather ids for logits.
     gather_ids: Optional[torch.Tensor] = None
     # The number of accepted draft tokens for each request.

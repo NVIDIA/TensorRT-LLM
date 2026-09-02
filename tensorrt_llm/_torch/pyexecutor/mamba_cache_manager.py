@@ -1454,16 +1454,16 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         if (self._use_replay_state_update
                 and self.prev_num_accepted_tokens is not None
                 and self.cache_buf_idx is not None):
-            self.prev_num_accepted_tokens[context_slots] = 0
-            self.cache_buf_idx[context_slots] = 0
+            self.prev_num_accepted_tokens.index_fill_(0, context_slots, 0)
+            self.cache_buf_idx.index_fill_(0, context_slots, 0)
             if self.old_x is not None:
-                self.old_x[:, context_slots] = 0
+                self.old_x.index_fill_(1, context_slots, 0)
             if self.old_B is not None:
-                self.old_B[:, context_slots] = 0
+                self.old_B.index_fill_(1, context_slots, 0)
             if self.old_dt is not None:
-                self.old_dt[:, context_slots] = 0
+                self.old_dt.index_fill_(1, context_slots, 0)
             if self.old_dA_cumsum is not None:
-                self.old_dA_cumsum[:, context_slots] = 0
+                self.old_dA_cumsum.index_fill_(1, context_slots, 0)
 
         if self.mamba_ssm_rand_seed is None:
             return
@@ -1476,10 +1476,9 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
             for slot in host_slots
         ]
         self.mamba_ssm_rand_seed[context_slots] = torch.tensor(
-            new_seeds,
-            dtype=torch.int64,
-            device=self.mamba_ssm_rand_seed.device,
-        )
+            new_seeds, dtype=torch.int64,
+            pin_memory=prefer_pinned()).to(self.mamba_ssm_rand_seed.device,
+                                           non_blocking=True)
 
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
