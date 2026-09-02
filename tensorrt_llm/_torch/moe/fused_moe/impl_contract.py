@@ -41,6 +41,23 @@ class MoEStaticCapability:
     supports_moe_lora: bool = False
     # Legacy gate: CuteDslFusedMoE isinstance check in ConfigurableMoE DWDP.
     supports_dwdp: bool = False
+    # Legacy gate: ``assert moe_cls in supported_load_balancer_backends`` in
+    # ``create_moe_backend``. Not the same question as the instance-level
+    # ``_supports_load_balancer()``, which TRTLLMGenFusedMoE overrides to mean
+    # "separated routing is used".
+    supports_eplb: bool = False
+    # Legacy gate: the ``assert moe_cls in [...]`` bias allow-list in
+    # ``create_moe_backend``. Per-expert FC bias from the checkpoint, added
+    # before the activation functor runs -- not an activation constant.
+    supports_expert_bias: bool = False
+    # Legacy gate: the three ``assert not apply_router_weight_on_input`` checks
+    # keyed on ``moe_cls`` in ``create_moe_backend``. The fold itself belongs to
+    # MoEScheduler (``x = x * token_final_scales``), so what a backend declares
+    # here is whether it handles what the fold leaves behind: ``None`` scales,
+    # or all-ones under a DeepEP / NCCL comm strategy. Backends that reject the
+    # flag in their own constructor keep doing so; that check guards direct
+    # construction, which never reaches the factory.
+    supports_apply_router_weight_on_input: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +111,11 @@ class MoEProblem:
     bias: Optional[bool] = None
     #: ``ActivationType`` member name; omitted values canonicalize to SwiGLU.
     activation: str = "Swiglu"
+    #: Which of the ``alpha`` / ``beta`` / ``clamp`` ABI registers the caller's
+    #: activation fills; the kind alone does not say, since clamped and
+    #: unclamped SwiGLU share one ``ActivationType``. Empty if the call site
+    #: supplied no activation carrier.
+    activation_constants: frozenset[str] = frozenset()
     #: ``RoutingMethodType`` member name; None means the call site did not say.
     routing: Optional[str] = None
 
@@ -367,6 +389,7 @@ class MoEResolutionReport:
                 "swiglu_gptoss_style": self.problem.swiglu_gptoss_style,
                 "bias": self.problem.bias,
                 "activation": self.problem.activation,
+                "activation_constants": sorted(self.problem.activation_constants),
                 "routing": self.problem.routing,
             },
             "deployment": {

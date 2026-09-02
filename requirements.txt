@@ -36,7 +36,9 @@ nccl4py>=0.3.1,<0.4
 nvidia-cuda-nvrtc
 transformers==5.5.4
 prometheus_client
-prometheus_fastapi_instrumentator
+# 8.x is the first series to allow starlette>=1.0.0; 7.1.0 pins starlette<1.0.0
+# and can no longer resolve against the starlette floor below.
+prometheus_fastapi_instrumentator>=8.1.0
 pydantic>=2.9.1
 pydantic-settings[yaml]
 msgspec
@@ -52,9 +54,9 @@ click>=8.3.1,<8.4
 click_option_group>=0.5.3
 aenum
 pyzmq
-fastapi>=0.120.1,<=0.121.3
-starlette>=0.49.1
-uvicorn>=0.49.0
+fastapi>=0.136.3
+starlette>=1.3.1
+uvicorn
 setuptools<80
 # FlashInfer source builds (--no-build-isolation) need packaging>=24.2 for setuptools license-expression validation
 packaging>=24.2

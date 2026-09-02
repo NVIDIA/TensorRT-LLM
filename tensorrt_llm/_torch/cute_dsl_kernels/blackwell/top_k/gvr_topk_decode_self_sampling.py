@@ -3415,9 +3415,6 @@ class GvrTopkRegKernel:
         j = cutlass.Int32(0)
         r = cutlass.Int32(0)
         tinc = cutlass.Int32(0)
-        cnt = cutlass.Int32(0)
-        bit = cutlass.Int32(0)
-        abv = cutlass.Int32(0)
         nA = cutlass.Int32(0)
         nT = cutlass.Int32(0)
         n1 = cutlass.Int32(0)
@@ -3463,8 +3460,6 @@ class GvrTopkRegKernel:
         nbw = cutlass.Int32(0)
         uq = cutlass.Uint32(0)
         vq = cutlass.Uint32(0)
-        kt = cutlass.Uint32(0)
-        klo = cutlass.Uint32(0)
         kv = cutlass.Uint32(0)
         rlo = cutlass.Uint32(0)
         rhi = cutlass.Uint32(0)
@@ -3762,16 +3757,28 @@ class GvrTopkRegKernel:
             above = s_res[RES_ABOVE]
             m = s_res[RES_M]
             Bv = s_res[RES_B]
+            tot = s_res[RES_TOT]
             need = k - above
             whole = cutlass.Int32(0)
             if need >= m:
                 whole = cutlass.Int32(1)
 
-            # ---- ESCAPE: 32-step key-space bisection
+            # ---- ESCAPE: radix descent over the key space
+            # Count-crossing enforcement: when the hint-derived bracket's low
+            # edge sits above the true k-th value, the classify arms count
+            # fewer than k entries (q < 0 is never histogrammed) and the
+            # crossing scan pins its bin-0 fallback as a fake crossing — the
+            # whole-bin emit would then stop at the histogram total and leave
+            # out_row[tot:k) unwritten. Exactness must come from the
+            # count-crossing invariant, never from the bracket estimate: when
+            # the histogram never reaches k (tot < k), take the escape — it
+            # ranks the FULL row in key space, independent of the bracket.
             esc = cutlass.Int32(0)
             if whole == cutlass.Int32(0):
                 if m > cmp_:
                     esc = cutlass.Int32(1)
+            if tot < k:
+                esc = cutlass.Int32(1)
             if esc == cutlass.Int32(1):
                 if tid == cutlass.Int32(0):
                     s_cnt[0] = cutlass.Int32(0)
@@ -3785,61 +3792,106 @@ class GvrTopkRegKernel:
                     s_e12[0] = cutlass.Int32(0)
                     s_e12[1] = cutlass.Int32(0)
                 cute.arch.barrier()  # escape init
-                klo = cutlass.Uint32(0)
-                bit = cutlass.Int32(31)
-                while bit >= cutlass.Int32(0):
-                    kt = klo | (cutlass.Uint32(1) << cutlass.Uint32(bit))
-                    cnt = cutlass.Int32(0)
-                    for s in cutlass.range_constexpr(S):
-                        ix = (
-                            (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
-                        ) + cutlass.Int32(s % 4)
-                        if ix < n:
-                            if fkey(_val(frags, s)) >= kt:
-                                cnt = cnt + cutlass.Int32(1)
-                    if tid < ntail:
-                        if fkey(tval) >= kt:
-                            cnt = cnt + cutlass.Int32(1)
-                    cnt = cutlass.Int32(warp_add_i32(cnt))
-                    if lane == cutlass.Int32(0):
-                        if cnt != cutlass.Int32(0):
-                            atomic_add_cta(s_cnt.iterator, cnt)
-                    cute.arch.barrier()  # count published
-                    if s_cnt[0] >= k:
-                        klo = kt
-                    cute.arch.barrier()  # count consumed
-                    if tid == cutlass.Int32(0):
-                        s_cnt[0] = cutlass.Int32(0)
-                    cute.arch.barrier()  # count reset
-                    bit = bit - cutlass.Int32(1)
-                ethr = cutlass.Int64(klo)  # k-th largest key
-                abv = cutlass.Int32(0)
-                for s in cutlass.range_constexpr(S):
-                    ix = (
-                        (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
-                    ) + cutlass.Int32(s % 4)
-                    if ix < n:
-                        if cutlass.Int64(fkey(_val(frags, s))) > ethr:
-                            abv = abv + cutlass.Int32(1)
-                if tid < ntail:
-                    if cutlass.Int64(fkey(tval)) > ethr:
-                        abv = abv + cutlass.Int32(1)
-                abv = cutlass.Int32(warp_add_i32(abv))
-                if lane == cutlass.Int32(0):
-                    if abv != cutlass.Int32(0):
-                        atomic_add_cta(s_cnt.iterator + 1, abv)
-                cute.arch.barrier()  # above-count published
-                nA = s_cnt[1]
-                nT = k - nA
-                # (rezero dropped — emit counters live in s_e12, see race-fix note)
-                cute.arch.barrier()  # nA consumed
+                # Vector-lane bound: the register batch holds real data only
+                # below 4*n4 — lanes in [4*n4, n) are the -inf FILL of the
+                # last partial float4 (the real values there live in tval).
+                # Bounding by n would count/emit each tail element twice
+                # (once as a fill key, once via tval): benign while the tie
+                # threshold is finite (a fill key loses every compare), but
+                # it emits duplicate indices when the tie class is the -inf
+                # key itself (in-window -inf entries are admissible).
+                nvec = n4 << cutlass.Int32(2)
+                # Narrow LNBH bits per level over the register batch — the
+                # same descent the Phase-3 ck fallback below runs — instead of
+                # one rescan per key bit: ceil(32/LNBH) levels at worst and
+                # two in practice, since the first level's LNBH bits already
+                # cut inside the exponent field, where the bisection took 32.
+                # The exit arms carry the count crossing, so the old separate
+                # above-count pass folds in.
+                # Neither ethr nor aboveC is carried across the descent: ethr
+                # is an Int64 derivable from rlo and the exit arm, and
+                # aboveC + needC == k holds at every exit.
+                rlo = cutlass.Uint32(0)
+                rhi = cutlass.Uint32(0xFFFFFFFF)
+                needC = k
+                mm = n  # in-range count, carried from the previous level
+                lev = cutlass.Int32(0)
+                state = cutlass.Int32(0)  # 1 -> ethr = rlo, 2 -> ethr = rlo - 1
+                while state == cutlass.Int32(0):
+                    if needC == mm:
+                        # whole in-range block is needed: threshold below it
+                        needC = cutlass.Int32(0)
+                        state = cutlass.Int32(2)
+                    if state == cutlass.Int32(0):
+                        if rlo >= rhi:  # single key left == the k-th key
+                            state = cutlass.Int32(1)
+                        if lev >= cutlass.Int32(34):  # non-binding: sh2 strictly shrinks
+                            state = cutlass.Int32(1)
+                    if state == cutlass.Int32(0):
+                        d2 = rhi - rlo
+                        b2w = cutlass.Int32(32) - clz_i32(cutlass.Int32(d2 | cutlass.Uint32(1)))
+                        sh2 = cutlass.Int32(0)
+                        if b2w > cutlass.Int32(LNBH):
+                            sh2 = b2w - cutlass.Int32(LNBH)
+                        for z in cutlass.range_constexpr(self.nbh // self.blk):
+                            s_hist[tid + cutlass.Int32(z * self.blk)] = cutlass.Int32(0)
+                        cute.arch.barrier()  # esc level clear
+                        for s in cutlass.range_constexpr(S):
+                            ix = (
+                                (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                            ) + cutlass.Int32(s % 4)
+                            if ix < nvec:
+                                uev = fkey(_val(frags, s))
+                                if uev >= rlo:
+                                    if uev <= rhi:
+                                        bne = _umin_u32(
+                                            (uev - rlo) >> cutlass.Uint32(sh2),
+                                            cutlass.Uint32(self.nbh - 1),
+                                        )
+                                        atomic_add_cta(
+                                            s_hist.iterator + cutlass.Int32(bne),
+                                            cutlass.Int32(1),
+                                        )
+                        if tid < ntail:
+                            uev = fkey(tval)
+                            if uev >= rlo:
+                                if uev <= rhi:
+                                    bne = _umin_u32(
+                                        (uev - rlo) >> cutlass.Uint32(sh2),
+                                        cutlass.Uint32(self.nbh - 1),
+                                    )
+                                    atomic_add_cta(
+                                        s_hist.iterator + cutlass.Int32(bne), cutlass.Int32(1)
+                                    )
+                        cute.arch.barrier()  # esc level hist
+                        if cutlass.const_expr(self.nbh > 1024):
+                            scan_cross_w(s_hist, s_ws, needC, tid, s_res, blk=self.blk, nb=self.nbh)
+                        else:
+                            find_cross(s_hist, needC, tid, s_res, nb=self.nbh)
+                        cute.arch.barrier()  # esc level scan
+                        needC = needC - s_res[RES_ABOVE]
+                        mm = s_res[RES_M]
+                        b_lv = s_res[RES_B]
+                        nlo = rlo + (cutlass.Uint32(b_lv) << cutlass.Uint32(sh2))
+                        if b_lv != cutlass.Int32(self.nbh - 1):
+                            rhi = nlo + (
+                                (cutlass.Uint32(1) << cutlass.Uint32(sh2)) - cutlass.Uint32(1)
+                            )
+                        rlo = nlo
+                        lev = lev + cutlass.Int32(1)
+                nA = k - needC
+                nT = needC
+                ethr = cutlass.Int64(rlo)
+                if state == cutlass.Int32(2):
+                    ethr = ethr - cutlass.Int64(1)
+                cute.arch.barrier()  # descent done
                 lml = cutlass.Int32(cute.arch.lanemask_lt())
                 for s in cutlass.range_constexpr(S):
                     ixv = (
                         (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                     ) + cutlass.Int32(s % 4)
                     u64 = cutlass.Int64(-1)
-                    if ixv < n:
+                    if ixv < nvec:
                         u64 = cutlass.Int64(fkey(_val(frags, s)))
                     q1e = cutlass.Int32(0)
                     q2e = cutlass.Int32(0)

@@ -127,6 +127,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      checkpoint_io_policy:
+        annotation: Literal['auto', 'native', 'rank_striped_read_ahead']
+        default: auto
+        status: prototype
       mx_config:
         annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
         default: null
@@ -238,6 +242,10 @@ methods:
       enable_autotuner:
         annotation: bool
         default: True
+        status: prototype
+      use_fine_grained_sync:
+        annotation: bool
+        default: False
         status: prototype
       enable_layerwise_nvtx_marker:
         annotation: bool
