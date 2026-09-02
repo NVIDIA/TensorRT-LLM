@@ -34,3 +34,23 @@ def test_unit_tests(build_google_tests, test_group, build_dir, lora_setup):
                             env=cpp_env,
                             timeout=2700,
                             parallel=parallel)
+
+
+@pytest.mark.parametrize("build_kv_cache_compression_tests", ["80", "100"],
+                         indirect=True)
+def test_kv_cache_compression_unit_tests(build_kv_cache_compression_tests,
+                                         build_dir):
+
+    xml_name = "results-unit-tests-kv_cache_compression.xml"
+
+    # Run the binary directly: the lightweight fixture builds only this gtest,
+    # so a ctest directory scan would trip over unbuilt neighbors.
+    _cpp.run_command(
+        [
+            f"{build_dir}/tests/unit_tests/kernels/nvfp4ColdPageKernelsTest",
+            f"--gtest_output=xml:{build_dir}/{xml_name}",
+        ],
+        cwd=build_dir,
+        env={**_os.environ},
+        timeout=2700,
+    )
