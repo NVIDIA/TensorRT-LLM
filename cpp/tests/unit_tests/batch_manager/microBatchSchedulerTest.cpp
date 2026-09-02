@@ -66,7 +66,7 @@ protected:
             /*isStreaming=*/false,
             /*endId=*/std::nullopt,
             /*padId=*/std::nullopt, /*embeddingBias=*/std::nullopt,
-            /*badWordsList=*/std::nullopt, /*stopWordsList=*/std::nullopt, /*positionIds=*/std::nullopt,
+            /*positionIds=*/std::nullopt,
             /*promptEmbeddingTable=*/std::nullopt, /*promptVocabSize=*/std::nullopt,
             /*multimodalHashes=*/std::nullopt, /*multimodalPos=*/std::nullopt, /*multimodalLength=*/std::nullopt,
             /*multimodalUuids=*/std::nullopt, /*multimodalEmbedding=*/std::nullopt,

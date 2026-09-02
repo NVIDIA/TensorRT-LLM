@@ -64,8 +64,6 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         // No speculative decoding config, draft tokens should be empty
         EXPECT_EQ(llmReq.getNumDraftTokens(), 0);
         EXPECT_FALSE(llmReq.getEmbeddingBias().has_value());
-        EXPECT_FALSE(llmReq.getBadWordsList().has_value());
-        EXPECT_FALSE(llmReq.getStopWordsList().has_value());
         EXPECT_FALSE(llmReq.getPromptEmbeddingTable().has_value());
         EXPECT_FALSE(llmReq.getPromptVocabSize().has_value());
     }
@@ -82,57 +80,6 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().nbDims, 2);
         EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().d[0], 1);
         EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().d[1], vocabSize);
-    }
-
-    // bad/stop words
-    {
-        texec::Request execReq(inputTokens, maxNewTokens);
-        SizeType32 vocabSize = 100;
-        // Try adding embedding bias
-        std::list<VecTokens> badWords{{1, 2, 3}, {4, 5}, {9}};
-        std::list<VecTokens> stopWords{{1, 3}, {4}};
-        execReq.setBadWords(badWords);
-        execReq.setStopWords(stopWords);
-        tb::LlmRequest llmReq(requestId, execReq);
-        EXPECT_TRUE(llmReq.getBadWordsList().has_value());
-        EXPECT_TRUE(llmReq.getStopWordsList().has_value());
-        {
-            auto badWordsTensor = llmReq.getBadWordsList().value();
-            EXPECT_EQ(badWordsTensor->getDataType(), tensorrt_llm::DataType::kINT32);
-            EXPECT_EQ(badWordsTensor->getShape().nbDims, 3);
-            EXPECT_EQ(badWordsTensor->getShape().d[0], 1);
-            EXPECT_EQ(badWordsTensor->getShape().d[1], 2);
-            EXPECT_EQ(badWordsTensor->getShape().d[2], 6);
-            auto data = tr::bufferCast<int32_t>(*badWordsTensor);
-            EXPECT_EQ(data[0], 1);
-            EXPECT_EQ(data[1], 2);
-            EXPECT_EQ(data[2], 3);
-            EXPECT_EQ(data[3], 4);
-            EXPECT_EQ(data[4], 5);
-            EXPECT_EQ(data[5], 9);
-            EXPECT_EQ(data[6 + 0], 3);
-            EXPECT_EQ(data[6 + 1], 5);
-            EXPECT_EQ(data[6 + 2], 6);
-            EXPECT_EQ(data[6 + 3], -1);
-            EXPECT_EQ(data[6 + 4], -1);
-            EXPECT_EQ(data[6 + 5], -1);
-        }
-
-        {
-            auto stopWordsTensor = llmReq.getStopWordsList().value();
-            EXPECT_EQ(stopWordsTensor->getDataType(), tensorrt_llm::DataType::kINT32);
-            EXPECT_EQ(stopWordsTensor->getShape().nbDims, 3);
-            EXPECT_EQ(stopWordsTensor->getShape().d[0], 1);
-            EXPECT_EQ(stopWordsTensor->getShape().d[1], 2);
-            EXPECT_EQ(stopWordsTensor->getShape().d[2], 3);
-            auto data = tr::bufferCast<int32_t>(*stopWordsTensor);
-            EXPECT_EQ(data[0], 1);
-            EXPECT_EQ(data[1], 3);
-            EXPECT_EQ(data[2], 4);
-            EXPECT_EQ(data[3 + 0], 2);
-            EXPECT_EQ(data[3 + 1], 3);
-            EXPECT_EQ(data[3 + 2], -1);
-        }
     }
 
     // Prompt tuning
