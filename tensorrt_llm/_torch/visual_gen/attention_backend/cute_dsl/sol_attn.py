@@ -23,7 +23,7 @@ https://github.com/NVlabs/Sana/tree/sol-engine, pinned at commit
 https://github.com/NVlabs/Sana/commit/5fe5feb -- see
 ``cute_dsl_kernels/blackwell/sol_attn/THIRD_PARTY_NOTICES.md`` for the pin
 and its currency-check note) under ``..cute_dsl_kernels.blackwell.sol_attn``
-/ ``sol_attn_backend.py``. Only the sm100 (B200/GB200) and sm120 (RTX
+/ ``sol_attn_backend.py``. Only the sm100 (B200/GB200)
 Blackwell) kernels are carried; the upstream sm89/sm90 kernels and the Triton
 reference path are not, and the FlashAttention CuTe helpers they needed come
 from the ``flash-attn-4`` dependency rather than a vendored copy.
@@ -109,7 +109,7 @@ def _parse_dense_layers(spec: Optional[str]) -> frozenset:
 
 
 class SolAttnAttention(AttentionBackend):
-    """Sol-Attn dynamic block-routing sparse attention (CuTeDSL, sm100/sm120).
+    """Sol-Attn dynamic block-routing sparse attention (CuTeDSL, sm100).
 
     The kernel wrapper already falls back to dense SDPA on any unsupported
     shape/dtype/arch (see ``_run_sol_attn_bthd``); this class only adds the
