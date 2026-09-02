@@ -175,10 +175,27 @@ def test_evaluator_decomposes_the_accept_evidence_capture():
     prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
     assert "perf-nsight-system-analysis" in prompt
     assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
-    assert "profile/nsys_analysis/" in prompt
+    assert "nsys_analysis" in prompt
     assert "the launch-starved share shrunk" in prompt
     # Never blocks the verdict, never states an unmeasured split.
     assert "never block the verdict on it" in prompt
+
+
+def test_evaluator_diffs_with_the_skills_comparative_mode():
+    # The skill differences two variants natively; running it twice
+    # single-variant and eyeballing the trees throws that away.
+    prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
+    assert "--variant before" in prompt
+    assert "--variant after" in prompt
+    assert "difference/rank-0/iteration.json" in prompt
+    # Per-call deltas survive a launch-count mismatch between the sides.
+    assert "difference/rank-0/module_slice.json" in prompt
+    # One taxonomy across both sides — a diff across two is not a diff.
+    assert "a diff across two taxonomies is not a diff" in prompt
+    # Degrades where the earlier capture kept no sqlite.
+    assert "kept no `.sqlite`" in prompt
+    # The mechanism claim names a row, not a vibe.
+    assert "is not a mechanism" in prompt
 
 
 def test_run_a2a_capture_feeds_the_timeline_pipeline():
@@ -1224,3 +1241,50 @@ def test_measuring_roles_inherit_the_server_identity_checks():
         assert "port 8000 already in use" in text, f"{name} lost the port precheck"
         assert "owns_port" in text, f"{name} lost the listener-ownership check"
         assert "not owned by PID" in text, f"{name} lost the identity failure path"
+
+
+# --------------------------------------------------------------------------- #
+# Consuming the nsys timeline analysis: headroom bounds what an item may
+# claim, and the skill's opportunity list must be accounted for rather than
+# read once and paraphrased into prose.
+# --------------------------------------------------------------------------- #
+
+
+def test_analyzer_bounds_expected_gain_by_measured_headroom():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # Ranking hot kernels by cost alone is how rounds get spent on kernels
+    # that were already at their roofline.
+    assert "Headroom bounds the gain, cost only ranks it" in prompt
+    assert "utilization.json" in prompt
+    assert "headroom_verdict" in prompt
+    # An at-roofline operator can still be removed — it just cannot be
+    # made faster.
+    assert "elimination or fusion" in prompt
+    # Unsampled is not zero, and a contaminated row is directional only.
+    assert "cannot carry an item by itself" in prompt
+    # Two independent verdicts on one kernel; a disagreement is reported.
+    assert "disagree for the same kernel" in prompt
+
+
+def test_analyzer_must_account_for_every_nsys_opportunity():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "Cover the nsys opportunity list" in prompt
+    assert "nsys_analysis/items.json" in prompt
+    assert "nsys_items" in prompt
+    # Deterministic teeth, not a request.
+    assert "stops the round rather than quietly evaporating" in prompt
+    # Dismissal is a first-class answer — padding the roadmap is not.
+    assert "Dismissing is a legitimate answer" in prompt
+
+
+def test_roadmap_spec_documents_the_nsys_items_block():
+    spec = _norm(ROADMAP_SPEC)
+    assert "nsys_items:" in spec
+    assert "disposition: item" in spec
+    assert "disposition: dismissed" in spec
+    # Same vocabulary as the kernel ledger, and the same reason for it.
+    assert "must name a real roadmap item id, any status" in spec
+    # Absent when the pipeline could not run; required when it did.
+    assert "omitted entirely when it does not" in spec
+    # The block is rewritten each round, so a dropped row is a violation.
+    assert "a dropped row reads as an unaccounted opportunity" in spec

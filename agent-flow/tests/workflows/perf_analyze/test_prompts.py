@@ -7,6 +7,7 @@ flags per run, so these tests pin the flags that template guarantees.
 
 from __future__ import annotations
 
+import json
 import re
 
 from agent_flow.workflows.perf_analyze.prompts import (
@@ -27,6 +28,7 @@ from agent_flow.workflows.perf_analyze.prompts._common import (
     SOL_CORRELATION_METHOD,
     SOL_METHODOLOGY_FALLBACK,
     SOL_REPORTER_GUIDANCE,
+    TRTLLM_TAXONOMY_PATH,
 )
 
 
@@ -893,3 +895,121 @@ def test_lifecycle_verifies_the_listener_belongs_to_our_process_group():
 def test_lifecycle_confirms_the_port_freed_after_teardown():
     block = _norm(SERVER_LIFECYCLE)
     assert "that :8000 is free again" in block
+
+
+# --------------------------------------------------------------------------- #
+# The nsys-timeline pipeline's own artifacts: the taxonomy it classifies with,
+# and the products the findings (and, downstream, the roadmap) are built from.
+# Running `run_all.py` is not the same as consuming what it wrote.
+# --------------------------------------------------------------------------- #
+
+
+def test_timeline_pipeline_uses_the_trtllm_taxonomy_not_the_skill_template():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The skill's template is shaped for training frameworks and matches
+    # almost nothing in a decode step; copying it verbatim leaves the hot
+    # kernels uncategorized and the Step 5 mode decision meaningless.
+    assert f"cp {TRTLLM_TAXONOMY_PATH}" in prompt
+    # Named only to be ruled out as the source, never as the thing to copy.
+    assert "not the skill's `references/taxonomy_template.json`" in prompt
+    assert "shaped for training frameworks" in prompt
+
+
+def test_trtllm_taxonomy_asset_is_loadable_and_keeps_the_reserved_categories():
+    data = json.loads(TRTLLM_TAXONOMY_PATH.read_text(encoding="utf-8"))
+    overall = data["Overall"]
+    # `gemm` / `mha` are the pipeline's hard-coded Step 4 anchors and
+    # `nccl` its collective class; renaming one silently empties a view.
+    assert {"gemm", "mha", "nccl"} <= set(overall)
+    # The exact-name overlay the correlation would merge into.
+    assert data["ExactNames"] == {}
+    for category, pattern in overall.items():
+        re.compile(pattern)  # a broken regex fails the whole pipeline
+        assert pattern.strip(), category
+
+
+def test_trtllm_taxonomy_classifies_real_trtllm_kernel_names():
+    overall = json.loads(TRTLLM_TAXONOMY_PATH.read_text(encoding="utf-8"))["Overall"]
+    compiled = [(name, re.compile(rx)) for name, rx in overall.items()]
+
+    def classify(kernel: str) -> str:
+        return next((name for name, rx in compiled if rx.search(kernel)), "uncategorized")
+
+    # First-match-wins ordering has to survive edits: a collective that
+    # carries `moe` in its name is comm, and a grouped MoE matmul is a
+    # GEMM rather than MoE plumbing.
+    assert classify("ncclDevKernel_AllReduce_Sum_bf16_RING_LL") == "nccl"
+    assert classify("moeA2ADispatchKernel") == "nccl"
+    assert classify("nvjet_tst_128x128_64x6_1x1_h_bz_coopA") == "gemm"
+    assert classify("void tensorrt_llm::kernels::moe_gemm::moeGemmKernel") == "gemm"
+    assert classify("fmha_v2_flash_attention_fp16_128_64_sm90_kernel") == "mha"
+    assert classify("xqa_kernel_dt_fp16_d128") == "mha"
+    assert classify("flashinfer::BatchDecodeWithPagedKVCacheKernel") == "mha"
+    assert classify("void tensorrt_llm::kernels::generalRmsNorm") == "norm"
+    assert classify("finalizeMoeRoutingKernel") == "moe"
+    assert classify("applyBiasRopeUpdateKVCache") == "rope"
+    assert classify("triton_poi_fused_add_mul_0") == "triton"
+
+
+def test_analyzer_verifies_the_taxonomy_before_quoting_a_category():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "Verify the taxonomy before quoting a single category number" in prompt
+    # The three buckets that say how much of the classification is real.
+    assert "classified_by" in prompt
+    assert "uncategorized_above_threshold" in prompt
+    # Iterating is free — the pipeline re-reads files, it does not re-profile.
+    assert "re-reads files only, no server, no GPU" in prompt
+    # The reserved names are load-bearing, not stylistic.
+    assert "hard-codes them as the Step 4 anchors" in prompt
+
+
+def test_analyzer_reads_the_per_op_breakdown_and_its_mode():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # Step 5 decides between two shapes and writes a different file each
+    # way; the busy rungs size the prize, this names the target.
+    assert "fused_share_of_residual_pct" in prompt
+    assert "module_slicing_recommended" in prompt
+    assert "opgroup.json" in prompt
+    assert "module_slice.json" in prompt
+    assert "window_labels" in prompt
+    assert "names *what to optimize*" in prompt
+
+
+def test_analyzer_authors_the_skills_items_json_handoff():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The skill's machine-readable opportunity list, authored from its own
+    # numbers — the artifact downstream stages key coverage on.
+    assert "items.json" in prompt
+    assert "magnitudeMs" in prompt
+    assert "boundingResource" in prompt
+    assert 'Write `{"items": []}` when the analysis genuinely found nothing' in prompt
+    # An opportunity omitted reads as one that does not exist.
+    assert "reads as one that does not exist" in prompt
+
+
+def test_analyzer_reconciles_the_pipelines_own_invariants():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "iter_ms ≈ device_busy_ms + device_idle_ms" in prompt
+    assert "launch_starved + blocking + dependency_stalled ≈ compute_absent" in prompt
+    # The usual cause, named so it can be found rather than rounded away.
+    assert "a sum was used where a union belongs" in prompt
+
+
+def test_ncu_targets_come_from_the_decomposition_not_the_kernel_sum():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # ~40 launches per server relaunch makes this the round's most
+    # expensive choice; kern_sum sums overlapping streams over the whole
+    # capture, the decomposition is a union clipped to the iteration.
+    assert "Pick the targets from the timeline decomposition, not the kernel sum" in prompt
+    assert "matched_kernels" in prompt
+    assert "sum across overlapping streams over the whole capture" in prompt
+    # Still the honest fallback when the pipeline could not run.
+    assert "if nsys ran but the skill's pipeline did not, rank on `kern_sum`" in prompt
+
+
+def test_findings_contract_owes_the_classification_and_the_step5_mode():
+    contract = _norm(PROFILE_FINDINGS_CONTRACT)
+    assert "a category number whose taxonomy was not verified is not a finding" in contract
+    assert "which Step 5 mode ran" in contract
+    # Both reconciliations are reported as pass/fail, not assumed.
+    assert "stated as pass/fail" in contract

@@ -108,26 +108,45 @@ story. Procedure, after your clean measurement and gate arithmetic:
   never a default shell timeout).
 - Then **decompose that capture with the `perf-nsight-system-analysis`
   skill**, exactly as the Analyzer's Run A step 5 does: `nsys export
-  --type sqlite`, then the skill's `run_all.py` single-variant into the
-  attempt's `profile/nsys_analysis/`. This is what makes "the launch
-  gaps shrunk" a number rather than an impression — the same
-  per-iteration time, busy rungs and launch-starved / blocking /
-  dependency-stalled split, on both sides of the comparison below. Load
-  the skill via the `Skill` tool (fully-qualified
+  --type sqlite`, then the skill's `run_all.py`. This is what makes "the
+  launch gaps shrunk" a number rather than an impression. Load the skill
+  via the `Skill` tool (fully-qualified
   `trtllm-agent-toolkit:perf-nsight-system-analysis` if the bare name is
   not found); if it is unavailable or its pipeline errors, note that in
   one line and compare on the `nsys stats` kernel table alone — never
   block the verdict on it, and never state a split you did not measure.
-- In `evaluation.md`'s *Kernel evidence* section, compare the capture's
-  top kernels / GPU-busy share — and, where both sides carry a
-  `nsys_analysis/`, the per-iteration time and the compute-absent split
-  — against the previous capture of the accepted state (your
-  instructions name its directory), and state whether the item's
-  **claimed mechanism is visible**: the fused kernel now present, the
-  launch-starved share shrunk, the eager fallback gone. A gain
-  whose mechanism is invisible in the trace is worth flagging in the
-  verdict prose (it may be noise riding), though the gate math alone
-  decides the verdict.
+- **Run it comparative, not twice single-variant.** The previous capture
+  of the accepted state (your instructions name its directory) kept its
+  own `server_nsys.sqlite`; hand the skill both sides in one command and
+  let it do the differencing:
+  ```bash
+  python <skill_dir>/scripts/run_all.py \\
+      --taxonomy <previous capture dir>/taxonomy.json \\
+      --out <attempt>/profile/nsys_analysis \\
+      --variant before --profile 0=<previous capture dir>/server_nsys.sqlite \\
+      --variant after  --profile 0=<attempt>/profile/server_nsys.sqlite
+  ```
+  It writes `difference/rank-0/iteration.json` — `iter_ms`,
+  `device_busy_ms` and `device_idle_ms` each as `{a, b, delta}`, delta =
+  after − before — plus `difference/rank-0/module_slice.json`, the
+  per-module signature diff carrying a per-call Δ that survives a
+  count mismatch. Use the taxonomy that capture was classified with —
+  its own `taxonomy.json` if it kept one, else the round's
+  `analysis/taxonomy.json`, which the Analyzer iterated — so both sides
+  are classified identically; a diff across two taxonomies is not a
+  diff. Copy the one you used into this capture's directory, so the next
+  attempt's comparison finds it in the same place. Where the previous
+  capture kept no `.sqlite`, run single-variant into the same directory
+  and compare the two trees by hand, saying so.
+- In `evaluation.md`'s *Kernel evidence* section, report the signed
+  deltas — per-iteration time, the busy rungs, and the module-slice rows
+  the item claims to move — and state whether the item's **claimed
+  mechanism is visible**: the fused kernel now present, the
+  launch-starved share shrunk, the eager fallback gone. Name the
+  specific row you expected to move and what it actually did; "faster
+  overall" is not a mechanism. A gain whose mechanism is invisible in
+  the trace is worth flagging in the verdict prose (it may be noise
+  riding), though the gate math alone decides the verdict.
 - The capture is **diagnostic, never a measurement**: profile a fresh
   relaunch, never the server your benchmark ran on, and take
   `measured_gain_pct` / `measured_value` from the un-profiled run only.

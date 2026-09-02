@@ -53,7 +53,9 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   `perf-nsight-system-analysis` skill into per-iteration time, busy/idle
   rungs and the compute-absent split (launch-starved / blocking /
   dependency-stalled) — plus an ncu per-kernel deep dive on the top
-  nsys kernels, captured over the same iteration window and interpreted
+  kernels of that decomposition (ranked by in-window union time, not by
+  the capture-wide `kern_sum`), captured over the same iteration window
+  and interpreted
   with the
   `perf-nsight-compute-analysis` skill — per-kernel SOL%, occupancy,
   warp stalls → bound class; perf-analyze methodology), then
@@ -61,7 +63,13 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   `roadmap.yaml` — items ordered by `expected_gain_pct` (bottleneck share
   removed, casebook-grounded), never by fix ease, each item's evidence
   drawn across the analyses (nsys timeline, ncu kernel analysis, SOL
-  correlation when the projector ran) rather than the timeline alone.
+  correlation when the projector ran) rather than the timeline alone,
+  and each kernel-speedup item bounded by the operator's measured
+  headroom rather than its cost. The timeline analysis's own
+  `items.json` is accounted for row by row in `roadmap.yaml`'s
+  `nsys_items` block — every opportunity it found becomes an item or a
+  dismissal with evidence, and the orchestrator validates that the
+  moment the turn ends (see *The nsys opportunity-coverage gate*).
   Later rounds re-profile
   (bottlenecks shift after each accepted item) and update statuses /
   ordering without rewriting history — a round following one that left
@@ -161,6 +169,41 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
 The orchestrator — not the agents — owns the roadmap lifecycle fields and
 the git state of the TRT-LLM checkout, driven by the evaluator's
 structured decisions in `progress.yaml`.
+
+## The nsys opportunity-coverage gate
+
+The `perf-nsight-system-analysis` skill closes every run by writing
+`nsys_analysis/items.json` — the performance opportunities the timeline
+found, each with a stable `id`, the step table behind it and a
+`magnitudeMs`. Without a consumer that list is prose: the analyzer reads
+the numbers, writes findings, and whether an opportunity ever reached
+the plan is invisible.
+
+So `roadmap.yaml` carries a top-level `nsys_items` block accounting for
+every id in that file — the same `disposition` / `ref` vocabulary as
+`kernel_ledger.yaml`, for the same reason:
+
+```yaml
+nsys_items:
+  - {id: nsys-01, disposition: item, ref: opt-003}
+  - {id: nsys-02, disposition: dismissed, ref: "0.2 ms/iter is below the noise floor"}
+```
+
+An `item` ref must name a real roadmap id (any status — an opportunity
+whose fix was already tried *was* considered); a `dismissed` ref is the
+evidence for dismissing it. The orchestrator validates the block the
+moment the analyzer's turn ends, so an opportunity that was neither
+planned nor dismissed parks the campaign at the analyzer instead of
+quietly evaporating. Dismissing is a first-class answer — below the
+noise floor, mechanism already present, no allowed approach reaches it —
+and is always cheaper than an unfounded item a full benchmark has to
+disprove.
+
+**Self-gating on the artifact**, so it needs no task knob: enforced
+exactly when the round produced an `items.json`. A replan-only round
+runs no profiler and writes none; a round whose skill was unavailable or
+whose pipeline errored writes none either and records the reason under
+*Caveats*. Neither owes the block anything.
 
 ## The acceptance gate
 
@@ -474,8 +517,16 @@ running the CLI.
   `.sqlite` and decomposed with the `perf-nsight-system-analysis` skill
   into `nsys_analysis/`, so "the launch gaps shrunk" is a measured
   per-iteration budget on both sides rather than an eyeballed kernel
-  table. The analyzer's ncu deep dive is bounded
-  (`--launch-count`, kernel filter from the top nsys kernels) and
+  table. The accept-evidence capture runs that pipeline **comparative**
+  against the previous capture of the accepted state, so the mechanism
+  check reads signed deltas out of `difference/rank-0/` instead of
+  comparing two trees by eye. Kernels are classified with the
+  checked-in TRT-LLM taxonomy
+  (`perf_analyze/assets/taxonomy_trtllm.json`), which the analyzer
+  extends per workload before quoting any category number. The
+  analyzer's ncu deep dive is bounded
+  (`--launch-count`, kernel filter from the top decomposition kernels)
+  and
   interpreted with the `perf-nsight-compute-analysis` skill; both
   degrade gracefully when the tool or the skill is unavailable.
 - **Per-kernel coverage contract (optional).** A

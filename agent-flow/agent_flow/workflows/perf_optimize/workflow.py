@@ -30,7 +30,7 @@ from agent_flow.workflows.perf_analyze.sol_methodology import (
 )
 from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_results
 
-from . import gitops, kernel_ledger, reuse, roadmap_schema
+from . import gitops, kernel_ledger, nsys_items, reuse, roadmap_schema
 from .disagg import disagg_config_path, has_disagg, load_disagg_config, worker_config_yaml
 from .progress import (
     EVALUATOR_DECISIONS,
@@ -488,6 +488,7 @@ class PerfOptimizeWorkflow:
                     roadmap = self._validate_roadmap()
                     if enforce_ledger:
                         self._validate_kernel_ledger(roadmap, analysis_dir)
+                    self._validate_nsys_items(roadmap, analysis_dir)
                     self._record_nsys_capture(state, analysis_dir)
                     if not replan_only and not state.reuse_pending:
                         # This round's evidence now describes the current
@@ -1702,6 +1703,36 @@ class PerfOptimizeWorkflow:
                 f"--clean to start over."
             )
 
+    def _validate_nsys_items(self, roadmap: dict[str, Any], analysis_dir: Path) -> None:
+        """Hold the roadmap to the timeline analysis's own opportunity list.
+
+        Self-gating on the artifact: enforced exactly when this round's
+        ``nsys_analysis/items.json`` exists. A round that could not run
+        the pipeline (nsys not requested, skill absent, export or
+        pipeline error) writes none and owes nothing here — its
+        *Caveats* line carries that. Raising leaves the checkpoint
+        parked at the analyzer, so re-running retries the stage.
+        """
+        items_file = nsys_items.items_path(analysis_dir)
+        if not items_file.is_file():
+            return
+        try:
+            item_ids = nsys_items.load_item_ids(items_file)
+        except nsys_items.NsysItemsError as exc:
+            raise RuntimeError(
+                f"analyzer stage finished but {exc}\nRe-run the workflow to retry "
+                f"the analyzer stage, or pass --clean to start over."
+            ) from exc
+        problems = nsys_items.cross_validate(roadmap, item_ids)
+        if problems:
+            bullet = "\n  - "
+            raise RuntimeError(
+                f"analyzer stage finished but {self.roadmap_path} does not account "
+                f"for {items_file}:{bullet}{bullet.join(problems)}\n"
+                f"Re-run the workflow to retry the analyzer stage, or pass "
+                f"--clean to start over."
+            )
+
     # ------------------------------------------------------------ shared lookups
 
     def _task_data(self) -> dict[str, Any]:
@@ -2410,7 +2441,11 @@ class PerfOptimizeWorkflow:
             f"than fabricated; when A2a lands, re-run the skill's "
             f"`run_all.py` with `--metrics-profile` pointed at its sqlite so "
             f"the utilization bullet comes from the pipeline too (it re-reads "
-            f"files only — no server, no GPU). Then run the **ncu "
+            f"files only — no server, no GPU). Verify the taxonomy and author "
+            f"`{analysis_dir}/nsys_analysis/items.json` as your system prompt's "
+            f"Run A step 5 requires, then account for every id it carries in "
+            f"`roadmap.yaml`'s `nsys_items` block — this stage does not pass "
+            f"until it does. Then run the **ncu "
             f"per-kernel deep dive** (Run B in your system prompt) — load "
             f"the `perf-nsight-compute-analysis` skill "
             f"(via the `Skill` tool; fully-qualified "
@@ -2659,11 +2694,22 @@ class PerfOptimizeWorkflow:
             return ""
         profile_dir = self._attempt_dir(state) / "profile"
         if state.last_nsys_dir:
+            decompose = (
+                f"its `run_all.py` **comparative** — `--variant before` on the "
+                f"`.sqlite` under `{state.last_nsys_dir}` and `--variant after` "
+                f"on this capture's, reusing that directory's `taxonomy.json` "
+                f"so both sides classify identically — into "
+                f"`{profile_dir}/nsys_analysis`, whose `difference/rank-0/` "
+                f"holds the signed per-iteration and module-slice deltas "
+                f"(single-variant, compared by hand, only if that capture kept "
+                f"no `.sqlite`)"
+            )
             compare = (
-                f"compare it against the previous capture of the accepted "
-                f"state at `{state.last_nsys_dir}`"
+                f"report those deltas against the previous capture of the "
+                f"accepted state at `{state.last_nsys_dir}`"
             )
         else:
+            decompose = f"its `run_all.py` single-variant into `{profile_dir}/nsys_analysis`"
             compare = (
                 "there is no previous capture to compare against — report "
                 "this capture's kernel picture on its own"
@@ -2687,8 +2733,7 @@ class PerfOptimizeWorkflow:
             f"tool; fully-qualified "
             f"`trtllm-agent-toolkit:perf-nsight-system-analysis` if the bare "
             f"name is not found) as your system prompt directs — `nsys "
-            f"export --type sqlite`, then its `run_all.py` single-variant "
-            f"into `{profile_dir}/nsys_analysis` — so the mechanism check "
+            f"export --type sqlite`, then {decompose} — so the mechanism check "
             f"below rests on a measured per-iteration budget rather than an "
             f"eyeballed one. In `evaluation.md`'s *Kernel "
             f"evidence* section, {compare}, and state whether the item's "

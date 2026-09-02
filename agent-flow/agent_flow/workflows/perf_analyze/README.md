@@ -112,7 +112,7 @@ workspace/perf-analyze/<name>/
 ├── sol_projection.md                 # ← projector (blank when disabled)
 ├── sol_work/                         # ← projector peaks.json; analyzer regions.json + sol.json
 ├── server_nsys.nsys-rep, nsys_stats.txt   # ← analyzer (nsys)
-├── nsys_analysis/                         # ← analyzer (nsys timeline decomposition)
+├── nsys_analysis/                         # ← analyzer (nsys timeline decomposition + items.json)
 ├── perf_metrics.json                      # ← analyzer (request breakdown)
 ├── server_ncu.ncu-rep, ncu_details.txt, ncu_raw.csv   # ← analyzer (ncu)
 ├── profile_findings.md               # ← analyzer
@@ -142,7 +142,8 @@ workspace/perf-analyze/<name>/
   `--trace-fork-before-exec=true`; and for ncu
   `--target-processes all`, `--profile-from-start off`, a bounded
   `--launch-count`, and a `--kernel-name` filter built from the top
-  nsys kernels) rather than improvising per run; only
+  kernels of the nsys timeline decomposition) rather than improvising
+  per run; only
   the paths and the `benchmark` / `profile` values are filled in.
 - **nsys timeline analysis (Run A).** `nsys stats` gives a kernel-sum
   table; the Analyzer additionally exports the trace to `.sqlite` and
@@ -151,8 +152,16 @@ workspace/perf-analyze/<name>/
   went*: per-iteration time against a detected anchor, three nested
   busy rungs with their idle complements, the compute-absent time split
   into launch-starved / blocking / dependency-stalled, the
-  kernel-category breakdown, and exposed collective time (transfer vs
-  jitter wait). It re-reads the trace already captured, so it costs no
+  kernel-category breakdown, the per-op breakdown (op-group or
+  module-slicing, whichever the fused share selects), and exposed
+  collective time (transfer vs jitter wait). Kernels are classified
+  with the checked-in TRT-LLM taxonomy
+  (`assets/taxonomy_trtllm.json`, extended per workload by the
+  skill's verify loop) rather than the skill's training-shaped
+  template, and the run closes by authoring `items.json` — the
+  machine-readable opportunity list a perf-optimize campaign keys its
+  roadmap coverage on. It re-reads the trace already captured, so it
+  costs no
   extra server launch, and it degrades gracefully — a missing skill or
   a pipeline error leaves an honest `timeline analysis unavailable`
   line and falls back to the `nsys stats` numbers.

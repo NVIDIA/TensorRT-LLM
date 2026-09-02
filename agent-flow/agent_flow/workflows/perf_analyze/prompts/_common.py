@@ -40,6 +40,19 @@ perf-optimize's analyzer is this workflow's analyzer plus the roadmap
 machinery, and its prompts compose these same fragments.
 """
 
+from pathlib import Path
+
+# The starting taxonomy the nsys-timeline pipeline classifies kernels with.
+# The skill ships a generic template shaped for *training* frameworks
+# (Transformer Engine, Adam, cuDNN convolutions); almost nothing in a
+# TRT-LLM decode step matches it, and with no call-stack correlation
+# available the regexes are the only classifier there is — an unmatched
+# kernel lands in `uncategorized` and drags the Step 5 mode decision with
+# it. This file is the same shape, written against TRT-LLM's own kernel
+# names. It is a starting point, not a golden file: the analyzer still
+# owes the skill's verify-and-extend loop per workload.
+TRTLLM_TAXONOMY_PATH = Path(__file__).resolve().parent.parent / "assets" / "taxonomy_trtllm.json"
+
 # --------------------------------------------------------------------------- #
 # Server lifecycle (shared by benchmarker + analyzer)
 # --------------------------------------------------------------------------- #
@@ -379,7 +392,7 @@ actually supports:
 """
 
 
-PROFILING_RUNS_REFERENCE = """\
+PROFILING_RUNS_REFERENCE = f"""\
 ## Run A — Nsight Systems (GPU timeline)
 
 Capture the trace (steps 1-4), then **read it with the
@@ -492,12 +505,16 @@ time nsys runs, without waiting to be asked.
    nsys export --type sqlite \\
        -o <workspace>/server_nsys.sqlite \\
        <workspace>/server_nsys.nsys-rep
-   cp <skill_dir>/references/taxonomy_template.json <workspace>/taxonomy.json
+   cp {TRTLLM_TAXONOMY_PATH} <workspace>/taxonomy.json
    python <skill_dir>/scripts/run_all.py \\
        --profile 0=<workspace>/server_nsys.sqlite \\
        --taxonomy <workspace>/taxonomy.json \\
        --out <workspace>/nsys_analysis
    ```
+   - **Copy that taxonomy, not the skill's `references/taxonomy_template.json`.**
+     The template is shaped for training frameworks (Transformer Engine,
+     Adam, cuDNN convolutions) and matches almost nothing in a TRT-LLM
+     decode step; the file above carries TRT-LLM's own kernel names.
    - **One captured rank means the skill's rank survey has nothing to
      decide**: a single `--profile` with no `--representative` runs
      straight through, and the skill's "ask the user which ranks are
@@ -510,6 +527,21 @@ time nsys runs, without waiting to be asked.
      one. Re-run with `--anchor <pattern>` on the densest recurring
      decode kernel from `nsys_stats.txt` and record which anchor you
      used; `--n-iters` does not rescue a failed detection.
+   - **Verify the taxonomy before quoting a single category number** —
+     the skill's own hard rule, and the one step that decides whether
+     `cat_*.json` describes this workload or nothing at all. Read
+     `cat_full.json`'s `classified_by`: `observed` is what call stacks
+     decided (zero here — this pipeline runs without them), `regex` is
+     what the taxonomy decided, and `uncategorized` is the work left.
+     Inspect `uncategorized_above_threshold`: for every name above 1% of
+     iter time, extend a regex or add a category, then re-run
+     `run_all.py` — it re-reads files only, no server, no GPU. Repeat
+     until no uncategorized kernel carries significant time. Save the
+     iterated `taxonomy.json` beside the analysis and report
+     `classified_by` next to the category table. Keep the category names
+     `gemm`, `mha` and `nccl` exactly: the pipeline hard-codes them as
+     the Step 4 anchors and the collective class, so renaming one
+     silently empties the heavy-compute view.
    - Read the numbers out of `<workspace>/nsys_analysis/` —
      `summary.json`, and per representative `windows.json`, `busy.json`,
      `gap.json`, `cat_*.json`, `comm.json` — into the findings' *nsys
@@ -517,6 +549,31 @@ time nsys runs, without waiting to be asked.
      them. Where step 1 had to fall back to `--cuda-graph-trace graph`,
      the per-kernel categories are graph-level aggregates: say so rather
      than reporting them as kernels.
+   - Read the **per-op breakdown** too, and say which mode produced it.
+     `cat_full.json` carries `fused_share_of_residual_pct` and the
+     `module_slicing_recommended` decision it drives; the pipeline then
+     writes either `opgroup.json` (per-operator breakdown of the
+     residual) or `module_slice.json` (per-module windows between
+     GEMM/MHA anchors). TRT-LLM fuses aggressively, so module-slicing is
+     the common outcome — report its `window_labels` and, for a
+     `scope`-labelled window, every scope it touches with each
+     `share_pct`. This is the section that names *what to optimize*;
+     the busy rungs only say how much there is to win.
+   - **Author `<workspace>/nsys_analysis/items.json`** per the skill's
+     *Output* section once the numbers are in: one entry per performance
+     opportunity the analysis found, each with `id`, `title`, `claim`,
+     `evidence` (the step table behind it), `magnitudeMs`, and `status`,
+     plus `boundingResource` / `headroomVerdict` / `iters` on a
+     utilization-derived item. This is the handoff downstream stages key
+     on — the numbers are evidence, the opportunities are your judgement,
+     and an opportunity you leave out reads as one that does not exist.
+     Write `{{"items": []}}` when the analysis genuinely found nothing.
+   - **Reconcile before you report.** Two invariants the pipeline's own
+     numbers must satisfy: `iter_ms ≈ device_busy_ms + device_idle_ms`
+     (~0.2 ms) and `launch_starved + blocking + dependency_stalled ≈
+     compute_absent` (~0.5 ms). A mismatch means a sum was used where a
+     union belongs — find it rather than rounding it away, and state
+     both checks in the findings.
    - Run this on Run A's **timing** capture alone, now — it must not
      wait on Run A2, which is additive and may be skipped or fail. Once
      Pass A2a below has landed its metric-sampling capture, re-run the
@@ -672,14 +729,28 @@ never profile every kernel blindly.
    escalation table, and the interpretation vocabulary. If the skill is
    unavailable, note that in one line and fall back to the command below
    plus the classification table you know from it.
-2. **Pick the targets from Run A.** From `nsys_stats.txt`'s
-   `cuda_gpu_kern_sum`, take the top kernels by total GPU time (typically
-   3–6 distinctive name stems covering the majority share) and build one
-   `--kernel-name "regex:<stem1|stem2|...>"` filter. Record the mapping
-   stem → full kernel name in your findings. (If nsys was not run —
-   not in `profile.methods` or its knob was missing — drop the
-   `--kernel-name` filter and let `--launch-count` alone bound the
-   capture, noting the untargeted sample in *Caveats*.)
+2. **Pick the targets from the timeline decomposition, not the kernel
+   sum.** `--launch-count` buys ~40 profiled launches for a full server
+   relaunch, so this choice is the most expensive one in the run. Rank
+   candidates from `nsys_analysis/` — `cat_full.json`'s `per_category`
+   (`median_ms_per_iter`, in-window and per-iteration) plus
+   `opgroup.json` / `module_slice.json` for the residual — and take the
+   3–6 name stems covering the majority of that time, using
+   `cat_full.json`'s `matched_kernels` to turn a hot category into one
+   family filter rather than hand-picked stems. Build a single
+   `--kernel-name "regex:<stem1|stem2|...>"` from them and record the
+   mapping stem → full kernel name in your findings.
+
+   `nsys_stats.txt`'s `cuda_gpu_kern_sum` is a **sum across overlapping
+   streams over the whole capture**; the decomposition is a union
+   clipped to the iteration window. They disagree, and ranking by the
+   sum spends the launch budget on kernels that are neither hot per
+   iteration nor on the critical path. Use it only as the fallback: if
+   nsys was not run (not in `profile.methods`, or its knob was missing)
+   drop the `--kernel-name` filter entirely and let `--launch-count`
+   alone bound the capture, noting the untargeted sample in *Caveats*;
+   if nsys ran but the skill's pipeline did not, rank on `kern_sum` and
+   say so there too.
 3. Relaunch `trtllm-serve` (same flags) wrapped in ncu, gated to the
    same steady-state window. **Start from this canonical invocation —
    do not improvise the ncu flags** (fill the `<...>` placeholders;
@@ -799,10 +870,18 @@ instructions, using this structure. Section headers must match.
   non-transfer busy, compute busy / **compute-absent** (the
   perf-nsight-system-analysis skill's vocabulary; never "compute idle")
 - The compute-absent split — launch-starved / blocking (naming the
-  producer) / dependency-stalled — in ms and % of the iteration
+  producer) / dependency-stalled — in ms and % of the iteration, with
+  the two reconciliation checks (`iter ≈ busy + idle`; the split sums
+  to compute-absent) stated as pass/fail
 - Kernel mix (compute/tensor-core vs memory/elementwise; NCCL if
   multi-GPU), plus exposed comm time split into transfer vs jitter
-  wait when collectives ran
+  wait when collectives ran. State `classified_by` (observed / regex /
+  uncategorized) beside the category table — a category number whose
+  taxonomy was not verified is not a finding
+- Per-op breakdown: which Step 5 mode ran (op-group or module-slicing)
+  and the `fused_share_of_residual_pct` that chose it, then the top
+  rows — operators for op-group, `window_labels` + per-scope
+  `share_pct` for module-slicing. This names *what* to optimize
 - Per-operator utilization (from Run A2a): for each top kernel its
   bounding resource (the **maximum** of compute / memory / network /
   bus), that resource's `[Throughput %]`, and the headroom verdict —

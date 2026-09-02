@@ -12,10 +12,19 @@ coverage target in :func:`cross_validate`), so a campaign can never
 conclude with a hot kernel whose optimization or fusion possibility was
 silently skipped.
 
+``share_pct`` is read from the nsys **timeline decomposition** under
+``analysis/nsys_analysis/``, not from ``nsys_stats.txt``: ``kern_sum``
+sums overlapping streams across the whole capture, while the
+decomposition is an interval union clipped to the iteration window. The
+two rank kernels differently, and the bar this ledger enumerates down to
+should be the share of an iteration, not of a sum. Where the pipeline
+could not run, ``kern_sum`` is the honest fallback — say so in
+``source``.
+
 Shape::
 
     version: 1
-    source: rounds/round_1/analysis/nsys_stats.txt   # the kern_sum enumerated
+    source: rounds/round_1/analysis/nsys_analysis   # the decomposition enumerated
     coverage:
       enumerated_share_pct: 96.8    # sum of kernels[].share_pct
       other_share_pct: 3.2          # the explicit below-bar tail roll-up
@@ -23,7 +32,7 @@ Shape::
     kernels:
       - kernel: gdn_bf16_state              # distinctive stem / group label (unique)
         full_name: "void tensorrt_llm::..." # representative full name(s)
-        share_pct: 18.4                     # % of profiled GPU time (nsys kern_sum)
+        share_pct: 18.4                     # % of in-window GPU time (nsys_analysis)
         ncu:                                # metrics mapping (or the string below)
           duration_us: 41.2
           sm_sol_pct: 12.1
@@ -96,7 +105,7 @@ _BOUND_ALIASES = {
 
 _NCU_METRIC_FIELDS = ("duration_us", "sm_sol_pct", "mem_sol_pct", "occupancy_pct")
 
-# |enumerated + other - 100| tolerance: kern_sum percentages are rounded
+# |enumerated + other - 100| tolerance: the share percentages are rounded
 # per row, so the two buckets may miss 100 by a little — but a large gap
 # means rows were dropped without being rolled into `other`.
 _COVERAGE_SUM_TOLERANCE = 2.0
@@ -290,7 +299,7 @@ def load_ledger(path: str | Path) -> dict[str, Any]:
 
     source = data.get("source")
     if not isinstance(source, str) or not source.strip():
-        errors.append(f"'source' must name the nsys kern_sum enumerated, got {source!r}")
+        errors.append(f"'source' must name the shares enumerated, got {source!r}")
 
     _validate_coverage(data, errors)
 
@@ -345,7 +354,7 @@ def cross_validate(
         errors.append(
             f"'coverage.enumerated_share_pct' ({enumerated}) is below the task's "
             f"'profile.kernel_coverage.coverage_target_pct' ({coverage_target_pct}) — "
-            f"enumerate further down the kern_sum (grouping related kernels is "
+            f"enumerate further down the ranking (grouping related kernels is "
             f"fine) until the target is covered"
         )
     return errors

@@ -97,6 +97,29 @@ acceptance gate, so it must be defensible:
   (when the projector stage ran — its per-op gap rows size what an item
   can plausibly recover). Say in `evidence` which analyses back the item;
   when one was unavailable, plan from the others and note the gap.
+- **Headroom bounds the gain, cost only ranks it.** Where the Run A2a
+  utilization pass landed, `nsys_analysis/rank-<id>/utilization.json` gives
+  each operator a `bounding_resource`, its `bounding_pct` and a
+  `headroom_verdict`. An item that makes an operator *faster* may not
+  claim more than that operator's distance from its bounding resource,
+  and one targeting an `at-roofline` operator has to justify itself as
+  **elimination or fusion** — removing the work — or be dropped: a
+  kernel already at its ceiling does not go faster because it is
+  expensive. An `unsampled` or `contaminated` row is directional only
+  and cannot carry an item by itself. When ncu's `bound` class and the
+  utilization pass's `bounding_resource` disagree for the same kernel,
+  say so in `evidence` and name which one you planned on.
+- **Cover the nsys opportunity list.** The timeline analysis writes
+  `nsys_analysis/items.json` — the opportunities it found, each with a
+  `magnitudeMs`. Account for **every** id in a top-level `nsys_items`
+  block of `roadmap.yaml` (contract below): either it became a roadmap
+  item, or it is dismissed with the evidence for dismissing it. The
+  orchestrator validates that block against the file the moment your
+  turn ends, so an opportunity you neither planned nor dismissed stops
+  the round rather than quietly evaporating. Dismissing is a legitimate
+  answer — below the noise floor, mechanism already present, no allowed
+  approach reaches it — and is always better than padding the roadmap
+  with an item a full benchmark will have to disprove.
 - Only propose `approach: code` items when the checkout is the installed
   package: verify **once per round** with
   `python -c "import tensorrt_llm, os; print(os.path.realpath(tensorrt_llm.__file__))"`

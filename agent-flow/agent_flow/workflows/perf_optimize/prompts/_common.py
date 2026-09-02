@@ -114,6 +114,13 @@ items:                                # pending items ordered by expected benefi
     status: pending                   # pending | in_progress | accepted | failed | obsolete
     attempts: 0
     measured_gain_pct: null           # filled from the evaluator's measurement
+nsys_items:                           # coverage of nsys_analysis/items.json; one row per id there
+  - id: nsys-01                       # the id verbatim from items.json
+    disposition: item                 # item | dismissed
+    ref: opt-001                      # the roadmap item id, or the evidence for dismissing it
+  - id: nsys-02
+    disposition: dismissed
+    ref: "0.2 ms/iter is below the noise floor at this operating point"
 ```
 
 Rules that keep the loop deterministic:
@@ -130,6 +137,16 @@ Rules that keep the loop deterministic:
 - **Expected gains are grounded, not vibes.** Every item cites the
   profiling evidence (trace file + numbers) and, when one matches, the
   casebook precedent its estimate leans on.
+- **`nsys_items` accounts for the timeline analysis, one row per id.**
+  Required whenever that round's `nsys_analysis/items.json` exists;
+  omitted entirely when it does not (nsys not in `profile.methods`, or
+  the pipeline could not run — the *Caveats* line covers that case). A
+  `disposition: item` `ref` must name a real roadmap item id, any
+  status: an opportunity whose fix was already tried *was* considered.
+  A `dismissed` `ref` is the evidence for dismissing it, never a bare
+  restatement. Carry still-valid rows forward each round — the analyzer
+  rewrites the block, so a dropped row reads as an unaccounted
+  opportunity and fails validation.
 - **Ownership.** Only the **analyzer** writes item content (ids, titles,
   categories, evidence, gains, ordering) and may mark still-pending items
   `obsolete` when fresh evidence — a re-profile, or the verdicts a

@@ -13,8 +13,8 @@ import yaml
 
 from agent_flow import CLAUDE_CODE_DEFAULT_MODEL
 from agent_flow.workflows.perf_analyze.sol_methodology import SolMethodology
+from agent_flow.workflows.perf_optimize import nsys_items, roadmap_schema, task_schema
 from agent_flow.workflows.perf_optimize import progress as progress_module
-from agent_flow.workflows.perf_optimize import roadmap_schema, task_schema
 from agent_flow.workflows.perf_optimize import state as state_module
 from agent_flow.workflows.perf_optimize import workflow as workflow_module
 
@@ -4152,3 +4152,152 @@ def test_baseline_gate_ignores_unreadable_json(tmp_path):
     wf = _workflow_with_baseline(tmp_path, {"output_throughput": 1.0})
     (wf.baseline_dir / "junk.json").write_text("\x00not json\x00", encoding="utf-8")
     wf._require_baseline_measurement()  # the good one still counts
+
+
+# --------------------------------------------------------------------------- #
+# The nsys opportunity-coverage gate: the timeline analysis writes items.json,
+# and the roadmap must account for every id in it. Self-gating on the file, so
+# a round that could not decompose a trace owes nothing.
+# --------------------------------------------------------------------------- #
+
+
+def _stub_agents_with_nsys_items(workflow, rows, item_ids=("nsys-01",), **kwargs):
+    """`_stub_agents` plus an analyzer that writes items.json + the block.
+
+    ``rows`` is the ``nsys_items`` coverage block the analyzer writes into
+    ``roadmap.yaml``; ``item_ids`` are the opportunities ``items.json``
+    carries. Passing mismatched pairs is how the negative cases are built.
+    """
+    trace = _stub_agents(workflow, **kwargs)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_items(state):
+        original_analyzer(state)
+        analysis_dir = workflow._analysis_dir(state)
+        items_file = nsys_items.items_path(analysis_dir)
+        items_file.parent.mkdir(parents=True, exist_ok=True)
+        items_file.write_text(
+            json.dumps({"items": [{"id": i, "title": i, "claim": "c"} for i in item_ids]}),
+            encoding="utf-8",
+        )
+        data = roadmap_schema.load_roadmap(workflow.roadmap_path)
+        data[nsys_items.ROADMAP_KEY] = [dict(row) for row in rows]
+        roadmap_schema.save_roadmap(workflow.roadmap_path, data)
+
+    workflow._run_analyzer = analyzer_with_items
+    return trace
+
+
+def test_nsys_items_covered_roadmap_completes(tmp_path, fake_git):
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow, [{"id": "nsys-01", "disposition": "item", "ref": "opt-001"}]
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_nsys_items_unaccounted_opportunity_blocks_advance(tmp_path, fake_git):
+    """An opportunity neither planned nor dismissed stops the round."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow,
+        [{"id": "nsys-01", "disposition": "item", "ref": "opt-001"}],
+        item_ids=("nsys-01", "nsys-02"),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="unaccounted for"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    # Parked at the analyzer, so re-running retries the stage.
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_nsys_items_dismissal_with_evidence_is_enough(tmp_path, fake_git):
+    """Dismissing beats padding the roadmap with an item to disprove."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow,
+        [
+            {"id": "nsys-01", "disposition": "item", "ref": "opt-001"},
+            {"id": "nsys-02", "disposition": "dismissed", "ref": "below the noise floor"},
+        ],
+        item_ids=("nsys-01", "nsys-02"),
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_nsys_items_unresolved_item_ref_blocks_advance(tmp_path, fake_git):
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow, [{"id": "nsys-01", "disposition": "item", "ref": "opt-999"}]
+    )
+    try:
+        with pytest.raises(RuntimeError, match="does not match any roadmap item id"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_nsys_items_malformed_file_blocks_advance(tmp_path, fake_git):
+    """The analyzer's own artifact being unreadable is worth stopping for."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_broken_items(state):
+        original_analyzer(state)
+        items_file = nsys_items.items_path(workflow._analysis_dir(state))
+        items_file.parent.mkdir(parents=True, exist_ok=True)
+        items_file.write_text("{not json", encoding="utf-8")
+
+    workflow._run_analyzer = analyzer_with_broken_items
+    try:
+        with pytest.raises(RuntimeError, match="could not be read as JSON"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+
+
+def test_no_items_json_means_no_coverage_owed(tmp_path, fake_git):
+    """A round whose pipeline could not run degrades, it does not fail.
+
+    The skill may be absent, the export may fail, or nsys may not be in
+    `profile.methods` at all — every such round writes no items.json and
+    records the reason under *Caveats* instead.
+    """
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(workflow)  # never writes items.json
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+    assert not list((ws / "rounds").glob("*/analysis/nsys_analysis/items.json"))
