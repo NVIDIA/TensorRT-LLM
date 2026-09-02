@@ -1095,6 +1095,7 @@ class MTPEagleDynamicTreeResourceManager(BaseResourceManager):
         hidden_size: int,
         max_num_requests: int,
         sa_manager=None,
+        num_seq_slots: Optional[int] = None,
     ):
         from .spec_tree_manager import SpecTreeManager
 
@@ -1108,8 +1109,15 @@ class MTPEagleDynamicTreeResourceManager(BaseResourceManager):
             dynamic_tree_max_topK=config.dynamic_tree_max_topK,
         )
         # MTP hidden-state slot pools (needed by MTPEagleWorker drafter inputs).
+        # num_seq_slots is forwarded because those pools are keyed by live-request
+        # identity; see MTPHiddenStatesManager.__init__.
         self._mtp_hidden_states_manager = MTPHiddenStatesManager(
-            config, dtype, hidden_size, max_num_requests, sa_manager=sa_manager
+            config,
+            dtype,
+            hidden_size,
+            max_num_requests,
+            sa_manager=sa_manager,
+            num_seq_slots=num_seq_slots,
         )
 
     # Expose the MTPHiddenStatesManager surface MTPSpecMetadata expects.

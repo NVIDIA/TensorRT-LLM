@@ -38,15 +38,26 @@ class MTPHiddenStatesManager(BaseResourceManager):
                  dtype: torch.dtype,
                  hidden_size: int,
                  max_num_requests: int,
-                 sa_manager=None):
+                 sa_manager=None,
+                 num_seq_slots: Optional[int] = None):
         self.dtype = dtype
         self.num_draft_slots = config.max_draft_len
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
+        # These slots are keyed by live-request identity, not by batch position:
+        # add_slot runs on a request's first context chunk and the slot is only
+        # returned by free_resources. So the pool must cover every request that
+        # can be resident at once, which is the SeqSlotManager pool size
+        # (``num_seq_slots``) rather than max_batch_size -- under the attention-DP
+        # overlap headroom the two differ by 2x, because a finished request holds
+        # its slot for one more iteration while its replacement is already
+        # admitted (nvbug-6627795). Sizing this at max_num_requests instead makes
+        # SlotManager.add_slot raise NoFreeSlotsError. Falls back to
+        # max_num_requests when the caller does not know the pool size.
         # Reserve one extra slot for the CUDA graph padding dummy request,
         # which is kept alive permanently and must not consume a real slot.
-        slot_pool_size = max_num_requests + 1
+        slot_pool_size = (num_seq_slots or max_num_requests) + 1
         self.slot_manager = SlotManager(slot_pool_size)
         # Optional SA manager for MTP+SA mode
         self.sa_manager = sa_manager
