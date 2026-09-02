@@ -19,3 +19,7 @@
 #
 # Blank lines and lines starting with '#' are ignored. No active entries mean
 # that no stages are skipped for resource maintenance.
+
+CPU-Generic-x86-1 | TRTLLMINF-353 validation: x86 CI resource maintenance
+A10-PyTorch-* | TRTLLMINF-353 validation: A10 CI resource maintenance | delimiter preservation
+TRTLLMINF-353-NO-SUCH-STAGE-* | TRTLLMINF-353 validation: unmatched pattern warning
