@@ -163,6 +163,59 @@ def test_analyzer_keeps_capture_range_end_stop_safety_flag():
 
 
 # --------------------------------------------------------------------------- #
+# nsys timeline decomposition (Run A step 5): the analyzer does not read the
+# trace by hand — it exports a .sqlite and runs the perf-nsight-system-analysis
+# skill's pipeline, whose vocabulary the findings must then use.
+# --------------------------------------------------------------------------- #
+
+
+def test_analyzer_loads_nsys_analysis_skill_and_degrades():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # Named with the fully-qualified fallback for plugin-namespaced installs,
+    # exactly as the ncu methodology skill is.
+    assert "perf-nsight-system-analysis" in prompt
+    assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
+    # It is proactive: the trace is already captured, so the pipeline costs
+    # no extra server launch and runs whenever nsys runs.
+    assert "costs no extra server launch" in prompt
+    assert "without waiting to be asked" in prompt
+    # A missing skill or a failed pipeline never blocks the run and never
+    # yields a fabricated split — the section degrades to a one-liner.
+    assert "timeline analysis unavailable" in prompt
+
+
+def test_nsys_analysis_pipeline_is_driven_from_the_sqlite_export():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The pipeline reads a .sqlite, not the .nsys-rep next to it.
+    assert "nsys export --type sqlite" in prompt
+    assert "scripts/run_all.py" in prompt
+    assert "--taxonomy" in prompt
+    assert "--out <workspace>/nsys_analysis" in prompt
+
+
+def test_nsys_analysis_resolves_the_skills_ask_the_user_steps_autonomously():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The skill tells a human operator to pick representatives and anchors;
+    # a campaign has nobody to ask, so the prompt resolves both itself.
+    assert "no user to ask" in prompt
+    assert "--representative" in prompt
+    assert "--anchor" in prompt
+
+
+def test_findings_contract_carries_the_timeline_decomposition():
+    block = _norm(PROFILE_FINDINGS_CONTRACT)
+    # The skill's vocabulary, verbatim — "compute-absent", never
+    # "compute idle", and the three causes it splits into.
+    assert "compute-absent" in block
+    assert 'never "compute idle"' in block
+    for bucket in ("launch-starved", "blocking", "dependency-stalled"):
+        assert bucket in block, bucket
+    # Iteration counts back every table, and the section degrades honestly.
+    assert "`n=` iterations" in block
+    assert "timeline analysis unavailable" in block
+
+
+# --------------------------------------------------------------------------- #
 # ncu deep dive (Run C): a bounded per-kernel profile of the top nsys kernels
 # over the same iteration window, interpreted with the
 # perf-nsight-compute-analysis skill; the findings carry a dedicated section

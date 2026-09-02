@@ -151,6 +151,49 @@ def test_findings_contract_carries_the_run_a2_evidence():
     assert "bounding resource" in contract
 
 
+def test_analyzer_carries_the_nsys_timeline_decomposition():
+    # Run A does not stop at ``nsys stats``: the analyzer exports a
+    # ``.sqlite`` and runs the perf-nsight-system-analysis pipeline, whose
+    # per-iteration budget is what separates a host-exposure item from a
+    # slow-kernel item.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "perf-nsight-system-analysis" in prompt
+    assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
+    assert "nsys export --type sqlite" in prompt
+    # Proactive by construction — it re-reads a trace already captured.
+    assert "costs no extra server launch" in prompt
+    # The roadmap's expected-gain grounding reads the split, not just shares.
+    assert "compute-absent split" in prompt
+    assert "a launch-starved share is not recovered by a faster kernel" in prompt
+    # Degrades to a one-liner rather than blocking or fabricating.
+    assert "timeline analysis unavailable" in prompt
+
+
+def test_evaluator_decomposes_the_accept_evidence_capture():
+    # The accept-evidence trace gets the same treatment, so "the launch
+    # gaps shrunk" is measured on both sides rather than eyeballed.
+    prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
+    assert "perf-nsight-system-analysis" in prompt
+    assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
+    assert "profile/nsys_analysis/" in prompt
+    assert "the launch-starved share shrunk" in prompt
+    # Never blocks the verdict, never states an unmeasured split.
+    assert "never block the verdict on it" in prompt
+
+
+def test_run_a2a_capture_feeds_the_timeline_pipeline():
+    # The two changes compose rather than sit side by side: A2a's
+    # metric-sampling capture is exactly what the skill's per-operator
+    # utilization step reads, and folding it in costs no GPU.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "--metrics-profile 0=<workspace>/server_nsys_metrics.sqlite" in prompt
+    assert "it reads the sampling capture, never the timing one" in prompt
+    # A2b is not an input to it — those flags name another tool's exports.
+    assert "Pass A2b's capture is **not** an input to that pipeline" in prompt
+    # And step 5 never waits on a pass that is allowed to be skipped.
+    assert "it must not wait on Run A2" in prompt
+
+
 def test_analyzer_carries_the_ncu_deep_dive():
     # The shared Run C: a bounded per-kernel ncu capture of the top nsys
     # kernels, interpreted with the perf-nsight-compute-analysis skill.

@@ -36,6 +36,11 @@ inventing it.
   none. These files are large — extract
   the kernel-summary rows with shell tools (`grep`/`head`/`awk`) rather
   than reading them whole.
+- `rounds/round_<n>/analysis/nsys_analysis/` — the same round's
+  `perf-nsight-system-analysis` products: small JSON holding the
+  per-iteration time, the busy rungs and the compute-absent split.
+  Present only where the skill ran; read `summary.json` and the
+  per-rank `busy.json` / `gap.json` rather than the whole tree.
 - `rounds/round_<n>/item_<j>_<id>/attempt_<k>/profile/nsys_stats.txt` —
   each **accepted** attempt's accept-evidence capture: the kernel
   picture with that item (and everything accepted before it) applied.
@@ -154,7 +159,13 @@ Open with one provenance line per profile: its round (or the accepted
 item it captured), its capture window, and **which accepted items were in
 effect** when it was captured; never imply full coverage when the named
 fallback lacks later accepts, and note any capture mismatch (different
-iteration window / load) that weakens comparability. Then compare over
+iteration window / load) that weakens comparability. Where **both**
+sides carry a `nsys_analysis/`, open the section with the iteration
+budget before the kernel table — per-iteration time, the busy rungs and
+the compute-absent split (launch-starved / blocking /
+dependency-stalled), before vs after — because that is what says whether
+the campaign bought GPU work or bought back host exposure; where either
+side lacks it, say so and compare on kernels alone. Then compare over
 the union of both profiles' top ~10 kernels by total GPU time:
 | kernel | before % | before ms | before calls | after % | after ms | after calls | Δ ms % |
 Abbreviate template-heavy kernel names to a distinctive stem,

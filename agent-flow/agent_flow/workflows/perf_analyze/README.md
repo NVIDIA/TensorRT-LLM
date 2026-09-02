@@ -32,7 +32,11 @@ benchmarker ──▶ projector ──▶ analyzer ──▶ reporter
   persists the machine-readable `sol_work/peaks.json` (latency
   constants merged in) that the analyzer's correlation joins against.
 - **Analyzer** — replays the same load under **Nsight Systems (nsys)**,
-  the **PyTorch profiler**, and **Nsight Compute (ncu)** — the ncu run
+  the **PyTorch profiler**, and **Nsight Compute (ncu)** — the nsys
+  timeline is decomposed with the **`perf-nsight-system-analysis`
+  skill** (per-iteration time, busy/idle rungs, and the compute-absent
+  split into launch-starved / blocking / dependency-stalled), and the
+  ncu run
   is a bounded per-kernel deep dive on the top nsys kernels, captured
   over the same iteration window and interpreted with the
   **`perf-nsight-compute-analysis` skill** (per-kernel SOL%, occupancy,
@@ -109,6 +113,7 @@ workspace/perf-analyze/<name>/
 ├── sol_projection.md                 # ← projector (blank when disabled)
 ├── sol_work/                         # ← projector peaks.json; analyzer regions.json + sol.json
 ├── server_nsys.nsys-rep, nsys_stats.txt   # ← analyzer (nsys)
+├── nsys_analysis/                         # ← analyzer (nsys timeline decomposition)
 ├── torch_trace/, perf_metrics.json        # ← analyzer (torch)
 ├── server_ncu.ncu-rep, ncu_details.txt, ncu_raw.csv   # ← analyzer (ncu)
 ├── profile_findings.md               # ← analyzer
@@ -140,6 +145,18 @@ workspace/perf-analyze/<name>/
   `--launch-count`, and a `--kernel-name` filter built from the top
   nsys kernels) rather than improvising per run; only
   the paths and the `benchmark` / `profile` values are filled in.
+- **nsys timeline analysis (Run A).** `nsys stats` gives a kernel-sum
+  table; the Analyzer additionally exports the trace to `.sqlite` and
+  runs the **`perf-nsight-system-analysis` skill**'s pipeline into
+  `nsys_analysis/`, which answers *where the iteration's wall clock
+  went*: per-iteration time against a detected anchor, three nested
+  busy rungs with their idle complements, the compute-absent time split
+  into launch-starved / blocking / dependency-stalled, the
+  kernel-category breakdown, and exposed collective time (transfer vs
+  jitter wait). It re-reads the trace already captured, so it costs no
+  extra server launch, and it degrades gracefully — a missing skill or
+  a pipeline error leaves an honest `timeline analysis unavailable`
+  line and falls back to the `nsys stats` numbers.
 - **ncu kernel analysis (Run C).** The Analyzer's ncu pass answers *why*
   the hot kernels are slow, complementing nsys's *where the time goes*:
   per-kernel Compute/Memory SOL%, occupancy, and warp stalls, classified

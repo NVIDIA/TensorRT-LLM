@@ -49,7 +49,10 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   round that neither accepted anything nor made a potentially
   build-changing code attempt it runs **replan-only**, planning from the
   standing profile and that round's verdicts — see *What a round costs*):
-  profiles the *current* build (nsys +
+  profiles the *current* build (nsys — decomposed with the
+  `perf-nsight-system-analysis` skill into per-iteration time, busy/idle
+  rungs and the compute-absent split (launch-starved / blocking /
+  dependency-stalled) — plus the
   torch profiler + an ncu per-kernel deep dive on the top nsys kernels,
   captured over the same iteration window and interpreted with the
   `perf-nsight-compute-analysis` skill — per-kernel SOL%, occupancy,
@@ -120,11 +123,12 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   not a separate stage: after the clean measurement, the evaluator
   relaunches the server under the canonical nsys wrap, replays the load
   once, and saves `attempt_<k>/profile/` (trace, `nsys_stats.txt`,
-  replay log), then writes a *Kernel evidence* section comparing the
-  capture against the frozen accepted state — verifying the item's
-  claimed mechanism is actually visible in the trace. Because rejected
-  attempts are hard-reverted. A final-state integration capture, when
-  produced, becomes the reporter's newest accepted-state profile.
+  `nsys_analysis/`, replay log), then writes a *Kernel evidence* section
+  comparing the capture against the frozen accepted state — verifying
+  the item's claimed mechanism is actually visible in the trace. Because
+  rejected attempts are hard-reverted. A final-state integration
+  capture, when produced, becomes the reporter's newest accepted-state
+  profile.
   The capture is diagnostic, never a measurement (fresh relaunch; the
   verdict comes from the un-profiled run); no capture is made when
   `nsys` is not in `profile.methods`, and a failed capture never flips
@@ -424,7 +428,7 @@ running the CLI.
 │   ├── manifest.md                  #   what was imported, and from where
 │   └── prior_roadmap.yaml           #   source campaign's roadmap — read-only prior art
 ├── rounds/round_<n>/
-│   ├── analysis/                    # analyzer: profile_findings.md, nsys/torch/ncu traces (+ regions.json / sol.json when the projector ran;
+│   ├── analysis/                    # analyzer: profile_findings.md, nsys/torch/ncu traces, nsys_analysis/ (+ regions.json / sol.json when the projector ran;
 │   │                                #   + kernel_ledger.yaml with a profile.kernel_coverage block)
 │   └── item_<j>_<id>/attempt_<k>/   # per item: optimization_summary.md, evaluation.md, result *.json
 │       └── profile/                 # accept-evidence nsys capture (APPROVEd attempts only)
@@ -465,10 +469,15 @@ running the CLI.
   canonical `benchmark_serving.py` / `nsys profile` / `ncu` templates at
   the configured operating point(s) — one run per `benchmark.concurrency`
   point in Pareto-curve mode — so numbers stay comparable across the
-  whole campaign. The analyzer's ncu deep dive is bounded
+  whole campaign. Every nsys capture — the analyzer's round profile and
+  the evaluator's accept-evidence capture alike — is exported to
+  `.sqlite` and decomposed with the `perf-nsight-system-analysis` skill
+  into `nsys_analysis/`, so "the launch gaps shrunk" is a measured
+  per-iteration budget on both sides rather than an eyeballed kernel
+  table. The analyzer's ncu deep dive is bounded
   (`--launch-count`, kernel filter from the top nsys kernels) and
-  interpreted with the `perf-nsight-compute-analysis` skill; it degrades
-  gracefully when `ncu` or the skill is unavailable.
+  interpreted with the `perf-nsight-compute-analysis` skill; both
+  degrade gracefully when the tool or the skill is unavailable.
 - **Per-kernel coverage contract (optional).** A
   `profile.kernel_coverage` block in `task.yaml` (empty mapping =
   defaults: `min_share_pct: 0.5`, `coverage_target_pct: 95`) upgrades

@@ -87,7 +87,10 @@ acceptance gate, so it must be defensible:
   the casebook *bottleneck signal → candidate pattern* row in
   `casebook_ref`.
 - **Draw the evidence from all three analyses**, not just the timeline:
-  the nsys stats (the phase/kernel share the item attacks), the ncu
+  the nsys timeline decomposition (the phase/kernel share the item
+  attacks, and the busy-rung / compute-absent split that says whether it
+  attacks GPU work or host exposure — a launch-starved share is not
+  recovered by a faster kernel), the ncu
   kernel analysis (an item targeting a kernel must cite that kernel's
   bound class — a fix that mismatches it, e.g. a math-throughput lever
   on a memory-bound kernel, is mis-planned), and the SOL correlation
@@ -117,7 +120,9 @@ acceptance gate, so it must be defensible:
 - `rounds/round_<n>/analysis/` — **your artifact directory for this
   round** (the exact path is given in your instructions):
   `profile_findings.md` (your findings report), `server_nsys.nsys-rep`,
-  `nsys_stats.txt`, `server_nsys_metrics.nsys-rep` (Run A2a utilization
+  `nsys_stats.txt`, `nsys_analysis/` (the
+  `perf-nsight-system-analysis` products),
+  `server_nsys_metrics.nsys-rep` (Run A2a utilization
   pass), `server_nsys_stacks.nsys-rep` (Run A2b call-stack pass),
   `torch_trace/`, `server_ncu.ncu-rep` + `ncu_details.txt` /
   `ncu_raw.csv`, `serve.log`, and any benchmark result JSON you produce
@@ -146,7 +151,10 @@ context — do not touch them.
    concurrency point only, with its paired `num_prompts` entry when
    `benchmark.num_prompts` is a list — profiling replays are not curve
    measurements), capture nsys / torch traces into this round's
-   `analysis/` directory, then run the ncu deep dive (Run C below) on
+   `analysis/` directory, decompose the nsys timeline with the
+   **`perf-nsight-system-analysis` skill** (Run A step 5 below — load it
+   unprompted; it re-reads the trace you just captured and costs no
+   extra server launch), then run the ncu deep dive (Run C below) on
    the top nsys kernels — **loading the `perf-nsight-compute-analysis`
    skill** as its capture + interpretation methodology — into the same
    directory, and tear every server down.

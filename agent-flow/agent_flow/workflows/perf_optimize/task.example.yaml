@@ -52,8 +52,11 @@ benchmark:
 # Optional: which profilers the Analyzer runs each round, and the
 # steady-state iteration window that gates them (TLLM_PROFILE_START_STOP
 # for nsys/torch; ncu arms on the same window via --profile-from-start
-# off). ncu is the bounded per-kernel deep dive on the top nsys kernels,
-# interpreted with the perf-nsight-compute-analysis skill. A round profiles
+# off). The nsys timeline is decomposed with the
+# perf-nsight-system-analysis skill (per-iteration time, busy/idle rungs,
+# compute-absent causes); ncu is the bounded per-kernel deep dive on the
+# top nsys kernels, interpreted with the perf-nsight-compute-analysis
+# skill. A round profiles
 # after an accept or a reverted code attempt that may have changed ignored
 # build output; otherwise the next one re-plans from current evidence. Drop
 # torch/ncu to trim what profiling rounds cost.

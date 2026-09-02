@@ -206,6 +206,27 @@ def test_import_leaves_the_sources_non_analysis_files_behind(tmp_path):
     assert not (ws / "task.yaml").exists()
 
 
+def test_import_brings_the_nsys_timeline_analysis_along(tmp_path):
+    """The `nsys_analysis/` products travel with the trace they describe.
+
+    A reused analysis is planned from, so the per-iteration budget and
+    the compute-absent split matter as much as the `.nsys-rep` — and
+    unlike the multi-GB `.sqlite` export they are small JSON.
+    """
+    source = _perf_analyze_workspace(tmp_path / "analyze")
+    _write(source / "nsys_analysis" / "summary.json", '{"mode": "single-variant"}\n')
+    _write(source / "nsys_analysis" / "rank-0" / "gap.json", "{}\n")
+    _write(source / "server_nsys.sqlite", "regenerable export\n")
+    ws = tmp_path / "ws"
+    _import_into(source, ws)
+
+    analysis = ws / "rounds" / "round_1" / "analysis"
+    assert (analysis / "nsys_analysis" / "summary.json").is_file()
+    assert (analysis / "nsys_analysis" / "rank-0" / "gap.json").is_file()
+    # The sqlite stays behind: regenerable from the .nsys-rep next to it.
+    assert not (analysis / "server_nsys.sqlite").exists()
+
+
 def test_import_from_perf_optimize_brings_ledger_and_prior_roadmap(tmp_path):
     source = _perf_optimize_workspace(tmp_path / "optimize")
     ws = tmp_path / "ws"

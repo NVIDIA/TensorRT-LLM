@@ -82,7 +82,7 @@ _ANALYSIS_FILE_GLOBS = (
     "regions.json",
     "sol.json",
 )
-_ANALYSIS_DIR_GLOBS = ("torch_trace*",)
+_ANALYSIS_DIR_GLOBS = ("torch_trace*", "nsys_analysis*")
 
 _ROUND_DIR_RE = re.compile(r"round_(\d+)")
 

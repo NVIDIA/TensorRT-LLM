@@ -2281,6 +2281,31 @@ def test_run_evaluator_includes_accept_evidence_duty_when_nsys_configured(tmp_pa
         workflow.close()
 
 
+def test_accept_evidence_duty_decomposes_the_capture(tmp_path, fake_git):
+    """The accept-evidence trace is decomposed, not just kernel-summed."""
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    recorder = _RecordingAgent()
+    workflow.evaluator = recorder
+    try:
+        (ws / "task.yaml").write_text(
+            yaml.safe_dump({"profile": {"methods": ["nsys", "torch"]}}),
+            encoding="utf-8",
+        )
+        state = _evaluator_state(ws)
+        workflow._run_evaluator(state)
+        prompt = recorder.messages[0]
+        profile_dir = workflow._attempt_dir(state) / "profile"
+        assert "perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
+        assert "nsys export --type sqlite" in prompt
+        assert f"{profile_dir}/nsys_analysis" in prompt
+        # The point of it: the mechanism check rests on a measured budget.
+        assert "rather than an eyeballed one" in prompt
+    finally:
+        workflow.close()
+
+
 def test_run_evaluator_has_no_duty_without_nsys(tmp_path, fake_git):
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -3208,6 +3233,22 @@ def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_pat
     # pointer even when the sol block is set.
     assert "sol_projection.md" not in with_sol["evaluator"]
     assert "sol_projection.md" not in with_sol["qa"]
+
+
+def test_analyzer_prompt_instructs_the_nsys_timeline_decomposition(tmp_path):
+    without = _capture_driving_prompts(tmp_path, _sol_off_extra())["analyzer"]
+    with_sol = _capture_driving_prompts(tmp_path, _sol_extra(tmp_path))["analyzer"]
+    # Not SOL-gated: every profiling round decomposes the timeline it just
+    # captured, into the round's own analysis directory.
+    for prompt in (without, with_sol):
+        assert "perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
+        assert "nsys export --type sqlite" in prompt
+        assert "analysis/nsys_analysis" in prompt
+        assert "nsys_analysis/` directory" in prompt
+        # Ranking a host-exposure item and a slow-kernel item needs the
+        # split, not the kernel-sum table alone.
+        assert "not from the `nsys stats` table alone" in prompt
 
 
 def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):

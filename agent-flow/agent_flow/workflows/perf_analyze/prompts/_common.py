@@ -12,9 +12,12 @@ enabled — the default, unless ``task.yaml`` sets ``sol.enabled: false``.
 Three blocks point at agent-toolkit skills: ``CASEBOOK_CONSULTATION``
 tells both serving roles to load ``perf-optimization-casebook`` as
 read-only reference so their analysis is grounded in known TRT-LLM
-performance precedents; ``PROFILING_RUNS_REFERENCE``'s Run C has the
-analyzer load ``perf-nsight-compute-analysis`` as the methodology for
-capturing and interpreting the ncu per-kernel deep dive; and the
+performance precedents; ``PROFILING_RUNS_REFERENCE`` has the analyzer
+load a methodology skill per profiler run, unprompted —
+``perf-nsight-system-analysis`` to read the Run A timeline (per-iteration
+anchor, the busy/idle rungs, and what caused each compute-absent
+stretch) and ``perf-nsight-compute-analysis`` to capture and interpret
+the Run C ncu per-kernel deep dive; and the
 projector's own prompt (in ``projector.py``) builds on
 ``internal-perf-sol-analysis`` as its projection methodology (the
 analyzer loads the same skill for the measured↔SOL correlation when the
@@ -381,6 +384,14 @@ actually supports:
 PROFILING_RUNS_REFERENCE = """\
 ## Run A — Nsight Systems (GPU timeline)
 
+Capture the trace (steps 1-4), then **read it with the
+`perf-nsight-system-analysis` skill** (step 5). `nsys stats` alone gives
+you a kernel-sum table; the skill turns the same trace into the
+iteration's actual budget — per-iteration time, the busy/idle rungs, and
+a cause for every stretch where no compute ran. It re-reads the report
+you already captured, so it costs no extra server launch: run it every
+time nsys runs, without waiting to be asked.
+
 1. Relaunch `trtllm-serve` (same flags as the Benchmarker) wrapped in
    nsys, gating capture to a steady-state iteration window. **Start from
    this canonical `nsys profile` invocation — do not improvise the nsys
@@ -460,6 +471,61 @@ PROFILING_RUNS_REFERENCE = """\
    attention / tensor-core vs memory/elementwise kernel mix, GPU busy vs
    idle, inter-kernel gaps (host/launch exposure), and any NCCL/collective
    time for multi-GPU runs.
+5. **Decompose the timeline with the `perf-nsight-system-analysis`
+   skill.** Load it via the `Skill` tool (fully-qualified
+   `trtllm-agent-toolkit:perf-nsight-system-analysis` if the bare name
+   is not found); the load announces the skill's base directory, and its
+   pipeline is `<skill_dir>/scripts/run_all.py`. It is the methodology
+   for everything nsys — the per-iteration anchor, the three nested busy
+   rungs and their idle complements, the split of compute-absent time
+   into **launch-starved / blocking / dependency-stalled**, the
+   kernel-category breakdown, and the exposed-collective accounting —
+   and it is the vocabulary the findings must use. It reads a `.sqlite`,
+   not the `.nsys-rep`, so export one first and run it single-variant:
+   ```bash
+   nsys export --type sqlite \\
+       -o <workspace>/server_nsys.sqlite \\
+       <workspace>/server_nsys.nsys-rep
+   cp <skill_dir>/references/taxonomy_template.json <workspace>/taxonomy.json
+   python <skill_dir>/scripts/run_all.py \\
+       --profile 0=<workspace>/server_nsys.sqlite \\
+       --taxonomy <workspace>/taxonomy.json \\
+       --out <workspace>/nsys_analysis
+   ```
+   - **One captured rank means the skill's rank survey has nothing to
+     decide**: a single `--profile` with no `--representative` runs
+     straight through, and the skill's "ask the user which ranks are
+     representative" step does not apply. If you did capture several
+     ranks, read the printed survey table, pick the representative
+     yourself (one per part of the parallelism), and name that choice
+     and its basis in your findings — this campaign has no user to ask,
+     and stopping to ask one costs the whole round.
+   - Anchor detection can exit listing candidates rather than picking
+     one. Re-run with `--anchor <pattern>` on the densest recurring
+     decode kernel from `nsys_stats.txt` and record which anchor you
+     used; `--n-iters` does not rescue a failed detection.
+   - Read the numbers out of `<workspace>/nsys_analysis/` —
+     `summary.json`, and per representative `windows.json`, `busy.json`,
+     `gap.json`, `cat_*.json`, `comm.json` — into the findings' *nsys
+     timeline* section, always with the `n=` iteration count behind
+     them. Where step 1 had to fall back to `--cuda-graph-trace graph`,
+     the per-kernel categories are graph-level aggregates: say so rather
+     than reporting them as kernels.
+   - Run this on Run A's **timing** capture alone, now — it must not
+     wait on Run A2, which is additive and may be skipped or fail. Once
+     Pass A2a below has landed its metric-sampling capture, re-run the
+     same command with
+     `--metrics-profile 0=<workspace>/server_nsys_metrics.sqlite` added:
+     that is the input the skill's per-operator utilization step reads
+     (it reads the sampling capture, never the timing one), and re-running
+     only re-reads files — no server, no GPU. Without it the step reports
+     metrics absent and everything else still stands.
+   - Degrade honestly. If the skill is unavailable, the export fails, or
+     the pipeline errors on this trace, keep the *nsys timeline* section
+     with the step-4 `nsys stats` numbers plus one line — `timeline
+     analysis unavailable: <reason>` — record it in *Caveats*, and move
+     on. Never hand-derive a busy/idle rung or a compute-absent split
+     the pipeline did not produce.
 
 For multi-GPU runs (tensor/pipeline/expert parallelism set in
 `extra_llm_api_options`), nsys wrapping only traces the launcher rank;
@@ -565,12 +631,20 @@ and "which Python function launched this" is guesswork.
   that pass, record it under *Caveats*, and keep Run A's findings. An
   analysis missing the utilization pass is incomplete; one that
   fabricated it is worthless.
-- Export each capture alongside the timing one so the numbers can be read
-  programmatically:
+- Export each capture alongside the timing one (Run A step 5 exported
+  that one) so the numbers can be read programmatically:
   ```bash
   nsys export --type sqlite -o <workspace>/<name>.sqlite \\
       <workspace>/<name>.nsys-rep
   ```
+- Then fold Pass A2a back into the timeline analysis: re-run Run A step
+  5's `run_all.py` with
+  `--metrics-profile 0=<workspace>/server_nsys_metrics.sqlite` so the
+  per-operator utilization bullet of your findings comes from the skill's
+  own step rather than a hand-read of the sampled trace. It re-reads
+  files only — no server, no GPU. Pass A2b's capture is **not** an input
+  to that pipeline (its `--launch-sequences` / `--call-stack-trace` flags
+  name a different tool's exports); read A2b from its own sqlite.
 
 ## Run B — PyTorch profiler (op-level)
 
@@ -753,8 +827,16 @@ instructions, using this structure. Section headers must match.
 
 ## nsys timeline
 - Top kernels (name, % of GPU time) — table
-- GPU busy vs idle, inter-kernel gaps
-- Kernel mix (compute/tensor-core vs memory/elementwise; NCCL if multi-GPU)
+- Per-iteration time (median / min / max, with `n=` iterations) and the
+  anchor it was measured on
+- The three busy rungs and each rung's idle complement — device busy,
+  non-transfer busy, compute busy / **compute-absent** (the
+  perf-nsight-system-analysis skill's vocabulary; never "compute idle")
+- The compute-absent split — launch-starved / blocking (naming the
+  producer) / dependency-stalled — in ms and % of the iteration
+- Kernel mix (compute/tensor-core vs memory/elementwise; NCCL if
+  multi-GPU), plus exposed comm time split into transfer vs jitter
+  wait when collectives ran
 - Per-operator utilization (from Run A2a): for each top kernel its
   bounding resource (the **maximum** of compute / memory / network /
   bus), that resource's `[Throughput %]`, and the headroom verdict —
@@ -770,6 +852,10 @@ instructions, using this structure. Section headers must match.
   sites, or only the eager prologue and host loop. When the pass did not
   run, keep the bullet with one line — `call stacks unavailable:
   <reason>` — and never guess an owner for a kernel.
+- When the skill's pipeline did not run (skill missing, export or
+  pipeline error): keep the section with the `nsys stats` numbers plus
+  one line — `timeline analysis unavailable: <reason>` — and record it
+  in *Caveats*.
 
 ## Torch profiler
 - Top operators (name, self/CUDA time) — table
@@ -816,7 +902,9 @@ as applying it — no fix is applied at this stage.
 **Synthesize the analyses — one pillar is not enough.** The ranked
 hypotheses (and every optimization suggestion built from them
 downstream) rest on three evidence pillars: the **nsys timeline** (where
-GPU time goes, what the host exposes), the **ncu kernel analysis** (why
+the iteration's time goes — the busy rungs, and whether the
+compute-absent share is launch-starved, blocking or
+dependency-stalled), the **ncu kernel analysis** (why
 the hot kernels are slow — per-kernel SOL% and bound class), and the
 **SOL correlation** (how far each region sits from its analytical
 ceiling — when the task enables it). Each ranked hypothesis must say

@@ -111,7 +111,10 @@ the replayed region, so it does not belong at #1 when host prep is the
 dominant cost. Tie each recommendation to the evidence and name the
 phase/metric it reduces. **Ground every recommendation in the three
 analyses the findings carry**: the nsys timeline (which phase/kernels
-the fix attacks and their measured share), the ncu kernel analysis (the
+the fix attacks and their measured share, and whether the time it
+targets is GPU work or a compute-absent share the findings already
+attributed to launch-starvation, blocking or a dependency stall), the
+ncu kernel analysis (the
 targeted kernels' bound class — a fix must match it: more math
 throughput helps a compute-bound kernel, not a memory-bound one), and
 the SOL correlation / projection when present (the ceiling caps the

@@ -77,7 +77,7 @@ continuity.
   JSON, `serve.log`, `serve.pid` land here.
 - `rounds/round_<n>/item_<j>_<id>/attempt_<k>/profile/` — the
   accept-evidence capture (APPROVE only): `.nsys-rep`, `nsys_stats.txt`,
-  the replay log.
+  `nsys_analysis/`, the replay log.
 - `tuning/extra_llm_api_options.yaml` (live) and
   `tuning/extra_llm_api_options.accepted.yaml` (last accepted snapshot) —
   read-only; their diff **is** the config change under review.
@@ -106,11 +106,25 @@ story. Procedure, after your clean measurement and gate arithmetic:
   log. Give the replay client a timeout sized from your own un-profiled
   benchmark at that same point (at least 2× its measured wall time,
   never a default shell timeout).
+- Then **decompose that capture with the `perf-nsight-system-analysis`
+  skill**, exactly as the Analyzer's Run A step 5 does: `nsys export
+  --type sqlite`, then the skill's `run_all.py` single-variant into the
+  attempt's `profile/nsys_analysis/`. This is what makes "the launch
+  gaps shrunk" a number rather than an impression — the same
+  per-iteration time, busy rungs and launch-starved / blocking /
+  dependency-stalled split, on both sides of the comparison below. Load
+  the skill via the `Skill` tool (fully-qualified
+  `trtllm-agent-toolkit:perf-nsight-system-analysis` if the bare name is
+  not found); if it is unavailable or its pipeline errors, note that in
+  one line and compare on the `nsys stats` kernel table alone — never
+  block the verdict on it, and never state a split you did not measure.
 - In `evaluation.md`'s *Kernel evidence* section, compare the capture's
-  top kernels / GPU-busy share against the previous capture of the
-  accepted state (your instructions name its directory) and state
-  whether the item's **claimed mechanism is visible** — the fused kernel
-  now present, the launch gaps shrunk, the eager fallback gone. A gain
+  top kernels / GPU-busy share — and, where both sides carry a
+  `nsys_analysis/`, the per-iteration time and the compute-absent split
+  — against the previous capture of the accepted state (your
+  instructions name its directory), and state whether the item's
+  **claimed mechanism is visible**: the fused kernel now present, the
+  launch-starved share shrunk, the eager fallback gone. A gain
   whose mechanism is invisible in the trace is worth flagging in the
   verdict prose (it may be noise riding), though the gate math alone
   decides the verdict.
