@@ -447,6 +447,34 @@ def test_thinking_budget_logits_processor_continues_end_sequence_on_stale_view()
     assert torch.equal(_run(processor, stale), torch.zeros(1, 1, 8))
 
 
+def test_thinking_budget_logits_processor_does_not_restart_partial_end_sequence():
+    """Regression: an end sequence the model began must not be restarted.
+
+    End tokens the model emitted itself are not reasoning content. Counting them
+    against the budget makes the processor force the first end token a second
+    time, so a two-token `</think>` reaches the stream as `</` `</` `think>` and
+    the reasoning parser never sees a clean end tag.
+    """
+    processor = ThinkingBudgetLogitsProcessor(
+        thinking_token_budget=3,
+        reasoning_start_token_ids=[1],
+        reasoning_end_token_ids=[2, 3],
+    )
+
+    # Content is 5, 6 -- under budget. The trailing 2 only opens the end tag.
+    assert torch.equal(_run(processor, [[1, 5, 6, 2]]), torch.zeros(1, 1, 8))
+
+    # Greedy decode on from there: the model finishes the tag it started, and no
+    # second 2 is spliced in front of it.
+    stream = [1, 5, 6, 2]
+    for model_token in (3, 7, 7):
+        logits = torch.full((1, 1, 8), -100.0)
+        logits[0, 0, model_token] = 100.0
+        processor(0, logits, [list(stream)], None, None)
+        stream.append(int(logits[0, 0].argmax()))
+    assert stream == [1, 5, 6, 2, 3, 7, 7]
+
+
 def test_add_thinking_budget_logits_processor_uses_reasoning_parser_tokens():
     class FakeTokenizer:
         def encode(self, text, add_special_tokens=False):
