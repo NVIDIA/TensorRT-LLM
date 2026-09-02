@@ -235,15 +235,25 @@ def test_attention_backend(name):
 # or workload shape and therefore do not belong in the cross-backend model
 # matrix above.
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("page_size", [32, 64], ids=["p32", "p64"])
 def test_trtllm_legacy_fallback_mla_kimi_k3_h96(
     monkeypatch: pytest.MonkeyPatch,
+    page_size: int,
 ) -> None:
-    """K3 H96 must decline FlashInfer TRTLLM-Gen and run the legacy fallback."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (10, 0):
-        pytest.skip("Kimi K3 TRTLLM-Gen MLA regression requires SM100")
+    """K3 H96 must decline FlashInfer TRTLLM-Gen and run the legacy fallback.
 
-    # On B200, the old heuristic selects an invalid
-    # KeepsMmaAb/Q64 head tile for the 96-head group.
+    page_size=32 is also declined by the pre-existing slower-kernel gate;
+    page_size=64 (the production K3 page size) reaches the fallback only
+    through the num_heads == 96 gate. Both must land on the legacy path.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Kimi K3 TRTLLM-Gen MLA regression requires SM100 or SM103")
+
+    # The old heuristic selects an invalid KeepsMmaAb/Q64 head tile for the
+    # 96-head group; the updated autotuner must select SwapsMmaAb/Q16.
     batch_size = 32
     case = BackendCase(
         num_heads=96,
@@ -253,7 +263,7 @@ def test_trtllm_legacy_fallback_mla_kimi_k3_h96(
         num_cached_tokens=[31] * batch_size,
         num_contexts=0,
         dtype="bfloat16",
-        page_size=32,
+        page_size=page_size,
         kv_layout="HND",
         is_mla=True,
         v_head_dim=128,
