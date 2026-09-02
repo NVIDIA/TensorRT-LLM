@@ -517,9 +517,9 @@ def test_SamplingConfig_is_executor_alias():
     config = _tb.SamplingConfig(beam_width=2)
     assert config.beam_width == 2
 
-    config.temperature = 0.7
+    config.temperature = 0.5  # exactly representable as a C++ float
     config.top_k = 3
-    assert config.temperature == 0.7
+    assert config.temperature == 0.5
     assert config.top_k == 3
 
     assert not hasattr(config, "min_length")
@@ -533,11 +533,11 @@ def test_SamplingConfig_is_executor_alias():
     # after the keyword constructor whose first parameter is an int.
     copied = _tb.SamplingConfig(config)
     assert copied.beam_width == 2
-    assert copied.temperature == 0.7
+    assert copied.temperature == 0.5
 
     unpickled = pickle.loads(pickle.dumps(config))
     assert unpickled.beam_width == 2
-    assert unpickled.temperature == 0.7
+    assert unpickled.temperature == 0.5
     assert unpickled.min_tokens == 4
     assert unpickled.seed == 7
 
