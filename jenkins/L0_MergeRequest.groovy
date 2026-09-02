@@ -433,7 +433,7 @@ def parseMaintenanceConfig(String content, String source)
         if (!line || line.startsWith('#')) {
             return
         }
-        def fields = line.split(/\|/, 2)*.trim()
+        def fields = line.split(/\|/, 2).collect { field -> field.trim() }
         if (fields.size() != 2 || !fields[0] || !fields[1]) {
             error "Invalid maintenance entry at ${source}:${index + 1}; " +
                   "expected '<stage-or-pattern> | <reason>'."
