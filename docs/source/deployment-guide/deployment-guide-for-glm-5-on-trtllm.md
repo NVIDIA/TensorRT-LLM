@@ -24,9 +24,16 @@ The following checkpoints are available:
 * BF16 model: [zai-org/GLM-5](https://huggingface.co/zai-org/GLM-5) — Official BF16 checkpoint
 * NVFP4 model: [warnold-nv/GLM-5-nvfp4-v1](https://huggingface.co/warnold-nv/GLM-5-nvfp4-v1) — Unofficial NVFP4 checkpoint for experimentation only. *Quantized with ModelOpt by Will Arnold.*
 
+Pick a host directory for the checkpoints and make sure your user can write to it. Use
+this same directory for the `-v <host_models_dir>:/models` mount in the `docker run`
+step below, so that the checkpoint appears at `/models/GLM-5-FP8` inside the container.
+
 ```bash
+export HOST_MODELS_DIR=/path/to/your/models
+mkdir -p "$HOST_MODELS_DIR"
+
 git lfs install
-git clone https://huggingface.co/zai-org/GLM-5-FP8 /models/GLM-5-FP8
+git clone https://huggingface.co/zai-org/GLM-5-FP8 "$HOST_MODELS_DIR/GLM-5-FP8"
 ```
 
 ## MoE Backend Support Matrix
@@ -51,7 +58,7 @@ docker run --rm -it \
     --ipc=host \
     --gpus all \
     -p 8000:8000 \
-    -v /path/to/your/models:/models \
+    -v "$HOST_MODELS_DIR":/models \
     --name tensorrt_llm \
     nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc8 \
     /bin/bash
