@@ -535,7 +535,7 @@ def test_zero_accepted_hint_variant(B, H):
 
 
 def test_misaligned_state_indices_rejected_after_aligned_warmup():
-    """The op enforces the alignment contract supplied by metadata prep."""
+    """The op rejects misalignment before the KDA frontend realigns it."""
     data = make_conv_data(B=1, H=6, M=M, seed=13)
     cute_run(data)
 

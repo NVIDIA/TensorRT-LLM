@@ -92,6 +92,55 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
     assert captured["ssm_state_indices"].data_ptr() == state_indices.data_ptr()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_forward_realigns_misaligned_generation_state_indices(monkeypatch):
+    attention = KimiKDALinearAttention(_Cfg(), layer_idx=0)
+    state_indices = torch.tensor([9, 4], dtype=torch.int32, device="cuda")
+    generation_slice = state_indices[1:]
+    assert generation_slice.data_ptr() % 16 != 0
+    captured = {}
+
+    def forward_prefill(hidden_states, *args, **kwargs):
+        return torch.zeros_like(hidden_states)
+
+    def forward_verify(
+        hidden_states,
+        num_steps,
+        layer_cache,
+        conv_pool,
+        ssm_pool,
+        slot_indices,
+    ):
+        captured["slot_indices"] = slot_indices
+        return torch.zeros_like(hidden_states)
+
+    monkeypatch.setattr(attention, "forward_prefill", forward_prefill)
+    monkeypatch.setattr(attention, "forward_verify", forward_verify)
+    layer_cache = SimpleNamespace(
+        conv=torch.empty(0, device="cuda"),
+        temporal=torch.empty(0, device="cuda"),
+    )
+    metadata = SimpleNamespace(
+        mamba_metadata=SimpleNamespace(
+            state_indices=state_indices,
+            query_start_loc_long=torch.tensor([0, 1], dtype=torch.long, device="cuda"),
+        ),
+        num_contexts=1,
+        num_ctx_tokens=1,
+        seq_lens=torch.tensor([1, 1]),
+        kv_cache_manager=SimpleNamespace(mamba_layer_cache=lambda _: layer_cache),
+    )
+    hidden_states = torch.empty(4, _Cfg.hidden_size, device="cuda")
+
+    output = attention(hidden_states, metadata)
+
+    aligned_indices = captured["slot_indices"]
+    assert output.shape == hidden_states.shape
+    assert aligned_indices.data_ptr() != generation_slice.data_ptr()
+    assert aligned_indices.data_ptr() % 16 == 0
+    torch.testing.assert_close(aligned_indices, generation_slice)
+
+
 class _LayerCache:
     def __init__(self, slots, dim3, w, h, v, k, t_max, device):
         self.conv = torch.zeros(slots, dim3, w, dtype=torch.bfloat16, device=device)

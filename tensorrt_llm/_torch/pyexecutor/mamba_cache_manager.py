@@ -26,7 +26,6 @@ import triton.language as tl
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
-    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
@@ -311,18 +310,6 @@ class BaseMambaCacheManager(ABC):
     def use_kda_replay_update(self) -> bool:
         """Whether KDA fused verification owns per-slot replay caches."""
         return getattr(self, "_use_kda_replay_update", False)
-
-    def create_mamba_metadata(self, max_batch_size: int,
-                              chunk_size: int) -> "Mamba2Metadata":
-        """Create metadata specialized for this manager's replay mode."""
-        if self.use_kda_replay_update:
-            from tensorrt_llm._torch.modules.kimi_kda.kda_metadata import \
-                KDAMetadata
-            return KDAMetadata(max_batch_size, chunk_size)
-
-        from tensorrt_llm._torch.modules.mamba.mamba2_metadata import \
-            Mamba2Metadata
-        return Mamba2Metadata(max_batch_size, chunk_size)
 
     @abstractmethod
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
@@ -1076,10 +1063,6 @@ class PythonMambaCacheManager(BaseResourceManager):
     def use_replay_state_update(self) -> bool:
         return self.get_replay_state_update_metadata() is not None
 
-    @property
-    def use_kda_replay_update(self) -> bool:
-        return self._use_kda_replay_update
-
     def get_replay_state_update_metadata(
             self) -> Optional[ReplayStateUpdateMetadata]:
         if (not self._use_replay_state_update
@@ -1294,10 +1277,6 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     @property
     def use_replay_state_update(self) -> bool:
         return self.get_replay_state_update_metadata() is not None
-
-    @property
-    def use_kda_replay_update(self) -> bool:
-        return self._impl.use_kda_replay_update
 
     def get_replay_state_update_metadata(
             self) -> Optional[ReplayStateUpdateMetadata]:
