@@ -596,7 +596,7 @@ def fuse_input_embeds(
                                    mm_embed.shape[-1],
                                    device=text_embed.device,
                                    dtype=text_embed.dtype)
-        input_embeds[text_token_indices, :] = text_embed
+        input_embeds.index_copy_(0, text_token_indices, text_embed)
     if extra_embeds is not None and len(extra_embeds) > 0:
         # only support single modality for deepstack features for now
         for i, extra_feature in enumerate(extra_embeds):
@@ -606,11 +606,14 @@ def fuse_input_embeds(
                 device=extra_feature.device,
                 dtype=extra_feature.dtype,
             )
-            extra_embed[mm_token_indices, :] = extra_feature
+            extra_embed.index_copy_(0, mm_token_indices, extra_feature)
             extra_embeds[i] = extra_embed
 
-    input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
-                                                    device=input_embeds.device)
+    input_embeds.index_copy_(
+        0,
+        mm_token_indices,
+        mm_embed.to(dtype=input_embeds.dtype, device=input_embeds.device),
+    )
     if extra_embeds is not None and len(extra_embeds) > 0:
         return None, cast(torch.FloatTensor, input_embeds), extra_embeds
     return None, cast(torch.FloatTensor, input_embeds)
