@@ -421,8 +421,19 @@ class CachedModelLoader:
                 self.llm_args.speculative_config.speculative_model is not None):
             spec_model_obj = _ModelWrapper(
                 self.llm_args.speculative_config.speculative_model)
+            was_hub_model = spec_model_obj.is_hub_model
             spec_model_dir = self._download_hf_model_if_needed(spec_model_obj)
             self.llm_args.speculative_config.speculative_model = spec_model_dir
+            # Some speculative configs read defaults out of the draft
+            # checkpoint's config.json (e.g. DFlash's target_layer_ids). A hub
+            # repo id had no readable config.json at validation time; a local
+            # path was already resolved back then.
+            if was_hub_model:
+                resolve_from_checkpoint = getattr(
+                    self.llm_args.speculative_config, 'resolve_from_checkpoint',
+                    None)
+                if resolve_from_checkpoint is not None:
+                    resolve_from_checkpoint()
 
         # AutoDeploy doesn't use ModelLoader
         if self.llm_args.backend == "_autodeploy":

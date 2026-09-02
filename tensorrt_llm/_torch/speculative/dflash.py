@@ -718,8 +718,9 @@ class DFlashWorker(SpecWorkerBase):
                 # next one's slot 0 and the last overruns. Degrades, never raises.
                 gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
 
+                gen_hidden_states = hidden_states_out[gen_gather_ids]
                 gen_logits = draft_model.logits_processor(
-                    hidden_states_out[gen_gather_ids], draft_model.lm_head, attn_metadata, True
+                    gen_hidden_states, draft_model.lm_head, attn_metadata, True
                 )
 
                 vocab_size = gen_logits.shape[-1]
@@ -728,6 +729,18 @@ class DFlashWorker(SpecWorkerBase):
                 gen_logits = self._refine_block_logits(
                     draft_model, gen_logits, inputs, spec_metadata
                 )
+
+                # DFlash 2: replace the independent per-position picks with one
+                # coherent path through the block (absent for plain DFlash).
+                if getattr(draft_model, "has_candidate_selector", False):
+                    gen_logits = self._apply_dflash2_selector(
+                        draft_model,
+                        gen_logits,
+                        gen_hidden_states.reshape(num_gens, K, -1),
+                        inputs["first_prev_tokens"],
+                        spec_metadata,
+                    )
+                    vocab_size = gen_logits.shape[-1]
 
                 gen_draft_tokens = self.sample_draft_tokens(
                     gen_logits,
@@ -753,7 +766,7 @@ class DFlashWorker(SpecWorkerBase):
                     self._accept_stats.record_draft_confidence(
                         spec_metadata.request_ids[num_contexts:batch_size],
                         draft_model,
-                        hidden_states_out[gen_gather_ids].reshape(num_gens, K, -1),
+                        gen_hidden_states.reshape(num_gens, K, -1),
                         inputs["first_prev_tokens"],
                         gen_draft_tokens,
                     )
@@ -836,6 +849,95 @@ class DFlashWorker(SpecWorkerBase):
         intra-block bias.
         """
         return gen_logits
+
+    def _apply_dflash2_selector(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        block_hidden_states: torch.Tensor,
+        anchor_tokens: torch.Tensor,
+        spec_metadata,
+    ) -> torch.Tensor:
+        """Replace DFlash's independent per-position picks with the DFlash 2
+        candidate selector's chosen path.
+
+        Returns full-vocab ``[num_gens, K, vocab]`` logits carrying only each
+        position's top-k candidates, scored under the predecessor the walk
+        settled on. Downstream sampling is unchanged and stays lossless: each
+        row is the distribution its draft token was drawn from.
+
+        The walk always chains through the greedy successor, so under sampling
+        a draft token can differ from the predecessor the next position was
+        scored under. That costs acceptance rate, not correctness — same
+        trade-off as ``_apply_dspark_markov_bias``.
+        """
+        if self._d2t is not None:
+            raise NotImplementedError(
+                "DFlash 2 candidate selection requires a shared draft/target "
+                "vocab (d2t vocab mapping is not supported)."
+            )
+        selector = draft_model.candidate_selector
+        candidate_ids, unary_logits, block_logits = self._dflash2_global_top_k(
+            gen_logits,
+            spec_metadata,
+            top_k=selector.top_k,
+            full_vocab=selector.predecessor_codebook.shape[0],
+        )
+        return draft_model.select_candidate_path(
+            block_logits,
+            candidate_ids,
+            unary_logits,
+            block_hidden_states,
+            anchor_tokens.long(),
+        )
+
+    def _dflash2_global_top_k(
+        self,
+        gen_logits: torch.Tensor,
+        spec_metadata,
+        top_k: int,
+        full_vocab: int,
+    ):
+        """Per-position global top-k candidates, and the tensor to score into.
+
+        The selector indexes full-vocab codebooks, so candidate ids must be
+        global. A vocab-sharded draft head is reduced by all-gathering only each
+        rank's local (id, value) pairs — 2 * top_k per position instead of the
+        whole vocabulary. Every rank then writes identical rows, so downstream
+        sampling needs no further collective.
+
+        Returns ``(candidate_ids, unary_logits, block_logits)``, where
+        ``block_logits`` is ``gen_logits`` rewritten in place when it is already
+        full-vocab (the common single-rank case) and a fresh tensor otherwise.
+        """
+        shard = gen_logits.shape[-1]
+        if shard == full_vocab:
+            unary_logits, candidate_ids = torch.topk(gen_logits, top_k, dim=-1)
+            return candidate_ids, unary_logits, gen_logits
+
+        mapping = self.mapping
+        if not (
+            self._draft_logits_are_sharded(gen_logits, spec_metadata)
+            and mapping is not None
+            and shard * mapping.tp_size == full_vocab
+        ):
+            raise NotImplementedError(
+                f"DFlash 2 candidate selection needs the drafter's full vocab "
+                f"({full_vocab}) or a plain TP column shard of it; got draft "
+                f"logits of width {shard}."
+            )
+
+        from ..distributed.ops import allgather
+
+        local_values, local_ids = torch.topk(gen_logits, top_k, dim=-1)
+        local_ids = local_ids + mapping.tp_rank * shard
+        # Interleaved (id, value) pairs, matching _get_local_max_and_combined.
+        combined = torch.stack([local_ids.float(), local_values.float()], dim=-1).flatten(-2)
+        gathered = allgather(combined, mapping, dim=-1)
+        unary_logits, selected = torch.topk(gathered[..., 1::2], top_k, dim=-1)
+        candidate_ids = gathered[..., 0::2].gather(-1, selected).long()
+        block_logits = gen_logits.new_full((*gen_logits.shape[:-1], full_vocab), float("-inf"))
+        return candidate_ids, unary_logits, block_logits
 
     def prepare_1st_drafter_inputs(
         self,
