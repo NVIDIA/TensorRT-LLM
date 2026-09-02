@@ -18,11 +18,20 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Overview
 
-Long-context and agentic workloads can retain large amounts of reusable KV
-cache. If GPU, Host, or Disk cache capacity is exhausted, useful prefixes are
-evicted and must be recomputed. KV cache compression reduces this pressure by
-changing either how KV data is represented in storage or how much KV data is
-retained.
+Long-context and agentic workloads repeatedly revisit prompts, tool histories,
+and intermediate reasoning state. Their reusable KV cache can grow beyond the
+GPU, Host, or Disk capacity available to the serving system. When a cache tier
+cannot retain enough reusable Pages, useful prefixes are evicted, the cache hit
+rate falls, and TensorRT-LLM must recompute more context. This can increase time
+to first token (TTFT) and reduce throughput.
+
+KV cache compression reduces this pressure by changing either how KV data is
+represented in storage or how much KV data is retained. A compact cold-tier
+representation can keep more reusable Pages within the same Host or Disk byte
+quota and move fewer bytes during Page migration. An iteration-driven method
+can instead reduce the retained token set and the associated storage or
+Attention work. The benefit is workload-dependent and is largest when the
+corresponding cache-capacity, migration, or computation cost is a bottleneck.
 
 Compression runs at well-defined safe points outside the Attention kernel. For
 example, a method can compress the cache after a prefill or generation step, or

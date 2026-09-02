@@ -3,7 +3,7 @@
 This document describes enabling TriAttention KV-cache compression in TensorRT-LLM.
 
 For an overview of all available compression methods, see
-[KV Cache Compression](../../docs/source/features/kv-cache-compression.md).
+[KV Cache Compression](https://nvidia.github.io/TensorRT-LLM/features/kv-cache-compression.html).
 
 TriAttention is a training-free, decode-time KV-cache eviction method for long-context LLM inference. During generation it periodically scores the cached tokens by a trigonometric importance measure derived from offline per-head query statistics (calibration), keeps the most important `budget` tokens, and physically compacts the cache — reducing KV-cache memory so more sequences fit on a GPU at once.
 

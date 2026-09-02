@@ -27,10 +27,11 @@ storage ABI, page-index lifetime, staging, and migration transaction, see the
 
 ## Architecture
 
-KV cache compression is a strategy layer over KVCM V2. The compression method
-decides *when* and *how* to reduce the stored KV representation. KVCM V2 remains
-the authority for Pages, Slots, cache levels, allocation, migration, reuse,
-events, and publication of a completed mapping.
+KV cache compression works through `KVCacheManagerV2` (KVCM V2). A compression
+method defines when compression runs and which method-specific transformation
+it applies. All KV-cache interactions go through KVCM V2, which remains the
+authority for Pages, Slots, cache levels, allocation, migration, reuse,
+completion ordering, and mapping publication.
 
 ```text
 KvCacheCompressionConfig
@@ -42,7 +43,7 @@ factory and compatibility checks
 KVCacheCompressionManager
         |
         +-- iteration-driven method
-        |     lifecycle hook -> decision/transform -> KVCM resize or reclaim
+        |     lifecycle hook -> method-specific compression action
         |
         `-- storage-bound method
               codec provider -> native codec adapter -> KVCM migration
@@ -55,10 +56,9 @@ The framework supports two extension models.
 | Iteration-driven | `uses_iteration_lifecycle = True` | PyExecutor resource-manager callbacks around model iterations | TriAttention periodic token eviction |
 | Storage-bound | `provides_cold_page_codec = True` | KVCM hot/cold migration | NVFP4 cold-page quantization |
 
-An iteration-driven method can change the token set or physical length while a
-request is running. A storage-bound method leaves the active GPU representation
-unchanged and transforms a complete Page batch only when KVCM moves it across a
-representation boundary.
+An iteration-driven method runs compression logic at request or model-iteration
+lifecycle boundaries. A storage-bound method runs when KVCM moves Pages across
+a representation boundary.
 
 Keep the two mechanisms separate. Do not add migration policy to an iteration
 hook, and do not make a cold-page provider allocate or publish KVCM Pages.
@@ -193,7 +193,7 @@ request completes or aborts
 | Hook | Exact trigger | Appropriate work |
 |---|---|---|
 | `on_request_init(request)` | The request's first context chunk reaches `prepare_resources()` | Allocate request-local algorithm state or raise a capacity high-water mark |
-| `on_context_step_end(requests)` | The iteration containing each request's final context chunk has completed | Perform one batched context-final action for that cohort |
+| `on_context_step_end(requests)` | After forward, for requests whose final context chunk ran in that iteration; intermediate chunks are excluded | Perform one batched context-final action for that cohort |
 | `on_generation_step_begin(scheduled_batch)` | Every scheduled iteration, before forward | Inspect the generation cohort or snapshot scheduler-owned information that cannot be reconstructed after overlap |
 | `on_generation_step_end(scheduled_batch)` | Every scheduled iteration, after forward and the native KVCM update | Process the generation cohort against authoritative KV state |
 | `on_request_finish(request)` | Request completion or abort | Release request-local algorithm state; do not release KVCM Pages |
@@ -299,30 +299,35 @@ the storage ABI, see the
 [PR #18091](https://github.com/NVIDIA/TensorRT-LLM/pull/18091) for a concrete
 NVFP4 layout and provider implementation.
 
-### `create_cold_page_codec()`
+### Common base contract and required overrides
 
-KVCM supplies the resolved cache configuration, runtime KV dtype, PP-local
-layer mapping, per-layer KV-head count, per-layer head dimension, and whether
-the cache belongs to a draft model. The method must return one owning native
-`IKvCacheColdPageCodec` object.
+For token-wise cold-page quantization, subclass
+`ColdPageQuantizationCompression`. It implements the common registration and
+Python/native bridge; the format subclass supplies only its state, layout, and
+batched transform.
 
-KVCM can request more than one codec, for example for target and independent
-draft caches or while rebuilding after a construction fallback. Every call
-must therefore create independent codec state. Do not store mutable
-lifecycle-specific metadata only on the shared compression-manager object.
+| Member | Common base behavior | Format subclass responsibility |
+|---|---|---|
+| `__init__()` | Stores the compression configuration and KVCM bindings | Override only to load immutable format metadata, and call `super().__init__()` |
+| `uses_iteration_lifecycle`, `provides_cold_page_codec` | Selects storage-bound execution | Inherit `False` and `True`, respectively |
+| `create_cold_page_codec()` | Builds independent codec state and returns an owning native `IKvCacheColdPageCodec` wrapper | Normally inherit |
+| `configure()` | Builds and retains metadata for every provider-owned lifecycle, reports one fixed cold Page size per lifecycle, and selects host-resident `PageIndexPair` arrays | Normally inherit when this index contract fits |
+| `build_codec_state()` | Raises `NotImplementedError` | Required: define codec-lifetime format state and provider-owned layers |
+| `build_lifecycle_metadata()` | Raises `NotImplementedError` | Required: resolve and validate one lifecycle's physical layout and launch metadata |
+| `encode_cold_pages()`, `decode_cold_pages()` | Raise `NotImplementedError` in `KVCacheCompressionManager` | Required: dispatch the batched format-specific transforms |
 
-`ColdPageQuantizationCompression.create_cold_page_codec()` implements the
-common bridge:
+A storage format that does not fit the token-wise quantization helper should
+subclass `KVCacheCompressionManager` directly and implement
+`create_cold_page_codec()`. It must provide the same ownership, lifetime, and
+migration contract; needing a different transform is not a reason to add an
+algorithm-specific path to KVCM.
 
-1. call `build_codec_state()` for format-specific codec-lifetime state;
-2. pass the provider and that state to
-   `create_python_cold_page_codec()`; and
-3. return the resulting native codec to KVCM.
+### Required codec state
 
-### `build_codec_state()`
-
-Implement this method in a format-specific subclass. It should resolve stable
-facts available before KVCM allocates its cold tiers, for example:
+KVCM supplies the cache configuration, runtime KV dtype, PP-local layer
+mapping, per-layer KV-head count, per-layer head dimension, and whether the
+cache belongs to a draft model. `build_codec_state()` should resolve stable
+facts available before KVCM allocates its cold tiers, such as:
 
 - provider-owned layer IDs;
 - runtime dtype and per-layer geometry;
@@ -330,63 +335,61 @@ facts available before KVCM allocates its cold tiers, for example:
 - immutable format parameters.
 
 The returned object must expose unique `layer_ids`. The native adapter uses
-them to determine which KVCM lifecycles the provider owns. State is retained by
-the native codec wrapper, so tensors and metadata referenced by later launches
-must remain alive for the codec lifetime.
+them to determine which KVCM lifecycles the provider owns. Each
+`create_cold_page_codec()` call must create independent state, and the native
+wrapper retains that state for the codec lifetime. Do not keep mutable
+lifecycle metadata only on the shared compression-manager object.
 
-### `configure()` and `build_lifecycle_metadata()`
+### Required lifecycle layout
 
-During `NativeColdPageCodec.configure()`, the adapter converts KVCM's
-authoritative hot pool descriptors into resolved lifecycles. A lifecycle is
-either entirely provider-owned or entirely handled by the default lossless
-codec. Mixing provider-owned and fallback layers inside one lifecycle is
-rejected.
+The native adapter converts KVCM's authoritative hot pool descriptors into
+resolved lifecycles before it calls `configure()`. The common implementation
+then calls `build_lifecycle_metadata(codec_state, lifecycle)` for each
+provider-owned lifecycle and retains the results on the codec state.
 
-`ColdPageQuantizationCompression.configure()` calls
-`build_lifecycle_metadata(codec_state, lifecycle)` for every provider-owned
-lifecycle, stores the results on the codec state, and returns:
+`build_lifecycle_metadata()` must validate the resolved hot buffer roles,
+addresses, Slot strides, byte sizes, alignment, and transform geometry. It must
+produce the fixed cold Page byte size and immutable metadata needed by later
+launches. Derive this information from the resolved descriptors rather than
+guessing a model layout from its name.
 
-- the fixed number of bytes in one cold Page; and
-- whether the `PageIndexPair` array is in host or device memory.
+A lifecycle must be entirely provider-owned or entirely handled by the
+embedded lossless codec. The native adapter rejects mixed ownership, duplicate
+provider layers, and provider layers missing from KVCM's descriptors.
+Provider-unowned lifecycles, such as recurrent state in a hybrid model, remain
+lossless.[^mixed-lifecycle-host-limit]
 
-Use `build_lifecycle_metadata()` to validate the actual hot buffer roles,
-addresses, Slot strides, byte sizes, alignment, and transform geometry. Derive
-launch metadata from these resolved descriptors rather than guessing a model
-layout from its name.
+[^mixed-lifecycle-host-limit]: On hosts where KVCM uses chunked pinned-memory
+    registration, the current adapter rejects a model that combines
+    provider-owned and lossless-fallback lifecycles because the embedded
+    lossless codec cannot split its batched copies at those registration
+    boundaries.
 
-Provider-unowned lifecycles, such as recurrent state in a hybrid model, use the
-embedded lossless codec. The native adapter verifies that every declared
-provider layer appears exactly once and rejects ambiguous lifecycle ownership.
-On systems running Linux kernels where KVCM requires chunked pinned-memory
-registration, the current adapter rejects a configuration that combines
-provider-owned and fallback lifecycles because the embedded lossless codec
-cannot split its batched copies at those registration boundaries.
+### Required batched transforms
 
-### `encode_cold_pages()` and `decode_cold_pages()`
+`encode_cold_pages()` and `decode_cold_pages()` receive the codec state,
+provider-lifecycle index, cold allocation base address, `PageIndexPair` array,
+Page count, and KVCM-owned CUDA stream.
 
-These methods receive:
+The common quantization base selects host-resident Page indices. Consume or
+copy the `PageIndexPair` array before the Python callback returns; the GPU
+transform itself should remain asynchronous on the supplied stream.
 
-- the codec state and provider-lifecycle index;
-- the cold allocation base address;
-- a `PageIndexPair` array address;
-- the number of Pages in this codec call; and
-- the KVCM-owned CUDA stream.
+Submit every Page in the call to the format-specific native launcher. Avoid a
+Python loop over Pages or layers; launcher-internal tiling or chunking belongs
+below this interface. A call may be the original migration batch or a chunk
+created by Page-index or Disk staging, so do not assume it contains every Page
+or lifecycle from the original KVCM operation.
 
-They must submit every Page in the call to the format-specific native launcher.
-Avoid a Python loop over Pages or layers; launcher-internal tiling or chunking
-belongs below this interface. A call may represent the full migration batch or
-a chunk created by Page-index or Disk staging, so a provider must not assume it
-sees the original batch or every lifecycle in a batching-equivalence class.
+Enqueue work only on the supplied stream, and do not retain the cold pointer,
+Page-index pointer, or stream past its documented lifetime. The provider must
+not synchronize successful work, publish Page mappings, release Slots, or
+perform Disk I/O. If a Python provider throws after beginning submission, the
+native adapter drains that stream before reporting failure so KVCM can roll
+back safely.
 
-The provider may enqueue work only on the supplied stream and must not retain
-the cold pointer, Page-index pointer, or stream past the documented lifetime.
-It must not synchronize successful work, publish Page mappings, release Slots,
-or perform disk I/O. If a Python provider throws after beginning submission,
-the native adapter drains that same stream before reporting failure so KVCM can
-roll back the migration transaction safely.
-
-The exact `IKvCacheColdPageCodec` ABI, host/device index lifetimes, batching
-representatives, staging rules, and failure transaction are documented in the
+The exact `IKvCacheColdPageCodec` ABI, host/device index lifetimes, batching,
+staging, and failure transaction are documented in the
 [Cold-Page Codec Design](kv-cache-cold-page-codec.md).
 
 ## Ownership and failure boundaries
@@ -432,10 +435,15 @@ partially updated.
 4. Fail before construction for an explicitly requested unsupported method or
    combination.
 
-Configuration dispatch, compatibility policy, manager construction, and
-algorithm policy belong in Python. Keep them in `llm_args.py`, `_util.py`, and
-the method's package under `tensorrt_llm/_torch/kv_cache_compression/`; do not
-add algorithm selection to KVCM C++.
+The KV cache compression framework owns a method's configuration dispatch,
+compatibility policy, manager construction, lifecycle integration, and
+algorithm policy. Keep that method-specific Python logic in `llm_args.py`,
+`_util.py`, and the method's package under
+`tensorrt_llm/_torch/kv_cache_compression/`, together with only the native
+launchers or bindings it needs. Use the existing executor and KVCM V2
+interfaces; do not add method-specific branches to the runtime or KVCM C++.
+Change those shared components only when extending an algorithm-neutral
+framework contract.
 
 ### 3A. Implement an iteration-driven method
 
@@ -456,9 +464,12 @@ add algorithm selection to KVCM C++.
    record order, offsets, alignment, padding, auxiliary metadata, and total Page
    bytes. Follow the
    [cold-page layout contract](#cold-page-storage-foundation-and-format-layout).
-3. Implement `create_cold_page_codec()` directly, or reuse
-   `ColdPageQuantizationCompression` and implement `build_codec_state()` plus
-   `build_lifecycle_metadata()`.
+3. Choose the provider base that matches the method:
+   - for token-wise cold-page quantization, subclass
+     `ColdPageQuantizationCompression` and implement `build_codec_state()` plus
+     `build_lifecycle_metadata()`; or
+   - for another storage format, subclass `KVCacheCompressionManager` directly
+     and implement `create_cold_page_codec()`.
 4. Define the provider-owned layer set and a lossless policy for unowned
    lifecycles.
 5. Implement batched `encode_cold_pages()` and `decode_cold_pages()` using the
