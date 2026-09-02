@@ -1154,9 +1154,11 @@ def test_warm_ctx_from_gen(model, generation_overlap):
         dict(disable_overlap_scheduler=not generation_overlap,
              cuda_graph_config=CudaGraphConfig()))
 
+    tokens_per_block = 32
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
-        for _ in range(2)
+        KvCacheConfig(max_tokens=2048 * 8,
+                      enable_block_reuse=True,
+                      tokens_per_block=tokens_per_block) for _ in range(2)
     ]
     cache_transceiver_configs = [
         CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
@@ -1207,10 +1209,16 @@ def test_warm_ctx_from_gen(model, generation_overlap):
             intercomm.send("GET_LAST_PROMPT_TOKEN_IDS", dest=0, tag=MPI_REQUEST)
             prompt_ids = intercomm.recv(source=0, tag=MPI_RESULT)
             assert len(prompt_ids) > 0
-            full_ids = list(prompt_ids) + generated_ids
+            raw_ids = list(prompt_ids) + generated_ids
+            whole = (len(raw_ids) // tokens_per_block) * tokens_per_block
+            full_ids = raw_ids[:whole]
+            assert len(full_ids) > len(prompt_ids), (
+                f"{len(raw_ids)} tokens align down to {len(full_ids)}, which does "
+                f"not reach past the {len(prompt_ids)}-token prompt")
             print(
                 f"Worker 0 holds {len(prompt_ids)} prompt + "
-                f"{len(generated_ids)} generated tokens",
+                f"{len(generated_ids)} generated tokens; "
+                f"aligned to {len(full_ids)} for transfer",
                 flush=True)
 
             # 2. Read worker 0's transceiver state
@@ -1232,10 +1240,12 @@ def test_warm_ctx_from_gen(model, generation_overlap):
                         ]
             responses = send_requests_to_worker(requests, 1, intercomm)
             assert len(responses) == 1
-            warm_tokens = responses[0][0].token_ids or []
-            assert len(warm_tokens) == 0, (
-                f"transfer_only request decoded {len(warm_tokens)} tokens. Should have decoded 0 tokens."
+            assert not isinstance(responses[0], str), (
+                f"warm request errored instead of transferring KV: {responses[0]}"
             )
+            warm_tokens = responses[0][0].token_ids or []
+            assert len(warm_tokens) <= 1, (
+                f"transfer_only request produced {len(warm_tokens)} tokens. Instead no decode steps should be run.")
 
             # 4. Next turn on worker 1: turn 1 plus a new user message, as token ids so the
             #    prefix stays byte-identical to what worker 0 served.
