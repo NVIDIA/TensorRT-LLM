@@ -2286,8 +2286,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             def __init__(self, decisions):
                 self.decisions = decisions
 
-            def tp_allgather(self, value):
-                del value
+            def tp_allgather(self, value, *, small_payload: bool = False):
+                del value, small_payload
                 return self.decisions
 
         engine = object.__new__(PyTorchModelEngine)
@@ -3461,8 +3461,46 @@ class TestPydanticBestPractices:
 
 @pytest.mark.cpu_only
 def test_kv_cache_compression_config_dispatches_by_algorithm():
-    from tensorrt_llm.llmapi.llm_args import \
-        TriAttentionKvCacheCompressionConfig
+    from tensorrt_llm.llmapi.llm_args import (
+        ColdPageQuantizationCompressionConfig,
+        TriAttentionKvCacheCompressionConfig)
+
+    cold_config = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_compression_config={
+            "algorithm": "quantization_for_cold_page",
+            "quant": "nvfp4",
+        },
+    ).kv_cache_compression_config
+
+    assert isinstance(cold_config, ColdPageQuantizationCompressionConfig)
+    assert cold_config.model_dump() == {
+        "algorithm": "quantization_for_cold_page",
+        "quant": "nvfp4",
+        "scale_checkpoint_path": None,
+    }
+    assert not cold_config.changes_physical_kv_length
+    assert cold_config.supports_block_reuse()
+    assert cold_config.supports_speculative_decoding()
+
+    cold_config_with_scales = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_compression_config={
+            "algorithm": "quantization_for_cold_page",
+            "quant": "nvfp4",
+            "scale_checkpoint_path": "/tmp/nvfp4-kv-scales",
+        },
+    ).kv_cache_compression_config
+    assert cold_config_with_scales.scale_checkpoint_path == "/tmp/nvfp4-kv-scales"
+
+    with pytest.raises(ValidationError):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_compression_config={
+                "algorithm": "quantization_for_cold_page",
+                "quant": "fp8",
+            },
+        )
 
     config_dict = yaml.safe_load("""
 kv_cache_compression_config:

@@ -819,6 +819,7 @@ class KVCacheManagerV2(BaseResourceManager):
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
         is_estimating_kv_cache: bool = False,
+        cold_page_codec_provider: Optional[object] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -1134,14 +1135,34 @@ class KVCacheManagerV2(BaseResourceManager):
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
 
+        def create_cold_page_codec(cache_config: object) -> Optional[object]:
+            if cold_page_codec_provider is None:
+                return None
+            return cold_page_codec_provider.create_cold_page_codec(
+                cache_config,
+                runtime_dtype=self.dtype,
+                pp_layers=self.pp_layers,
+                num_kv_heads_per_layer=self.num_kv_heads_per_layer,
+                head_dim_per_layer=self.head_dim_per_layer,
+                is_draft=self.is_draft,
+            )
+
         candidate: Optional[KVCacheManagerPy] = None
         if not has_host_cache_tier:
-            candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
+            candidate = KVCacheManagerPy(
+                config,
+                event_manager=self.event_manager,
+                cold_page_codec=create_cold_page_codec(config),
+            )
         else:
             init_error: Optional[Exception] = None
             local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
             try:
-                candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
+                candidate = KVCacheManagerPy(
+                    config,
+                    event_manager=self.event_manager,
+                    cold_page_codec=create_cold_page_codec(config),
+                )
             except Exception as error:
                 if isinstance(error, (CuError, KVCacheOutOfMemoryError)):
                     local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
@@ -1177,7 +1198,11 @@ class KVCacheManagerV2(BaseResourceManager):
                             if not isinstance(tier, HostCacheTierConfig)
                         ],
                     )
-                    candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
+                    candidate = KVCacheManagerPy(
+                        config,
+                        event_manager=self.event_manager,
+                        cold_page_codec=create_cold_page_codec(config),
+                    )
                 except Exception as error:
                     fallback_error = error.with_traceback(None)
 

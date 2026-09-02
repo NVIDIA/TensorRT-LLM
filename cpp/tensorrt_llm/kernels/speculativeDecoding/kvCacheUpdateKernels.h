@@ -43,7 +43,7 @@ using IndexType = int;
  * @param rewindDraftTokenCount : Count to rewind
  * @param seqSlotRemapping mapping from batch index to index of the seqSlot in the sorted seqSlot buffer
  * e.g. for requests [0, 1, 2] with seqSlots [5, 3, 4], seqSlotRemapping is [1, 2, 0]
- * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices from gptDecoderBatched
+ * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices produced by the decoder
  * and pointerArray and pastKeyValueLengths from runtimeBuffers.
  * @param maxKVCacheLen : Maximum length of each KV cache
  * @param stream : CUDA stream to use.
@@ -69,7 +69,7 @@ void updateLinearKVCacheDraftTokenLocationCommonRewind(runtime::SizeType32 const
  * @param rewindDraftTokenCount : Count to rewind
  * @param seqSlotRemapping mapping from batch index to index of the seqSlot in the sorted seqSlot buffer
  * e.g. for requests [0, 1, 2] with seqSlots [5, 3, 4], seqSlotRemapping is [1, 2, 0]
- * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices from gptDecoderBatched
+ * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices produced by the decoder
  * and pointerArray and pastKeyValueLengths from runtimeBuffers.
  * @param maxKVCacheLen : Maximum length of each KV cache
  * @param maxBlocksPerSeq : Maximum blocks per sequence of Block KV cache.
@@ -99,7 +99,7 @@ void updateKVBlockArrayDraftTokenLocationCommonRewind(runtime::SizeType32 const*
  * one sequence.
  * @param seqSlotRemapping mapping from batch index to index of the seqSlot in the sorted seqSlot buffer
  * e.g. for requests [0, 1, 2] with seqSlots [5, 3, 4], seqSlotRemapping is [1, 2, 0]
- * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices from gptDecoderBatched
+ * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices produced by the decoder
  * and pointerArray and pastKeyValueLengths from runtimeBuffers.
  * @param maxKVCacheLen : Maximum length of each KV cache
  * @param stream : CUDA stream to use.
@@ -127,7 +127,7 @@ void updateLinearKVCacheDraftTokenLocationSeparateRewind(runtime::SizeType32 con
  * one sequence.
  * @param seqSlotRemapping mapping from batch index to index of the seqSlot in the sorted seqSlot buffer
  * e.g. for requests [0, 1, 2] with seqSlots [5, 3, 4], seqSlotRemapping is [1, 2, 0]
- * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices from gptDecoderBatched
+ * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices produced by the decoder
  * and pointerArray and pastKeyValueLengths from runtimeBuffers.
  * @param maxKVCacheLen : Maximum length of each KV cache
  * @param maxBlocksPerSeq : Maximum blocks per sequence of Block KV cache.
@@ -160,7 +160,7 @@ void updateKVBlockArrayDraftTokenLocationSeparateRewind(runtime::SizeType32 cons
  * rewind adjustment for one sequence.
  * @param seqSlotRemapping mapping from batch index to index of the seqSlot in the sorted seqSlot buffer
  * e.g. for requests [0, 1, 2] with seqSlots [5, 3, 4], seqSlotRemapping is [1, 2, 0]
- * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices from gptDecoderBatched
+ * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices produced by the decoder
  * and pointerArray and pastKeyValueLengths from runtimeBuffers.
  * @param maxKVCacheLen : Maximum length of each KV cache
  * @param stream : CUDA stream to use.
@@ -191,7 +191,7 @@ void updateLinearKVCacheDraftTokenLocation(runtime::SizeType32 const* seqAccepte
  * rewind adjustment for one sequence, indexed through batchSlots.
  * @param seqSlotRemapping mapping from batch index to index of the seqSlot in the sorted seqSlot buffer
  * e.g. for requests [0, 1, 2] with seqSlots [5, 3, 4], seqSlotRemapping is [1, 2, 0]
- * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices from gptDecoderBatched
+ * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices produced by the decoder
  * and pointerArray and pastKeyValueLengths from runtimeBuffers.
  * @param batchSlots : [seqCount] indices of sequences in the seq slots.
  * @param maxKVCacheLen : Maximum length of each KV cache

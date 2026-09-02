@@ -28,7 +28,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/common/vec_dtypes.cuh"
-#include "tensorrt_llm/kernels/decodingCommon.h"
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
