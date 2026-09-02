@@ -171,6 +171,13 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff
   - unittest/_torch/moe/test_megamoe_streaming_load.py
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_accepts_minimax_m3_problem
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_accepts_uniform_minimax_m3_swiglu_bias
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_rejects_nonuniform_swiglu_bias
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_standard_swiglu_keeps_original_activation_path
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tactic_autotune_defaults_off
+  - unittest/_torch/moe/test_moe_backend.py::test_enumerate_megamoe_candidate_tactics_curated_space
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout

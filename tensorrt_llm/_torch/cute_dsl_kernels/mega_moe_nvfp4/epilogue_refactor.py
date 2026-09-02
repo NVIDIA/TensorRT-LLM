@@ -1015,6 +1015,8 @@ class SwapABSwigluFp4Epilogue:
             allow_overlap_acc: bool = True,
             static_expert_shape: Optional[Tuple[
                 int, int, int]] = None,  # [expert, intermediate, hidden]
+            swiglu_alpha: Optional[float] = None,
+            swiglu_beta: Optional[float] = None,
             gate_up_clamp: Optional[float] = None,  # Swiglu style only
             # SiTU (Kimi K3). Both None -> SwiGLU. Both set -> SiTU, and
             # ``gate_up_clamp`` must be None (SiTU has no clamp, matching
@@ -1048,6 +1050,15 @@ class SwapABSwigluFp4Epilogue:
         self.acc_dtype = acc_dtype
         self.fc1_output_sf_dtype = fc1_output_sf_dtype
         self.sf_vec_size = sf_vec_size
+        # Optional MiniMax-M3 SwiGLUBias constants. None preserves the
+        # original standard SwiGLU instruction path exactly.
+        if (swiglu_alpha is None) != (swiglu_beta is None):
+            raise ValueError(
+                "swiglu_alpha and swiglu_beta must be set together, got "
+                f"{swiglu_alpha} and {swiglu_beta}.")
+        self.swiglu_alpha = None if swiglu_alpha is None else float(
+            swiglu_alpha)
+        self.swiglu_beta = None if swiglu_beta is None else float(swiglu_beta)
         # Swiglu gate/up clamp limit; None disables clamping.
         self.gate_up_clamp = gate_up_clamp
         # SiTU activation constants; None/None selects SwiGLU.
@@ -1063,6 +1074,9 @@ class SwapABSwigluFp4Epilogue:
                 raise ValueError(
                     "SiTU does not support gate_up_clamp (matches DeepGEMM, "
                     "which rejects activation_clamp together with SiTU).")
+            if swiglu_alpha is not None:
+                raise ValueError(
+                    "SiTU does not support MiniMax-M3 SwiGLUBias constants.")
         self.situ_beta = None if situ_beta is None else float(situ_beta)
         self.situ_linear_beta = (None if situ_linear_beta is None else
                                  float(situ_linear_beta))
@@ -1680,8 +1694,9 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         #   2. clamp the DEQUANTED (real) values, gpt-oss ``_apply_gate`` style:
         #        gate = min(gate, +limit)           (upper bound only)
         #        up   = clamp(up, -limit, +limit)   (symmetric)
-        #   3. swiglu:   out = up * gate * sigmoid(gate)
-        #                sigmoid(x) = rcp(1 + exp2(-x * log2e))
+        #   3. swiglu: out = (up + beta) * gate * sigmoid(alpha * gate)
+        #      Standard SwiGLU uses alpha=1 and beta=0. MiniMax-M3 uses
+        #      alpha=1.702 and beta=1.0.
         #
         # The symmetric up-clamp is a single ``min.xorsign.abs.f32`` (magnitude
         # min(|up|, limit), sign = sign(up)^sign(limit) = sign(up) since limit>=0);
@@ -1691,11 +1706,18 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         out = cute.make_rmem_tensor((n, ), cutlass.Float32)
         log2_e = 1.4426950408889634
 
+        activation_alpha = 1.0 if self.swiglu_alpha is None else self.swiglu_alpha
+        neg_activation_alpha_log2e = -activation_alpha * log2_e
         neg_log2e_pair = (
-            cutlass.Float32(-log2_e),
-            cutlass.Float32(-log2_e),
+            cutlass.Float32(neg_activation_alpha_log2e),
+            cutlass.Float32(neg_activation_alpha_log2e),
         )
         one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
+        if cutlass.const_expr(self.swiglu_beta is not None):
+            beta_pair = (
+                cutlass.Float32(self.swiglu_beta),
+                cutlass.Float32(self.swiglu_beta),
+            )
         if cutlass.const_expr(self.gate_up_clamp is not None):
             limit = cutlass.Float32(self.gate_up_clamp)
 
@@ -1770,7 +1792,10 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             sigmoid_pair = _sigmoid(g0, g1)
 
             if cutlass.const_expr(self.situ_beta is None):
-                # SwiGLU: out = up * gate * sigmoid(gate)
+                # SwiGLU: out = (up + beta) * gate * sigmoid(alpha * gate).
+                # The beta offset follows the up clamp for MiniMax-M3.
+                if cutlass.const_expr(self.swiglu_beta is not None):
+                    u0, u1 = cute.arch.add_packed_f32x2((u0, u1), beta_pair)
                 ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
                 out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
             else:
