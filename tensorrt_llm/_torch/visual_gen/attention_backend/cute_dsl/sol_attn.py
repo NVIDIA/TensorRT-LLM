@@ -94,6 +94,24 @@ def sol_attn_graph_phase(
     return int(value < disabled_until_timestep)
 
 
+def _cute_dense_available() -> bool:
+    """Whether `cute_dsl_fmha_fwd` can run on the current device.
+
+    Checked once at construction. Sol-Attn is sm100-only and the dense CuTe DSL
+    kernel covers sm_100a/sm_103a, so in practice this is always true wherever
+    Sol-Attn runs; the negative branch exists so an unsupported device degrades
+    to SDPA instead of raising.
+    """
+    try:
+        from .fmha import _check_cute_runtime_available, _get_gpu_arch
+
+        _check_cute_runtime_available()
+        _get_gpu_arch()
+    except Exception:
+        return False
+    return True
+
+
 def _parse_dense_layers(spec: Optional[str]) -> frozenset:
     layers: set = set()
     for item in str(spec or "").split(","):
@@ -149,6 +167,37 @@ class SolAttnAttention(AttentionBackend):
         self.disabled_until_timestep = getattr(cfg, "disabled_until_timestep", None)
         self.dense_layers = _parse_dense_layers(getattr(cfg, "dense_layers", None))
 
+        # Sol-Attn's dense steps must run the backend the user selected. Without
+        # this they ran torch SDPA while a `backend: CUTEDSL` baseline ran
+        # cute_dsl_fmha_fwd, so candidate and reference differed on the dense
+        # steps too -- measured at LPIPS 0.214 on Wan2.2-T2V-A14B with sparsity
+        # switched off entirely, against a 0.25 gate.
+        from .fmha import CuTeDSLAttention
+
+        self._dense_backend = CuTeDSLAttention(
+            layer_idx=layer_idx,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=self.num_kv_heads,
+            dtype=dtype,
+        )
+        # Whether the CuTe DSL dense kernel can serve this device, decided once
+        # here. Doing it at construction (rather than lazily on the first call)
+        # keeps `_dense` free of attribute mutation, so it stays traceable and
+        # the dense step sits in the same place in the graph as the dense
+        # CUTEDSL baseline's does. Deciding it lazily and marking `_dense`
+        # `@torch.compiler.disable` instead moved the whole dense step out of
+        # the graph and reintroduced the very mismatch this is meant to remove:
+        # measured LPIPS 0.4044 compiled, against 0.2112 eager.
+        self._cute_dense_ok = _cute_dense_available()
+        if not self._cute_dense_ok:
+            logger.warning_once(
+                "[sol-attn] the CuTe DSL FMHA kernel cannot serve this device; dense "
+                "steps will use torch SDPA. Numerics will differ from a `backend: "
+                "CUTEDSL` dense baseline.",
+                key="sol_attn_dense_backend_unavailable",
+            )
+
     # The `.item()` in here would graph-break the enclosing block once per
     # attention layer, so keep it in eager (as cute_dsl/fmha.py and VSA's
     # `_get_vsa_inputs` do). Returns a host-side bool, so the dense and sparse
@@ -175,6 +224,25 @@ class SolAttnAttention(AttentionBackend):
             return False
         return phase == 0
 
+    @staticmethod
+    def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Dense attention via torch SDPA, for architectures CuTe DSL cannot serve."""
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        ).transpose(1, 2)
+
+    def _dense(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Dense attention on the configured backend, or SDPA where unavailable.
+
+        ``_cute_dense_ok`` answers "can this *device* run the kernel", decided at
+        construction; ``q.is_cuda`` answers "is this *tensor* on it". Both are
+        needed: the construction-time probe inspects the current CUDA device, so
+        it says yes on a GPU host even when a caller passes CPU tensors.
+        """
+        if self._cute_dense_ok and q.is_cuda:
+            return self._dense_backend.forward(q, k, v)
+        return self._sdpa(q, k, v)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -188,9 +256,7 @@ class SolAttnAttention(AttentionBackend):
         if self.disabled_until_timestep is not None:
             dense_by_step = self._dense_by_step(kwargs.get("timestep"))
         if dense_by_layer or dense_by_step:
-            return torch.nn.functional.scaled_dot_product_attention(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            ).transpose(1, 2)
+            return self._dense(q, k, v)
         return _sol_attn_run(
             q,
             k,
@@ -198,6 +264,7 @@ class SolAttnAttention(AttentionBackend):
             tau=self.tau,
             thresh_type=self.thresh_type,
             kv_splits=self.kv_splits,
+            dense_fn=self._dense,
         )
 
     @classmethod
