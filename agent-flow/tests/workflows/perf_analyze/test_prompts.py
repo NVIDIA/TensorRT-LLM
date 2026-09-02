@@ -69,6 +69,20 @@ _NSYS_CANONICAL_FLAGS = (
     "--trace-fork-before-exec=true",
 )
 
+# Canonical Run A2 flags: the utilization pass (``--gpu-metrics-*``) and the
+# call-stack pass (backtraces). Both are separate captures from the timing
+# pass, so a prompt that carries the flags but folds them into Run A would
+# silently perturb every timing number the findings rest on.
+_NSYS_UTILIZATION_FLAGS = (
+    "--gpu-metrics-devices=all",
+    "--gpu-metrics-frequency=100000",
+)
+_NSYS_CALL_STACK_FLAGS = (
+    "--python-backtrace",
+    "--python-sampling=true",
+    "--cudabacktrace=kernel:5000,sync:10000",
+)
+
 # Canonical ``ncu`` flags the analyzer's Run C must carry.
 _NCU_CANONICAL_FLAGS = (
     "--target-processes all",
@@ -92,6 +106,53 @@ def test_analyzer_prompt_has_canonical_benchmark_flags():
 def test_analyzer_prompt_has_canonical_nsys_flags():
     for flag in _NSYS_CANONICAL_FLAGS:
         assert flag in ANALYZER_SYSTEM_PROMPT, flag
+
+
+def test_analyzer_prompt_has_run_a2_utilization_and_call_stack_flags():
+    # Without ``--gpu-metrics-*`` a trace ranks kernels by cost and calls it
+    # headroom; without backtraces every kernel is a mangled name with no
+    # owner. Both passes are pinned so they cannot quietly fall out.
+    for flag in _NSYS_UTILIZATION_FLAGS + _NSYS_CALL_STACK_FLAGS:
+        assert flag in ANALYZER_SYSTEM_PROMPT, flag
+    assert "## Run A2" in ANALYZER_SYSTEM_PROMPT
+
+
+def test_run_a2_passes_are_separate_captures_from_the_timing_pass():
+    # Metric sampling and backtraces perturb the timeline, so they must land
+    # in their own captures — the timing numbers stay Run A's.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "server_nsys_metrics" in prompt
+    assert "server_nsys_stacks" in prompt
+    assert "additional** captures" in prompt
+
+
+def test_run_a2_degrades_gracefully_instead_of_fabricating():
+    # ERR_NVGPUCTRPERM is the expected portability failure of the metrics
+    # pass; the prompt must send the agent on rather than into a permission
+    # fight, and must never let it invent the numbers.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "ERR_NVGPUCTRPERM" in prompt
+    assert "NVreg_RestrictProfilingToAdminUsers" in prompt
+    assert "additive, never blocking" in prompt
+
+
+def test_run_a2_call_stack_pass_states_the_cuda_graph_limit():
+    # One cudaGraphLaunch covers thousands of kernels, so a backtrace on it
+    # names the launch site and not the operator inside the graph. A prompt
+    # that omits this invites graph-launch stacks reported as call sites.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "cudaGraphLaunch" in prompt
+    assert "graphId IS NOT NULL" in prompt
+
+
+def test_findings_contract_carries_the_run_a2_evidence():
+    # The evidence lands inside the existing ``nsys timeline`` section, so
+    # every "Profiling setup / nsys timeline / ..." enumeration elsewhere
+    # stays valid.
+    contract = _norm(PROFILE_FINDINGS_CONTRACT)
+    assert "gpu metrics unavailable" in contract
+    assert "call stacks unavailable" in contract
+    assert "bounding resource" in contract
 
 
 def test_analyzer_keeps_capture_range_end_stop_safety_flag():

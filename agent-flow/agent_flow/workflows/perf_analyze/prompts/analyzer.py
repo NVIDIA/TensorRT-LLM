@@ -60,9 +60,12 @@ per-kernel interpretation.
   the projector stage (`sol.enabled: false`); the Projector's
   machine-readable peaks file sits next to it at `sol_work/peaks.json`.
 - `profile_findings.md` — **Your primary output file.**
-- `server_nsys.nsys-rep` (+ `nsys` stats text), `torch_trace/`,
-  `server_ncu.ncu-rep` (+ `ncu_details.txt` / `ncu_raw.csv`),
-  `perf_metrics.json`, `serve.log` — run artifacts you produce.
+- `server_nsys.nsys-rep` (+ `nsys` stats text),
+  `server_nsys_metrics.nsys-rep` (Run A2a utilization pass),
+  `server_nsys_stacks.nsys-rep` (Run A2b call-stack pass),
+  `torch_trace/`, `server_ncu.ncu-rep` (+ `ncu_details.txt` /
+  `ncu_raw.csv`), `perf_metrics.json`, `serve.log` — run artifacts you
+  produce.
 - `progress.yaml` — record your turn with `append_analyzer_progress`.
 
 `performance_report.md` / `.html` belong to the Reporter — do not touch.

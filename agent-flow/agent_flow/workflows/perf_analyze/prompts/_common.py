@@ -467,6 +467,111 @@ consult the repo's profiling guidance (e.g. `TLLM_PROFILE_LOG_RANKS`,
 `examples/.../nsys` patterns) and at minimum profile rank 0, noting the
 limitation.
 
+## Run A2 — Nsight Systems utilization + call-stack passes
+
+Run A above is the **timing** pass and stays exactly as written. GPU
+metric sampling and backtrace collection both perturb the timeline, so
+neither is ever folded into it: every per-iteration, busy/idle and gap
+number you report comes from Run A's `server_nsys.nsys-rep`. Run A2 takes
+two **additional** captures that answer questions Run A structurally
+cannot.
+
+Both passes reuse Run A's wrap verbatim — same `TLLM_PROFILE_START_STOP`
+window, same `-c cudaProfilerApi --capture-range-end=stop`, same
+`--cuda-graph-trace` granularity that worked there, same `trtllm-serve`
+flags, same benchmark replay — and change only the `-o` name and the
+flags listed below.
+
+### Pass A2a — per-operator utilization (`--gpu-metrics-devices`)
+
+Without it a trace can say a kernel took 2.9 ms and **nothing** about
+whether those 2.9 ms sit near a hardware limit or are mostly headroom. A
+top-kernel list with no bounding resource ranks by cost and calls it
+opportunity — which is how rounds get spent on kernels that were already
+at their roofline.
+
+```bash
+   -o <workspace>/server_nsys_metrics -f true \\
+   --gpu-metrics-devices=all \\
+   --gpu-metrics-frequency=100000 \\
+```
+
+- `--gpu-metrics-frequency=100000` is deliberate, not a default tweak.
+  The 10 kHz default has a measured effective period of ~103 us, so a
+  150 us kernel receives one sample and an 11 us kernel receives none —
+  no verdict for most kernels in a real decode step. 200 kHz does not
+  deliver 200 kHz and doubles the artifact for nothing.
+- `--gpu-metrics-devices=all` on a multi-GPU run; name the ids
+  (`--gpu-metrics-devices=0,1`) when only some ranks matter.
+- **`ERR_NVGPUCTRPERM` is the expected portability failure**, not a bug
+  in your command: metric sampling needs a profiling permission many
+  hosts withhold. Record `gpu metrics unavailable: ERR_NVGPUCTRPERM`
+  under *Caveats*, keep every Run A number, and move on. Do not try to
+  obtain the permission — `NVreg_RestrictProfilingToAdminUsers` is the
+  system owner's to change, not this run's.
+- Consume `[Throughput %]` metrics only, and rest each verdict on the
+  **maximum** resource across compute / memory / network / bus — never an
+  average across them, never compute alone. `SMs Active [Throughput %]`
+  is residency, not throughput: any kernel launched with enough blocks
+  reads ~100% on it whatever the SMs do inside.
+- An operator too short to receive a sample is **unsampled**, never 0%
+  utilization. Say which one it is.
+
+### Pass A2b — the call sites behind the kernels (backtraces)
+
+Without it every kernel in your report is a mangled name with no owner,
+and "which Python function launched this" is guesswork.
+
+```bash
+   -o <workspace>/server_nsys_stacks -f true \\
+   -s process-tree -b dwarf --sampling-frequency=2000 \\
+   --python-backtrace=cuda \\
+   --python-sampling=true --python-sampling-frequency=2000 \\
+   --cudabacktrace=kernel:5000,sync:10000 \\
+```
+
+- `--python-backtrace` records the Python stack at CUDA API calls and
+  `--cudabacktrace` the C/C++ chain; the latter **requires CPU sampling**,
+  so `-s`/`-b` travel with it. Confirm the accepted value before the run
+  — `nsys profile --help 2>&1 | grep -A3 python-backtrace` — because it
+  differs across nsys versions; drop only the rejected flag.
+- **Know what this pass can and cannot name on a graph-captured server.**
+  When the forward is replayed as CUDA graphs, one `cudaGraphLaunch`
+  covers thousands of kernels, and a backtrace on that call names the
+  *launch site*, not the operator behind any kernel inside the graph.
+  Measure the share first, on the exported sqlite:
+  `SELECT COUNT(*) FILTER (WHERE graphId IS NOT NULL) * 100.0 / COUNT(*)
+  FROM CUPTI_ACTIVITY_KIND_KERNEL;`. Above ~90% this pass buys you the
+  **eager prologue and the host loop** — usually exactly where host-bound
+  time hides — and buys nothing per-kernel inside the graph. Report which
+  of the two you got; never present a graph-launch stack as a kernel's
+  call site.
+- If the binaries carry no symbols the callchains export **unresolved**
+  and name nothing. Check before reporting: rows in `SAMPLING_CALLCHAINS`
+  carrying `unresolved = 1` throughout is a symbol problem, not an
+  absence of stacks. Note it under *Caveats* instead of reporting empty
+  attribution as a finding.
+- The frequency caps are enforced: `--sampling-frequency` 100-8000 Hz,
+  `--python-sampling-frequency` 1-2000 Hz.
+
+### Both passes
+
+- They are **additive, never blocking**. Run them only *after* Run A has
+  produced a usable `server_nsys.nsys-rep` — never in place of it, and
+  never before you know Run A landed. Two extra server launches and
+  benchmark replays cost real GPU time; spending them on top of a failed
+  timing pass wastes the allocation.
+- If a pass fails, or your `nsys` rejects a flag you cannot drop, skip
+  that pass, record it under *Caveats*, and keep Run A's findings. An
+  analysis missing the utilization pass is incomplete; one that
+  fabricated it is worthless.
+- Export each capture alongside the timing one so the numbers can be read
+  programmatically:
+  ```bash
+  nsys export --type sqlite -o <workspace>/<name>.sqlite \\
+      <workspace>/<name>.nsys-rep
+  ```
+
 ## Run B — PyTorch profiler (op-level)
 
 In current checkouts the torch profiler is **server-side and
@@ -632,6 +737,12 @@ instructions, using this structure. Section headers must match.
 
 ## Profiling setup
 - nsys: command + iteration window (TLLM_PROFILE_START_STOP) + trace file
+- nsys utilization pass (Run A2a): `--gpu-metrics-devices` /
+  `--gpu-metrics-frequency` used + trace file, or the reason it did not
+  run (e.g. `ERR_NVGPUCTRPERM`)
+- nsys call-stack pass (Run A2b): backtrace flags used + trace file +
+  the graph-kernel share that bounds what it could name, or the reason
+  it did not run
 - torch profiler: env var used + trace dir
 - ncu: command + kernels targeted (stem → full name) + launch count +
   report file
@@ -644,6 +755,21 @@ instructions, using this structure. Section headers must match.
 - Top kernels (name, % of GPU time) — table
 - GPU busy vs idle, inter-kernel gaps
 - Kernel mix (compute/tensor-core vs memory/elementwise; NCCL if multi-GPU)
+- Per-operator utilization (from Run A2a): for each top kernel its
+  bounding resource (the **maximum** of compute / memory / network /
+  bus), that resource's `[Throughput %]`, and the headroom verdict —
+  never an average across resources, never compute alone, and never a
+  figure without the sample count behind it. A kernel too short to be
+  sampled is `unsampled`, not 0%. When the pass did not run, keep the
+  bullet with one line — `gpu metrics unavailable: <reason>` — and
+  record it in *Caveats*; do not rank kernels by cost alone and call the
+  ranking headroom.
+- Call sites (from Run A2b): the Python/host frame behind each kernel
+  you name, plus the graph-kernel share that bounds the attribution. On
+  a graph-captured server say plainly which you got — per-kernel call
+  sites, or only the eager prologue and host loop. When the pass did not
+  run, keep the bullet with one line — `call stacks unavailable:
+  <reason>` — and never guess an owner for a kernel.
 
 ## Torch profiler
 - Top operators (name, self/CUDA time) — table

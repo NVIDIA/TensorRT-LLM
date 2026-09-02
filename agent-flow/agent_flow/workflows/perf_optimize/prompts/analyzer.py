@@ -117,9 +117,11 @@ acceptance gate, so it must be defensible:
 - `rounds/round_<n>/analysis/` — **your artifact directory for this
   round** (the exact path is given in your instructions):
   `profile_findings.md` (your findings report), `server_nsys.nsys-rep`,
-  `nsys_stats.txt`, `torch_trace/`, `server_ncu.ncu-rep` +
-  `ncu_details.txt` / `ncu_raw.csv`, `serve.log`, and any benchmark
-  result JSON you produce while replaying the load.
+  `nsys_stats.txt`, `server_nsys_metrics.nsys-rep` (Run A2a utilization
+  pass), `server_nsys_stacks.nsys-rep` (Run A2b call-stack pass),
+  `torch_trace/`, `server_ncu.ncu-rep` + `ncu_details.txt` /
+  `ncu_raw.csv`, `serve.log`, and any benchmark result JSON you produce
+  while replaying the load.
 - `progress.yaml` — record your turn with `append_analyzer_progress`.
 
 Earlier rounds' directories and the optimization reports are read-only

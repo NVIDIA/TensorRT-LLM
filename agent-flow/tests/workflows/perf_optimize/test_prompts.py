@@ -103,6 +103,54 @@ def test_analyzer_carries_canonical_nsys_flags():
     assert "Verify the profiling knobs first" in ANALYZER_SYSTEM_PROMPT
 
 
+def test_run_a2_flags_reach_every_role_that_captures_nsys():
+    # The analyzer profiles each round and the evaluator captures the
+    # accept-evidence trace; both inherit PROFILING_RUNS_REFERENCE, so both
+    # must carry the utilization and call-stack passes or one of the two
+    # keeps producing traces with no bounding resource and no call sites.
+    for prompt, role in (
+        (ANALYZER_SYSTEM_PROMPT, "analyzer"),
+        (EVALUATOR_SYSTEM_PROMPT, "evaluator"),
+    ):
+        for flag in (
+            "--gpu-metrics-devices=all",
+            "--gpu-metrics-frequency=100000",
+            "--python-backtrace",
+            "--python-sampling=true",
+            "--cudabacktrace=kernel:5000,sync:10000",
+        ):
+            assert flag in prompt, (role, flag)
+        assert "## Run A2" in prompt, role
+
+
+def test_run_a2_is_a_separate_capture_and_degrades_gracefully():
+    # Metric sampling and backtraces perturb the timeline, so they take
+    # their own captures; and when the host withholds the profiling
+    # permission the run reports it rather than inventing utilization.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "server_nsys_metrics" in prompt
+    assert "server_nsys_stacks" in prompt
+    assert "additional** captures" in prompt
+    assert "ERR_NVGPUCTRPERM" in prompt
+    assert "additive, never blocking" in prompt
+
+
+def test_run_a2_call_stack_pass_states_the_cuda_graph_limit():
+    # perf-optimize profiles graph-captured servers almost exclusively, so
+    # the prompt has to say that a backtrace on cudaGraphLaunch names the
+    # launch site and not the operator inside the graph.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "cudaGraphLaunch" in prompt
+    assert "graphId IS NOT NULL" in prompt
+
+
+def test_findings_contract_carries_the_run_a2_evidence():
+    contract = _norm(PROFILE_FINDINGS_CONTRACT)
+    assert "gpu metrics unavailable" in contract
+    assert "call stacks unavailable" in contract
+    assert "bounding resource" in contract
+
+
 def test_analyzer_carries_the_ncu_deep_dive():
     # The shared Run C: a bounded per-kernel ncu capture of the top nsys
     # kernels, interpreted with the perf-nsight-compute-analysis skill.
