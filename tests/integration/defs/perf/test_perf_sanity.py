@@ -1244,7 +1244,10 @@ class ClientConfig:
         # so a requested warmup there would never run while b_warmup claimed it
         # did -- and a later investigator would rule warmup out as a cause it
         # never had.
-        self.warmup = warmup and not (self.benchmark_client or self.use_nv_sa_benchmark)
+        # NB: benchmark_client defaults to "" (not None), so an ordinary lane is
+        # falsy here and does get its warmup.
+        uses_default_benchmark_client = not self.benchmark_client and not self.use_nv_sa_benchmark
+        self.warmup = warmup and uses_default_benchmark_client
         self.env_vars = env_vars
         # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
         # is now always passed; output-length stability with spec decoding comes from
