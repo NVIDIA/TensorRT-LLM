@@ -27,7 +27,10 @@ so it never reaches the join.
 """
 
 import faulthandler
+import itertools
+import os
 import threading
+import time
 
 import pytest
 import torch
@@ -42,7 +45,17 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManagerConfig,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+KV_CACHE_MANAGER_V2_BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
+
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    # The pure-Python backend is not thread-safe: it relies on the GIL and has no API lock, so
+    # these tests would race against it rather than exercise the property they assert.
+    pytest.mark.skipif(
+        KV_CACHE_MANAGER_V2_BACKEND != "cpp",
+        reason="GIL-free API locking exists only in the C++ backend",
+    ),
+]
 
 # Generous relative to the work each test does (milliseconds); tight enough that a deadlock fails
 # the run in reasonable time rather than hanging it.
@@ -72,14 +85,17 @@ def deadlock_watchdog():
         faulthandler.cancel_dump_traceback_later()
 
 
-def _make_config() -> KVCacheManagerConfig:
+def _make_config(
+    sliding_window_size: int | None = None, quota: int = 8 << 20
+) -> KVCacheManagerConfig:
     return KVCacheManagerConfig(
         tokens_per_block=4,
-        cache_tiers=[GpuCacheTierConfig(quota=8 << 20)],
+        cache_tiers=[GpuCacheTierConfig(quota=quota)],
         layers=[
             AttentionLayerConfig(
                 layer_id=0,
                 buffers=[BufferConfig(role="key", size=4096)],
+                sliding_window_size=sliding_window_size,
             )
         ],
         enable_stats=True,
@@ -120,6 +136,167 @@ def _join(*threads: threading.Thread) -> None:
     for thread in threads:
         for error in getattr(thread, "errors", []):
             raise error
+
+
+def _priority_callback_antagonist(
+    manager: KVCacheManager, stop: threading.Event, hits: dict
+) -> threading.Thread:
+    """A thread that repeatedly holds the exclusive API lock and reacquires the GIL under it.
+
+    This is the far side of every deadlock in this file: `create_kv_cache`/`resize` release the GIL,
+    take the lock, then call back into Python for `custom_priority_callback`. Anything on the main
+    thread that blocks on the lock *while holding the GIL* parks forever against this loop.
+    """
+
+    def priority(block_ordinal: int, life_cycle: object) -> int:
+        hits["n"] += 1
+        return 0
+
+    def loop() -> None:
+        stream = CudaStream(torch.cuda.Stream().cuda_stream)
+        length = manager.tokens_per_block * 4
+        # Fresh tokens every iteration: a repeated prompt matches the reuse tree and commits
+        # nothing, so the callback -- and with it the GIL reacquisition under the lock -- would
+        # stop firing after the first pass.
+        for start in itertools.count(0, length):
+            if stop.is_set():
+                return
+            tokens = list(range(start, start + length))
+            cache = manager.create_kv_cache(None, tokens, custom_priority_callback=priority)
+            cache.resume(stream)
+            cache.resize(len(tokens))
+            uncommitted = tokens[cache.num_committed_tokens :]
+            if uncommitted:
+                cache.commit(uncommitted)
+            cache.suspend()
+            cache.close()
+
+    return _worker(loop)
+
+
+def _await_antagonist(antagonist: threading.Thread, hits: dict) -> None:
+    """Block until the antagonist is actually cycling through the lock.
+
+    Without this the main thread can finish its whole loop inside the antagonist's thread-start
+    latency, never contending for the lock -- the test then passes even on a build that deadlocks.
+    """
+    deadline = time.monotonic() + TIMEOUT_S
+    while hits["n"] == 0:
+        for error in getattr(antagonist, "errors", []):
+            raise error
+        assert antagonist.is_alive(), "antagonist thread exited before running a priority callback"
+        assert time.monotonic() < deadline, "antagonist thread never reached the priority callback"
+        time.sleep(0.001)
+
+
+def test_capacity_and_history_length_setters_do_not_deadlock() -> None:
+    """The `capacity` / `history_length` property setters reach resize(), so they must free the GIL.
+
+    Unlike `resize()` itself, these are `def_prop_rw` setters, which have no `call_guard` unless one
+    is written out by hand -- the case this guards against.
+    """
+    manager = KVCacheManager(_make_config())
+    try:
+        stop = threading.Event()
+        hits = {"n": 0}
+        antagonist = _priority_callback_antagonist(manager, stop, hits)
+        antagonist.start()
+        try:
+            _await_antagonist(antagonist, hits)
+            tokens_per_block = manager.tokens_per_block
+            cache = manager.create_kv_cache(None, [])
+            stream = CudaStream(torch.cuda.Stream().cuda_stream)
+            cache.resume(stream)
+            # Capacity first: history_length can only grow, and may never exceed capacity.
+            for _ in range(500):
+                cache.capacity = tokens_per_block * 4
+                cache.capacity = tokens_per_block
+            cache.capacity = tokens_per_block * 4
+            for history_length in range(tokens_per_block * 4):
+                cache.history_length = history_length
+            cache.suspend()
+            cache.close()
+        finally:
+            stop.set()
+            _join(antagonist)
+
+        assert hits["n"] > 0, "priority callback never ran; test proves nothing"
+    finally:
+        manager.shutdown()
+
+
+def test_dropping_the_last_kv_cache_reference_does_not_deadlock() -> None:
+    """~KvCache() calls close(), which takes the exclusive lock -- from tp_dealloc, under the GIL.
+
+    No binding is involved on this path: it is the ordinary "Python drops the last reference" case,
+    so the GIL has to be released by the destructor itself.
+    """
+    manager = KVCacheManager(_make_config())
+    try:
+        stop = threading.Event()
+        hits = {"n": 0}
+        antagonist = _priority_callback_antagonist(manager, stop, hits)
+        antagonist.start()
+        try:
+            _await_antagonist(antagonist, hits)
+            stream = CudaStream(torch.cuda.Stream().cuda_stream)
+            tokens = list(range(manager.tokens_per_block * 4))
+            for _ in range(100):
+                cache = manager.create_kv_cache(None, tokens)
+                cache.resume(stream)
+                cache.suspend()
+                # Deliberately no close(): let the destructor do it.
+                del cache
+        finally:
+            stop.set()
+            _join(antagonist)
+
+        assert hits["n"] > 0, "priority callback never ran; test proves nothing"
+    finally:
+        manager.shutdown()
+
+
+def test_dropping_a_planned_drop_handle_does_not_deadlock() -> None:
+    """~PlannedDropHandle() applies the plan, taking the exclusive lock under the GIL.
+
+    The explicit `drop()` binding releases the GIL, but production code relies on the destructor:
+    ConversationManager drops handles by letting them fall out of a deque.
+    """
+    manager = KVCacheManager(_make_config(sliding_window_size=8, quota=64 << 20))
+    try:
+        stop = threading.Event()
+        hits = {"n": 0}
+        antagonist = _priority_callback_antagonist(manager, stop, hits)
+        antagonist.start()
+        handles_planned = 0
+        try:
+            _await_antagonist(antagonist, hits)
+            stream = CudaStream(torch.cuda.Stream().cuda_stream)
+            for i in range(200):
+                tokens = list(range(i * 24, i * 24 + 24))
+                cache = manager.create_kv_cache(None, tokens)
+                cache.resume(stream)
+                cache.resize(len(tokens))
+                uncommitted = tokens[cache.num_committed_tokens :]
+                if uncommitted:
+                    cache.commit(uncommitted)
+                cache.stop_committing()
+                handle = cache.plan_committed_block_drop()
+                cache.suspend()
+                cache.close()
+                if handle is not None:
+                    handles_planned += 1
+                # Applies the plan from the destructor rather than through drop() -- the shape
+                # ConversationManager produces when an expired turn falls out of its deque.
+                del handle
+        finally:
+            stop.set()
+            _join(antagonist)
+
+        assert handles_planned > 0, "no drop plan was ever created; test proves nothing"
+        assert hits["n"] > 0, "priority callback never ran; test proves nothing"
+    finally:
+        manager.shutdown()
 
 
 def test_stats_queries_do_not_block_a_concurrent_resize() -> None:

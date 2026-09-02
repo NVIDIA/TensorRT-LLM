@@ -128,7 +128,9 @@ public:
     // Deduplicates `pages` by identity, stores weak references, and increments
     // each page's plannedDropCount.
     //
-    // `manager` owns the API lock this handle takes, and must outlive it.
+    // `manager` owns the API lock this handle takes, both here and in ~PlannedDropHandle,
+    // and must outlive it: drop the plans before shutting the manager down (see
+    // KVCacheManagerV2.shutdown(), which clears ConversationManager first).
     PlannedDropHandle(KvCacheManager& manager, std::vector<CommittedPage*> const& pages);
 
     // Mirrors Python's __del__: applies the plan if not already dropped.
@@ -310,6 +312,9 @@ public:
     // called after stopCommitting(). Returns nullptr without creating a plan if
     // any required SWA page is unavailable. Mirrors Python's
     // _KVCache.plan_committed_block_drop().
+    //
+    // Every returned handle must be dropped -- via drop() or destruction -- before the manager is
+    // shut down: applying a plan takes the manager's API lock and mutates its state.
     std::unique_ptr<PlannedDropHandle> planCommittedBlockDrop();
 
     int historyLength() const noexcept

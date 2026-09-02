@@ -1776,9 +1776,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
         .def("_get_num_tokens_before_hybrid_pruning", &kv::KvCache::numTokensBeforeHybridPruning)
+        // Both setters reach resize(), which takes the exclusive API lock: release the GIL first.
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
-            [](kv::KvCache& self, int hist) { self.setHistoryLength(hist); })
-        .def_prop_rw("capacity", &kv::KvCache::capacity, [](kv::KvCache& self, int cap) { self.setCapacity(cap); })
+            [](kv::KvCache& self, int hist)
+            {
+                nb::gil_scoped_release release;
+                self.setHistoryLength(hist);
+            })
+        .def_prop_rw("capacity", &kv::KvCache::capacity,
+            [](kv::KvCache& self, int cap)
+            {
+                nb::gil_scoped_release release;
+                self.setCapacity(cap);
+            })
         .def_prop_ro("tokens_per_block", &kv::KvCache::tokensPerBlock)
         .def_prop_ro("beam_width", [](kv::KvCache const& self) { return self.beamWidth().value(); })
         .def_prop_rw(

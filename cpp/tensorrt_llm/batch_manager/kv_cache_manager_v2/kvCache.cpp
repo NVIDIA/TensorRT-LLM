@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
@@ -110,6 +111,10 @@ KvCache::~KvCache()
 {
     try
     {
+        // close() takes the exclusive API lock. When Python drops the last reference nanobind runs
+        // this from tp_dealloc with the GIL held, which deadlocks against a lock holder waiting on
+        // the GIL to run a Python callback. Drop the GIL first if we happen to hold it.
+        OptionalGilRelease const gilRelease;
         close();
     }
     catch (...)
@@ -1895,6 +1900,9 @@ PlannedDropHandle::~PlannedDropHandle()
         // Destructors must not throw; swallow any error.
         try
         {
+            // drop() takes the exclusive API lock. The explicit drop() binding releases the GIL,
+            // but this path runs from tp_dealloc/GC with the GIL held, so release it here too.
+            OptionalGilRelease const gilRelease;
             drop();
         }
         catch (...)
