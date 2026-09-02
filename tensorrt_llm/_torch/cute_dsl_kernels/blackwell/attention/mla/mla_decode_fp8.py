@@ -3589,11 +3589,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 (H, split_kv, S, B),
                 stride=(split_kv, 1, H * split_kv, H * split_kv * S),
             )
-            acc_lse_iter = cute.recast_ptr(
-                workspace.iterator +
-                cute.cosize(acc_o_layout) * acc_dtype.width // 8,
-                dtype=acc_dtype,
-            )
+            # Advance acc_o_iter by whole elements: a byte offset off the raw
+            # workspace pointer ((cosize * width) // 8) wraps the 32-bit
+            # dynamic arithmetic once cosize * width reaches 2^31 bits, e.g.
+            # B=64, split_kv=16.
+            acc_lse_iter = acc_o_iter + cute.cosize(acc_o_layout)
             acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
         return acc_o, acc_lse
 
@@ -3688,6 +3688,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         # The performance is not good when split_kv is not in [1, 32].
         if split_kv < 1 or split_kv > 32:
+            return False
+
+        # split_kv > 0 is a caller-forced split count.
+        # The reduction kernel holds one LSE scale per split in a
+        # MAX_SPLITS-element SMEM array, and the split-KV workspace is indexed
+        # with 32-bit element arithmetic (acc_o holds B*S*H*split_kv*L
+        # elements, acc_lse another B*S*H*split_kv).
+        if B * S * H * split_kv * (L + 1) >= 2**31:
             return False
 
         return True
@@ -3989,6 +3997,14 @@ def run(
                 mma_qk_tiler_mn,
                 max_active_clusters * cluster_shape_mnk[0],
             )
+        # Re-check the resolved value: run() calls can_implement() before
+        # auto/var-split resolution, so the -1 sentinel (and the per-batch
+        # maximum in var-split mode) is never bounds-checked there.
+        if split_kv > MAX_SPLITS or (batch_size * seq_len_q * num_heads *
+                                     split_kv * (latent_dim + 1) >= 2**31):
+            raise ValueError(
+                f"resolved split_kv={split_kv} exceeds the kernel envelope "
+                f"(MAX_SPLITS={MAX_SPLITS} or 32-bit workspace indexing)")
         return split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu
 
     def create_workspace(num_heads, seq_len_q, latent_dim, batch_size, split_kv,
