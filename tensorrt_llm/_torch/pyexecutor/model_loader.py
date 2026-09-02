@@ -23,7 +23,8 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformProfile, PostTransformProfileRegistry,
     PostTransformQualificationDecision, PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints, PostTransformTransferScope, SourceIdentity,
-    check_weight_sharing_compatibility)
+    WeightManifestWriteResult, check_weight_sharing_compatibility,
+    maybe_write_weight_manifest)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
@@ -377,6 +378,7 @@ class ModelLoaderMetricNames(Enum):
         "draft_checkpoint_preparation_seconds")
     DRAFT_WEIGHT_POPULATION_SECONDS = "draft_weight_population_seconds"
     POST_LOAD_PROCESSING_SECONDS = "post_load_processing_seconds"
+    WEIGHT_MANIFEST_SECONDS = "weight_manifest_seconds"
 
 
 class ModelLoader:
@@ -1146,6 +1148,13 @@ class ModelLoader:
                 # perturb NVLink barrier synchronization in multi-rank DG init.
                 torch.cuda.empty_cache()
 
+        manifest_result = self._dump_final_weight_manifest(
+            checkpoint_loader, model, weights_preloaded=weights_preloaded)
+        if manifest_result is not None:
+            self._metrics[ModelLoaderMetricNames.WEIGHT_MANIFEST_SECONDS.
+                          value] = (manifest_result.build_seconds +
+                                    manifest_result.write_seconds)
+
         metrics = ", ".join(f"{name}={value:.4f}"
                             for name, value in self._metrics.items())
         logger.info(
@@ -1302,6 +1311,34 @@ class ModelLoader:
                 model.model_config, model=model),
         )
 
+    def _dump_final_weight_manifest(
+            self, checkpoint_loader: BaseCheckpointLoader,
+            model: DecoderModelForCausalLM, *,
+            weights_preloaded: bool) -> Optional[WeightManifestWriteResult]:
+        """Write the env-gated final-state weight manifest for this rank.
+
+        This is a no-op unless `MX_WEIGHT_MANIFEST_DIR` is set. It runs after
+        every post-load hook and after MoE load-balancer finalization, and
+        before engine warmup, so the manifest describes the final post-load
+        state that all roles of the MX qualification harness share.
+        `reload()` is deliberately not covered: incremental weight updates own
+        their own lifecycle.
+        """
+        return maybe_write_weight_manifest(
+            model,
+            family="final",
+            rank=self.mapping.rank,
+            context={
+                "boundary": "model_loader_load_end",
+                "checkpoint_format": checkpoint_loader.checkpoint_format,
+                "weights_preloaded": bool(weights_preloaded),
+                "load_format": str(self.llm_args.load_format),
+                "tp_rank": self.mapping.tp_rank,
+                "pp_rank": self.mapping.pp_rank,
+                "world_size": self.mapping.world_size,
+                "model_class": type(model).__name__,
+            })
+
     def _post_load_publish(
             self, checkpoint_loader: BaseCheckpointLoader,
             model: DecoderModelForCausalLM, *, checkpoint_dir: str,
@@ -1454,7 +1491,8 @@ class ModelLoader:
         before rebinding fresh weights. Partial reloads keep existing transform
         guards intact because untouched modules may already contain transformed
         live weights. The owner of the update lifecycle is responsible for
-        running post-load processing once all bytes are present.
+        running post-load processing once all bytes are present. Weight
+        manifests are not written here; see `_dump_final_weight_manifest`.
 
         Args:
             model: Model instance receiving the replacement weights.

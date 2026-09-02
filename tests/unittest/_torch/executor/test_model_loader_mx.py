@@ -35,6 +35,8 @@ from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     SOURCE_IDENTITY_FORMAT_VERSION,
+    WEIGHT_MANIFEST_DIR_ENV,
+    WEIGHT_MANIFEST_ROLE_ENV,
     ArtifactIdentity,
     PostTransformFeature,
     PostTransformProfile,
@@ -43,6 +45,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints,
     PostTransformTransferScope,
+    load_weight_manifest,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
@@ -134,6 +137,15 @@ class _TinyModel(nn.Module):
 
     def post_load_weights(self):
         self._events.append("post_load_weights")
+
+
+class _ManifestTinyModel(_TinyModel):
+    """`_TinyModel` plus real CPU tensors so a weight manifest has something to hash."""
+
+    def __init__(self, events):
+        super().__init__(events)
+        self.weight = nn.Parameter(torch.arange(8, dtype=torch.float32).reshape(2, 4))
+        self.register_buffer("scale", torch.tensor([0.5, 0.25]))
 
 
 @contextmanager
@@ -1627,3 +1639,110 @@ def test_mla_transform_weights_is_idempotent(monkeypatch):
     mla._weights_transformed = False
     MLA.cache_derived_state(mla)
     assert mla._weights_transformed is True
+
+
+def _make_manifest_loader(monkeypatch, tmp_path, *, events, role, mapping=None):
+    loader = _make_loader(monkeypatch, events=events)
+    loader.mapping = mapping or mapping_mod.Mapping(world_size=1, rank=0, tp_size=1)
+    monkeypatch.setattr(
+        model_loader_mod.AutoModelForCausalLM,
+        "from_config",
+        MagicMock(return_value=_ManifestTinyModel(events)),
+    )
+    if role is None:
+        monkeypatch.delenv(WEIGHT_MANIFEST_DIR_ENV, raising=False)
+        monkeypatch.delenv(WEIGHT_MANIFEST_ROLE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(WEIGHT_MANIFEST_DIR_ENV, str(tmp_path))
+        monkeypatch.setenv(WEIGHT_MANIFEST_ROLE_ENV, role)
+    real_write = model_loader_mod.maybe_write_weight_manifest
+
+    def _recording_write(*args, **kwargs):
+        events.append("manifest")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(model_loader_mod, "maybe_write_weight_manifest", _recording_write)
+    return loader
+
+
+def _hf_checkpoint_loader():
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+    checkpoint_loader.is_weights_preloaded.return_value = False
+    checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
+    return checkpoint_loader
+
+
+@pytest.mark.cpu_only
+def test_load_writes_final_manifest_at_end_of_load(monkeypatch, tmp_path):
+    events = []
+    loader = _make_manifest_loader(monkeypatch, tmp_path, events=events, role="baseline")
+
+    model, _ = loader.load("/ckpt", _hf_checkpoint_loader())
+
+    assert events == ["load_weights", "post_load_weights", "manifest"]
+    files = sorted(path.name for path in tmp_path.iterdir())
+    assert files == ["manifest.final.baseline.rank0.json"]
+    manifest = load_weight_manifest(tmp_path / files[0])
+    assert [entry.fqn for entry in manifest.entries] == ["scale", "weight"]
+    assert manifest.context["boundary"] == "model_loader_load_end"
+    assert manifest.context["checkpoint_format"] == "HF"
+    assert manifest.context["weights_preloaded"] is False
+    assert manifest.context["load_format"] == str(LoadFormat.AUTO)
+    assert manifest.context["model_class"] == type(model).__name__
+    assert manifest.context["tp_rank"] == 0 and manifest.context["world_size"] == 1
+    assert model_loader_mod.ModelLoaderMetricNames.WEIGHT_MANIFEST_SECONDS.value in loader._metrics
+
+
+@pytest.mark.cpu_only
+def test_load_final_manifest_records_mx_receiver_facts(monkeypatch, tmp_path):
+    events = []
+    loader = _make_manifest_loader(monkeypatch, tmp_path, events=events, role="receiver")
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader.is_weights_preloaded.return_value = True
+    # `_ManifestTinyModel` is not a registered root, so the post-transform
+    # staged path must stay off; the full post-load path still ends in a manifest.
+    checkpoint_loader.is_post_transform_weights_preloaded.return_value = False
+    checkpoint_loader.load_weights.return_value = {}
+
+    loader.load("/ckpt", checkpoint_loader)
+
+    assert events[-1] == "manifest"
+    manifest = load_weight_manifest(tmp_path / "manifest.final.receiver.rank0.json")
+    assert manifest.context["checkpoint_format"] == "MX"
+    assert manifest.context["weights_preloaded"] is True
+    assert manifest.context["role"] == "receiver"
+
+
+@pytest.mark.cpu_only
+def test_load_writes_no_manifest_when_env_unset(monkeypatch, tmp_path):
+    events = []
+    loader = _make_manifest_loader(monkeypatch, tmp_path, events=events, role=None)
+
+    loader.load("/ckpt", _hf_checkpoint_loader())
+
+    assert events == ["load_weights", "post_load_weights", "manifest"]
+    assert list(tmp_path.iterdir()) == []
+    assert (
+        model_loader_mod.ModelLoaderMetricNames.WEIGHT_MANIFEST_SECONDS.value not in loader._metrics
+    )
+
+
+@pytest.mark.cpu_only
+def test_load_final_manifest_uses_mapping_rank(monkeypatch, tmp_path):
+    events = []
+    loader = _make_manifest_loader(
+        monkeypatch,
+        tmp_path,
+        events=events,
+        role="donor",
+        mapping=mapping_mod.Mapping(world_size=2, rank=1, tp_size=2),
+    )
+
+    loader.load("/ckpt", _hf_checkpoint_loader())
+
+    manifest = load_weight_manifest(tmp_path / "manifest.final.donor.rank1.json")
+    assert manifest.context["rank"] == 1
+    assert manifest.context["tp_rank"] == 1
+    assert manifest.context["world_size"] == 2
