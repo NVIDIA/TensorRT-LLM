@@ -50,13 +50,18 @@ including mixed batches.
 
 | Parameter | Support |
 |---|---|
-| GPU architecture | SM90, SM100, SM103, SM120, and SM121 through architecture-specific sparse MLA implementations |
-| Sparse compute phase | Packed prefill, generation, and mixed context/generation batches |
-| Attention type | MLA with a model-specific shared KV representation |
-| Model geometry | Checkpoint-native geometry for DeepSeek-V3.2 (`qk_head_dim=192`, `v_head_dim=128`) and DeepSeek-V4 (`qk_head_dim=512`, `v_head_dim=512`) |
-| Model input dtype | BF16 |
-| KV-cache dtype | BF16 and the FP8 modes supported by the selected model and GPU architecture |
-| Sparse indices | `int32` token indices; one selection per query token |
+| GPU architecture | SM90, SM100, SM103, SM120, and SM121 |
+| Compute phase | Packed prefill and generation, including mixed batches |
+| Attention type | MLA |
+| Head counts | Checkpoint-defined |
+| Q heads per KV head | Not applicable; the model uses a shared KV representation |
+| Head dimensions | DeepSeek-V3.2: QK `192`, V `128`; DeepSeek-V4: QK/V `512` |
+| Input dtype | BF16 |
+| Input layout | Model-native MLA inputs |
+| Output dtype | BF16 |
+| KV-cache dtype | BF16 or model- and architecture-specific FP8 |
+| KV-cache layout | Paged, model-specific shared KV representation |
+| Sparse granularity | Token |
 | Attention semantics | Causal self-attention |
 
 See
@@ -65,10 +70,12 @@ for executable sparse MLA examples.
 
 ### Sparse MQA/GQA
 
-TensorRT LLM provides two sparse MQA/GQA compute paths. The token-sparse path
-accepts a precomputed token list for each KV head and query token. Query heads
-in the same KV group share the KV head's list. The block-sparse path accepts
-request-local selections of 128-token KV blocks from a paged HND cache.
+The table below compares token-sparse and 128-token block-sparse MQA/GQA. The
+token-sparse path accepts a precomputed token list for each KV head and query
+token; query heads in the same KV group share that list. The block-sparse path
+accepts request-local KV-block selections from a paged HND cache. The shared
+page-sparse generation path described under [Sparse MHA](#sparse-mha) also
+supports MQA and GQA.
 
 These are attention capabilities, not standalone public
 `SparseAttentionConfig` algorithms. A user-facing algorithm must also provide
@@ -76,34 +83,27 @@ the selector, metadata, cache management, and backend integration.
 
 | Parameter | Token-sparse | Block-sparse |
 |---|---|---|
-| Sparse block size | 1 token | 128 tokens |
 | GPU architecture | SM100 and SM103 | SM100 and SM103 |
-| Sparse compute phase | Packed prefill, single-token generation, and linear draft-token generation | Packed prefill, single-token generation, linear multi-query compute, and mixed batches |
-| Attention type | MQA and GQA; Q heads must be divisible by KV heads | MQA and GQA; Q heads must be divisible by KV heads |
-| Query heads per KV head | At most 32 | `2`, `4`, `8`, or `16` |
-| Q/KV head counts | No additional discrete kernel limit | No additional discrete kernel limit |
-| Model Q/K/V input dtype | BF16 or FP16 | BF16 or E4M3 FP8 |
-| Model Q/K/V input layout | Fused QKV | Q `[tokens, q_heads, 128]`; paged K/V `[pages, kv_heads, 128, 128]` |
+| Compute phase | Packed prefill and generation, including linear draft tokens | Packed prefill and generation, including linear multi-query and mixed batches |
+| Attention type | MQA and GQA | MQA and GQA |
+| Head counts | Q heads must be divisible by KV heads; no other discrete limit | Q heads must be divisible by KV heads; no other discrete limit |
+| Q heads per KV head | At most 32 | `2`, `4`, `8`, or `16` |
+| Head dimensions | Q/K/V: `64`, `80`, `128`, or `256` | Q/K/V: `128` |
+| Input dtype | BF16 or FP16 | BF16 or E4M3 FP8 |
+| Input layout | Fused QKV | Q `[tokens, q_heads, 128]`; paged K/V `[pages, kv_heads, 128, 128]` |
 | Output dtype | BF16 or FP16 for every supported head dimension; E4M3 FP8 for head dimensions `64`, `128`, and `256` | BF16 |
 | KV-cache dtype | BF16 or FP16 for every supported head dimension; E4M3 FP8 for head dimensions `64`, `128`, and `256` | BF16 or E4M3 FP8 |
-| Q/K/V head dimension | Equal dimensions of `64`, `80`, `128`, or `256` | Equal dimension of `128` |
 | KV-cache layout | Paged cache; page size is a power of two and at least 8 tokens | Paged HND cache with page size `128`; supports shuffled physical pages and strided outer-page storage |
-| Sparse indices | `int32` physical token indices per KV head and query token | `int32` request-local block indices per KV head and query token; supports per-token lists, `-1` padding, and physical remapping |
-| Sparse Top-K | Positive multiple of 4 | `4`, `8`, `16`, or `32` selected blocks |
+| Sparse granularity | Token | Block (`128` tokens) |
 | Attention semantics | Causal self-attention | Causal self-attention with bottom-right or explicit per-request query offsets |
 
-The token-sparse path is JIT-compiled with NVRTC. Its support is defined by the
-current source checks rather than by the precompiled cubins that were present
-when the feature was introduced. During linear draft-token generation, each
-query has its own causal sparse list, including K/V written earlier in the same
-speculative forward. Tree-shaped speculative masks are not applied by this
-path.
+The token-sparse path is JIT-compiled with NVRTC. During linear draft-token
+generation, each query has its own causal sparse list, including K/V written
+earlier in the same speculative forward.
 
 For an FP8 KV cache, token-sparse Q is quantized to E4M3 during QKV
 preprocessing while the model input remains BF16 or FP16. The path supports
-both BF16 output with an FP8 KV cache and E4M3 FP8 output. The shared kernel
-validator also admits head dimension `512`, but the sparse path aborts before
-launch for that configuration, so it is excluded from this matrix.
+both BF16 output with an FP8 KV cache and E4M3 FP8 output.
 
 Backend developers can use
 [`test_sparse_mqa_gqa.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mqa_gqa.py)
@@ -119,19 +119,17 @@ the retained KV cache after prefill to reduce cache size and later decode work.
 | Parameter | Support |
 |---|---|
 | GPU architecture | SM100 and SM103 |
-| Sparse compute phase | Single-token and linear draft-token generation |
-| Attention type | MHA (`num_q_heads == num_kv_heads`) |
-| Query heads per KV head | `1` |
-| Number of MHA heads | No additional discrete source restriction beyond `num_q_heads == num_kv_heads > 0` |
-| Model Q/K/V input dtype | BF16 or FP16 |
-| Model Q/K/V input layout | Fused QKV |
+| Compute phase | Generation, including single-token and linear draft-token inputs |
+| Attention type | MHA |
+| Head counts | Positive and `num_q_heads == num_kv_heads`; no other discrete limit |
+| Q heads per KV head | `1` |
+| Head dimensions | Q/K/V: `64`, `80`, `128`, or `256` |
+| Input dtype | BF16 or FP16 |
+| Input layout | Fused QKV |
 | Output dtype | Model dtype for head dimensions `64`, `80`, `128`, and `256`; E4M3 FP8 for head dimensions `64`, `128`, and `256` with an FP8 KV cache |
 | KV-cache dtype | Model dtype for head dimensions `64`, `80`, `128`, and `256`; E4M3 FP8 for head dimensions `64`, `128`, and `256` |
-| Q/K/V dimensions | Equal head dimensions of `64`, `80`, `128`, or `256` |
 | KV-cache layout | Paged KV cache; page size is a power of two and at least 8 tokens |
-| Selection granularity | Block indices expanded to KV-cache pages |
-| Sparse indices | `int32` block indices with `int32` per-request offsets; supports per-head patterns, unordered indices, and variable request offsets |
-| Sparse index block size | Positive; blocks may cross KV-page boundaries |
+| Sparse granularity | Positive-size blocks expanded to KV-cache pages |
 | Attention semantics | Causal self-attention |
 
 Backend developers can use
@@ -233,11 +231,6 @@ llm = LLM(
     model="deepseek-ai/DeepSeek-V3.2",
     sparse_attention_config=DeepSeekSparseAttentionConfig(),
 )
-```
-
-```yaml
-sparse_attention_config:
-  algorithm: dsa
 ```
 
 On supported Blackwell configurations, Guess-Verify-Refine (GVR) can replace

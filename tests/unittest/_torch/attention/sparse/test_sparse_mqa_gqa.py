@@ -88,6 +88,11 @@ def _force_trtllm_gen_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
 
 
+def _fp8_qdq(tensor: torch.Tensor) -> torch.Tensor:
+    """Apply unit-scale E4M3 quantize-dequantize to a reference tensor."""
+    return tensor.to(torch.float8_e4m3fn).to(tensor.dtype)
+
+
 # Kernel contract and static selector adapter.
 
 
@@ -363,6 +368,16 @@ _SPARSE_KV_CASES = [
     pytest.param(
         ContextScenario(batch_size=3, seq_lens=(64, 96, 128), num_pages=12),
         id="batch3_var_seq",
+    ),
+    pytest.param(
+        ContextScenario(
+            batch_size=1,
+            seq_lens=(128,),
+            num_pages=8,
+            num_heads=8,
+            num_kv_heads=8,
+        ),
+        id="mha_8q8kv",
     ),
 ]
 
@@ -863,11 +878,18 @@ def test_generation_sparse_mqa_gqa(scenario: GenerationScenario) -> None:
             scenario,
             scenario.dtype,
         )
+        reference_q = inputs.q
+        reference_k_new = inputs.k_new
+        reference_v_new = inputs.v_new
+        if scenario.kvcache_dtype == torch.float8_e4m3fn:
+            reference_q = _fp8_qdq(reference_q)
+            reference_k_new = _fp8_qdq(reference_k_new)
+            reference_v_new = _fp8_qdq(reference_v_new)
         reference_output = _reference_sparse_generation_attention(
-            inputs.q,
+            reference_q,
             kv_caches,
-            inputs.k_new,
-            inputs.v_new,
+            reference_k_new,
+            reference_v_new,
             inputs.local_sparse_attn_indices,
             scenario,
         )
@@ -888,6 +910,8 @@ def test_generation_sparse_mqa_gqa(scenario: GenerationScenario) -> None:
         assert output.shape == expected_shape
         uses_fp8 = scenario.kvcache_dtype == torch.float8_e4m3fn or scenario.fp8_output
         output_for_comparison = output.float() if uses_fp8 else output
+        if scenario.fp8_output:
+            reference_output = reference_output.to(torch.float8_e4m3fn)
         reference_for_comparison = reference_output.float() if uses_fp8 else reference_output
         assert torch.isfinite(output_for_comparison).all()
         if scenario.fp8_output:
