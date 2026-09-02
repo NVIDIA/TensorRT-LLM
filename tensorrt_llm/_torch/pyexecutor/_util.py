@@ -49,9 +49,10 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
+                           extract_qwen4_exp_ple_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid,
+                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -2229,6 +2230,29 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
+def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
+                                    is_draft: bool):
+    """Align target-only PLE state with a target/draft cache layout."""
+    if is_draft:
+        return None
+
+    params = extract_qwen4_exp_ple_cache_params(config)
+    num_target_layers = len(params.ple_layer_mask)
+    if num_target_layers > total_layers:
+        raise ValueError(
+            "PLE layer mask cannot exceed the hybrid cache layout: "
+            f"got {num_target_layers}, expected at most {total_layers}")
+    if num_target_layers == total_layers:
+        return params
+
+    # Unified one-model caches append attention-only MTP layers.
+    return dataclasses.replace(
+        params,
+        ple_layer_mask=params.ple_layer_mask + [False] *
+        (total_layers - num_target_layers),
+    )
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -2624,7 +2648,7 @@ def _create_kv_cache_manager(
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             **mamba_manager_extra_kwargs,
         )
-    elif is_qwen3_hybrid(config):
+    elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -2707,6 +2731,16 @@ def _create_kv_cache_manager(
                 sparse_attention_config=sparse_attention_config,
                 pretrained_config=config,
             )
+        if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
+                                               MambaHybridCacheManagerV2):
+            ple_cache_params = _get_qwen4_exp_ple_cache_params(
+                config,
+                total_layers=len(mamba_layer_mask),
+                is_draft=is_draft,
+            )
+            if ple_cache_params is not None:
+                mamba_manager_extra_kwargs[
+                    "qwen4_exp_ple_cache_params"] = ple_cache_params
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,

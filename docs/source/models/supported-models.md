@@ -58,6 +58,8 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen3MoeForCausalLM`                | Qwen3MoE                           | `Qwen/Qwen3-30B-A3B`                         |
 | `Qwen3NextForCausalLM`               | Qwen3Next                          | `Qwen/Qwen3-Next-80B-A3B-Thinking`           |
 | `Qwen3_5MoeForCausalLM`              | Qwen3.8-MoE, Qwen3.5-MoE           | `Qwen/Qwen3.8-2.4T-A95B`, `Qwen/Qwen3.5-397B-A17B` |
+| `Qwen4ExpForCausalLM`                | Qwen3.8-Flash-Next (text)          | `Qwen/Qwen3.8-Flash-Next`                    |
+| `Qwen4ExpForConditionalGeneration`   | Qwen3.8-Flash-Next                 | `Qwen/Qwen3.8-Flash-Next`                    |
 | `SeedOssForCausalLM` [^5]            | Seed OSS, Seed-Coder               | `ByteDance-Seed/Seed-OSS-36B-Instruct`       |
 | `SkyworkR1V2ForConditionalGeneration` [^5] | Skywork R1V2, Skywork SWE    | `Skywork/Skywork-R1V2-38B`                   |
 | `SmolLM3ForCausalLM` [^5]            | SmolLM3                            | `HuggingFaceTB/SmolLM3-3B`                   |
@@ -80,6 +82,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Qwen3MoeForCausalLM`            | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes              | Yes               | No     | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `Qwen3NextForCausalLM` [^3]      | Yes               | Yes        | Yes                        | Untested              | Yes             | No  | No               | No                | No     | Yes           | Yes              | No             | No                       | Untested              | Untested        |
 | `Qwen3_5MoeForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes             | Yes | No               | No                | No     | Yes           | Untested         | Yes            | N/A                      | Untested              | Untested        |
+| `Qwen4ExpForCausalLM`            | Yes               | Yes        | Yes                        | No                    | Yes             | Yes | No               | No                | No     | Yes           | Untested         | Yes            | N/A                      | Yes                   | Untested        |
 | `Llama4ForConditionalGeneration` | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes              | Yes               | No     | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
 | `GptOssForCausalLM`              | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes              | No                | Yes    | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `Glm4MoeLiteForCausalLM` [^5]    | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No               | No                | No     | Yes           | Untested         | Untested       | N/A                      | Untested              | Untested        |
@@ -147,6 +150,7 @@ complete encoder input must fit in the iteration token budget.
 | `Cosmos3ForConditionalGeneration` [^13] | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Untested              | Untested                  | L + I + V |
 | `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Yes              | No             | Untested              | Yes                       | L + I + V |
 | `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | Yes              | No             | Untested              | Yes                       | L + I + V |
+| `Qwen4ExpForConditionalGeneration`   | Untested          | Untested   | Untested        | Yes           | Untested         | Untested       | Yes                   | No                        | L + I     |
 
 Note:
 - L: Language

@@ -31,7 +31,8 @@ from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
-    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config)
+    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
+    load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -1529,14 +1530,14 @@ class ModelConfig(Generic[TConfig]):
 
         Pure model property: independent of which KV cache manager will run.
         For non-hybrid models this equals num_hidden_layers. For hybrid Mamba
-        models (Nemotron-hybrid, Qwen3-hybrid) it returns only the attention
+        models (Nemotron-hybrid, Qwen3-hybrid, Qwen4-Exp) it returns only the attention
         count derived from the layer pattern; mamba layers are reported by
         ``get_num_mamba_layers``.
         """
         cfg = self.pretrained_config
         if is_nemotron_hybrid(cfg):
             return cfg.hybrid_override_pattern.count("*")
-        if is_qwen3_hybrid(cfg):
+        if is_qwen3_hybrid(cfg) or is_qwen4_exp(cfg):
             return get_qwen3_hybrid_num_attention_layers(cfg)
         if is_kimi_linear(cfg):
             return get_kimi_linear_num_attention_layers(cfg)
@@ -1547,7 +1548,7 @@ class ModelConfig(Generic[TConfig]):
         cfg = self.pretrained_config
         if is_nemotron_hybrid(cfg):
             return cfg.hybrid_override_pattern.count("M")
-        if is_qwen3_hybrid(cfg):
+        if is_qwen3_hybrid(cfg) or is_qwen4_exp(cfg):
             return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
                 cfg)
         if is_kimi_linear(cfg):

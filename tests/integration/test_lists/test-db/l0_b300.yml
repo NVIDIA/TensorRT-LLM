@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 version: 0.0.1
 l0_b300:
 - condition:
@@ -23,6 +26,7 @@ l0_b300:
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
   - unittest/_torch/attention/sparse/qsa/test_qsa_sparse.py TIMEOUT (90)
   - unittest/_torch/modeling/test_qsa_runtime_wiring.py
+  - unittest/_torch/modeling/test_qwen4_exp_support.py TIMEOUT (90)
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
