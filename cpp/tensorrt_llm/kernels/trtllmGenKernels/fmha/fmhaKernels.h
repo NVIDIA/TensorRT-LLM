@@ -377,8 +377,8 @@ private:
         10752, 11264, 11776, 12288, 13312, 14336, 16384, 20480, 24576, 32768, 40960, 49152, 65536, 98304, 131072};
     // Selection of seqLenQ: typically our prefill kernels would not use JIT and seqLenQ is fixed during decode.
     // However seqLenQ can change when we use generation kernel to do prefill. SeqLenQ is sensitive in the range 1-16.
-    // But for prefill we typically face much longer sequence. So we only use a very single datapoint.
-    inline static std::vector<int> const kDefaultWarmupSeqLenQCandidates = {128};
+    // Below sequence are chosen to cover most sparse attention cases.
+    inline static std::vector<int> const kDefaultWarmupSeqLenQCandidates = {1, 2, 4, 8, 32, 64, 128};
 
     static std::vector<int> makeWarmupCandidateSizes(std::vector<int> const& defaultCandidateSizes, int maxSize)
     {
