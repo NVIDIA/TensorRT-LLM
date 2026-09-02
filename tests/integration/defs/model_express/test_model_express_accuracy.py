@@ -221,6 +221,8 @@ def _load_worker_module():
     spec = importlib.util.spec_from_file_location("mx_e2e_worker_under_test", WORKER_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    # Register before executing so modules with postponed annotations resolve.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
