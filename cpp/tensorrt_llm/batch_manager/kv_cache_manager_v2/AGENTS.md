@@ -251,9 +251,11 @@ the manager, the storage manager, or the radix tree.
   (`setCapacity` -> `resize`) does not take it either.
 - `std::shared_mutex` is not recursive, but public APIs call each other freely
   here. `ReentrantSharedMutex` makes a nested *exclusive* acquisition on the
-  owning thread a no-op, so internal call sites need no annotation. Shared ->
-  exclusive upgrade on one thread cannot work and is asserted in debug builds
-  rather than left to deadlock.
+  owning thread a no-op, so internal call sites need no annotation. The shared
+  side is NOT re-entrant, and a shared -> exclusive upgrade on one thread cannot
+  work. Neither is checked -- a violation is a hang, not a diagnostic -- so both
+  have to be respected by construction. See the "deliberate non-features" list
+  in `utils/reentrantSharedMutex.h`.
 
 **Where the guarantee applies.** The thread-safety contract covers the API
 surface exposed through nanobind and declared in the `.pyi` stubs. Internal C++
