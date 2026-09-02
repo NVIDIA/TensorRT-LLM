@@ -453,7 +453,6 @@ def test_async_encoder_step_lifecycle():
         ready_event=ready_event,
     )
     future = Mock()
-    future.done.side_effect = [False, True]
     future.result.return_value = result
     executor = _make_async_encoder_executor(future)
     active_request = types.SimpleNamespace(
@@ -473,10 +472,13 @@ def test_async_encoder_step_lifecycle():
         )
     )
 
+    # The launch is joined inline (https://nvbugs/6683840); publication stays
+    # asynchronous, waiting on ready_event rather than the future.
     executor._submit_encoder_step(requests)
-    executor._poll_encoder_steps()
 
-    future.result.assert_not_called()
+    future.result.assert_called_once_with()
+    future.done.assert_not_called()
+    ready_event.query.assert_not_called()
     executor._publish_encoder_step.assert_not_called()
     assert executor.inflight_req_ids.ids == {11, 12}
     assert len(executor.pending_encoder_steps) == 1

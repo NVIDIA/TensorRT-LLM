@@ -6567,7 +6567,7 @@ class PyExecutor:
             warmup(self.resource_manager)
 
     def _submit_encoder_step(self, encoder_requests: List[LlmRequest]) -> None:
-        """Queue encoder work, serializing it with decoder work under TP."""
+        """Queue encoder work, joining the launch before the caller runs the decoder."""
         executor = self.encoder_launch_executor
         if executor is None:
             raise RuntimeError("Encoder launch executor is unavailable.")
@@ -6603,8 +6603,18 @@ class PyExecutor:
                 self.inflight_req_ids.erase(request.request_id)
             return
 
+        # torch.fx's tracing state is process-global, so a dynamo compile on
+        # either thread captures the other's concurrent module calls
+        # (https://nvbugs/6683840). Join the launch, but leave ready_event
+        # unsynchronized so encoder kernels still overlap decoder work.
+        try:
+            result = future.result()
+        except Exception as e:
+            self._finish_failed_encoder_step(requests, e)
+            return
+
         self.pending_encoder_steps.append(
-            PendingEncoderStep(requests=requests, future=future))
+            PendingEncoderStep(requests=requests, future=future, result=result))
 
     @nvtx_range("_poll_encoder_steps")
     def _poll_encoder_steps(self) -> None:
