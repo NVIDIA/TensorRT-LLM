@@ -88,11 +88,12 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def _get_num_reserved_index_slots(
-        spec_config: Optional[SpeculativeConfig]) -> int:
+def _get_num_reserved_index_slots(spec_config: Optional[SpeculativeConfig],
+                                  estimating_kv_cache: bool) -> int:
     """Return IndexMapper headroom required by the execution policy."""
     if getattr(spec_config, "enable_confidence_scheduling", False):
-        return _CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS
+        return (0 if estimating_kv_cache else
+                _CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS)
     return _DEFAULT_INDEX_MAPPER_RESERVED_SLOTS
 
 
@@ -2486,7 +2487,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["num_reserved_index_slots"] = (
-            _get_num_reserved_index_slots(spec_config))
+            _get_num_reserved_index_slots(spec_config, estimating_kv_cache))
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

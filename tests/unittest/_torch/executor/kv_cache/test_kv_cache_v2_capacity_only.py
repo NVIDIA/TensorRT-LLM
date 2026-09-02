@@ -18,18 +18,24 @@ CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
 
 
 @pytest.mark.parametrize(
-    ("spec_config", "expected"),
+    ("spec_config", "estimating_kv_cache", "expected"),
     [
-        (None, 1),
-        (SimpleNamespace(enable_confidence_scheduling=False), 1),
-        (SimpleNamespace(enable_confidence_scheduling=True), 2),
+        (None, False, 1),
+        (SimpleNamespace(enable_confidence_scheduling=False), False, 1),
+        (SimpleNamespace(enable_confidence_scheduling=True), False, 2),
+        (SimpleNamespace(enable_confidence_scheduling=True), True, 0),
     ],
-    ids=["no-speculation", "static-dspark", "confidence-dspark"],
+    ids=[
+        "no-speculation",
+        "static-dspark",
+        "confidence-dspark",
+        "confidence-estimator",
+    ],
 )
 def test_index_mapper_reservation_tracks_confidence_scheduling(
-    spec_config: SimpleNamespace | None, expected: int
+    spec_config: SimpleNamespace | None, estimating_kv_cache: bool, expected: int
 ) -> None:
-    assert _get_num_reserved_index_slots(spec_config) == expected
+    assert _get_num_reserved_index_slots(spec_config, estimating_kv_cache) == expected
 
 
 def _manager(
