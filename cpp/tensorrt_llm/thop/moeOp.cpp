@@ -234,6 +234,14 @@ public:
                     && mWeightDtype == c10::ScalarType::Float8_e4m3fn),
             "use_mxfp8_weight_scaling requires both activation and weight dtypes to be Float8_e4m3fn.");
 
+        // The per-channel weight-only path reinterprets fc2's dimensions as
+        // [num_experts, inter_size, hidden_size] and, for INT4, treats the trailing
+        // dim as packed two-per-byte. That is only meaningful for integer
+        // weight-only quantization, so reject other weight dtypes here rather
+        // than silently transposing them downstream.
+        TORCH_CHECK(
+            !mUseWoqPerChannel || isIntWeightOnlyQuant(), "use_woq_per_channel requires an INT8 or INT4 weight dtype.");
+
         // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
         if (mActivationDtype == c10::ScalarType::Half && mWeightDtype == c10::ScalarType::Half)
         {
@@ -998,8 +1006,13 @@ public:
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
         }
-        int64_t const group_size_
-            = isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size : -1;
+        // Only group-scaled INT4 (W4A8_AWQ) carries a group size. Plain per-channel
+        // W4A16 must profile with -1 so the profiler builds QuantParams::Int, matching
+        // getQuantParams() and the runner chosen in the constructor; deriving this from
+        // isInt4Quant() alone would profile a groupwise configuration runMoe never uses.
+        int64_t const group_size_ = (isInt4Quant() && mUseW4GroupScaling)
+            ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size
+            : -1;
         int64_t const group_size = isWFP4A16Quant()
             ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
             : group_size_;
