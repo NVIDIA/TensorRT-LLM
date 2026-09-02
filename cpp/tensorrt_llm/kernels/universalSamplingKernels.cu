@@ -44,6 +44,13 @@ namespace
 constexpr int kNarrowBlock = 512;
 constexpr int kWideBlock = 1024;
 constexpr int kWideBlockMaxRows = 128;
+//! Large-vocabulary probability-producing small batches use several CTAs per row. The
+//! output buffer temporarily holds their reduction state, so no external workspace is
+//! required.
+constexpr int kSmallBatchSplitBlock = 512;
+constexpr int kSmallBatchSplits = 8;
+constexpr int kSmallBatchSplitMaxRows = 32;
+constexpr int kSmallBatchSplitMinVocab = 65536;
 //! Architectural limits the occupancy bound below is expressed against.
 constexpr int kMaxThreadsPerBlock = 1024;
 constexpr int kMaxThreadsPerSm = 2048;
@@ -194,6 +201,16 @@ struct OnlineSoftmax
     int argmax;
 };
 
+constexpr int kOnlineSoftmaxFloats = (sizeof(OnlineSoftmax) + sizeof(float) - 1) / sizeof(float);
+constexpr int kSplitStatsFloats = kOnlineSoftmaxFloats * kSmallBatchSplits;
+constexpr int kMergedStatsOffset = kSplitStatsFloats;
+constexpr int kSplitMassOffset = kMergedStatsOffset + kOnlineSoftmaxFloats;
+constexpr int kSmallBatchWorkspaceFloats = kSplitMassOffset + kSmallBatchSplits;
+constexpr int kSplitHistogramOffset = kSmallBatchWorkspaceFloats;
+constexpr int kSplitHistogramStride = 2 * kRadixBuckets;
+static_assert(sizeof(OnlineSoftmax) % sizeof(float) == 0);
+static_assert(kSplitHistogramOffset + kSmallBatchSplits * kSplitHistogramStride <= kSmallBatchSplitMinVocab);
+
 //! Merge two partial online-softmax states by rebasing the smaller max onto the larger.
 //! Associative and commutative, so a block reduce over it is order-independent -- which is
 //! what keeps two TP ranks holding identical logits in agreement.
@@ -267,7 +284,8 @@ struct CountMassOp
 template <typename T>
 __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv, float maxScaled, float floorValue,
     long long targetCount, float targetMass, bool byCount, int* sCount, float* sMass, float* sCand, int* sCandCount,
-    int* sBucketCount, int* sChosen, long long* sCountHi, float* sMassHi, bool* sFired)
+    int* sBucketCount, int* sChosen, long long* sCountHi, float* sMassHi, bool* sFired,
+    bool firstHistogramReady = false)
 {
     uint32_t prefix = 0u;
     uint32_t fixedMask = 0u;
@@ -287,57 +305,36 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
             *sFired = false;
         }
 
-        for (int b = tid; b < kRadixBuckets * kHistCopies; b += blockDim.x)
+        if (!(firstHistogramReady && pass == 0))
         {
-            sCount[b] = 0;
-            sMass[b] = 0.0f;
-        }
-        __syncthreads();
-
-        // Which private copy this thread accumulates into. Contention, not bandwidth, is
-        // what makes a shared-memory histogram slow here: w lies in (0, 1], so the top 8
-        // bits only ever take ~64 of the 256 values, and a softmax concentrates most of a
-        // 128k-element row into a handful of those. Every element issues two atomics, so a
-        // single shared histogram serializes the whole pass on a few addresses. Splitting
-        // by warp group divides that contention by kHistCopies at the cost of one cheap
-        // fold afterwards.
-        int const copy = (tid >> 5) & (kHistCopies - 1);
-        int* const myCount = sCount + copy * kRadixBuckets;
-        float* const myMass = sMass + copy * kRadixBuckets;
-
-        if (useShared)
-        {
-            int const n = *sCandCount;
-            for (int i = tid; i < n; i += blockDim.x)
+            for (int b = tid; b < kRadixBuckets * kHistCopies; b += blockDim.x)
             {
-                float const w = sCand[i];
-                uint32_t const bits = __float_as_uint(w);
-                if ((bits & fixedMask) != prefix)
-                {
-                    continue;
-                }
-                uint32_t const digit = (bits >> shift) & (kRadixBuckets - 1);
-                atomicAdd(&myCount[digit], 1);
-                if (!byCount)
-                {
-                    atomicAdd(&myMass[digit], w);
-                }
+                sCount[b] = 0;
+                sMass[b] = 0.0f;
             }
-        }
-        else
-        {
-            forEachLogit(rowLogits, vocabSize,
-                [&](int, float logit)
+            __syncthreads();
+
+            // Which private copy this thread accumulates into. Contention, not bandwidth, is
+            // what makes a shared-memory histogram slow here: w lies in (0, 1], so the top 8
+            // bits only ever take ~64 of the 256 values, and a softmax concentrates most of a
+            // 128k-element row into a handful of those. Every element issues two atomics, so a
+            // single shared histogram serializes the whole pass on a few addresses. Splitting
+            // by warp group divides that contention by kHistCopies at the cost of one cheap
+            // fold afterwards.
+            int const copy = (tid >> 5) & (kHistCopies - 1);
+            int* const myCount = sCount + copy * kRadixBuckets;
+            float* const myMass = sMass + copy * kRadixBuckets;
+
+            if (useShared)
+            {
+                int const n = *sCandCount;
+                for (int i = tid; i < n; i += blockDim.x)
                 {
-                    float const w = __expf(__fmul_rn(logit, tempInv) - maxScaled);
-                    if (w < floorValue)
-                    {
-                        return;
-                    }
+                    float const w = sCand[i];
                     uint32_t const bits = __float_as_uint(w);
                     if ((bits & fixedMask) != prefix)
                     {
-                        return;
+                        continue;
                     }
                     uint32_t const digit = (bits >> shift) & (kRadixBuckets - 1);
                     atomicAdd(&myCount[digit], 1);
@@ -345,35 +342,59 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
                     {
                         atomicAdd(&myMass[digit], w);
                     }
-                });
-        }
-        __syncthreads();
-
-        // Fold the private copies into copy 0, one bucket per thread, keeping the raw
-        // per-bucket totals in the space copy 1 occupied -- the suffix scan below runs in
-        // place and the chosen bucket's own count is still needed afterwards.
-        for (int b = tid; b < kRadixBuckets; b += blockDim.x)
-        {
-            int totalCount = sCount[b];
-            float totalMass = byCount ? 0.0f : sMass[b];
-#pragma unroll
-            for (int c = 1; c < kHistCopies; ++c)
-            {
-                totalCount += sCount[c * kRadixBuckets + b];
-                if (!byCount)
-                {
-                    totalMass += sMass[c * kRadixBuckets + b];
                 }
             }
-            sCount[b] = totalCount;
-            sCount[kRadixBuckets + b] = totalCount;
-            if (!byCount)
+            else
             {
-                sMass[b] = totalMass;
-                sMass[kRadixBuckets + b] = totalMass;
+                forEachLogit(rowLogits, vocabSize,
+                    [&](int, float logit)
+                    {
+                        float const w = __expf(__fmul_rn(logit, tempInv) - maxScaled);
+                        if (w < floorValue)
+                        {
+                            return;
+                        }
+                        uint32_t const bits = __float_as_uint(w);
+                        if ((bits & fixedMask) != prefix)
+                        {
+                            return;
+                        }
+                        uint32_t const digit = (bits >> shift) & (kRadixBuckets - 1);
+                        atomicAdd(&myCount[digit], 1);
+                        if (!byCount)
+                        {
+                            atomicAdd(&myMass[digit], w);
+                        }
+                    });
             }
+            __syncthreads();
+
+            // Fold the private copies into copy 0, one bucket per thread, keeping the raw
+            // per-bucket totals in the space copy 1 occupied -- the suffix scan below runs in
+            // place and the chosen bucket's own count is still needed afterwards.
+            for (int b = tid; b < kRadixBuckets; b += blockDim.x)
+            {
+                int totalCount = sCount[b];
+                float totalMass = byCount ? 0.0f : sMass[b];
+#pragma unroll
+                for (int c = 1; c < kHistCopies; ++c)
+                {
+                    totalCount += sCount[c * kRadixBuckets + b];
+                    if (!byCount)
+                    {
+                        totalMass += sMass[c * kRadixBuckets + b];
+                    }
+                }
+                sCount[b] = totalCount;
+                sCount[kRadixBuckets + b] = totalCount;
+                if (!byCount)
+                {
+                    sMass[b] = totalMass;
+                    sMass[kRadixBuckets + b] = totalMass;
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads();
 
         // Descending suffix sums, Hillis-Steele: 8 parallel steps instead of the 256
         // dependent shared-memory reads a serial walk costs.
@@ -500,6 +521,47 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
     return __uint_as_float(prefix);
 }
 
+template <int BLOCK>
+struct UniversalSamplingShared
+{
+    using BlockReduceF = cub::BlockReduce<float, BLOCK>;
+    using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, BLOCK>;
+    using BlockReduceMaxArg = cub::BlockReduce<MaxArg, BLOCK>;
+    using BlockReduceCountMass = cub::BlockReduce<CountMass, BLOCK>;
+    using BlockScanF = cub::BlockScan<float, BLOCK>;
+
+    union
+    {
+        typename BlockReduceF::TempStorage reduceF;
+        typename BlockReduceOnline::TempStorage reduceOnline;
+        typename BlockReduceMaxArg::TempStorage reduceMaxArg;
+        typename BlockReduceCountMass::TempStorage reduceCountMass;
+        typename BlockScanF::TempStorage scanF;
+    } temp;
+
+    int count[kRadixBuckets * kHistCopies];
+    float mass[kRadixBuckets * kHistCopies];
+    float cand[kCandCap];
+    int candCount;
+    int bucketCount;
+    int chosen;
+    long long countHi;
+    float massHi;
+    bool fired;
+    float maxScaled;
+    float totalMass;
+    float keptMass;
+    float survivingMass;
+    float target;
+    int argmax;
+    int token;
+    float pivot;
+    float candWeight;
+    float massTarget;
+    int candIdx;
+    curandStatePhilox4_32_10_t rejectRng;
+};
+
 //! \brief The kernel body, shared by both entry points below.
 //!
 //! A __device__ function rather than the __global__ itself because only ONE of the six
@@ -510,8 +572,8 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
 //! bound is measurably worse than no attribute at all. So the bounded case gets its own
 //! entry point and every other instantiation keeps none.
 //! \brief Fused temperature + min-p + top-k + top-p + (probs | sampling), one block per row.
-template <typename T, int BLOCK, bool NEED_TOKENS, bool NEED_PROBS>
-__device__ void universalSamplingBody(UniversalSamplingParams const& params)
+template <typename T, int BLOCK, bool NEED_TOKENS, bool NEED_PROBS, bool PRECOMPUTED_STATS = false>
+__device__ void universalSamplingBody(UniversalSamplingParams const& params, UniversalSamplingShared<BLOCK>& shared)
 {
     int const row = blockIdx.x;
     int const tid = threadIdx.x;
@@ -527,65 +589,88 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     using BlockReduceCountMass = cub::BlockReduce<CountMass, BLOCK>;
     using BlockScanF = cub::BlockScan<float, BLOCK>;
 
-    __shared__ union
-    {
-        typename BlockReduceF::TempStorage reduceF;
-        typename BlockReduceOnline::TempStorage reduceOnline;
-        typename BlockReduceMaxArg::TempStorage reduceMaxArg;
-        typename BlockReduceCountMass::TempStorage reduceCountMass;
-        typename BlockScanF::TempStorage scanF;
-    } temp;
-
-    __shared__ int sCount[kRadixBuckets * kHistCopies];
-    __shared__ float sMass[kRadixBuckets * kHistCopies];
-    __shared__ float sCand[kCandCap];
-    __shared__ int sCandCount;
-    __shared__ int sBucketCount;
-    __shared__ int sChosen;
-    __shared__ long long sCountHi;
-    __shared__ float sMassHi;
-    __shared__ bool sFired;
-    __shared__ float sMaxScaled;
-    __shared__ float sTotalMass;
-    __shared__ float sKeptMass;
-    __shared__ float sSurvivingMass;
-    __shared__ float sTarget;
-    __shared__ int sArgMax;
-    __shared__ int sToken;
+    auto& temp = shared.temp;
+    int* const sCount = shared.count;
+    float* const sMass = shared.mass;
+    float* const sCand = shared.cand;
+    int& sCandCount = shared.candCount;
+    int& sBucketCount = shared.bucketCount;
+    int& sChosen = shared.chosen;
+    long long& sCountHi = shared.countHi;
+    float& sMassHi = shared.massHi;
+    bool& sFired = shared.fired;
+    float& sMaxScaled = shared.maxScaled;
+    float& sTotalMass = shared.totalMass;
+    float& sKeptMass = shared.keptMass;
+    float& sSurvivingMass = shared.survivingMass;
+    float& sTarget = shared.target;
+    int& sArgMax = shared.argmax;
+    int& sToken = shared.token;
     // Rejection-path state. Distinct names rather than reuse of the above: the descent
     // path's scalars each mean one thing for one stage, and an earlier version of this
     // kernel shipped a bug where the sampler's target clobbered the mass it was derived
     // from.
-    __shared__ float sPivot;
-    __shared__ float sCandWeight;
-    __shared__ float sMassTarget;
-    __shared__ int sCandIdx;
-    __shared__ curandStatePhilox4_32_10_t sRejectRng;
+    float& sPivot = shared.pivot;
+    float& sCandWeight = shared.candWeight;
+    float& sMassTarget = shared.massTarget;
+    int& sCandIdx = shared.candIdx;
+    curandStatePhilox4_32_10_t& sRejectRng = shared.rejectRng;
 
     // --- Pass 1: max, total mass and argmax in one read (Milakov & Gimelshein).
     //
-    // The tokens-only rejection path is the exception: its first inverse-CDF scan must
-    // compute each thread's mass anyway. For those rows, doing an online mass here also
-    // evaluates one exp per logit and then discards the result, so specialize this pass
-    // down to max + argmax. A pure top-k row retains the mass for the descent path below;
-    // top-k + top-p only needs the max to solve the rank cutoff, then computes the
-    // post-top-k mass in its rejection scan.
+    // The tokens-only rejection path has two variants. When no earlier filter changes its
+    // support, retain each thread's online-softmax partial and rebase it onto the block max;
+    // the first inverse-CDF scan can consume that mass without reading the row again. A
+    // min-p or top-k support cannot reuse the unfiltered partial, so those rows specialize
+    // this pass down to max + argmax and compute their useful mass in the rejection scan.
     bool const deferMassToRejection
         = NEED_TOKENS && !NEED_PROBS && (!rp.needTopK || (rp.needTopP && params.numRows <= 8));
-    if constexpr (NEED_TOKENS && !NEED_PROBS)
+    bool const reuseThreadMass = deferMassToRejection && !rp.needTopK && !rp.needMinP;
+    OnlineSoftmax cachedThreadStats{-FLT_MAX, 0.0f, 0};
+    if constexpr (PRECOMPUTED_STATS)
+    {
+        static_assert(NEED_PROBS);
+        if (tid == 0)
+        {
+            OnlineSoftmax const rowStats = *reinterpret_cast<OnlineSoftmax const*>(rowProbs + kMergedStatsOffset);
+            sMaxScaled = rowStats.max;
+            sArgMax = rowStats.argmax;
+            sTotalMass = rowStats.sum;
+        }
+    }
+    else if constexpr (NEED_TOKENS && !NEED_PROBS)
     {
         if (deferMassToRejection)
         {
-            MaxArg local{-FLT_MAX, 0};
-            forEachLogit(rowLogits, vocabSize,
-                [&](int i, float logit) {
-                    local = MaxArgOp()(local, MaxArg{__fmul_rn(logit, rp.tempInv), i});
-                });
-            MaxArg const rowStats = BlockReduceMaxArg(temp.reduceMaxArg).Reduce(local, MaxArgOp());
-            if (tid == 0)
+            if (reuseThreadMass)
             {
-                sMaxScaled = rowStats.max;
-                sArgMax = rowStats.argmax;
+                forEachLogit(rowLogits, vocabSize,
+                    [&](int i, float logit) {
+                        cachedThreadStats = combineOnlineSoftmax(
+                            cachedThreadStats, OnlineSoftmax{__fmul_rn(logit, rp.tempInv), 1.0f, i});
+                    });
+                OnlineSoftmax const rowStats
+                    = BlockReduceOnline(temp.reduceOnline).Reduce(cachedThreadStats, OnlineSoftmaxOp());
+                if (tid == 0)
+                {
+                    sMaxScaled = rowStats.max;
+                    sArgMax = rowStats.argmax;
+                    sTotalMass = rowStats.sum;
+                }
+            }
+            else
+            {
+                MaxArg local{-FLT_MAX, 0};
+                forEachLogit(rowLogits, vocabSize,
+                    [&](int i, float logit) {
+                        local = MaxArgOp()(local, MaxArg{__fmul_rn(logit, rp.tempInv), i});
+                    });
+                MaxArg const rowStats = BlockReduceMaxArg(temp.reduceMaxArg).Reduce(local, MaxArgOp());
+                if (tid == 0)
+                {
+                    sMaxScaled = rowStats.max;
+                    sArgMax = rowStats.argmax;
+                }
             }
         }
         else
@@ -621,6 +706,8 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     }
     __syncthreads();
     float const maxScaled = sMaxScaled;
+    float const cachedLocalMass
+        = reuseThreadMass ? cachedThreadStats.sum * __expf(cachedThreadStats.max - maxScaled) : 0.0f;
 
     // --- Pass 2: only min-p needs one, and only because its cutoff is relative to the max
     //     -- which pass 1 does not know until it ends, so the filtered mass cannot be
@@ -712,20 +799,23 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
             {
                 float const pivot = sPivot;
 
-                // Inverse-CDF draw over the current support. The scan's aggregate is the
-                // support's mass, recomputed here rather than carried over from the
-                // previous round's reduction, so the target can never fall outside the
-                // walk that has to find it.
-                float localMass = 0.0f;
-                forEachLogit(rowLogits, vocabSize,
-                    [&](int, float logit)
-                    {
-                        float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
-                        if (w >= supportFloor && w > pivot)
+                // Inverse-CDF draw over the current support. Round 0 can consume the
+                // retained online-softmax partial; a narrowed retry recomputes its mass.
+                // Either way the scan aggregates the same per-thread partials that the
+                // sampling walk uses, so the target cannot fall outside that walk.
+                float localMass = round == 0 && reuseThreadMass ? cachedLocalMass : 0.0f;
+                if (!(round == 0 && reuseThreadMass))
+                {
+                    forEachLogit(rowLogits, vocabSize,
+                        [&](int, float logit)
                         {
-                            localMass += w;
-                        }
-                    });
+                            float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                            if (w >= supportFloor && w > pivot)
+                            {
+                                localMass += w;
+                            }
+                        });
+                }
                 float base = 0.0f;
                 float supportMass = 0.0f;
                 BlockScanF(temp.scanF).ExclusiveSum(localMass, base, supportMass);
@@ -1081,12 +1171,463 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     }
 }
 
+//! Several CTAs independently reduce contiguous vocabulary slices and leave their
+//! online-softmax partials at the start of the output row.
+template <typename T>
+__global__ void smallBatchSplitStatsKernel(UniversalSamplingParams params)
+{
+    int const row = blockIdx.x / kSmallBatchSplits;
+    int const split = blockIdx.x % kSmallBatchSplits;
+    int const tid = threadIdx.x;
+    RowParams const rp = loadRowParams(params, row);
+
+    int const vocabSize = params.vocabSize;
+    int const begin = static_cast<int>(static_cast<long long>(vocabSize) * split / kSmallBatchSplits);
+    int const end = static_cast<int>(static_cast<long long>(vocabSize) * (split + 1) / kSmallBatchSplits);
+    T const* rowLogits = static_cast<T const*>(params.logits) + static_cast<size_t>(row) * vocabSize;
+
+    OnlineSoftmax local{-FLT_MAX, 0.0f, begin};
+    for (int i = begin + tid; i < end; i += blockDim.x)
+    {
+        local = combineOnlineSoftmax(local, OnlineSoftmax{__fmul_rn(toFloat(rowLogits[i]), rp.tempInv), 1.0f, i});
+    }
+
+    using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, kSmallBatchSplitBlock>;
+    __shared__ typename BlockReduceOnline::TempStorage temp;
+    OnlineSoftmax const partial = BlockReduceOnline(temp).Reduce(local, OnlineSoftmaxOp());
+    if (tid == 0)
+    {
+        float* rowProbs = params.outputProbs + static_cast<size_t>(row) * vocabSize;
+        reinterpret_cast<OnlineSoftmax*>(rowProbs)[split] = partial;
+    }
+}
+
+//! Reuse the split-vocabulary grid to write neutral probabilities or build pure-top-p's
+//! first radix histogram. Other filters leave their merged statistics for the final CTA.
+template <typename T, bool NEED_TOKENS>
+__global__ void smallBatchSplitOutputKernel(UniversalSamplingParams params)
+{
+    int const row = blockIdx.x / kSmallBatchSplits;
+    int const split = blockIdx.x % kSmallBatchSplits;
+    int const tid = threadIdx.x;
+    int const vocabSize = params.vocabSize;
+    RowParams const rp = loadRowParams(params, row);
+
+    T const* rowLogits = static_cast<T const*>(params.logits) + static_cast<size_t>(row) * vocabSize;
+    float* rowProbs = params.outputProbs + static_cast<size_t>(row) * vocabSize;
+    int const splitBegin = static_cast<int>(static_cast<long long>(vocabSize) * split / kSmallBatchSplits);
+    int const splitEnd = static_cast<int>(static_cast<long long>(vocabSize) * (split + 1) / kSmallBatchSplits);
+    __shared__ OnlineSoftmax sRowStats;
+    if (tid == 0)
+    {
+        OnlineSoftmax rowStats = reinterpret_cast<OnlineSoftmax const*>(rowProbs)[0];
+        for (int other = 1; other < kSmallBatchSplits; ++other)
+        {
+            rowStats = combineOnlineSoftmax(rowStats, reinterpret_cast<OnlineSoftmax const*>(rowProbs)[other]);
+        }
+        sRowStats = rowStats;
+        if (split == 0)
+        {
+            *reinterpret_cast<OnlineSoftmax*>(rowProbs + kMergedStatsOffset) = rowStats;
+        }
+    }
+    __syncthreads();
+    OnlineSoftmax const rowStats = sRowStats;
+    if (rp.needTopK || rp.needMinP)
+    {
+        return;
+    }
+
+    // The first radix pass is dominated by contended shared atomics. Spread it across
+    // the same slice grid as the online-softmax pass, then leave one folded histogram per
+    // slice in the output buffer for the row CTA to merge and continue descending.
+    __shared__ int sCount[kRadixBuckets * kHistCopies];
+    __shared__ float sMass[kRadixBuckets * kHistCopies];
+    if (rp.needTopP)
+    {
+        for (int b = tid; b < kRadixBuckets * kHistCopies; b += blockDim.x)
+        {
+            sCount[b] = 0;
+            sMass[b] = 0.0f;
+        }
+        __syncthreads();
+
+        int const copy = (tid >> 5) & (kHistCopies - 1);
+        int* const myCount = sCount + copy * kRadixBuckets;
+        float* const myMass = sMass + copy * kRadixBuckets;
+        for (int i = splitBegin + tid; i < splitEnd; i += blockDim.x)
+        {
+            float const w = weightOf(rowLogits, i, rp.tempInv, rowStats.max);
+            uint32_t const digit = __float_as_uint(w) >> (32 - kRadixBits);
+            atomicAdd(&myCount[digit], 1);
+            atomicAdd(&myMass[digit], w);
+        }
+        __syncthreads();
+
+        float* const splitHistogram = rowProbs + kSplitHistogramOffset + split * kSplitHistogramStride;
+        for (int b = tid; b < kRadixBuckets; b += blockDim.x)
+        {
+            int totalCount = sCount[b];
+            float totalMass = sMass[b];
+#pragma unroll
+            for (int c = 1; c < kHistCopies; ++c)
+            {
+                totalCount += sCount[c * kRadixBuckets + b];
+                totalMass += sMass[c * kRadixBuckets + b];
+            }
+            reinterpret_cast<int*>(splitHistogram)[b] = totalCount;
+            splitHistogram[kRadixBuckets + b] = totalMass;
+        }
+        return;
+    }
+
+    float const scale = 1.0f / rowStats.sum;
+    int const begin = splitBegin > kSmallBatchWorkspaceFloats ? splitBegin : kSmallBatchWorkspaceFloats;
+
+    int const vecBegin = (begin + 3) / 4;
+    int const vecEnd = splitEnd / 4;
+    float localProbMass = 0.0f;
+    int const prologueEnd = vecBegin * 4 < splitEnd ? vecBegin * 4 : splitEnd;
+    for (int i = begin + tid; i < prologueEnd; i += blockDim.x)
+    {
+        float const p = weightOf(rowLogits, i, rp.tempInv, rowStats.max) * scale;
+        rowProbs[i] = p;
+        if constexpr (NEED_TOKENS)
+        {
+            localProbMass += p;
+        }
+    }
+    for (int v = vecBegin + tid; v < vecEnd; v += blockDim.x)
+    {
+        float4 out;
+        float* elems = reinterpret_cast<float*>(&out);
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            elems[j] = weightOf(rowLogits, v * 4 + j, rp.tempInv, rowStats.max) * scale;
+            if constexpr (NEED_TOKENS)
+            {
+                localProbMass += elems[j];
+            }
+        }
+        reinterpret_cast<float4*>(rowProbs)[v] = out;
+    }
+    int const tailBegin = begin > vecEnd * 4 ? begin : vecEnd * 4;
+    for (int i = tailBegin + tid; i < splitEnd; i += blockDim.x)
+    {
+        float const p = weightOf(rowLogits, i, rp.tempInv, rowStats.max) * scale;
+        rowProbs[i] = p;
+        if constexpr (NEED_TOKENS)
+        {
+            localProbMass += p;
+        }
+    }
+
+    if constexpr (NEED_TOKENS)
+    {
+        using BlockReduceF = cub::BlockReduce<float, kSmallBatchSplitBlock>;
+        __shared__ typename BlockReduceF::TempStorage temp;
+        float const splitMass = BlockReduceF(temp).Sum(localProbMass);
+        if (tid == 0)
+        {
+            rowProbs[kSplitMassOffset + split] = splitMass;
+        }
+    }
+}
+
+//! Finish split-owned rows, or continue the normal universal body from the precomputed
+//! statistics. Mixing both in one grid keeps heterogeneous rows concurrent.
+template <typename T, bool NEED_TOKENS>
+__global__ void smallBatchSplitFinalizeKernel(UniversalSamplingParams params)
+{
+    int const row = blockIdx.x;
+    int const tid = threadIdx.x;
+    int const vocabSize = params.vocabSize;
+    RowParams const rp = loadRowParams(params, row);
+    __shared__ UniversalSamplingShared<kWideBlock> shared;
+    if (rp.needTopK || rp.needMinP)
+    {
+        universalSamplingBody<T, kWideBlock, NEED_TOKENS, true, true>(params, shared);
+        return;
+    }
+
+    T const* rowLogits = static_cast<T const*>(params.logits) + static_cast<size_t>(row) * vocabSize;
+    float* rowProbs = params.outputProbs + static_cast<size_t>(row) * vocabSize;
+    using BlockReduceF = cub::BlockReduce<float, kWideBlock>;
+    using BlockScanF = cub::BlockScan<float, kWideBlock>;
+    auto& temp = shared.temp;
+    int* const sCount = shared.count;
+    float* const sMass = shared.mass;
+    float* const sCand = shared.cand;
+    int& sCandCount = shared.candCount;
+    int& sBucketCount = shared.bucketCount;
+    int& sChosen = shared.chosen;
+    long long& sCountHi = shared.countHi;
+    float& sMassHi = shared.massHi;
+    bool& sFired = shared.fired;
+    float& sMaxScaled = shared.maxScaled;
+    float& sTotalMass = shared.totalMass;
+    float& sKeptMass = shared.keptMass;
+    float& sTarget = shared.target;
+    int& sArgMax = shared.argmax;
+    int& sToken = shared.token;
+
+    if (tid == 0)
+    {
+        OnlineSoftmax const rowStats = *reinterpret_cast<OnlineSoftmax const*>(rowProbs + kMergedStatsOffset);
+        sMaxScaled = rowStats.max;
+        sTotalMass = rowStats.sum;
+        sArgMax = rowStats.argmax;
+        if constexpr (NEED_TOKENS)
+        {
+            if (!rp.needTopP)
+            {
+                for (int split = 0; split < kSmallBatchSplits; ++split)
+                {
+                    sMass[split] = rowProbs[kSplitMassOffset + split];
+                }
+            }
+        }
+    }
+    __syncthreads();
+    float const maxScaled = sMaxScaled;
+    float const totalMass = sTotalMass;
+    int const argmax = sArgMax;
+
+    if (rp.needTopP)
+    {
+        // Merge the per-slice first-pass histograms into the layout findThreshold expects:
+        // copy 0 is scanned in place, while copy 1 preserves each bucket's raw count.
+        for (int b = tid; b < kRadixBuckets; b += blockDim.x)
+        {
+            int totalCount = 0;
+            float totalMass = 0.0f;
+#pragma unroll
+            for (int split = 0; split < kSmallBatchSplits; ++split)
+            {
+                float const* splitHistogram = rowProbs + kSplitHistogramOffset + split * kSplitHistogramStride;
+                totalCount += reinterpret_cast<int const*>(splitHistogram)[b];
+                totalMass += splitHistogram[kRadixBuckets + b];
+            }
+            sCount[b] = totalCount;
+            sCount[kRadixBuckets + b] = totalCount;
+            sMass[b] = totalMass;
+            sMass[kRadixBuckets + b] = totalMass;
+        }
+        __syncthreads();
+
+        float threshold = findThreshold<T>(rowLogits, vocabSize, rp.tempInv, maxScaled, 0.0f, 0, rp.topP * totalMass,
+            /*byCount=*/false, sCount, sMass, sCand, &sCandCount, &sBucketCount, &sChosen, &sCountHi, &sMassHi, &sFired,
+            /*firstHistogramReady=*/true);
+
+        float localKept = 0.0f;
+        forEachLogit(rowLogits, vocabSize,
+            [&](int, float logit)
+            {
+                float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                if (w >= threshold)
+                {
+                    localKept += w;
+                }
+            });
+        float const blockKept = BlockReduceF(temp.reduceF).Sum(localKept);
+        if (tid == 0)
+        {
+            sKeptMass = blockKept;
+        }
+        __syncthreads();
+
+        float keptMass = sKeptMass;
+        if (!(keptMass > 0.0f))
+        {
+            threshold = 0.0f;
+            keptMass = totalMass;
+            localKept = 0.0f;
+            forEachLogit(rowLogits, vocabSize,
+                [&](int, float logit) { localKept += __expf(__fmul_rn(logit, rp.tempInv) - maxScaled); });
+        }
+
+        float const outputScale = 1.0f / keptMass;
+        int const probVecCount = vocabSize / 4;
+        bool const probsAligned = (reinterpret_cast<uintptr_t>(rowProbs) % kVecBytes) == 0;
+        if (probsAligned)
+        {
+            for (int v = tid; v < probVecCount; v += blockDim.x)
+            {
+                float4 out;
+                float* elems = reinterpret_cast<float*>(&out);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    float const w = weightOf(rowLogits, v * 4 + j, rp.tempInv, maxScaled);
+                    elems[j] = w >= threshold ? w * outputScale : 0.0f;
+                }
+                reinterpret_cast<float4*>(rowProbs)[v] = out;
+            }
+            for (int i = probVecCount * 4 + tid; i < vocabSize; i += blockDim.x)
+            {
+                float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
+                rowProbs[i] = w >= threshold ? w * outputScale : 0.0f;
+            }
+        }
+        else
+        {
+            for (int i = tid; i < vocabSize; i += blockDim.x)
+            {
+                float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
+                rowProbs[i] = w >= threshold ? w * outputScale : 0.0f;
+            }
+        }
+
+        if constexpr (NEED_TOKENS)
+        {
+            if (tid == 0)
+            {
+                int const rngIdx = params.perRowRng ? row : 0;
+                uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
+                uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
+                curandStatePhilox4_32_10_t state;
+                curand_init(seed, static_cast<uint64_t>(row), offset, &state);
+                sTarget = curand_uniform(&state) * keptMass;
+                sToken = -1;
+            }
+            __syncthreads();
+
+            float base = 0.0f;
+            BlockScanF(temp.scanF).ExclusiveSum(localKept, base);
+            __syncthreads();
+            if (sTarget >= base && sTarget < base + localKept)
+            {
+                float running = base;
+                bool found = false;
+                forEachLogit(rowLogits, vocabSize,
+                    [&](int i, float logit)
+                    {
+                        if (found)
+                        {
+                            return;
+                        }
+                        float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                        if (w < threshold)
+                        {
+                            return;
+                        }
+                        running += w;
+                        if (running > sTarget)
+                        {
+                            sToken = i;
+                            found = true;
+                        }
+                    });
+            }
+            __syncthreads();
+            if (tid == 0)
+            {
+                params.outputTokens[row] = sToken >= 0 ? sToken : argmax;
+            }
+        }
+        return;
+    }
+
+    float const scale = 1.0f / totalMass;
+    if constexpr (NEED_TOKENS)
+    {
+        if (tid == 0)
+        {
+            float headMass = 0.0f;
+            for (int i = 0; i < kSmallBatchWorkspaceFloats; ++i)
+            {
+                float const p = weightOf(rowLogits, i, rp.tempInv, maxScaled) * scale;
+                rowProbs[i] = p;
+                headMass += p;
+            }
+            sMass[0] += headMass;
+
+            float totalProbMass = 0.0f;
+            for (int split = 0; split < kSmallBatchSplits; ++split)
+            {
+                totalProbMass += sMass[split];
+            }
+            int const rngIdx = params.perRowRng ? row : 0;
+            uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
+            uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
+            curandStatePhilox4_32_10_t state;
+            curand_init(seed, static_cast<uint64_t>(row), offset, &state);
+            float const target = curand_uniform(&state) * totalProbMass;
+
+            float massBefore = 0.0f;
+            sChosen = kSmallBatchSplits - 1;
+            for (int split = 0; split < kSmallBatchSplits; ++split)
+            {
+                if (target < massBefore + sMass[split])
+                {
+                    sChosen = split;
+                    break;
+                }
+                massBefore += sMass[split];
+            }
+            sTarget = target - massBefore;
+            sToken = -1;
+        }
+    }
+    else
+    {
+        for (int i = tid; i < kSmallBatchWorkspaceFloats; i += blockDim.x)
+        {
+            rowProbs[i] = weightOf(rowLogits, i, rp.tempInv, maxScaled) * scale;
+        }
+    }
+
+    if constexpr (NEED_TOKENS)
+    {
+        __syncthreads();
+        int const chosenSplit = sChosen;
+        int const splitBegin = static_cast<int>(static_cast<long long>(vocabSize) * chosenSplit / kSmallBatchSplits);
+        int const splitEnd
+            = static_cast<int>(static_cast<long long>(vocabSize) * (chosenSplit + 1) / kSmallBatchSplits);
+        float localProbMass = 0.0f;
+        for (int i = splitBegin + tid; i < splitEnd; i += blockDim.x)
+        {
+            localProbMass += rowProbs[i];
+        }
+        float base = 0.0f;
+        BlockScanF(temp.scanF).ExclusiveSum(localProbMass, base);
+        __syncthreads();
+
+        float const target = sTarget;
+        if (target >= base && target < base + localProbMass)
+        {
+            float running = base;
+            bool found = false;
+            for (int i = splitBegin + tid; i < splitEnd; i += blockDim.x)
+            {
+                if (found)
+                {
+                    continue;
+                }
+                running += rowProbs[i];
+                if (running > target)
+                {
+                    sToken = i;
+                    found = true;
+                }
+            }
+        }
+        __syncthreads();
+        if (tid == 0)
+        {
+            params.outputTokens[row] = sToken >= 0 ? sToken : argmax;
+        }
+    }
+}
+
 //! The generic entry point: no __launch_bounds__, so ptxas compiles every instantiation
 //! exactly as it did before the tokens-only path existed.
 template <typename T, int BLOCK, bool NEED_TOKENS, bool NEED_PROBS>
 __global__ void universalSamplingKernel(UniversalSamplingParams params)
 {
-    universalSamplingBody<T, BLOCK, NEED_TOKENS, NEED_PROBS>(params);
+    __shared__ UniversalSamplingShared<BLOCK> shared;
+    universalSamplingBody<T, BLOCK, NEED_TOKENS, NEED_PROBS>(params, shared);
 }
 
 //! The tokens-only narrow-block entry point, and the only one carrying an occupancy bound.
@@ -1104,7 +1645,8 @@ template <typename T>
 __global__ __launch_bounds__(kNarrowBlock, kMaxThreadsPerSm / kNarrowBlock) void universalSamplingTokensNarrowKernel(
     UniversalSamplingParams params)
 {
-    universalSamplingBody<T, kNarrowBlock, true, false>(params);
+    __shared__ UniversalSamplingShared<kNarrowBlock> shared;
+    universalSamplingBody<T, kNarrowBlock, true, false>(params, shared);
 }
 
 } // namespace
@@ -1141,8 +1683,37 @@ void launchUniversalSampling(UniversalSamplingParams const& params, cudaStream_t
 }
 
 template <typename T>
+void launchSmallBatchSplit(UniversalSamplingParams const& params, cudaStream_t stream)
+{
+    dim3 const statsGrid(params.numRows * kSmallBatchSplits);
+    dim3 const statsBlock(kSmallBatchSplitBlock);
+    smallBatchSplitStatsKernel<T><<<statsGrid, statsBlock, 0, stream>>>(params);
+
+    dim3 const rowGrid(params.numRows);
+    dim3 const finishBlock(kWideBlock);
+    if (params.outputTokens != nullptr)
+    {
+        smallBatchSplitOutputKernel<T, true><<<statsGrid, statsBlock, 0, stream>>>(params);
+        smallBatchSplitFinalizeKernel<T, true><<<rowGrid, finishBlock, 0, stream>>>(params);
+    }
+    else
+    {
+        smallBatchSplitOutputKernel<T, false><<<statsGrid, statsBlock, 0, stream>>>(params);
+        smallBatchSplitFinalizeKernel<T, false><<<rowGrid, finishBlock, 0, stream>>>(params);
+    }
+}
+
+template <typename T>
 void invokeUniversalSampling(UniversalSamplingParams const& params, cudaStream_t stream)
 {
+    bool const useSmallBatchSplit = params.outputProbs != nullptr && params.numRows <= kSmallBatchSplitMaxRows
+        && params.vocabSize >= kSmallBatchSplitMinVocab;
+    if (useSmallBatchSplit)
+    {
+        launchSmallBatchSplit<T>(params, stream);
+        return;
+    }
+
     // See kNarrowBlock / kWideBlock: a small batch wants a wide block to shorten each
     // row's critical path, a large one wants narrow blocks so more fit per SM.
     if (params.numRows <= kWideBlockMaxRows)
