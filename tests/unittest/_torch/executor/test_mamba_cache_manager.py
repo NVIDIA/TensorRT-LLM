@@ -2922,22 +2922,33 @@ def test_branch_snapshot_is_inert_when_the_flag_is_off():
     assert request.expect_snapshot_points == []
 
 
-@pytest.mark.parametrize(
-    ("local_num_mamba_layers", "is_dummy_request"),
-    [(0, False), (1, True)],
-)
-def test_branch_snapshot_skipped_without_recurrent_state_or_for_dummies(
-    local_num_mamba_layers, is_dummy_request
-):
-    mgr = _branch_snapshot_manager(local_num_mamba_layers=local_num_mamba_layers)
-    request = _fake_context_request(prompt_len=256, is_dummy_request=is_dummy_request)
+def test_branch_snapshot_points_match_on_attention_only_pp_rank():
+    mamba_mgr = _branch_snapshot_manager(local_num_mamba_layers=1)
+    attention_mgr = _branch_snapshot_manager(local_num_mamba_layers=0)
+    mamba_request = _fake_context_request(prompt_len=256)
+    attention_request = _fake_context_request(prompt_len=256)
+    kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
+
+    mamba_mgr._record_branch_snapshot_point(mamba_request, kv_cache, num_lookup_tokens=255)
+    attention_mgr._record_branch_snapshot_point(attention_request, kv_cache, num_lookup_tokens=255)
+
+    assert mamba_request.expect_snapshot_points == [192, 256]
+    assert attention_request.expect_snapshot_points == [192, 256]
+    assert mamba_mgr._branch_snapshot_points == attention_mgr._branch_snapshot_points
+    assert mamba_mgr._page_pruned_tokens_total == 192 - 64
+    assert attention_mgr._snapshot_pruned_tokens_total == 0
+    assert attention_mgr._page_pruned_tokens_total == 0
+
+
+def test_branch_snapshot_skipped_for_dummy_requests():
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256, is_dummy_request=True)
     kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
 
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
 
     assert mgr._branch_snapshot_points == {}
     assert mgr._branch_snapshots_taken_total == 0
-    # These requests carry no attributable loss, so nothing is counted at all.
     assert mgr._branch_snapshots_skipped_total == {}
     assert mgr._snapshot_pruned_tokens_total == 0
 

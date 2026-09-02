@@ -3261,22 +3261,23 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Snapshot where this request leaves the reuse tree, for its siblings."""
         if not self.kv_cache_config.mamba_state_config.enable_branch_snapshot:
             return
-        if self.local_num_mamba_layers == 0 or req.is_dummy_request:
+        if req.is_dummy_request:
             return
         if num_lookup_tokens is None:
             self._skip_branch_snapshot("no_fresh_match")
             return
 
         diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
-        hybrid_depth = diagnostics._get_num_reusable_tokens_before_hybrid_pruning(
-        )
         divergence = diagnostics._get_num_reusable_tokens_before_pruning()
         reused = kv_cache.num_committed_tokens
-        # Loss attributable to a missing recurrent snapshot, versus loss
-        # attributable to attention pages having been evicted. These call for
-        # different fixes, so they are counted apart.
-        self._snapshot_pruned_tokens_total += max(0, hybrid_depth - reused)
-        self._page_pruned_tokens_total += max(0, divergence - hybrid_depth)
+        if self.local_num_mamba_layers > 0:
+            hybrid_depth = (
+                diagnostics._get_num_reusable_tokens_before_hybrid_pruning())
+            # Loss attributable to a missing recurrent snapshot, versus loss
+            # attributable to attention pages having been evicted. These call
+            # for different fixes, so they are counted apart.
+            self._snapshot_pruned_tokens_total += max(0, hybrid_depth - reused)
+            self._page_pruned_tokens_total += max(0, divergence - hybrid_depth)
 
         # The whole lookup range matched, so there is no fork here.
         if divergence >= num_lookup_tokens:
