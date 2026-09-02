@@ -499,7 +499,14 @@ def main() -> int:
             llm.shutdown()
 
     llm = _build_llm(ckpt, tp, spec_mode, adp)
-    completions = _generate(llm, prompt_texts, max_tokens, want_logprobs)
+    # The baseline above keeps its logprobs (logits parity hard-requires an
+    # aligned baseline), but "sa" runs the one-engine SpecSampler, whose sample
+    # state carries tokens only: it rejects logprobs at request admission rather
+    # than silently dropping them, so this run must not ask for them at all.
+    # _compare_logits_parity already handles a spec run without logprobs via
+    # one-sided parity.
+    spec_want_logprobs = want_logprobs and spec_mode != "sa"
+    completions = _generate(llm, prompt_texts, max_tokens, spec_want_logprobs)
     llm.shutdown()
     if output_json:
         _dump_completions(output_json, completions, want_logprobs)
