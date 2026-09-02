@@ -2933,9 +2933,8 @@ int AttentionOp::initialize() noexcept
         "fuse_fp4_quant only supports SM100f or SM120 or SM121 devices.");
 
     // Check requirements for FP4 KV cache.
-    TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA
-            || (mIsMLAEnabled && mUseSparseAttention && (mFP8ContextMLA || mFP8GenerationMLA)),
-        "FP4 KV cache requires FP8 context FMHA or sparse MLA with an FP8 scratch pool");
+    TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA || mUseNvfp4MlaKvCache,
+        "FP4 KV cache requires FP8 context FMHA or static sparse MLA with an FP8 scratch pool");
 
     TLLM_CHECK(isRoPE() == (mRotaryEmbeddingDim != 0));
     TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != tensorrt_llm::DataType::kBF16),
