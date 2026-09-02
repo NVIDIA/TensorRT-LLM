@@ -201,22 +201,22 @@ def test_sampling_config():
         setattr(sampling_config, member, value)
         assert getattr(sampling_config, member) == value
 
-    float_array = [1., 2., 3.]
-    size_t_array = [1, 2, 3]
-    check_empty_then_set("temperature", float_array)
-    check_empty_then_set("min_length", size_t_array)
-    check_empty_then_set("repetition_penalty", float_array)
-    check_empty_then_set("presence_penalty", float_array)
-    check_empty_then_set("frequency_penalty", float_array)
-    check_empty_then_set("top_k", size_t_array)
-    check_empty_then_set("top_p", float_array)
-    check_empty_then_set("random_seed", size_t_array)
-    check_empty_then_set("top_p_decay", float_array)
-    check_empty_then_set("top_p_min", float_array)
-    check_empty_then_set("top_p_reset_ids", size_t_array)
-    check_empty_then_set("beam_search_diversity_rate", float_array)
-    check_empty_then_set("length_penalty", float_array)
-    check_empty_then_set("early_stopping", size_t_array)
+    # Fields are scalars on executor::SamplingConfig, not the one-element
+    # columns the removed runtime type used.
+    check_empty_then_set("temperature", 1.)
+    check_empty_then_set("min_tokens", 1)
+    check_empty_then_set("repetition_penalty", 1.)
+    check_empty_then_set("presence_penalty", 1.)
+    check_empty_then_set("frequency_penalty", 1.)
+    check_empty_then_set("top_k", 1)
+    check_empty_then_set("top_p", 1.)
+    check_empty_then_set("seed", 1)
+    check_empty_then_set("top_p_decay", 1.)
+    check_empty_then_set("top_p_min", 1.)
+    check_empty_then_set("top_p_reset_ids", 1)
+    check_empty_then_set("beam_search_diversity_rate", 1.)
+    check_empty_then_set("length_penalty", 1.)
+    check_empty_then_set("early_stopping", 1)
 
 
 def test_gpt_json_config():
