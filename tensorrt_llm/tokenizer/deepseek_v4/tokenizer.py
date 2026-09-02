@@ -434,9 +434,27 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
         )
         return cls(tokenizer)
 
+    @staticmethod
+    def _resolve_thinking(kwargs: dict[str, Any]) -> bool:
+        """Decide whether to open a ``<think>`` block for this request.
+
+        ``thinking`` / ``enable_thinking`` are the native keys and win whenever
+        the caller passes either of them. Otherwise fall back to
+        ``thinking_budget``, the key used by the Jinja chat templates of other
+        models and the documented default of ``trtllm-eval aime25``/``aime26``
+        (a positive budget means "think", ``0`` disables thinking). DeepSeek-V4
+        ships no Jinja template, so without this the key would be silently
+        dropped and the request would run in non-thinking chat mode.
+        """
+        if "thinking" in kwargs or "enable_thinking" in kwargs:
+            return bool(kwargs.get("thinking", False) or kwargs.get("enable_thinking", False))
+
+        thinking_budget = kwargs.get("thinking_budget")
+        return thinking_budget is not None and int(thinking_budget) > 0
+
     def apply_chat_template(self, messages, tools=None, **kwargs):
         tokenize = kwargs.get("tokenize", False)
-        thinking = kwargs.get("thinking", False) or kwargs.get("enable_thinking", False)
+        thinking = self._resolve_thinking(kwargs)
         thinking_mode = "thinking" if thinking else "chat"
         reasoning_effort = kwargs.get("reasoning_effort")
         if reasoning_effort not in ("max", "high"):
