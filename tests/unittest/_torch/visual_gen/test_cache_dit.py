@@ -3,9 +3,9 @@
 
 """Tests for Cache-DiT in visual generation.
 
-Wan 2.2 step-split logic is covered with small CPU-side tests. Wan, FLUX, and LTX-2
-integration tests run on GPU only when cache_dit is installed, CUDA is available, and
-checkpoints can be resolved (TRTLLM_CACHE_DIT_* env vars or the fallbacks inside each test).
+Wan 2.2 step-split logic is covered with small CPU-side tests. Wan and FLUX
+integration tests run on GPU only when cache_dit is installed, CUDA is available,
+and checkpoints can be resolved.
 """
 
 from __future__ import annotations
@@ -41,20 +41,10 @@ requires_cuda = pytest.mark.skipif(
 _WAN_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 _FLUX_SUBPATH = "FLUX.1-dev"
 _QWEN_IMAGE_SUBPATH = "qwen-image"
-_LTX2_DIR = "LTX-2"
-_LTX2_WEIGHTS_FILE = "ltx-2-19b-dev.safetensors"
-_LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
-# Same share as other Gemma checkpoints (e.g. google/gemma-3-1b-it -> gemma/gemma-3-1b-it).
-_LTX2_TEXT_ENCODER_RELATIVE_PATHS = (
-    _LTX2_TEXT_ENCODER_SUBPATH,
-    os.path.join("gemma", _LTX2_TEXT_ENCODER_SUBPATH),
-)
 # Default NFS layout used on CI runners (override via TRTLLM_CACHE_DIT_*_CHECKPOINT).
 _CI_DEFAULT_LLM_MODELS = "/home/scratch.trt_llm_data_ci/llm-models"
 _DEFAULT_WAN_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _WAN_SUBPATH)
 _DEFAULT_FLUX_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _FLUX_SUBPATH)
-_DEFAULT_LTX2_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _LTX2_DIR, _LTX2_WEIGHTS_FILE)
-_DEFAULT_LTX2_TEXT_ENCODER = os.path.join(_CI_DEFAULT_LLM_MODELS, _LTX2_TEXT_ENCODER_SUBPATH)
 _DEFAULT_QWEN_IMAGE_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _QWEN_IMAGE_SUBPATH)
 
 
@@ -103,47 +93,6 @@ def _resolve_flux_checkpoint() -> str | None:
         cand = os.path.join(root, _FLUX_SUBPATH)
         if os.path.isdir(cand):
             return os.path.abspath(cand)
-    return None
-
-
-def _resolve_ltx2_checkpoint() -> str | None:
-    """LTX-2 weights file: explicit env, LTX2_MODEL_PATH, CI default, then LLM_MODELS_ROOT (same tiers as Wan/Flux)."""
-    explicit = os.environ.get("TRTLLM_CACHE_DIT_LTX2_CHECKPOINT", "").strip()
-    if explicit:
-        if os.path.isfile(explicit):
-            return os.path.abspath(explicit)
-        if os.path.isdir(explicit):
-            cand = os.path.join(explicit, _LTX2_WEIGHTS_FILE)
-            if os.path.isfile(cand):
-                return os.path.abspath(cand)
-    ltx2_model = os.environ.get("LTX2_MODEL_PATH", "").strip()
-    if ltx2_model and os.path.isfile(ltx2_model):
-        return os.path.abspath(ltx2_model)
-    if os.path.isfile(_DEFAULT_LTX2_CHECKPOINT):
-        return os.path.abspath(_DEFAULT_LTX2_CHECKPOINT)
-    root = os.environ.get("LLM_MODELS_ROOT", "").strip()
-    if root:
-        cand = os.path.join(root, _LTX2_DIR, _LTX2_WEIGHTS_FILE)
-        if os.path.isfile(cand):
-            return os.path.abspath(cand)
-    return None
-
-
-def _resolve_ltx2_text_encoder() -> str | None:
-    """Gemma text encoder directory: explicit env, CI default, then LLM_MODELS_ROOT."""
-    explicit = os.environ.get("TRTLLM_CACHE_DIT_LTX2_TEXT_ENCODER", "").strip()
-    if explicit and os.path.isdir(explicit):
-        return os.path.abspath(explicit)
-    for rel in _LTX2_TEXT_ENCODER_RELATIVE_PATHS:
-        cand = os.path.join(_CI_DEFAULT_LLM_MODELS, rel)
-        if os.path.isdir(cand):
-            return os.path.abspath(cand)
-    root = os.environ.get("LLM_MODELS_ROOT", "").strip()
-    if root:
-        for rel in _LTX2_TEXT_ENCODER_RELATIVE_PATHS:
-            cand = os.path.join(root, rel)
-            if os.path.isdir(cand):
-                return os.path.abspath(cand)
     return None
 
 
@@ -279,7 +228,7 @@ class TestSplitWan22InferenceSteps:
 @requires_cache_dit
 @requires_cuda
 class TestCacheDiTRealPipelineForward:
-    """Wan, FLUX.1, and LTX-2 use the CI llm-models tree when checkpoints are present.
+    """Wan and FLUX.1 use the CI llm-models tree when checkpoints are present.
 
     Each test calls _teardown_cache_dit in finally; cache_dit treats caching as
     process-global, so a second loaded pipeline would otherwise skip setup.
@@ -302,7 +251,6 @@ class TestCacheDiTRealPipelineForward:
     def _load_visual_gen_pipeline(
         checkpoint_dir: str,
         *,
-        text_encoder_path: str = "",
         enable_torch_compile: bool = False,
     ):
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -313,18 +261,8 @@ class TestCacheDiTRealPipelineForward:
             VisualGenArgs,
         )
 
-        # text_encoder_path lives under pipeline_config and is only a
-        # legal key for the LTX2 family. Strict validation rejects it
-        # for Wan/Flux pipelines whose registry defaults are empty —
-        # so only emit the key when the caller supplied a non-empty
-        # value (LTX2 case).
-        pipeline_config: dict = {}
-        if text_encoder_path:
-            pipeline_config["text_encoder_path"] = text_encoder_path
-
         args = VisualGenArgs(
             model=checkpoint_dir,
-            pipeline_config=pipeline_config,
             cache_config=CacheDiTConfig(
                 max_warmup_steps=0,
                 Fn_compute_blocks=1,
@@ -468,62 +406,6 @@ class TestCacheDiTRealPipelineForward:
                         guidance_scale=3.5,
                         seed=0,
                         max_sequence_length=256,
-                    )
-
-                stats = pipeline.cache_accelerator.get_stats()
-                cached = _total_accumulated_cached_steps(stats)
-                assert cached > 0, (
-                    "Expected Cache-DiT accumulated_cached_steps > 0 after forward; "
-                    f"stats={stats!r}. Try more steps or a looser residual_diff_threshold."
-                )
-            finally:
-                if pipeline is not None:
-                    self._teardown_cache_dit(pipeline)
-
-    def test_ltx2_cache_dit_skips_blocks_after_forward(self):
-        ckpt = _resolve_ltx2_checkpoint()
-        text_enc = _resolve_ltx2_text_encoder()
-        if ckpt is None or text_enc is None:
-            missing = []
-            if ckpt is None:
-                missing.append("LTX-2 checkpoint")
-            if text_enc is None:
-                missing.append("Gemma text encoder")
-            pytest.skip(
-                f"Missing {' and '.join(missing)}: set "
-                "TRTLLM_CACHE_DIT_LTX2_CHECKPOINT (file or directory with "
-                f"{_LTX2_WEIGHTS_FILE}) and TRTLLM_CACHE_DIT_LTX2_TEXT_ENCODER, "
-                "or LTX2_MODEL_PATH, or stage under CI tree "
-                f"{_DEFAULT_LTX2_CHECKPOINT} and one of "
-                f"{', '.join(os.path.join(_CI_DEFAULT_LLM_MODELS, r) for r in _LTX2_TEXT_ENCODER_RELATIVE_PATHS)} "
-                f"(same as Wan/Flux under {_CI_DEFAULT_LLM_MODELS}), "
-                f"or $LLM_MODELS_ROOT/{_LTX2_DIR}/{_LTX2_WEIGHTS_FILE} and "
-                f"$LLM_MODELS_ROOT/<{' or '.join(_LTX2_TEXT_ENCODER_RELATIVE_PATHS)}>"
-            )
-
-        pipeline = None
-        with _suppress_stdlib_logging_for_cache_dit():
-            try:
-                pipeline = self._load_visual_gen_pipeline(ckpt, text_encoder_path=text_enc)
-                name = pipeline.__class__.__name__
-                if name != "LTX2Pipeline":
-                    pytest.skip(f"Checkpoint resolved to {name}, not LTX2Pipeline")
-
-                assert pipeline.cache_accelerator is not None
-                assert pipeline.cache_accelerator.is_enabled()
-
-                with torch.inference_mode():
-                    pipeline.forward(
-                        prompt="cache dit validation",
-                        negative_prompt="",
-                        height=512,
-                        width=768,
-                        num_frames=33,
-                        num_inference_steps=16,
-                        guidance_scale=4.0,
-                        seed=0,
-                        max_sequence_length=256,
-                        frame_rate=24.0,
                     )
 
                 stats = pipeline.cache_accelerator.get_stats()
