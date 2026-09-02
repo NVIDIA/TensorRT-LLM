@@ -6262,6 +6262,9 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda *= 0
 
         position_ids = apply_position_id_offset(position_ids, model=self.model)
+        host_position_ids = torch.tensor(position_ids,
+                                         dtype=torch.int,
+                                         pin_memory=prefer_pinned())
         # Use the (3,1,N) MRoPE layout whenever the model declares MRoPE, even
         # for text-only batches: keeping position_ids rank-consistent between
         # warmup and serving keeps torch.compile guards stable, so piecewise
@@ -6271,10 +6274,7 @@ class PyTorchModelEngine(ModelEngine):
             # data. Seed the full (3,1,N) buffer from scalar position_ids
             # (text-only tokens get the same value on all 3 axes), then
             # overwrite only the multimodal spans with their real MRoPE coords.
-            position_ids_tensor = torch.tensor(position_ids,
-                                               dtype=torch.int,
-                                               pin_memory=prefer_pinned())
-            self.position_ids_cuda[:total_num_tokens].copy_(position_ids_tensor,
+            self.position_ids_cuda[:total_num_tokens].copy_(host_position_ids,
                                                             non_blocking=True)
             # Broadcast [N] to [3,1,N]: default for text-only tokens.
             self.mrope_position_ids_cuda[:, :, :total_num_tokens].copy_(
@@ -6304,10 +6304,7 @@ class PyTorchModelEngine(ModelEngine):
             final_position_ids = self.mrope_position_ids_cuda[:, :, :
                                                               total_num_tokens]
         else:
-            position_ids = torch.tensor(position_ids,
-                                        dtype=torch.int,
-                                        pin_memory=prefer_pinned())
-            self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
+            self.position_ids_cuda[:total_num_tokens].copy_(host_position_ids,
                                                             non_blocking=True)
             final_position_ids = self.position_ids_cuda[:
                                                         total_num_tokens].unsqueeze(
@@ -6528,6 +6525,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
+            spec_metadata.host_position_ids = host_position_ids
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:len(
                 num_accepted_draft_tokens)]
             if context_prompt_lookahead is not None:
