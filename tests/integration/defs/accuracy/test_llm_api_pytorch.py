@@ -1403,7 +1403,6 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         enable_partial_reuse=False,
                                         dtype="fp8",
-                                        dtype="fp8",
                                         # Cap KV cache at 50% of free memory to leave PyTorch
                                         # activation headroom during MMLU (nvbugs/6701493).
                                         free_gpu_memory_fraction=0.5)
