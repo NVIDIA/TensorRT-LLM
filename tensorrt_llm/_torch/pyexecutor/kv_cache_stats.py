@@ -119,6 +119,12 @@ class KVCacheV2IterationStatsReport:
     # transition internally, but it is not a preemption and is excluded.
     suspended_requests: int = 0
     resumed_requests: int = 0
+    # Logical prompt tokens successfully scheduled for disk-to-host prefetch
+    # during this iteration.
+    disk_prefetch_tokens: int = 0
+    # Initial current-residency cached-token attribution, by source tier
+    # (gpu/host/disk/remote), for requests admitted during this iteration.
+    cached_tokens_by_tier: dict = field(default_factory=dict)
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -210,6 +216,8 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
 
     stats_dict["iterSuspendedRequests"] = kv_iter_stats.suspended_requests
     stats_dict["iterResumedRequests"] = kv_iter_stats.resumed_requests
+    stats_dict["iterDiskPrefetchTokens"] = kv_iter_stats.disk_prefetch_tokens
+    stats_dict["iterCachedTokensByTier"] = dict(kv_iter_stats.cached_tokens_by_tier)
 
     stats_dict["kvCacheIterationStatsByPoolGroup"] = {
         str(pool_group_id): {

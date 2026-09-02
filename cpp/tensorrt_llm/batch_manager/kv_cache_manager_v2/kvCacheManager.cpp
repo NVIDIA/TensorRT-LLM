@@ -524,6 +524,43 @@ void KvCacheManager::recordRequestResumed()
     ++mIterResumedRequests;
 }
 
+void KvCacheManager::recordDiskPrefetchTokens(int64_t numTokens)
+{
+    TLLM_CHECK_DEBUG(numTokens >= 0);
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    mIterDiskPrefetchTokens += numTokens;
+}
+
+int64_t KvCacheManager::getAndResetIterationDiskPrefetchTokens()
+{
+    auto const numTokens = mIterDiskPrefetchTokens;
+    mIterDiskPrefetchTokens = 0;
+    return numTokens;
+}
+
+void KvCacheManager::recordCachedTokensByTier(CachedTokensByTier const& counts)
+{
+    TLLM_CHECK_DEBUG(counts.gpu >= 0 && counts.host >= 0 && counts.disk >= 0 && counts.remote >= 0);
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    mIterCachedTokensByTier.gpu += counts.gpu;
+    mIterCachedTokensByTier.host += counts.host;
+    mIterCachedTokensByTier.disk += counts.disk;
+    mIterCachedTokensByTier.remote += counts.remote;
+}
+
+CachedTokensByTier KvCacheManager::getAndResetIterationCachedTokensByTier()
+{
+    auto const counts = mIterCachedTokensByTier;
+    mIterCachedTokensByTier = CachedTokensByTier{};
+    return counts;
+}
+
 std::pair<int64_t, int64_t> KvCacheManager::getAndResetIterationSuspendResumeStats()
 {
     // Suspend/resume is a per-request, manager-level event (not per-pool-group), so it

@@ -96,6 +96,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
 
     if (reuseMatch.has_value())
     {
+        mCachedTokensByTier = _computeCachedTokensByTier(*reuseMatch, mLastCachedTokenTier);
         _setupForReuse(*reuseMatch);
     }
 
@@ -493,6 +494,8 @@ bool KvCache::prefetch(CacheLevel target)
     LifeCycleId const numLifeCycles = storageMgr.numLifeCycles();
     TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> allPages(
         numLifeCycles, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>(numTiers));
+    bool const trackDiskTokens = _shouldRecordManagerStats() && storageMgr.cacheTier(target) == CacheTier::HOST_MEM;
+    bool hasDiskSource = false;
 
     for (auto const& activePage : _activePages())
     {
@@ -506,6 +509,7 @@ bool KvCache::prefetch(CacheLevel target)
         {
             continue;
         }
+        hasDiskSource = hasDiskSource || (trackDiskTokens && storageMgr.cacheTier(level) == CacheTier::DISK);
         allPages.at(activePage.lcId).at(level).push_back(std::move(page));
     }
 
@@ -516,6 +520,10 @@ bool KvCache::prefetch(CacheLevel target)
     catch (OutOfPagesError const&)
     {
         return false;
+    }
+    if (hasDiskSource)
+    {
+        mManager->recordDiskPrefetchTokens(mCachedTokensByTier.disk);
     }
     return true;
 }
@@ -2045,6 +2053,117 @@ void KvCache::_onStopCommitting()
         }
     }
     TLLM_CHECK_DEBUG(_checkSanity());
+}
+
+// ---------------------------------------------------------------------------
+// _computeCachedTokensByTier: observe current source tiers before hold/onboard.
+// ---------------------------------------------------------------------------
+
+CachedTokensByTier KvCache::_computeCachedTokensByTier(
+    BlockRadixTree::ReuseMatch const& match, std::optional<CacheTier>& lastCachedTokenTier) const
+{
+    CachedTokensByTier counts;
+    int const numTokens = match.numTokens;
+    lastCachedTokenTier.reset();
+    if (numTokens == 0)
+    {
+        return counts;
+    }
+
+    auto const& matched = match.blocks;
+    auto const& lifeCycles = mManager->lifeCycles();
+    auto const& allLifeCycles = lifeCycles.getAll();
+    auto const ssmLifeCycleId = lifeCycles.ssmLifeCycleId();
+    std::vector<CacheTier> attentionTiers(matched.stdSize(), CacheTier::GPU_MEM);
+
+    auto const colderTier
+        = [](CacheTier lhs, CacheTier rhs) { return static_cast<int>(lhs) < static_cast<int>(rhs) ? rhs : lhs; };
+
+    // Merge required attention pages at block granularity. For SWA, only sink
+    // and live-window pages at the matched endpoint are materialized. Stale
+    // spans inherit the next live page's tier because that later anchor is what
+    // enables those logical tokens to be skipped.
+    for (LifeCycleId lifeCycleId{0}; lifeCycleId < lifeCycles.size(); ++lifeCycleId)
+    {
+        if (ssmLifeCycleId.has_value() && lifeCycleId == *ssmLifeCycleId)
+        {
+            continue;
+        }
+        if (!std::holds_alternative<AttnLifeCycle>(allLifeCycles[lifeCycleId]))
+        {
+            continue;
+        }
+
+        auto const staleRange = getStaleRange(allLifeCycles[lifeCycleId], numTokens, mTokensPerBlock);
+        std::vector<std::optional<CacheTier>> lifeCycleTiers(matched.stdSize());
+        auto const recordOrdinal = [&](BlockOrdinal ordinal)
+        {
+            auto const* page = matched.at(ordinal)->storage.at(lifeCycleId);
+            TLLM_CHECK_DEBUG_WITH_INFO(page != nullptr, "Expected page in non-stale reused block");
+            lifeCycleTiers.at(ordinal.value()) = mManager->storage().cacheTier(page->cacheLevel);
+        };
+        for (BlockOrdinal ordinal{0}; ordinal < staleRange.beg; ++ordinal)
+        {
+            recordOrdinal(ordinal);
+        }
+        for (BlockOrdinal ordinal = staleRange.end; ordinal < matched.size(); ++ordinal)
+        {
+            recordOrdinal(ordinal);
+        }
+
+        std::optional<CacheTier> nextAnchorTier;
+        for (int ordinal = matched.size().value() - 1; ordinal >= 0; --ordinal)
+        {
+            auto tier = lifeCycleTiers.at(static_cast<size_t>(ordinal));
+            if (!tier.has_value())
+            {
+                tier = nextAnchorTier;
+            }
+            else
+            {
+                nextAnchorTier = tier;
+            }
+            if (tier.has_value())
+            {
+                attentionTiers.at(static_cast<size_t>(ordinal))
+                    = colderTier(attentionTiers.at(static_cast<size_t>(ordinal)), *tier);
+            }
+        }
+    }
+
+    // Reuse onboards only the final recurrent checkpoint. It summarizes the
+    // entire matched prefix, so its source tier applies to every logical
+    // reused token; older checkpoints are traversal history, not inputs.
+    std::optional<CacheTier> ssmTier;
+    if (ssmLifeCycleId.has_value())
+    {
+        auto const* page = matched.back()->storage.at(*ssmLifeCycleId);
+        TLLM_CHECK_DEBUG_WITH_INFO(page != nullptr, "Expected final SSM snapshot in reused prefix");
+        ssmTier = mManager->storage().cacheTier(page->cacheLevel);
+    }
+
+    for (BlockOrdinal ordinal{0}; ordinal < matched.size(); ++ordinal)
+    {
+        int const blockStart = ordinal.value() * mTokensPerBlock;
+        int const blockEnd = std::min(numTokens, blockStart + mTokensPerBlock);
+        CacheTier sourceTier = attentionTiers.at(ordinal.value());
+        if (ssmTier.has_value())
+        {
+            sourceTier = colderTier(sourceTier, *ssmTier);
+        }
+        lastCachedTokenTier = sourceTier;
+        int const blockLength = blockEnd - blockStart;
+        switch (sourceTier)
+        {
+        case CacheTier::GPU_MEM: counts.gpu += blockLength; break;
+        case CacheTier::HOST_MEM: counts.host += blockLength; break;
+        case CacheTier::DISK: counts.disk += blockLength; break;
+        }
+    }
+
+    TLLM_CHECK_DEBUG(counts.total() == numTokens);
+    TLLM_CHECK_DEBUG(lastCachedTokenTier.has_value());
+    return counts;
 }
 
 // ---------------------------------------------------------------------------

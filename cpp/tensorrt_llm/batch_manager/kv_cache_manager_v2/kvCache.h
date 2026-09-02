@@ -114,6 +114,20 @@ struct SeqBlock
     }
 };
 
+//! Current-residency source-tier token counts observed by a KvCache's initial reuse match.
+struct CachedTokensByTier
+{
+    int gpu = 0;
+    int host = 0;
+    int disk = 0;
+    int remote = 0;
+
+    int total() const noexcept
+    {
+        return gpu + host + disk + remote;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // PlannedDropHandle — tracks committed pages planned for dropping without
 // owning them. Mirrors Python's PlannedDropHandle in _core/_kv_cache.py.
@@ -282,6 +296,16 @@ public:
         return static_cast<int>(mCommittedTokens.size());
     }
 
+    CachedTokensByTier const& cachedTokensByTier() const noexcept
+    {
+        return mCachedTokensByTier;
+    }
+
+    std::optional<CacheTier> lastCachedTokenTier() const noexcept
+    {
+        return mLastCachedTokenTier;
+    }
+
     // Internal diagnostic: prefix supported by the attention pages alone,
     // before recurrent-state (SSM) snapshot pruning shortened the reuse.
     int numReusableTokensBeforeHybridPruning() const noexcept
@@ -433,6 +457,8 @@ private:
     void activate();
 
     // Internal helpers.
+    CachedTokensByTier _computeCachedTokensByTier(
+        BlockRadixTree::ReuseMatch const& match, std::optional<CacheTier>& lastCachedTokenTier) const;
     void _setupForReuse(BlockRadixTree::ReuseMatch const& match);
     // Reconstruct the committed token sequence from a match's blocks (mirrors
     // Python's _get_matched_tokens); used when reuse-matching no longer has the
@@ -601,6 +627,9 @@ private:
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 
     std::vector<TokenIdExt> mCommittedTokens;
+    // Initial current-residency provenance, observed before reused pages are held or promoted.
+    CachedTokensByTier mCachedTokensByTier;
+    std::optional<CacheTier> mLastCachedTokenTier;
     // Resolved per-sequence text-only state after applying the manager default.
     bool mTextOnly = false;
     int mNumReusableTokensBeforeHybridPruning;

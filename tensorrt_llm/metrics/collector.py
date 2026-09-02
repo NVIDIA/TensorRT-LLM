@@ -20,6 +20,8 @@ from typing import Dict, List, Optional, Union
 
 from .enums import MetricNames
 
+_PROMPT_CACHE_TIERS = ("gpu", "host", "disk", "remote")
+
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
 class MetricsCollector:
@@ -45,6 +47,7 @@ class MetricsCollector:
             trtllm_prompt_tokens_total
             trtllm_generation_tokens_total
             trtllm_prompt_cached_tokens_total
+            trtllm_prompt_cache_hit_tokens_total
             trtllm_prompt_cached_tokens_per_request
             trtllm_spec_decode_drafted_tokens_total
             trtllm_spec_decode_accepted_tokens_total
@@ -66,6 +69,7 @@ class MetricsCollector:
             trtllm_kv_cache_gen_alloc_blocks_total
             trtllm_kv_cache_onboard_bytes_total
             trtllm_kv_cache_offload_bytes_total
+            trtllm_kv_cache_disk_prefetch_tokens_total
             trtllm_kv_cache_intra_device_copy_bytes_total
             trtllm_num_requests_running
             trtllm_num_requests_waiting
@@ -102,6 +106,7 @@ class MetricsCollector:
             trtllm_kv_cache_config_info
     """
     labelname_finish_reason = "finished_reason"
+    labelname_cache_tier = "cache_tier"
 
     def __init__(
         self,
@@ -291,6 +296,13 @@ class MetricsCollector:
             name=self.metric_prefix + "kv_cache_offload_bytes_total",
             documentation="Total bytes transferred from GPU to host (offload)",
             labelnames=self.labels.keys())
+        self.kv_cache_disk_prefetch_tokens_total = Counter(
+            name=self.metric_prefix + "kv_cache_disk_prefetch_tokens_total",
+            documentation=(
+                "Process-lifetime total logical prompt tokens successfully "
+                "scheduled for disk-to-host V2 KV-cache prefetch. "
+                "Resets only when the serving process restarts."),
+            labelnames=self.labels.keys())
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
             documentation=
@@ -415,8 +427,34 @@ class MetricsCollector:
         # Prompt cache hit tracking
         self.counter_tokens_cached_prompt = Counter(
             name=self.metric_prefix + "prompt_cached_tokens_total",
-            documentation="Total prompt tokens served from KV cache.",
+            documentation=(
+                "Process-lifetime total prompt tokens served from KV cache. "
+                "Resets only when the serving process restarts, not when the "
+                "KV cache is flushed or evicted."),
             labelnames=self.labels.keys())
+        self.counter_tokens_cached_prompt.labels(**self.labels)
+        self.labels_with_cache_tier = {
+            **self.labels, self.labelname_cache_tier: ""
+        }
+        self.counter_tokens_cached_prompt_by_tier = Counter(
+            name=self.metric_prefix + "prompt_cache_hit_tokens_total",
+            documentation=(
+                "Process-lifetime total prompt tokens served from each KV "
+                "cache tier. Resets only when the serving process restarts, "
+                "not when the KV cache is flushed or evicted. Requests from "
+                "older peers without tier provenance update only the existing "
+                "aggregate counter; no unknown tier is emitted. Prompt KV "
+                "supplied across a disaggregated context/generation boundary "
+                "is attributed to the remote tier. Pages already prefetched "
+                "from disk to host are attributed to host."),
+            labelnames=self.labels_with_cache_tier.keys())
+        # Create all fixed-label children at startup so zero-valued tiers are
+        # visible before their first cache hit.
+        for cache_tier in _PROMPT_CACHE_TIERS:
+            self.counter_tokens_cached_prompt_by_tier.labels(
+                **{
+                    **self.labels, self.labelname_cache_tier: cache_tier
+                })
         self.histogram_tokens_cached_prompt = Histogram(
             name=self.metric_prefix + "prompt_cached_tokens_per_request",
             documentation="Histogram of cached prompt tokens per request.",
@@ -539,7 +577,7 @@ class MetricsCollector:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
 
-    def log_request_metrics_dict(self, metrics_dict: dict[str, float]) -> None:
+    def log_request_metrics_dict(self, metrics_dict: dict) -> None:
         """Log per-request metrics from TRTLLM engine responses.
 
         This method updates Prometheus metrics including:
@@ -553,6 +591,7 @@ class MetricsCollector:
         - histogram_inference_time_request
         - counter_prompt_tokens
         - counter_generation_tokens
+        - counter_tokens_cached_prompt
 
         Args:
             metrics_dict: A dictionary containing request metrics with the following expected keys:
@@ -567,6 +606,8 @@ class MetricsCollector:
                 - `MetricNames.INFERENCE_TIME` (float): Total inference duration in seconds.
                 - `MetricNames.PROMPT_TOKENS` (int): Number of input tokens.
                 - `MetricNames.GENERATION_TOKENS` (int): Number of output tokens.
+                - `MetricNames.PROMPT_CACHE_CACHED_TOKENS` (int): Number of prompt tokens served
+                  from KV cache.
 
         Returns:
             None: Metrics are logged to Prometheus; nothing is returned.
@@ -799,6 +840,20 @@ class MetricsCollector:
 
         # Per-iteration KV cache stats. V2 reports reuse/miss by lifecycle and
         # storage/transfer counters by pool group; legacy V1 uses window stats.
+        disk_prefetch_tokens = iteration_stats.get("iterDiskPrefetchTokens", 0)
+        if disk_prefetch_tokens > 0:
+            self._log_counter(self.kv_cache_disk_prefetch_tokens_total, {},
+                              disk_prefetch_tokens)
+
+        cached_tokens_by_tier = iteration_stats.get("iterCachedTokensByTier")
+        if cached_tokens_by_tier:
+            for cache_tier in _PROMPT_CACHE_TIERS:
+                count = cached_tokens_by_tier.get(cache_tier, 0)
+                if count > 0:
+                    self._log_counter(self.counter_tokens_cached_prompt_by_tier,
+                                      {self.labelname_cache_tier: cache_tier},
+                                      count)
+
         kv_iter = iteration_stats.get("kvCacheIterationStats")
         kv_iter_by_lifecycle = iteration_stats.get(
             "kvCacheIterationStatsByLifecycle")

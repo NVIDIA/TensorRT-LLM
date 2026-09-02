@@ -240,6 +240,16 @@ public:
     // counts; a freshly-created cache is activated by its first resume(), but
     // that is an admission, not a recovery, and is not counted.
     void recordRequestResumed();
+    // Add logical tokens successfully scheduled for disk-to-host prefetch in the current iteration window.
+    void recordDiskPrefetchTokens(int64_t numTokens);
+    // Return the number of disk-prefetched tokens since the last drain and reset it.
+    int64_t getAndResetIterationDiskPrefetchTokens();
+    // Accumulate a request's initial current-residency cached-token tier attribution into the
+    // current iteration window.
+    void recordCachedTokensByTier(CachedTokensByTier const& counts);
+    // Return {gpu, host, disk, remote} cached-token counts accumulated since the last drain and
+    // reset them.
+    CachedTokensByTier getAndResetIterationCachedTokensByTier();
     // Return {suspended, resumed} counts since the last drain and reset them.
     // Both counters track the same population, so the running
     // (suspended - resumed) total is the number of requests still parked in
@@ -365,6 +375,8 @@ private:
     std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;
     int64_t mIterSuspendedRequests{0};
     int64_t mIterResumedRequests{0};
+    int64_t mIterDiskPrefetchTokens{0};
+    CachedTokensByTier mIterCachedTokensByTier;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
