@@ -1662,7 +1662,7 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
 
     def load_expert_w3_w1_weight(self, module: torch.nn.Module,
                                  w1_weight: torch.Tensor,
-                                 w3_weight: torch.Tensor,
+                                 w3_weight: Optional[torch.Tensor],
                                  dst_w3_w1_weight: torch.Tensor) -> None:
         """Load the w1 (and, when gated, w3) weights for one expert."""
         w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
@@ -1724,6 +1724,14 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
         """Load per-output-channel scales, concatenating w3 only when gated."""
+        # The keys below are the per-expert VANILLA layout. Fused checkpoints
+        # store gate_up_proj_weight_scale / down_proj_weight_scale instead, so
+        # reject that mode here rather than failing on an opaque KeyError.
+        if (module.weight_loading_mode ==
+                MoEWeightLoadingMode.FUSED_GATE_UP_PROJ):
+            raise ValueError(
+                "W4A16 per-channel MoE does not support loading scales from "
+                "MoEWeightLoadingMode.FUSED_GATE_UP_PROJ checkpoints.")
         all_w1_scales = [
             load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
                               module.tp_size, module.tp_rank,
