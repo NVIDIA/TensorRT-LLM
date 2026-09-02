@@ -611,6 +611,10 @@ def _dsv4_kernel(
     r1 = I32(KTOP) - cabove
 
     # ---------------- single streaming pass: claim + fine histogram ----------
+    # Single-CTA rows stage winners in SMEM (sHist / sTot are dead after the
+    # coarse descent; local slot == output slot) and write them out with full
+    # lines after the pass, instead of per-warp partial-line stores.
+    sWK = cute.make_tensor(cute.recast_ptr(sTot.iterator, dtype=U16), cute.make_layout(2 * NBINS))
     nw = ntl * (TOK // 2)
     niter = (nw + NTHREADS - 1) // NTHREADS
     lane = cute.arch.lane_idx()
@@ -643,14 +647,22 @@ def _dsv4_kernel(
         n0lo = cute.arch.popc(m0 & lmask)
         if hi0:
             p = base + n0lo
-            gI[p] = t0
-            u0 = I32(kv0) ^ (0x8000 + ((((I32(kv0) >> 15) & 1) ^ 1) * 0x7FFF))
-            gV[p] = U16(u0 & 0xFFFF).bitcast(F16).to(F32)
+            if cutlass.const_expr(CS == 1):
+                sHist[p] = t0
+                sWK[p] = kv0
+            else:
+                gI[p] = t0
+                u0 = I32(kv0) ^ (0x8000 + ((((I32(kv0) >> 15) & 1) ^ 1) * 0x7FFF))
+                gV[p] = U16(u0 & 0xFFFF).bitcast(F16).to(F32)
         if hi1:
             p = base + cute.arch.popc(m0) + cute.arch.popc(m1 & lmask)
-            gI[p] = t1
-            u1 = I32(kv1) ^ (0x8000 + ((((I32(kv1) >> 15) & 1) ^ 1) * 0x7FFF))
-            gV[p] = U16(u1 & 0xFFFF).bitcast(F16).to(F32)
+            if cutlass.const_expr(CS == 1):
+                sHist[p] = t1
+                sWK[p] = kv1
+            else:
+                gI[p] = t1
+                u1 = I32(kv1) ^ (0x8000 + ((((I32(kv1) >> 15) & 1) ^ 1) * 0x7FFF))
+                gV[p] = U16(u1 & 0xFFFF).bitcast(F16).to(F32)
         if live and (t0 < L) and (n0 == b1):
             q = cute.arch.atomic_add(sCtl.iterator + 11, I32(1), scope="cta")
             if q < CAP:
@@ -663,6 +675,13 @@ def _dsv4_kernel(
             cute.arch.atomic_add(sFine.iterator + (I32(kv1) & (NFINE - 1)), I32(1), scope="cta")
     cute.arch.barrier()
 
+    if cutlass.const_expr(CS == 1):
+        nwin = sCtl[8]
+        for j in cutlass.range(tidx, nwin, NTHREADS, unroll=1):
+            gI[j] = sHist[j]
+            kw = I32(sWK[j])
+            uw = kw ^ (0x8000 + ((((kw >> 15) & 1) ^ 1) * 0x7FFF))
+            gV[j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
     # No rendezvous before the fine push: peer sFTot buffers were zeroed before
     # the scan-end arrive and nobody reads them until the wait below.
     if cutlass.const_expr(CS > 1):
