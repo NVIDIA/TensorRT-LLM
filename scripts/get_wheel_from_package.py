@@ -83,6 +83,11 @@ def get_wheel_from_package(arch, artifact_path, timeout):
         shutil.move(wheel_file, str(build_dir))
         print(f"Moved wheel file: {wheel_file} -> {build_dir}")
 
+    third_party_sources = tmp_dir / "third-party-sources.json"
+    if third_party_sources.exists():
+        shutil.copy2(third_party_sources, llm_root / "third-party-sources.json")
+        print(f"Copied third-party-sources.json -> {build_dir}")
+
     shutil.rmtree(tmp_dir)
 
     if os.path.exists(tarfile_name):

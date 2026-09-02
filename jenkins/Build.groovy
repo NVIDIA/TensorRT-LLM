@@ -460,6 +460,9 @@ def runLLMBuild(
             sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
         }
     }
+    withCredentials([string(credentialsId: 'svc_tensorrt_llm_oss_gitlab_token_secret', variable: 'GITLAB_TOKEN')]) {
+        sh "cd ${LLM_ROOT} && python3 scripts/generate_cpp_dependency_json.py --deps-dir cpp/build/_deps --output-dir ./ --token ${GITLAB_TOKEN}"
+    }
 
     // Type-check with the compiled bindings that build_wheel.py just produced in
     // place. Runs mypy directly (not via pre-commit) so this step does zero
@@ -477,8 +480,10 @@ def runLLMBuild(
     }
 
     sh "cp ${LLM_ROOT}/tensorrt_llm/version.py TensorRT-LLM/src/tensorrt_llm/version.py"
-    // Step 3: packaging wheels into tarfile
+    // Step 3.1: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
+    // Step 3.2: packaging cmake dependency source json into tarfile
+    sh "cp ${LLM_ROOT}/third-party-sources.json TensorRT-LLM/"
 
     // Step 4: packaging attribution files into tarfile when they exist
     sh "mkdir -p TensorRT-LLM/attribution"
