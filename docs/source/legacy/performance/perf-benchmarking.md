@@ -715,7 +715,6 @@ The low latency benchmark follows a similar workflow to the [throughput benchmar
 but requires building the engine separately from `trtllm-bench`. Low latency benchmarks has the following modes:
 
 - A single-request low-latency engine
-- A Medusa-enabled speculative-decoding engine
 
 ### Low Latency TensorRT-LLM Engine for Llama-3 70B
 
@@ -723,7 +722,7 @@ To build a low-latency engine for the latency benchmark, run the following quant
 The `$checkpoint_dir` is the path to the [meta-llama/Meta-Llama-3-70B](https://huggingface.co/meta-llama/Meta-Llama-3-70B) Hugging Face checkpoint in your cache or downloaded to a specific location with the [huggingface-cli](https://huggingface.co/docs/huggingface_hub/en/guides/cli).
 To prepare a dataset, follow the same process as specified in [](#preparing-a-dataset).
 
-#### Benchmarking a non-Medusa Low Latency Engine
+#### Benchmarking a Low Latency Engine
 
 To quantize the checkpoint:
 
@@ -772,73 +771,6 @@ env TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG=1 \
   --engine_dir /tmp/meta-llama/Meta-Llama-3-70B/engine
 ```
 
-### Building a Medusa Low-Latency Engine
-
-To build a Medusa-enabled engine requires checkpoints that contain Medusa heads.
-NVIDIA provides TensorRT-LLM checkpoints on the [NVIDIA](https://huggingface.co/nvidia) page on Hugging Face.
-The checkpoints are pre-quantized and can be directly built after downloading them with the
-[huggingface-cli](https://huggingface.co/docs/huggingface_hub/en/guides/cli).
-After you download the checkpoints, run the following command. Make sure to
-specify the `$tp_size` supported by your Medusa checkpoint and the path to its stored location `$checkpoint_dir`.
-Additionally, `$max_seq_len` should be set to the model's maximum position embedding.
-
-Using Llama-3.1 70B as an example, for a tensor parallel 8 and bfloat16 dtype:
-
-```shell
-tp_size=8
-max_seq_len=131072
-trtllm-build --checkpoint_dir $checkpoint_dir \
-    --speculative_decoding_mode medusa \
-    --max_batch_size 1 \
-    --gpt_attention_plugin bfloat16 \
-    --max_seq_len $max_seq_len \
-    --output_dir /tmp/meta-llama/Meta-Llama-3.1-70B/medusa/engine \
-    --use_fused_mlp enable \
-    --paged_kv_cache enable \
-    --use_paged_context_fmha disable \
-    --multiple_profiles enable \
-    --reduce_fusion enable \
-    --use_fp8_context_fmha enable \
-    --workers $tp_size \
-    --low_latency_gemm_plugin fp8
-```
-
-After the engine is built, you need to define the Medusa choices.
-The choices are specified with a YAML file like the following example (`medusa.yaml`):
-
-```yaml
-- [0]
-- [0, 0]
-- [1]
-- [0, 1]
-- [2]
-- [0, 0, 0]
-- [1, 0]
-- [0, 2]
-- [3]
-- [0, 3]
-- [4]
-- [0, 4]
-- [2, 0]
-- [0, 5]
-- [0, 0, 1]
-```
-
-To run the Medusa-enabled engine, run the following command:
-
-```shell
-env TRTLLM_ENABLE_PDL=1 \
-  UB_ONESHOT=1 \
-  UB_TP_SIZE=$tp_size \
-  TRTLLM_ENABLE_PDL=1 \
-  TRTLLM_PDL_OVERLAP_RATIO=0.15 \
-  TRTLLM_PREFETCH_RATIO=-1 \
-  trtllm-bench --model meta-llama/Meta-Llama-3-70B \
-  latency \
-  --dataset $DATASET_PATH \
-  --engine_dir /tmp/meta-llama/Meta-Llama-3-70B/medusa/engine
-```
-
 ## Summary
 
 The following table summarizes the commands needed for running benchmarks:
@@ -849,7 +781,7 @@ The following table summarizes the commands needed for running benchmarks:
 | Throughput | Build | `trtllm-bench --model $HF_MODEL build --dataset $DATASET_PATH` |
 | Throughput | Benchmark | `trtllm-bench --model $HF_MODEL throughput --dataset $DATASET_PATH --engine_dir $ENGINE_DIR` |
 | Latency | Build | See [section about building low latency engines](#low-latency-tensorrt-llm-engine-for-llama-3-70b) |
-| Non-Medusa Latency | Benchmark | `trtllm-bench --model $HF_MODEL latency --dataset $DATASET_PATH --engine_dir $ENGINE_DIR` |
+| Latency | Benchmark | `trtllm-bench --model $HF_MODEL latency --dataset $DATASET_PATH --engine_dir $ENGINE_DIR` |
 
 where,
 
