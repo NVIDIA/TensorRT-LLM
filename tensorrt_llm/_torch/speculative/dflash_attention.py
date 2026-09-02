@@ -46,6 +46,61 @@ def get_dflash_flash_attention() -> Callable[..., torch.Tensor]:
     return flash_attn_with_kvcache
 
 
+@lru_cache(maxsize=1)
+def get_dflash_paged_append() -> Callable[..., None]:
+    """Load flashinfer's paged K/V append, shared by the paged backends.
+
+    Deliberately separate from :func:`get_dflash_trtllm_gen_ops`: the append is
+    a plain scatter into an HND page pool and works wherever flashinfer does,
+    while the TRTLLM-Gen FMHA kernels additionally require SM100/SM103.
+    """
+    if not IS_FLASHINFER_AVAILABLE:
+        raise RuntimeError(
+            "DFlash paged context cache requires flashinfer, which is not installed."
+        )
+    import flashinfer
+
+    return flashinfer.page.append_paged_kv_cache
+
+
+@lru_cache(maxsize=1)
+def get_dflash_fa4_fwd() -> Callable[..., tuple]:
+    """Load the FlashAttention-4 (CuTe DSL) forward."""
+    try:
+        from flash_attn.cute.interface import _flash_attn_fwd
+    except (ImportError, OSError) as error:
+        raise RuntimeError(
+            "DFlash FA4 attention requires a flash-attn build with the CuTe DSL "
+            "interface (flash_attn.cute)."
+        ) from error
+    return _flash_attn_fwd
+
+
+def validate_dflash_fa4_runtime(
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+) -> None:
+    """Fail before cache allocation when DFlash's shape is unsupported by FA4."""
+    get_dflash_fa4_fwd()
+    get_dflash_paged_append()
+
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(f"DFlash FA4 attention does not support activation dtype {dtype}.")
+
+    # FA4 builds kernels for other archs too, but this backend has
+    # only been validated on SM90 (H100); SM120 and friends keep VANILLA.
+    sm = get_sm_version()
+    if sm != 90:
+        raise RuntimeError(
+            f"DFlash FA4 attention backend is supported on SM90 only, got SM{sm}. "
+            "Use attention_backend='VANILLA'."
+        )
+    # Mirrors flash_attn.cute.interface._validate_head_dims for SM90.
+    if not (8 <= head_dim <= 256) or head_dim % 8 != 0:
+        raise RuntimeError(f"DFlash FA4 attention does not support head_dim={head_dim} on SM90.")
+
+
 def _get_trtllm_gen_unavailability_reason() -> Optional[str]:
     """Return why the DFlash TRTLLM backend cannot be initialized."""
     if not IS_FLASHINFER_AVAILABLE:
