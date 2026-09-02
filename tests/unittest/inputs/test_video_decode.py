@@ -46,6 +46,10 @@ def test_np_format_returns_stacked_uint8_ndarray(sample_video_path: str) -> None
 
 def test_pt_format_returns_list_of_chw_tensors(sample_video_path: str) -> None:
     video = _load_video_by_cv2(sample_video_path, num_frames=10, fps=-1, format="pt")
+    numpy_video = _load_video_by_cv2(sample_video_path, num_frames=10, fps=-1, format="np")
+    # Same arithmetic as the previous NumPy conversion.
+    expected = numpy_video.frames.astype(np.float32)
+    expected *= 1.0 / 255.0
     assert isinstance(video.frames, list)
     assert len(video.frames) == 10
     for frame in video.frames:
@@ -53,6 +57,9 @@ def test_pt_format_returns_list_of_chw_tensors(sample_video_path: str) -> None:
         assert frame.shape == (3, 64, 64)
         assert frame.dtype == torch.float32
         assert 0.0 <= frame.min().item() and frame.max().item() <= 1.0
+    torch.testing.assert_close(
+        torch.stack(video.frames), torch.from_numpy(expected).permute(0, 3, 1, 2), rtol=0, atol=0
+    )
 
 
 def test_pil_format_returns_list_of_pil_images(sample_video_path: str) -> None:

@@ -843,9 +843,10 @@ def _load_video_by_cv2(
         stacked_rgb = stacked_rgb[: len(valid_indices)]
 
         if format == "pt":
-            stacked_f32 = stacked_rgb.astype(np.float32)
-            stacked_f32 *= 1.0 / 255.0
-            tensor_nchw = torch.from_numpy(stacked_f32).permute(0, 3, 1, 2).contiguous()
+            src_nchw = torch.from_numpy(stacked_rgb).permute(0, 3, 1, 2)
+            tensor_nchw = torch.empty(src_nchw.shape, dtype=torch.float32)
+            tensor_nchw.copy_(src_nchw)
+            tensor_nchw.mul_(1.0 / 255.0)
             if device != "cpu":
                 tensor_nchw = tensor_nchw.to(device)
             loaded_frames = list(torch.unbind(tensor_nchw, dim=0))
