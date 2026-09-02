@@ -6061,8 +6061,8 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
     parallel wrapped
     if (deferred) {
         echo "[INFRA-DEFER] ${deferred.size()} stage(s) infra-incomplete " +
-             "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
-             "(coverage incomplete, no genuine test failure)."
+             "(${deferred.collect { it.stage }.join(', ')}); result already marked UNSTABLE " +
+             "per branch above (coverage incomplete, no genuine test failure)."
         // Distinguish a per-branch infra blip from a cluster-wide outage: when EVERY
         // branch in the group infra-aborted, the shared infra (a SLURM frontend / a
         // whole cluster) is the likely culprit. Flag it loudly so a re-run isn't
