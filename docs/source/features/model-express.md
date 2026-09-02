@@ -187,6 +187,57 @@ or NIXL prerequisites fail instead of skipping. Do not add every model profile
 to recurring coverage: use the harness for representative rows claimed by the
 support table and keep wider matrices in scheduled qualification.
 
+### Accuracy Canaries (Post-Merge)
+
+`tests/integration/defs/model_express/test_model_express_accuracy.py` runs one
+reference-backed accuracy task per qualified family on an MX receiver. The donor
+publishes exactly as in the smoke test and never evaluates; the receiver starts
+from the metadata-only snapshot, self-checks its own transfer logs before
+spending any evaluation time (a fallback exits with status 3), evaluates the
+task with `tensorrt_llm.evaluate` inside its own subprocess, and writes the
+score to JSON. The pytest process never constructs an `LLM`: it loads the
+accuracy reference YAMLs, asserts the same hypothesis-testing threshold as
+`tests/integration/defs/accuracy/`, and additionally requires the transfer
+evidence and the donor/receiver weight manifests to match. There is no paired
+HF baseline evaluation because the reference value is that baseline.
+
+Current rows (all TP=1, BF16, `references/*.yaml` hold the expected values):
+
+| Test ID | Model | Task | Model path override |
+| --- | --- | --- | --- |
+| `llama3-8b-instruct-mmlu-tp1` | `meta-llama/Meta-Llama-3-8B-Instruct` | MMLU | `TRTLLM_MX_LLAMA3_8B_MODEL` |
+| `qwen2.5-7b-instruct-mmlu-tp1` | `Qwen/Qwen2.5-7B-Instruct` | MMLU | `TRTLLM_MX_QWEN25_MODEL` |
+| `qwen3-8b-gsm8k-tp1` | `Qwen3/Qwen3-8B` | GSM8K | `TRTLLM_MX_QWEN3_MODEL` |
+
+The rows are registered as `stage: post_merge` entries in
+`tests/integration/test_lists/test-db/l0_model_express.yml`, so they run in
+`DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1` on every main commit and
+never in pre-merge pipelines. Trigger the stage on a pull request with:
+
+```text
+/bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1"
+```
+
+GSM8K needs the `lm_eval` package from `requirements-dev.txt`; the test checks
+for it and, under `TRTLLM_MX_E2E_REQUIRED=1`, fails instead of skipping when it
+is absent. Each run records the donor and receiver load times, the evaluation
+time, the score, and the threshold as junit properties and as
+`model_express_accuracy/<test-id>.json` under `--output-dir`; load times are
+observed only, not gated. To run one canary locally:
+
+```bash
+TRTLLM_MX_E2E_REQUIRED=1 \
+MODEL_EXPRESS_URL=http://127.0.0.1:8001 \
+LLM_MODELS_ROOT=/path/to/llm-models \
+pytest -v tests/integration/defs/model_express/test_model_express_accuracy.py \
+  -k llama3-8b-instruct-mmlu-tp1 --output-dir /path/to/artifacts
+```
+
+Adding a canary is one `MxAccuracyCase` row (the model must be inside the
+family's qualified runtime envelope and have a bare reference entry for the
+task), one line in the `post_merge` block of `l0_model_express.yml`, and a row
+in the table above.
+
 ### Transform-Layout ABI Rules
 
 An existing transform-layout ABI ID is immutable. Introduce a new ID when a
