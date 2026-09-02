@@ -92,9 +92,9 @@ The methods have these contracts:
 - The default `getBatchingLayerGroupId()` returns its argument, disabling cross-lifecycle batching.
 - `getBatchingLayerGroupId()` returns a negative ID on failure or for an unknown lifecycle.
 - `queryPageIndexLocation()` explicitly selects the pointer location used by both `encode()` and `decode()`.
-  Lifecycles with the same batching ID must return the same location. A codec may select `kDevice` when its asynchronous
-  work reads indices directly, or `kHost` when it consumes the array synchronously to construct batched DMA descriptors,
-  page-wise `cudaMemcpyAsync` calls, or kernel parameters. It returns `kBadLocation` on failure or for an unknown lifecycle;
+  Lifecycles with the same batching ID must return the same location. Compressing codecs normally select `kDevice`; a
+  codec that consumes indices synchronously to construct batched DMA descriptors, page-wise `cudaMemcpyAsync` calls,
+  or kernel parameters may select `kHost`. It returns `kBadLocation` on failure or for an unknown lifecycle;
   `kBadLocation` is never a valid index-array location.
 - KVCM may concatenate index pairs from any subset of lifecycles with the same batching ID and call `encode()` or
   `decode()` once using that representative ID. KVCM does not promise that every member of the class is present.
