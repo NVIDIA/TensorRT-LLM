@@ -1658,7 +1658,11 @@ def append_time_breakdown_metrics(
             )
             continue
         try:
-            metrics, info = compute_time_breakdown_metrics(paths, case_type)
+            # The client's warmup request is un-measured and absent from every other
+            # metric on the row, so it is excluded here too -- see _drop_warmup_record.
+            metrics, info = compute_time_breakdown_metrics(
+                paths, case_type, drop_warmup_request=bool(record.get("warmup"))
+            )
         except (OSError, ValueError, KeyError) as exc:
             print_info(f"Time breakdown aggregation failed for {breakdown_dir}: {exc}")
             continue
@@ -1666,6 +1670,8 @@ def append_time_breakdown_metrics(
         for warning in info["warnings"]:
             print_info(f"Time breakdown: {warning}")
         print_info(f"Time breakdown ({case_type}) from {len(paths)} file(s): {info['counts']}")
+        if info["warmup_dropped"]:
+            print_info(f"Time breakdown: excluded the warmup request from {info['warmup_dropped']}")
 
         summary_lines = "\n".join(format_metric_log_lines(metrics))
         with open(record["benchmark_file_path"], "a") as benchmark_ctx:
@@ -1788,6 +1794,7 @@ class AggrTestCmds(NamedTuple):
                                 "output_index": len(outputs) - 1,
                                 "benchmark_file_path": client_file_path,
                                 "benchmark_mode": self.benchmark_mode,
+                                "warmup": bool(client_config and client_config.warmup),
                             }
                         )
                 else:
@@ -2442,6 +2449,7 @@ class DisaggTestCmds(NamedTuple):
                                     "output_index": len(outputs) - 1,
                                     "benchmark_file_path": benchmark_file_path,
                                     "benchmark_mode": benchmark_mode_for_idx,
+                                    "warmup": bool(client_config and client_config.warmup),
                                 }
                             )
                     else:

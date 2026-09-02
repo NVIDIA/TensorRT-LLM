@@ -625,3 +625,144 @@ def test_every_listed_breakdown_lane_is_an_id_the_harness_generates():
     for mode, stems in allowlists.items():
         for stem in stems:
             assert (mode, stem) in seen, f"{mode} breakdown case {stem!r} is in no lane list"
+
+
+# Loading the harness imported this for real (test_perf_sanity does
+# ``from .time_breakdown_metrics import ...``), and _load_test_perf_sanity only restores the
+# names it stubbed -- which this is not -- so it is still registered. Taken from sys.modules
+# rather than imported: ``from defs.perf import time_breakdown_metrics`` would need the
+# ``defs.perf`` parent, and that stub *was* restored away.
+_tbm = sys.modules["defs.perf.time_breakdown_metrics"]
+
+
+def _burst_ctx_worker_jsonl(directory, count=4, warmup=False):
+    """A ctx worker's JSONL whose measured requests overlap, as a real lane's do.
+
+    The measured requests arrive within 50 ms of each other and each takes 500 ms, so
+    every one of them overlaps its neighbour -- the property _drop_warmup_record relies
+    on to tell them apart from a warmup request. With ``warmup=True`` an additional
+    request is prepended that arrives 10 s earlier and completes 9.5 s before the burst
+    opens, which is what benchmark_serving's "initial single prompt test run" looks like.
+
+    Returns the path written.
+    """
+    os.makedirs(directory, exist_ok=True)
+
+    def record(request_id, t0, forward_ms):
+        chunk_start = t0 + 0.010
+        return {
+            "request_id": request_id,
+            "perf_metrics": {
+                "timing_metrics": {
+                    "server_arrival_time": t0,
+                    "arrival_time": t0 + 0.001,
+                    "first_scheduled_time": t0 + 0.003,
+                    "first_token_time": t0 + 0.500,
+                    "server_first_token_time": t0 + 0.501,
+                    "last_token_time": t0 + 0.500,
+                }
+            },
+            "time_breakdown_metrics": {
+                "ctx_chunk_metrics": [
+                    {
+                        "forward_start_time": chunk_start,
+                        "forward_end_time": chunk_start + forward_ms / 1000.0,
+                        "sample_start_time": chunk_start + 0.402,
+                        "sample_end_time": chunk_start + 0.403,
+                        "token_time": t0 + 0.500,
+                        "gpu_forward_time": forward_ms,
+                        "gpu_sample_time": 0.9,
+                    }
+                ]
+            },
+        }
+
+    records = []
+    if warmup:
+        # Deliberately pathological, the way a cold first request is: ~4x the forward
+        # time of a measured request. If it is not excluded it moves the mean.
+        records.append(record("warmup", 1000.0 - 10.0, forward_ms=1600.0))
+    records.extend(record(i, 1000.0 + i * 0.05, forward_ms=400.0) for i in range(count))
+
+    path = os.path.join(directory, "perf_metrics-server-host-1-20260101T000000Z.jsonl")
+    with open(path, "w", encoding="utf-8") as handle:
+        for raw in records:
+            handle.write(json.dumps(raw) + "\n")
+    return path
+
+
+def test_the_warmup_request_is_excluded_and_the_measured_population_recovered(tmp_path):
+    """Dropping the warmup record must reproduce the warmup-free run exactly."""
+    clean = _burst_ctx_worker_jsonl(str(tmp_path / "clean"), warmup=False)
+    dirty = _burst_ctx_worker_jsonl(str(tmp_path / "dirty"), warmup=True)
+
+    baseline, _ = _tbm.compute_time_breakdown_metrics([clean], "ctx_only")
+    left_in, _ = _tbm.compute_time_breakdown_metrics([dirty], "ctx_only")
+    dropped, info = _tbm.compute_time_breakdown_metrics(
+        [dirty], "ctx_only", drop_warmup_request=True
+    )
+
+    # The warmup request has to actually perturb the result, or this proves nothing.
+    assert left_in["d_tb_chunk_gpu_forward_mean"] != baseline["d_tb_chunk_gpu_forward_mean"]
+    assert dropped == baseline
+    assert sum(info["warmup_dropped"].values()) == 1
+
+
+def test_a_burst_of_measured_requests_is_never_mistaken_for_a_warmup_request(tmp_path):
+    """The guard is isolation: overlapping requests must all survive."""
+    clean = _burst_ctx_worker_jsonl(str(tmp_path / "clean"), warmup=False)
+
+    kept, info = _tbm.compute_time_breakdown_metrics([clean], "ctx_only", drop_warmup_request=True)
+    untouched, _ = _tbm.compute_time_breakdown_metrics([clean], "ctx_only")
+
+    assert info["warmup_dropped"] == {}
+    assert kept == untouched
+
+
+def test_a_single_record_file_is_never_emptied(tmp_path):
+    """One record cannot be shown to be isolated, and dropping it would erase the file."""
+    path = _burst_ctx_worker_jsonl(str(tmp_path / "one"), count=1, warmup=False)
+
+    metrics, info = _tbm.compute_time_breakdown_metrics(
+        [path], "ctx_only", drop_warmup_request=True
+    )
+
+    assert info["warmup_dropped"] == {}
+    assert metrics["d_tb_ctx_processing_mean"] > 0.0
+
+
+def test_the_harness_forwards_the_clients_warmup_flag(tmp_path):
+    """append_time_breakdown_metrics must honour the pending record's warmup flag."""
+    breakdown_dir = str(tmp_path / "tb")
+    _burst_ctx_worker_jsonl(breakdown_dir, warmup=True)
+
+    def scraped(warmup):
+        benchmark_file = tmp_path / f"benchmark-{warmup}.log"
+        benchmark_file.write_text("client output\n", encoding="utf-8")
+        outputs = ["client output\n"]
+        _sanity.append_time_breakdown_metrics(
+            [
+                {
+                    "output_index": 0,
+                    "benchmark_file_path": str(benchmark_file),
+                    "benchmark_mode": "ctx_only",
+                    "warmup": warmup,
+                }
+            ],
+            outputs,
+            breakdown_dir,
+        )
+        return {
+            match.group(1) + "_" + match.group(2): float(match.group(3))
+            for match in _sanity.TIME_BREAKDOWN_METRIC_LOG_QUERY.finditer(outputs[0])
+        }
+
+    with_warmup = scraped(True)
+    without = scraped(False)
+
+    assert with_warmup and without
+    # Same schema either way; only the values move.
+    assert set(with_warmup) == set(without)
+    assert with_warmup["chunk_gpu_forward_mean"] != without["chunk_gpu_forward_mean"]
+    # Excluding the cold request must lower the mean forward time, not raise it.
+    assert with_warmup["chunk_gpu_forward_mean"] < without["chunk_gpu_forward_mean"]

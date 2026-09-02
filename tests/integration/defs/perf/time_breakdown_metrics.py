@@ -266,6 +266,74 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _request_window(raw: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """``(first arrival, last completion)`` for one record, on that record's own clock.
+
+    Only ever compared against other records from the *same* file, so no cross-worker
+    clock correction is needed (or valid).
+    """
+    view = _RecordView(raw)
+    arrivals = [
+        ts
+        for ts in (_ts(_timing(view.ctx), "arrival_time"), _ts(_timing(view.gen), "arrival_time"))
+        if ts is not None
+    ]
+    ends = [
+        ts
+        for ts in (
+            _ts(_timing(view.gen), "last_token_time"),
+            _ts(_timing(view.ctx), "last_token_time"),
+        )
+        if ts is not None
+    ]
+    return (min(arrivals) if arrivals else None, max(ends) if ends else None)
+
+
+def _drop_warmup_record(
+    records: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Remove ``benchmark_serving``'s warmup record. Returns ``(kept, dropped_or_None)``.
+
+    perf-sanity omits ``--no-test-input`` for the modes in its ``WARMUP_BENCHMARK_MODES``
+    (``e2e`` and ``ctx_only`` -- the same two the time_breakdown modifier supports), so the
+    client issues one un-measured request before the measured window: its "initial single
+    prompt test run". ``benchmark_serving`` awaits that request, checks it for success and
+    then discards it, so it is absent from ``completed`` and from every ``d_*`` client
+    metric on the row -- but the servers still append a perf-metrics record for it, which
+    is exactly why the client computes ``expected_count = completed + 1``. Left in, that
+    one cold request would make ``d_tb_*`` the only family on the row computed over a
+    different population than the rest.
+
+    It is dropped per file because only the ctx worker and the gen worker that actually
+    served it hold a record for it; the run's other workers must be left alone. The test
+    is isolation, which is the one property no measured request has: the warmup request
+    completes before the measured window opens, whereas measured requests arrive in a
+    burst at the lane's concurrency and therefore always overlap. A file whose earliest
+    record is not isolated is returned unchanged.
+
+    Only the mean is materially at risk (a percentile over thousands of requests cannot be
+    moved by one sample), and no ``d_tb_*`` metric is regression-gated, so this correction
+    buys accuracy in the diagnostics rather than protecting a build.
+    """
+    if len(records) < 2:
+        # A lone record cannot be shown to be isolated, and dropping it would leave the
+        # file empty -- indistinguishable from a run that measured nothing.
+        return records, None
+    dated = [
+        (window, raw)
+        for window, raw in ((_request_window(r), r) for r in records)
+        if window[0] is not None
+    ]
+    if len(dated) < 2:
+        return records, None
+    dated.sort(key=lambda item: item[0][0])
+    (_, first_end), first_rec = dated[0]
+    second_start = dated[1][0][0]
+    if first_end is None or first_end >= second_start:
+        return records, None
+    return [r for r in records if r is not first_rec], first_rec
+
+
 def _estimate_clock_offset(
     records: List[Dict[str, Any]], instances_key: str, reference_field: str
 ) -> Optional[float]:
@@ -388,6 +456,7 @@ def _collect_instance_metrics(
 def compute_time_breakdown_metrics(
     paths: Sequence[str],
     benchmark_mode: str,
+    drop_warmup_request: bool = False,
 ) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """Reduce per-request JSONLs to ``{d_tb_<metric>_<stat>: value_ms}``.
 
@@ -399,6 +468,10 @@ def compute_time_breakdown_metrics(
             per-instance samples are pooled into one case-level distribution.
         benchmark_mode: ``ctx_only``, ``gen_only`` or ``e2e``. Anything else yields all-zero
             metrics, since aggregated cases do not support the time_breakdown tool.
+        drop_warmup_request: set when the client ran with a warmup request (perf-sanity omits
+            ``--no-test-input`` for ``e2e`` and ``ctx_only``). Discards that request's record
+            so the breakdown covers the same population as every other metric on the row; see
+            :func:`_drop_warmup_record`. Reported as ``info["warmup_dropped"]``.
 
     Returns:
         ``(metrics, info)``. ``metrics`` always has exactly ``len(ALL_METRICS) * 4`` keys;
@@ -418,6 +491,7 @@ def compute_time_breakdown_metrics(
     warnings: List[str] = []
     classified: Dict[str, str] = {}
     counts: Dict[str, int] = defaultdict(int)
+    warmup_dropped: Dict[str, int] = {}
 
     combined: List[Dict[str, Any]] = []
     ctx_workers: List[Tuple[str, List[Dict[str, Any]]]] = []
@@ -429,6 +503,10 @@ def compute_time_breakdown_metrics(
         except (OSError, json.JSONDecodeError) as exc:
             warnings.append(f"{os.path.basename(path)}: unreadable ({exc})")
             continue
+        if drop_warmup_request:
+            records, dropped = _drop_warmup_record(records)
+            if dropped is not None:
+                warmup_dropped[os.path.basename(path)] = 1
         kind = _classify(path, records)
         classified[os.path.basename(path)] = f"{kind} (n={len(records)})"
         if kind == "combined":
@@ -531,6 +609,9 @@ def compute_time_breakdown_metrics(
         "groups": list(groups),
         "files": classified,
         "counts": dict(counts),
+        # Per file, so an unexpected pattern is visible: with a warmup request exactly one
+        # ctx worker and one gen worker (plus the disagg server) should report a drop.
+        "warmup_dropped": warmup_dropped,
         "sample_counts": {
             name: len(
                 (per_instance if name in CHUNK_METRICS + STEP_METRICS else per_request).get(
@@ -605,6 +686,12 @@ def main() -> int:
         action="store_true",
         help="print 'Time Breakdown ...' lines for the harness to re-parse",
     )
+    parser.add_argument(
+        "--drop-warmup-request",
+        action="store_true",
+        help="discard the client's un-measured warmup request (perf-sanity runs one for "
+        "e2e and ctx_only); pass this to match what the harness uploads",
+    )
     args = parser.parse_args()
 
     paths = list(args.input)
@@ -613,7 +700,9 @@ def main() -> int:
     if not paths:
         parser.error("no input: pass --input and/or --output-dir")
 
-    metrics, info = compute_time_breakdown_metrics(paths, args.mode)
+    metrics, info = compute_time_breakdown_metrics(
+        paths, args.mode, drop_warmup_request=args.drop_warmup_request
+    )
 
     if args.log_lines:
         for line in format_metric_log_lines(metrics):
@@ -621,7 +710,8 @@ def main() -> int:
     else:
         print(f"mode={info['benchmark_mode']} groups={info['groups']} counts={info['counts']}")
         for name, kind in sorted(info["files"].items()):
-            print(f"  {name}: {kind}")
+            dropped = " (-1 warmup)" if info["warmup_dropped"].get(name) else ""
+            print(f"  {name}: {kind}{dropped}")
         header = f"{'metric':24s}" + "".join(f"{s:>12s}" for s in STATS) + f"{'n':>9s}"
         print(header)
         print("-" * len(header))
