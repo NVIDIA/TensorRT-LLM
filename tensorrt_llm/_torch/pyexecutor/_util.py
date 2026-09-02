@@ -2337,7 +2337,7 @@ def _create_kv_cache_manager(
         layer_mask: Optional[List[bool]] = None,
         num_layers: Optional[int] = None,
         num_kv_heads: Optional[Union[int, List[int]]] = None,
-        head_dim: Optional[int] = None,
+        head_dim: Optional[Union[int, List[int]]] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
         cold_page_codec_provider: Optional[object] = None) -> KVCacheManager:

@@ -235,10 +235,18 @@ class Gemma4Attention(QKNormRoPEAttention):
                     "Gemma4Attention requires layer_idx with a heterogeneous Transformers config."
                 )
             geometry_layer_idx = next(
-                idx
-                for idx, layer_type in enumerate(config.layer_types)
-                if (layer_type == "sliding_attention") == is_sliding
+                (
+                    idx
+                    for idx, layer_type in enumerate(config.layer_types)
+                    if (layer_type == "sliding_attention") == is_sliding
+                ),
+                None,
             )
+            if geometry_layer_idx is None:
+                raise ValueError(
+                    "Gemma4Attention could not infer layer_idx: no layer type "
+                    f"matches is_sliding={is_sliding}."
+                )
 
         # Native TRTLLM's SM100 FP8-KV path consumes BF16 Q/K/V and quantizes
         # while appending to the cache. Keep RoPE at the model layer so the
