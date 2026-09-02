@@ -44,6 +44,7 @@ class KVCacheDtype(IntEnum):
     FP8_PERTENSOR = 1  # FP8 E4M3 with implicit scale=1
     FP8_BLOCKWISE = 2  # FP8 E4M3 with per-128 fp32 scales
     MXFP4_BLOCKWISE = 3  # packed FP4 E2M1 with per-32 UE8M0 scales
+    NVFP4_BLOCKWISE = 4  # packed FP4 E2M1 with per-16 E4M3 scales
 
 
 _KV_CACHE_DTYPE_MAP = {
@@ -52,6 +53,7 @@ _KV_CACHE_DTYPE_MAP = {
     "fp8_pertensor": KVCacheDtype.FP8_PERTENSOR,
     "fp8_blockwise": KVCacheDtype.FP8_BLOCKWISE,
     "mxfp4": KVCacheDtype.MXFP4_BLOCKWISE,
+    "nvfp4": KVCacheDtype.NVFP4_BLOCKWISE,
 }
 
 
@@ -88,6 +90,7 @@ class Compressor(nn.Module):
         kv_cache_dtype: Union[str, KVCacheDtype] = KVCacheDtype.NONE,
         is_indexer: bool = False,
         rotate_activation: bool = False,
+        nvfp4_global_scale: float = 1.0,
     ):
         super().__init__()
         # Dimensions
@@ -104,6 +107,7 @@ class Compressor(nn.Module):
         # Cache config
         self.layer_idx = layer_idx
         self.kv_cache_dtype: KVCacheDtype = resolve_kv_cache_dtype(kv_cache_dtype)
+        self.nvfp4_global_scale = nvfp4_global_scale
         self.is_indexer = is_indexer
         self.rotate_activation = rotate_activation
         # The C++ scatter does not write FlashInfer's footer-scale layout.
@@ -166,6 +170,11 @@ class Compressor(nn.Module):
 
         # Get cache buffers
         kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx, compress_type)
+        kv_cache_scale = (
+            metadata.kv_cache_manager.get_compress_scale_buffers(self.layer_idx)
+            if not self.is_indexer and self.kv_cache_dtype == KVCacheDtype.NVFP4_BLOCKWISE
+            else None
+        )
         paged_kv_state = metadata.kv_cache_manager.get_buffers(self.layer_idx, kv_type)
         paged_score_state = metadata.kv_cache_manager.get_buffers(self.layer_idx, score_type)
 
@@ -300,6 +309,7 @@ class Compressor(nn.Module):
             self.nope_head_dim,
             self.rope_head_dim,
             kv_cache,
+            kv_cache_scale,
             num_comp_tokens,
             cu_new_comp_kv,
             start_pos,
@@ -307,6 +317,7 @@ class Compressor(nn.Module):
             compressed_mask,
             compress_tokens_per_block,
             int(self.kv_cache_dtype),
+            self.nvfp4_global_scale,
             self.rotate_activation,
             quant_output,
             scale_output,

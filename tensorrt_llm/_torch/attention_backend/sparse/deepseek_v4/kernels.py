@@ -171,7 +171,8 @@ def deepseek_v4_local_to_global_indices(
     swa_pool_base_ptr: int,  # int64: base address of SWA pool
     swa_buffer_ptr: int,  # int64: base address of SWA buffer
     tokens_per_block: int,  # tokens per block for SWA
-    token_stride: int,  # bytes per token (use SWA token stride)
+    token_stride: int,  # bytes per SWA token
+    compressed_token_stride: int | None = None,
     # Optional compressed arguments (for compress_ratio > 1)
     block_table_compressed: torch.Tensor | None = None,
     compressed_local_indices: torch.Tensor | None = None,
@@ -264,12 +265,13 @@ def deepseek_v4_local_to_global_indices(
 
         tokens_per_block_compressed = tokens_per_block // compress_ratio
         # Compute compressed buffer offset relative to compress_pool_base_ptr in tokens
-        assert (compressed_buffer_ptr - compress_pool_base_ptr) % token_stride == 0, (
+        compressed_token_stride = compressed_token_stride or token_stride
+        assert (compressed_buffer_ptr - compress_pool_base_ptr) % compressed_token_stride == 0, (
             "compressed_buffer_ptr must be aligned to token_stride"
         )
         compressed_buffer_offset_in_tokens = (
             compressed_buffer_ptr - compress_pool_base_ptr
-        ) // token_stride
+        ) // compressed_token_stride
         _, max_blocks_compressed = block_table_compressed.shape
         block_table_compressed_c = block_table_compressed.contiguous()
         compressed_local_indices_c = compressed_local_indices.contiguous()

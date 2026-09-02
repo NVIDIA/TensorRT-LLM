@@ -27,8 +27,11 @@ from tensorrt_llm._torch.attention_backend.interface import (
     merge_attention_forward_args,
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantMode
 
+from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -42,6 +45,38 @@ if TYPE_CHECKING:
 
 class DeepseekV4TrtllmAttention(TrtllmAttention):
     Metadata = DeepseekV4TrtllmAttentionMetadata
+
+    @property
+    def uses_fp4_mla_attention(self) -> bool:
+        """Compressed NVFP4 rows are dequantized before sparse MLA."""
+        return False
+
+    def _configure_compress_quant_mode(self) -> None:
+        source_quant_mode = (
+            self.quant_config.layer_quant_mode if self.quant_config is not None else QuantMode(0)
+        )
+        self._uses_nvfp4_compress = source_quant_mode.has_fp4_kv_cache()
+        if self._uses_nvfp4_compress:
+            self.quant_mode = int(
+                (source_quant_mode & ~QuantMode.NVFP4_KV_CACHE) | QuantMode.FP8_KV_CACHE
+            )
+            self.has_fp4_kv_cache = False
+            self.has_fp8_kv_cache = True
+            self._nvfp4_global_scale = 448.0 * 6.0 / _get_nvfp4_mla_kv_cache_amax()
+            self._nvfp4_compress_scale_quant_orig = torch.full_like(
+                self.kv_cache_scaling_factor, 1.0 / self._nvfp4_global_scale
+            )
+        else:
+            self._nvfp4_global_scale = 1.0
+            self._nvfp4_compress_scale_quant_orig = self.kv_scale_quant_orig
+
+    def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        super().update_quant_config(new_quant_config)
+        self._configure_compress_quant_mode()
+        if self._uses_nvfp4_compress:
+            # The base update builds FMHA libraries before the effective cache
+            # mode is converted from NVFP4 storage to FP8 execution.
+            self.create_fmha_libs()
 
     def __init__(
         self,
@@ -95,6 +130,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             **kwargs,
         )
 
+        self._configure_compress_quant_mode()
+
         self.sparse_attention_config = sparse_attention_config
         self.compress_ratio = sparse_attention_config.compress_ratios[layer_idx]
 
@@ -116,7 +153,13 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             has_fp8_kv_cache = False
             if quant_config is not None:
                 has_fp8_kv_cache = quant_config.layer_quant_mode.has_fp8_kv_cache()
-            kv_cache_dtype = "fp8_pertensor" if has_fp8_kv_cache else "default"
+            kv_cache_dtype = (
+                "nvfp4"
+                if self._uses_nvfp4_compress
+                else "fp8_pertensor"
+                if has_fp8_kv_cache
+                else "default"
+            )
             self.compressor = Compressor(
                 mla_params,
                 layer_idx,
@@ -127,6 +170,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 kv_cache_dtype=kv_cache_dtype,
                 dtype=dtype,
                 rotate_activation=False,
+                nvfp4_global_scale=self._nvfp4_global_scale,
             )
             if self.use_fp8_ds_mla:
                 self.compressor.enable_footer_scale_cache()
@@ -206,9 +250,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
 
         # Token stride
         index_head_dim = self.sparse_attention_config.index_head_dim
-        has_fp8_kv_cache = False
-        if self.quant_config is not None:
-            has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache()
+        has_fp8_kv_cache = kv_cache_manager.dtype == DataType.FP8
         token_stride = get_token_bytes(
             self.head_dim,
             index_head_dim,
@@ -300,6 +342,9 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             swa_buffer_ptr=swa_buffer_ptr,
             tokens_per_block=kv_cache_manager.tokens_per_block,
             token_stride=token_stride,
+            compressed_token_stride=(
+                self.head_dim // 2 if self._uses_nvfp4_compress else token_stride
+            ),
             block_table_compressed=block_table_compressed,
             compressed_local_indices=compressed_local_indices,
             compress_pool_base_ptr=compress_pool_base_ptr,
@@ -312,7 +357,35 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
 
         if self.use_fp8_ds_mla:
             return result
-        return result, None
+        global_indices = result
+
+        if self._uses_nvfp4_compress and self.compress_ratio > 1:
+            num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
+            compressed_indices = global_indices[:, -num_compressed_indices:].contiguous()
+            data_pool, scale_pool = kv_cache_manager.get_compress_pool_buffers(self.compress_ratio)
+            # The previous layer has already enqueued its attention on this stream.
+            # Release its Python reference before allocating the next scratch so
+            # the caching allocator can reuse the storage in stream order.
+            metadata.nvfp4_compress_fp8_scratch = None
+            scratch = torch.empty(
+                (*compressed_indices.shape, self.head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=global_indices.device,
+            )
+            torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+                data_pool,
+                scale_pool,
+                compressed_indices,
+                scratch,
+                self._nvfp4_compress_scale_quant_orig,
+                0,
+                data_pool.numel() // (self.head_dim // 2),
+            )
+            metadata.nvfp4_compress_fp8_scratch = scratch
+            global_indices[:, -num_compressed_indices:] = compressed_indices
+            forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
+
+        return global_indices, None
 
     def sparse_kv_predict(
         self,
