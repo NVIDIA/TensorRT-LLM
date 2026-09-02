@@ -41,7 +41,12 @@ from .._config import DataRole, KVCacheManagerConfig
 from .._exceptions import LogicError
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
-from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta, SsmSnapshotIterationStatsDelta
+from .._stats import (
+    KVCacheIterationStatsDelta,
+    KVCacheStatsDelta,
+    ReusedBlocksByLevel,
+    SsmSnapshotIterationStatsDelta,
+)
 from .._storage._config import BufferId, SlotDesc, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
 from .._storage_manager import StorageManager
@@ -225,6 +230,7 @@ class KVCacheManager:
         "_iter_resumed_requests",
         "_iter_disk_prefetch_tokens",
         "_iter_cached_tokens_by_tier",
+        "_iter_reused_blocks_by_level",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -310,6 +316,7 @@ class KVCacheManager:
         self._iter_resumed_requests = 0
         self._iter_disk_prefetch_tokens = 0
         self._iter_cached_tokens_by_tier = dict.fromkeys(_CACHED_TOKEN_TIERS, 0)
+        self._iter_reused_blocks_by_level = {}
 
     def __del__(self) -> None:
         try:
@@ -631,6 +638,31 @@ class KVCacheManager:
         }
         self._ssm_snapshot_iteration_stats_by_life_cycle.clear()
         return stats
+
+    def _commit_reused_blocks_by_level(
+        self, by_life_cycle: dict[LifeCycleId, ReusedBlocksByLevel]
+    ) -> None:
+        """Commit the per-cache-level split of the reuse block counts.
+
+        Committed alongside the scalar iteration stats so both views cover exactly the same
+        requests: a cache whose pending stats are discarded contributes to neither.
+        """
+        if not self._stats_enabled:
+            return
+        for life_cycle, by_level in by_life_cycle.items():
+            if by_level.empty:
+                continue
+            self._iter_reused_blocks_by_level.setdefault(life_cycle, ReusedBlocksByLevel()).add(
+                by_level
+            )
+
+    def get_and_reset_iteration_reused_blocks_by_level(
+        self,
+    ) -> dict[LifeCycleId, ReusedBlocksByLevel]:
+        """Return and reset the per-cache-level reuse block counts for this iteration."""
+        by_life_cycle = self._iter_reused_blocks_by_level
+        self._iter_reused_blocks_by_level = {}
+        return by_life_cycle
 
     def record_request_suspended(self) -> None:
         """Count one ACTIVE->SUSPENDED transition for the current iteration window."""

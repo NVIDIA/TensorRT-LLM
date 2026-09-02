@@ -457,8 +457,10 @@ private:
     void activate();
 
     // Internal helpers.
-    CachedTokensByTier _computeCachedTokensByTier(
-        BlockRadixTree::ReuseMatch const& match, std::optional<CacheTier>& lastCachedTokenTier) const;
+    // Turn the per-block attention tiers observed while holding the matched pages into logical
+    // token counts. Called at the end of _setupForReuse, which collects them in the same walk.
+    void _finalizeCachedTokensByTier(
+        int numTokens, std::vector<CacheTier> const& attentionTiers, std::optional<CacheTier> ssmTier);
     void _setupForReuse(BlockRadixTree::ReuseMatch const& match);
     // Reconstruct the committed token sequence from a match's blocks (mirrors
     // Python's _get_matched_tokens); used when reuse-matching no longer has the

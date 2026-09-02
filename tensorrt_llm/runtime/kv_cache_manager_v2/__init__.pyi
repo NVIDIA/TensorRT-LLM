@@ -94,6 +94,21 @@ class KVCacheIterationStatsDelta:
     iter_host_dropped_bytes: int = 0
 
 @dataclass(slots=True)
+class ReusedBlocksByLevel:
+    """Reuse block counts split by the cache level the reused pages were resident on.
+
+    Indices are CacheLevel values, so entry i is the i-th configured tier.
+    """
+
+    full: list[int]
+    partial: list[int]
+
+    def __init__(self, full: list[int] = ..., partial: list[int] = ...) -> None: ...
+    @property
+    def empty(self) -> bool: ...
+    def add(self, other: ReusedBlocksByLevel) -> None: ...
+    def copy(self) -> ReusedBlocksByLevel: ...
+
 class SsmSnapshotIterationStatsDelta:
     iter_snapshot_lookups: int = 0
     iter_snapshot_hits: int = 0
@@ -538,6 +553,9 @@ class KVCacheManager:
     def get_and_reset_iteration_disk_prefetch_tokens(self) -> int: ...
     def record_cached_tokens_by_tier(self, counts: dict[str, int]) -> None: ...
     def get_and_reset_iteration_cached_tokens_by_tier(self) -> dict[str, int]: ...
+    def get_and_reset_iteration_reused_blocks_by_level(
+        self,
+    ) -> dict[LifeCycleId, ReusedBlocksByLevel]: ...
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel
     ) -> Sequence[PoolGroupPeakBlockStats]: ...

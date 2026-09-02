@@ -77,6 +77,12 @@ class KVCacheV2LifeCycleIterationStats:
     window_size: int | None
     kind: str
     stats: Any
+    # Reuse block counts split by the cache level the reused pages were resident on. Indexed by
+    # CacheLevel, so entry i is the i-th configured tier -- a deployment with a hot and a cold GPU
+    # level gets two distinct entries rather than one merged "gpu" bucket. Empty when the life
+    # cycle recorded no reuse this iteration.
+    full_reused_blocks_by_level: list[int] = field(default_factory=list)
+    partial_reused_blocks_by_level: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -265,5 +271,12 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
             serialized.update(
                 serialize_kv_cache_iteration_stats(stats.stats, KV_CACHE_ITERATION_STATS_REUSE_KEYS)
             )
+            # Indexed by cache level, so the arrays are as long as the configured tier list.
+            if stats.full_reused_blocks_by_level:
+                serialized["iterFullReusedBlocksByLevel"] = list(stats.full_reused_blocks_by_level)
+            if stats.partial_reused_blocks_by_level:
+                serialized["iterPartialReusedBlocksByLevel"] = list(
+                    stats.partial_reused_blocks_by_level
+                )
         stats_by_life_cycle[str(life_cycle_id)] = serialized
     stats_dict["kvCacheIterationStatsByLifecycle"] = stats_by_life_cycle
