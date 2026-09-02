@@ -25,6 +25,85 @@ __extra_import_path__ = ["~/tests/integration"]
 from defs.perf import test_perf_sanity as perf_sanity  # noqa: E402
 
 
+def test_make_startup_observation_combines_checkpoint_phases(
+    tmp_path: Path,
+) -> None:
+    server_log = tmp_path / "trtllm-serve.0.log"
+    server_log.write_text(
+        "Checkpoint I/O policy: requested=auto, "
+        "selected=rank_striped_read_ahead, activated=True, "
+        "effective=rank_striped_read_ahead, fallback_reason=none.\n",
+        encoding="utf-8",
+    )
+    server_info = {
+        "startup_metrics": {
+            "model_loader": {
+                "checkpoint_preparation_seconds": 1,
+                "weight_population_seconds": 2.5,
+                "checkpoint_finalization_seconds": 0.5,
+                "total_model_loading_seconds": 6.0,
+            }
+        }
+    }
+
+    observation = perf_sanity.make_startup_observation(server_info, [str(server_log)], "aggregate")
+
+    assert observation["metrics"]["checkpoint_pipeline_seconds"] == 4.0
+    assert observation["metrics"]["total_model_loading_seconds"] == 6.0
+    assert observation["checkpoint_io_policies"] == [
+        {
+            "requested": "auto",
+            "selected": "rank_striped_read_ahead",
+            "activated": True,
+            "effective": "rank_striped_read_ahead",
+            "fallback_reason": "none",
+        }
+    ]
+
+
+def test_add_startup_metric_values_uses_slowest_disagg_worker() -> None:
+    observations = [
+        {
+            "role": "gen",
+            "metrics": {
+                "checkpoint_pipeline_seconds": 7.0,
+                "total_model_loading_seconds": 9.0,
+            },
+            "checkpoint_io_policies": [
+                {
+                    "requested": "auto",
+                    "selected": "rank_striped_read_ahead",
+                    "activated": True,
+                    "effective": "rank_striped_read_ahead",
+                }
+            ],
+        },
+        {
+            "role": "gen",
+            "metrics": {
+                "checkpoint_pipeline_seconds": 8.0,
+                "total_model_loading_seconds": 10.0,
+            },
+            "checkpoint_io_policies": [
+                {
+                    "requested": "auto",
+                    "selected": "rank_striped_read_ahead",
+                    "activated": True,
+                    "effective": "rank_striped_read_ahead",
+                }
+            ],
+        },
+    ]
+    new_data = {}
+
+    perf_sanity.add_startup_metric_values(new_data, observations, role="gen")
+
+    assert new_data["d_gen_checkpoint_pipeline_seconds"] == 8.0
+    assert new_data["d_gen_total_model_loading_seconds"] == 10.0
+    assert new_data["s_gen_checkpoint_io_policy_effective"] == "rank_striped_read_ahead"
+    assert new_data["b_gen_checkpoint_io_policy_activated"] is True
+
+
 def test_run_benchmark_with_log_returns_successful_output(tmp_path: Path) -> None:
     benchmark_log = tmp_path / "trtllm-benchmark.0.0.log"
     command = [sys.executable, "-c", "print('benchmark succeeded')"]

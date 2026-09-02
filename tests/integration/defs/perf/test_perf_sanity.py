@@ -17,6 +17,7 @@
 import copy
 import fcntl
 import glob
+import json
 import math
 import os
 import re
@@ -26,6 +27,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import urllib.request
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
@@ -626,6 +628,137 @@ REGRESSION_METRICS = [
     "d_token_throughput",
     "d_total_token_throughput",
 ]
+
+STARTUP_METRIC_NAMES = (
+    "total_model_loading_seconds",
+    "checkpoint_preparation_seconds",
+    "weight_population_seconds",
+    "checkpoint_finalization_seconds",
+    "draft_checkpoint_preparation_seconds",
+    "draft_weight_population_seconds",
+    "draft_checkpoint_finalization_seconds",
+    "post_load_processing_seconds",
+)
+CHECKPOINT_PIPELINE_PHASES = (
+    "checkpoint_preparation_seconds",
+    "weight_population_seconds",
+    "checkpoint_finalization_seconds",
+)
+DRAFT_CHECKPOINT_PIPELINE_PHASES = (
+    "draft_checkpoint_preparation_seconds",
+    "draft_weight_population_seconds",
+    "draft_checkpoint_finalization_seconds",
+)
+CHECKPOINT_IO_POLICY_PATTERN = re.compile(
+    r"Checkpoint I/O policy: requested=(?P<requested>[^,]+), "
+    r"selected=(?P<selected>[^,]+), activated=(?P<activated>True|False), "
+    r"effective=(?P<effective>[^,]+), fallback_reason=(?P<fallback_reason>.*)\."
+)
+
+
+def parse_checkpoint_io_policies(log_paths: List[str]) -> List[dict]:
+    """Return every checkpoint I/O status emitted by the server."""
+    statuses = []
+    for log_path in log_paths:
+        if not os.path.exists(log_path):
+            continue
+        with open(log_path, "r", encoding="utf-8", errors="replace") as log_file:
+            for match in CHECKPOINT_IO_POLICY_PATTERN.finditer(log_file.read()):
+                status = match.groupdict()
+                status["activated"] = status["activated"] == "True"
+                statuses.append(status)
+    return statuses
+
+
+def make_startup_observation(server_info: dict, log_paths: List[str], role: str) -> dict:
+    """Normalize startup data from ``/server_info`` and server logs."""
+    model_loader_metrics = server_info.get("startup_metrics", {}).get("model_loader", {})
+    metrics = {}
+    for metric_name in STARTUP_METRIC_NAMES:
+        value = model_loader_metrics.get(metric_name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            metrics[metric_name] = float(value)
+
+    if all(name in metrics for name in CHECKPOINT_PIPELINE_PHASES):
+        metrics["checkpoint_pipeline_seconds"] = sum(
+            metrics[name] for name in CHECKPOINT_PIPELINE_PHASES
+        )
+    if all(name in metrics for name in DRAFT_CHECKPOINT_PIPELINE_PHASES):
+        metrics["draft_checkpoint_pipeline_seconds"] = sum(
+            metrics[name] for name in DRAFT_CHECKPOINT_PIPELINE_PHASES
+        )
+
+    return {
+        "role": role,
+        "metrics": metrics,
+        "checkpoint_io_policies": parse_checkpoint_io_policies(log_paths),
+    }
+
+
+def fetch_startup_observation(server_address: str, log_paths: List[str], role: str) -> dict:
+    """Fetch one server's startup metrics after it reports ready."""
+    request = urllib.request.Request(
+        f"http://{server_address}/server_info",
+        headers={"Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        server_info = json.load(response)
+    return make_startup_observation(server_info, log_paths, role)
+
+
+def write_startup_observations(
+    test_output_dir: str, server_idx: int, observations: List[dict]
+) -> None:
+    """Persist observations as a CI artifact for later result upload."""
+    path = os.path.join(test_output_dir, f"startup_metrics.{server_idx}.json")
+    with open(path, "w", encoding="utf-8") as output_file:
+        json.dump(observations, output_file, indent=2, sort_keys=True)
+
+
+def read_startup_observations(test_output_dir: str, server_idx: int) -> List[dict]:
+    """Read observations captured while the server was alive."""
+    path = os.path.join(test_output_dir, f"startup_metrics.{server_idx}.json")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as input_file:
+        observations = json.load(input_file)
+    return observations if isinstance(observations, list) else []
+
+
+def add_startup_metric_values(
+    new_data: dict, observations: List[dict], role: Optional[str] = None
+) -> None:
+    """Add informational startup fields to one OpenSearch result row.
+
+    Disaggregated serving can have several servers per role. The maximum time
+    is recorded because the slowest server determines fleet readiness.
+    """
+    selected = [entry for entry in observations if role is None or entry.get("role") == role]
+    if not selected:
+        return
+
+    field_prefix = f"{role}_" if role else ""
+    metric_names = {name for entry in selected for name in entry.get("metrics", {})}
+    for metric_name in metric_names:
+        values = [entry.get("metrics", {}).get(metric_name) for entry in selected]
+        numeric_values = [
+            float(value)
+            for value in values
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        ]
+        if numeric_values:
+            new_data[f"d_{field_prefix}{metric_name}"] = max(numeric_values)
+
+    policies = [policy for entry in selected for policy in entry.get("checkpoint_io_policies", [])]
+    for policy_field in ("requested", "selected", "effective"):
+        values = sorted(
+            {str(policy[policy_field]) for policy in policies if policy.get(policy_field)}
+        )
+        if values:
+            new_data[f"s_{field_prefix}checkpoint_io_policy_{policy_field}"] = ",".join(values)
+    activated = [policy.get("activated") for policy in policies if "activated" in policy]
+    if activated:
+        new_data[f"b_{field_prefix}checkpoint_io_policy_activated"] = all(activated)
 
 
 def get_model_dir(model_name: str) -> str:
@@ -1497,6 +1630,12 @@ class AggrTestCmds(NamedTuple):
                     check_files=[server_file_path],
                     server_proc=server_proc,
                 )
+                observation = fetch_startup_observation(
+                    f"{server_hostname}:{server_port}",
+                    [server_file_path],
+                    "aggregate",
+                )
+                write_startup_observations(self.test_output_dir, server_idx, [observation])
 
             # Run all clients for this server
             for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
@@ -1737,6 +1876,33 @@ class DisaggTestCmds(NamedTuple):
         addr_path = self._disagg_server_addr_file(server_idx)
         print_info(f"Waiting for disagg server address file {addr_path}")
         return wait_for_reported_addr(addr_path, self.timeout)
+
+    def _collect_worker_startup_observations(self, server_idx: int) -> List[dict]:
+        """Collect startup data from every ready context/generation server."""
+        observations = []
+        hostnames_dir = self._hostnames_dir(server_idx)
+        for filename in sorted(os.listdir(hostnames_dir)):
+            if not filename.endswith(".txt"):
+                continue
+            worker_name = os.path.splitext(filename)[0]
+            if worker_name.startswith("CTX"):
+                role = "ctx"
+            elif worker_name.startswith("GEN"):
+                role = "gen"
+            else:
+                continue
+            with open(
+                os.path.join(hostnames_dir, filename), "r", encoding="utf-8"
+            ) as hostname_file:
+                server_address = hostname_file.read().strip()
+            log_paths = [
+                os.path.join(
+                    self.test_output_dir,
+                    f"trtllm-serve.{worker_name}.{server_idx}.log",
+                )
+            ]
+            observations.append(fetch_startup_observation(server_address, log_paths, role))
+        return observations
 
     def wait_for_benchmark_ready(
         self,
@@ -2043,6 +2209,8 @@ class DisaggTestCmds(NamedTuple):
                     ),
                     check_files=self.get_server_logs(server_idx),
                 )
+                observations = self._collect_worker_startup_observations(server_idx)
+                write_startup_observations(self.test_output_dir, server_idx, observations)
 
                 client_configs = self.client_configs.get(server_idx, [])
 
@@ -2911,6 +3079,7 @@ class PerfSanityTestConfig:
                 server_config = self.server_configs[server_idx]
                 server_config_dict = server_config.to_db_data()
                 server_perf_results = self._perf_results.get(server_idx, [])
+                startup_observations = read_startup_observations(self.test_output_dir, server_idx)
                 # Skip if server failed
                 if len(server_perf_results) != len(client_configs):
                     cmd_idx += len(client_configs)
@@ -2943,6 +3112,7 @@ class PerfSanityTestConfig:
                         server_perf_results[client_idx],
                         spec_decoding=client_config.spec_decoding,
                     )
+                    add_startup_metric_values(new_data, startup_observations)
 
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
@@ -2960,6 +3130,7 @@ class PerfSanityTestConfig:
             ):
                 client_configs = self.server_client_configs[server_idx]
                 server_perf_results = self._perf_results.get(server_idx, [])
+                startup_observations = read_startup_observations(self.test_output_dir, server_idx)
                 # Skip if server failed
                 if len(server_perf_results) != len(client_configs):
                     cmd_idx += len(client_configs)
@@ -3004,6 +3175,8 @@ class PerfSanityTestConfig:
                         spec_decoding=client_config.spec_decoding,
                         benchmark_mode=disagg_config.benchmark_mode,
                     )
+                    add_startup_metric_values(new_data, startup_observations, role="ctx")
+                    add_startup_metric_values(new_data, startup_observations, role="gen")
 
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
