@@ -1,12 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import ast
-import inspect
-import textwrap
-from collections.abc import Callable
 from types import SimpleNamespace
-from typing import TypeAlias
 
 import pytest
 import torch
@@ -16,29 +11,8 @@ from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
     _get_multi_ctas_kv_counter_size,
 )
-from tensorrt_llm._torch.attention_backend.fmha.interface import _CuteDslMlaStagingKey
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner
-
-
-class _AttentionStub:
-    def __init__(
-        self,
-        *,
-        is_mla_enable: bool,
-        has_fp8_kv_cache: bool,
-        flashinfer_mla_backend: str | None = None,
-    ) -> None:
-        self.is_mla_enable = is_mla_enable
-        self.has_fp8_kv_cache = has_fp8_kv_cache
-        self.flashinfer_mla_backend = flashinfer_mla_backend
-        self.kv_lora_rank = 512 if is_mla_enable else None
-        self.head_dim = 576
-        self.v_head_dim = 512 if is_mla_enable else None
-
-
-_MlaBackendPolicy: TypeAlias = Callable[[str, SimpleNamespace, int], str]
 
 
 def _get_total_num_blocks(manager: SimpleNamespace, kv_factor: int = 2) -> int:
@@ -125,30 +99,6 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
             forward_args=SimpleNamespace(),
             workspace=SimpleNamespace(),
         )
-
-
-def test_flashinfer_cute_dsl_mla_backend_rejects_fp8_kv_cache() -> None:
-    attn = _AttentionStub(
-        is_mla_enable=True,
-        has_fp8_kv_cache=True,
-        flashinfer_mla_backend="cute-dsl",
-    )
-
-    with pytest.raises(ValueError, match="does not support FP8 KV cache"):
-        FlashInferTrtllmGenFmha(attn)
-
-
-@pytest.mark.parametrize("configured_backend", ["cute-dsl", "trtllm-gen"])
-def test_standalone_cute_dsl_mla_defers_to_explicit_flashinfer_backend(
-    configured_backend: str,
-) -> None:
-    attn = _AttentionStub(
-        is_mla_enable=True,
-        has_fp8_kv_cache=False,
-        flashinfer_mla_backend=configured_backend,
-    )
-
-    assert not CuteDslMlaFmha.is_available(attn)
 
 
 def _cute_dsl_mla_helix_support(
@@ -240,112 +190,7 @@ def test_cute_dsl_mla_rejects_invalid_helix_contract(
     assert reason in actual_reason
 
 
-def test_flashinfer_mla_backend_defaults_to_trtllm_gen() -> None:
-    attn = _AttentionStub(
-        is_mla_enable=True,
-        has_fp8_kv_cache=False,
-    )
-
-    assert FlashInferTrtllmGenFmha(attn)._mla_backend == "trtllm-gen"
-
-
-def test_mla_scheduler_invalidation_resets_cute_dsl_staging_key() -> None:
-    metadata = object.__new__(TrtllmAttentionMetadata)
-    metadata._mla_scheduler_buffers_valid = True
-    metadata._mla_ctx_cu_seqlens_valid = True
-    metadata._cute_dsl_mla_staging_key = _CuteDslMlaStagingKey(
-        is_capturing=True,
-        workspace_ptr=1,
-        block_tables_ptr=2,
-        block_tables_shape=(3, 4),
-        sequence_lengths_ptr=5,
-        sequence_lengths_offset=6,
-        batch_beam=7,
-        padded_num_pages=8,
-    )
-
-    metadata._invalidate_mla_scheduler_buffers()
-
-    assert not metadata._mla_scheduler_buffers_valid
-    assert not metadata._mla_ctx_cu_seqlens_valid
-    assert metadata._cute_dsl_mla_staging_key is None
-
-
-def test_flashinfer_mla_backend_rejects_unknown_backend() -> None:
-    attn = _AttentionStub(
-        is_mla_enable=True,
-        has_fp8_kv_cache=False,
-        flashinfer_mla_backend="cutedsl",
-    )
-
-    with pytest.raises(ValueError, match="flashinfer_mla_backend must be one of"):
-        FlashInferTrtllmGenFmha(attn)
-
-
-def _make_fmha(
-    requested_backend: str,
-    mla_backend_policy: _MlaBackendPolicy | None,
-) -> FlashInferTrtllmGenFmha:
-    fmha = object.__new__(FlashInferTrtllmGenFmha)
-    fmha._mla_backend = requested_backend
-    # ``Fmha.attn`` is a read-only property that dereferences ``_attn_ref``
-    # (normally a weakref to the owning TrtllmAttention). SimpleNamespace is
-    # not weak-referenceable, so stand in with a closure of the same shape.
-    attn = SimpleNamespace(mla_backend_policy=mla_backend_policy)
-    fmha._attn_ref = lambda: attn
-    return fmha
-
-
-@pytest.mark.parametrize("requested_backend", ["cute-dsl", "trtllm-gen"])
-@pytest.mark.parametrize(
-    ("num_contexts", "num_generations", "num_gen_tokens"),
-    [
-        (0, 4, 4),  # generation-only, one token per request
-        (1, 3, 3),  # mixed context/generation batch
-        (0, 4, 8),  # multi-token generation (speculative verification)
-    ],
-)
-def test_flashinfer_mla_backend_default_matches_static_selection(
-    requested_backend: str,
-    num_contexts: int,
-    num_generations: int,
-    num_gen_tokens: int,
-) -> None:
-    """Without an installed policy the static backend is used for every batch
-    composition, matching the behavior before the policy hook existed."""
-    fmha = _make_fmha(requested_backend, mla_backend_policy=None)
-
-    assert (
-        fmha._get_effective_mla_backend(
-            SimpleNamespace(
-                num_contexts=num_contexts,
-                num_generations=num_generations,
-            ),
-            num_gen_tokens,
-        )
-        == requested_backend
-    )
-
-
-def test_flashinfer_mla_backend_policy_hook_is_consulted() -> None:
-    calls: list[tuple[str, SimpleNamespace, int]] = []
-
-    def policy(
-        requested_backend: str,
-        meta: SimpleNamespace,
-        num_gen_tokens: int,
-    ) -> str:
-        calls.append((requested_backend, meta, num_gen_tokens))
-        return "trtllm-gen"
-
-    fmha = _make_fmha("cute-dsl", mla_backend_policy=policy)
-    meta = SimpleNamespace(num_contexts=0, num_generations=4)
-
-    assert fmha._get_effective_mla_backend(meta, 4) == "trtllm-gen"
-    assert calls == [("cute-dsl", meta, 4)]
-
-
-# The six tests below guard the MLA generation perf gate that #15300 removed as
+# The tests below guard the MLA generation perf gate that #15300 removed as
 # refactoring collateral, costing ~3% output token throughput on DeepSeek-V3-family
 # and Kimi-K2 MLA decode at the default tokens_per_block. They deliberately call the
 # checker instead of asserting on SLOWER_MLA_GENERATION_KERNELS itself: a test that
@@ -361,7 +206,6 @@ def test_mla_generation_declines_slower_trtllm_gen_decode_kernel() -> None:
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
         tokens_per_block=32,
-        mla_backend="trtllm-gen",
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
@@ -379,71 +223,11 @@ def test_mla_generation_gate_is_scoped_to_one_page_size(tokens_per_block: int) -
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
         tokens_per_block=tokens_per_block,
-        mla_backend="trtllm-gen",
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
     assert supported, reason
     assert reason == ""
-
-
-def test_mla_generation_gate_is_scoped_to_the_trtllm_gen_backend() -> None:
-    # The gated kernel is the trtllm-gen one; the cute-dsl MLA decode path shares
-    # this class and these head dims, and must stay selectable.
-    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
-        head_size=576,
-        tokens_per_block=32,
-        mla_backend="cute-dsl",
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-    )
-    assert supported, reason
-    assert reason == ""
-
-
-def test_mla_generation_gate_declines_a_policy_downgrade_to_trtllm_gen() -> None:
-    # A cute-dsl config whose per-batch policy downgrades to trtllm-gen (K3 does so
-    # for mixed batches and for speculative verification) still runs the gated
-    # kernel, so the gate must fire on the *effective* backend. Reading the static
-    # self._mla_backend here would let the slower kernel through.
-    fmha = _make_fmha("cute-dsl", mla_backend_policy=lambda *_: "trtllm-gen")
-    meta = SimpleNamespace(num_contexts=1, num_generations=3)
-    effective = fmha._get_effective_mla_backend(meta, 3)
-    assert effective == "trtllm-gen"
-
-    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
-        head_size=576,
-        tokens_per_block=32,
-        mla_backend=effective,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-    )
-    assert not supported
-    assert "slower" in reason
-
-
-def test_mla_generation_gate_reads_the_effective_mla_backend() -> None:
-    # The composition above is only load-bearing if the production call site feeds
-    # the gate the effective backend. Assert that structurally: reverting to the
-    # static self._mla_backend is a one-word change, and no behavioural test here
-    # would catch it because driving _is_supported_with_reason needs a full
-    # metadata/forward-args stub.
-    source = textwrap.dedent(inspect.getsource(FlashInferTrtllmGenFmha._is_supported_with_reason))
-    calls = [
-        node
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_check_mla_generation_support"
-    ]
-    assert len(calls) == 1, "expected exactly one MLA generation gate call site"
-    kwargs = {kw.arg: kw.value for kw in calls[0].keywords}
-    passed = kwargs.get("mla_backend")
-    assert passed is not None, "gate call site lost its mla_backend argument"
-    assert (
-        isinstance(passed, ast.Call)
-        and getattr(passed.func, "attr", None) == "_get_effective_mla_backend"
-    ), f"gate must receive the effective backend, got {ast.dump(passed)}"
 
 
 def test_mla_generation_allows_other_supported_head_dims() -> None:
@@ -451,7 +235,6 @@ def test_mla_generation_allows_other_supported_head_dims() -> None:
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=320,
         tokens_per_block=32,
-        mla_backend="trtllm-gen",
         kv_lora_rank=256,
         qk_rope_head_dim=64,
     )

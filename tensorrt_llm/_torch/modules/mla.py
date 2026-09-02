@@ -229,7 +229,6 @@ class MLA(nn.Module):
         o_lora_rank: int = 1024,
         fuse_qkv_a_proj: bool = True,
         rms_norm_eps: Optional[float] = None,
-        flashinfer_mla_backend: Optional[str] = None,
     ) -> None:
         """
         Initialize the MLA module.
@@ -261,9 +260,6 @@ class MLA(nn.Module):
             rms_norm_eps (Optional[float]): Override the RMSNorm epsilon from
                 the pretrained config. If neither source provides a value
                 (e.g. config.pretrained_config is None), falls back to 1e-6.
-            flashinfer_mla_backend (Optional[str]): Generation backend for the
-                FlashInfer/TRTLLM-Gen MLA dispatcher. ``None`` preserves the
-                attention backend default.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -575,7 +571,6 @@ class MLA(nn.Module):
             aux_stream=mqa_aux_stream,
             rope_append=(self.sparse_attn_hooks is None or self.sparse_attn_hooks.mqa_rope_append),
             kv_cache_dtype=self.kv_cache_dtype,
-            flashinfer_mla_backend=flashinfer_mla_backend,
             skip_correction_threshold=config.skip_correction_threshold,
         )
         if self.mqa is None:

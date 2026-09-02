@@ -10,120 +10,17 @@ gated output projection.
 
 from __future__ import annotations
 
-import os
-from functools import partial
 from typing import Optional
 
 import torch
 
 from ....functional import PositionEmbeddingType
-from ....logger import logger
 from ....mapping import Mapping
-from ....models.modeling_utils import QuantConfig
-from ...attention_backend import TrtllmAttention, TrtllmAttentionMetadata
+from ...attention_backend import TrtllmAttention
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
 from ..mla import MLA
-
-_KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
-_KIMI_K3_MLA_GEN_BACKENDS = ("cute-dsl", "trtllm-gen")
-
-
-def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
-    """Select K3's absorbed-generation MLA backend.
-
-    K3 was tuned with the FlashInfer CuTe-DSL backend for BF16 KV cache.
-    FP8 KV cache carries device scales that CuTe-DSL does not support, so
-    retain the TRTLLM-Gen fallback used by the pre-refactor implementation.
-    """
-    backend = os.environ.get(_KIMI_K3_MLA_GEN_BACKEND_ENV, "cute-dsl")
-    # Validate here, where the env var is read: an invalid value would
-    # otherwise surface only deep inside attention-backend construction,
-    # with an error that never names the knob that caused it.
-    if backend not in _KIMI_K3_MLA_GEN_BACKENDS:
-        raise ValueError(
-            f"{_KIMI_K3_MLA_GEN_BACKEND_ENV}={backend!r} is invalid; "
-            f"expected one of {list(_KIMI_K3_MLA_GEN_BACKENDS)}."
-        )
-    has_fp8_kv_cache = bool(
-        quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache()
-    )
-    if has_fp8_kv_cache and backend != "trtllm-gen":
-        # info_once: this runs once per MLA layer (~60x at startup for
-        # FP8-KV) and the decision is identical for every layer.
-        logger.info_once(
-            "Kimi K3 MLA: FP8 KV cache requires the trtllm-gen MLA "
-            f"generation backend; overriding '{backend}' -> 'trtllm-gen'.",
-            key="kimi_k3_mla_gen_backend_fp8_override",
-        )
-        return "trtllm-gen"
-    return backend
-
-
-def _validate_mla_generation_backend(backend: str, num_heads: int) -> None:
-    """Fail fast when `backend` can never run at this per-rank head count.
-
-    FlashInfer's `trtllm_batch_decode_with_kv_cache_mla` rejects
-    `64 < num_heads_q < 128` for every batch shape, and the per-batch policy
-    never demotes away from an explicit `trtllm-gen` selection (the
-    FP8-KV-cache override or a `TLLM_K3_MLA_GEN_BACKEND=trtllm-gen` request).
-    Without this check the conflict only surfaces as a FlashInfer error deep
-    in attention warmup.
-
-    The bound mirrors FlashInfer's validation gate verbatim: it predicts
-    FlashInfer's rejection, it is not a verified support claim for the head
-    counts outside the range. For Kimi K3 the open side above 128 is
-    unreachable anyway — per-rank Q heads never exceed 96 (all heads
-    replicated under attention-DP, `96 / tp_size` under TEP head sharding).
-    """
-    if backend == "trtllm-gen" and 64 < num_heads < 128:
-        raise ValueError(
-            "Kimi K3 MLA: the trtllm-gen generation backend cannot run with "
-            f"{num_heads} query heads per rank (trtllm-gen MLA decode rejects "
-            "64 < num_heads_q < 128; under attention-DP every rank keeps all "
-            "heads). trtllm-gen was selected explicitly — by the FP8-KV-cache "
-            f"override or by {_KIMI_K3_MLA_GEN_BACKEND_ENV}=trtllm-gen. Use "
-            "tensor-parallel head sharding (TEP) so each rank has <= 64 "
-            "heads, or a BF16 KV cache with the default cute-dsl backend."
-        )
-
-
-def _kimi_k3_mla_decode_backend_policy(
-    requested_backend: str,
-    metadata: TrtllmAttentionMetadata,
-    num_gen_tokens: int,
-    *,
-    num_heads: int,
-) -> str:
-    """Per-batch MLA decode backend selection for Kimi K3.
-
-    Installed as ``mla_backend_policy`` on K3's generation attention backend
-    (see :class:`KimiK3MLAAttention`); the general attention code applies no
-    such policy on its own.
-
-    CuTe-DSL reuses one staged page table across MLA layers for a
-    generation-only, one-token-per-request batch. Other mixed batches repeat
-    the staging copies in every MLA layer and regress time to first token, so
-    they fall back to TRTLLM-Gen. The H=96 path is the correctness exception
-    and applies to EVERY fallback candidate: TRTLLM-Gen may select a 64-head
-    Q tile, which does not divide 96 (invalid after K3's head padding was
-    removed), and its decode gate rejects 64 < num_heads_q < 128 outright —
-    falling back would fail engine initialization. H=96 per rank is K3's
-    attention-DP shape, so this keeps attention-DP + speculative
-    verification (a generation-only multi-token batch) on CuTe-DSL, which
-    accepts multi-token queries; K3's decode tuning preference for
-    TRTLLM-Gen only applies where TRTLLM-Gen is valid at all.
-    """
-    is_single_token_generation = num_gen_tokens == metadata.num_generations
-    requires_cute_dsl = num_heads == 96
-    if (
-        requested_backend == "cute-dsl"
-        and not requires_cute_dsl
-        and (metadata.num_contexts > 0 or not is_single_token_generation)
-    ):
-        return "trtllm-gen"
-    return requested_backend
 
 
 def _meta_safe_cast_dtype(module, dtype):
@@ -289,7 +186,6 @@ class KimiK3MLAAttention(MLA):
             reduce_output=False,
             fuse_qkv_a_proj=False,
             rms_norm_eps=rms_norm_eps,
-            flashinfer_mla_backend=_select_mla_generation_backend(model_config.get_quant_config()),
         )
         # Keep the base MLA registration enabled so breakable CUDA graphs use
         # the shared custom op. The output gate is a base hook and runs on both
@@ -322,18 +218,6 @@ class KimiK3MLAAttention(MLA):
         assert isinstance(self.mqa, TrtllmAttention)
         _install_identity_rope_table(self.mha)
         _install_identity_rope_table(self.mqa)
-        # Only the absorbed-generation backend (mqa) requests CuTe-DSL, so
-        # only it needs K3's per-batch fallback policy; mha keeps the
-        # default trtllm-gen selection.
-        # Validate here rather than in _select_mla_generation_backend: the
-        # per-rank head count (replicated under attention-DP, sharded under
-        # TEP) is only authoritative once the base MLA module has built its
-        # generation backend.
-        _validate_mla_generation_backend(self.mqa.flashinfer_mla_backend, self.mqa.num_heads)
-        self.mqa.mla_backend_policy = partial(
-            _kimi_k3_mla_decode_backend_policy,
-            num_heads=self.mqa.num_heads,
-        )
         self.rotary_emb = None
         self.apply_rotary_emb = False
 
