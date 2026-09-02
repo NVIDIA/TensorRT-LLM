@@ -185,7 +185,7 @@ def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
             free_gpu_memory_fraction=float(os.environ.get("KIMI_K3_FREE_GPU_FRACTION", "0.25")),
             # Retain the established K3 integration page size. H=96 is now
             # declined by the FlashInfer TRTLLM-Gen wrapper independently of
-            # page size and runs through the legacy TRTLLM-Gen fallback.
+            # page size and can run through the legacy TRTLLM-Gen fallback.
             tokens_per_block=64,
         ),
     )
