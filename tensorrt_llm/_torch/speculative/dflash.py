@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -168,11 +169,13 @@ class DFlashSpecMetadata(SpecMetadata):
             return
         i = self._layer_to_idx.get(layer_id)
         if i is not None:
-            num_tokens = hidden_states.shape[0]
             to_save = hidden_states + residual if residual is not None else hidden_states
-            self.captured_hidden_states[
-                :num_tokens, i * self.hidden_size : (i + 1) * self.hidden_size
-            ].copy_(to_save, non_blocking=True)
+            inplace_slice_copy(
+                self.captured_hidden_states,
+                to_save,
+                i * self.hidden_size,
+                (i + 1) * self.hidden_size,
+            )
 
     def get_hidden_states(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Get captured hidden states (all layers concatenated)."""
