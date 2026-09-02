@@ -26,6 +26,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -45,6 +46,20 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //   - void: instance pool — Deleter stores a SimplePool* pointer (8 bytes).
 //   - non-void: singleton pool — Deleter is stateless (0 bytes), calls
 //     Derived::instance() to find the pool. PoolItem is pointer-sized.
+//
+// Thread safety: all public methods are mutex-guarded. The singleton pools are
+// process-wide, so they are shared by every KvCacheManager and cannot be
+// covered by any manager's API lock; and put() runs from the PoolItem
+// destructor, which fires on whichever thread drops the last reference -- for
+// CachedCudaEvent that includes Python's GC, since it is a bound type handed
+// out by _KVCache.finish_event.
+//
+// The mutex costs ~6ns against the ~160ns of make_shared plus cuEventRecord
+// that every get() already pays, and the pools are touched per resize,
+// migration and suspend/resume rather than per page. Should that ever show up
+// in a profile, the fix is a thread_local pool per thread, with a depleted
+// pool stealing a batch from another thread's pool; the mutex would then be
+// needed only on the steal path, off the common path entirely.
 // ---------------------------------------------------------------------------
 
 // Forward declare so Deleters can reference it.
@@ -101,6 +116,7 @@ public:
     // Get a resource wrapped in a PoolItem that auto-returns to pool on destruction.
     [[nodiscard]] PoolItem get()
     {
+        std::lock_guard<std::mutex> const lock(mMutex);
         // Increment only after the item is successfully obtained, so a throwing
         // mCreateFn() leaves mOutstandingCount unchanged (no leak in stats).
         T* item = mItems.empty() ? mCreateFn() : popFront();
@@ -117,6 +133,7 @@ public:
 
     void clear()
     {
+        std::lock_guard<std::mutex> const lock(mMutex);
         while (!mItems.empty())
         {
             mDestroyFn(popFront());
@@ -125,11 +142,13 @@ public:
 
     [[nodiscard]] int outstandingCount() const noexcept
     {
+        std::lock_guard<std::mutex> const lock(mMutex);
         return mOutstandingCount;
     }
 
     [[nodiscard]] int cachedCount() const noexcept
     {
+        std::lock_guard<std::mutex> const lock(mMutex);
         return static_cast<int>(mItems.size());
     }
 
@@ -146,6 +165,7 @@ private:
 
     void put(T* item)
     {
+        std::lock_guard<std::mutex> const lock(mMutex);
         --mOutstandingCount;
         if (mMaxSize.has_value() && static_cast<int>(mItems.size()) >= *mMaxSize)
         {
@@ -162,6 +182,8 @@ private:
     std::optional<int> mMaxSize;
     std::deque<T*> mItems;
     int mOutstandingCount;
+    //! Guards every member above. Mutable so the const count accessors can lock.
+    mutable std::mutex mMutex;
 };
 
 // Deleter implementations (after SimplePool is fully defined).

@@ -16,7 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/storageManager.h"
-#include "kv_cache_manager_v2/coldPageCopy.h"
+#include "kv_cache_manager_v2/batchedPageCopy.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
@@ -241,7 +241,9 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mLayerToLifeCycleIds = config.layerToLifeCycleIds();
     mSlotToPageIndices = computeSlotToPageIndices(config);
     mBufferAttr = config.bufferAttributes();
-    mSlotDescLists.resize(config.cacheTiers.size(), config.slotDescList);
+    // The hot tier is registered up front; the cold tiers follow once the codec has told us
+    // their page sizes. Nothing may read a cold level before then.
+    TLLM_CHECK(appendLevelSlotDescList(config.slotDescList) == kHotLevel);
 
     // Compute layer attributes and slot utilization fractions for scratch support.
     mLayerAttributes = config.layerAttributes();
@@ -339,22 +341,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
         gpuSlotCounts, mGpuPhysMemAllocator.get());
 
-    auto& gpuStorage = *mLevels[kHotLevel].storage;
-    TypedVec<PoolGroupIndex, PoolGroupDesc> gpuDescs;
-    gpuDescs.reserve(numPoolGroups(kHotLevel));
-    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(kHotLevel); ++pgIdx)
-    {
-        TypedVec<PoolIndex, PoolDesc> pools;
-        auto const poolSizes = slotSize(kHotLevel, pgIdx);
-        pools.reserve(poolSizes.size());
-        for (PoolIndex poolIdx{0}; poolIdx < poolSizes.size(); ++poolIdx)
-        {
-            pools.push_back(
-                PoolDesc{poolIdx, gpuStorage.getBaseAddress(pgIdx, poolIdx, SlotId{0}), poolSizes.at(poolIdx)});
-        }
-        gpuDescs.push_back(
-            PoolGroupDesc{pgIdx, gpuStorage.numSlots(pgIdx), slotDescList(kHotLevel).at(pgIdx), std::move(pools)});
-    }
+    auto const gpuDescs = poolGroupDescs();
     TLLM_CHECK_WITH_INFO(
         codec.configure(gpuDescs.raw().data(), gpuDescs.size()), "Cold-page codec configuration failed");
 
@@ -446,7 +433,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     for (CacheLevel level{1}; level < config.cacheTiers.size(); ++level)
     {
-        mSlotDescLists[level] = coldSlotDescList;
+        TLLM_CHECK(appendLevelSlotDescList(coldSlotDescList) == level);
         auto const coldRatio = projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
         auto slotCounts
             = computeSlotCountForLevel(config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots);
@@ -468,31 +455,6 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             = std::make_unique<StagingBufferManager>(pageStagingBytes, StagingBufferMemory::kPinnedHost);
     }
 
-    // cuMemcpyBatchAsync cannot copy across adjacent HostMem registrations in one batch entry. The default codec needs
-    // the owning HostMem objects to split copies at registration boundaries on linux kernels that require chunked
-    // pinning.
-    if (detail::needsHostMemRegistration(codec))
-    {
-        for (CacheLevel level{0}; level < mLevels.size(); ++level)
-        {
-            if (cacheTier(level) != CacheTier::HOST_MEM)
-            {
-                continue;
-            }
-            for (PoolGroupIndex poolGroupIndex{0}; poolGroupIndex < numPoolGroups(level); ++poolGroupIndex)
-            {
-                auto const& hostPoolGroup = static_cast<HostPoolGroup const&>(poolGroup(level, poolGroupIndex));
-                for (PoolIndex poolIndex{0}; poolIndex < numPools(level, poolGroupIndex); ++poolIndex)
-                {
-                    detail::registerHostMem(codec, hostPoolGroup.hostMem(poolIndex));
-                }
-            }
-        }
-        if (mPageStagingManager)
-        {
-            detail::registerHostMem(codec, mPageStagingManager->hostMem());
-        }
-    }
     mCopyEngine = std::make_unique<CopyEngine>(mPageStagingManager.get());
 }
 
@@ -700,7 +662,10 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
         size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
             ? std::numeric_limits<size_t>::max()
             : coldPageBytes * remaining;
-        auto staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 1, stream);
+        // 16-byte alignment: the cold-page codec's copy path uses 16-byte vector accesses and
+        // requires its base pointer to be 16-aligned. Nothing here needs finer granularity, so
+        // this is a floor rather than a computed requirement.
+        auto staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, stream);
         size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
         stagingPageIndices.resize(batchSize);
 
@@ -1387,14 +1352,21 @@ PoolIndex StorageManager::numPools(PoolGroupIndex pgIdx) const
     return numPools(kHotLevel, pgIdx);
 }
 
-TypedVec<PoolIndex, size_t> StorageManager::slotSize(CacheLevel level, PoolGroupIndex pgIdx) const
+CacheLevel StorageManager::appendLevelSlotDescList(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescs)
 {
-    return slotDescList(level).at(pgIdx).slotSizeList();
-}
+    CacheLevel const level = mSlotDescLists.size();
+    mSlotDescLists.push_back(slotDescs);
 
-TypedVec<PoolIndex, size_t> StorageManager::slotSize(PoolGroupIndex pgIdx) const
-{
-    return slotSize(kHotLevel, pgIdx);
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> sizes;
+    sizes.reserve(slotDescs.size());
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescs.size(); ++pgIdx)
+    {
+        sizes.push_back(slotDescs.at(pgIdx).slotSizeList());
+    }
+    mSlotSizes.push_back(std::move(sizes));
+
+    TLLM_CHECK_DEBUG(mSlotSizes.size() == mSlotDescLists.size());
+    return level;
 }
 
 PoolGroupBase& StorageManager::poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx)
@@ -1415,6 +1387,25 @@ MemAddress StorageManager::getMemPoolBaseAddress(LayerId layerId, DataRole role)
 MemAddress StorageManager::getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
 {
     return mLevels[kHotLevel].storage->getBaseAddress(pgIdx, poolIdx, SlotId{0});
+}
+
+TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
+{
+    auto const& descList = slotDescList(kHotLevel);
+    TypedVec<PoolGroupIndex, PoolGroupDesc> result;
+    result.reserve(descList.size());
+    for (PoolGroupIndex pgIdx{0}; pgIdx < descList.size(); ++pgIdx)
+    {
+        auto const& slotSizeList = slotSize(kHotLevel, pgIdx);
+        TypedVec<PoolIndex, PoolDesc> pools;
+        pools.reserve(slotSizeList.size());
+        for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
+        {
+            pools.push_back(PoolDesc{poolIdx, getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx)});
+        }
+        result.push_back(PoolGroupDesc{pgIdx, numSlots(pgIdx, kHotLevel), descList.at(pgIdx), std::move(pools)});
+    }
+    return result;
 }
 
 LayerAttr const& StorageManager::getLayerAttr(LayerId layerId) const

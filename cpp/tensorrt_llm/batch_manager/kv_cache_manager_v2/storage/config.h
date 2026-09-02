@@ -108,12 +108,12 @@ struct CoalescedBuffer
     size_t singleBufferSize = 0;
     std::vector<BufferId> bufferIds;
 
-    size_t size() const noexcept
+    [[nodiscard]] size_t size() const noexcept
     {
         return singleBufferSize * bufferIds.size();
     }
 
-    int numBuffers() const noexcept
+    [[nodiscard]] int numBuffers() const noexcept
     {
         return static_cast<int>(bufferIds.size());
     }
@@ -129,7 +129,7 @@ struct SlotDescVariant
     TypedVec<PoolIndex, CoalescedBuffer> coalescedBuffers; // sorted size desc
 
     // Slot size for each pool in this group.
-    TypedVec<PoolIndex, size_t> slotSizeList() const
+    [[nodiscard]] TypedVec<PoolIndex, size_t> slotSizeList() const
     {
         TypedVec<PoolIndex, size_t> out;
         out.reserve(coalescedBuffers.size());
@@ -150,7 +150,7 @@ struct SlotDesc
 {
     std::vector<SlotDescVariant> variants; // different life cycles sharing this pool group
 
-    TypedVec<PoolIndex, size_t> slotSizeList() const
+    [[nodiscard]] TypedVec<PoolIndex, size_t> slotSizeList() const
     {
         return getUniformAttribute(variants, [](auto const& v) { return v.slotSizeList(); });
     }

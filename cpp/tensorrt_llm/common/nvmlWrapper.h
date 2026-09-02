@@ -57,6 +57,13 @@ public:
     nvmlReturn_t nvmlDeviceGetGpuFabricInfoV(nvmlDevice_t device, nvmlGpuFabricInfoV_t* gpuFabricInfo) const;
     nvmlReturn_t nvmlDeviceGetGpuFabricInfo(nvmlDevice_t device, nvmlGpuFabricInfo_t* gpuFabricInfo) const;
 
+    //! Used to read C2C link count and per-link bandwidth (NVML_FI_DEV_C2C_*), which size the
+    //! KVCM2 cold-page copy grid. Returns NVML_ERROR_FUNCTION_NOT_FOUND if the driver lacks it;
+    //! callers are expected to fall back to a conservative bandwidth estimate rather than fail.
+    nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int valuesCount, nvmlFieldValue_t* values) const;
+    nvmlReturn_t nvmlDeviceGetMaxPcieLinkGeneration(nvmlDevice_t device, unsigned int* maxLinkGen) const;
+    nvmlReturn_t nvmlDeviceGetMaxPcieLinkWidth(nvmlDevice_t device, unsigned int* maxLinkWidth) const;
+
     // Runtime availability checks
     bool hasGpuFabricInfoV() const;
     bool hasGpuFabricInfo() const;
@@ -80,6 +87,9 @@ private:
     // Optional function pointers (may be nullptr)
     nvmlReturn_t (*_nvmlDeviceGetGpuFabricInfoV)(nvmlDevice_t, nvmlGpuFabricInfoV_t*);
     nvmlReturn_t (*_nvmlDeviceGetGpuFabricInfo)(nvmlDevice_t, nvmlGpuFabricInfo_t*);
+    nvmlReturn_t (*_nvmlDeviceGetFieldValues)(nvmlDevice_t, int, nvmlFieldValue_t*);
+    nvmlReturn_t (*_nvmlDeviceGetMaxPcieLinkGeneration)(nvmlDevice_t, unsigned int*);
+    nvmlReturn_t (*_nvmlDeviceGetMaxPcieLinkWidth)(nvmlDevice_t, unsigned int*);
 };
 
 // RAII class that initializes NVML on construction and shuts down on destruction.

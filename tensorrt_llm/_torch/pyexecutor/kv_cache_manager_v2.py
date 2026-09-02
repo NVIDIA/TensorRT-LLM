@@ -3893,9 +3893,11 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self._request_stats_enabled_ids.clear()
-        self.impl.shutdown()
+        # Drop the outstanding plans before the manager shuts down: discarding a handle applies
+        # its plan, which mutates manager state.
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
+        self.impl.shutdown()
 
     def get_max_resource_count(self) -> int:
         # TODO: implement this

@@ -564,22 +564,12 @@ static kv::EventManager::AttentionDpGatherFn castAttentionDpGather(nb::handle ca
     return [gather = std::move(gather)](std::vector<kv::KVCacheEvent> const& events) { return (*gather)(events); };
 }
 
-static nb::object castStatsDelta(kv::KVCacheStatsDelta const& stats)
-{
-    return nb::cast(stats);
-}
-
-static nb::object castIterationStatsDelta(kv::KVCacheIterationStatsDelta const& stats)
-{
-    return nb::cast(stats);
-}
-
 static nb::dict castIterationStatsByLifeCycle(kv::IterationStatsByLifeCycle const& statsByLifeCycle)
 {
     nb::dict result;
     for (auto const& [lifeCycle, stats] : statsByLifeCycle)
     {
-        result[nb::int_(lifeCycle.value())] = castIterationStatsDelta(stats);
+        result[nb::int_(lifeCycle.value())] = nb::cast(stats);
     }
     return result;
 }
@@ -1688,8 +1678,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
-        .def("commit_pending_stats", [](kv::KvCache& self) { return castStatsDelta(self.commitPendingStats()); })
-        .def("discard_pending_stats", &kv::KvCache::discardPendingStats)
+        .def("commit_pending_stats", &kv::KvCache::commitPendingStats, nb::call_guard<nb::gil_scoped_release>())
+        .def("discard_pending_stats", &kv::KvCache::discardPendingStats, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resize",
             [](kv::KvCache& self, std::optional<int> capacity, std::optional<int> historyLength) -> bool
@@ -1754,9 +1744,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("has_scratch_slots", &kv::KvCache::hasScratchSlots)
         .def_prop_rw("enable_swa_scratch_reuse", &kv::KvCache::isSwaScratchReuseEnabled,
-            [](kv::KvCache& self, bool enable) { self.setEnableSwaScratchReuse(enable); })
-        .def_prop_rw(
-            "text_only", &kv::KvCache::textOnly, [](kv::KvCache& self, bool textOnly) { self.setTextOnly(textOnly); })
+            [](kv::KvCache& self, bool enable)
+            {
+                nb::gil_scoped_release release;
+                self.setEnableSwaScratchReuse(enable);
+            })
+        .def_prop_rw("text_only", &kv::KvCache::textOnly,
+            [](kv::KvCache& self, bool textOnly)
+            {
+                nb::gil_scoped_release release;
+                self.setTextOnly(textOnly);
+            })
         .def("supports_index_mode", &kv::KvCache::supportsIndexMode, nb::arg("mode"))
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)
@@ -1778,9 +1776,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
         .def("_get_num_tokens_before_hybrid_pruning", &kv::KvCache::numTokensBeforeHybridPruning)
+        // Both setters reach resize(), which takes the exclusive API lock: release the GIL first.
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
-            [](kv::KvCache& self, int hist) { self.setHistoryLength(hist); })
-        .def_prop_rw("capacity", &kv::KvCache::capacity, [](kv::KvCache& self, int cap) { self.setCapacity(cap); })
+            [](kv::KvCache& self, int hist)
+            {
+                nb::gil_scoped_release release;
+                self.setHistoryLength(hist);
+            })
+        .def_prop_rw("capacity", &kv::KvCache::capacity,
+            [](kv::KvCache& self, int cap)
+            {
+                nb::gil_scoped_release release;
+                self.setCapacity(cap);
+            })
         .def_prop_ro("tokens_per_block", &kv::KvCache::tokensPerBlock)
         .def_prop_ro("beam_width", [](kv::KvCache const& self) { return self.beamWidth().value(); })
         .def_prop_rw(
@@ -1801,7 +1809,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCache const& self, int layerGroupId, int beamIdx, bool validOnly) {
                 return self.getAggregatedPageIndices(kv::LayerGroupId{layerGroupId}, kv::BeamIndex{beamIdx}, validOnly);
             },
-            nb::arg("layer_group_id"), nb::arg("beam_idx") = 0, nb::arg("valid_only") = false)
+            nb::arg("layer_group_id"), nb::arg("beam_idx") = 0, nb::arg("valid_only") = false,
+            // Takes the shared API lock, so it can block on a writer.
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "set_base_page_index_buf",
             [](kv::KvCache& self, int beamIdx, int layerGroupId, nb::object bufObj)
@@ -2270,7 +2280,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_page_stride", &kv::KvCacheManager::getPageStride, nb::arg("layer_id"), nb::arg("data_role"))
         .def("get_page_index_scale", &kv::KvCacheManager::getPageIndexScale, nb::arg("layer_id"), nb::arg("data_role"))
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
-            nb::arg("data_role"))
+            nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resize",
             [](kv::KvCacheManager& self, int cacheLevel, size_t quota, bool bestEfforts)
@@ -2280,30 +2290,66 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "get_quota",
             [](kv::KvCacheManager const& self, int cacheLevel) { return self.getQuota(kv::CacheLevel{cacheLevel}); },
-            nb::arg("cache_level"))
-        .def("get_committed_stats",
-            [](kv::KvCacheManager const& self) { return castStatsDelta(self.getCommittedStats()); })
+            nb::arg("cache_level"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_committed_stats", &kv::KvCacheManager::getCommittedStats, nb::call_guard<nb::gil_scoped_release>())
         .def("get_and_reset_iteration_stats",
-            [](kv::KvCacheManager& self) { return castIterationStatsByLifeCycle(self.getAndResetIterationStats()); })
+            [](kv::KvCacheManager& self)
+            {
+                auto stats = [&]
+                {
+                    nb::gil_scoped_release release;
+                    return self.getAndResetIterationStats();
+                }();
+                return castIterationStatsByLifeCycle(stats);
+            })
         .def("get_and_reset_ssm_snapshot_iteration_stats",
             [](kv::KvCacheManager& self)
-            { return castSsmSnapshotIterationStatsByLifeCycle(self.getAndResetSsmSnapshotIterationStats()); })
-        .def("record_request_suspended", &kv::KvCacheManager::recordRequestSuspended)
-        .def("record_request_resumed", &kv::KvCacheManager::recordRequestResumed)
-        .def(
-            "get_and_reset_iteration_suspend_resume_stats", &kv::KvCacheManager::getAndResetIterationSuspendResumeStats)
+            {
+                auto stats = [&]
+                {
+                    nb::gil_scoped_release release;
+                    return self.getAndResetSsmSnapshotIterationStats();
+                }();
+                return castSsmSnapshotIterationStatsByLifeCycle(stats);
+            })
+        .def("record_request_suspended", &kv::KvCacheManager::recordRequestSuspended,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("record_request_resumed", &kv::KvCacheManager::recordRequestResumed,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_and_reset_iteration_suspend_resume_stats",
+            &kv::KvCacheManager::getAndResetIterationSuspendResumeStats, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_and_reset_iteration_peak_block_stats",
             [](kv::KvCacheManager& self, int cacheLevel)
-            { return castPeakBlockStats(self.getAndResetIterationPeakBlockStats(kv::CacheLevel{cacheLevel})); },
+            {
+                auto stats = [&]
+                {
+                    nb::gil_scoped_release release;
+                    return self.getAndResetIterationPeakBlockStats(kv::CacheLevel{cacheLevel});
+                }();
+                return castPeakBlockStats(stats);
+            },
             nb::arg("cache_level"))
-        .def("mark_stats_dirty", &kv::KvCacheManager::markStatsDirty, nb::arg("kv_cache_id").none())
-        .def("clear_stats_dirty", &kv::KvCacheManager::clearStatsDirty, nb::arg("kv_cache_id").none())
+        .def("mark_stats_dirty", &kv::KvCacheManager::markStatsDirty, nb::arg("kv_cache_id").none(),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("clear_stats_dirty", &kv::KvCacheManager::clearStatsDirty, nb::arg("kv_cache_id").none(),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("get_dirty_stats_kv_cache_ids",
-            [](kv::KvCacheManager const& self) { return castRequestIds(self.getDirtyStatsKvCacheIds()); })
-        .def("mark_stats_excluded", &kv::KvCacheManager::markStatsExcluded, nb::arg("kv_cache_id").none())
-        .def("clear_stats_excluded", &kv::KvCacheManager::clearStatsExcluded, nb::arg("kv_cache_id").none())
-        .def("is_stats_excluded", &kv::KvCacheManager::isStatsExcluded, nb::arg("kv_cache_id").none())
+            [](kv::KvCacheManager const& self)
+            {
+                auto ids = [&]
+                {
+                    nb::gil_scoped_release release;
+                    return self.getDirtyStatsKvCacheIds();
+                }();
+                return castRequestIds(ids);
+            })
+        .def("mark_stats_excluded", &kv::KvCacheManager::markStatsExcluded, nb::arg("kv_cache_id").none(),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("clear_stats_excluded", &kv::KvCacheManager::clearStatsExcluded, nb::arg("kv_cache_id").none(),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("is_stats_excluded", &kv::KvCacheManager::isStatsExcluded, nb::arg("kv_cache_id").none(),
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
         .def_prop_ro("event_manager",
             [](kv::KvCacheManager const& self)
@@ -2311,7 +2357,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("init_config", [](kv::KvCacheManager const& self) { return self.config(); })
         .def_prop_ro("cache_tier_list", [](kv::KvCacheManager const& self) { return self.cacheTierList().raw(); })
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)
-        .def_prop_ro("pool_group_descs", [](kv::KvCacheManager const& self) { return self.poolGroupDescs().raw(); })
+        .def_prop_ro("pool_group_descs",
+            [](kv::KvCacheManager const& self)
+            {
+                nb::gil_scoped_release release;
+                return self.poolGroupDescs().raw();
+            })
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("allow_seq_rebasing", &kv::KvCacheManager::allowSeqRebasing)
@@ -2354,7 +2405,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("buffers"))
         .def("adjust", &kv::KvCacheManager::adjust, nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("need_adjustment", &kv::KvCacheManager::needAdjustment);
+        .def_prop_ro("need_adjustment",
+            [](kv::KvCacheManager const& self)
+            {
+                nb::gil_scoped_release release;
+                return self.needAdjustment();
+            });
 
     // ---- PageIndexConverter ------------------------------------------------
     nb::class_<kv::PageIndexConverter>(m, "PageIndexConverter")
