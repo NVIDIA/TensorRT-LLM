@@ -45,7 +45,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `attention_dp_config.kv_cache_routing_max_sessions` | `<class 'int'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_new_conv_placement` | `Literal['round_robin', 'least_queued']` | `categorical` |  | `round_robin`, `least_queued` |
 | `attention_dp_config.timeout_iters` | `<class 'int'>` | `value` |  |  |
-| `attn_backend` | `<class 'str'>` | `categorical` | allowlist | `VANILLA`, `TRTLLM`, `FLASHINFER`, `FLASHINFER_STAR_ATTENTION` |
+| `attn_backend` | `<class 'str'>` | `categorical` | allowlist | `VANILLA`, `TRTLLM`, `FLASHINFER` |
 | `backend` | `Literal['pytorch']` | `categorical` |  | `pytorch` |
 | `batch_wait_max_tokens_ratio` | `<class 'float'>` | `value` |  |  |
 | `batch_wait_timeout_iters` | `<class 'int'>` | `value` |  |  |
@@ -58,9 +58,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cache_transceiver_config.max_tokens_in_buffer` | `Optional[int]` | `value` |  |  |
 | `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON', 'auto']]` | `categorical` |  | `CPP`, `PYTHON`, `auto` |
 | `context_parallel_size` | `<class 'int'>` | `value` |  |  |
-| `cp_config.block_size` | `Optional[int]` | `value` |  |  |
-| `cp_config.cp_anchor_size` | `Optional[int]` | `value` |  |  |
-| `cp_config.cp_type` | `<enum 'CpType'>` | `categorical` |  | `ULYSSES`, `STAR`, `RING`, `HELIX` |
+| `cp_config.cp_type` | `<enum 'CpType'>` | `categorical` |  | `ULYSSES`, `RING`, `HELIX` |
 | `cp_config.fifo_version` | `Optional[int]` | `value` |  |  |
 | `cp_config.tokens_per_block` | `Optional[int]` | `value` |  |  |
 | `cp_config.use_nccl_for_alltoall` | `Optional[bool]` | `value` |  |  |
@@ -219,7 +217,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `request_stats_max_iterations` | `Optional[int]` | `value` |  |  |
 | `return_perf_metrics` | `<class 'bool'>` | `value` |  |  |
 | `sampler_force_async_worker` | `<class 'bool'>` | `value` |  |  |
-| `sampler_type` | `Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]` | `categorical` | allowlist | `TRTLLMSampler`, `TorchSampler`, `auto` |
 | `scheduler_config.capacity_scheduler_policy` | `<enum 'CapacitySchedulerPolicy'>` | `categorical` |  | `MAX_UTILIZATION`, `GUARANTEED_NO_EVICT`, `STATIC_BATCH` |
 | `scheduler_config.context_chunking_policy` | `Optional[tensorrt_llm.llmapi.llm_args.ContextChunkingPolicy]` | `categorical` |  | `FIRST_COME_FIRST_SERVED`, `EQUAL_PROGRESS`, `FORCE_CHUNK` |
 | `scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window` | `<class 'int'>` | `value` |  |  |
@@ -312,7 +309,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.write_interval` | `<class 'int'>` | `value` |  |  |
 | `stream_interval` | `<class 'int'>` | `value` |  |  |
 | `telemetry_config.disabled` | `<class 'bool'>` | `value` |  |  |
-| `telemetry_config.usage_context` | `<enum 'UsageContext'>` | `categorical` |  | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval` |
+| `telemetry_config.usage_context` | `<enum 'UsageContext'>` | `categorical` |  | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval`, `disaggregated` |
 | `tensor_parallel_size` | `<class 'int'>` | `value` |  |  |
 | `tokenizer_mode` | `Literal['auto', 'slow']` | `categorical` |  | `auto`, `slow` |
 | `torch_compile_config.capture_num_tokens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |

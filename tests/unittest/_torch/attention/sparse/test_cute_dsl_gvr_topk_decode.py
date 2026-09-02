@@ -397,6 +397,107 @@ def test_cute_dsl_gvr_topk_decode_seqlen_sorted(
 
 
 # ===========================================================================
+# Degenerate-hint bracket-rewrite race regressions. A straggler warp reading
+# a leader-rewritten smem scalar (Phase-1 bracket, Phase-2 ``done`` flags,
+# Phase-4 bin-search publish) could skip a guarded barrier and corrupt the
+# row. Degenerate hints are reachable: CUDA-graph capture-warmup rows,
+# disagg gen-side first decode, stale or position-shifted priors, and
+# value-collision ties. Timing race: each test launches repeatedly over a
+# poisoned output buffer.
+# ===========================================================================
+
+
+@skip_not_sm100
+def test_cute_dsl_gvr_topk_decode_all_zeros_pre_idx(tie_aware_check) -> None:
+    """All-zeros ``pre_idx`` (CUDA-graph capture warmup, disagg gen-side
+    first decode) gathers one value per row: every CTA takes the degenerate
+    bracket rewrite — the race site. Pre-fix: wrong sets, unwritten slots,
+    out-of-range indices on most launches."""
+    top_k = 1024
+    num_rows, N = 4096, 4096
+    torch.manual_seed(7)
+    logits = torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 2.0
+    pre_idx = torch.zeros(num_rows, top_k, dtype=torch.int32, device="cuda")
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    ref_cache: dict = {}
+
+    for _ in range(40):
+        # Poison: any output slot the kernel fails to write stays negative
+        # and trips the checker's range assertion.
+        out_indices = torch.full((num_rows, top_k), -777777, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+            logits,
+            pre_idx,
+            seq_lens,
+            out_indices,
+            top_k=top_k,
+            next_n=1,
+            compress_ratio=1,
+            cluster_size=1,
+        )
+        torch.cuda.synchronize()
+        tie_aware_check(
+            out_indices,
+            logits,
+            seq_lens,
+            top_k,
+            1,
+            compress_ratio=1,
+            ref_vals_cache=ref_cache,
+        )
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("scenario", ["quantized", "plateau_wider_than_kc"])
+def test_cute_dsl_gvr_topk_decode_tie_degenerate_hint(scenario, tie_aware_check) -> None:
+    """Tie-heavy rows collide the gathered hint values bitwise, arming the
+    degenerate rewrite despite a real hint. ``quantized``: 0.25-step logits
+    (pre-fix: intermittent illegal memory access); ``plateau_wider_than_kc``:
+    0.0 tie class wider than ``kC`` (pins the plateau-collapse terminal and
+    plateau fill)."""
+    top_k = 512
+    num_rows, N = 1024, 16384
+    if scenario == "quantized":
+        torch.manual_seed(11)
+        logits = (torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 8.0).round() / 4.0
+    else:
+        n_win = 100
+        logits = torch.zeros(num_rows, N, dtype=torch.float32, device="cuda")
+        # Winners beyond column top_k+1 at stride >= 2: every hint-gathered
+        # column (offset +1) stays on the 0.0 plateau.
+        stride = (N - top_k - 2) // n_win
+        win_cols = top_k + 2 + stride * torch.arange(n_win, device="cuda")
+        logits[:, win_cols] = 1.0
+    pre_idx = torch.zeros(num_rows, top_k, dtype=torch.int32, device="cuda")
+    pre_idx[:, 0] = logits.argmax(dim=-1).int()
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    ref_cache: dict = {}
+
+    for _ in range(60):
+        out_indices = torch.full((num_rows, top_k), -777777, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+            logits,
+            pre_idx,
+            seq_lens,
+            out_indices,
+            top_k=top_k,
+            next_n=1,
+            compress_ratio=1,
+            cluster_size=1,
+        )
+        torch.cuda.synchronize()
+        tie_aware_check(
+            out_indices,
+            logits,
+            seq_lens,
+            top_k,
+            1,
+            compress_ratio=1,
+            ref_vals_cache=ref_cache,
+        )
+
+
+# ===========================================================================
 # GVR top-K multi-CTA short-row degrade boundary tests.
 #
 # For cluster_size > 1 each row is owned by a cluster of CTAs.  When the
@@ -1317,3 +1418,120 @@ def test_cute_dsl_gvr_topk_decode_plateau_terminal(dtype, variant):
     assert int((sel == 1.0).sum()) == (top_k - n_hi) * bs, "remaining slots must be plateau members"
     ref = torch.topk(lo.float(), top_k, dim=-1).values.sort(-1).values
     assert torch.equal(sel.sort(-1).values, ref)
+
+
+# ============================================================================
+# GVR non-converged threshold-search repair regressions (CuTe DSL counterpart
+# of #17550): hostile/degenerate hints and ReLU-sparse tie plateaus used to
+# yield a silently wrong top-K (row[0:K] or -1-padded rows). The tests force
+# the in-tree kernel via TRTLLM_GVR_TIERS_DISABLE; the tiers are covered by
+# test_cute_dsl_gvr_topk_tiers.py.
+# ============================================================================
+
+
+@pytest.fixture
+def _intree_only(monkeypatch):
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+        gvr_topk_decode_dispatch as _disp,
+    )
+
+    monkeypatch.setenv("TRTLLM_GVR_TIERS_DISABLE", "1")
+    _disp._reset_env_cache()
+    yield
+    monkeypatch.delenv("TRTLLM_GVR_TIERS_DISABLE", raising=False)
+    _disp._reset_env_cache()
+
+
+def _assert_exact_topk(out, logits, seq_lens, top_k, next_n, compress_ratio):
+    """Self-contained per-row exactness: no -1 beyond the legal short-row
+    pad, K distinct in-range indices, and a tie-aware value-multiset match
+    against torch.topk over the row's N_eff prefix."""
+    for r in range(out.shape[0]):
+        seq = int(seq_lens[r // next_n])
+        n_eff = min((seq - next_n + (r % next_n) + 1) // compress_ratio, logits.shape[1])
+        k_eff = min(top_k, n_eff)
+        idx = out[r].long()
+        n_neg = int((idx < 0).sum())
+        assert n_neg == top_k - k_eff, f"row {r}: {n_neg} -1 slots (legal pad = {top_k - k_eff})"
+        sel = idx[idx >= 0]
+        assert sel.numel() == k_eff, f"row {r}: {sel.numel()} valid indices, expected {k_eff}"
+        assert bool((sel < n_eff).all()), f"row {r}: out-of-range index (n_eff={n_eff})"
+        assert int(sel.unique().numel()) == k_eff, f"row {r}: duplicated indices"
+        row = logits[r, :n_eff].float()
+        assert torch.equal(
+            logits[r].float()[sel].sort().values, row.topk(k_eff).values.sort().values
+        ), f"row {r}: selected values differ from torch.topk"
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("hint", ["bottom_k", "uniform", "random"])
+def test_cute_dsl_gvr_topk_decode_hostile_hint(top_k, hint, _intree_only):
+    """A hint pointing away from the true top-K must not change the result;
+    ``uniform`` covers the degenerate bracket that used to emit row[0:K]."""
+    N, cr = 65536, 4
+    g = torch.Generator(device="cuda").manual_seed(1234)
+    logits = torch.randn(1, N, generator=g, dtype=torch.float32, device="cuda")
+    flat = logits[0]
+    if hint == "bottom_k":
+        pre = flat.topk(top_k, largest=False).indices.to(torch.int32)
+    elif hint == "uniform":
+        pre = torch.full((top_k,), N // 2, dtype=torch.int32, device="cuda")
+    else:
+        pre = torch.randint(0, N, (top_k,), generator=g, device="cuda", dtype=torch.int32)
+    pre = pre.view(1, top_k).contiguous()
+    seq_lens = torch.full((1,), N * cr, dtype=torch.int32, device="cuda")
+    out = torch.full((1, top_k), -1, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits, pre, seq_lens, out, top_k=top_k, next_n=1, compress_ratio=cr
+    )
+    torch.cuda.synchronize()
+    _assert_exact_topk(out, logits, seq_lens, top_k, 1, cr)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("n_pos", [3, 100, 1000])
+def test_cute_dsl_gvr_topk_decode_relu_sparse_plateau(n_pos, _intree_only):
+    """ReLU-sparse row (n_pos positives + exact-0.0 plateau wider than kC):
+    the fail-soft used to return (top_k - n_pos) trailing -1 slots."""
+    top_k, N, cr = 2048, 32768, 1
+    g = torch.Generator(device="cuda").manual_seed(61)
+    row = torch.zeros(N, dtype=torch.float32, device="cuda")
+    row[torch.randperm(N, generator=g, device="cuda")[:n_pos]] = (
+        torch.rand(n_pos, generator=g, device="cuda") + 1.0
+    )
+    logits = row.view(1, N).contiguous()
+    pre = row.topk(top_k).indices.to(torch.int32).view(1, top_k).contiguous()
+    seq_lens = torch.full((1,), N, dtype=torch.int32, device="cuda")
+    out = torch.full((1, top_k), -1, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits, pre, seq_lens, out, top_k=top_k, next_n=1, compress_ratio=cr
+    )
+    torch.cuda.synchronize()
+    _assert_exact_topk(out, logits, seq_lens, top_k, 1, cr)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("next_n", [2, 4])
+@pytest.mark.parametrize("hint", ["bottom_k", "uniform"])
+def test_cute_dsl_gvr_topk_decode_mtp_hostile_hint(next_n, hint, _intree_only):
+    """Hostile/degenerate hints under MTP row geometry (next_n > 1):
+    request-level hint sharing plus the per-row N_eff arithmetic must stay
+    exact when the repair path fires on every row."""
+    top_k, N, cr, n_req = 512, 65536, 4, 2
+    g = torch.Generator(device="cuda").manual_seed(7)
+    num_rows = n_req * next_n
+    logits = torch.randn(num_rows, N, generator=g, dtype=torch.float32, device="cuda")
+    if hint == "bottom_k":
+        pre1 = logits[0].topk(top_k, largest=False).indices.to(torch.int32)
+    else:
+        pre1 = torch.full((top_k,), N // 2, dtype=torch.int32, device="cuda")
+    pre = pre1.view(1, top_k).expand(n_req, -1).contiguous()
+    # exercise the mod-cr boundary: per-request kv_len differs by one token
+    seq_lens = torch.tensor([N * cr, N * cr - 1], dtype=torch.int32, device="cuda")
+    out = torch.full((num_rows, top_k), -1, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits, pre, seq_lens, out, top_k=top_k, next_n=next_n, compress_ratio=cr
+    )
+    torch.cuda.synchronize()
+    _assert_exact_topk(out, logits, seq_lens, top_k, next_n, cr)

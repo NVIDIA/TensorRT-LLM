@@ -36,6 +36,7 @@ from _source_identity_fakes import (
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     IdentityCheckPolicy,
     SourceIdentity,
     SourceIdentityMismatchError,
@@ -77,6 +78,7 @@ def test_from_model_config_requires_one_artifact_source() -> None:
     [
         LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
         QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+        QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     ],
 )
 def test_from_model_config_binds_transform_abi(transform_abi_id: str) -> None:

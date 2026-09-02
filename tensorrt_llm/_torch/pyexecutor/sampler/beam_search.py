@@ -12,35 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""PyTorch-native beam-search sampling kernels.
+"""Beam search for ``TorchSampler``.
 
-The candidate-selection, beam-expansion, and candidate-beams-array (CBA)
-beam-search logic for TorchSampler, split out of ``ops.vanilla``. Pure tensor
-functions plus their metadata dataclasses; no dependency on the
-``sampling_utils`` interface.
+The candidate-selection, beam-expansion and candidate-beams-array (CBA) logic:
+pure tensor functions plus the metadata dataclasses they consume
+(:class:`BeamSearchStore`, :class:`BeamSearchMetadata`, :class:`CBAState`,
+:class:`BeamHistory`).
+
+:class:`BeamSearchHandler` sits on top of those: it owns the store and the
+host-side state the CBA path needs, builds the per-step
+:class:`BeamSearchMetadata`, and is driven by ``TorchSampler``, which holds one
+instance.
+
+Unlike the per-step log-prob path, a beam's tokens and log-probs are only
+final once the winning path is known, so they are accumulated in
+:class:`BeamHistory` and emitted in one go by :func:`finalize_beam`.
 """
 
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, TypeAlias, cast
+from typing import Any, Callable, NamedTuple, Optional, TypeAlias, cast
 
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.executor.result import Logprob
 
 from ..llm_request import LlmRequest, LlmRequestState
-from .logprobs import LogProbsStore, convert_logprobs_tensor_to_list
+from .logprobs import LogProbsStore
 from .ops.flashinfer import radix_topk_op
 from .ops.vanilla import StrategyMetadata
 from .sampler_common import _get_beam_width_in, _unwrap_singleton, int_tensor
-
-if TYPE_CHECKING:
-    # Type-only: the async-D2H copier is a private detail of sampler.py and is
-    # injected as a bound method, so importing it at runtime would create a cycle.
-    from .sampler import _SideStreamCopier
+from .sampler_features import _SideStreamCopier
 
 BEAM_SEARCH_PAD_TOKEN = -1
 
@@ -642,11 +648,11 @@ def _cba_step_math(
     # applied before log_softmax and so never reaches the accumulated score,
     # and vLLM, which ranks purely by cum_logprob / seq_len**length_penalty.
     #
-    # The C++ kernels here diverge from all three: they fold
-    # `diversityRate * source_beam_index` into pLocalLogProbs
-    # (beamSearchKernels.cu), which then flows into normedScoresCBA and
-    # bestAttainableScore (beamSearchKernelsTemplate.h), so with diversity_rate
-    # set they order the pool and reach the done verdict differently. Do not
+    # The former C++ beam-search kernels diverged from all three: they folded
+    # `diversityRate * source_beam_index` into the local log-probs, which then
+    # flowed into the normalized CBA scores and the best-attainable score, so
+    # with diversity_rate set they ordered the pool and reached the done verdict
+    # differently. Do not
     # "fix" this by matching them: a cumulative_logprob carrying
     # `diversity_rate * beam_index` is no longer a log-probability, and the
     # offset depends on which slot the beam happened to occupy (TRTLLM-14792).
@@ -1201,13 +1207,48 @@ def _prepare_beam_history_cba(
         return BeamHistory(
             tokens=tokens,
             # [beam, tokens, 1]: the sampled token's logprob per position,
-            # matching the shape contract of _convert_logprobs_tensor_to_list.
+            # matching the shape contract of convert_logprobs_tensor_to_list.
             logprobs=log_probs.unsqueeze(-1) if log_probs is not None else None,
             logprobs_indices=tokens.unsqueeze(-1) if return_log_probs else None,
             cum_logprobs=cum_logprobs,
         )
 
     return _builder
+
+
+def convert_logprobs_tensor_to_list(
+    token_tensor: torch.Tensor,
+    logprobs_tensor: torch.Tensor,
+) -> list[list[dict[int, Logprob]]]:
+    """Convert the logprobs tensor to a list of lists of dictionaries of Logprob objects
+
+    Logprobs storage expects logprobs as a list[list[dict[int, Logprob]]] object
+
+    args:
+        token_tensor: torch.Tensor. Shape: beam_width, num_tokens, num_logprobs
+        logprobs_tensor: torch.Tensor. Shape: beam_width, num_tokens, num_logprobs
+    output:
+        list[list[dict[int, Logprob]]]. Shape: (beam_width, num_tokens)
+    """
+    assert token_tensor.dim() == 3 and logprobs_tensor.dim() == 3, (
+        f"Token and logprobs tensors must have 3 dimensions (beam_width, num_tokens, num_logprobs). \
+        Got shapes (token_tensor) {token_tensor.shape} and (logprobs_tensor) {logprobs_tensor.shape} instead"
+    )
+
+    token_log_probs: list[list[dict[int, Logprob]]] = []
+    token_list = token_tensor.tolist()
+    logprobs_list = logprobs_tensor.tolist()
+    for beam_idx in range(token_tensor.shape[0]):
+        beam_token_log_probs: list[dict[int, Logprob]] = []
+        for topk_token, topk_logprob in zip(token_list[beam_idx], logprobs_list[beam_idx]):
+            logprobs = {
+                token: Logprob(logprob=logprob, rank=rank + 1)
+                for rank, (token, logprob) in enumerate(zip(topk_token, topk_logprob))
+            }
+            beam_token_log_probs.append(logprobs)
+        token_log_probs.append(beam_token_log_probs)
+
+    return token_log_probs
 
 
 def finalize_beam(
@@ -1286,7 +1327,7 @@ class BeamSearchHandler:
         use_speculative_d2h: bool,
         has_multi_token_stop_words: Callable[[LlmRequest], bool],
         copy_to_host: Callable[[torch.Tensor], torch.Tensor],
-        make_side_stream_copier: Callable[[], AbstractContextManager["_SideStreamCopier"]],
+        make_side_stream_copier: Callable[[], AbstractContextManager[_SideStreamCopier]],
     ):
         self._store = store
         self._max_seq_len = max_seq_len
@@ -1303,6 +1344,89 @@ class BeamSearchHandler:
         # Stop-word length check lives with finish-reason handling, which also
         # uses it outside beam search; injected rather than duplicated here.
         self._has_multi_token_stop_words = has_multi_token_stop_words
+
+    def build_metadata(
+        self,
+        *,
+        requests: list[LlmRequest],
+        group_req_indices: torch.Tensor,
+        seq_slots: torch.Tensor,
+        seq_lens: torch.Tensor | None,
+        seq_slots_cuda: torch.Tensor,
+        seq_lens_cuda: torch.Tensor,
+        num_requests: int,
+        new_log_probs: torch.Tensor,
+        end_ids_cuda: torch.Tensor,
+        past_tokens_cuda: torch.Tensor,
+    ) -> BeamSearchMetadata:
+        """Build the beam-search metadata for a beam-search group.
+
+        Assembles the per-step view the CBA op consumes: the persistent store
+        tensors plus the group's slot/length tensors and the host-derived
+        ``max_gen_len`` bound. Mirrors ``TopPDecayHandler.build_metadata``.
+
+        ``new_log_probs``, ``end_ids_cuda`` and ``past_tokens_cuda`` are owned
+        by the log-probs and finish-reason handlers respectively and are passed
+        in rather than reached for, keeping this module independent of them.
+        """
+        store = self._store
+        assert store is not None
+        assert seq_lens is not None, "seq_lens is required for beam search"
+        # Reuse the precomputed CUDA tensors when the strategy group
+        # covers the full batch (typical single-strategy case);
+        # otherwise fall back to a per-group H2D for the subset.
+        if group_req_indices.size(0) == num_requests:
+            group_seq_slots_cuda = seq_slots_cuda
+            group_seq_lens_cuda = seq_lens_cuda
+        else:
+            group_seq_slots_cuda = seq_slots[group_req_indices].to(
+                device="cuda", dtype=torch.int64, non_blocking=True
+            )  # Should be on device for beam search, need long for index_copy_
+            group_seq_lens_cuda = seq_lens[group_req_indices].to(
+                device="cuda", non_blocking=True
+            )  # Should be on device for beam search
+        return BeamSearchMetadata(
+            cache_indirection=store.cache_indirection,
+            cache_indirection_buffer=store.cache_indirection_buffer,
+            cum_log_probs=store.cum_log_probs,
+            new_log_probs=new_log_probs,
+            seq_slots=group_seq_slots_cuda,
+            seq_lens=group_seq_lens_cuda,
+            finished_beams=store.first_finish_reasons,
+            pending_harvest=store.pending_harvest,
+            predecessor_beams=store.predecessor_beams,
+            beam_idx_arange=store.beam_idx_arange,
+            stop_past_tokens=past_tokens_cuda,
+            # None unless a beam-search request has been
+            # admitted; the CBA tensors are not allocated before that.
+            cba=None
+            if store.cba is None
+            else CBAState(
+                # Context-only requests already carry the masked end id in the
+                # store -- FinishReasonsHandler.prepare_for_new_request writes
+                # the sentinel for them once, at setup -- so the CBA op reads
+                # it from here with no per-step work.
+                end_ids=end_ids_cuda,
+                prompt_lens=store.prompt_lens,
+                original_tokens=store.original_tokens,
+                batch_dones=store.batch_dones,
+                cba_tokens=store.cba.cba_tokens,
+                cba_cum_log_probs=store.cba.cba_cum_log_probs,
+                cba_normed_scores=store.cba.cba_normed_scores,
+                cba_lengths=store.cba.cba_lengths,
+                original_log_probs=store.cba.original_log_probs,
+                cba_log_probs=store.cba.cba_log_probs,
+                cba_caps=store.cba.cba_caps,
+                max_seq_len=self._max_seq_len,
+                max_gen_len=max(
+                    (
+                        requests[i].max_beam_num_tokens + 2 - requests[i].py_prompt_len
+                        for i in group_req_indices.tolist()
+                    ),
+                    default=0,
+                ),
+            ),
+        )
 
     def clear_slot(self, slot: int) -> None:
         """Drop stale predictor state from a prior occupant of ``slot``."""
@@ -1445,7 +1569,7 @@ class BeamSearchHandler:
             return [self._speculative_builder(req) for req in requests], None
 
         # Single `with` for both modes; nullcontext yields None.
-        copier_ctx: AbstractContextManager["_SideStreamCopier | None"] = (
+        copier_ctx: AbstractContextManager[_SideStreamCopier | None] = (
             self._make_side_stream_copier() if self._use_speculative_d2h else nullcontext()
         )
         with copier_ctx as copier:

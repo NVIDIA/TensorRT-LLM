@@ -323,6 +323,7 @@ class _KVCache:
         custom_priority_callback: Callable[[int, Any], Priority],
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
+        enable_request_stats: bool = False,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -514,6 +515,7 @@ class KVCacheManager:
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
+        enable_request_stats: bool = False,
     ) -> _KVCache: ...
     def probe_reuse(
         self,
@@ -527,6 +529,9 @@ class KVCacheManager:
     def get_and_reset_ssm_snapshot_iteration_stats(
         self,
     ) -> dict[LifeCycleId, SsmSnapshotIterationStatsDelta]: ...
+    def record_request_suspended(self) -> None: ...
+    def record_request_resumed(self) -> None: ...
+    def get_and_reset_iteration_suspend_resume_stats(self) -> tuple[int, int]: ...
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel
     ) -> Sequence[PoolGroupPeakBlockStats]: ...

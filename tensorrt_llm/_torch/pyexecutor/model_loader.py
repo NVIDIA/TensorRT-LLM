@@ -6,6 +6,7 @@ import inspect
 import os
 import traceback
 import warnings
+from dataclasses import replace
 from enum import Enum
 from typing import Callable, Optional, Tuple
 
@@ -16,7 +17,8 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
-    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
+    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, PostTransformConfigIdentity, PostTransformFeature,
     PostTransformProfile, PostTransformProfileRegistry,
     PostTransformQualificationDecision, PostTransformRuntimeConfig,
@@ -41,9 +43,9 @@ from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
-from ..modules.fused_moe.moe_load_balancer import (
-    MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
+from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+                                               maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
@@ -51,10 +53,11 @@ from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
+    "fp8_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
     "auto": "auto"
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
+_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto")
 
 # Dense models do not consume the MoE backend or MoE mapping dimensions. Their
 # runtime topology remains bounded by the general and attention dimensions.
@@ -77,6 +80,10 @@ _MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
     tied_word_embeddings=frozenset({False}),
     rope_types=frozenset({"default"}),
     rope_fusion=frozenset({True}),
+)
+_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    rope_fusion=frozenset({False}),
 )
 
 
@@ -389,6 +396,7 @@ class ModelLoader:
         if cls._POST_TRANSFORM_PROFILE_REGISTRY is None:
             from ..models.modeling_llama import LlamaForCausalLM
             from ..models.modeling_qwen import Qwen2ForCausalLM
+            from ..models.modeling_qwen3 import Qwen3ForCausalLM
             cls._POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
                 profiles=(
                     PostTransformProfile(
@@ -415,6 +423,20 @@ class ModelLoader:
                         QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
                         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
                         runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+                    ),
+                    PostTransformProfile(
+                        profile_id="qwen3-for-causal-lm-bf16-target-v1",
+                        root_model_class=Qwen3ForCausalLM,
+                        architecture="Qwen3ForCausalLM",
+                        model_type="qwen3",
+                        speculative_mode=None,
+                        protocol_version=cls.
+                        _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+                        transform_abi_id=
+                        QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+                        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+                        runtime_constraints=
+                        _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
                     ),
                 ))
         return cls._POST_TRANSFORM_PROFILE_REGISTRY
@@ -1506,6 +1528,11 @@ class ModelLoader:
 
         resolve_mtp_checkpoint_source(self.spec_config, checkpoint_dir)
 
+        # Mirror use_fine_grained_sync into env var so C++ getEnvUseFineGrainedSync()
+        # sees it at kernel-option construction time. Never write "0": that would
+        # clobber an externally exported TLLM_USE_FINE_GRAINED_SYNC=1.
+        if self.llm_args.use_fine_grained_sync:
+            os.environ["TLLM_USE_FINE_GRAINED_SYNC"] = "1"
         load_config_kwargs = dict(
             checkpoint_dir=checkpoint_dir,
             trust_remote_code=self.llm_args.trust_remote_code,
@@ -1561,6 +1588,8 @@ class ModelLoader:
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
+        config.extra_attrs[
+            'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are

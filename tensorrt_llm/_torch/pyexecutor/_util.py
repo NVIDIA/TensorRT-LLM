@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
@@ -24,16 +24,14 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_str)
-from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
     KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig,
-    MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SamplerType,
-    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
-    WaitingQueuePolicy)
+    MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
+    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
@@ -41,6 +39,7 @@ from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
                                                    supports_native_fp8_lora)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
@@ -72,16 +71,12 @@ from .py_executor import PyExecutor
 from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
-from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
-                      TRTLLMSampler)
+from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
                         MultimodalScheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
-
-if TYPE_CHECKING:
-    import transformers
 
 GB = 1 << 30
 
@@ -652,16 +647,12 @@ class KvCacheCreator:
         # (e.g. ``MiniMaxM3KVCacheManagerV2`` from the sparse-attention path)
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
+            sparse_attn_config = model_config.sparse_attention_config
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("max_beam_width > 1")
-            sparse_attn_config = model_config.sparse_attention_config
-            if (sparse_attn_config is not None
-                    and sparse_attn_config.algorithm == "dsa"
-                    and self._mapping.cp_config.get("cp_type") == CpType.STAR):
-                incompat.append("STAR context parallelism")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Never silently replace a sparse V2 manager with V1. Some
@@ -852,8 +843,9 @@ class KvCacheCreator:
                 self._profiling_stage_data,
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
             return []
-        # No local multimodal encoder (disable_mm_encoder or MM E/P disagg):
-        # nothing to profile.
+        if self._llm_args.disable_mm_encoder:
+            return []
+        # MM E/P disaggregation may remove an otherwise exposed encoder.
         if (hasattr(self._model_engine.model, "mm_encoder")
                 and self._model_engine.model.mm_encoder is None):
             return []
@@ -1014,10 +1006,13 @@ class KvCacheCreator:
             )
         num_cache_blocks *= num_pool_groups
 
-        # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
-        max_num_tokens_for_estimation = (
-            num_cache_blocks * self._tokens_per_block *
-            self._dummy_reqs[0].sampling_config.beam_width)
+        # Dummy context requests use the configured maximum beam width. Scale
+        # their block budget by the same value so the temporary KV cache used
+        # during warm-up can accommodate those requests.
+        num_cache_blocks *= self._max_beam_width
+
+        max_num_tokens_for_estimation = (num_cache_blocks *
+                                         self._tokens_per_block)
         # V2 capacity is controlled by max_gpu_total_bytes; max_tokens only
         # describes the dummy workload needed for estimation.
         if self._is_kv_cache_manager_v2:
@@ -1364,7 +1359,8 @@ class KvCacheCreator:
         self,
         model_engine: PyTorchModelEngine,
         estimating_kv_cache: bool = False,
-        kv_cache_config_override: Optional[KvCacheConfig] = None
+        kv_cache_config_override: Optional[KvCacheConfig] = None,
+        cold_page_codec_provider: Optional[object] = None,
     ) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -1402,6 +1398,7 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
+            cold_page_codec_provider=cold_page_codec_provider,
         )
 
         if not self._skip_est:
@@ -1518,6 +1515,7 @@ class KvCacheCreator:
         max_seq_len: int,
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
+        cold_page_codec_provider: Optional[object] = None,
     ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
@@ -1589,6 +1587,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
+            cold_page_codec_provider=cold_page_codec_provider,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -2051,10 +2050,23 @@ class KvCacheCreator:
                         budget_attr, self_kv_cache_config,
                         draft_kv_cache_config))
 
+        compression_config = self._llm_args.kv_cache_compression_config
+        compression_manager = create_kv_cache_compression_manager(
+            compression_config,
+            model_engine=self._model_engine,
+            kv_cache_config=self_kv_cache_config,
+            estimating_kv_cache=estimating_kv_cache and not self._skip_est,
+        )
+        cold_page_codec_provider = (
+            compression_manager if compression_manager is not None
+            and compression_manager.provides_cold_page_codec else None)
+
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine,
             estimating_kv_cache,
-            kv_cache_config_override=self_kv_cache_config)
+            kv_cache_config_override=self_kv_cache_config,
+            cold_page_codec_provider=cold_page_codec_provider,
+        )
 
         # Carry the fp8 context-MLA workspace admission cap (computed in configure_kv_cache_capacity) onto
         # the real KV manager so the scheduler reads it directly instead of re-deriving from pool layout.
@@ -2092,7 +2104,8 @@ class KvCacheCreator:
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
                 original_max_seq_len,
                 estimating_kv_cache,
-                kv_cache_config_override=draft_build_kv_cache_config)
+                kv_cache_config_override=draft_build_kv_cache_config,
+                cold_page_codec_provider=cold_page_codec_provider)
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
@@ -2106,9 +2119,17 @@ class KvCacheCreator:
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
         resources[
             ResourceManagerType.CROSS_KV_CACHE_MANAGER] = cross_kv_cache_manager
+        if (compression_manager is not None
+                and compression_manager.uses_iteration_lifecycle):
+            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
+                compression_manager)
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model, draft model, and cross pool."""
+        compression_manager = resources.pop(
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, None)
+        if compression_manager is not None:
+            compression_manager.shutdown()
         resources[ResourceManagerType.KV_CACHE_MANAGER].shutdown()
         del resources[ResourceManagerType.KV_CACHE_MANAGER]
         draft_kv_cache_manager = resources[
@@ -2220,11 +2241,18 @@ def _create_kv_cache_manager(
         num_kv_heads: Optional[Union[int, List[int]]] = None,
         head_dim: Optional[int] = None,
         kv_cache_type=None,
-        is_disagg: bool = False) -> KVCacheManager:
+        is_disagg: bool = False,
+        cold_page_codec_provider: Optional[object] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
+    if cold_page_codec_provider is not None and not issubclass(
+            kv_cache_manager_cls, KVCacheManagerV2):
+        raise ValueError(
+            "Cold-page quantization requires the resolved KV cache manager "
+            f"to be KVCacheManagerV2; selected {kv_cache_manager_cls.__name__}")
+
     if (estimating_kv_cache
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
             and kv_cache_config.pool_ratio is None
@@ -2351,6 +2379,8 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        manager_extra_kwargs[
+            "cold_page_codec_provider"] = cold_page_codec_provider
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
@@ -2426,6 +2456,7 @@ def _create_kv_cache_manager(
             head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             is_draft=is_draft,
             max_batch_size=max_batch_size,
             mapping=mapping,
@@ -2568,6 +2599,7 @@ def _create_kv_cache_manager(
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             is_draft=is_draft,
             max_batch_size=max_batch_size,
             mapping=mapping,
@@ -2675,6 +2707,7 @@ def _create_kv_cache_manager(
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             is_draft=is_draft,
             max_batch_size=max_batch_size,
             mapping=mapping,
@@ -2752,6 +2785,21 @@ def validate_kv_cache_compression_compatibility(
     spec_config: Optional[SpeculativeConfig],
 ) -> None:
     """Reject unsupported KV-cache compression feature combinations."""
+    if config.algorithm == "quantization_for_cold_page":
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND
+
+        if _BACKEND == "python":
+            raise ValueError(
+                "Cold-page quantization requires the C++ KVCacheManagerV2 backend"
+            )
+        if config.quant == "nvfp4" and not is_sm_100f():
+            raise RuntimeError(
+                "NVFP4 cold-page quantization requires an SM100-family device "
+                "(SM100 or SM103).")
+    elif config.algorithm == "triattention" and not is_sm_100f():
+        raise RuntimeError(
+            "TriAttention requires an SM100-family device (SM100 or SM103).")
+
     if kv_cache_config.enable_block_reuse and not config.supports_block_reuse():
         raise ValueError(
             f"KV-cache compression algorithm {config.algorithm!r} does not "
@@ -2760,44 +2808,71 @@ def validate_kv_cache_compression_compatibility(
     if spec_config is None:
         return
     if not config.supports_speculative_decoding():
+        guidance = ("; TriAttention requires eviction_mode='union'"
+                    if config.algorithm == "triattention" else "")
         raise ValueError(
             f"KV-cache compression algorithm {config.algorithm!r} does not "
-            "support speculative decoding with its current configuration; "
-            "TriAttention requires eviction_mode='union'")
+            "support speculative decoding with its current configuration"
+            f"{guidance}")
     mode = spec_config.spec_dec_mode
-    if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
+    if config.algorithm == "quantization_for_cold_page":
+        supported = mode.is_mtp_eagle_one_model() or mode.is_eagle3_one_model()
+        guidance = "one-model MTP-EAGLE or EAGLE3"
+    else:
+        supported = mode.is_mtp_one_model() or mode.is_eagle3_one_model()
+        guidance = "one-model MTP or EAGLE3"
+    if not supported:
         raise ValueError(
             f"KV-cache compression does not support speculative decoding "
-            f"mode {mode.name}; use one-model MTP or EAGLE3")
+            f"mode {mode.name}; use {guidance}")
 
 
 def create_kv_cache_compression_manager(
-    config: KvCacheCompressionConfig,
-    kv_cache_manager: KVCacheManagerV2,
-    draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
-    pretrained_config: Optional["transformers.PretrainedConfig"] = None,
+    config: Optional[KvCacheCompressionConfig],
+    *,
+    model_engine: PyTorchModelEngine,
+    kv_cache_config: KvCacheConfig,
+    estimating_kv_cache: bool = False,
 ) -> Optional[KVCacheCompressionManager]:
-    """Build the KV-cache compression manager for ``config.algorithm``, or return
-    None if no algorithm matches.
+    """Validate, select, and construct the configured manager before KVCM."""
+    if config is None:
+        return None
+    if model_engine.mapping.has_cp_helix():
+        # TODO: Revisit after KVCC validates HELIX-sharded Page ownership and migration.
+        raise ValueError(
+            "KV-cache compression does not support HELIX context parallelism.")
 
-    Called from ``create_py_executor`` and registered as a resource manager,
-    like the KV cache manager itself. Concrete algorithms add a dispatch branch
-    here. Feature compatibility is checked before resource-manager construction.
-    """
+    if config.algorithm == "quantization_for_cold_page":
+        if config.quant != "nvfp4":
+            raise NotImplementedError(
+                f"Unsupported cold-page quantization format {config.quant!r}")
+        if estimating_kv_cache:
+            return None
+        quant_config = model_engine.model.model_config.quant_config
+        if (quant_config is not None and getattr(
+                quant_config, "kv_cache_quant_algo", None) == QuantAlgo.NVFP4):
+            logger.info(
+                "Skipping cold-page NVFP4 quantization because the active KV "
+                "cache already uses NVFP4; KVCM will migrate it losslessly.")
+            return None
+
+        validate_kv_cache_compression_compatibility(config, kv_cache_config,
+                                                    model_engine.spec_config)
+        from ..kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import \
+            Nvfp4ColdPageQuantizationCompression
+
+        return Nvfp4ColdPageQuantizationCompression(config)
+
     if config.algorithm == "triattention":
-        if not is_sm_100f():
-            raise RuntimeError(
-                "TriAttention requires an SM100-family device (SM100 or SM103)."
-            )
+        validate_kv_cache_compression_compatibility(config, kv_cache_config,
+                                                    model_engine.spec_config)
         # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
         from ..kv_cache_compression.triattention.triattention import \
             TriAttentionCompressionManager
 
         return TriAttentionCompressionManager(
             config,
-            kv_cache_manager,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-            pretrained_config=pretrained_config,
+            pretrained_config=model_engine.model.model_config.pretrained_config,
         )
 
     logger.warning(
@@ -3067,24 +3142,13 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
-    # Register the compression manager (if one is configured) with the other
-    # managers, before building ResourceManager, so it is part of the manager
-    # set from the start. Reads its own config, not the sparse-attention one.
-    kv_cache_compression_config = getattr(llm_args,
-                                          "kv_cache_compression_config", None)
-    if kv_cache_compression_config is not None:
-        draft_kv_cache_manager = resources.get(
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-        compression_manager = create_kv_cache_compression_manager(
-            kv_cache_compression_config,
-            kv_cache_manager,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-            pretrained_config=model_engine.model.model_config.pretrained_config,
+    compression_manager = resources.get(
+        ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
+    if compression_manager is not None:
+        compression_manager.bind_kv_cache_managers(
+            resources[ResourceManagerType.KV_CACHE_MANAGER],
+            resources.get(ResourceManagerType.DRAFT_KV_CACHE_MANAGER),
         )
-        if compression_manager is not None:
-            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
-                compression_manager)
-
     resource_manager = ResourceManager(resources)
 
     # KV cache manager runs last (others may depend on it), except the
@@ -3097,7 +3161,8 @@ def create_py_executor_instance(
     if cross_kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.CROSS_KV_CACHE_MANAGER, last=True)
-    # Compression is the final reconciler after every native KV manager.
+    # Iteration-driven compression is the final reconciler after every native
+    # KV manager. Cold-page quantization runs only at native storage migration.
     if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
             in resource_manager.resource_managers):
         resource_manager.resource_managers.move_to_end(
@@ -3333,11 +3398,8 @@ def instantiate_sampler(
     *,
     max_batch_size: int,
     max_beam_width: int,
-    max_seq_len: int,
     mm_encoder_only: bool,
     speculative_config: SpeculativeConfig,
-    decoding_config: trtllm.DecodingConfig,
-    kv_cache_config: KvCacheConfig,
     max_num_sequences: Optional[int] = None,
 ):
     enable_async_worker = (confidential_compute_enabled()
@@ -3355,11 +3417,6 @@ def instantiate_sampler(
         enable_speculative_beam_history_d2h,
         max_num_sequences=max_num_sequences,
     )
-    decoding_mode = get_decoding_mode(decoding_config=decoding_config,
-                                      max_beam_width=max_beam_width)
-    if mapping.cp_config.get('cp_type') == CpType.STAR:
-        assert llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        return TorchSampler(sampler_args)
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)
@@ -3367,50 +3424,10 @@ def instantiate_sampler(
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
         return EarlyStopWithMMResult()
-    if llm_args.sampler_type == SamplerType.TRTLLMSampler:
-        logger.warning(
-            "TRTLLMSampler is deprecated and will be removed in release 1.4. Please use TorchSampler instead."
-        )
-        logger.debug(f"DecodingMode: {decoding_mode.name}")
-        return TRTLLMSampler(engine.model,
-                             engine.dtype,
-                             mapping,
-                             decoding_mode,
-                             llm_args.disable_overlap_scheduler,
-                             max_seq_len=max_seq_len,
-                             max_batch_size=max_batch_size,
-                             max_beam_width=max_beam_width,
-                             decoding_config=decoding_config,
-                             kv_cache_config=kv_cache_config,
-                             enable_async_worker=enable_async_worker,
-                             max_num_sequences=max_num_sequences)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
     return TorchSampler(sampler_args)
-
-
-def get_decoding_mode(
-    decoding_config: trtllm.DecodingConfig,
-    max_beam_width: int,
-) -> DecodingMode:
-    '''This implementation is based off trtGptModelInflightBatching.cpp getDecodingMode().'''
-    if decoding_config and decoding_config.decoding_mode and not decoding_config.decoding_mode.isAuto(
-    ):
-        decoding_mode = decoding_config.decoding_mode
-    elif max_beam_width == 1:
-        decoding_mode = DecodingMode.TopKTopP()
-    else:
-        decoding_mode = DecodingMode.BeamSearch()
-
-    # Override decoding mode when beam width is one
-    if max_beam_width == 1 and decoding_mode.isBeamSearch():
-        logger.warning(
-            "Beam width is set to 1, but decoding mode is BeamSearch. Overwriting decoding mode to TopKTopP."
-        )
-        decoding_mode = DecodingMode.TopKTopP()
-
-    return decoding_mode
 
 
 _ATTN_MODULES = frozenset({
@@ -3583,16 +3600,8 @@ def _adjust_torch_mem_fraction():
     torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)
 
 
-def validate_feature_combination(llm_args, model_engine, sampler_type):
+def validate_feature_combination(llm_args, model_engine):
     # Validate the flags for features' combination
-    compression_config = llm_args.kv_cache_compression_config
-    if compression_config is not None:
-        validate_kv_cache_compression_compatibility(
-            compression_config,
-            llm_args.kv_cache_config,
-            model_engine.spec_config,
-        )
-
     def init_feature_status(llm_args) -> Dict[str, bool]:
         assert isinstance(
             llm_args, TorchLlmArgs
@@ -3606,8 +3615,6 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
             "mtp",
             "eagle3_one_model",
             "eagle3_two_model",
-            "torch_sampler",
-            "trtllm_sampler",
             "kv_cache_reuse",
             "slide_window_attention",
             "guided_decoding",
@@ -3629,11 +3636,6 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
             isinstance(llm_args.speculative_config, EagleDecodingConfig)
             and not llm_args.speculative_config.eagle3_one_model)
         feature_status[
-            "torch_sampler"] = sampler_type == SamplerType.TorchSampler
-        feature_status[
-            "trtllm_sampler"] = sampler_type == SamplerType.TRTLLMSampler
-
-        feature_status[
             "kv_cache_reuse"] = llm_args.kv_cache_config is not None and llm_args.kv_cache_config.enable_block_reuse
         feature_status["slide_window_attention"] = (
             hasattr(model_engine.model.model_config.pretrained_config,
@@ -3650,29 +3652,9 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
 
     feature_status: Dict[str, bool] = init_feature_status(llm_args)
 
-    ERR_MSG_TMPL = "{feature1} and {feature2} enabled together is not supported yet."
-
-    CONFLICT_RULES = [
-        {
-            "features": ["trtllm_sampler", "mtp"],
-            "message":
-            ERR_MSG_TMPL.format(feature1="trtllm_sampler", feature2="mtp") +
-            " Please use sampler type auto instead."
-        },
-        {
-            "features": ["trtllm_sampler", "eagle3_one_model"],
-            "message":
-            ERR_MSG_TMPL.format(feature1="trtllm_sampler",
-                                feature2="eagle3_one_model") +
-            " Please use sampler type auto instead."
-        },
-        {
-            "features": ["trtllm_sampler", "eagle3_two_model"],
-            "message":
-            ERR_MSG_TMPL.format(feature1="trtllm_sampler",
-                                feature2="eagle3_two_model") +
-            " Please use sampler type auto instead."
-        },
+    # Kept as an extension point; there are currently no conflicting feature
+    # combinations to reject.
+    CONFLICT_RULES: list[dict[str, Any]] = [
         # Add new conflict rules here in the future
     ]
     for rule in CONFLICT_RULES:

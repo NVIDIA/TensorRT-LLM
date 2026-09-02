@@ -32,8 +32,8 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     CompletionFlagReadTimeout,
     reject_rank_mask_cuda_graph_capture,
 )
-from tensorrt_llm._torch.modules.fused_moe.ep_group_health import EPGroupHealth
-from tensorrt_llm._torch.modules.fused_moe.wide_ep_ft import get_wide_ep_ft_options
+from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
+from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import get_wide_ep_ft_options
 
 
 class FakeCompletionFlagReader:

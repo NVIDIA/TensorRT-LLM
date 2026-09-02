@@ -4,6 +4,9 @@ import enum
 import math
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, Optional, Union
 
@@ -14,7 +17,7 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
-from tensorrt_llm._torch.peft.lora.layer import LoraLayer, add_lora_result
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
@@ -31,7 +34,6 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
 from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
@@ -899,11 +901,14 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         """
         weight_mode = module.weights_loading_config.weight_mode
         shard_key_to_index = weight_mode.shard_key_to_index
+        compute_device = module.weight.device
+        if compute_device.type == "cpu" and torch.cuda.is_available():
+            compute_device = torch.device("cuda")
 
         # Handle input_scale
         if hasattr(module, "has_static_input_scale"):
             # Compute max and replace input_scale with a new parameter
-            max_input_scale = module.tmp_input_scales.max()
+            max_input_scale = module.tmp_input_scales.to(compute_device).max()
             module.input_scale.data.copy_(max_input_scale)
             # Also update inv_input_scale for static quantization
             if hasattr(
@@ -917,13 +922,13 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 module.inv_input_scale = None
 
         # Compute max weight_scale
-        max_weight_scale = module.tmp_weight_scales.max()
+        max_weight_scale = module.tmp_weight_scales.to(compute_device).max()
         module.weight_scale.data.copy_(max_weight_scale)
 
         # Rescale each weight shard: (weight * original_scale) / max_scale
         for shard_key in weight_mode.shard_keys:
             idx = shard_key_to_index[shard_key]
-            original_scale = module.tmp_weight_scales[idx]
+            original_scale = module.tmp_weight_scales[idx].to(compute_device)
 
             # Get shard position from mapping
             shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
@@ -932,12 +937,14 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             # Rescale: FP8 -> BF16 -> multiply by original_scale -> divide by max_scale -> FP8
             weight_shard = module.weight.data[shard_offset:shard_offset +
                                               shard_size]
-            rescaled_weight = weight_shard.to(module.dtype).mul_(original_scale)
+            rescaled_weight = weight_shard.to(compute_device).to(
+                module.dtype).mul_(original_scale)
             rescaled_weight = rescaled_weight.div_(
                 max_weight_scale.to(rescaled_weight.device)).to(
                     torch.float8_e4m3fn)
             module.weight.data[shard_offset:shard_offset +
-                               shard_size] = rescaled_weight
+                               shard_size] = rescaled_weight.to(
+                                   module.weight.device)
 
         delattr(module, "tmp_input_scales")
         delattr(module, "tmp_weight_scales")
@@ -2119,7 +2126,7 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         input, original_shape = self._prepare_input(module, input)
-        from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import \
+        from tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4 import \
             dequant_nvfp4_2d_triton
         weight_deq = dequant_nvfp4_2d_triton(
             module.weight.view(torch.uint8),
@@ -3160,28 +3167,146 @@ def _mxfp8_cutlass_op_available() -> bool:
                    ) and torch.cuda.get_device_capability()[0] >= 10
 
 
+_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
+    "flashinfer_mxfp8_autotune_active", default=False)
+_FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
+    "flashinfer_mxfp8_decode_graph_capture_active", default=False)
+
+
+@contextmanager
+def flashinfer_mxfp8_autotune() -> Iterator[None]:
+    """Tune FlashInfer MXFP8 tactics while enabling auto-dispatched calls."""
+    from flashinfer import autotune
+
+    token = _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.set(True)
+    try:
+        with autotune():
+            yield
+    finally:
+        _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.reset(token)
+
+
+@contextmanager
+def flashinfer_mxfp8_decode_graph_capture() -> Iterator[None]:
+    """Enable auto-dispatched FlashInfer calls only for decode graph capture."""
+    token = _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(token)
+
+
 class MXFP8LinearMethod(LinearMethodBase):
     """MXFP8 weights (e4m3 + UE8M0 1x32) x dynamic MXFP8 activations (W8A8).
 
-    Two execution paths share a common loader:
+    Three execution paths share a common loader:
       - Reference (no CUTLASS op compiled): dequantize the weight to compute
         dtype and run F.linear. Slow but correct -- used to seed M1 tests and
         as a portable fallback.
       - CUTLASS (Blackwell sm100/103 + mxfp8_mxfp8_gemm op present): dynamic
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
+      - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
+        with ``mm_mxfp8``. MiniMax-M3 enables this path automatically only
+        while tuning or capturing decode CUDA graphs; eager execution remains
+        on the native TensorRT-LLM op.
 
-    The path is selected at create_weights time via _mxfp8_cutlass_op_available;
-    the weight_scale tensor's layout matches the chosen path (2D [O,K/32] for
-    the reference, 1D padded swizzled for CUTLASS) so apply() stays branchless.
+    ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
+    ``flashinfer``, or ``auto``. The reference layout is 2D [O,K/32]; both
+    compiled backends consume the same 1D padded swizzled scale layout.
+    When the TensorRT-LLM autotuner is enabled, the native backend profiles
+    its compiled tactics during startup. Learned tactics are registered in
+    the native op so serving avoids the Python autotuner lookup; the generic
+    CUTLASS configuration remains the cache-miss fallback.
     """
     BLOCK_SIZE = 32
     # Swizzled-SF layout padding (matches W4A8MXFP4FP8: rows->128, cols/SFblock->4).
     _SF_ROW_PAD = 128
     _SF_COL_PAD = 4
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.use_cutlass = _mxfp8_cutlass_op_available()
+        self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+        # Only PyTorchModelEngine owns the startup tuning lifecycle. Keep
+        # standalone modules and engine paths that skip warmup (for example,
+        # Helix CP) on the direct native op instead of leaving Python
+        # AutoTuner dispatch armed indefinitely.
+        self.use_native_autotuner = False
+        self._native_autotuned = False
+        if self.backend not in ("trtllm", "flashinfer", "auto"):
+            raise ValueError("TRTLLM_MXFP8_GEMM_BACKEND must be 'trtllm', "
+                             f"'flashinfer', or 'auto', got {self.backend!r}")
+        self._flashinfer_mxfp8 = None
+        self._flashinfer_autotuned = False
+        if self.backend == "flashinfer":
+            self._load_flashinfer(required=True)
+        elif self.backend == "auto" and not self._load_flashinfer(
+                required=False):
+            self.backend = "trtllm"
+
+    @property
+    def uses_flashinfer(self) -> bool:
+        return self.backend in ("flashinfer", "auto")
+
+    @property
+    def needs_flashinfer_autotune(self) -> bool:
+        return self.uses_flashinfer and self._flashinfer_mxfp8 is not None
+
+    @property
+    def needs_native_autotune(self) -> bool:
+        return (self.use_native_autotuner and not self._native_autotuned
+                and self.use_cutlass)
+
+    def _load_flashinfer(self, *, required: bool) -> bool:
+        if not self.use_cutlass:
+            if required:
+                raise RuntimeError(
+                    "FlashInfer MXFP8 GEMM requires the TensorRT-LLM MXFP8 "
+                    "quantization ops on Blackwell")
+            return False
+        try:
+            from flashinfer import autotune, mm_mxfp8
+            if not callable(autotune):
+                raise ImportError("flashinfer.autotune is unavailable")
+        except ImportError as error:
+            if required:
+                raise RuntimeError(
+                    "TRTLLM_MXFP8_GEMM_BACKEND=flashinfer requires the "
+                    "pinned flashinfer-python package") from error
+            logger.warning_once(
+                "FlashInfer MXFP8 is unavailable; using the native "
+                "TensorRT-LLM GEMM backend.",
+                key="flashinfer_mxfp8_unavailable")
+            return False
+        self._flashinfer_mxfp8 = mm_mxfp8
+        return True
+
+    def enable_flashinfer_auto(self) -> bool:
+        """Enable graph-only FlashInfer dispatch unless the user overrode it."""
+        if "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
+            return self.backend == "auto"
+        if not self._load_flashinfer(required=False):
+            return False
+        self.backend = "auto"
+        return True
+
+    def mark_flashinfer_autotuned(self) -> None:
+        self._flashinfer_autotuned = True
+
+    def mark_native_autotuned(self) -> None:
+        self._native_autotuned = True
+
+    def enable_native_autotune(self) -> None:
+        self.use_native_autotuner = True
+
+    def disable_native_autotune(self) -> None:
+        self.use_native_autotuner = False
+        self._native_autotuned = False
+
+    def disable_flashinfer_auto(self) -> None:
+        if self.backend == "auto":
+            self.backend = "trtllm"
+            self._flashinfer_autotuned = False
 
     @classmethod
     def _swizzled_scale_size(cls, out_features: int, in_features: int) -> int:
@@ -3227,15 +3352,39 @@ class MXFP8LinearMethod(LinearMethodBase):
             # the CUTLASS block-scaled e4m3xe4m3 GEMM.
             act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
                 input.contiguous(), True)
-            # globalScale is the alpha multiplier; pure MXFP8xMXFP8 uses 1.0.
-            global_scale = torch.ones([1],
-                                      dtype=torch.float32,
-                                      device=input.device)
-            output = torch.ops.trtllm.mxfp8_mxfp8_gemm(act_e4m3, act_sf,
-                                                       module.weight,
-                                                       module.weight_scale,
-                                                       global_scale,
-                                                       module.dtype)
+            use_flashinfer = self.backend == "flashinfer" or (
+                self.backend == "auto" and
+                (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
+                 (self._flashinfer_autotuned
+                  and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
+            if use_flashinfer:
+                flashinfer_mxfp8 = self._flashinfer_mxfp8
+                assert flashinfer_mxfp8 is not None
+                output = flashinfer_mxfp8(
+                    act_e4m3,
+                    module.weight.t(),
+                    act_sf,
+                    module.weight_scale,
+                    out_dtype=module.dtype,
+                    use_8x4_sf_layout=False,
+                    backend="cutlass",
+                )
+            else:
+                # globalScale is the alpha multiplier; pure MXFP8xMXFP8 uses 1.0.
+                global_scale = torch.ones([1],
+                                          dtype=torch.float32,
+                                          device=input.device)
+                gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
+                        if self.needs_native_autotune else
+                        torch.ops.trtllm.mxfp8_mxfp8_gemm)
+                output = gemm(
+                    act_e4m3,
+                    act_sf,
+                    module.weight,
+                    module.weight_scale,
+                    global_scale,
+                    module.dtype,
+                )
             if bias is not None:
                 output = output + bias
         else:
@@ -3553,10 +3702,10 @@ class Linear(nn.Module):
         elif method_type is NVFP4LinearMethod:
             # The Marlin kernel is W4A16, so an explicit opt-in on a W4A4
             # checkpoint runs the weight-only method, which pads N/K to the
-            # tile sizes the kernel requires.
-            if ("marlin" in self.nvfp4_allowed_backends
-                    and is_nvfp4_marlin_supported_sm()
-                    and MarlinNVFP4LinearMethod.is_supported(self)):
+            # tile sizes the kernel requires. Reuse the same predicate the
+            # ``uses_marlin_nvfp4`` property reads, so the method chosen here
+            # and that property can never disagree on the SM.
+            if _uses_marlin_nvfp4_backend(self):
                 return MarlinNVFP4LinearMethod()
         return quant_method
 
@@ -3823,10 +3972,16 @@ class Linear(nn.Module):
                      bias,
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
-        output = self.quant_method.apply(self, input, bias)
         if self.lora is not None and bool(lora_params):
-            lora_result = self.lora(input, lora_params, layer_idx)
-            output = add_lora_result(output, lora_result)
+            output = LoraLayer.forward_with_base(
+                lambda: self.quant_method.apply(self, input, bias),
+                (self.lora, ),
+                input,
+                lora_params,
+                layer_idx,
+            )
+        else:
+            output = self.quant_method.apply(self, input, bias)
         return output
 
     def apply_linear_allreduce(self,

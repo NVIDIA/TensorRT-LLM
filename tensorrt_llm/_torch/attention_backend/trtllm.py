@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import bisect
 import functools
+import inspect
 import math
 import os
 import weakref
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from dataclasses import dataclass, field, fields, is_dataclass
+from enum import Enum
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import torch
 
@@ -30,12 +33,13 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend.fmha import (
-    Fmha, get_enabled_fmha_lib_classes)
+    CombinedFmha, Fmha, FmhaPhase, PhasedFmha, get_enabled_fmha_lib_classes)
 from tensorrt_llm._torch.attention_backend.fmha.interface import (
     MlaBackendPolicy, _CuteDslMlaStagingKey)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -44,12 +48,251 @@ from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams,
-                        merge_attention_forward_args)
+                        CustomAttentionMask, KVCacheParams, MLAParams,
+                        PositionalEmbeddingParams, PredefinedAttentionMask,
+                        RopeParams, merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
+
+# Keep these general-purpose cache buckets aligned with the shape coverage used
+# by TRTLLM-Gen JIT warmup in fmhaKernels.h. Adding the predecessor of every
+# ceiling candidate prevents support changes at a candidate from aliasing with
+# the interval immediately below it. Values above the largest grid point share
+# the largest bucket.
+_FMHA_CACHE_BATCH_SIZE_CANDIDATES: Tuple[int, ...] = (
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    26,
+    28,
+    30,
+    32,
+    36,
+    40,
+    48,
+    56,
+    64,
+    80,
+    96,
+    128,
+    256,
+    384,
+    512,
+    768,
+    1024,
+    1280,
+    1536,
+    2048,
+)
+_FMHA_CACHE_SEQ_LEN_Q_CANDIDATES: Tuple[int, ...] = (1, 2, 4, 8, 32, 64, 128)
+
+
+def _make_fmha_cache_grid(candidates: Tuple[int, ...]) -> Tuple[int, ...]:
+    return tuple(
+        sorted({
+            boundary
+            for candidate in candidates
+            for boundary in (candidate - 1, candidate) if boundary > 0
+        }))
+
+
+_FMHA_CACHE_BATCH_SIZE_GRID: Tuple[int, ...] = _make_fmha_cache_grid(
+    _FMHA_CACHE_BATCH_SIZE_CANDIDATES)
+_FMHA_CACHE_SEQ_LEN_Q_GRID: Tuple[int, ...] = _make_fmha_cache_grid(
+    _FMHA_CACHE_SEQ_LEN_Q_CANDIDATES)
+_FMHA_CACHE_SANITY_CHECK_ENV = ("TRTLLM_FMHA_CACHE_SANITY_CHECK")
+
+
+class _FmhaCacheKey(NamedTuple):
+    context_batch_size: int
+    generation_batch_size: int
+    generation_seq_len_q: int
+    attention_mask_type: AttentionMaskType
+    use_spec_decoding: bool
+    # LoRA can change the effective output from packed NVFP4 to unpacked BF16
+    # without changing the request shape. Keep those selection regimes apart.
+    output_dtype: Optional[torch.dtype]
+    output_sf_dtype: Optional[torch.dtype]
+
+
+_FmhaCacheInputs = Dict[str, str]
+_FMHA_CACHE_INPUT_EXCLUDED_FIELDS = frozenset({"kv_cache_manager"})
+
+
+def _should_snapshot_fmha_cache_field(value: object, name: str) -> bool:
+    descriptor = inspect.getattr_static(type(value), name, None)
+    return (not name.startswith("_")
+            and name not in _FMHA_CACHE_INPUT_EXCLUDED_FIELDS
+            and not isinstance(descriptor,
+                               (property, functools.cached_property)))
+
+
+def _normalize_fmha_cache_grid_value(value: int, grid: Tuple[int, ...]) -> int:
+    if value <= 0:
+        return 0
+    index = bisect.bisect_left(grid, value)
+    return grid[min(index, len(grid) - 1)]
+
+
+def _is_fmha_cache_enabled() -> bool:
+    # Selection policy may differ while tuning (currently for CuTe DSL MLA).
+    # Keep all temporary selections out of the serving cache so future FMHAs
+    # inherit the same cache boundary.
+    from tensorrt_llm._torch.autotuner import AutoTuner
+
+    autotuner = AutoTuner._instance
+    return autotuner is None or not autotuner.is_tuning_mode
+
+
+def _is_fmha_cache_sanity_check_enabled() -> bool:
+    return os.environ.get(_FMHA_CACHE_SANITY_CHECK_ENV, "0") == "1"
+
+
+def _snapshot_fmha_cache_value(
+    snapshot: _FmhaCacheInputs,
+    path: str,
+    value: object,
+    seen: Set[int],
+) -> None:
+    """Record tensor shapes and primitive values without retaining inputs."""
+    if isinstance(value, torch.Tensor):
+        snapshot[path] = f"shape={tuple(value.shape)}"
+    elif isinstance(value, Enum):
+        snapshot[path] = f"{type(value).__name__}.{value.name}"
+    elif isinstance(value, (torch.dtype, torch.device)):
+        snapshot[path] = str(value)
+    elif value is None or isinstance(value, (bool, int, float, str)):
+        snapshot[path] = repr(value)
+    elif is_dataclass(value):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        for value_field in fields(value):
+            if _should_snapshot_fmha_cache_field(value, value_field.name):
+                _snapshot_fmha_cache_value(
+                    snapshot,
+                    f"{path}.{value_field.name}",
+                    getattr(value, value_field.name),
+                    seen,
+                )
+    elif isinstance(value, (list, tuple)):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        for index, item in enumerate(value):
+            _snapshot_fmha_cache_value(snapshot, f"{path}[{index}]", item, seen)
+    elif isinstance(value, dict):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        for key in sorted(value, key=repr):
+            _snapshot_fmha_cache_value(snapshot, f"{path}[{key!r}]", value[key],
+                                       seen)
+
+
+def _snapshot_fmha_cache_fields(
+    snapshot: _FmhaCacheInputs,
+    path: str,
+    value: object,
+    seen: Set[int],
+) -> None:
+    seen.add(id(value))
+    if is_dataclass(value):
+        value_fields = (
+            (value_field.name, getattr(value, value_field.name))
+            for value_field in fields(value)
+            if _should_snapshot_fmha_cache_field(value, value_field.name))
+    else:
+        value_fields = ((name, field_value)
+                        for name, field_value in vars(value).items()
+                        if _should_snapshot_fmha_cache_field(value, name))
+    for name, field_value in value_fields:
+        _snapshot_fmha_cache_value(snapshot, f"{path}.{name}", field_value,
+                                   seen)
+
+
+def _snapshot_fmha_cache_inputs(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    metadata: "TrtllmAttentionMetadata",
+    forward_args: AttentionForwardArgs,
+) -> _FmhaCacheInputs:
+    snapshot: _FmhaCacheInputs = {}
+    seen: Set[int] = set()
+    _snapshot_fmha_cache_value(snapshot, "q", q, seen)
+    _snapshot_fmha_cache_value(snapshot, "k", k, seen)
+    _snapshot_fmha_cache_value(snapshot, "v", v, seen)
+    _snapshot_fmha_cache_fields(snapshot, "metadata", metadata, seen)
+    _snapshot_fmha_cache_fields(snapshot, "forward_args", forward_args, seen)
+    return snapshot
+
+
+def _format_fmha_cache_input_diff(
+    cached: Optional[_FmhaCacheInputs],
+    uncached: _FmhaCacheInputs,
+) -> str:
+    if cached is None:
+        return ("  cached input snapshot unavailable; enable "
+                f"{_FMHA_CACHE_SANITY_CHECK_ENV} before the cache "
+                "entry is created")
+
+    missing = "<missing>"
+    differences = []
+    for path in sorted(cached.keys() | uncached.keys()):
+        cached_value = cached.get(path, missing)
+        uncached_value = uncached.get(path, missing)
+        if cached_value != uncached_value:
+            differences.append(
+                f"  {path}: cached={cached_value}, uncached={uncached_value}")
+    if not differences:
+        return "  (no captured input differences)"
+    return "\n".join(differences)
+
+
+def _fmha_cache_values_match(cached: Optional[Fmha],
+                             uncached: Optional[Fmha]) -> bool:
+    if cached is uncached:
+        return True
+    if not (isinstance(cached, CombinedFmha)
+            and isinstance(uncached, CombinedFmha)):
+        return False
+    return (_fmha_cache_values_match(cached._get_context_impl(),
+                                     uncached._get_context_impl())
+            and _fmha_cache_values_match(cached._get_generation_impl(),
+                                         uncached._get_generation_impl()))
+
+
+def _describe_fmha_cache_value(fmha: Optional[Fmha]) -> str:
+    if fmha is None:
+        return "None"
+    if isinstance(fmha, CombinedFmha):
+        context = _describe_fmha_cache_value(fmha._get_context_impl())
+        generation = _describe_fmha_cache_value(fmha._get_generation_impl())
+        return f"CombinedFmha(context={context}, generation={generation})"
+    return type(fmha).__name__
 
 
 @functools.cache
@@ -1187,7 +1430,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         is_spec_dec_dynamic_tree,
         max_draft_len,
         max_total_draft_tokens,
-        model_is_wrapped: bool = False,
         spec_metadata: Optional['SpecMetadata'] = None,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
         num_contexts: int = 0,
@@ -1201,7 +1443,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             is_spec_dec_dynamic_tree: bool, whether using dynamic tree.
             max_draft_len: int, the number of the draft layers.
             max_total_draft_tokens: int, the number of all nodes in the tree (except the root).
-            model_is_wrapped: Optional[bool] = False, whether the drafter model is wrapped (i.e, CDL).
             spec_metadata: Optional['SpecMetadata'] = None, the metadata of the spec-dec.
             spec_tree_manager: Optional['SpecTreeManager'] = None, the spec_tree_manager for draft token tree.
             num_contexts: int = 0, the number of context (prefill) requests in the
@@ -1329,61 +1570,26 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
                 cpp_query_len = n_dt
 
-            # Case 2/3: static tree
+            # Case 2: static tree (target model only)
             elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
                 assert (spec_metadata.spec_dec_mode.is_eagle3()
                         or spec_metadata.spec_dec_mode.is_eagle3_one_model()
                         ), "Tree decoding is only supported for Eagle3 now"
+                assert not getattr(spec_metadata, 'is_draft_model', False), (
+                    "Static tree spec-dec params are only prepared for the target model"
+                )
 
-                is_target_model = not getattr(spec_metadata, 'is_draft_model',
-                                              False)
+                # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
+                self.spec_decoding_position_offsets[:batch_size, :].copy_(
+                    spec_tree_manager.spec_dec_position_offsets[0, :],
+                    non_blocking=True)
+                self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
+                    spec_tree_manager.spec_dec_packed_mask[0, :, :],
+                    non_blocking=True)
+                self.spec_decoding_generation_lengths[:batch_size].fill_(
+                    spec_tree_manager.max_total_draft_tokens + 1)
 
-                # Case 2: static tree and target model
-                if is_target_model:
-                    # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
-                    self.spec_decoding_position_offsets[:batch_size, :].copy_(
-                        spec_tree_manager.spec_dec_position_offsets[0, :],
-                        non_blocking=True)
-                    self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
-                        spec_tree_manager.spec_dec_packed_mask[0, :, :],
-                        non_blocking=True)
-                    self.spec_decoding_generation_lengths[:batch_size].fill_(
-                        spec_tree_manager.max_total_draft_tokens + 1)
-
-                # Case 3: static tree and the first drafter layer
-                else:
-                    assert model_is_wrapped == True, "The drafter model should be wrapped"
-                    # The first drafter layer will take the padded tokens as input (padding to the max_draft_len + 1)
-                    # But the spec-dec parameters are still in the shape of max_total_draft_tokens + 1.
-                    # Considering that these spec-dec params are accessed consecutively (without padding) in the attention Op,
-                    # we need to write them consecutively when setting them.
-                    # For the next drafter layers, we will prepare these spec-dec params in the drafting loops.
-
-                    # position_offsets
-                    position_offset = torch.arange(
-                        max_draft_len + 1,
-                        dtype=torch.int,
-                        device='cpu',
-                        pin_memory=prefer_pinned()).repeat(batch_size)
-                    self.spec_decoding_position_offsets.reshape(
-                        -1)[:(max_draft_len + 1) * batch_size].copy_(
-                            position_offset, non_blocking=True)
-                    # packed_mask
-                    dummy_idx = torch.arange(max_draft_len + 1)
-                    spec_decoding_packed_mask = torch.pow(
-                        2, dummy_idx + 1) - 1  # [max_draft_len + 1]
-                    spec_decoding_packed_mask = spec_decoding_packed_mask.repeat(
-                        batch_size)  # [batch_size * (max_draft_len + 1)]
-                    self.spec_decoding_packed_mask.reshape(
-                        -1)[:(max_draft_len + 1) * batch_size].copy_(
-                            spec_decoding_packed_mask, non_blocking=True)
-                    self.generate_spec_decoding_generation_length(
-                        runtime_draft_len=max_draft_len)
-                    if (self.spec_decoding_position_offsets is not None
-                            and self.spec_decoding_position_offsets.dim() == 1):
-                        cpp_query_len = max_draft_len + 1
-
-            # Case 4: linear tree
+            # Case 3: linear tree
             else:
                 # Currently dynamic draft length is only supported for linear tree
                 # Dynamic draft length needs position offsets and packed mask to be shaped for each runtime draft length.
@@ -1431,6 +1637,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_create_weights_in_init: bool = False,
         attention_chunk_size: Optional[int] = None,
         sparse_params: Optional[SparseParams] = None,
+        kv_cache_dtype: str = "auto",
         flashinfer_mla_backend: Optional[str] = None,
         **kwargs,
     ) -> None:
@@ -1447,6 +1654,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
+            kv_cache_dtype (str): KV-cache dtype selected by ``KvCacheConfig``. Accepted
+                values are ``auto``, ``fp8``, ``fp8_ds_mla``, ``nvfp4``, and supported
+                torch dtype strings. ``fp8_ds_mla`` selects the packed sparse-MLA cache
+                used by DeepSeek-V4 and DSA on SM120/SM121.
             flashinfer_mla_backend (Optional[str]): FlashInfer MLA generation backend
                                                     selected for this attention instance.
                                                     None preserves the ordered FMHA-library
@@ -1455,6 +1666,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
+        self.kv_cache_dtype = kv_cache_dtype
+        self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
         self.flashinfer_mla_backend = flashinfer_mla_backend
         # Per-batch MLA decode backend override hook. Maps (statically
         # configured backend, batch metadata, generation-token count) to the
@@ -1519,6 +1732,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.local_layer_idx: Optional[int] = None
         self.fmha_libs: List[Fmha] = []
+        self.phased_fmha_libs: List[PhasedFmha] = []
+        self.non_phased_fmha_libs: List[Fmha] = []
+        self._fmha_cache: Dict[_FmhaCacheKey, Fmha] = {}
+        self._fmha_cache_inputs: Dict[_FmhaCacheKey, _FmhaCacheInputs] = {}
+        # Environment configuration is fixed for an attention instance so
+        # normal forwarding never pays for an environment lookup.
+        self._fmha_cache_sanity_check_enabled = (
+            _is_fmha_cache_sanity_check_enabled())
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1774,10 +1995,231 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return self.rope_params.original_max_positions
 
     def create_fmha_libs(self) -> None:
+        self._fmha_cache = {}
+        self._fmha_cache_inputs = {}
+        self._fmha_cache_sanity_check_enabled = (
+            _is_fmha_cache_sanity_check_enabled())
+        sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
+        if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
+                and get_sm_version() in (120, 121)
+                and getattr(self, "kv_cache_dtype", None) != "fp8_ds_mla"):
+            raise ValueError(
+                "DeepSeek-V4/DSA sparse MLA on SM120/SM121 requires "
+                "kv_cache_config.dtype='fp8_ds_mla'.")
         self.fmha_libs = []
         for fmha_cls in get_enabled_fmha_lib_classes():
             if fmha_cls.is_available(self):
                 self.fmha_libs.append(fmha_cls(self))
+
+        self.phased_fmha_libs = [
+            fmha for fmha in self.fmha_libs if isinstance(fmha, PhasedFmha)
+        ]
+        self.non_phased_fmha_libs = [
+            fmha for fmha in self.fmha_libs if not isinstance(fmha, PhasedFmha)
+        ]
+
+    def _make_fmha_cache_key(
+        self,
+        q: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> _FmhaCacheKey:
+        """Build the dynamic FMHA cache key for one attention instance.
+
+        FMHA cache inputs not represented here must remain invariants for
+        the cache lifetime. Rebuilding the FMHA library list starts a new one.
+
+        Batch size and generation Q length use ceiling grid buckets based on
+        TRTLLM-Gen JIT warmup candidates. Each candidate and its predecessor
+        are separate grid points so a support boundary at the candidate cannot
+        alias with the interval below it. Generation Q lengths are uniform in
+        the executor, including padded speculative-decoding batches.
+
+        The batch fields describe the complete source scheduler batch, even
+        when ``q`` contains only one compacted phase. Ordinary attention
+        instances use mixed inputs, while MLA instances use those compacted
+        phase calls, so the zero Q length still distinguishes a context-only
+        subcall from a generation-active subcall.
+        """
+        attention_input_type = forward_args.attention_input_type
+        output_dtype = (forward_args.output.dtype
+                        if forward_args.output is not None else None)
+        output_sf_dtype = (forward_args.output_sf.dtype
+                           if forward_args.output_sf is not None else None)
+        # Explicit mask data has the same FMHA support constraints as a
+        # custom mask enum, even when the accompanying enum remains causal.
+        attention_mask_type = (AttentionMaskType.custom_mask if (
+            forward_args.attention_mask == CustomAttentionMask.CUSTOM
+            or forward_args.attention_mask_data is not None) else
+                               AttentionMaskType(forward_args.mask_type))
+
+        context_batch_size = _normalize_fmha_cache_grid_value(
+            metadata.num_contexts, _FMHA_CACHE_BATCH_SIZE_GRID)
+        generation_batch_size = _normalize_fmha_cache_grid_value(
+            metadata.num_generations, _FMHA_CACHE_BATCH_SIZE_GRID)
+        generation_seq_len_q = 0
+        if (attention_input_type != AttentionInputType.context_only
+                and metadata.num_generations > 0):
+            generation_num_tokens = q.shape[0]
+            if attention_input_type == AttentionInputType.mixed:
+                generation_num_tokens -= metadata.num_ctx_tokens
+            generation_seq_len_q = (generation_num_tokens //
+                                    metadata.num_generations)
+            generation_seq_len_q = _normalize_fmha_cache_grid_value(
+                generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID)
+
+        return _FmhaCacheKey(
+            context_batch_size=context_batch_size,
+            generation_batch_size=generation_batch_size,
+            generation_seq_len_q=generation_seq_len_q,
+            attention_mask_type=attention_mask_type,
+            use_spec_decoding=metadata.use_spec_decoding,
+            output_dtype=output_dtype,
+            output_sf_dtype=output_sf_dtype,
+        )
+
+    def _select_fmha(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[Fmha]:
+        if not _is_fmha_cache_enabled():
+            return self._select_fmha_uncached(q, k, v, metadata, forward_args)
+
+        cache_key = self._make_fmha_cache_key(q, metadata, forward_args)
+        fmha = self._fmha_cache.get(cache_key)
+        if fmha is not None:
+            if self._fmha_cache_sanity_check_enabled:
+                uncached_fmha = self._select_fmha_uncached(
+                    q, k, v, metadata, forward_args)
+                if not _fmha_cache_values_match(fmha, uncached_fmha):
+                    uncached_inputs = _snapshot_fmha_cache_inputs(
+                        q, k, v, metadata, forward_args)
+                    input_diff = _format_fmha_cache_input_diff(
+                        self._fmha_cache_inputs.get(cache_key), uncached_inputs)
+                    message = ("FMHA cache sanity check failed for "
+                               f"key={cache_key}: "
+                               f"cached={_describe_fmha_cache_value(fmha)}, "
+                               "uncached="
+                               f"{_describe_fmha_cache_value(uncached_fmha)}.\n"
+                               f"Forward input differences:\n{input_diff}")
+                    logger.error(message)
+                    raise RuntimeError(message)
+                if cache_key not in self._fmha_cache_inputs:
+                    self._fmha_cache_inputs[
+                        cache_key] = _snapshot_fmha_cache_inputs(
+                            q, k, v, metadata, forward_args)
+            return fmha
+
+        fmha = self._select_fmha_uncached(q, k, v, metadata, forward_args)
+        if fmha is None:
+            return None
+        self._fmha_cache[cache_key] = fmha
+        if self._fmha_cache_sanity_check_enabled:
+            self._fmha_cache_inputs[cache_key] = _snapshot_fmha_cache_inputs(
+                q, k, v, metadata, forward_args)
+        return fmha
+
+    def _select_fmha_uncached(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[Fmha]:
+        if self.is_mla_enable:
+            return self._select_mla_fmha(q, k, v, metadata, forward_args)
+        return self._select_non_mla_fmha(q, k, v, metadata, forward_args)
+
+    def _select_non_mla_fmha(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[Fmha]:
+        has_context = metadata.num_contexts > 0
+        has_generation = metadata.num_generations > 0
+        if not has_context and not has_generation:
+            return None
+
+        context_fmha = None
+        generation_fmha = None
+        for fmha in self.fmha_libs:
+            if isinstance(fmha, PhasedFmha):
+                if (has_context and context_fmha is None and fmha.is_supported(
+                        q,
+                        k,
+                        v,
+                        metadata,
+                        forward_args,
+                        phase=FmhaPhase.CONTEXT,
+                )):
+                    context_fmha = fmha
+                if (has_generation and generation_fmha is None
+                        and fmha.is_supported(
+                            q,
+                            k,
+                            v,
+                            metadata,
+                            forward_args,
+                            phase=FmhaPhase.GENERATION,
+                        )):
+                    generation_fmha = fmha
+
+                if (has_context and context_fmha is None) or (
+                        has_generation and generation_fmha is None):
+                    continue
+                if context_fmha is None:
+                    return generation_fmha
+                if generation_fmha is None or context_fmha is generation_fmha:
+                    return context_fmha
+
+                combined_fmha = CombinedFmha(self)
+                combined_fmha.set_fmha_impls(
+                    context_fmha,
+                    generation_fmha,
+                )
+                return combined_fmha
+            if fmha.is_supported(q, k, v, metadata, forward_args):
+                return fmha
+        return None
+
+    def _select_mla_fmha(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[Fmha]:
+        if forward_args.attention_input_type == AttentionInputType.context_only:
+            phase = FmhaPhase.CONTEXT
+        elif forward_args.attention_input_type == AttentionInputType.generation_only:
+            phase = FmhaPhase.GENERATION
+        else:
+            return None
+
+        for fmha in self.fmha_libs:
+            if isinstance(fmha, PhasedFmha):
+                supported = fmha.is_supported(
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    phase=phase,
+                )
+            else:
+                supported = fmha.is_supported(q, k, v, metadata, forward_args)
+            if supported:
+                return fmha
+        return None
 
     def forward(
         self,
@@ -1828,15 +2270,24 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.output = outputs[0]
             forward_args.output_sf = outputs[1] if len(outputs) == 2 else None
 
-        forward_args.is_fused_qkv = not metadata.is_cross and k is None
-        forward_args.update_kv_cache = not metadata.is_cross or k is not None
+        has_q_only = False
+        if not self.is_mla_enable and not metadata.is_cross and k is None and v is None:
+            q_hidden_size = self.num_heads * self.head_dim
+            qkv_hidden_size = q_hidden_size + 2 * self.num_kv_heads * self.head_dim
+            has_q_only = q.size(-1) == q_hidden_size
+            forward_args.is_fused_qkv = q.size(-1) == qkv_hidden_size
+            forward_args.update_kv_cache = not has_q_only
+        else:
+            forward_args.is_fused_qkv = not metadata.is_cross and k is None
+            forward_args.update_kv_cache = not metadata.is_cross or k is not None
         has_fused_qkv = forward_args.is_fused_qkv and k is None and v is None
         has_unfused_kv = (not forward_args.is_fused_qkv and k is not None
                           and v is not None)
         uses_cached_cross_kv = (metadata.is_cross
                                 and not forward_args.update_kv_cache
                                 and k is None and v is None)
-        assert has_fused_qkv or has_unfused_kv or uses_cached_cross_kv
+        assert (has_fused_qkv or has_unfused_kv or has_q_only
+                or uses_cached_cross_kv)
         # `quant_scale_qkv` only makes sense paired with `quant_q_buffer`: the
         # C++ op interprets the buffer as the destination of a pre-quantized
         # FP8 Q for the DSv4 fused norm+RoPE path. `quant_q_buffer` alone is
@@ -1857,6 +2308,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # generation FMHA only reads the cache, and the fallback path needs the
         # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
         if (self.is_mla_enable and forward_args.skip_mla_rope_generation
+                and not getattr(self, "use_fp8_ds_mla", False)
                 and forward_args.attention_input_type
                 == AttentionInputType.generation_only):
             num_ctx = metadata.num_contexts
@@ -2077,13 +2529,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not self.fmha_libs:
             self.create_fmha_libs()
 
-        for fmha in self.fmha_libs:
-            if fmha.is_supported(q, k, v, metadata, forward_args):
-                fmha.forward(q, k, v, metadata, forward_args)
-                break
-        else:
+        fmha = self._select_fmha(q, k, v, metadata, forward_args)
+
+        if fmha is None:
             raise RuntimeError(
                 "No TRT-LLM attention FMHA library supports this request.")
+        fmha.forward(q, k, v, metadata, forward_args)
 
         if self.print_skip_softmax_stat:
             total_blocks, skipped_blocks = self.skip_softmax_stat

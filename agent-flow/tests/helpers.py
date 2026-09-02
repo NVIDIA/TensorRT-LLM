@@ -15,14 +15,19 @@ class FakeClient(BackendClient):
         tool_calls: list[ToolCallEvent] | None = None,
         error: Exception | None = None,
         usage: UsageInfo | None = None,
+        skills: list[str] | None = None,
     ) -> None:
         self.text = text
         self.tool_calls = tool_calls or []
         self.error = error
         self.usage = usage
+        self.skills = skills
         self.messages: list[str] = []
         self.send_count = 0
         self.closed = False
+
+    async def list_available_skills(self) -> list[str] | None:
+        return self.skills
 
     async def send_message(self, message: str):
         self.messages.append(message)
@@ -68,6 +73,7 @@ class FakeBackend(Backend):
             tool_calls=plan.get("tool_calls"),
             error=plan.get("error"),
             usage=plan.get("usage"),
+            skills=plan.get("skills"),
         )
         client.system_prompt = system_prompt
         client.model = model

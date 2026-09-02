@@ -173,7 +173,7 @@ void KvCacheManager::clearReusableBlocks()
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
-    std::optional<bool> textOnly)
+    std::optional<bool> textOnly, bool enableRequestStats)
 {
     if (!priorityCb)
     {
@@ -195,7 +195,7 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),
-        std::move(priorityCb), expectedPromptLength, textOnly);
+        std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats);
 }
 
 BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
@@ -504,6 +504,35 @@ SsmSnapshotIterationStatsByLifeCycle KvCacheManager::getAndResetSsmSnapshotItera
     }
     mSsmSnapshotIterationStatsByLifeCycle.clear();
     return stats;
+}
+
+void KvCacheManager::recordRequestSuspended()
+{
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    ++mIterSuspendedRequests;
+}
+
+void KvCacheManager::recordRequestResumed()
+{
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    ++mIterResumedRequests;
+}
+
+std::pair<int64_t, int64_t> KvCacheManager::getAndResetIterationSuspendResumeStats()
+{
+    // Suspend/resume is a per-request, manager-level event (not per-pool-group), so it
+    // is drained alongside getAndResetIterationStats once per iteration-stats fetch.
+    auto const suspended = mIterSuspendedRequests;
+    auto const resumed = mIterResumedRequests;
+    mIterSuspendedRequests = 0;
+    mIterResumedRequests = 0;
+    return {suspended, resumed};
 }
 
 PeakBlockStatsByCacheLevel KvCacheManager::_currentBlockStatsByCacheLevel() const
