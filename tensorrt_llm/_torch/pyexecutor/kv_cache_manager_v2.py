@@ -857,6 +857,7 @@ class KVCacheManagerV2(BaseResourceManager):
         num_reserved_index_slots: int = 1,
         is_estimating_kv_cache: bool = False,
         cold_page_codec_provider: Optional[object] = None,
+        max_cuda_graph_batch_size: Optional[int] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -931,6 +932,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        self.max_cuda_graph_batch_size = max_cuda_graph_batch_size
         self.max_num_tokens = max_num_tokens
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         from ..speculative import get_num_extra_kv_tokens
@@ -2011,7 +2013,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
 
                 # CUDA graph generation warmup uses one request at max_seq_len and
-                # enough minimal decode requests to fill max_batch_size.
+                # enough minimal decode requests to fill the largest captured
+                # graph — normally well below max_batch_size, and 0 when graph
+                # capture is off, leaving no decode requests at all. Constraints
+                # act as a floor on the KV quota, so sizing this by max_batch_size
+                # can demand more than the whole cache. None means the graph batch
+                # size is unknown, so stay conservative.
+                warmup_batch_size = self.max_batch_size
+                if self.max_cuda_graph_batch_size is not None:
+                    warmup_batch_size = min(warmup_batch_size, self.max_cuda_graph_batch_size)
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
                 constraints.append(
                     BatchDesc(
@@ -2022,7 +2032,7 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
                         ]
                         + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
-                        * (self.max_batch_size - 1)
+                        * (warmup_batch_size - 1)
                     )
                 )
 

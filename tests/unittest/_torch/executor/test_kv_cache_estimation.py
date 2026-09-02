@@ -191,6 +191,8 @@ def _make_creator(
     use_sliding_window=None,
     max_attention_window=None,
     max_beam_width=1,
+    head_dim=None,
+    global_head_dim=None,
 ):
     """Build a minimal KvCacheCreator (bypasses __init__) wired up for
     _get_token_num_for_estimation only."""
@@ -206,11 +208,16 @@ def _make_creator(
 
     c._llm_args = Mock(disable_overlap_scheduler=True)
 
+    # head_dim/global_head_dim are what is_gemma4_hybrid keys on, and only a
+    # Gemma4 hybrid gets per-layer windows plumbed to the manager. A test
+    # standing in for Gemma4 must set them, or it describes a plain VSWA model.
     pretrained = SimpleNamespace(
         layer_types=layer_types,
         num_hidden_layers=(len(layer_types) if isinstance(layer_types, (list, tuple)) else None),
         sliding_window=sliding_window,
         use_sliding_window=use_sliding_window,
+        head_dim=head_dim,
+        global_head_dim=global_head_dim,
     )
 
     model_config = Mock()
@@ -463,6 +470,8 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
         sliding_window=sliding_window,
+        head_dim=256,
+        global_head_dim=128,
     )
     uniform = _make_creator(
         tpb,
@@ -534,6 +543,8 @@ def test_v2_pool_estimation_falls_back_for_unsupported_window_metadata(
         layer_types=["sliding_attention", "full_attention"],
         sliding_window=sliding_window,
         use_sliding_window=use_sliding_window,
+        head_dim=256,
+        global_head_dim=128,
     )
     uniform = _make_creator(
         tpb,
@@ -546,6 +557,46 @@ def test_v2_pool_estimation_falls_back_for_unsupported_window_metadata(
     )
 
     assert hybrid._get_token_num_for_estimation() == 2 * uniform._get_token_num_for_estimation()
+
+
+def test_plain_vswa_does_not_scale_without_per_layer_windows():
+    """A non-Gemma4 sliding/full mix must estimate one attention pool.
+
+    Only a Gemma4 hybrid gets per-layer windows plumbed into the manager, so
+    for every other VSWA model (GPT-OSS) the manager keeps a single ``[None]``
+    window and builds one attention pool group. Scaling by the config's layer
+    types then doubles the dummy workload, and via the max_tokens quota cap
+    reserves twice the KV cache needed, starving activations (nvbugs/6626640).
+    """
+    tpb = 32
+    max_seq_len = 12288
+    layer_types = ["sliding_attention", "full_attention"] * 18
+    assert len(set(layer_types)) == 2
+
+    def creator(**extra):
+        return _make_creator(
+            tpb,
+            [_make_mock_request(max_seq_len - 1), _make_mock_request(1)],
+            enable_attention_dp=False,
+            tp_size=1,
+            model_max_seq_len=max_seq_len,
+            max_cuda_graph_batch_size=4,
+            **extra,
+        )
+
+    vswa = creator(layer_types=layer_types, sliding_window=128)
+    uniform = creator(layer_types=["full_attention"] * len(layer_types))
+    # Same layer_types, but a Gemma4 hybrid: those windows do reach the
+    # manager, so it keeps two pools (the MMMU Pro livelock guard).
+    gemma4 = creator(
+        layer_types=layer_types,
+        sliding_window=128,
+        head_dim=256,
+        global_head_dim=128,
+    )
+
+    assert vswa._get_token_num_for_estimation() == uniform._get_token_num_for_estimation()
+    assert gemma4._get_token_num_for_estimation() == 2 * uniform._get_token_num_for_estimation()
 
 
 def test_vswa_max_attention_window_fallback_scales():
@@ -598,6 +649,8 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
         sliding_window=sliding_window,
+        head_dim=256,
+        global_head_dim=128,
     )
 
     total_tokens = c._get_token_num_for_estimation()

@@ -49,9 +49,9 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
-                           get_layer_attention_window, is_gemma4_hybrid,
-                           is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid,
+                           get_layer_attention_window, is_attention_layer_type,
+                           is_gemma4_hybrid, is_hybrid_linear, is_kimi_linear,
+                           is_mla, is_nemotron_hybrid, is_qwen3_hybrid,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -464,11 +464,22 @@ def _get_num_pool_groups_for_estimation(
     their distinct layer types. Unsupported target window metadata must not
     make estimation fail; in that
     case preserve the legacy layer-type/window heuristic.
+
+    A window-derived split only counts when something actually hands those
+    per-layer windows to the manager: an explicit ``max_attention_window``, or
+    ``_create_kv_cache_manager`` deriving one, which it does only for Gemma4
+    hybrids. Otherwise the manager keeps a single ``[None]`` window and builds
+    one attention pool group, so counting the config's sliding/full split
+    inflates the dummy workload and — through the max_tokens quota cap —
+    reserves a multiple of the KV cache actually needed, starving activations
+    (nvbugs/6626640).
     """
     num_layers = getattr(model_config, "num_hidden_layers", None)
     layer_types = getattr(model_config, "layer_types", None)
     attention_windows = None
-    if isinstance(num_layers, int) and num_layers > 0:
+    windows_reach_manager = (fallback_attention_windows is not None
+                             or is_gemma4_hybrid(model_config))
+    if windows_reach_manager and isinstance(num_layers, int) and num_layers > 0:
         try:
             inferred_windows = [
                 get_layer_attention_window(model_config, layer_idx)
@@ -493,9 +504,19 @@ def _get_num_pool_groups_for_estimation(
         return len(set(normalized_windows))
 
     if isinstance(layer_types, (list, tuple)):
-        num_layer_types = len(set(layer_types))
-        if num_layer_types > 1:
-            return num_layer_types
+        if windows_reach_manager:
+            pool_types = set(layer_types)
+        else:
+            # Collapse sliding vs full into one attention type; recurrent types
+            # keep their own pool either way. A Gemma4 hybrid still counts per
+            # type here — its windows are plumbed through even when the
+            # inference above could not use them.
+            pool_types = {
+                "attention" if is_attention_layer_type(lt) else lt
+                for lt in layer_types
+            }
+        if len(pool_types) > 1:
+            return len(pool_types)
 
     if fallback_attention_windows is not None:
         normalized_windows = _normalize_attention_windows(
@@ -2414,6 +2435,14 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
+        # V2 reserves a constraint floor for the CUDA-graph generation warmup.
+        # Graphs are captured only up to the engine's graph batch size, which
+        # can be far below max_batch_size; see _build_base_config. The separate
+        # one-model draft pool is built without an engine, and None there keeps
+        # the previous conservative max_batch_size floor.
+        manager_extra_kwargs["max_cuda_graph_batch_size"] = (
+            model_engine._max_cuda_graph_batch_size
+            if model_engine is not None else None)
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

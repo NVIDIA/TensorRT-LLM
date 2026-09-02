@@ -83,6 +83,7 @@ def _make_cache_config_for_test(
     max_num_tokens: int | None = None,
     max_draft_len: int = 0,
     num_extra_kv_tokens: int = 0,
+    max_cuda_graph_batch_size: int | None = None,
 ) -> KVCacheManagerConfig:
     cache_manager = object.__new__(KVCacheManagerV2)
     cache_manager.kv_cache_type = CacheType.SELFKONLY
@@ -98,6 +99,7 @@ def _make_cache_config_for_test(
     cache_manager.max_attention_window_vec = [None]
     cache_manager.max_seq_len = max_seq_len
     cache_manager.max_batch_size = max_batch_size
+    cache_manager.max_cuda_graph_batch_size = max_cuda_graph_batch_size
     cache_manager.max_num_tokens = max_num_tokens
     cache_manager.max_draft_len = max_draft_len
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
@@ -288,26 +290,39 @@ def test_default_uses_allocator_fallback() -> None:
     assert config.constraints == []
 
 
-def test_avg_seq_len_builds_warmup_constraints() -> None:
+@pytest.mark.parametrize(
+    ("max_cuda_graph_batch_size", "num_warmup_decode_reqs"),
+    # CUDA graphs are captured only up to max_cuda_graph_batch_size, so the
+    # graph warmup floor is sized by the largest captured graph rather than
+    # max_batch_size — constraints act as a floor on the KV quota, so a
+    # max_batch_size-sized floor can demand more than the whole cache. None
+    # means the graph batch size is unknown, so the floor stays conservative.
+    [(None, 2), (2, 1)],
+    ids=["unknown_graph_batch_size", "clamped_to_graph_batch_size"],
+)
+def test_avg_seq_len_builds_warmup_constraints(
+    max_cuda_graph_batch_size: int | None,
+    num_warmup_decode_reqs: int,
+) -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(host_cache_size=0, avg_seq_len=1024),
         max_batch_size=3,
         max_seq_len=1024,
         max_num_tokens=2048,
         max_draft_len=2,
+        max_cuda_graph_batch_size=max_cuda_graph_batch_size,
     )
 
+    # The typical step spans the full max_batch_size either way; only the
+    # graph warmup constraint is clamped.
     assert config.typical_step == BatchDesc(
         [KVCacheDesc(capacity=2048, history_length=0)]
         + [KVCacheDesc(capacity=1024, history_length=1021)] * 2
     )
     assert config.constraints == [
         BatchDesc(
-            [
-                KVCacheDesc(capacity=1024, history_length=1023),
-                KVCacheDesc(capacity=3, history_length=0),
-                KVCacheDesc(capacity=3, history_length=0),
-            ]
+            [KVCacheDesc(capacity=1024, history_length=1023)]
+            + [KVCacheDesc(capacity=3, history_length=0)] * num_warmup_decode_reqs
         ),
         BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
     ]

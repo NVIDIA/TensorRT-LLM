@@ -77,6 +77,19 @@ def _is_sliding_attention_layer(layer_type: object) -> bool:
     return "sliding" in layer_type_name
 
 
+def is_attention_layer_type(layer_type: object) -> bool:
+    """Return whether a config layer type denotes softmax attention.
+
+    Sliding and full attention are both attention; recurrent layer types
+    (mamba, linear/gated attention) are not. ``linear_attention`` names an SSM
+    layer despite the substring, so it is excluded explicitly.
+    """
+    layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
+    if "linear" in layer_type_name:
+        return False
+    return "attention" in layer_type_name
+
+
 def get_layer_attention_window(
     config: object,
     layer_idx: int,
