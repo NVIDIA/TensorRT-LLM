@@ -203,6 +203,15 @@ protected:
     {
         RoutingKernelTest<T>::setupBuffers(param);
 
+        if (!param.useTopKAsInput && !param.useTopKPackedAsInput)
+        {
+            // Raw-score paths must initialize both count regions themselves. A
+            // nonzero device sentinel makes the cooperative-path tests catch
+            // any accidental dependency on allocator contents.
+            TLLM_CUDA_CHECK(cudaMemsetAsync(bufferCast<int32_t>(*this->mPtrExpertCountsDevice), 0x7F,
+                this->mPtrExpertCountsDevice->getSizeInBytes(), this->mStream->get()));
+        }
+
         // Initialize routing bias with small random values
         if (param.preprocessType == RoutingPreprocessType::SigmoidBias)
         {
