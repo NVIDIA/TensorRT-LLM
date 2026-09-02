@@ -31,7 +31,6 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 pytestmark = pytest.mark.cpu_only
 
-
 # ---------------------------------------------------------------------------
 # _align_kv_blocks: contract unchanged.
 # ---------------------------------------------------------------------------
@@ -402,6 +401,8 @@ def _build_transceiver_for_kv_slice(
         py_request_id=0,
         py_beam_width=beam_width,
         is_generation_only_request=lambda: is_generation_only,
+        # num_extra_kv_tokens == max_draft_len - 1
+        py_draft_tokens=[0 for _ in range(num_extra_kv_tokens + 1)],
     )
     return transceiver, req
 
