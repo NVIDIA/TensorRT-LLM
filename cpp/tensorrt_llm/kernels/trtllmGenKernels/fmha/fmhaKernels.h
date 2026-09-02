@@ -172,22 +172,22 @@ public:
                 try
                 {
                     std::thread(
-                    [this]()
-                    {
-                        // Relaxed capture mode: CUDA calls made by this thread (NVRTC module
-                        // loads) must neither fail nor invalidate a CUDA graph capture that the
-                        // forward-pass thread may have in progress. Module loads never touch a
-                        // capturing stream. This is the same pattern NCCL/cuDNN use for lazy
-                        // module loading from helper threads.
-                        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
-                        if (cudaThreadExchangeStreamCaptureMode(&mode) != cudaSuccess)
+                        [this]()
                         {
-                            TLLM_LOG_WARNING(
-                                "TRTLLM-Gen FMHA async JIT warmup: failed to set relaxed stream-capture mode; "
-                                "run() will drain this worker before any CUDA graph capture.");
-                        }
-                        workerLoop();
-                    })
+                            // Relaxed capture mode: CUDA calls made by this thread (NVRTC module
+                            // loads) must neither fail nor invalidate a CUDA graph capture that the
+                            // forward-pass thread may have in progress. Module loads never touch a
+                            // capturing stream. This is the same pattern NCCL/cuDNN use for lazy
+                            // module loading from helper threads.
+                            cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+                            if (cudaThreadExchangeStreamCaptureMode(&mode) != cudaSuccess)
+                            {
+                                TLLM_LOG_WARNING(
+                                    "TRTLLM-Gen FMHA async JIT warmup: failed to set relaxed stream-capture mode; "
+                                    "run() will drain this worker before any CUDA graph capture.");
+                            }
+                            workerLoop();
+                        })
                         .detach();
                     mThreadStarted = true;
                 }
@@ -611,29 +611,28 @@ private:
         // device's CUDA context, so an identical configuration on another device
         // still needs its own sweep. Warmup requests always run with the target
         // device current.
-        for (uint64_t value : std::initializer_list<uint64_t>{
-                 static_cast<uint64_t>(tensorrt_llm::common::getDevice()), static_cast<uint64_t>(mSM),
-                 static_cast<uint64_t>(mDtypeQ), static_cast<uint64_t>(mDtypeK), static_cast<uint64_t>(mDtypeV),
-                 static_cast<uint64_t>(mDtypeOut), static_cast<uint64_t>(mNumEltsPerSageAttnBlkQ),
-                 static_cast<uint64_t>(mNumEltsPerSageAttnBlkK), static_cast<uint64_t>(mNumEltsPerSageAttnBlkP),
-                 static_cast<uint64_t>(mNumEltsPerSageAttnBlkV), static_cast<uint64_t>(params.mQkvLayout),
-                 static_cast<uint64_t>(params.mMaskType), static_cast<uint64_t>(params.mKernelType),
-                 static_cast<uint64_t>(params.mTileScheduler), static_cast<uint64_t>(params.mMultiCtasKvMode),
-                 static_cast<uint64_t>(params.mUseBlockSparseAttention), static_cast<uint64_t>(params.mHeadDimQk),
-                 static_cast<uint64_t>(params.mHeadDimV), static_cast<uint64_t>(params.mNumHeadsQ),
-                 static_cast<uint64_t>(params.mNumHeadsKv), static_cast<uint64_t>(params.mNumHeadsQPerKv),
-                 static_cast<uint64_t>(params.mMaxSeqLenQ), static_cast<uint64_t>(params.mUseGenKernelForPrefill),
-                 static_cast<uint64_t>(params.mJITWarmupMaxNumRequests),
-                 static_cast<uint64_t>(params.mJITWarmupMaxSeqLenQ),
-                 static_cast<uint64_t>(params.mJITWarmupMaxSeqLenKv),
-                 static_cast<uint64_t>(params.mAttentionWindowSize),
-                 static_cast<uint64_t>(params.mChunkedAttentionSize),
-                 static_cast<uint64_t>(params.mMaxNumPagesPerSeqKv), static_cast<uint64_t>(params.mNumTokensPerPage),
-                 static_cast<uint64_t>(params.mNumPagesInMemPool), static_cast<uint64_t>(params.mMultiProcessorCount),
-                 static_cast<uint64_t>(skipSoftmaxBits), static_cast<uint64_t>(scaleQBits),
-                 static_cast<uint64_t>(params.mSparseAttention), static_cast<uint64_t>(params.mSparseTopK),
-                 static_cast<uint64_t>(params.mIsSpecDecTree),
-                 static_cast<uint64_t>(params.mSpecDecodingTargetMaxGenLen)})
+        for (uint64_t value :
+            std::initializer_list<uint64_t>{static_cast<uint64_t>(tensorrt_llm::common::getDevice()),
+                static_cast<uint64_t>(mSM), static_cast<uint64_t>(mDtypeQ), static_cast<uint64_t>(mDtypeK),
+                static_cast<uint64_t>(mDtypeV), static_cast<uint64_t>(mDtypeOut),
+                static_cast<uint64_t>(mNumEltsPerSageAttnBlkQ), static_cast<uint64_t>(mNumEltsPerSageAttnBlkK),
+                static_cast<uint64_t>(mNumEltsPerSageAttnBlkP), static_cast<uint64_t>(mNumEltsPerSageAttnBlkV),
+                static_cast<uint64_t>(params.mQkvLayout), static_cast<uint64_t>(params.mMaskType),
+                static_cast<uint64_t>(params.mKernelType), static_cast<uint64_t>(params.mTileScheduler),
+                static_cast<uint64_t>(params.mMultiCtasKvMode), static_cast<uint64_t>(params.mUseBlockSparseAttention),
+                static_cast<uint64_t>(params.mHeadDimQk), static_cast<uint64_t>(params.mHeadDimV),
+                static_cast<uint64_t>(params.mNumHeadsQ), static_cast<uint64_t>(params.mNumHeadsKv),
+                static_cast<uint64_t>(params.mNumHeadsQPerKv), static_cast<uint64_t>(params.mMaxSeqLenQ),
+                static_cast<uint64_t>(params.mUseGenKernelForPrefill),
+                static_cast<uint64_t>(params.mJITWarmupMaxNumRequests),
+                static_cast<uint64_t>(params.mJITWarmupMaxSeqLenQ), static_cast<uint64_t>(params.mJITWarmupMaxSeqLenKv),
+                static_cast<uint64_t>(params.mAttentionWindowSize), static_cast<uint64_t>(params.mChunkedAttentionSize),
+                static_cast<uint64_t>(params.mMaxNumPagesPerSeqKv), static_cast<uint64_t>(params.mNumTokensPerPage),
+                static_cast<uint64_t>(params.mNumPagesInMemPool), static_cast<uint64_t>(params.mMultiProcessorCount),
+                static_cast<uint64_t>(skipSoftmaxBits), static_cast<uint64_t>(scaleQBits),
+                static_cast<uint64_t>(params.mSparseAttention), static_cast<uint64_t>(params.mSparseTopK),
+                static_cast<uint64_t>(params.mIsSpecDecTree),
+                static_cast<uint64_t>(params.mSpecDecodingTargetMaxGenLen)})
         {
             fingerprint = combine(fingerprint, value);
         }
@@ -736,10 +735,11 @@ private:
             {
                 std::lock_guard<std::mutex> lock(getJITWarmupRegistryMutex());
                 auto& registry = getJITWarmupRegistry();
-                auto it = std::find_if(registry.begin(), registry.end(), [currentDevice](auto const& entry) {
-                    return entry.second.mState == JITWarmupState::kBackgroundDone
-                        && entry.second.mDeviceId == currentDevice;
-                });
+                auto it = std::find_if(registry.begin(), registry.end(),
+                    [currentDevice](auto const& entry) {
+                        return entry.second.mState == JITWarmupState::kBackgroundDone
+                            && entry.second.mDeviceId == currentDevice;
+                    });
                 if (it == registry.end())
                 {
                     return;
@@ -840,8 +840,9 @@ private:
                         throw;
                     }
                     markJITWarmupBackgroundDone(fingerprint);
-                    TLLM_LOG_INFO("TRTLLM-Gen FMHA JIT warmup: background compilation of the generation-kernel grid "
-                                  "finished (fingerprint=%llx).",
+                    TLLM_LOG_INFO(
+                        "TRTLLM-Gen FMHA JIT warmup: background compilation of the generation-kernel grid "
+                        "finished (fingerprint=%llx).",
                         static_cast<unsigned long long>(fingerprint));
                 });
             if (!queued)
