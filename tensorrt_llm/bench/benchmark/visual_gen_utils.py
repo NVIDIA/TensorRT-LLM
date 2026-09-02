@@ -235,6 +235,9 @@ def load_visual_gen_prompts(
     else:
         raise ValueError("Either prompt or prompt_file must be specified.")
 
+    if not prompts:
+        raise ValueError(f"No prompts found in {prompt_file}.")
+
     if len(prompts) < num_prompts:
         repeats = (num_prompts // len(prompts)) + 1
         prompts = (prompts * repeats)[:num_prompts]
