@@ -6,6 +6,7 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -20,9 +21,11 @@ from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
     WanCausalConvHalo,
     _native_decode_chunk_size,
 )
+from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import (
     TRTLLM_USE_DIFFUSER_VAE_ENV,
     _is_nvfp4_vae_ckpt,
+    _normalize_nvfp4_checkpoint_keys,
     _select_dynamic_fp4_convs,
     _use_native_wan_vae,
     load_wan_vae,
@@ -63,6 +66,70 @@ DTYPE = torch.float32
 def test_detect_nvfp4_checkpoint(tmp_path, config, expected):
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     assert _is_nvfp4_vae_ckpt(tmp_path) is expected
+
+
+def test_normalize_compressed_tensors_nvfp4_checkpoint_keys():
+    packed_weight = torch.tensor([1], dtype=torch.uint8)
+    block_scale = torch.tensor([1], dtype=torch.float8_e4m3fn)
+    state_dict = {
+        "decoder.conv.weight_packed": packed_weight,
+        "decoder.conv.weight_scale": block_scale,
+        "decoder.conv.weight_global_scale": torch.tensor([2.0]),
+        "decoder.conv.input_global_scale": torch.tensor([4.0]),
+    }
+
+    normalized = _normalize_nvfp4_checkpoint_keys(state_dict)
+
+    assert set(normalized) == {
+        "decoder.conv.weight",
+        "decoder.conv.weight_scale",
+        "decoder.conv.weight_scale_2",
+        "decoder.conv.input_scale",
+    }
+    assert normalized["decoder.conv.weight"] is packed_weight
+    assert normalized["decoder.conv.weight_scale"] is block_scale
+    torch.testing.assert_close(normalized["decoder.conv.weight_scale_2"], torch.tensor([0.5]))
+    torch.testing.assert_close(normalized["decoder.conv.input_scale"], torch.tensor([0.25]))
+
+
+def test_normalize_nvfp4_checkpoint_keys_rejects_alias_collisions():
+    state_dict = {
+        "decoder.conv.weight": torch.tensor([1], dtype=torch.uint8),
+        "decoder.conv.weight_packed": torch.tensor([1], dtype=torch.uint8),
+    }
+
+    with pytest.raises(ValueError, match=r"duplicate aliases for decoder\.conv\.weight"):
+        _normalize_nvfp4_checkpoint_keys(state_dict)
+
+
+def test_wan_warmup_encodes_each_fp4_ti2v_resolution_once():
+    class _FakeVAE(torch.nn.Module):
+        dtype = torch.bfloat16
+
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Sequential(
+                NVFP4WanCausalConv3d(WanCausalConv3d(8, 8, 3, padding=1))
+            )
+            self.encoded_shapes: list[tuple[int, ...]] = []
+
+        def encode(self, image):
+            self.encoded_shapes.append(tuple(image.shape))
+
+    pipeline = object.__new__(WanPipeline)
+    pipeline.is_wan22_5b = True
+    pipeline._fp4_vae_encoder_warmup_resolutions = set()
+    pipeline.vae = _FakeVAE()
+    pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+    forward_calls = []
+    pipeline.forward = lambda **kwargs: forward_calls.append(kwargs)
+
+    WanPipeline._run_warmup(pipeline, 64, 96, 33, 1)
+    WanPipeline._run_warmup(pipeline, 64, 96, 121, 1)
+    WanPipeline._run_warmup(pipeline, 96, 128, 33, 1)
+
+    assert pipeline.vae.encoded_shapes == [(1, 3, 1, 64, 96), (1, 3, 1, 96, 128)]
+    assert len(forward_calls) == 3
 
 
 def test_fp4_conv_composes_with_parallel_vae_halo():

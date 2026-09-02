@@ -56,17 +56,11 @@ FP4_CONV_TACTICS: tuple[FP4ConvTactic, ...] = (
     FP4ConvTactic((256, 192), (2, 1), (2, 1), True),
     FP4_CONV_FIXED_TACTIC,
 )
-_failed_tactics: dict[tuple[object, ...], set[int]] = {}
 
 
 def _tactic_set_key() -> tuple[tuple[object, ...], ...]:
     """Persist the ordered tactic definitions."""
     return tuple(astuple(tactic) for tactic in FP4_CONV_TACTICS)
-
-
-def _clear_fp4_conv_failed_tactics() -> None:
-    """Clear failed-candidate records shared across runner instances."""
-    _failed_tactics.clear()
 
 
 def _launch_fallback_tactic(
@@ -113,11 +107,6 @@ class FP4ConvTunableRunner(TunableRunner):
         self.compile_tactic = compile_tactic
         self.launch = launch
         self.output = output
-        self._runner_key = (_tactic_set_key(), *signature, problem_shape)
-        # Runners are rebuilt for each invocation. Share failures for an exact
-        # signature and problem shape so capture/replay does not re-enumerate a
-        # tactic that compiled successfully but failed during profiling launch.
-        self._failed_tactics = _failed_tactics.setdefault(self._runner_key, set())
 
     def unique_id(self) -> tuple[object, ...]:
         # Tactic IDs are persisted by the shared autotuner. Include the ordered
@@ -131,11 +120,34 @@ class FP4ConvTunableRunner(TunableRunner):
         **kwargs,
     ) -> list[int]:
         del inputs, profile, kwargs
-        return [
-            tactic_id
-            for tactic_id in range(len(FP4_CONV_TACTICS))
-            if tactic_id not in self._failed_tactics
-        ]
+        valid_tactics = []
+        for tactic_id, candidate in enumerate(FP4_CONV_TACTICS):
+            try:
+                self.compile_tactic(candidate)
+            except Exception as error:
+                # CuTe compilation may touch CUDA before rejecting a
+                # configuration; clear any pending error before continuing.
+                try:
+                    torch.cuda.synchronize()
+                except RuntimeError as sync_error:
+                    logger.debug(
+                        "NVFP4 Conv3d CUDA synchronize failed after "
+                        f"tactic {tactic_id} compilation: {sync_error}"
+                    )
+                logger.warning_once(
+                    "NVFP4 Conv3d could not compile "
+                    f"tactic {tactic_id} for {self.signature}, {self.problem_shape}: {error}",
+                    key=(
+                        _NVFP4_CONV_TUNER_KEY,
+                        "compile_failure",
+                        self.signature,
+                        self.problem_shape,
+                        tactic_id,
+                    ),
+                )
+            else:
+                valid_tactics.append(tactic_id)
+        return valid_tactics
 
     @staticmethod
     def resolve_tactic(tactic: object) -> FP4ConvTactic:
@@ -154,48 +166,13 @@ class FP4ConvTunableRunner(TunableRunner):
         inputs: list[torch.Tensor],
         *,
         tactic: int = -1,
-        do_preparation: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         del inputs, kwargs
-        if do_preparation:
-            # CuTe compilation can be orders of magnitude slower than a launch;
-            # compile every candidate before the autotuner starts timing.
-            for tactic_id, candidate in enumerate(FP4_CONV_TACTICS):
-                try:
-                    self.compile_tactic(candidate)
-                except Exception as error:
-                    # CuTe compilation may touch CUDA before rejecting a
-                    # configuration; clear any pending error before continuing.
-                    try:
-                        torch.cuda.synchronize()
-                    except RuntimeError as sync_error:
-                        logger.debug(
-                            "NVFP4 Conv3d CUDA synchronize failed after "
-                            f"tactic {tactic_id} compilation: {sync_error}"
-                        )
-                    self._failed_tactics.add(tactic_id)
-                    logger.warning_once(
-                        "NVFP4 Conv3d could not compile "
-                        f"tactic {tactic_id} for {self.signature}, {self.problem_shape}: {error}",
-                        key=(
-                            _NVFP4_CONV_TUNER_KEY,
-                            "compile_failure",
-                            self.signature,
-                            self.problem_shape,
-                            tactic_id,
-                        ),
-                    )
-            return self.output
-
-        if tactic in self._failed_tactics:
-            raise RuntimeError(f"NVFP4 Conv3d tactic {tactic} failed during preparation")
         compiled = self.compile_tactic(self.resolve_tactic(tactic))
         try:
             self.launch(compiled)
         except Exception as error:
-            if isinstance(tactic, int) and tactic >= 0:
-                self._failed_tactics.add(tactic)
             raise RuntimeError(f"NVFP4 Conv3d tactic {tactic} failed during launch") from error
         return self.output
 

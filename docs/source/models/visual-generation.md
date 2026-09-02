@@ -185,10 +185,17 @@ Omit `quant_config` for BF16/FP16 baseline.
 
 #### Wan VAE NVFP4
 
-FP4 VAE replaces eligible native VAE Conv3d operators with NVFP4
-weight-and-activation kernels while retaining BF16 outputs.
-Transformer and VAE quantization are selected independently. Use
-`quant_config` for transformer layers and `vae_quant_config` for the VAE.
+The VAE can represent a substantial fraction of end-to-end latency in distilled
+video-generation pipelines with few denoising steps. Blackwell Tensor Cores offer
+up to four times the peak NVFP4 compute throughput of BF16, making VAE Conv3d
+operators an important optimization target. FP4 VAE replaces eligible native VAE
+Conv3d operators with NVFP4 weight-and-activation kernels while retaining BF16
+outputs.
+
+Linear-layer, attention, and VAE quantization are selected independently. Use
+`quant_config` for transformer linear layers,
+`attention_config.quant_attention_config` for attention, and `vae_quant_config`
+for the VAE.
 NVFP4 VAE execution currently supports native Wan-family VAEs on SM100, SM103,
 and SM120 GPUs. Unsupported pipelines and algorithms fail before
 pipeline construction. On an unsupported device, an explicit NVFP4 request
@@ -229,10 +236,13 @@ requires a valid calibrated checkpoint scale for every selected convolution;
 `true` derives rank-local activation scales at runtime. Do not specify both the
 top-level shorthand and `config_groups`.
 
-The optional ModelOpt `ignore` list excludes matching VAE modules. With a
+The optional `ignore` list excludes matching VAE modules. With a
 high-precision checkpoint, excluded convolutions remain in BF16. With a packed
 NVFP4 checkpoint, their weights can only be dequantized back to BF16; the
 original high-precision weights cannot be recovered.
+
+See the [Model Optimizer diffusion example](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers#wan-22-vae-nvfp4-conv3d-implicit-gemm)
+for a Wan 2.2 VAE NVFP4 calibration and checkpoint-generation recipe.
 
 ### Runtime LoRA
 

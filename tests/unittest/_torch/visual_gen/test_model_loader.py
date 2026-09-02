@@ -357,6 +357,27 @@ def test_auto_pipeline_rejects_unsupported_explicit_vae_quant_algo(monkeypatch):
         AutoPipeline.from_config(config, "/unused")
 
 
+def test_auto_pipeline_rejects_unsupported_checkpoint_vae_quant_algo(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
+
+    monkeypatch.setattr(
+        AutoPipeline,
+        "_detect_from_checkpoint",
+        staticmethod(lambda _: "WanPipeline"),
+    )
+    config = SimpleNamespace(
+        vae_quant_config=None,
+        model_configs={
+            "vae": SimpleNamespace(
+                pretrained_config=SimpleNamespace(quantization_config={"quant_algo": "FP8"})
+            )
+        },
+    )
+
+    with pytest.raises(ValueError, match="VAE checkpoint quantization supports only NVFP4"):
+        AutoPipeline.from_config(config, "/unused")
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

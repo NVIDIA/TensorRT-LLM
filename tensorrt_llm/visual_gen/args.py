@@ -679,7 +679,10 @@ class VisualGenArgs(StrictBaseModel):
     vae_quant_config: Optional[Union[QuantConfig, Dict[str, Any]]] = Field(
         None,
         status="prototype",
-        description="Quantization config for the VAE, independent from transformer quantization.",
+        description=(
+            "Quantization config for VAE Conv3d operators, independent of "
+            "transformer linear-layer and attention quantization."
+        ),
     )
     compilation_config: CompilationConfig = Field(
         default_factory=CompilationConfig,
