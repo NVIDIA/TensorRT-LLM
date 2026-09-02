@@ -38,7 +38,7 @@ from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info
 
 from ..conftest import get_llm_root, llm_models_root
-from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
+from ._model_paths import MODEL_PATH_DICT
 from .perf_regression_utils import _percentile, process_and_upload_test_results
 from .time_breakdown_metrics import ALL_METRICS as TIME_BREAKDOWN_METRIC_NAMES
 from .time_breakdown_metrics import MODE_GROUPS as TIME_BREAKDOWN_MODE_GROUPS
@@ -48,12 +48,6 @@ from .time_breakdown_metrics import (
     discover_perf_metrics_files,
     format_metric_log_lines,
 )
-
-# Sanity-side path differs from test_perf for this key; preserve historical value.
-MODEL_PATH_DICT = {
-    **_MODEL_PATH_DICT_BASE,
-    "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
-}
 
 SUPPORTED_GPU_MAPPING = {
     "GB200": "gb200",
@@ -66,6 +60,13 @@ SUPPORTED_GPU_MAPPING = {
 # benchmark_client value selecting the AgentX trace-replay client
 # (agentx_client.py). Any other non-empty value is rejected at parse time.
 AGENTX_BENCHMARK_CLIENT = "agentx"
+
+WARMUP_BENCHMARK_MODES = ("e2e", "ctx_only")
+
+
+def wants_warmup(benchmark_mode: str) -> bool:
+    return benchmark_mode in WARMUP_BENCHMARK_MODES
+
 
 BENCH_SERVING_REPO = "https://github.com/kedarpotdar-nv/bench_serving.git"
 BENCH_SERVING_COMMIT = "f3ea022a5780de5d0babc5fffa53634e2023d28f"
@@ -1348,6 +1349,7 @@ class ClientConfig:
         model_name: str,
         env_vars: str = "",
         spec_decoding: bool = False,
+        warmup: bool = False,
     ):
         self.model_name = model_name
         self.concurrency = client_config_data.get("concurrency", 1)
@@ -1378,6 +1380,8 @@ class ClientConfig:
         # agentx_client.py. Reported only -- see the s_benchmark_client note in
         # to_db_data for why it is not a match key.
         self.benchmark_client = client_config_data.get("benchmark_client", "")
+        run_agentx_mode = self.benchmark_client == AGENTX_BENCHMARK_CLIENT
+        self.warmup = warmup and not (run_agentx_mode or self.use_nv_sa_benchmark)
         # Directory the servers write per-request perf-metrics JSONLs to. When
         # set, the client reads the combined disagg record back after the run and
         # prints the per-span statistics; see PerfSanityTestConfig.time_breakdown_dir.
@@ -1488,11 +1492,12 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
             "--ignore-eos",
         ]
+        if not self.warmup:
+            benchmark_cmd.append("--no-test-input")
         if dataset_path:
             benchmark_cmd.append("--dataset-name")
             benchmark_cmd.append("trtllm_custom")
@@ -1553,6 +1558,7 @@ class ClientConfig:
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
+            "b_warmup": self.warmup,
             # Reported, not matched. Case identity is keyed on s_test_case_name
             # (plus GPU type, runtime, branch), and a disagg case name embeds its
             # config stem, so an agentx lane already forms its own population by
@@ -2983,6 +2989,7 @@ class PerfSanityTestConfig:
                 model_name,
                 env_vars=client_env_var,
                 spec_decoding=spec_decoding,
+                warmup=wants_warmup(benchmark_mode),
             )
             client_configs.append(client_config)
 

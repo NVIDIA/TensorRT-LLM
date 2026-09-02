@@ -615,10 +615,11 @@
     },
     {
       "allowed_values": [
+        "quantization_for_cold_page",
         "triattention"
       ],
       "annotation": "Literal['triattention']",
-      "converter": "",
+      "converter": "allowlist",
       "kind": "categorical",
       "path": "kv_cache_compression_config.algorithm"
     },
@@ -653,6 +654,15 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_compression_config.normalize_scores"
+    },
+    {
+      "allowed_values": [
+        "nvfp4"
+      ],
+      "annotation": "Literal['nvfp4']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.quant"
     },
     {
       "allowed_values": [],
@@ -2273,6 +2283,13 @@
       "converter": "",
       "kind": "value",
       "path": "use_cute_dsl_blockscaling_mm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "use_fine_grained_sync"
     }
   ]
 }
