@@ -13,19 +13,23 @@ verification share the same state lifecycle as other recurrent model layers.
 
 import dataclasses
 import math
+import os
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
-from tensorrt_llm._torch.distributed import allgather, reducescatter
+from tensorrt_llm._torch.distributed import AllReduce, allgather, reducescatter
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._utils import CUASSERT, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..mamba.layernorm_gated import RMSNorm as TritonRMSNorm
+from .hyper_connection import GroupedRMSNorm
 from .ple_kernels import (
     can_use_ple_decode_short_conv,
     can_use_ple_gate_value,
@@ -43,6 +47,17 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
+_PLE_HOST_OFFLOAD_ENV = "TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD"
+
+
+def _uses_ple_host_offload() -> bool:
+    """Resolve the environment-only opt-in for pinned-host PLE weights."""
+    value = os.environ.get(_PLE_HOST_OFFLOAD_ENV, "0").strip().lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{_PLE_HOST_OFFLOAD_ENV} must be a boolean value, got {value!r}")
 
 
 def _uses_scaled_fp8_ngram_table(config: object) -> bool:
@@ -146,6 +161,7 @@ class PLEMetadata:
     num_contexts: int = 0
     context_tokens: int = 0
     use_spec_decoding: bool = False
+    is_cuda_graph: bool = False
 
     @classmethod
     def build(
@@ -162,6 +178,7 @@ class PLEMetadata:
         uniform_row_width: Optional[int] = None,
         host_seq_lens: Optional[list[int]] = None,
         all_rank_num_tokens: Optional[list[int]] = None,
+        is_cuda_graph: bool = False,
     ) -> "PLEMetadata":
         """Construct metadata from packed ``input_ids`` and per-sequence lengths.
 
@@ -277,56 +294,183 @@ class PLEMetadata:
             num_contexts=num_contexts,
             context_tokens=context_tokens,
             use_spec_decoding=use_spec_decoding,
+            is_cuda_graph=is_cuda_graph,
         )
 
 
-class Qwen4ExpPLEGroupedNorm(TritonRMSNorm):
-    """Grouped Gemma (``weight + 1``) RMSNorm, computed per group in fp32.
+@triton.jit
+def _gather_pinned_embedding_kernel(
+    weight_ptr,
+    ids_ptr,
+    output_ptr,
+    weight_scale,
+    embedding_dim,
+    vocab_start,
+    vocab_end,
+    is_fp8: tl.constexpr,
+    apply_weight_scale: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Gather owned rows through UVA and write zero for another rank's rows."""
+    row = tl.program_id(0)
+    global_id = tl.load(ids_ptr + row)
+    is_owned = (global_id >= vocab_start) & (global_id < vocab_end)
+    local_id = tl.where(is_owned, global_id - vocab_start, 0)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < embedding_dim
+    if is_fp8:
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    else:
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+    values = tl.load(
+        weight_ptr + local_id * embedding_dim + offsets,
+        mask=is_owned & mask,
+        other=0.0,
+    ).to(tl.bfloat16)
+    if apply_weight_scale:
+        # Preserve the checkpoint contract: FP8 -> BF16 -> FP32 scale -> BF16.
+        values = (values.to(tl.float32) * weight_scale).to(tl.bfloat16)
+    tl.store(output_ptr + row * embedding_dim + offsets, values, mask=mask)
 
-    ``group_size`` groups the last dim into contiguous blocks (one per
-    Hyper-Connection stream); ``group_size is None`` normalizes the whole last
-    dim. CUDA tensors reuse TRT-LLM's fused grouped RMSNorm kernel; CPU tensors
-    retain the equivalent PyTorch path for construction and parity tests.
-    """
+
+class Qwen4ExpPinnedHostEmbedding(nn.Module):
+    """A row-sharded PLE table held in pinned host memory and read through UVA."""
+
+    _requires_standard_hf_loading = True
 
     def __init__(
         self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        group_size: Optional[int] = None,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        dtype: torch.dtype,
+        vocab_start_index: int,
+        vocab_end_index: int,
     ) -> None:
-        if group_size is not None and hidden_size % group_size != 0:
-            raise ValueError(
-                f"hidden_size ({hidden_size}) must be divisible by group_size ({group_size})"
-            )
-        super().__init__(
-            hidden_size,
-            eps=eps,
-            group_size=group_size,
-            weight_is_delta=True,
-            dtype=dtype,
-            device=device,
+        super().__init__()
+        if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise TypeError(f"PLE host offload requires BF16 or FP8 weights, got {dtype}")
+        self.num_embeddings = int(num_embeddings)
+        self.embedding_dim = int(embedding_dim)
+        self.vocab_start_index = int(vocab_start_index)
+        self.vocab_end_index = int(vocab_end_index)
+        self._block_d = triton.next_power_of_2(self.embedding_dim)
+        self._mapped_host_ptr: Optional[int] = None
+        self._mapped_device_ptrs: dict[int, int] = {}
+        self.weight = nn.Parameter(
+            torch.empty(
+                (self.num_embeddings, self.embedding_dim),
+                device="meta",
+                dtype=dtype,
+            ),
+            requires_grad=False,
         )
-        # Gemma stores a delta around one. Construct a fresh tensor instead of
-        # mutating the meta-initialized parameter in place.
-        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype, device=device))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.is_cuda:
-            return super().forward(x)
-        compute_dtype = x.dtype
-        x_float = x.float()
-        if self.group_size == self.hidden_size:
-            variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-        else:
-            group_shape = x_float.shape[:-1] + (-1, self.group_size)
-            variance = x_float.reshape(group_shape).pow(2).mean(dim=-1, keepdim=True)
-            variance = variance.expand(group_shape).reshape_as(x_float)
-        x_norm = x_float * torch.rsqrt(variance + self.eps)
-        weight = self.weight.float() + 1.0
-        return (x_norm * weight).to(compute_dtype)
+    def materialize_pinned(self) -> nn.Parameter:
+        """Create the stable pinned allocation exactly once."""
+        weight = self.weight
+        if weight.device.type == "cpu" and weight.is_pinned():
+            return weight
+        if weight.device.type != "meta":
+            raise RuntimeError(
+                f"PLE host-offload weight must be meta or pinned CPU memory, got {weight.device}"
+            )
+        if not prefer_pinned():
+            raise RuntimeError("PLE host offload requires the pinned-memory runtime policy")
+        pinned = nn.Parameter(
+            torch.empty(
+                weight.shape,
+                device="cpu",
+                dtype=weight.dtype,
+                pin_memory=prefer_pinned(),
+            ),
+            requires_grad=False,
+        )
+        if not pinned.is_pinned():
+            raise RuntimeError("PLE host-offload allocation is not pinned")
+        self.register_parameter("weight", pinned)
+        return pinned
+
+    def _mapped_device_ptr(self, device: torch.device) -> int:
+        """Return the CUDA-visible address for the stable host allocation."""
+        weight = self.materialize_pinned()
+        host_ptr = weight.data_ptr()
+        if self._mapped_host_ptr is not None and self._mapped_host_ptr != host_ptr:
+            raise RuntimeError("PLE pinned-host allocation changed after pointer mapping")
+
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        mapped_ptr = self._mapped_device_ptrs.get(device_index)
+        if mapped_ptr is not None:
+            return mapped_ptr
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("PLE host pointer must be resolved before CUDA graph capture")
+
+        from cuda.bindings import runtime as cudart
+
+        with torch.cuda.device(device_index):
+            (device_ptr,) = CUASSERT(cudart.cudaHostGetDevicePointer(host_ptr, 0))
+        mapped_ptr = int(device_ptr)
+        if mapped_ptr == 0:
+            raise RuntimeError("CUDA returned a null PLE host-mapping pointer")
+        self._mapped_host_ptr = host_ptr
+        self._mapped_device_ptrs[device_index] = mapped_ptr
+        return mapped_ptr
+
+    def _apply(self, fn, recurse: bool = True) -> "Qwen4ExpPinnedHostEmbedding":
+        """Apply module transforms without moving or replacing the host table."""
+        weight = self._parameters.pop("weight")
+        try:
+            result = super()._apply(fn, recurse=recurse)
+        finally:
+            self._parameters["weight"] = weight
+        if weight.device.type == "meta":
+            self.materialize_pinned()
+        return result
+
+    def allocate_output(self, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+        """Allocate the BF16 device rows written by the UVA gather."""
+        return torch.empty(shape, dtype=torch.bfloat16, device=device)
+
+    def gather(
+        self,
+        input_ids: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        *,
+        weight_scale: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Gather global row IDs, returning zero for IDs owned by another rank."""
+        if input_ids.device.type != "cuda":
+            raise ValueError("PLE pinned-host gather requires CUDA input IDs")
+        weight = self.materialize_pinned()
+        if weight_scale is not None and weight.dtype != torch.float8_e4m3fn:
+            raise ValueError("PLE pinned-host scaling is valid only for FP8 tables")
+
+        expected_shape = (*input_ids.shape, self.embedding_dim)
+        output = self.allocate_output(expected_shape, input_ids.device) if out is None else out
+        if tuple(output.shape) != expected_shape:
+            raise ValueError(f"PLE gather output shape {tuple(output.shape)} != {expected_shape}")
+        if output.dtype != torch.bfloat16 or output.device != input_ids.device:
+            raise ValueError("PLE gather output must be BF16 on the input-ID device")
+        if not output.is_contiguous():
+            raise ValueError("PLE gather output must be contiguous")
+
+        flat_ids = input_ids.reshape(-1).long()
+        if flat_ids.numel() > 0:
+            _gather_pinned_embedding_kernel[(flat_ids.numel(),)](
+                self._mapped_device_ptr(input_ids.device),
+                flat_ids,
+                output,
+                1.0 if weight_scale is None else weight_scale,
+                embedding_dim=self.embedding_dim,
+                vocab_start=self.vocab_start_index,
+                vocab_end=self.vocab_end_index,
+                is_fp8=weight.dtype == torch.float8_e4m3fn,
+                apply_weight_scale=weight_scale is not None,
+                BLOCK_D=self._block_d,
+            )
+        return output
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -362,6 +506,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if self.tp_size <= 0 or not 0 <= self.tp_rank < self.tp_size:
             raise ValueError("PLE received an invalid tensor-parallel mapping")
         self.embedding_output_dtype = dtype
+        self.host_offload = _uses_ple_host_offload()
         self.use_attention_dp_sharding = bool(
             mapping is not None and mapping.enable_attention_dp and self.tp_size > 1
         )
@@ -375,6 +520,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             None,
             persistent=False,
         )
+        self._host_offload_weight_scale: Optional[float] = None
 
         if self.ngram_embed_dim <= 0:
             raise ValueError("PLE embedding dimension must be positive")
@@ -423,14 +569,38 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.padded_vocab_size = padded_vocab_size
         weight_dtype = torch.float8_e4m3fn if _uses_scaled_fp8_ngram_table(config) else dtype
         slice_width = math.ceil(padded_vocab_size / self.tp_size)
-        if self.use_attention_dp_sharding:
-            self.vocab_start_index = self.tp_rank * slice_width
-            self.vocab_end_index = min((self.tp_rank + 1) * slice_width, padded_vocab_size)
+        self.vocab_start_index = self.tp_rank * slice_width
+        self.vocab_end_index = min((self.tp_rank + 1) * slice_width, padded_vocab_size)
+        if self.host_offload:
+            if dtype != torch.bfloat16:
+                raise TypeError(
+                    "PLE host offload currently gathers BF16 activations; "
+                    f"got model activation dtype {dtype}"
+                )
+            self.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
+                slice_width,
+                self.head_dim_per_ngram,
+                dtype=weight_dtype,
+                vocab_start_index=self.vocab_start_index,
+                vocab_end_index=self.vocab_end_index,
+            )
+            self.embedding_allreduce = (
+                AllReduce(mapping=mapping, dtype=torch.bfloat16)
+                if self.tp_size > 1 and not self.use_attention_dp_sharding
+                else None
+            )
+            logger.info(
+                "PLE n-gram table uses pinned host memory: "
+                f"rank={self.tp_rank}/{self.tp_size}, local_rows={slice_width}, "
+                f"dtype={weight_dtype}"
+            )
+        elif self.use_attention_dp_sharding:
             self.ngram_embedding = Embedding(
                 slice_width,
                 self.head_dim_per_ngram,
                 dtype=weight_dtype,
             )
+            self.embedding_allreduce = None
         elif self.tp_size > 1:
             self.ngram_embedding = Embedding(
                 padded_vocab_size,
@@ -441,6 +611,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
             self.vocab_start_index = self.ngram_embedding.vocab_start_index
             self.vocab_end_index = self.ngram_embedding.vocab_end_index
+            self.embedding_allreduce = None
         else:
             self.vocab_start_index = 0
             self.vocab_end_index = padded_vocab_size
@@ -449,6 +620,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 self.head_dim_per_ngram,
                 dtype=weight_dtype,
             )
+            self.embedding_allreduce = None
 
     def configure_fp8_weight_storage(
         self,
@@ -468,6 +640,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         weight = self.ngram_embedding.weight
         if weight.dtype != weight_dtype:
+            if self.host_offload:
+                raise TypeError(
+                    "PLE host-offload checkpoint dtype does not match its "
+                    f"preallocated table: {weight_dtype} != {weight.dtype}"
+                )
             weight_shape = weight.shape
             weight_device = weight.device
             # Release the old table before allocating its FP8 replacement;
@@ -493,6 +670,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if self.ngram_embedding_weight_scale.device != configured_scale.device:
                 raise RuntimeError("PLE n-gram scale device cannot change after configuration")
             self.ngram_embedding_weight_scale.copy_(configured_scale)
+        if self.host_offload:
+            self._host_offload_weight_scale = scale
         logger.info(
             "Qwen4-Exp PLE n-gram table configured for scaled FP8 storage: "
             f"dtype={self.ngram_embedding.weight.dtype}, "
@@ -561,7 +740,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         all_rank_num_tokens: Optional[list[int]],
     ) -> torch.Tensor:
         """Reduce row-sharded lookup results and restore local token ownership."""
-        partial = self._dequantize_embeddings(partial)
+        # The host gather fuses FP8 scaling before communication. Resident
+        # tables still dequantize the selected rows here.
+        if not self.host_offload:
+            partial = self._dequantize_embeddings(partial)
         if self.use_attention_dp_sharding:
             if all_rank_num_tokens is None:
                 raise ValueError("PLE attention-DP token counts are missing")
@@ -570,6 +752,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if physical_tokens is None:
                 physical_tokens = partial.shape[0]
             partial = partial[:physical_tokens]
+        elif self.tp_size > 1 and self.host_offload:
+            if self.embedding_allreduce is None:
+                raise RuntimeError("PLE host-offload TP lookup is missing its AllReduce")
+            partial = self.embedding_allreduce(partial)
 
         return partial[:semantic_tokens]
 
@@ -699,6 +885,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # format; using them before the mapper attaches the scalar would
             # silently change every lookup.
             raise RuntimeError("PLE FP8 n-gram table is missing its weight scale")
+        if self.host_offload:
+            lookup_ids, semantic_tokens = self._prepare_embedding_lookup(
+                ngram_ids,
+                physical_tokens,
+                all_rank_num_tokens,
+            )
+            partial = self.ngram_embedding.gather(
+                lookup_ids,
+                weight_scale=self._host_offload_weight_scale,
+            )
+            return self._finish_embedding_lookup(
+                partial,
+                semantic_tokens,
+                physical_tokens,
+                all_rank_num_tokens,
+            )
         if not self.use_attention_dp_sharding and self.ngram_embedding_weight_scale is not None:
             return self._embed_fp8_tp(ngram_ids)
         if not self.use_attention_dp_sharding:
@@ -785,13 +987,13 @@ class Qwen4ExpPLE(nn.Module):
         )
         norm_hidden = self.hc_hidden_size
         norm_group = self.hidden_size
-        self.norm_key = Qwen4ExpPLEGroupedNorm(
+        self.norm_key = GroupedRMSNorm(
             norm_hidden, eps=config.rms_norm_eps, group_size=norm_group, dtype=dtype
         )
-        self.norm_query = Qwen4ExpPLEGroupedNorm(
+        self.norm_query = GroupedRMSNorm(
             norm_hidden, eps=config.rms_norm_eps, group_size=norm_group, dtype=dtype
         )
-        self.norm_conv = Qwen4ExpPLEGroupedNorm(
+        self.norm_conv = GroupedRMSNorm(
             norm_hidden, eps=config.rms_norm_eps, group_size=norm_group, dtype=dtype
         )
         # Only ``.weight`` (shape [conv_channels, 1, kernel]) is used; the
@@ -810,10 +1012,16 @@ class Qwen4ExpPLE(nn.Module):
         # Target verification advances through every proposed token. Retain the
         # per-prefix candidates until rejection sampling reports the accepted
         # length, then restore the accepted prefix state.
-        self._pending_conv_states: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
-        self._pending_ngram_contexts: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
-            None
-        )
+        self._pending_conv_states: Optional[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None
+        self._pending_ngram_contexts: Optional[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None
+        self._prefetch_stream = torch.cuda.Stream() if self.ple_embedding.host_offload else None
+        self._graph_prefetch_buffers: dict[tuple[int, int], torch.Tensor] = {}
+        self._eager_prefetch_buffer: Optional[torch.Tensor] = None
+        self._prefetch_state: Optional[tuple[torch.Tensor, int, int, torch.Tensor]] = None
 
     def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
         """Per-stream grouped norm over a ``[..., hc_count, hidden]`` tensor."""
@@ -834,6 +1042,114 @@ class Qwen4ExpPLE(nn.Module):
             contexts,
             use_decode_fusion=metadata.is_decode,
         )
+
+    def _allocate_prefetch_buffer(
+        self,
+        lookup_tokens: int,
+        lookup_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.ple_embedding.ngram_embedding.allocate_output(
+            (lookup_tokens, self.ple_embed_dim), lookup_ids.device
+        )
+
+    def _get_prefetch_buffer(
+        self,
+        lookup_tokens: int,
+        lookup_ids: torch.Tensor,
+        *,
+        is_cuda_graph: bool,
+    ) -> torch.Tensor:
+        if is_cuda_graph:
+            device_index = lookup_ids.device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            key = (device_index, lookup_tokens)
+            buffer = self._graph_prefetch_buffers.get(key)
+            if buffer is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("PLE prefetch buffer must be allocated during graph warmup")
+                buffer = self._allocate_prefetch_buffer(lookup_tokens, lookup_ids)
+                self._graph_prefetch_buffers[key] = buffer
+            return buffer
+
+        buffer = self._eager_prefetch_buffer
+        if buffer is None or buffer.device != lookup_ids.device or buffer.shape[0] < lookup_tokens:
+            buffer = self._allocate_prefetch_buffer(lookup_tokens, lookup_ids)
+            self._eager_prefetch_buffer = buffer
+        return buffer[:lookup_tokens]
+
+    def start_prefetch(
+        self,
+        metadata: PLEMetadata,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        """Start the sparse host lookup before execution reaches the PLE layer."""
+        prefetch_stream = self._prefetch_stream
+        if prefetch_stream is None:
+            return
+        if self._prefetch_state is not None:
+            raise RuntimeError("PLE prefetch state was not consumed before reuse")
+
+        combined, ngram_ids = self._prepare_ngram_lookup(metadata, ngram_context)
+        lookup_ids, semantic_tokens = self.ple_embedding._prepare_embedding_lookup(
+            ngram_ids,
+            metadata.physical_tokens,
+            metadata.all_rank_num_tokens,
+        )
+        lookup_tokens = lookup_ids.shape[0]
+        if lookup_tokens == 0:
+            return
+
+        prefetched = self._get_prefetch_buffer(
+            lookup_tokens,
+            lookup_ids,
+            is_cuda_graph=metadata.is_cuda_graph,
+        )
+        output = prefetched.view(
+            lookup_tokens,
+            self.ple_embedding.ngram_heads,
+            self.ple_embedding.head_dim_per_ngram,
+        )
+        current_stream = torch.cuda.current_stream()
+        prefetch_stream.wait_stream(current_stream)
+        lookup_ids.record_stream(prefetch_stream)
+        with torch.cuda.stream(prefetch_stream):
+            self.ple_embedding.ngram_embedding.gather(
+                lookup_ids,
+                out=output,
+                weight_scale=self.ple_embedding._host_offload_weight_scale,
+            )
+        self._prefetch_state = (
+            prefetched,
+            semantic_tokens,
+            metadata.physical_tokens,
+            combined,
+        )
+
+    def abort_prefetch(self) -> None:
+        """Discard an unconsumed lookup after the enclosing forward fails."""
+        self._prefetch_state = None
+
+    def _consume_prefetched_embeddings(
+        self,
+        metadata: PLEMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._prefetch_state is None or self._prefetch_stream is None:
+            raise RuntimeError("PLE prefetch state is missing")
+        prefetched, semantic_tokens, physical_tokens, combined = self._prefetch_state
+        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        embeddings = self.ple_embedding._finish_embedding_lookup(
+            prefetched.view(
+                prefetched.shape[0],
+                self.ple_embedding.ngram_heads,
+                self.ple_embedding.head_dim_per_ngram,
+            ),
+            semantic_tokens,
+            physical_tokens,
+            metadata.all_rank_num_tokens,
+        )
+        self._prefetch_state = None
+        return embeddings.flatten(start_dim=-2), combined
 
     def _short_conv(
         self, x: torch.Tensor, metadata: PLEMetadata, conv_state: torch.Tensor
@@ -938,20 +1254,21 @@ class Qwen4ExpPLE(nn.Module):
                 .expand(-1, self.conv_channels, -1),
             )
 
-        next_state = _gather_at(m.lengths)
-        conv_state[m.state_indices] = next_state.to(dtype=conv_state.dtype)
-
         if m.use_spec_decoding and m.num_contexts < num_seq:
+            generation_slots = m.state_indices[m.num_contexts :]
             candidates = conv_input.unfold(2, self.short_conv_state_len, 1)[
                 :, :, 1 : m.row_width + 1
             ]
             candidates = candidates.permute(0, 2, 1, 3).contiguous()
             self._pending_conv_states = (
                 conv_state,
-                m.state_indices[m.num_contexts :],
+                generation_slots,
+                conv_state[generation_slots].clone(),
                 candidates[m.num_contexts :],
             )
 
+        next_state = _gather_at(m.lengths)
+        conv_state[m.state_indices] = next_state.to(dtype=conv_state.dtype)
         return F.silu(conv_output[m.req_indices, m.token_offsets])
 
     def _commit_ngram_context(
@@ -967,15 +1284,17 @@ class Qwen4ExpPLE(nn.Module):
         context_len = combined.shape[1] - m.row_width
         context_cols = torch.arange(context_len, device=combined.device, dtype=torch.long)
         next_context = combined.gather(1, m.lengths.unsqueeze(1) + context_cols.unsqueeze(0))
-        ngram_context[m.state_indices] = next_context.to(dtype=ngram_context.dtype)
-
         if m.use_spec_decoding and m.num_contexts < m.lengths.shape[0]:
+            generation_slots = m.state_indices[m.num_contexts :]
             candidates = combined.unfold(1, context_len, 1)[:, 1 : m.row_width + 1].contiguous()
             self._pending_ngram_contexts = (
                 ngram_context,
-                m.state_indices[m.num_contexts :],
+                generation_slots,
+                ngram_context[generation_slots].clone(),
                 candidates[m.num_contexts :],
             )
+
+        ngram_context[m.state_indices] = next_context.to(dtype=ngram_context.dtype)
 
     def commit_speculative_states(
         self,
@@ -991,11 +1310,21 @@ class Qwen4ExpPLE(nn.Module):
         for entry in (self._pending_conv_states, self._pending_ngram_contexts):
             if entry is None:
                 continue
-            state_pool, slots, candidates = entry
+            state_pool, slots, _, candidates = entry
             num_gens = slots.shape[0]
             rows = torch.arange(num_gens, device=slots.device)
             selected = candidates[rows, accepted[:num_gens]]
             state_pool[slots] = selected.to(dtype=state_pool.dtype)
+        self._pending_conv_states = None
+        self._pending_ngram_contexts = None
+
+    def abort_speculative_states(self) -> None:
+        """Restore recurrent state captured before target verification."""
+        for entry in (self._pending_conv_states, self._pending_ngram_contexts):
+            if entry is None:
+                continue
+            state_pool, slots, original, _ = entry
+            state_pool[slots] = original.to(dtype=state_pool.dtype)
         self._pending_conv_states = None
         self._pending_ngram_contexts = None
 
@@ -1053,12 +1382,15 @@ class Qwen4ExpPLE(nn.Module):
             # the graph's physical row count with zero PLE contributions.
             return hidden_states.new_zeros((m.physical_tokens, hc_dim))
 
-        combined, ngram_ids = self._prepare_ngram_lookup(m, ngram_context)
-        embeddings = self.ple_embedding.embed(
-            ngram_ids,
-            physical_tokens=m.physical_tokens,
-            all_rank_num_tokens=m.all_rank_num_tokens,
-        ).flatten(start_dim=-2)
+        if self._prefetch_state is not None:
+            embeddings, combined = self._consume_prefetched_embeddings(m)
+        else:
+            combined, ngram_ids = self._prepare_ngram_lookup(m, ngram_context)
+            embeddings = self.ple_embedding.embed(
+                ngram_ids,
+                physical_tokens=m.physical_tokens,
+                all_rank_num_tokens=m.all_rank_num_tokens,
+            ).flatten(start_dim=-2)
 
         key = self.key_proj(embeddings)
         value = self.value_proj(embeddings)

@@ -804,6 +804,21 @@ class ModelLoader:
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
+            requires_standard_hf_loading = any(
+                getattr(module, "_requires_standard_hf_loading", False)
+                for module in model.modules())
+            # Pinned-host parameters must be materialized and filled in place.
+            # AUTO uses the HF mapper that preserves their stable addresses;
+            # AUTO may still resolve to MX, so check the resolved format too.
+            uses_standard_hf_loader = (load_format == LoadFormat.AUTO
+                                       and checkpoint_loader.checkpoint_format
+                                       != "MX")
+            if requires_standard_hf_loading and not uses_standard_hf_loader:
+                raise ValueError(
+                    "Host-resident model weights currently require the standard "
+                    "Hugging Face AUTO loader; DUMMY, VISION_ONLY, GMS, and MX "
+                    "loaders cannot materialize them")
+
             loads_draft_weights = (
                 self.spec_config is not None
                 and self.spec_config.needs_separate_draft_weights)

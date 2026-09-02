@@ -44,6 +44,7 @@ l0_b300:
   - unittest/_torch/modules/test_qwen4_exp_hyper_connection.py TIMEOUT (90)
   - unittest/_torch/modules/test_qwen4_exp_ple.py TIMEOUT (90)
   - unittest/_torch/modules/test_qwen4_exp_ple_kernels.py TIMEOUT (90)
+  - unittest/_torch/modules/test_qwen4_exp_ple_offload.py TIMEOUT (90)
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------

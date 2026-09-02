@@ -572,6 +572,7 @@ class Qwen4ExpModel(DecoderModel):
             uniform_row_width=uniform_row_width,
             host_seq_lens=sequence_lengths if not is_decode and uniform_row_width is None else None,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            is_cuda_graph=attn_metadata.is_cuda_graph,
         )
 
         conv_state, ngram_context = self._resolve_ple_pools(
@@ -726,19 +727,35 @@ class Qwen4ExpModel(DecoderModel):
             if ple_input_ids is not None
             else None
         )
+        prefetched_ple_module = None
+        if ple_state is not None:
+            ple_layer_idx = self.ple_layer_index
+            if ple_layer_idx is None:
+                raise RuntimeError("PLE state was prepared on a rank without a PLE layer")
+            ple_meta, _, ngram_context = ple_state
+            ple_module = self.layers[ple_layer_idx].ple
+            if ple_module is None:
+                raise RuntimeError("PLE layer mask resolved to a layer without a PLE module")
+            ple_module.start_prefetch(ple_meta, ngram_context)
+            prefetched_ple_module = ple_module
         pending_combine = None
-        for layer_idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
-            hidden_states, pending_combine = decoder_layer(
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                mamba_metadata=mamba_metadata,
-                ple_state=ple_state if self.ple_layer_mask[layer_idx] else None,
-                spec_metadata=spec_metadata,
-                lora_params=lora_params,
-                pending_combine=pending_combine,
-                defer_combine=self.defer_combine_mask[layer_idx],
-            )
+        try:
+            for layer_idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
+                hidden_states, pending_combine = decoder_layer(
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    mamba_metadata=mamba_metadata,
+                    ple_state=ple_state if self.ple_layer_mask[layer_idx] else None,
+                    spec_metadata=spec_metadata,
+                    lora_params=lora_params,
+                    pending_combine=pending_combine,
+                    defer_combine=self.defer_combine_mask[layer_idx],
+                )
+        except Exception:
+            if prefetched_ple_module is not None:
+                prefetched_ple_module.abort_prefetch()
+            raise
         if pending_combine is not None:
             raise RuntimeError("the last decoder layer must materialize the residual bundle")
 

@@ -305,6 +305,58 @@ def test_multimodal_forward_requires_original_token_ids_on_a_ple_rank() -> None:
         )
 
 
+def test_model_forward_aborts_unconsumed_ple_prefetch(monkeypatch) -> None:
+    from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpModel
+
+    class _PrefetchState(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = False
+            self.aborted = False
+
+        def start_prefetch(self, metadata, ngram_context) -> None:
+            del metadata, ngram_context
+            self.started = True
+
+        def abort_prefetch(self) -> None:
+            self.aborted = True
+
+    class _FailingLayer(nn.Module):
+        def __init__(self, ple) -> None:
+            super().__init__()
+            self.ple = ple
+
+        def forward(self, **kwargs):
+            del kwargs
+            raise RuntimeError("simulated layer failure")
+
+    ple = _PrefetchState()
+    model = object.__new__(Qwen4ExpModel)
+    nn.Module.__init__(model)
+    model.model_config = SimpleNamespace(mapping=SimpleNamespace(has_pp=lambda: False))
+    model.layers = nn.ModuleList((_FailingLayer(ple),))
+    model.num_hidden_layers = 1
+    model.ple_layer_mask = [True]
+    model.ple_layer_index = 0
+    model.has_ple = True
+    model.defer_combine_mask = [False]
+    monkeypatch.setattr(
+        Qwen4ExpModel,
+        "_prepare_ple_state",
+        lambda *args, **kwargs: (object(), object(), object()),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated layer failure"):
+        model(
+            attn_metadata=SimpleNamespace(mamba_metadata=None, max_num_requests=1),
+            inputs_embeds=torch.randn(1, 8),
+            orig_input_ids=torch.ones(1, dtype=torch.long),
+        )
+
+    assert ple.started
+    assert ple.aborted
+
+
 def test_text_model_is_eligible_for_online_eplb() -> None:
     from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import moe_model_arch_list
 

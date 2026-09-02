@@ -78,6 +78,7 @@ from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm._torch.modules.qwen4_exp.ple import Qwen4ExpPinnedHostEmbedding
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm._torch.utils import split
@@ -570,7 +571,10 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
             elif shard_dtype == torch.float8_e4m3fn:
                 raise ValueError(f"PLE FP8 n-gram shards for {ple_prefix} have no weight scale")
 
-            table = module.ngram_embedding.weight
+            if isinstance(module.ngram_embedding, Qwen4ExpPinnedHostEmbedding):
+                table = module.ngram_embedding.materialize_pinned()
+            else:
+                table = module.ngram_embedding.weight
             for leaf in shard_leaves:
                 shard = leaves[leaf]
                 if shard.ndim != 2 or shard.shape[1] != table.shape[1] or shard.shape[0] <= 0:
@@ -578,6 +582,11 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                         f"PLE n-gram shard {leaf} has shape {tuple(shard.shape)}, expected "
                         f"[positive_rows, {table.shape[1]}]"
                     )
+            if getattr(module, "host_offload", False) and table.dtype != shard_dtype:
+                raise TypeError(
+                    f"PLE host table for {ple_prefix} uses {table.dtype}, "
+                    f"but checkpoint shards use {shard_dtype}"
+                )
             table_ptr = table.data_ptr()
             row = 0
             copied_rows = 0
@@ -609,3 +618,5 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
             local_rows = vocab_end - vocab_start
             if table.shape[0] > local_rows:
                 table.data[local_rows:].zero_()
+            if table.data_ptr() != table_ptr:
+                raise RuntimeError("PLE n-gram table address changed while loading")
