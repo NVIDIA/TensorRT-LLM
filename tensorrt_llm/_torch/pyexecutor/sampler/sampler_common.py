@@ -161,7 +161,7 @@ def request_random_seed(request: LlmRequest) -> Optional[int]:
     opaque bit pattern, so this keeps distinct seeds distinct, and it avoids an
     overflow that would abort the whole sampling step rather than one request.
     """
-    seed = request.sampling_config.seed
+    seed = cast(Optional[int], request.sampling_config.seed)
     if seed is None:
         return None
     return seed - (1 << 64) if seed >= (1 << 63) else seed

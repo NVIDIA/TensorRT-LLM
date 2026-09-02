@@ -157,7 +157,7 @@ class TestStrategySelection:
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
         ) -> int:  # Torch sampler accesses this, but it does not affect this test
-            return self.sampling_config.beam_width
+            return cast(int, self.sampling_config.beam_width)
 
     def _check_params(self, params: SamplingParams):
         # cf. description of 'top_p' in doc-string of SamplingParams and
@@ -563,7 +563,7 @@ def test_select_generated_logits(
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
-                return self.sampling_config.beam_width
+                return cast(int, self.sampling_config.beam_width)
 
         class GenRequestMock:
             def __init__(self, draft_len: int):
@@ -575,7 +575,7 @@ def test_select_generated_logits(
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
-                return self.sampling_config.beam_width
+                return cast(int, self.sampling_config.beam_width)
 
         def _build_scheduled_requests() -> ScheduledRequests:
             scheduled_requests = ScheduledRequests()
