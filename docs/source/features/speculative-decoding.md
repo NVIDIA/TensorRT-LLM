@@ -166,6 +166,31 @@ speculative_config = DFlashDecodingConfig(
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
 
+#### DFlash 2
+
+DFlash 2 drafters raise the acceptance rate with two additions to the DFlash block decode:
+
+* **Two-tap dynamic depthwise convolutions** wrapped around every attention and MLP sublayer. These take over mixing information within the drafted block, which frees the draft attention to spend its capacity on reading the target's context.
+* **A pairwise candidate path selector.** Predicting each block position independently leaves the correct token in the position's candidate list far more often than in first place, so DFlash 2 keeps the top `selector_top_k` candidates per position, scores every adjacent candidate pair, and walks one coherent path through the block.
+
+Reference: [DFlash 2](https://inco.ai/blog/dflash2/)
+
+Both are detected from the draft checkpoint's `dflash_config`, so DFlash 2 uses the same `DFlashDecodingConfig` and needs no extra options — point `speculative_model` at a DFlash 2 drafter and the rest is read from its config. Set `max_draft_len` to the drafter's trained `block_size` minus one; a mismatch is served with a warning and a lower acceptance length.
+
+```python
+from tensorrt_llm.llmapi import DFlashDecodingConfig
+
+# incoai/Qwen3.8-27B-DFlash2 is trained with block_size=8.
+speculative_config = DFlashDecodingConfig(
+    max_draft_len=7,
+    speculative_model="incoai/Qwen3.8-27B-DFlash2",
+)
+
+llm = LLM("Qwen/Qwen3.8-27B", speculative_config=speculative_config)
+```
+
+The candidate selector indexes codebooks over the full draft vocabulary, so it requires the drafter to share the target's vocabulary (no `d2t` vocabulary mapping).
+
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
 * `max_draft_len`: Maximum draft candidate length.
