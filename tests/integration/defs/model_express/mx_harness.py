@@ -82,6 +82,9 @@ print(f"MODELEXPRESS_VERSION={metadata.version('modelexpress')}")
 """
 
 ROLES = ("baseline", "donor", "receiver")
+# Exit status `mx_e2e_worker.py` uses when a receiver's own transfer
+# self-check fails before any accuracy evaluation runs.
+SELF_CHECK_FAILED_EXIT_CODE = 3
 MX_ROLES = ("donor", "receiver")
 # NIXL binds `MX_METADATA_PORT + device_id` in every rank. The donor and the
 # receiver share one network namespace in CI, so each side gets its own range.
@@ -433,6 +436,11 @@ def run_worker(
             returncode = process.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         pytest.fail(f"MX E2E worker timed out: {' '.join(command)}\n{log_tail(log_path)}")
+    if returncode == SELF_CHECK_FAILED_EXIT_CODE:
+        pytest.fail(
+            "MX receiver transfer self-check failed before eval (weights did not arrive "
+            f"through MX P2P): {' '.join(command)}\n{log_tail(log_path)}"
+        )
     if returncode != 0:
         pytest.fail(
             f"MX E2E worker exited with status {returncode}: "
@@ -804,6 +812,7 @@ __all__ = [
     "MX_PREFLIGHT_SCRIPT",
     "MX_ROLES",
     "ROLES",
+    "SELF_CHECK_FAILED_EXIT_CODE",
     "TRANSFER_TIER_KINDS",
     "WEIGHT_SUFFIXES",
     "WORKER_PATH",
