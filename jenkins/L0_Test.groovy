@@ -2930,6 +2930,12 @@ def stageMatchesAnyPattern(String key, List patterns) {
     return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
 }
 
+// Return the OpenSearch regexp for sibling shards and their CBTS variants.
+String getTestReuseStagePattern(String stageName) {
+    def stageNamePrefix = stageName.replaceFirst(/-\d+(-cbts)?$/, "")
+    return "${stageNamePrefix}-[0-9]+(-cbts)?"
+}
+
 // Test filter flags
 // Multi-GPU stages matching any entry here run inside the single-GPU job
 // instead of waiting for the separate multi-GPU dispatch (which requires
@@ -2980,7 +2986,8 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-// Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
+// Suffix for CBTS-narrowed stages so they cannot be reused as whole non-CBTS stages.
+// Their individual passed testcases may still be reused through an OpenSearch query.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
 def CBTS_STAGE_SUFFIX = "-cbts"
@@ -4668,12 +4675,14 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
         sh "mkdir -p ${workDir}"
 
         // 1. OpenSearch lookup -- tests that PASSED in a previous pipeline run
-        //    for this commit + stage.
+        //    for this commit + sibling stage shards. CBTS and non-CBTS results
+        //    are merged only at testcase granularity.
         def passedTestListFile = "${workDir}/passed_test_list.txt"
+        def stageNamePattern = getTestReuseStagePattern(stageName)
         sh """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
-            --stage-name ${stageName} \
+            --stage-name-pattern '${stageNamePattern}' \
             --output-file ${passedTestListFile}
         """
         if (fileExists(passedTestListFile)) {
