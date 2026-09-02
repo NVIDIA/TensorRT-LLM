@@ -63,7 +63,6 @@ WARMUP_BENCHMARK_MODES = ("e2e", "ctx_only")
 
 
 def wants_warmup(benchmark_mode: str) -> bool:
-    """Whether a lane in this benchmark mode should issue a warmup request."""
     return benchmark_mode in WARMUP_BENCHMARK_MODES
 
 
