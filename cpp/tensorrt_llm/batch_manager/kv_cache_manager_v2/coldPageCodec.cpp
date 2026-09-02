@@ -215,9 +215,10 @@ private:
         {
             return false;
         }
-        // KVCM never submits a negative index, so this is a debug-only sanity check rather than a
-        // validated precondition -- an O(numBasePages) host scan does not belong on the eviction
-        // critical path. The copy path carries matching assertions.
+        // Valid indices are a caller contract (see PageIndexPair), not something this method
+        // validates: an O(numBasePages) host scan does not belong on the eviction critical path,
+        // and it is impossible anyway once the array lives in device memory. This is a debug-only
+        // sanity check on the host-array path, where the scan happens to be cheap and possible.
         if (mCopier.pageIndexLocation() == PageIndexLocation::kHost)
         {
             TLLM_CHECK_DEBUG(std::all_of(pageIndices, pageIndices + numBasePages,

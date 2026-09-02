@@ -699,18 +699,19 @@ LinkInfo detectLink(int device)
 // BatchedPageCopier
 // ---------------------------------------------------------------------------------------------
 
-BatchedPageCopier::BatchedPageCopier(int device)
+BatchedPageCopier::BatchedPageCopier()
 {
-    if (device < 0)
-    {
-        TLLM_CUDA_CHECK(cudaGetDevice(&device));
-    }
-    detect(device);
+    detect();
     computeConfigs();
 }
 
-void BatchedPageCopier::detect(int device)
+void BatchedPageCopier::detect()
 {
+    // Everything below queries or configures the current device: cudaFuncSetAttribute in
+    // computeConfigs() has no device parameter, so accepting one here could only produce a
+    // topology describing one device and kernel attributes set on another.
+    int device = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
     mTopology.device = device;
 
     int major = 0;

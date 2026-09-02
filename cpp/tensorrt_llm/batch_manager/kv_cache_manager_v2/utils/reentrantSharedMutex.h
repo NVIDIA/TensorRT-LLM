@@ -148,7 +148,7 @@ private:
     //! *calling* thread's own id: a thread always observes its own stores in program order, and
     //! two live threads cannot share an id, so a stale read can never produce a false
     //! "I already own this".
-    mutable std::atomic<std::thread::id> mOwnerThread;
+    mutable std::atomic<std::thread::id> mOwnerThread{std::thread::id{}};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

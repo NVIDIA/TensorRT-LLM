@@ -58,6 +58,13 @@ enum class PageIndexLocation : int
 };
 
 //! Source and destination page indices for one logical page conversion.
+//!
+//! Caller contract: both indices are non-negative and in range for their pool. KVCM2 derives them
+//! from concrete allocated pages, so they are valid by construction. Implementations are entitled
+//! to use them unchecked -- validating costs an O(numBasePages) scan on the eviction critical path,
+//! and on the device-array path the values are not host-readable at all. A negative index
+//! sign-extends into a wild device address rather than faulting cleanly, so a violation is memory
+//! corruption, not a caught error.
 struct alignas(8) PageIndexPair
 {
     int32_t dst;
@@ -109,6 +116,9 @@ public:
     //! The cold base pointer is GPU-accessible. The index-array location is selected by queryPageIndexLocation(). Host
     //! arrays remain valid until this method returns; device arrays remain valid until work enqueued on stream
     //! completes. The pairs may have been concatenated from multiple codec-equivalent lifecycles.
+    //!
+    //! Every pageIndices entry must satisfy the PageIndexPair contract; passing an invalid index is
+    //! undefined behaviour rather than a `false` return.
     virtual bool encode(LayerGroupId layerGroupId, void* dstBasePtr, PageIndexPair const* pageIndices,
         size_t numBasePages, cudaStream_t stream) noexcept
         = 0;
@@ -118,6 +128,9 @@ public:
     //! The cold base pointer is GPU-accessible. The index-array location is selected by queryPageIndexLocation(). Host
     //! arrays remain valid until this method returns; device arrays remain valid until work enqueued on stream
     //! completes. The pairs may have been concatenated from multiple codec-equivalent lifecycles.
+    //!
+    //! Every pageIndices entry must satisfy the PageIndexPair contract; passing an invalid index is
+    //! undefined behaviour rather than a `false` return.
     virtual bool decode(LayerGroupId layerGroupId, void const* srcBasePtr, PageIndexPair const* pageIndices,
         size_t numBasePages, cudaStream_t stream) noexcept
         = 0;

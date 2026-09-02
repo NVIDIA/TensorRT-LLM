@@ -92,6 +92,7 @@ public:
     //! Platform facts discovered at construction. Exposed for logging and tests.
     struct Topology
     {
+        //! The current device at construction time.
         int device = -1;
         int smVersion = 0;
         int smCount = 0;
@@ -107,8 +108,9 @@ public:
         int gpusOnSameHostNuma = 1;
     };
 
-    //! @param device CUDA device ordinal, or -1 for the current device.
-    explicit BatchedPageCopier(int device = -1);
+    //! Detection and the shared-memory opt-in below both apply to the *current* device, so there
+    //! is no device parameter: construct on the device this copier will be used from.
+    BatchedPageCopier();
 
     [[nodiscard]] KernelConfig const& config(CopyDirection direction) const noexcept
     {
@@ -159,7 +161,7 @@ public:
     void launch(PoolCopyArgs const& args, CopyDirection direction, CUstream stream);
 
 private:
-    void detect(int device);
+    void detect();
     void computeConfigs();
     void launchKernel(PoolCopyArgs const& args, CopyDirection direction, CUstream stream) const;
     //! Alignment-agnostic fallback, used when the pool layout is not a multiple of 16 bytes.
