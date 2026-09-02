@@ -16,6 +16,6 @@ cache compression method can be enabled for each LLM instance.
 | TriAttention | Periodically evict lower-importance generation tokens and compact the GPU KV cache | [TriAttention](triattention.md) |
 
 For a feature overview and configuration guidance, see
-[KV Cache Compression](../../docs/source/features/kv-cache-compression.md). To
-implement another compression method, see the
-[KV Cache Compression Development Guide](../../docs/source/developer-guide/kv-cache-compression-development.md).
+[KV Cache Compression](https://nvidia.github.io/TensorRT-LLM/features/kv-cache-compression.html).
+To implement another compression method, see the
+[KV Cache Compression Development Guide](https://nvidia.github.io/TensorRT-LLM/developer-guide/kv-cache-compression-development.html).

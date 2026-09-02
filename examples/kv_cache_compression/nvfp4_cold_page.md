@@ -11,31 +11,15 @@ optimization: the active GPU cache and Attention kernels continue to use the
 model's normal runtime KV type.
 
 For an overview of all available compression methods, see
-[KV Cache Compression](../../docs/source/features/kv-cache-compression.md).
+[KV Cache Compression](https://nvidia.github.io/TensorRT-LLM/features/kv-cache-compression.html).
 
 ## Motivation
 
-Agentic workloads repeatedly revisit long prompts, tool histories, and
-intermediate reasoning states. Their reusable KV cache can therefore grow
-faster than the GPU, Host, or Disk cache capacity available to the serving
-system. When the secondary cache cannot retain enough reusable Pages, useful
-prefixes are evicted, the cache hit rate falls, and TensorRT-LLM must recompute
-more context. Under sustained pressure, this can sharply increase time to first
-token (TTFT) and reduce throughput.
-
-NVFP4 cold-page compression addresses both sides of this bottleneck. It stores
-more reusable Pages within the same Host or Disk byte quota, which can improve
-the cache hit rate when cold-tier capacity is the limiting factor. It also
-reduces the bytes moved during GPU-to-Host, Host-to-GPU, Host-to-Disk, and
-Disk-to-Host migration. The benefit is workload-dependent: workloads with
-substantial prefix reuse and real cold-tier pressure have the most opportunity
-to reduce recomputation and migration cost.
-
-| Source of pressure | What compression changes | Expected effect |
-| --- | --- | --- |
-| Host or Disk capacity | Supported Attention KV occupies fewer cold-tier bytes | More reusable Pages can remain cached and the hit rate can increase |
-| Page migration | Fewer bytes cross the storage boundary | Offload and onboard can complete faster |
-| GPU runtime compatibility | The hot Page is restored to FP16, BF16, or FP8 before publication | Attention and the model runtime do not consume the cold representation |
+Long-context and agentic workloads can outgrow the available Host or Disk cache,
+evict reusable prefixes, and require context recomputation. NVFP4 cold Pages let
+more reusable KV fit in the same cold-tier quota and reduce Page-migration bytes.
+The benefit is largest when the workload has substantial prefix reuse and real
+cold-tier pressure.
 
 ## Design and Enablement
 
@@ -149,7 +133,7 @@ required for Pages to cross a compression boundary.
 
 On Linux 6.11 through 6.13, mixed models that need both NVFP4 Attention
 lifecycles and lossless SSM/GDN fallback lifecycles are not supported. See the
-[KV Cache Compression Development Guide](../../docs/source/developer-guide/kv-cache-compression-development.md)
+[KV Cache Compression Development Guide](https://nvidia.github.io/TensorRT-LLM/developer-guide/kv-cache-compression-development.html)
 for the current storage-path limitation.
 
 ### Tested Models
@@ -192,6 +176,7 @@ with LLM(
     ),
     kv_cache_compression_config=ColdPageQuantizationCompressionConfig(
         quant="nvfp4",
+        scale_checkpoint_path="/path/to/modelopt/scale",
     ),
 ) as llm:
     outputs = llm.generate(
@@ -216,7 +201,12 @@ kv_cache_config:
 kv_cache_compression_config:
   algorithm: quantization_for_cold_page
   quant: nvfp4
+  scale_checkpoint_path: /path/to/modelopt/scale
 ```
+
+Replace the scale path with a local ModelOpt checkpoint for the same model that
+contains per-layer K/V global-scale metadata. Omit `scale_checkpoint_path` to
+use identity global scales.
 
 ```bash
 trtllm-serve Qwen/Qwen3.5-4B --config qwen3.5-cold-nvfp4.yaml
@@ -387,7 +377,7 @@ for the same model contains per-layer K/V scale metadata, pass its directory:
 kv_cache_compression_config:
   algorithm: quantization_for_cold_page
   quant: nvfp4
-  scale_checkpoint_path: /path/to/modelopt-nvfp4-checkpoint
+  scale_checkpoint_path: /path/to/modelopt/scale
 ```
 
 `scale_checkpoint_path` supplies optional metadata; it is not the model path.
@@ -420,4 +410,4 @@ feature can reduce the cold-tier storage footprint and transfer pressure
 without changing the model's Attention path.
 
 For the underlying KVCM lifecycle and codec ABI, see
-[KVCacheManagerV2 Cold-Page Codec Design](../../docs/source/developer-guide/kv-cache-cold-page-codec.md).
+[KVCacheManagerV2 Cold-Page Codec Design](https://nvidia.github.io/TensorRT-LLM/developer-guide/kv-cache-cold-page-codec.html).
