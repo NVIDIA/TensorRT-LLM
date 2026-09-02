@@ -18,6 +18,7 @@ storage ABI, page-index lifetime, staging, and migration transaction, see the
 - [Architecture](#architecture)
 - [Capability declarations](#capability-declarations)
 - [Configuration, construction, and binding](#configuration-construction-and-binding)
+- [Calibration and offline artifacts](#calibration-and-offline-artifacts)
 - [Iteration-driven methods](#iteration-driven-methods)
 - [Storage-bound codec providers](#storage-bound-codec-providers)
 - [Ownership and failure boundaries](#ownership-and-failure-boundaries)
@@ -132,6 +133,26 @@ method to copy KVCM allocation state into a second owner.
 bound. Target and draft caches remain independent owners: an algorithm must not
 reuse target mappings or decisions for a draft cache unless its contract
 explicitly defines that relationship.
+
+## Calibration and offline artifacts
+
+TensorRT-LLM is an inference platform. A compression method must not perform
+model calibration, corpus collection, parameter fitting, or calibration-file
+generation in the inference critical path. Users should produce any required
+artifacts before serving with the method's upstream tooling, NVIDIA ModelOpt,
+or another documented offline workflow.
+
+The runtime may accept an artifact path in the method configuration, then load
+and validate that artifact during manager or model initialization. Once request
+execution begins, lifecycle hooks and cold-page `encode()`/`decode()` calls must
+consume ready-to-use immutable state. They must not launch a calibration
+workflow from prefill, generation, Page migration, or request teardown.
+
+Fail fast during initialization when a required artifact is missing,
+incompatible with the model, or malformed. Loading optional checkpoint metadata
+is also an initialization concern. Dynamic quantities that are mathematically
+part of each compression operation, such as per-block scales computed while
+encoding a Page, are runtime transform state rather than model calibration.
 
 ## Iteration-driven methods
 
@@ -342,10 +363,13 @@ partially updated.
    concrete class.
 3. Declare physical-length, block-reuse, and speculative-decoding capabilities.
 4. Add the class to `KvCacheCompressionConfigType`.
-5. Add the algorithm value to the existing compression-algorithm telemetry
+5. If the method requires calibration, expose only the path or identifier of a
+   precomputed artifact. Document the external offline workflow; do not add
+   calibration execution to TensorRT-LLM.
+6. Add the algorithm value to the existing compression-algorithm telemetry
    allowlist. Opt in only safe, low-cardinality method fields; model paths,
    calibration paths, and other user data must remain excluded.
-6. Run `python3 scripts/generate_llm_args_golden_manifest.py`, review the
+7. Run `python3 scripts/generate_llm_args_golden_manifest.py`, review the
    generated schema change, and run the telemetry manifest tests. Public
    configuration is not complete until the manifest is updated deliberately.
 
