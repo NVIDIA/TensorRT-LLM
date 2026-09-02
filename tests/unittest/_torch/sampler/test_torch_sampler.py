@@ -39,7 +39,6 @@ from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     LlmRequestState,
-    convert_wordlist,
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import (
@@ -1004,9 +1003,7 @@ class TestFinishReasons:
                 seq_slot=seq_slot,
                 input_tokens=prompt,
                 max_new_tokens=max_new_tokens,
-                stop_words_list=convert_wordlist(stop_words_list)
-                if stop_words_list is not None
-                else None,
+                stop_words_list=stop_words_list,
                 end_id=end_id,
                 sampling_config=SamplingConfig(),
                 is_streaming=False,

@@ -43,7 +43,6 @@ from dataclasses import dataclass
 from itertools import repeat
 from typing import Any, Iterator, Optional, cast
 
-import numpy as np
 import torch
 
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
@@ -354,25 +353,15 @@ def meet_stop_token_criteria(
         assert isinstance(request.py_stop_words_list, list), (
             "request.py_stop_words_list should be a list"
         )
-        stop_words_list, prefix_sum = request.py_stop_words_list
-
-        # Determine max stop word length to decide optimization path
-        max_stop_word_length = prefix_sum[0] if prefix_sum else 0
-        for i in range(1, len(prefix_sum)):
-            word_length = prefix_sum[i] - prefix_sum[i - 1]
-            max_stop_word_length = max(max_stop_word_length, word_length)
+        stop_words_list = request.py_stop_words_list
 
         # Fast path: all stop words are single tokens
-        if max_stop_word_length == 1:
-            return new_token in stop_words_list
+        if all(len(word) == 1 for word in stop_words_list):
+            return any(word[0] == new_token for word in stop_words_list)
 
         # Slow path: at least one multi-token stop word exists
         tokens = request.get_tokens(beam_idx)
-        offset = 0
-        for i, offset_end in enumerate(prefix_sum):
-            if i > 0:
-                offset = prefix_sum[i - 1]
-            stop_word = stop_words_list[offset:offset_end]
+        for stop_word in stop_words_list:
             if len(stop_word) > len(tokens):
                 continue
             if tokens[-len(stop_word) :] == stop_word:
@@ -405,12 +394,7 @@ def check_stop_words_length(request: LlmRequest) -> bool:
     # TODO: cache this on the request (e.g. as `request._py_has_multi_token_stop_words`)
     # so we don't recompute it per step from `py_stop_words_list`.
     if request.py_stop_words_list is not None:
-        _, cumsum = request.py_stop_words_list
-        if -1 in cumsum:
-            cumsum = cumsum[: cumsum.index(-1)]
-        cumsum_arr = np.asarray(cumsum, dtype=np.int32)
-        longest_stop_word_len = cast(int, np.max(np.diff(cumsum_arr, prepend=0), initial=0).item())
-        return longest_stop_word_len > 1
+        return any(len(word) > 1 for word in request.py_stop_words_list)
     return False
 
 
