@@ -45,8 +45,9 @@ The Mistral identity covers dense Hugging Face-format checkpoints that resolve
 to the exact `MistralForCausalLM` / `mistral` pair and whose realized attention
 runs without a sliding window on every layer; Mistral-7B-Instruct-v0.3 is the
 qualified canary. Checkpoints that enable `sliding_window`, including
-Ministral-style `layer_types` mixes, YaRN scaling, or tied embeddings do not
-match this profile. The native `mistral` checkpoint format (`params.json` with
+Ministral-style `layer_types` mixes, do not match this profile. YaRN scaling
+and tied embeddings are separate constraints that also exclude a checkpoint.
+The native `mistral` checkpoint format (`params.json` with
 `consolidated.safetensors`) is a separate `checkpoint_format` that rewrites the
 model type to `mistral_common`; it cannot be combined with the MX loading path.
 The unregistered Llama-based `MistralForCausalLM` class in `modeling_llama.py`
