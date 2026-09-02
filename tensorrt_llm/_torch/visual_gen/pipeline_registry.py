@@ -191,6 +191,10 @@ class AutoPipeline:
             quant_algo = checkpoint_quant_algo
 
         nvfp4_values = (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
+        if checkpoint_quant_algo is not None and checkpoint_quant_algo not in nvfp4_values:
+            raise ValueError(
+                f"VAE checkpoint quantization supports only NVFP4, got {checkpoint_quant_algo}."
+            )
         if quant_algo not in nvfp4_values and checkpoint_quant_algo not in nvfp4_values:
             return
         if not entry.supports_nvfp4_vae:

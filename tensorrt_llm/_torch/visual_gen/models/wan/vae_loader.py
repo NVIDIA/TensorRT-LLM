@@ -153,6 +153,34 @@ def _resolve_input_scales(
     return valid_input_scales
 
 
+def _normalize_nvfp4_checkpoint_keys(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Normalize compressed-tensors NVFP4 aliases to TRT-LLM names."""
+    aliases = {
+        ".weight_packed": (".weight", False),
+        ".weight_global_scale": (".weight_scale_2", True),
+        ".input_global_scale": (".input_scale", True),
+    }
+    normalized: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        target_key = key
+        invert_scale = False
+        for source_suffix, (target_suffix, should_invert) in aliases.items():
+            if key.endswith(source_suffix):
+                target_key = key.removesuffix(source_suffix) + target_suffix
+                invert_scale = should_invert
+                break
+        if target_key in normalized or (target_key != key and target_key in state_dict):
+            raise ValueError(f"NVFP4 checkpoint contains duplicate aliases for {target_key}")
+        if invert_scale:
+            value = value.to(torch.float32)
+            value = torch.where(value > 0, value.reciprocal(), torch.zeros_like(value))
+            value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+        normalized[target_key] = value
+    return normalized
+
+
 def _load_nvfp4_wan_vae(
     checkpoint_dir: str,
     device: torch.device,
@@ -173,9 +201,11 @@ def _load_nvfp4_wan_vae(
 
     vae_dir = Path(checkpoint_dir) / "vae"
     wan_vae = WanVAE(WanVAEConfig.from_json_file(vae_dir / "config.json"))
-    raw_state_dict = WeightLoader(components=PipelineComponent.VAE).load_weights(
-        checkpoint_dir,
-        Mapping(),
+    raw_state_dict = _normalize_nvfp4_checkpoint_keys(
+        WeightLoader(components=PipelineComponent.VAE).load_weights(
+            checkpoint_dir,
+            Mapping(),
+        )
     )
     conv_modules = {
         name: module
