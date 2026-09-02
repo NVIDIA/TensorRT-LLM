@@ -82,6 +82,14 @@ There are two independent capability layers.
 | `supports_block_reuse()` | The method preserves the block-reuse contract | Admission can keep block reuse enabled |
 | `supports_speculative_decoding()` | The configuration supports at least one speculative mode | Admission proceeds to method-specific mode checks |
 
+`changes_physical_kv_length` does not conflict with
+`supports_block_reuse()`. They describe independent properties. A method can
+change or compact only the generation/decode suffix while preserving the
+reusable prompt-prefix blocks and their identity. Such a method can set
+`changes_physical_kv_length = True` and still return `True` from
+`supports_block_reuse()`. A method should report block reuse as unsupported
+only when it cannot preserve the reusable prefix or its mapping contract.
+
 Capability methods are admission predicates, not runtime fallbacks. A method
 may still impose narrower mode, backend, or model-layout checks in the common
 compatibility validator or its construction path.
@@ -139,8 +147,9 @@ explicitly defines that relationship.
 TensorRT-LLM is an inference platform. A compression method must not perform
 model calibration, corpus collection, parameter fitting, or calibration-file
 generation in the inference critical path. Users should produce any required
-artifacts before serving with the method's upstream tooling, NVIDIA ModelOpt,
-or another documented offline workflow.
+artifacts before serving with the method's upstream tooling,
+[NVIDIA ModelOpt](https://nvidia.github.io/Model-Optimizer/), or another
+documented offline workflow.
 
 The runtime may accept an artifact path in the method configuration, then load
 and validate that artifact during manager or model initialization. Once request
