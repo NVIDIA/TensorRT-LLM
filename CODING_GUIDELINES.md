@@ -892,8 +892,8 @@ Commit the updated `ruff-legacy-baseline.json` alongside your changes.
 #### CLI Options in Documentation
 1. When documenting CLI commands for `trtllm-serve`, `trtllm-bench`, `trtllm-eval`, or similar tools, prefer using `--config` over `--extra_llm_api_options` for specifying configuration files.
    - `--config` is the preferred, shorter alias for configuration file options.
-   - Example: `trtllm-serve --model <model_path> --config config.yaml` (preferred)
-   - Avoid: `trtllm-serve --model <model_path> --extra_llm_api_options config.yaml`
+   - Example: `trtllm-serve <model_path> --config config.yaml` (preferred)
+   - Avoid: `trtllm-serve <model_path> --extra_llm_api_options config.yaml`
 
 ## AI Coding Agent Guidance
 
