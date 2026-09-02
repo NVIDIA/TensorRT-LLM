@@ -1110,7 +1110,9 @@ def test_fmha_cache_does_not_cache_failed_selection() -> None:
         assert backend._select_fmha(q, None, None, metadata, forward_args) is None
 
     assert events == [
+        ("support", "unsupported", None),
         ("support", "unsupported", FmhaPhase.CONTEXT),
+        ("support", "unsupported", None),
         ("support", "unsupported", FmhaPhase.CONTEXT),
     ]
 
