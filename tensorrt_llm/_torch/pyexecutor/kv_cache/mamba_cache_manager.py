@@ -3313,6 +3313,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return None
         return conv, ngram
 
+    def get_disagg_recurrent_side_states(
+            self) -> Dict[str, Dict[int, torch.Tensor]]:
+        """Expose replicated recurrent roles that share the V2 slot lifecycle."""
+        return {
+            str(MambaRole.PLE_NGRAM_CONTEXT): dict(self._ple_ngram_contexts),
+            str(MambaRole.PLE_CONV_STATE): dict(self._ple_conv_states),
+        }
+
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
         return getattr(self, "_use_gdn_cached_replay_all_layer_commit", False)

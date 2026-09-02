@@ -29,6 +29,10 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     MambaLayerGroup,
     MapperKind,
 )
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_layer_byte_ranges,
+    get_pool_view_global_layer_ids,
+)
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -384,6 +388,19 @@ class MambaPolicy:
         metadata comes from ``self_lg`` / ``peer_lg`` (MambaLayerGroup).
         """
         transfer_layers = len(self_layer_offsets)
+        if mapper_kind == MapperKind.REPLICATED:
+            if self_bytes_per_layer != peer_bytes_per_layer:
+                raise ValueError(
+                    "Replicated Mamba state size differs between peers: "
+                    f"local={self_bytes_per_layer}, peer={peer_bytes_per_layer}"
+                )
+            return MambaHeadMatchMapper(
+                transfer_layers=transfer_layers,
+                src_layer_off=src_layer_off,
+                dst_layer_off=dst_layer_off,
+                block_bytes_per_layer=self_bytes_per_layer,
+            )
+
         self_mamba_tp, self_mamba_tp_rank = MambaPolicy._mamba_tp(self._ri)
         peer_mamba_tp, peer_mamba_tp_rank = MambaPolicy._mamba_tp(peer_ri)
         tp_match = self_mamba_tp == peer_mamba_tp
@@ -544,6 +561,58 @@ class MambaPolicy:
             ):
                 _check_global(f"conv_section_bytes[{i}]", s, p)
 
+        self_globals = {layer.global_layer_id for layer in self_mlg.local_layers}
+        peer_globals = {layer.global_layer_id for layer in peer_mlg.local_layers}
+        overlapping_layers = self_globals & peer_globals
+
+        def _replicated_views(layer_group: MambaLayerGroup):
+            views = {}
+            for pool_view in layer_group.pool_views:
+                if pool_view.mapper_kind != MapperKind.REPLICATED:
+                    continue
+                if pool_view.pool_role in views:
+                    raise ValueError(
+                        "MambaPolicy.validate_peer_compatible: duplicate replicated "
+                        f"role {sorted(pool_view.pool_role)}"
+                    )
+                views[pool_view.pool_role] = pool_view
+            return views
+
+        self_views = _replicated_views(self_mlg)
+        peer_views = _replicated_views(peer_mlg)
+        all_roles = set(self_views) | set(peer_views)
+        for role in sorted(all_roles, key=lambda value: tuple(sorted(value))):
+            self_view = self_views.get(role)
+            peer_view = peer_views.get(role)
+            self_layers = (
+                set(get_pool_view_global_layer_ids(self_view, self_mlg))
+                if self_view is not None
+                else set()
+            )
+            peer_layers = (
+                set(get_pool_view_global_layer_ids(peer_view, peer_mlg))
+                if peer_view is not None
+                else set()
+            )
+            missing_layers = overlapping_layers & (self_layers ^ peer_layers)
+            role_name = ",".join(sorted(role))
+            if missing_layers:
+                raise ValueError(
+                    "MambaPolicy.validate_peer_compatible: replicated recurrent "
+                    f"role {role_name!r} differs for overlapping layers "
+                    f"{sorted(missing_layers)}"
+                )
+            if not (overlapping_layers & self_layers & peer_layers):
+                continue
+            _, self_bytes = get_layer_byte_ranges(self_view)
+            _, peer_bytes = get_layer_byte_ranges(peer_view)
+            if self_bytes != peer_bytes:
+                raise ValueError(
+                    "MambaPolicy.validate_peer_compatible: replicated recurrent "
+                    f"role {role_name!r} bytes per layer differs "
+                    f"(local={self_bytes}, peer={peer_bytes})"
+                )
+
     @staticmethod
     def _mamba_tp(ri: RankInfo) -> Tuple[int, int]:
         """Return (mamba_effective_tp_size, mamba_effective_tp_rank).
@@ -597,19 +666,20 @@ def mamba_receiver_payload_bytes(
     if sender_mlg is None or receiver_mlg is None:
         return 0
 
-    sender_globals = {ll.global_layer_id for ll in sender_mlg.local_layers}
-    receiver_globals = {ll.global_layer_id for ll in receiver_mlg.local_layers}
-    overlap = sender_globals & receiver_globals
-    if not overlap:
-        return 0
-
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
-
-    receiver_lg_idx = next(
-        i for i, lg in enumerate(receiver_page_table.layer_groups) if lg.kind == CacheKind.STATE
-    )
-    per_layer = sum(
-        get_physical_pool(receiver_page_table, receiver_lg_idx, pv.pool_idx).slot_bytes
-        for pv in receiver_mlg.pool_views
-    )
-    return len(overlap) * per_layer
+    sender_views = {
+        (pool_view.pool_role, pool_view.mapper_kind): pool_view
+        for pool_view in sender_mlg.pool_views
+    }
+    total = 0
+    for receiver_view in receiver_mlg.pool_views:
+        sender_view = sender_views.get((receiver_view.pool_role, receiver_view.mapper_kind))
+        if sender_view is None:
+            continue
+        sender_layers = set(get_pool_view_global_layer_ids(sender_view, sender_mlg))
+        receiver_layers = set(get_pool_view_global_layer_ids(receiver_view, receiver_mlg))
+        overlap = sender_layers & receiver_layers
+        if not overlap:
+            continue
+        _, receiver_bytes_per_layer = get_layer_byte_ranges(receiver_view)
+        total += len(overlap) * receiver_bytes_per_layer
+    return total

@@ -64,9 +64,9 @@ class MapperKind(IntEnum):
     in ``bytes_per_layer``). View count per layer group is bounded by the
     number of role classes, never by layer count.
 
-    Mamba state pools do not use this enum: Mamba's transfer is dispatched
-    through :class:`MambaPolicy` which hard-codes the ``is_conv`` switch and
-    bypasses the attention pool-matching path entirely.
+    Mamba state pools use SECTIONED for convolution state, INDEXED for SSM
+    state, and REPLICATED for auxiliary recurrent state. Their transfer is
+    dispatched through :class:`MambaPolicy`.
     """
 
     INDEXED = 0
