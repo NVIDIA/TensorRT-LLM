@@ -152,6 +152,7 @@ def iter_diff_pre_image(diff: str) -> Iterator[tuple[str, str]]:
     `("@", "")` so callers can reset any positional state they track —
     pre-image continuity does not hold across hunk boundaries.
 
+    Blank/comment-only additions may appear as context despite being absent before the change.
     Line numbers are deliberately not reported: `strip_noop_diff_lines`
     drops blank / comment-only `-` lines, which shifts every later
     pre-image line number. Callers must derive meaning from the

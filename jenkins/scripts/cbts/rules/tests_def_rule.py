@@ -62,7 +62,7 @@ _CLASS_RE = re.compile(r"class\s+(\w+)")
 _TEST_ID_KEY_RE = re.compile(r"^(Test\w+)::(\w+)$")
 
 
-def _scope_start_line(node) -> int:
+def _scope_start_line(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> int:
     """First line owned by `node`, decorators included.
 
     `node.lineno` points at the `def` / `class` keyword, so decorators sit
@@ -238,6 +238,8 @@ class TestsDefRule(Rule):
         self._stages_by_yaml = stages_by_yaml_stem(stages)
         self._repo_root = repo_root
         self._total_blocks = len(yaml_index.blocks)
+        self._acc_class_indexes: Optional[tuple[dict[str, list[str]], dict[str, list[str]]]] = None
+        self._acc_source_texts: tuple[str, ...] = ()
 
     def _compute_anchors(self, git_path: str, yaml_path: str, diff: str) -> list[str]:
         """Return lookup anchors for one file.
@@ -256,22 +258,23 @@ class TestsDefRule(Rule):
             content = (self._repo_root / git_path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             return [yaml_path]
+        if _diff_has_deletions(diff):
+            return self._recover_deleted_scope_anchors(yaml_path, content, diff)
         line_numbers = iter_diff_post_line_numbers(diff)
-        if line_numbers:
-            scopes = _map_lines_to_pytest_scopes(content, line_numbers)
-            if scopes is not None:
-                return [f"{yaml_path}::{s}" for s in sorted(scopes)]
-        return self._recover_deleted_scope_anchors(yaml_path, content, diff)
+        if not line_numbers:
+            return [yaml_path]
+        scopes = _map_lines_to_pytest_scopes(content, line_numbers)
+        if scopes is None:
+            return [yaml_path]
+        return [f"{yaml_path}::{s}" for s in sorted(scopes)]
 
     def _recover_deleted_scope_anchors(self, yaml_path: str, content: str, diff: str) -> list[str]:
-        """Retry post-image scope mapping for `+` lines, pre-image for `-` lines.
+        """Combine post-image scopes for `+` lines with pre-image scopes for `-` lines.
 
-        Post-image mapping is tried first and only reaches here when it
-        landed at module scope. That is expected for a deletion-only diff:
-        removed lines have no post-image position, so they anchor to the
-        next surviving line, which may sit between scopes. Reading the
-        deleted lines' owning class off the pre-image recovers a class
-        anchor instead of widening to the whole file.
+        Removed lines can anchor to the next surviving post-image scope,
+        so every diff with deletions takes this path before accepting
+        post-image mappings. Reading deleted lines from the pre-image
+        avoids attributing them to an adjacent surviving scope.
         """
         if not _diff_has_deletions(diff):
             return [yaml_path]
@@ -306,12 +309,10 @@ class TestsDefRule(Rule):
         `ModelA:` and its body lands those lines on `ModelB:`.
 
         An empty anchor list is a zero-impact claim rather than a
-        failure: no test under `accuracy/` references any changed
-        section. That is only sound when those sections are gone from the
-        post-PR YAML too — the shape of a test-pruning PR, which drops a
-        reference and its test together. A surviving section could still
-        be read by a test this rule failed to resolve, so that case keeps
-        the file-level fallback.
+        failure. That is only sound when the sections are gone from the
+        post-PR YAML and their keys are absent from accuracy test sources
+        — the shape of a test-pruning PR, which drops a reference and its
+        test together. Otherwise the file-level fallback is retained.
         """
         if not diff:
             return [yaml_path]
@@ -332,13 +333,20 @@ class TestsDefRule(Rule):
         if not changed_keys:
             return [yaml_path]
 
-        anchors = sorted({a for k in changed_keys for a in self._reference_key_anchors(k)})
-        if anchors:
-            return anchors
-        # A section that survives the PR may still be read by some test.
-        if changed_keys & _yaml_all_top_keys(content):
+        anchors: set[str] = set()
+        unresolved_keys: set[str] = set()
+        for key in changed_keys:
+            key_anchors = self._reference_key_anchors(key)
+            if key_anchors:
+                anchors.update(key_anchors)
+            else:
+                unresolved_keys.add(key)
+        if unresolved_keys and (
+            unresolved_keys & _yaml_all_top_keys(content)
+            or self._accuracy_sources_contain_any(unresolved_keys)
+        ):
             return [yaml_path]
-        return []
+        return sorted(anchors)
 
     def _reference_key_anchors(self, key: str) -> list[str]:
         """Anchors for one reference-YAML top-level key.
@@ -365,6 +373,11 @@ class TestsDefRule(Rule):
         """
         return self._scan_accuracy_classes()[1]
 
+    def _accuracy_sources_contain_any(self, keys: set[str]) -> bool:
+        """Return whether any changed reference key appears in an accuracy test source."""
+        self._scan_accuracy_classes()
+        return any(key in source for source in self._acc_source_texts for key in keys)
+
     def _scan_accuracy_classes(self) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
         """Cached AST scan of `accuracy/test_*.py` for `Test*` classes.
 
@@ -373,17 +386,22 @@ class TestsDefRule(Rule):
         `MODEL_NAME = "<hf>"` assignment; classes without one appear only
         in the second.
         """
-        cached = getattr(self, "_acc_class_indexes", None)
-        if cached is not None:
-            return cached
+        if self._acc_class_indexes is not None:
+            return self._acc_class_indexes
         by_model: dict[str, list[str]] = {}
         by_class: dict[str, list[str]] = {}
+        source_texts: list[str] = []
         acc_dir = self._repo_root / ACCURACY_DIR
         if acc_dir.is_dir():
             for py in sorted(acc_dir.glob("test_*.py")):
                 try:
-                    tree = ast.parse(py.read_text(encoding="utf-8"))
-                except (OSError, SyntaxError, UnicodeDecodeError):
+                    source = py.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                source_texts.append(source)
+                try:
+                    tree = ast.parse(source)
+                except (SyntaxError, ValueError):
                     continue
                 rel = f"accuracy/{py.name}"
                 for node in tree.body:
@@ -402,6 +420,7 @@ class TestsDefRule(Rule):
                         if isinstance(v, ast.Constant) and isinstance(v.value, str):
                             by_model.setdefault(v.value, []).append(qualified)
                             break
+        self._acc_source_texts = tuple(source_texts)
         self._acc_class_indexes = (by_model, by_class)
         return self._acc_class_indexes
 
