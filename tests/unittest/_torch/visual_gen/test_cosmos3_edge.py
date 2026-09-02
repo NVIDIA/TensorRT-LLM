@@ -88,19 +88,6 @@ def _require_edge_checkpoint() -> str:
     return path
 
 
-def _require_edge_policy_droid_checkpoint() -> str:
-    """Resolve the released Policy-DROID checkpoint for gated component tests."""
-    path = os.environ.get("DIFFUSION_MODEL_PATH_COSMOS3_EDGE_POLICY_DROID")
-    if not path:
-        root = Path(os.environ.get("LLM_MODELS_ROOT", "/home/scratch.trt_llm_data_ci/llm-models/"))
-        if not root.exists():
-            root = Path("/scratch/trt_llm_data/llm-models/")
-        path = str(root / "Cosmos3-Edge-Policy-DROID")
-    if not os.path.isdir(path):
-        pytest.skip(f"Checkpoint not found: {path}")
-    return path
-
-
 def _reduced_edge_config() -> SimpleNamespace:
     # Key set mirrors the Edge checkpoint's transformer/config.json verbatim
     # (including the missing rope_type in rope_scaling); only sizes shrink.
@@ -1267,10 +1254,265 @@ class TestEnvelopeAdvisory:
         assert records == []
 
 
+_POLICY_PARITY_VIDEO_SHAPE = (9, 4, 6)
+_POLICY_PARITY_ACTION_LENGTH = 33
+_POLICY_PARITY_ACTION_DIM = 64
+_POLICY_PARITY_RAW_ACTION_DIM = 8
+_POLICY_PARITY_DOMAIN_ID = 8
+_POLICY_PARITY_FPS = 15.0
+_POLICY_PARITY_RAW_TIMESTEP = 999.0
+
+
+def _policy_parity_inputs() -> dict[str, object]:
+    from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+        compute_mrope_position_ids_action,
+        compute_mrope_position_ids_text,
+        compute_mrope_position_ids_vision,
+    )
+
+    cfg = _reduced_qwen3_config(action_dim=_POLICY_PARITY_ACTION_DIM)
+    generator = torch.Generator().manual_seed(2026)
+    latent_t, latent_h, latent_w = _POLICY_PARITY_VIDEO_SHAPE
+    video = torch.randn(
+        (1, cfg.latent_channel, latent_t, latent_h, latent_w),
+        generator=generator,
+        dtype=torch.float32,
+    ).to(torch.bfloat16)
+    action = torch.zeros(
+        (_POLICY_PARITY_ACTION_LENGTH, _POLICY_PARITY_ACTION_DIM), dtype=torch.bfloat16
+    )
+    action[0, :_POLICY_PARITY_RAW_ACTION_DIM] = torch.linspace(
+        -1.0, 1.0, _POLICY_PARITY_RAW_ACTION_DIM, dtype=torch.bfloat16
+    )
+    action[1:, :_POLICY_PARITY_RAW_ACTION_DIM] = torch.randn(
+        (_POLICY_PARITY_ACTION_LENGTH - 1, _POLICY_PARITY_RAW_ACTION_DIM),
+        generator=generator,
+        dtype=torch.float32,
+    ).to(torch.bfloat16)
+
+    input_ids = torch.tensor([3, 5, 7, 11, 13], dtype=torch.long)
+    und_len = len(input_ids)
+    patch_size = cfg.latent_patch_size
+    patch_h = (latent_h + patch_size - 1) // patch_size
+    patch_w = (latent_w + patch_size - 1) // patch_size
+    frame_token_stride = patch_h * patch_w
+    num_vision_tokens = latent_t * frame_token_stride
+
+    text_mrope_ids, next_offset = compute_mrope_position_ids_text(und_len, temporal_offset=0)
+    media_offset = next_offset + cfg.unified_3d_mrope_temporal_modality_margin
+    vision_mrope_ids, _ = compute_mrope_position_ids_vision(
+        latent_t,
+        patch_h,
+        patch_w,
+        temporal_offset=media_offset,
+        fps=_POLICY_PARITY_FPS,
+        base_fps=float(cfg.base_fps),
+        temporal_compression_factor=cfg.temporal_compression_factor,
+        enable_fps_modulation=cfg.enable_fps_modulation,
+    )
+    action_mrope_ids, _ = compute_mrope_position_ids_action(
+        _POLICY_PARITY_ACTION_LENGTH,
+        temporal_offset=media_offset,
+        action_fps=_POLICY_PARITY_FPS,
+        base_fps=float(cfg.base_fps),
+        base_temporal_compression_factor=cfg.temporal_compression_factor,
+        enable_fps_modulation=cfg.enable_fps_modulation,
+        start_frame_offset=0,
+    )
+
+    vision_start = und_len
+    vision_noisy_frame_indexes = torch.arange(1, latent_t, dtype=torch.long)
+    vision_mse_loss_indexes = torch.cat(
+        [
+            torch.arange(
+                vision_start + frame * frame_token_stride,
+                vision_start + (frame + 1) * frame_token_stride,
+                dtype=torch.long,
+            )
+            for frame in range(1, latent_t)
+        ]
+    )
+    action_start = vision_start + num_vision_tokens
+    action_sequence_indexes = torch.arange(
+        action_start,
+        action_start + _POLICY_PARITY_ACTION_LENGTH,
+        dtype=torch.long,
+    )
+    action_noisy_frame_indexes = torch.arange(1, _POLICY_PARITY_ACTION_LENGTH, dtype=torch.long)
+
+    return {
+        "video": video,
+        "action": action,
+        "input_ids": input_ids,
+        "text_indexes": torch.arange(und_len, dtype=torch.long),
+        "position_ids": torch.cat([text_mrope_ids, vision_mrope_ids, action_mrope_ids], dim=1),
+        "und_len": und_len,
+        "sequence_length": action_start + _POLICY_PARITY_ACTION_LENGTH,
+        "vision_token_shapes": [(latent_t, patch_h, patch_w)],
+        "vision_sequence_indexes": torch.arange(
+            vision_start, vision_start + num_vision_tokens, dtype=torch.long
+        ),
+        "vision_mse_loss_indexes": vision_mse_loss_indexes,
+        "vision_timesteps": torch.full(
+            (len(vision_mse_loss_indexes),), _POLICY_PARITY_RAW_TIMESTEP
+        ),
+        "vision_noisy_frame_indexes": [vision_noisy_frame_indexes],
+        "action_token_shapes": [(_POLICY_PARITY_ACTION_LENGTH, 1, 1)],
+        "action_sequence_indexes": action_sequence_indexes,
+        "action_mse_loss_indexes": action_sequence_indexes[action_noisy_frame_indexes],
+        "action_timesteps": torch.full(
+            (len(action_noisy_frame_indexes),), _POLICY_PARITY_RAW_TIMESTEP
+        ),
+        "action_noisy_frame_indexes": [action_noisy_frame_indexes],
+        "action_domain_ids": [torch.tensor(_POLICY_PARITY_DOMAIN_ID, dtype=torch.long)],
+    }
+
+
+def _policy_parity_to_device(value):
+    if isinstance(value, torch.Tensor):
+        return value.to(DEVICE)
+    if isinstance(value, list):
+        return [_policy_parity_to_device(item) for item in value]
+    return value
+
+
+def _policy_parity_models():
+    from diffusers.models.transformers.transformer_cosmos3 import Cosmos3OmniTransformer
+
+    cfg = _reduced_qwen3_config(action_dim=_POLICY_PARITY_ACTION_DIM)
+    torch.manual_seed(2026)
+    reference = Cosmos3OmniTransformer(
+        attention_bias=cfg.attention_bias,
+        attention_dropout=cfg.attention_dropout,
+        dtype="bfloat16",
+        head_dim=cfg.head_dim,
+        hidden_size=cfg.hidden_size,
+        intermediate_size=cfg.intermediate_size,
+        base_fps=cfg.base_fps,
+        enable_fps_modulation=cfg.enable_fps_modulation,
+        latent_channel=cfg.latent_channel,
+        unified_3d_mrope_reset_spatial_ids=cfg.unified_3d_mrope_reset_spatial_ids,
+        unified_3d_mrope_temporal_modality_margin=(cfg.unified_3d_mrope_temporal_modality_margin),
+        latent_patch_size=cfg.latent_patch_size,
+        num_attention_heads=cfg.num_attention_heads,
+        num_hidden_layers=cfg.num_hidden_layers,
+        num_key_value_heads=cfg.num_key_value_heads,
+        patch_latent_dim=cfg.patch_latent_dim,
+        rms_norm_eps=cfg.rms_norm_eps,
+        rope_scaling=cfg.rope_scaling,
+        rope_theta=cfg.rope_theta,
+        action_dim=cfg.action_dim,
+        action_gen=cfg.action_gen,
+        num_embodiment_domains=cfg.num_embodiment_domains,
+        timestep_scale=cfg.timestep_scale,
+        vocab_size=cfg.vocab_size,
+    ).eval()
+    weights = {name: value.detach().clone() for name, value in reference.state_dict().items()}
+
+    actual = Cosmos3VFMTransformer(
+        _reduced_qwen3_model_config(action_dim=_POLICY_PARITY_ACTION_DIM)
+    ).eval()
+    actual.load_weights(weights)
+    actual.post_load_weights()
+    reference.to(DEVICE)
+    # Both production paths retain the sinusoidal timestep MLP in FP32 and
+    # downcast only its emitted embedding before adding it to BF16 tokens.
+    # Cast parameters selectively to avoid Diffusers' warning about a blanket
+    # ``to(torch.bfloat16)`` changing that intentional FP32 island.
+    for name, parameter in reference.named_parameters():
+        if not name.startswith("time_embedder."):
+            parameter.data = parameter.data.to(torch.bfloat16)
+    return reference, actual.to(DEVICE)
+
+
+def _policy_reference_forward(transformer, inputs: dict[str, object]):
+    inputs = {key: _policy_parity_to_device(value) for key, value in inputs.items()}
+    with torch.inference_mode():
+        video_out, _, action_out = transformer(
+            input_ids=inputs["input_ids"],
+            text_indexes=inputs["text_indexes"],
+            position_ids=inputs["position_ids"],
+            und_len=inputs["und_len"],
+            sequence_length=inputs["sequence_length"],
+            vision_tokens=[inputs["video"]],
+            vision_token_shapes=inputs["vision_token_shapes"],
+            vision_sequence_indexes=inputs["vision_sequence_indexes"],
+            vision_mse_loss_indexes=inputs["vision_mse_loss_indexes"],
+            vision_timesteps=inputs["vision_timesteps"],
+            vision_noisy_frame_indexes=inputs["vision_noisy_frame_indexes"],
+            action_tokens=[inputs["action"]],
+            action_token_shapes=inputs["action_token_shapes"],
+            action_sequence_indexes=inputs["action_sequence_indexes"],
+            action_mse_loss_indexes=inputs["action_mse_loss_indexes"],
+            action_timesteps=inputs["action_timesteps"],
+            action_noisy_frame_indexes=inputs["action_noisy_frame_indexes"],
+            action_domain_ids=inputs["action_domain_ids"],
+        )
+    return video_out[0], action_out[0]
+
+
+def _policy_trt_forward(transformer, inputs: dict[str, object], action: torch.Tensor):
+    latent_t, _, _ = _POLICY_PARITY_VIDEO_SHAPE
+    input_ids = inputs["input_ids"].unsqueeze(0).to(DEVICE)
+    text_mask = torch.ones_like(input_ids)
+    video_noisy_mask = torch.ones((1, 1, latent_t, 1, 1), dtype=torch.bfloat16, device=DEVICE)
+    video_noisy_mask[:, :, 0] = 0
+    action_noisy_mask = torch.ones(
+        (1, _POLICY_PARITY_ACTION_LENGTH, 1), dtype=torch.bfloat16, device=DEVICE
+    )
+    action_noisy_mask[:, 0] = 0
+    raw_timestep = torch.tensor([_POLICY_PARITY_RAW_TIMESTEP], device=DEVICE)
+
+    transformer.reset_cache()
+    with torch.inference_mode():
+        output = transformer(
+            hidden_states=inputs["video"].to(DEVICE),
+            timestep=raw_timestep / 1000.0,
+            raw_timestep=raw_timestep,
+            text_ids=input_ids,
+            text_mask=text_mask,
+            video_shape=_POLICY_PARITY_VIDEO_SHAPE,
+            fps=_POLICY_PARITY_FPS,
+            noisy_frame_mask=video_noisy_mask,
+            action_latents=action.unsqueeze(0).to(DEVICE),
+            action_domain_ids=torch.tensor(
+                [_POLICY_PARITY_DOMAIN_ID], dtype=torch.long, device=DEVICE
+            ),
+            action_noisy_mask=action_noisy_mask,
+            action_start_frame_offset=0,
+            action_fps=_POLICY_PARITY_FPS,
+        )
+    return (
+        output.video[0] * video_noisy_mask[0],
+        output.action[0] * action_noisy_mask[0],
+    )
+
+
+def _policy_parity_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    import torch.nn.functional as F
+
+    actual = actual.float().reshape(-1)
+    expected = expected.float().reshape(-1)
+    assert actual.shape == expected.shape
+    reference_norm = torch.linalg.vector_norm(expected)
+    assert reference_norm > 0
+    abs_error = (actual - expected).abs()
+    return {
+        "relative_l2": float(torch.linalg.vector_norm(actual - expected) / reference_norm),
+        "cosine": float(F.cosine_similarity(actual.unsqueeze(0), expected.unsqueeze(0))),
+        "max_abs": float(abs_error.max()),
+        "p99_abs": float(torch.quantile(abs_error, 0.99)),
+        "reference_max_abs": float(expected.abs().max()),
+    }
+
+
 class TestDiffusersParity:
-    """Per-step velocity parity against diffusers main (first release with the
-    Edge classes). Runs in a subprocess because diffusers main cannot be
-    imported next to the pinned diffusers; gated on DIFFUSERS_MAIN_PATH."""
+    """Per-step velocity parity against Diffusers.
+
+    Edge checkpoint parity uses the first Diffusers revision with the Edge
+    classes and remains an explicitly gated diagnostic. Policy action parity
+    below is checkpoint-free and runs against the pinned Diffusers package.
+    """
 
     def test_per_step_velocity_parity(self):
         import re
@@ -1300,52 +1542,55 @@ class TestDiffusersParity:
         assert all(rel < 0.05 for rel in rels), result.stdout
 
     def test_policy_droid_joint_transformer_parity(self):
-        """L2: DROID state-conditioned joint DiT vs the exported reference.
+        """L2: DROID-layout action DiT step vs pinned Diffusers.
 
         The emitted tensors are one-step BF16 video and action velocities. The
-        reference is the Diffusers transformer with cosmos-framework's DROID
-        state-row layout. The relaxed T1 band covers reduction reordering from
-        the two frameworks' different attention backends.
-        """
-        import json
-        import subprocess
-        import sys
+        model-specific behavior is a clean state row followed by 32 noisy
+        actions, with domain-selected input/output heads. The trusted reference
+        is pinned Diffusers 0.39.0 with identical synthetic weights and packed
+        inputs. This is transparent T1; its tolerance covers reduction
+        reordering between SDPA and TRT-LLM's vanilla attention backend.
 
-        diffusers_main = os.environ.get("DIFFUSERS_MAIN_PATH")
-        if not diffusers_main:
-            pytest.skip("Set DIFFUSERS_MAIN_PATH to Diffusers with Edge and action support")
-        checkpoint = _require_edge_policy_droid_checkpoint()
+        Pinned Diffusers predates the Nemotron-dense Edge backbone, so this pair
+        deliberately exercises the shared action machinery on the Qwen3 recipe.
+        The Edge-only norm, MLP and generator K-normalization forks have focused
+        tests above.
+        """
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
 
-        script = Path(__file__).parent / "cosmos3_edge_policy_component_parity.py"
-        result = subprocess.run(
-            [sys.executable, str(script), checkpoint],
-            env={**os.environ},
-            capture_output=True,
-            text=True,
-            timeout=1200,
-        )
-        assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-4000:]
-        prefix = "POLICY_DROID_COMPONENT_PARITY="
-        reports = [line for line in result.stdout.splitlines() if line.startswith(prefix)]
-        assert len(reports) == 1, result.stdout
-        report = json.loads(reports[0][len(prefix) :])
+        inputs = _policy_parity_inputs()
+        reference, actual = _policy_parity_models()
+        expected_video, expected_action = _policy_reference_forward(reference, inputs)
+        actual_video, actual_action = _policy_trt_forward(actual, inputs, inputs["action"])
+        report = {
+            "video": _policy_parity_stats(actual_video, expected_video),
+            "action": _policy_parity_stats(actual_action, expected_action),
+        }
 
-        # B300 calibration against Diffusers 2919c5096 with BF16 SDPA:
-        # video/action relative-L2 0.01184/0.00410 and cosine
-        # 0.999932/0.999992. The 0.025 band leaves roughly 2x headroom for
-        # backend accumulation order.
         for modality in ("video", "action"):
             stats = report[modality]
-            assert stats["relative_l2"] < 0.025, report
-            assert stats["cosine"] > 0.9998, report
-            assert stats["max_abs"] < 0.025 * stats["reference_max_abs"] + 1e-3, report
-            assert stats["p99_abs"] < 0.025 * stats["reference_max_abs"] + 1e-3, report
+            assert stats["relative_l2"] < 0.01, report
+            assert stats["cosine"] > 0.9999, report
+            assert stats["max_abs"] < 0.01 * stats["reference_max_abs"] + 1e-3, report
+            assert stats["p99_abs"] < 0.01 * stats["reference_max_abs"] + 1e-3, report
+
         # Feature-active assertion: removing the clean state row must change
         # the predicted DROID action chunk by more than BF16 rounding noise.
-        assert report["state_effect_relative_l2"] > 0.01, report
-        assert report["state_effect_max_abs"] > 0.01, report
+        zero_state_action = inputs["action"].clone()
+        zero_state_action[0] = 0
+        _, zero_state_output = _policy_trt_forward(actual, inputs, zero_state_action)
+        noisy_action = actual_action[1:, :_POLICY_PARITY_RAW_ACTION_DIM].float()
+        state_delta = noisy_action - zero_state_output[1:, :_POLICY_PARITY_RAW_ACTION_DIM].float()
+        state_effect_relative_l2 = float(
+            torch.linalg.vector_norm(state_delta) / torch.linalg.vector_norm(noisy_action)
+        )
+        assert state_effect_relative_l2 > 0.001, {
+            **report,
+            "state_effect_relative_l2": state_effect_relative_l2,
+            "state_effect_max_abs": float(state_delta.abs().max()),
+        }
+        assert state_delta.abs().max() > 0.01
 
 
 # Recorded from diffusers main 2919c5096 (`Cosmos3OmniPipeline.tokenize_prompt`
