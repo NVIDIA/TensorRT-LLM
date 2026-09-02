@@ -16,6 +16,7 @@ import socket
 import time
 import unittest
 from threading import Lock, Thread, get_ident
+from types import SimpleNamespace
 
 import pytest
 from parameterized import parameterized
@@ -200,6 +201,98 @@ def test_zmq_messenger_parallel_creation_uses_one_context(dynamic_endpoint):
     assert errors == []
     assert len(contexts) == len(threads)
     assert len({id(context) for context in contexts}) == 1
+
+
+def test_zmq_sync_socket_rejects_cross_thread_use(dynamic_endpoint):
+    messenger = ZMQMessenger("DEALER", endpoint=dynamic_endpoint)
+    errors = []
+
+    def send_from_non_owner():
+        try:
+            messenger.send([b"message"])
+        except Exception as error:
+            errors.append(error)
+
+    thread = Thread(target=send_from_non_owner)
+    thread.start()
+    thread.join(timeout=5)
+    messenger.stop()
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "owner thread" in str(errors[0])
+
+
+def test_zmq_listener_socket_lifecycle_stays_on_owner_thread(monkeypatch):
+    calls = []
+    lock = Lock()
+
+    def record(operation):
+        with lock:
+            calls.append((operation, get_ident()))
+
+    class FakeSocket:
+        def __init__(self):
+            self.closed = False
+            self.endpoint = None
+
+        def bind(self, endpoint):
+            record("bind")
+            self.endpoint = endpoint
+
+        def getsockopt_string(self, _option):
+            record("getsockopt")
+            return self.endpoint
+
+        def send_multipart(self, _messages):
+            record("send")
+
+        def setsockopt(self, _option, _value):
+            record("setsockopt")
+
+        def close(self):
+            record("close")
+            self.closed = True
+
+    class FakeContext:
+        @staticmethod
+        def instance():
+            return FakeContext()
+
+        def socket(self, _socket_type):
+            record("create")
+            return FakeSocket()
+
+    class FakePoller:
+        def register(self, _socket, _event):
+            record("register")
+
+        def poll(self, timeout):
+            time.sleep(timeout / 1000)
+            return []
+
+    fake_zmq = SimpleNamespace(
+        Context=FakeContext,
+        Poller=FakePoller,
+        POLLIN=1,
+        LAST_ENDPOINT=2,
+        LINGER=3,
+        ZMQError=RuntimeError,
+    )
+    monkeypatch.setattr(messenger_module, "zmq", fake_zmq)
+
+    caller_thread = get_ident()
+    messenger = ZMQMessenger("ROUTER", endpoint="tcp://127.0.0.1:12345")
+    messenger.start_listener(lambda _messages: True)
+    messenger.send([b"message"])
+    messenger.stop()
+
+    assert calls
+    socket_threads = {thread_id for _, thread_id in calls}
+    assert socket_threads == {messenger._listener_thread.ident}
+    assert caller_thread not in socket_threads
+    assert [operation for operation, _ in calls].count("close") == 1
 
 
 def test_zmq_dealer_pool_confines_sockets_to_owner_thread(monkeypatch):
