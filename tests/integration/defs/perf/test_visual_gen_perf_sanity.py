@@ -317,10 +317,6 @@ class VisualGenPerfSanityTestConfig:
             if "/" in path_value:
                 _append_candidate(models_root / path_value.split("/", 1)[1])
 
-        if "gemma-3-12b-it" in path_value:
-            _append_candidate(models_root / "gemma" / "gemma-3-12b-it")
-            _append_candidate(models_root / "gemma-3-12b-it")
-
         for candidate in candidates:
             if candidate.exists():
                 return str(candidate)

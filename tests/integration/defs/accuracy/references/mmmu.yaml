@@ -1,20 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-google/gemma-3-27b-it:
-  - accuracy: 52.0
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 50.0
-  # Blackwell FP8 cubins for Gemma3 multimodal route through a different
-  # FlashInfer path than Hopper, producing ~5pt lower MMMU. Use a separate
-  # Blackwell-calibrated reference instead of relaxing the Hopper one.
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    extra_acc_spec: sm100_fp8
-    accuracy: 46.0
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 48.0
 google/gemma-4-26B-A4B-it:
   - accuracy: 56.667
   # B200 PyTorch backend baseline for nvidia/Gemma-4-26B-A4B-NVFP4.
@@ -25,14 +10,6 @@ google/gemma-4-26B-A4B-it:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 54.0
-google/gemma-3-12b-it:
-  - accuracy: 50.44
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 49.0
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 50.11
 LGAI-EXAONE/EXAONE-4.5-33B:
   # Empirically achieved ~46.5 across H20/B200/B300/GB200/GB300 since the
   # model was added (PR #12873). The original 51.22 was committed without

@@ -36,12 +36,10 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, skip_fp8_pre_ada,
-                        skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
-import tempfile
 
 import torch
 from transformers.configuration_utils import PretrainedConfig
@@ -58,9 +56,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader as _register_checkpoint_weight_loader,
     register_config_loader as _register_config_loader)
 
-from peft import LoraConfig as PeftLoraConfig
-from peft import get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from dataclasses import replace
 
 # isort: on
@@ -405,143 +401,6 @@ def test_llama_3_1_8b_fp8_with_bf16_lora(cuda_graph_config) -> None:
     finally:
         llm.shutdown()
     assert similar(output.outputs[0].text, reference)
-
-
-@pytest.mark.part2
-@test_lora_with_and_without_cuda_graph
-def test_gemma3_1b_instruct_multi_lora(cuda_graph_config) -> None:
-    model_dir = f"{llm_models_root()}/gemma/gemma-3-1b-it"
-
-    target_modules = ['attn_q', 'attn_k', 'attn_v']
-
-    # Set up temporary directory for LoRA adapters
-    with tempfile.TemporaryDirectory() as lora_dir:
-        print("Creating dummy LoRAs...")
-
-        model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                     dtype=torch.bfloat16,
-                                                     device_map="auto")
-        hf_modules = ["q_proj", "k_proj", "v_proj"]
-        peft_lora_config = PeftLoraConfig(r=8,
-                                          target_modules=hf_modules,
-                                          bias="none",
-                                          task_type="CAUSAL_LM")
-        lora_paths = []
-        for i in range(2):
-            lora_model = get_peft_model(model, peft_lora_config)
-            for param in lora_model.parameters():
-                param.data.zero_()
-            lora_path = f"{lora_dir}/lora_{i}"
-            lora_model.save_pretrained(lora_path)
-            lora_paths.append(lora_path)
-
-        trtllm_lora_config = LoraConfig(lora_dir=lora_paths,
-                                        lora_target_modules=target_modules,
-                                        max_lora_rank=8,
-                                        max_loras=2,
-                                        max_cpu_loras=2)
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-        )
-        llm = LLM(model_dir,
-                  lora_config=trtllm_lora_config,
-                  kv_cache_config=kv_cache_config,
-                  cuda_graph_config=cuda_graph_config)
-
-        prompts = [
-            "Is it ok to fill diesel in a petrol car?",
-            "What is the capital of France?",
-        ]
-        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
-        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
-        lora_requests = [lora_req1, lora_req2]
-        sampling_params = SamplingParams(max_tokens=200)
-
-        outputs = llm.generate(prompts,
-                               sampling_params,
-                               lora_request=lora_requests)
-
-        assert len(outputs) == 2
-
-
-@skip_gpu_memory_less_than_40gb
-@pytest.mark.part3
-def test_lora_many_adapters_no_memory_leak() -> None:
-    """Verify GPU memory stays bounded when loading many unique LoRA adapters.
-
-    Creates 20 dummy adapters but sets max_loras=2 and max_cpu_loras=4 to
-    force eviction.  Without proper cleanup, _lora_weights can accumulate
-    GPU tensors for every loaded adapter, causing unbounded memory growth.
-    """
-    model_dir = f"{llm_models_root()}/gemma/gemma-3-1b-it"
-    num_adapters = 20
-    target_modules = ['attn_q', 'attn_k', 'attn_v']
-
-    with tempfile.TemporaryDirectory() as lora_dir:
-        model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                     dtype=torch.bfloat16,
-                                                     device_map="auto")
-        hf_modules = ["q_proj", "k_proj", "v_proj"]
-        peft_lora_config = PeftLoraConfig(r=8,
-                                          target_modules=hf_modules,
-                                          bias="none",
-                                          task_type="CAUSAL_LM")
-        lora_paths = []
-        for i in range(num_adapters):
-            lora_model = get_peft_model(model, peft_lora_config)
-            for param in lora_model.parameters():
-                param.data.zero_()
-            lora_path = f"{lora_dir}/lora_{i}"
-            lora_model.save_pretrained(lora_path)
-            lora_paths.append(lora_path)
-
-        del model
-        torch.cuda.empty_cache()
-
-        trtllm_lora_config = LoraConfig(lora_dir=lora_paths[:1],
-                                        lora_target_modules=target_modules,
-                                        max_lora_rank=8,
-                                        max_loras=2,
-                                        max_cpu_loras=4)
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        enable_partial_reuse=False)
-        llm = LLM(model_dir,
-                  lora_config=trtllm_lora_config,
-                  kv_cache_config=kv_cache_config)
-
-        sampling_params = SamplingParams(max_tokens=20)
-        warmup_count = 5
-
-        mem_samples = []
-        for i in range(num_adapters):
-            lora_req = LoRARequest(f"lora-{i}", i, lora_paths[i])
-            output = llm.generate("Hello, tell me a story.",
-                                  sampling_params,
-                                  lora_request=lora_req)
-            assert output.outputs[0].text != ""
-
-            if i >= warmup_count:
-                mem_samples.append(torch.cuda.memory_allocated())
-
-        num_measured = len(mem_samples)
-        assert num_measured >= 2, "Not enough samples to measure growth"
-
-        total_growth = mem_samples[-1] - mem_samples[0]
-        per_adapter_mb = (total_growth / (num_measured - 1)) / (1024 * 1024)
-
-        # Each adapter is ~3 MB on GPU (r=8, 3 modules, 26 layers, bf16).
-        # The C++ PeftCacheManager handles eviction and _lora_weights
-        # stays empty, so per-adapter growth should be ~0.  If GPU tensors
-        # leak, we would see ~3 MB/adapter of linear growth.  Threshold
-        # of 1 MB/adapter catches leaks while tolerating noise from
-        # allocator fragmentation averaged over many samples.
-        max_per_adapter_mb = 1.0
-        assert per_adapter_mb < max_per_adapter_mb, (
-            f"GPU memory growing at {per_adapter_mb:.2f} MB/adapter over "
-            f"{num_measured} adapters (total {total_growth / (1024**2):.1f} MB). "
-            f"Possible _lora_weights leak.")
 
 
 @pytest.mark.parametrize(

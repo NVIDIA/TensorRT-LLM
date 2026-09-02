@@ -51,7 +51,6 @@ SKIP_COMPONENTS = [
 
 
 _LTX2_BASE = os.path.join(str(llm_models_root(check=True)), "LTX-2")
-_GEMMA3_DEFAULT = os.path.join(str(llm_models_root(check=True)), "gemma", "gemma-3-12b-it")
 
 
 CHECKPOINT_PATH_BF16 = os.environ.get(
@@ -62,20 +61,6 @@ CHECKPOINT_PATH_FP8 = os.environ.get(
     "LTX2_MODEL_PATH_FP8",
     os.path.join(_LTX2_BASE, "ltx-2-19b-dev-fp8.safetensors"),
 )
-GEMMA3_PATH = os.environ.get("LTX2_TEXT_ENCODER_PATH", _GEMMA3_DEFAULT)
-
-
-def _ltx2_pipeline_config(**overrides):
-    """Build pipeline_config with the Gemma3 text_encoder_path LTX-2 needs.
-
-    LTX-2's tokenizer + text encoder are loaded from a separate Gemma
-    directory (not the diffusion checkpoint), so every full-pipeline
-    load needs ``text_encoder_path`` set. Tests can pass extra keys via
-    ``overrides`` (e.g. ``spatial_upsampler_path`` for two-stage).
-    """
-    cfg = {"text_encoder_path": GEMMA3_PATH}
-    cfg.update(overrides)
-    return cfg
 
 
 def _write_minimal_ltx2_native_checkpoint(tmp_path):
@@ -206,7 +191,6 @@ class TestLTX2Quantization:
         args = VisualGenArgs(
             model=CHECKPOINT_PATH_BF16,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
-            pipeline_config=_ltx2_pipeline_config(),
         )
 
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
@@ -261,7 +245,6 @@ class TestLTX2FP8NumericalCorrectness:
         print(f"\n[Compare {quant_algo}] Loading BF16 pipeline...")
         args_bf16 = VisualGenArgs(
             model=CHECKPOINT_PATH_BF16,
-            pipeline_config=_ltx2_pipeline_config(),
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load(
             skip_warmup=True, skip_components=SKIP_COMPONENTS
@@ -271,7 +254,6 @@ class TestLTX2FP8NumericalCorrectness:
         args_fp8 = VisualGenArgs(
             model=CHECKPOINT_PATH_BF16,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
-            pipeline_config=_ltx2_pipeline_config(),
         )
         pipeline_fp8 = PipelineLoader(args_fp8).load(
             skip_warmup=True, skip_components=SKIP_COMPONENTS
@@ -338,7 +320,6 @@ class TestLTX2FP8Memory:
 
         args_bf16 = VisualGenArgs(
             model=CHECKPOINT_PATH_BF16,
-            pipeline_config=_ltx2_pipeline_config(),
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load(
             skip_warmup=True, skip_components=SKIP_COMPONENTS
@@ -355,7 +336,6 @@ class TestLTX2FP8Memory:
         args_fp8 = VisualGenArgs(
             model=CHECKPOINT_PATH_BF16,
             quant_config={"quant_algo": "FP8", "dynamic": True},
-            pipeline_config=_ltx2_pipeline_config(),
         )
         pipeline_fp8 = PipelineLoader(args_fp8).load(
             skip_warmup=True, skip_components=SKIP_COMPONENTS
@@ -392,7 +372,6 @@ class TestLTX2AttentionBackend:
         args_baseline = VisualGenArgs(
             model=CHECKPOINT_PATH_BF16,
             attention_config=AttentionConfig(backend="VANILLA"),
-            pipeline_config=_ltx2_pipeline_config(),
         )
         pipeline_baseline = PipelineLoader(args_baseline).load(
             skip_warmup=True, skip_components=SKIP_COMPONENTS
@@ -419,7 +398,6 @@ class TestLTX2AttentionBackend:
         args_trtllm = VisualGenArgs(
             model=CHECKPOINT_PATH_BF16,
             attention_config=AttentionConfig(backend="TRTLLM"),
-            pipeline_config=_ltx2_pipeline_config(),
         )
         pipeline_trtllm = PipelineLoader(args_trtllm).load(
             skip_warmup=True, skip_components=SKIP_COMPONENTS
@@ -1615,10 +1593,10 @@ class TestLTX2TwoStagePipelineLoading:
 
         args = VisualGenArgs(
             model=CHECKPOINT_PATH_BF16,
-            pipeline_config=_ltx2_pipeline_config(
-                spatial_upsampler_path=UPSAMPLER_PATH,
-                distilled_lora_path=LORA_PATH,
-            ),
+            pipeline_config={
+                "spatial_upsampler_path": UPSAMPLER_PATH,
+                "distilled_lora_path": LORA_PATH,
+            },
         )
 
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
@@ -1648,10 +1626,10 @@ class TestLTX2TwoStagePipelineLoading:
 
         args = VisualGenArgs(
             model=CHECKPOINT_PATH_BF16,
-            pipeline_config=_ltx2_pipeline_config(
-                spatial_upsampler_path=UPSAMPLER_PATH,
-                distilled_lora_path=LORA_PATH,
-            ),
+            pipeline_config={
+                "spatial_upsampler_path": UPSAMPLER_PATH,
+                "distilled_lora_path": LORA_PATH,
+            },
         )
 
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
@@ -1694,10 +1672,10 @@ class TestLTX2TwoStagePipelineLoading:
 
         args = VisualGenArgs(
             model=CHECKPOINT_PATH_BF16,
-            pipeline_config=_ltx2_pipeline_config(
-                spatial_upsampler_path=UPSAMPLER_PATH,
-                distilled_lora_path=LORA_PATH,
-            ),
+            pipeline_config={
+                "spatial_upsampler_path": UPSAMPLER_PATH,
+                "distilled_lora_path": LORA_PATH,
+            },
             quant_config={"quant_algo": quant_algo, "dynamic": True},
         )
 
