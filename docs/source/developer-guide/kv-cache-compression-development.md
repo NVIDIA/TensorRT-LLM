@@ -16,10 +16,10 @@ storage ABI, page-index lifetime, staging, and migration transaction, see the
 [KVCM V2 Cold-Page Codec Design](kv-cache-cold-page-codec.md).
 
 - [Architecture](#architecture)
+- [Capability declarations](#capability-declarations)
 - [Configuration, construction, and binding](#configuration-construction-and-binding)
 - [Iteration-driven methods](#iteration-driven-methods)
 - [Storage-bound codec providers](#storage-bound-codec-providers)
-- [Capability declarations](#capability-declarations)
 - [Ownership and failure boundaries](#ownership-and-failure-boundaries)
 - [Adding a compression method](#adding-a-compression-method)
 - [Validation](#validation)
@@ -61,6 +61,29 @@ representation boundary.
 
 Keep the two mechanisms separate. Do not add migration policy to an iteration
 hook, and do not make a cold-page provider allocate or publish KVCM Pages.
+
+## Capability declarations
+
+There are two independent capability layers.
+
+### Manager execution model
+
+| Attribute | Meaning |
+|---|---|
+| `uses_iteration_lifecycle` | Register the manager for per-iteration resource callbacks |
+| `provides_cold_page_codec` | Pass the manager to KVCM during construction as a codec provider |
+
+### Configuration behavior
+
+| Member | Meaning | Framework effect |
+|---|---|---|
+| `changes_physical_kv_length` | Physical and logical KV lengths can diverge | Binding tells KVCM that compression manages history reconciliation |
+| `supports_block_reuse()` | The method preserves the block-reuse contract | Admission can keep block reuse enabled |
+| `supports_speculative_decoding()` | The configuration supports at least one speculative mode | Admission proceeds to method-specific mode checks |
+
+Capability methods are admission predicates, not runtime fallbacks. A method
+may still impose narrower mode, backend, or model-layout checks in the common
+compatibility validator or its construction path.
 
 ## Configuration, construction, and binding
 
@@ -295,29 +318,6 @@ The exact `IKvCacheColdPageCodec` ABI, host/device index lifetimes, batching
 representatives, staging rules, and failure transaction are documented in the
 [Cold-Page Codec Design](kv-cache-cold-page-codec.md).
 
-## Capability declarations
-
-There are two independent capability layers.
-
-### Manager execution model
-
-| Attribute | Meaning |
-|---|---|
-| `uses_iteration_lifecycle` | Register the manager for per-iteration resource callbacks |
-| `provides_cold_page_codec` | Pass the manager to KVCM during construction as a codec provider |
-
-### Configuration behavior
-
-| Member | Meaning | Framework effect |
-|---|---|---|
-| `changes_physical_kv_length` | Physical and logical KV lengths can diverge | Binding tells KVCM that compression manages history reconciliation |
-| `supports_block_reuse()` | The method preserves the block-reuse contract | Admission can keep block reuse enabled |
-| `supports_speculative_decoding()` | The configuration supports at least one speculative mode | Admission proceeds to method-specific mode checks |
-
-Capability methods are admission predicates, not runtime fallbacks. A method
-may still impose narrower mode, backend, or model-layout checks in the common
-compatibility validator or its construction path.
-
 ## Ownership and failure boundaries
 
 | Component | Owns | Does not own |
@@ -335,17 +335,21 @@ partially updated.
 
 ## Adding a compression method
 
-### 1. Define the configuration
+### 1. Define the configuration and telemetry
 
 1. Add a `KvCacheCompressionConfig` subclass in `llm_args.py`.
 2. Choose a unique `algorithm` value and keep method-specific fields on the
    concrete class.
 3. Declare physical-length, block-reuse, and speculative-decoding capabilities.
 4. Add the class to `KvCacheCompressionConfigType`.
-5. Regenerate and test the LLM-arguments manifest when the public schema
-   changes.
+5. Add the algorithm value to the existing compression-algorithm telemetry
+   allowlist. Opt in only safe, low-cardinality method fields; model paths,
+   calibration paths, and other user data must remain excluded.
+6. Run `python3 scripts/generate_llm_args_golden_manifest.py`, review the
+   generated schema change, and run the telemetry manifest tests. Public
+   configuration is not complete until the manifest is updated deliberately.
 
-### 2. Register admission and construction
+### 2. Register Python admission and construction
 
 1. Extend `validate_kv_cache_compression_compatibility()` with only the
    method's real unsupported combinations.
@@ -353,6 +357,11 @@ partially updated.
 3. Keep optional heavy algorithm imports local to the selected factory branch.
 4. Fail before construction for an explicitly requested unsupported method or
    combination.
+
+Configuration dispatch, compatibility policy, manager construction, and
+algorithm policy belong in Python. Keep them in `llm_args.py`, `_util.py`, and
+the method's package under `tensorrt_llm/_torch/kv_cache_compression/`; do not
+add algorithm selection to KVCM C++.
 
 ### 3A. Implement an iteration-driven method
 
@@ -379,7 +388,41 @@ partially updated.
 5. Keep fixed cold-page size, Page-index location, pointer lifetime, and
    asynchronous failure behavior consistent with the native codec contract.
 
-### 4. Document the method
+The native `IKvCacheColdPageCodec` interface and Python/native adapter already
+connect a storage-bound provider to KVCM V2. A new compression format should
+implement the Python provider and its algorithm launcher, not add a format
+branch to `storageManager.cpp`, `kvCache.cpp`, or the KVCM migration engine.
+
+### 4. Add method-specific kernels
+
+Keep the manager responsible for policy and the kernel responsible for a
+batched transform. Put Python launchers with the method implementation. Triton
+and CuTe DSL kernels can live in the method package; a CUDA implementation can
+live under `cpp/tensorrt_llm/kernels/` with the smallest required binding.
+
+For a storage-bound method, the launcher must consume the resolved lifecycle
+metadata, Page-index batch, cold base pointer, and CUDA stream provided through
+the existing codec adapter. Adding a CUDA kernel or binding does not require
+changing the KVCM storage or migration code. Preserve non-contiguous Pages,
+partial Pages, batching, supplied-stream execution, pointer lifetime, and the
+asynchronous failure contract.
+
+Prefer an existing production primitive when its numerical and layout contract
+matches. Keep backend-specific imports local, provide an actionable unsupported
+architecture error, and test the launcher separately before wiring it into a
+manager lifecycle.
+
+### 5. Preserve reuse and serving compatibility where possible
+
+KV-cache block reuse and disaggregated serving are important compression use
+cases. Preserve and test them when the algorithm's semantics permit it; they
+are not unconditional requirements for every method. Declare
+`supports_block_reuse()` truthfully, validate context/generation ownership and
+transfer behavior for disaggregated serving, and avoid silently disabling
+either feature. If a combination cannot be supported, reject it during
+compatibility validation and document the limitation.
+
+### 6. Document the method
 
 Add a concise method section to the user-facing feature page and a complete,
 runnable example under `examples/kv_cache_compression/`. Keep algorithm details
@@ -392,9 +435,12 @@ Start with focused CPU tests, then exercise the real native and model paths.
 ### Common framework tests
 
 - configuration parsing, serialization, and factory dispatch;
+- telemetry allowlisting, privacy exclusions, and golden-manifest parity;
 - admission of supported combinations and early rejection of unsupported ones;
 - target-only and independent target/draft construction;
 - resource-manager ordering and exact lifecycle-hook cadence;
+- block-reuse and disaggregated-serving paths when the method declares them
+  supported;
 - request completion and abort cleanup; and
 - proof that compression activated rather than merely parsing a configuration.
 
