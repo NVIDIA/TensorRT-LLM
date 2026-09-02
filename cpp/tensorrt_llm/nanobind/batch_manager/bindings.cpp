@@ -425,21 +425,17 @@ void initBindings(nb::module_& m)
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_lengths,
                 std::optional<std::string> cache_salt)
             {
-                auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
+                auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor)
                 {
                     std::optional<tb::LlmRequest::TensorPtr> tensorPtr = std::nullopt;
                     if (atTensor)
                     {
                         tensorPtr = tr::TorchView::of(atTensor.value());
-                        if (unsqueeze)
-                        {
-                            (*tensorPtr)->unsqueeze(0);
-                        }
                     }
                     return tensorPtr;
                 };
 
-                auto embedding_bias_tensor_ptr = makeOptionalTensor(embedding_bias, true);
+                auto embedding_bias_tensor_ptr = makeOptionalTensor(embedding_bias);
                 auto prompt_embedding_table_tensor_ptr = makeOptionalTensor(prompt_embedding_table);
                 auto multimodal_embedding_tensor_ptr = makeOptionalTensor(multimodal_embedding);
                 auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
