@@ -833,11 +833,15 @@ gives a coarser version of the same check.
 - **UCX warmup requests hit the store too.** `run_benchmark.sh` sends
   `2 x ctx_instances x gen_instances` 100-token requests before the real run.
   Harmless, but they are in the counters.
-- **`enable_chunked_prefill` interacts with the offer.** The connector offers
-  only whole blocks and only when the local match is block-aligned; a partial
-  local match disables the store for that request entirely. With
-  `tokens_per_block: 128` this is rare, but it explains occasional zero-offer
-  requests.
+- **A partial local match disables the store for that request entirely,** and
+  this is the dominant failure mode rather than the rare one it was predicted to
+  be here. The connector offers only whole blocks and only when the local match
+  is block-aligned, and `enable_partial_reuse` (default `true`) is exactly what
+  puts the match off a boundary: measured on M3, it declined **97.2% of
+  lookups**, so a 1.6 TB pool measured as if it were absent. Turning it off took
+  actual prompt cache read from 35% to 94%. `py_executor_creator` now forces it
+  off for this connector, so the hazard is gone, but the arithmetic is worth
+  knowing before changing `tokens_per_block`. See `../mooncake_usage.md` §3.
 - **`block_reuse_policy: per_conversation` is off on the context worker** in
   these configs. It is not gated, but the connector derives its own
   `cache_salt`-seeded hash chain and the interaction is untested. Restore it
