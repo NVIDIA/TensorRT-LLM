@@ -267,7 +267,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.attention_backend` | `Literal['VANILLA', 'TRTLLM']` | `categorical` |  | `VANILLA`, `TRTLLM` |
 | `speculative_config.begin_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.block_size` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
-| `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `Lookahead`, `MTP`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
+| `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `MTP`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
 | `speculative_config.dynamic_tree_max_topK` | `Optional[int]` | `value` |  |  |
 | `speculative_config.eagle3_layers_to_capture` | `Optional[Set[int]]` | `value` |  |  |
 | `speculative_config.eagle3_model_arch` | `Literal['llama3', 'mistral_large3']` | `categorical` |  | `llama3`, `mistral_large3` |

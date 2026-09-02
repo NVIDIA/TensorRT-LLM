@@ -61,7 +61,6 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  DynamicBatchConfig as _DynamicBatchConfig,
                                  ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig,
                                  KvCacheConfig as _KvCacheConfig,
-                                 LookaheadDecodingConfig as _LookaheadDecodingConfig,
                                  PeftCacheConfig as _PeftCacheConfig,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
 from ..bindings.internal.algorithms import AgentTreeConfig as _AgentTreeConfig  # isort: skip
@@ -3688,48 +3687,11 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
             lora_prefetch_dir=self.lora_prefetch_dir)
 
 
-@PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
-class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
-    """Configuration for lookahead speculative decoding."""
-
-    decoding_type: Literal["Lookahead"] = Field(default="Lookahead")
-    max_window_size: PositiveInt = Field(
-        default=_LookaheadDecodingConfig.get_default_lookahead_decoding_window(
-        ),
-        description="Number of NGrams in lookahead branch per step.")
-    max_ngram_size: PositiveInt = Field(
-        default=_LookaheadDecodingConfig.get_default_lookahead_decoding_ngram(),
-        description="Number of tokens per NGram.")
-    max_verification_set_size: PositiveInt = Field(
-        default=_LookaheadDecodingConfig.
-        get_default_lookahead_decoding_verification_set(),
-        description="Number of NGrams in verification branch per step.")
-
-    @model_validator(mode="after")
-    def set_max_total_draft_tokens(self):
-        self.max_total_draft_tokens = self.max_draft_len  # Current Lookahead only supports linear tree
-        return self
-
-    def calculate_speculative_resource(self):
-        return _LookaheadDecodingConfig.calculate_speculative_resource_tuple(
-            self.max_window_size, self.max_ngram_size,
-            self.max_verification_set_size)
-
-    def _to_pybind(self):
-        return _LookaheadDecodingConfig(self.max_window_size,
-                                        self.max_ngram_size,
-                                        self.max_verification_set_size)
-
-    def supports_backend(self, backend: str) -> bool:
-        return backend not in ("pytorch", "_autodeploy")
-
-
 SpeculativeConfig: TypeAlias = Annotated[
     Union[
         DraftTargetDecodingConfig,
         Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
         EagleDecodingConfig,
-        LookaheadDecodingConfig,
         MTPDecodingConfig,
         NGramDecodingConfig,
         SADecodingConfig,

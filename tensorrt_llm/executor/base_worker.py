@@ -35,7 +35,7 @@ from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
-from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
+from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
@@ -481,9 +481,6 @@ class BaseWorker(GenerationExecutor):
                     is_pytorch_backend=self._is_pytorch_backend),
                 # Beam search enforces return_all_generated_tokens=True regardless of the passed value
                 return_all_generated_tokens=False,
-                # convert python config into pybind config
-                lookahead_config=PybindMirror.maybe_to_pybind(
-                    request.sampling_params.lookahead_config),
                 guided_decoding_params=request.sampling_params.
                 _get_guided_decoding_params(),
                 bad_words=request.sampling_params._get_bad_words(),

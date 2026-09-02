@@ -48,10 +48,9 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           EncodeCudaGraphConfig,
                                           ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
-                                          KvCacheConfig,
-                                          LookaheadDecodingConfig,
-                                          MambaStateConfig, MoeConfig,
-                                          MTPDecodingConfig, MultimodalConfig,
+                                          KvCacheConfig, MambaStateConfig,
+                                          MoeConfig, MTPDecodingConfig,
+                                          MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
                                           PeftCacheConfig,
                                           PrefillCudaGraphBackend, PybindMirror,
@@ -168,34 +167,6 @@ def test_rank_striped_checkpoint_io_warns_and_preserves_request_for_autodeploy(
     assert serialized_args["checkpoint_io_policy"] == "rank_striped_read_ahead"
     assert any("selected=native" in call.args[0]
                for call in warning.call_args_list)
-
-
-@pytest.mark.cpu_only
-def test_LookaheadDecodingConfig():
-    # from constructor
-    config = LookaheadDecodingConfig(max_window_size=4,
-                                     max_ngram_size=3,
-                                     max_verification_set_size=4)
-    assert config.max_window_size == 4
-    assert config.max_ngram_size == 3
-    assert config.max_verification_set_size == 4
-
-    # from dict
-    config = LookaheadDecodingConfig(**{
-        "max_window_size": 4,
-        "max_ngram_size": 3,
-        "max_verification_set_size": 4
-    })
-    assert config.max_window_size == 4
-    assert config.max_ngram_size == 3
-    assert config.max_verification_set_size == 4
-
-    # to pybind
-    pybind_config = config._to_pybind()
-    assert isinstance(pybind_config, tle.LookaheadDecodingConfig)
-    assert pybind_config.max_window_size == 4
-    assert pybind_config.max_ngram_size == 3
-    assert pybind_config.max_verification_set_size == 4
 
 
 @pytest.mark.cpu_only
