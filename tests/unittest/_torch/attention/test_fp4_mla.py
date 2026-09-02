@@ -32,7 +32,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2,
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexConverter
 
 _DataType = tensorrt_llm.bindings.DataType
 _CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -130,7 +129,7 @@ def test_fp4_mla_cuda_graph_generation_lengths_records_capture_once(monkeypatch)
 def test_fp4_mla_v2_encoded_page_capacity_is_layer_invariant(layer_offset: int) -> None:
     manager = object.__new__(Fp4MlaKVCacheManagerV2)
     manager.impl = SimpleNamespace(
-        get_page_index_converter=lambda *_: PageIndexConverter(
+        get_page_index_converter=lambda *_: SimpleNamespace(
             scale=4,
             expansion=1,
             layer_offset=layer_offset,
@@ -170,6 +169,7 @@ def test_fp4_mla_v2_runtime_sizing_accounts_for_pipeline_slots() -> None:
     manager.max_num_tokens = 100
     manager.tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
     manager.enable_swa_scratch_reuse = False
+    manager._has_cp_helix = False
     manager._get_runtime_cache_size_layer_components = lambda: ([10, 8], [None, 19])
 
     quota = manager._get_quota_from_max_tokens(manager.max_num_tokens)

@@ -21,7 +21,8 @@ import os
 import weakref
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import (TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Set,
+                    Tuple)
 
 import torch
 
@@ -355,6 +356,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _max_seq_len_storage: Optional[int] = field(default=None,
                                                 init=True,
                                                 repr=False)
+    _page_size_override: Optional[int] = field(init=False,
+                                               default=None,
+                                               repr=False)
 
     # Encoder CUDA graph compatibility: overrides host-side max_context_q_len
     # so FMHA kernel launch params are stable across graph capture/replay even
@@ -569,8 +573,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """
         Number of tokens per cache page.
         """
+        page_size_override = getattr(self, '_page_size_override', None)
+        if page_size_override is not None:
+            return page_size_override
         assert self.kv_cache_manager is not None, "page_size requires a KV cache manager"
         return self.kv_cache_manager.tokens_per_block
+
+    @page_size.setter
+    def page_size(self, value: int) -> None:
+        self._page_size_override = value
 
     @property
     def paged_kv_indices(self) -> torch.Tensor:
