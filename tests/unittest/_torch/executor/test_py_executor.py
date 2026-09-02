@@ -1801,6 +1801,7 @@ class _StubADPExecutor:
         enable_scheduler_aware_adp_dummy=None,
         enable_non_overlap_adp_forward_intent=None,
         peer_forward_intent=_ADPForwardIntent.GENERATION,
+        exclude_retiring_requests=True,
     ):
         self.enable_attention_dp = enable_attention_dp
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -1833,6 +1834,12 @@ class _StubADPExecutor:
         self.dist.tp_size = 1
         self.dist.tp_allgather.side_effect = lambda value: [value]
         self.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
+        # The pad path reads the router's gate rather than re-deriving it, so
+        # the two views of "which requests are routable load" cannot drift.
+        # Default True models a non-PP attention-DP executor; under pipeline
+        # parallelism the router leaves retiring requests in the load vector
+        # and the pad path must not subtract them (nvbug-6627795).
+        self.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
 
         self.scheduler = Mock()
         self.scheduler.scheduling_state_range = (

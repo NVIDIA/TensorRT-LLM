@@ -643,6 +643,11 @@ class MockPadDummyExecutor:
         self.resource_manager = Mock()
         self.resource_manager.get_resource_manager.return_value = None
 
+        # The pad path reads the router's gate for "which requests count as
+        # routable load"; non-PP attention DP excludes the retiring ones
+        # (nvbug-6627795).
+        self.adp_router = Mock(exclude_retiring_requests=True)
+
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _ADPForwardIntent
 
     _pad_attention_dp_dummy_request = PyExecutor._pad_attention_dp_dummy_request

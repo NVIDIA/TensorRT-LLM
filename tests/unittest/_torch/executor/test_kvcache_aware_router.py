@@ -34,7 +34,7 @@ pytestmark = pytest.mark.cpu_only
 # ---- Helpers ----
 
 
-def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
+def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False, has_pp=False):
     """Create a mock Distributed object for testing."""
     dist = MagicMock()
     dist.tp_rank = tp_rank
@@ -42,6 +42,10 @@ def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
     # ADP scheduling assumes ``enable_attention_dp=True``, so ``dp_size``
     # mirrors ``tp_size`` (see ``Mapping.dp_size``).
     dist.mapping.dp_size = tp_size
+    # ADPRouter reads this to decide whether to route on the overlap-corrected
+    # active list; a bare MagicMock would make has_pp() truthy and silently
+    # disable the correction in every test.
+    dist.mapping.has_pp.return_value = has_pp
     dist.has_cp_helix = has_cp_helix
     return dist
 

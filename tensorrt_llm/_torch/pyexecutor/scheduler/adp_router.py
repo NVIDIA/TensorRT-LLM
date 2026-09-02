@@ -229,6 +229,24 @@ class ADPRouter(ABC):
 
     def __init__(self, dist: Distributed):
         self.dist = dist
+        # Whether to route on the overlap-corrected active list (nvbug-6627795).
+        #
+        # Gated off under pipeline parallelism, deliberately matching
+        # ``should_enable_adp_overlap_seq_slot_headroom`` in ``_util.py``: the
+        # correction lets a rank hold more requests than it is charged for, so
+        # it is only safe where the sequence-slot pool has the matching
+        # headroom, and that headroom is sized for non-PP only. Beyond the slot
+        # accounting, ``GENERATION_TO_COMPLETE`` is marked on the last pipeline
+        # stage alone, while every rank pops from its own copy of the waiting
+        # queue -- so a PP-enabled correction would have the stages admit
+        # different numbers of requests and diverge.
+        #
+        # Not additionally gated on ``disable_overlap_scheduler``: without
+        # overlap the retire is not deferred, so no request is ever in
+        # ``GENERATION_TO_COMPLETE`` when the router runs and the filter is
+        # arithmetically a no-op (measured: zero such requests on 5126/5126
+        # routing records with overlap disabled).
+        self.exclude_retiring_requests = not dist.mapping.has_pp()
 
     @classmethod
     def create(
@@ -325,8 +343,13 @@ class ADPRouter(ABC):
         # admission capacity that nothing can spend (nvbug-6627795). Applied
         # here rather than in each create_rank_state so every router -- and both
         # num_active_requests and num_active_tokens -- is corrected at once.
-        active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
-        num_retiring_requests = len(active_requests) - len(active_requests_for_overlap)
+        # Disabled under pipeline parallelism; see exclude_retiring_requests.
+        if self.exclude_retiring_requests:
+            active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
+            num_retiring_requests = len(active_requests) - len(active_requests_for_overlap)
+        else:
+            active_requests_for_overlap = active_requests
+            num_retiring_requests = 0
         local_state = self.create_rank_state(active_requests_for_overlap, new_requests or [])
         # The retiring requests are still resident, so the executor loop is NOT
         # idle while any of them exists. Report the count so the idle-fetch wait

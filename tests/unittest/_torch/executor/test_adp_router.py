@@ -44,12 +44,16 @@ class _MockRequest(MagicMock):
         return len(self.input_token_ids)
 
 
-def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
+def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False, has_pp=False):
     """Create a mock Distributed object for testing."""
     dist = MagicMock()
     dist.tp_rank = tp_rank
     dist.tp_size = tp_size
     dist.has_cp_helix = has_cp_helix
+    # ADPRouter reads this to decide whether to route on the overlap-corrected
+    # active list; a bare MagicMock would make has_pp() truthy and silently
+    # disable the correction in every test.
+    dist.mapping.has_pp.return_value = has_pp
     return dist
 
 
@@ -412,6 +416,38 @@ class TestDefaultADPRouter:
         assert states[0].num_active_requests == 0
         assert states[0].num_active_tokens == 0
         assert states[0].num_retiring_requests == 2
+
+    def test_gather_all_rank_states_keeps_retiring_under_pp(self):
+        # Under pipeline parallelism the correction is off, matching the
+        # sequence-slot headroom gate in _util.py. Two reasons it must stay off:
+        # the slot pool is sized pp_size * max_batch_size with no headroom for
+        # requests a rank holds but is not charged for, and
+        # GENERATION_TO_COMPLETE is marked on the last stage only while every
+        # rank pops from its own copy of the waiting queue -- so a corrected
+        # count would have the stages admit different numbers of requests.
+        dist = _mock_dist(tp_rank=0, has_cp_helix=False, has_pp=True)
+        router = DefaultADPRouter(dist=dist)
+        assert router.exclude_retiring_requests is False
+        active = [
+            Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
+            _retiring_request(prompt_len=200),
+            _retiring_request(prompt_len=300),
+        ]
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+
+        states = router.gather_all_rank_states(active_requests=active)
+
+        # Same inputs as test_gather_all_rank_states_excludes_retiring, which
+        # asserts 1 / 2 / 100 -- here nothing is filtered.
+        assert states[0].num_active_requests == 3
+        assert states[0].num_retiring_requests == 0
+        assert states[0].num_active_tokens == 600
+
+    def test_exclude_retiring_requests_follows_pipeline_parallelism(self):
+        # The flag is the single gate; _pad_attention_dp_dummy_request reads it
+        # rather than re-deriving the predicate, so the two cannot drift.
+        assert DefaultADPRouter(dist=_mock_dist(has_pp=False)).exclude_retiring_requests is True
+        assert DefaultADPRouter(dist=_mock_dist(has_pp=True)).exclude_retiring_requests is False
 
     def test_create_rank_state_cp_helix(self):
         dist = _mock_dist(tp_rank=1, has_cp_helix=True)

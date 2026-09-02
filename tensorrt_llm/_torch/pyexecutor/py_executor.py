@@ -7016,12 +7016,17 @@ class PyExecutor:
 
         expected_num_active_requests = self.expected_num_active_requests
         # Compare against the same routable count the router balanced on:
-        # create_rank_state excludes retiring requests from the per-rank loads
-        # that floor `expected` (nvbug-6627795), so measuring against the raw
-        # len() here would make the warning below fire every iteration.
-        num_routable_active_requests = (
-            len(self.active_requests) -
-            count_retiring_requests(self.active_requests))
+        # gather_all_rank_states excludes retiring requests from the per-rank
+        # loads that floor `expected` (nvbug-6627795), so measuring against the
+        # raw len() here would make the warning below fire every iteration.
+        # Read the router's own flag rather than re-deriving the gate, so the
+        # two can never disagree -- it is off under pipeline parallelism, where
+        # subtracting requests the router still counted would under-report this
+        # rank's load instead.
+        num_routable_active_requests = len(self.active_requests)
+        if self.adp_router.exclude_retiring_requests:
+            num_routable_active_requests -= count_retiring_requests(
+                self.active_requests)
         if expected_num_active_requests < num_routable_active_requests:
             # Not fatal, and not a capacity violation. The router derives this
             # value as
