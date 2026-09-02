@@ -36,7 +36,17 @@ import traceback
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterator, MutableMapping, Optional, Protocol, Type, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterator,
+    MutableMapping,
+    Optional,
+    Protocol,
+    Type,
+    Union,
+)
 
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
@@ -51,6 +61,9 @@ from tensorrt_llm._torch.weight_sharing import (
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+if TYPE_CHECKING:
+    from torch import nn
 
 # Defensive default for the upstream `MX_SOURCE_QUERY_TIMEOUT` env var.
 # The upstream `MxLiveWeightLoader` polls the MX server every 5 s for up
@@ -201,7 +214,7 @@ def _enable_mx_transfer_logging() -> None:
         mx_logger.setLevel(logging.INFO)
 
 
-def _maybe_write_mx_transfer_manifest(model: Any, *, rank: int, boundary: str) -> None:
+def _maybe_write_mx_transfer_manifest(model: "nn.Module", *, rank: int, boundary: str) -> None:
     """Fingerprint the bytes at an MX transfer boundary when `MX_WEIGHT_MANIFEST_DIR` is set."""
     maybe_write_weight_manifest(
         model,

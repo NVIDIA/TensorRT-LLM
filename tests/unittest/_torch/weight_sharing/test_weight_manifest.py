@@ -50,7 +50,8 @@ from tensorrt_llm._torch.weight_sharing import (
 from tensorrt_llm._torch.weight_sharing import weight_manifest as weight_manifest_mod
 from tensorrt_llm._torch.weight_sharing.source_identity import _canonical_hash
 
-pytestmark = pytest.mark.cpu_only
+# CPU tests carry `pytest.mark.cpu_only` individually so the CUDA test below stays
+# eligible for GPU stages (which run with `-m "not cpu_only"`).
 
 # Phrases the MX E2E harness treats as receiver failure markers; manifest log
 # lines and reports must never contain them.
@@ -122,6 +123,7 @@ def _assert_close_passes(left: torch.Tensor, right: torch.Tensor) -> None:
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.cpu_only
 def test_canonical_tensor_bytes_matches_design_formula():
     tensor = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3).t()
     assert not tensor.is_contiguous()
@@ -139,17 +141,20 @@ def test_canonical_tensor_bytes_matches_design_formula():
     assert canonical_tensor_bytes(torch.empty(0, dtype=torch.bfloat16)).numel() == 0
 
 
+@pytest.mark.cpu_only
 def test_canonical_json_digest_matches_source_identity_hash():
     sample = {"b": [1, 2, {"z": torch.bfloat16}], "a": ("x", None, 3.5)}
     assert weight_manifest_mod._canonical_json_digest(sample) == _canonical_hash(sample)
 
 
+@pytest.mark.cpu_only
 def test_entries_sorted_by_fqn_regardless_of_registration_order():
     manifest = build_weight_manifest(_NamedParamsModule(["zeta", "alpha", "mid"]))
     assert _fqns(manifest) == ["alpha", "mid", "zeta"]
     assert all(entry.kind == "param" for entry in manifest.entries)
 
 
+@pytest.mark.cpu_only
 def test_manifest_is_deterministic_and_context_does_not_affect_digest():
     module = _TwoTensorModule()
     first = build_weight_manifest(module, context={"boundary": "first"})
@@ -173,6 +178,7 @@ def test_manifest_is_deterministic_and_context_does_not_affect_digest():
     assert first.context["bytes_hashed"] == 8 * 2 + 2 * 4
 
 
+@pytest.mark.cpu_only
 def test_entry_metadata_records_layout_and_kinds():
     manifest = build_weight_manifest(_TwoTensorModule())
     by_fqn = manifest.entries_by_fqn()
@@ -196,6 +202,7 @@ def test_entry_metadata_records_layout_and_kinds():
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.cpu_only
 def test_single_bit_flip_fails_manifest_and_names_only_that_fqn():
     module = _TwoTensorModule()
     reference = module.weight.detach().clone()
@@ -217,6 +224,7 @@ def test_single_bit_flip_fails_manifest_and_names_only_that_fqn():
     assert _digest_of(before, "scale") == _digest_of(after, "scale")
 
 
+@pytest.mark.cpu_only
 def test_signed_zero_flip_fails_manifest_but_passes_assert_close():
     module = _TwoTensorModule()
     assert module.weight[0, 0].item() == 0.0
@@ -235,6 +243,7 @@ def test_signed_zero_flip_fails_manifest_but_passes_assert_close():
     assert not diff.is_empty
 
 
+@pytest.mark.cpu_only
 def test_nan_payload_change_fails_manifest_but_passes_assert_close():
     module = _TwoTensorModule()
     with torch.no_grad():
@@ -258,6 +267,7 @@ def test_nan_payload_change_fails_manifest_but_passes_assert_close():
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.cpu_only
 def test_non_contiguous_tensor_hashes_logical_bytes_and_records_stride():
     base = torch.arange(12, dtype=torch.float32).reshape(3, 4)
 
@@ -283,6 +293,7 @@ def test_non_contiguous_tensor_hashes_logical_bytes_and_records_stride():
     assert not diff.is_empty
 
 
+@pytest.mark.cpu_only
 def test_alias_groups_partition_tied_and_view_tensors():
     tied = build_weight_manifest(_TiedModule(tied=True))
     untied = build_weight_manifest(_TiedModule(tied=False))
@@ -300,6 +311,7 @@ def test_alias_groups_partition_tied_and_view_tensors():
     assert not diff.is_empty
 
 
+@pytest.mark.cpu_only
 def test_empty_storage_tensors_do_not_form_alias_groups():
     module = _NamedParamsModule([])
     module.first = nn.Parameter(torch.empty(0))
@@ -312,6 +324,7 @@ def test_empty_storage_tensors_do_not_form_alias_groups():
     assert all(entry.sha256 == hashlib.sha256(b"").hexdigest() for entry in manifest.entries)
 
 
+@pytest.mark.cpu_only
 def test_meta_tensors_are_skipped_with_reason():
     class _PartlyMeta(nn.Module):
         def __init__(self, materialized: bool) -> None:
@@ -341,6 +354,7 @@ def test_meta_tensors_are_skipped_with_reason():
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.cpu_only
 def test_format_version_differences_never_compare():
     manifest = build_weight_manifest(_TwoTensorModule())
     other = dataclasses.replace(
@@ -350,6 +364,7 @@ def test_format_version_differences_never_compare():
         compare_weight_manifests(manifest, other)
 
 
+@pytest.mark.cpu_only
 def test_identical_manifests_compare_empty_and_describe_says_so():
     module = _TwoTensorModule()
     diff = compare_weight_manifests(build_weight_manifest(module), build_weight_manifest(module))
@@ -357,6 +372,7 @@ def test_identical_manifests_compare_empty_and_describe_says_so():
     assert "identical" in diff.describe("baseline rank0", "receiver rank0")
 
 
+@pytest.mark.cpu_only
 def test_compare_exemptions_apply_only_to_digests():
     expected = build_weight_manifest(_TwoTensorModule())
     shifted_module = _TwoTensorModule()
@@ -387,6 +403,7 @@ def test_compare_exemptions_apply_only_to_digests():
     assert not reshaped.is_empty
 
 
+@pytest.mark.cpu_only
 def test_compare_kinds_filter_ignores_other_kind():
     expected = build_weight_manifest(_TwoTensorModule())
     module = _TwoTensorModule()
@@ -400,6 +417,7 @@ def test_compare_kinds_filter_ignores_other_kind():
         compare_weight_manifests(expected, actual, kinds=("weights",))
 
 
+@pytest.mark.cpu_only
 def test_describe_lists_first_differences_and_avoids_failure_markers():
     names = [f"p{index}" for index in range(5)]
     expected = build_weight_manifest(
@@ -418,7 +436,8 @@ def test_describe_lists_first_differences_and_avoids_failure_markers():
     assert "role='baseline'" in report and "role='receiver'" in report
     assert "boundary='end'" in report
     assert "digest=5" in report
-    assert report.count("expected=") == 2
+    # Entry lines render " expected=<digest>"; the counts line uses "-expected=".
+    assert report.count(" expected=") == 2
     assert "... and 3 more" in report
     assert "torch.float32 [2]" in report
     lowered = report.lower()
@@ -430,6 +449,7 @@ def test_describe_lists_first_differences_and_avoids_failure_markers():
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.cpu_only
 def test_manifest_file_name_validates_parts():
     assert manifest_file_name("final", "baseline", 0) == "manifest.final.baseline.rank0.json"
     assert manifest_file_name("transfer", "receiver", 7) == "manifest.transfer.receiver.rank7.json"
@@ -445,6 +465,7 @@ def test_manifest_file_name_validates_parts():
         manifest_file_name("final", "baseline", True)
 
 
+@pytest.mark.cpu_only
 def test_write_load_roundtrip_is_atomic_and_refuses_overwrite(tmp_path: Path):
     manifest = build_weight_manifest(_TiedModule(tied=True), context={"boundary": "unit"})
     path = tmp_path / manifest_file_name("final", "baseline", 0)
@@ -475,6 +496,7 @@ def test_write_load_roundtrip_is_atomic_and_refuses_overwrite(tmp_path: Path):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.cpu_only
 def test_maybe_write_is_noop_without_dir(monkeypatch, tmp_path: Path):
     monkeypatch.delenv(WEIGHT_MANIFEST_DIR_ENV, raising=False)
     monkeypatch.setenv(WEIGHT_MANIFEST_ROLE_ENV, "baseline")
@@ -485,6 +507,7 @@ def test_maybe_write_is_noop_without_dir(monkeypatch, tmp_path: Path):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.cpu_only
 def test_maybe_write_requires_valid_role(monkeypatch, tmp_path: Path):
     monkeypatch.setenv(WEIGHT_MANIFEST_DIR_ENV, str(tmp_path))
     monkeypatch.delenv(WEIGHT_MANIFEST_ROLE_ENV, raising=False)
@@ -497,6 +520,7 @@ def test_maybe_write_requires_valid_role(monkeypatch, tmp_path: Path):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.cpu_only
 def test_maybe_write_rejects_bad_family_or_rank(monkeypatch, tmp_path: Path):
     monkeypatch.setenv(WEIGHT_MANIFEST_DIR_ENV, str(tmp_path))
     monkeypatch.setenv(WEIGHT_MANIFEST_ROLE_ENV, "donor")
@@ -509,6 +533,7 @@ def test_maybe_write_rejects_bad_family_or_rank(monkeypatch, tmp_path: Path):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.cpu_only
 def test_maybe_write_writes_expected_path_and_context(monkeypatch, tmp_path: Path):
     target_dir = tmp_path / "manifests"
     monkeypatch.setenv(WEIGHT_MANIFEST_DIR_ENV, str(target_dir))
@@ -549,6 +574,37 @@ def test_maybe_write_writes_expected_path_and_context(monkeypatch, tmp_path: Pat
 
     with pytest.raises(FileExistsError):
         maybe_write_weight_manifest(_TwoTensorModule(), family="transfer", rank=1)
+
+
+@pytest.mark.cpu_only
+def test_load_rejects_stale_manifest_digest(tmp_path: Path):
+    manifest = build_weight_manifest(_TwoTensorModule())
+    path = tmp_path / manifest_file_name("final", "baseline", 0)
+    write_weight_manifest(manifest, path)
+
+    # Tamper with an entry but keep the stored whole-manifest digest.
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["entries"][0]["sha256"] = "0" * 64
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest_sha256"):
+        load_weight_manifest(path)
+
+
+@pytest.mark.cpu_only
+def test_compare_does_not_trust_stale_manifest_digest():
+    manifest = build_weight_manifest(_TwoTensorModule())
+    tampered_entries = tuple(
+        dataclasses.replace(entry, sha256="0" * 64) if entry.fqn == "weight" else entry
+        for entry in manifest.entries
+    )
+    # Same stored `manifest_sha256`, different entries: the fast path must not apply.
+    stale = dataclasses.replace(manifest, entries=tampered_entries)
+
+    diff = compare_weight_manifests(manifest, stale)
+
+    assert diff.digest_diffs == ("weight",)
+    assert not diff.is_empty
 
 
 # --------------------------------------------------------------------------- #

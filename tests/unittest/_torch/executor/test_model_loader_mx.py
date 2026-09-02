@@ -142,7 +142,7 @@ class _TinyModel(nn.Module):
 class _ManifestTinyModel(_TinyModel):
     """`_TinyModel` plus real CPU tensors so a weight manifest has something to hash."""
 
-    def __init__(self, events):
+    def __init__(self, events: list[str]) -> None:
         super().__init__(events)
         self.weight = nn.Parameter(torch.arange(8, dtype=torch.float32).reshape(2, 4))
         self.register_buffer("scale", torch.tensor([0.5, 0.25]))
@@ -1641,7 +1641,14 @@ def test_mla_transform_weights_is_idempotent(monkeypatch):
     assert mla._weights_transformed is True
 
 
-def _make_manifest_loader(monkeypatch, tmp_path, *, events, role, mapping=None):
+def _make_manifest_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    events: list[str],
+    role: str | None,
+    mapping: mapping_mod.Mapping | None = None,
+) -> ModelLoader:
     loader = _make_loader(monkeypatch, events=events)
     loader.mapping = mapping or mapping_mod.Mapping(world_size=1, rank=0, tp_size=1)
     monkeypatch.setattr(
@@ -1665,7 +1672,7 @@ def _make_manifest_loader(monkeypatch, tmp_path, *, events, role, mapping=None):
     return loader
 
 
-def _hf_checkpoint_loader():
+def _hf_checkpoint_loader() -> MagicMock:
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
     checkpoint_loader.is_weights_preloaded.return_value = False
@@ -1674,7 +1681,9 @@ def _hf_checkpoint_loader():
 
 
 @pytest.mark.cpu_only
-def test_load_writes_final_manifest_at_end_of_load(monkeypatch, tmp_path):
+def test_load_writes_final_manifest_at_end_of_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     events = []
     loader = _make_manifest_loader(monkeypatch, tmp_path, events=events, role="baseline")
 
@@ -1695,7 +1704,9 @@ def test_load_writes_final_manifest_at_end_of_load(monkeypatch, tmp_path):
 
 
 @pytest.mark.cpu_only
-def test_load_final_manifest_records_mx_receiver_facts(monkeypatch, tmp_path):
+def test_load_final_manifest_records_mx_receiver_facts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     events = []
     loader = _make_manifest_loader(monkeypatch, tmp_path, events=events, role="receiver")
     checkpoint_loader = MagicMock(name="checkpoint_loader")
@@ -1716,7 +1727,9 @@ def test_load_final_manifest_records_mx_receiver_facts(monkeypatch, tmp_path):
 
 
 @pytest.mark.cpu_only
-def test_load_writes_no_manifest_when_env_unset(monkeypatch, tmp_path):
+def test_load_writes_no_manifest_when_env_unset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     events = []
     loader = _make_manifest_loader(monkeypatch, tmp_path, events=events, role=None)
 
@@ -1730,7 +1743,9 @@ def test_load_writes_no_manifest_when_env_unset(monkeypatch, tmp_path):
 
 
 @pytest.mark.cpu_only
-def test_load_final_manifest_uses_mapping_rank(monkeypatch, tmp_path):
+def test_load_final_manifest_uses_mapping_rank(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     events = []
     loader = _make_manifest_loader(
         monkeypatch,

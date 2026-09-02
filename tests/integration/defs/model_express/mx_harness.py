@@ -169,11 +169,11 @@ def skip_or_fail(message: str) -> NoReturn:
 def resolve_model_path(case: MxE2ECase) -> Path:
     configured = os.environ.get(case.model_env)
     if configured:
-        model_path = Path(configured)
+        model_path = Path(configured).expanduser()
     else:
         models_root_env = os.environ.get("LLM_MODELS_ROOT")
         if models_root_env:
-            models_root = Path(models_root_env)
+            models_root = Path(models_root_env).expanduser()
         else:
             models_root = Path("/home/scratch.trt_llm_data_ci/llm-models")
             if not models_root.exists():
