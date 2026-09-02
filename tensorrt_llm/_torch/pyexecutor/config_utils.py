@@ -169,7 +169,8 @@ def is_gemma4_hybrid(config: transformers.PretrainedConfig) -> bool:
 
     per_layer_attributes = getattr(config, "per_layer_attributes", None)
     if per_layer_attributes is not None:
-        return bool({"head_dim", "num_key_value_heads"} & per_layer_attributes)
+        return not {"head_dim", "num_key_value_heads"
+                    }.isdisjoint(per_layer_attributes)
 
     global_head_dim = getattr(config, 'global_head_dim', None)
     head_dim = getattr(config, 'head_dim', None)
