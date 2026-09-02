@@ -15,7 +15,7 @@
 
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 from torch import nn
@@ -28,8 +28,16 @@ from ..attention_backend import AttentionMetadata
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
-from .dflash_attention import get_dflash_trtllm_gen_ops, validate_dflash_trtllm_gen_runtime
+from .dflash_attention import (
+    get_dflash_paged_append,
+    validate_dflash_fa4_runtime,
+    validate_dflash_trtllm_gen_runtime,
+)
 from .interface import SpecMetadata, SpecWorkerBase
+
+# Backends that keep the draft's private context K/V in a paged HND pool.
+# They share the pool layout, page table and paged append op
+_PAGED_ATTENTION_BACKENDS = ("TRTLLM", "FA4")
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
@@ -227,6 +235,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_last_page_len = None
         self._ctx_page_size = 32
         self._ctx_pages_per_slot = 0
+        self._ctx_paged_append = None
         self._dflash_attention_backend = spec_config.attention_backend
 
         # Slot management (Python, updated in prepare() and eager mode)
@@ -344,19 +353,23 @@ class DFlashWorker(SpecWorkerBase):
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
         capacity = self._max_ctx + self._compute_block_size
-        if self._dflash_attention_backend == "TRTLLM":
+        if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
             page_size = self._ctx_page_size
-            has_context_attention = any(
-                not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
-            )
-            validate_dflash_trtllm_gen_runtime(
-                dtype=dtype,
-                num_heads=nh,
-                num_kv_heads=nkv,
-                head_dim=hd,
-                tokens_per_block=page_size,
-                has_context_attention=has_context_attention,
-            )
+            if self._dflash_attention_backend == "TRTLLM":
+                has_context_attention = any(
+                    not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
+                )
+                validate_dflash_trtllm_gen_runtime(
+                    dtype=dtype,
+                    num_heads=nh,
+                    num_kv_heads=nkv,
+                    head_dim=hd,
+                    tokens_per_block=page_size,
+                    has_context_attention=has_context_attention,
+                )
+            else:  # FA4 reads the same HND page pool, with its own kernel.
+                validate_dflash_fa4_runtime(dtype=dtype, head_dim=hd)
+                self._ctx_paged_append = get_dflash_paged_append()
             self._ctx_pages_per_slot = (capacity + page_size - 1) // page_size
             total_pages = num_slots * self._ctx_pages_per_slot
             # HND layout consumed by both FlashInfer's paged append and the
@@ -391,6 +404,12 @@ class DFlashWorker(SpecWorkerBase):
             f"dflash_attention_backend={self._dflash_attention_backend}"
         )
 
+    def _get_ctx_paged_append(self) -> Callable[..., None]:
+        """flashinfer paged append, shared by the TRTLLM and FA4 backends."""
+        if self._ctx_paged_append is None:
+            self._ctx_paged_append = get_dflash_paged_append()
+        return self._ctx_paged_append
+
     def _store_context_kv_paged(
         self,
         k: torch.Tensor,
@@ -398,7 +417,7 @@ class DFlashWorker(SpecWorkerBase):
         slots: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        trtllm_gen_ops = get_dflash_trtllm_gen_ops()
+        append_paged_kv_cache = self._get_ctx_paged_append()
 
         # Convert at most once and reuse for every layer. Calling ``.to()`` in
         # the op call would allocate converted tensors once per layer when the
@@ -407,7 +426,7 @@ class DFlashWorker(SpecWorkerBase):
         positions_i32 = positions.to(torch.int32)
         kv_indices = self._ctx_page_table.flatten().contiguous()
         for layer_idx in range(k.size(1)):
-            trtllm_gen_ops.append_paged_kv_cache(
+            append_paged_kv_cache(
                 append_key=k[:, layer_idx].contiguous(),
                 append_value=v[:, layer_idx].contiguous(),
                 batch_indices=slots_i32,
@@ -529,7 +548,7 @@ class DFlashWorker(SpecWorkerBase):
             if actual > 0:
                 cache_dtype = (
                     self._ctx_kv_buf.dtype
-                    if self._dflash_attention_backend == "TRTLLM"
+                    if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS
                     else self._ctx_k_buf.dtype
                 )
                 chunk_proj_cast = chunk_proj[:actual].to(cache_dtype)
@@ -540,7 +559,7 @@ class DFlashWorker(SpecWorkerBase):
                     chunk_proj_cast, chunk_pos[:actual]
                 )
                 # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
-                if self._dflash_attention_backend == "TRTLLM":
+                if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
                     self._store_context_kv_paged(
                         chunk_k,
                         chunk_v,
@@ -960,7 +979,7 @@ class DFlashWorker(SpecWorkerBase):
                 # dflash_forward reads these directly via cache_batch_idx.
                 cache_dtype = (
                     self._ctx_kv_buf.dtype
-                    if self._dflash_attention_backend == "TRTLLM"
+                    if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS
                     else self._ctx_k_buf.dtype
                 )
                 k_new, v_new = draft_model.precompute_context_kv(
@@ -971,7 +990,7 @@ class DFlashWorker(SpecWorkerBase):
                 v_new.mul_(mask_bc)
                 slot_long = slot_flat.long()
                 col_long = col_flat.long()
-                if self._dflash_attention_backend == "TRTLLM":
+                if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
                     self._store_context_kv_paged(k_new, v_new, slot_long, col_long)
                 else:  # VANILLA DFlash backend (FlashAttention)
                     self._ctx_k_buf[slot_long, :, col_long] = k_new

@@ -2983,15 +2983,15 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
-    attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
+    attention_backend: Literal["VANILLA", "TRTLLM", "FA4"] = Field(
         default="VANILLA",
         description=
-        "Attention backend for DFlash pooled-context cross-attention. This is "
-        "independent of the backend used to construct the drafter's standard "
-        "attention modules. TRTLLM requires FlashInfer and an NVIDIA Blackwell "
-        "GPU with SM100 or SM103, and uses generated FMHA kernels with a private "
-        "paged context cache; VANILLA uses FlashAttention with a contiguous cache."
-    )
+        "Attention backend for DFlash pooled-context cross-attention, independent "
+        "of the drafter's standard attention modules. VANILLA uses FlashAttention "
+        "with a contiguous context K/V cache and runs anywhere. TRTLLM uses "
+        "TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache "
+        "and supports SM100/SM103 only. FA4 uses the flash-attn CuTe DSL kernels "
+        "on the same paged cache and supports SM90 only.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
