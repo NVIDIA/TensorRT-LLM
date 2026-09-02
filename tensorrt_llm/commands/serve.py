@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import contextlib
 import gc
 import importlib
 import inspect
@@ -14,7 +15,8 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
+from typing import (Any, ContextManager, Dict, NamedTuple, Optional, Sequence,
+                    Set)
 
 import click
 import torch
@@ -38,7 +40,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig,
+                                          MultimodalConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -514,6 +517,36 @@ def _terminate_attached_frontends(children: list) -> None:
             child.kill()
 
 
+def _provision_kv_connector_pool(llm_args: dict,
+                                 owns_engine: bool = True) -> ContextManager:
+    """Bring up the shared cache a KV connector needs, for its lifetime.
+
+    Connectors backed by a cluster-wide pool need it reachable before any rank
+    opens a handle to it, and the ranks are spawned by the LLM constructor.
+    Entering this around that construction is what makes the pool part of
+    `trtllm-serve` bringup rather than something a launch script has to
+    arrange; a deployment that arranges it anyway is detected and left alone.
+
+    Only the process that owns the engine provisions anything: an attached
+    frontend re-execs this command line but shares the launcher's executor,
+    so it would otherwise stand up a second, private pool.
+    """
+    if not owns_engine:
+        return contextlib.nullcontext()
+
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import \
+        maybe_provision_pool
+
+    connector_config = llm_args.get("kv_connector_config")
+    if isinstance(connector_config, dict):
+        # A YAML config section arrives here unvalidated. Coerce it now, since
+        # the pool has to be described before the LLM constructor would do it,
+        # and hand the validated model on so it is not parsed twice.
+        connector_config = KvCacheConnectorConfig(**connector_config)
+        llm_args["kv_connector_config"] = connector_config
+    return maybe_provision_pool(connector_config)
+
+
 def launch_server(
         host: str,
         port: int,
@@ -570,53 +603,55 @@ def launch_server(
             raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
                                f"Port holder(s): {holder}")
 
-        if backend == 'pytorch':
-            llm_args.pop("build_config", None)
-            llm = PyTorchLLM(**llm_args)
-        elif backend == '_autodeploy':
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+        with _provision_kv_connector_pool(
+                llm_args, owns_engine=not multi_frontend.is_attached_frontend):
+            if backend == 'pytorch':
+                llm_args.pop("build_config", None)
+                llm = PyTorchLLM(**llm_args)
+            elif backend == '_autodeploy':
+                from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 
-            # AutoDeploy does not support build_config
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
-        else:
-            raise click.BadParameter(
-                f"{backend} is not a known backend, check help for available options.",
-                param_hint="backend")
+                # AutoDeploy does not support build_config
+                llm_args.pop("build_config", None)
+                llm = AutoDeployLLM(**llm_args)
+            else:
+                raise click.BadParameter(
+                    f"{backend} is not a known backend, check help for available options.",
+                    param_hint="backend")
 
-        # The finally below is the cleanup boundary for the attached
-        # frontends: it must cover everything from their spawn through
-        # server construction, middleware registration, and runtime, or a
-        # failure in between leaks the child processes.
-        frontend_children = []
-        try:
-            if multi_frontend.is_launcher:
-                frontend_children = _spawn_attached_frontends(
-                    llm, multi_frontend.num_frontends)
+            # The finally below is the cleanup boundary for the attached
+            # frontends: it must cover everything from their spawn through
+            # server construction, middleware registration, and runtime, or a
+            # failure in between leaks the child processes.
+            frontend_children = []
+            try:
+                if multi_frontend.is_launcher:
+                    frontend_children = _spawn_attached_frontends(
+                        llm, multi_frontend.num_frontends)
 
-            server = OpenAIServer(
-                generator=llm,
-                model=model,
-                tool_parser=tool_parser,
-                server_role=server_role,
-                metadata_server_cfg=metadata_server_cfg,
-                disagg_cluster_config=disagg_cluster_config,
-                multimodal_server_config=multimodal_server_config,
-                chat_template=chat_template,
-                allow_request_chat_template=allow_request_chat_template,
-                input_processor_workers=num_input_processor_workers,
-                media_load_workers=num_media_load_workers)
-            _apply_fastapi_middlewares(server.app, middleware)
+                server = OpenAIServer(
+                    generator=llm,
+                    model=model,
+                    tool_parser=tool_parser,
+                    server_role=server_role,
+                    metadata_server_cfg=metadata_server_cfg,
+                    disagg_cluster_config=disagg_cluster_config,
+                    multimodal_server_config=multimodal_server_config,
+                    chat_template=chat_template,
+                    allow_request_chat_template=allow_request_chat_template,
+                    input_processor_workers=num_input_processor_workers,
+                    media_load_workers=num_media_load_workers)
+                _apply_fastapi_middlewares(server.app, middleware)
 
-            # Optionally disable GC (default: not disabled)
-            if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-                gc.disable()
+                # Optionally disable GC (default: not disabled)
+                if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+                    gc.disable()
 
-            _signal_frontend_ready(multi_frontend)
-            uvloop.run(server(host, port, sockets=[s]))
-        finally:
-            if frontend_children:
-                _terminate_attached_frontends(frontend_children)
+                _signal_frontend_ready(multi_frontend)
+                uvloop.run(server(host, port, sockets=[s]))
+            finally:
+                if frontend_children:
+                    _terminate_attached_frontends(frontend_children)
 
 
 def launch_grpc_server(host: str,
@@ -739,7 +774,8 @@ def launch_grpc_server(host: str,
 
             logger.info("Shutdown complete")
 
-    uvloop.run(serve_grpc_async())
+    with _provision_kv_connector_pool(llm_args):
+        uvloop.run(serve_grpc_async())
 
 
 def launch_mm_encoder_server(

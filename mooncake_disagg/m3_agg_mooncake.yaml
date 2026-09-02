@@ -87,3 +87,23 @@ enable_attention_dp: false
 
 kv_connector_config:
     connector: mooncake-store
+
+    # Aggregated means one engine, which is the only shape a server-owned
+    # master is right for: it dies with the server, so nothing else can be
+    # sharing the pool and nothing can expect it to survive a restart. Point
+    # master_server_address at a master of its own for either of those.
+    #
+    # An inherited MOONCAKE_CONFIG_PATH wins over this block, so the SLURM
+    # harness keeps naming its own pool.
+    mooncake_store:
+        launch_master: true
+        # TCP removes RDMA from the variable list at the cost of any
+        # performance conclusion. Set protocol: rdma with a device_name from
+        # ibv_devinfo for a run worth quoting.
+        protocol: tcp
+        device_name: ""
+        # Contributed per worker process, so the pool is this times the world
+        # size. Sized for the working set, not for what the node can spare:
+        # by ~85-90% full the master evicts and the hit rate follows it down.
+        global_segment_size: 160GiB
+        local_buffer_size: 4GiB

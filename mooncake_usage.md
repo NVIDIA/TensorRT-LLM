@@ -41,15 +41,39 @@ mentions `mooncake-store`. Images built from this branch have it baked in.
 ## 2. Configure
 
 A `mooncake_master` process must be reachable, and every worker needs
-`MOONCAKE_CONFIG_PATH` pointing at a JSON client config naming it. The SLURM
-harness starts the master and writes that JSON per job; outside SLURM, see
-§4 of the runbook.
+`MOONCAKE_CONFIG_PATH` pointing at a JSON client config naming it.
+
+Three ways to get there, in increasing order of how much you have to arrange:
+
+| Deployment | Master |
+|---|---|
+| One `trtllm-serve`, own pool | `mooncake_store: {launch_master: true}` — the server starts it |
+| Several engines, or a pool that outlives them | `mooncake_store: {master_server_address: host:50051}` — a master you run |
+| SLURM benchmark harness | Nothing: `disaggr_torch.slurm` starts the master and writes the JSON per job |
+
+The first two make `trtllm-serve` render the client config and export
+`MOONCAKE_CONFIG_PATH` itself. An inherited `MOONCAKE_CONFIG_PATH` wins over
+both and says so in the log, which is why the harness path is unaffected.
+`mooncake_disagg/README.md` §4 covers running a master as its own SLURM job.
+
+A launched master dies with the server, so use it only for a single engine:
+two context servers that each launch one get two disjoint pools, and the
+survival-across-restart case is impossible by construction.
+
+Set `TRTLLM_MOONCAKE_RUN_DIR` to keep the generated JSON and the master's log,
+which otherwise sit in a temporary directory that shutdown removes.
+`TRTLLM_MOONCAKE_MASTER_TIMEOUT` (default 60s) bounds the wait for the port;
+that wait is also what turns an unreachable external master from a failure in
+every rank after the model loads into one line before it starts.
 
 Put the connector on the **context** workers only:
 
 ```yaml
 kv_connector_config:
   connector: mooncake-store
+  mooncake_store:                 # omit when an orchestrator sets
+    launch_master: true           # MOONCAKE_CONFIG_PATH for you
+    protocol: tcp                 # rdma with a device_name for real numbers
 kv_cache_config:
   use_kv_cache_manager_v2: true   # required: only V2 describes its pools
   enable_block_reuse: true
@@ -120,7 +144,9 @@ have aborted startup).
 Then check that the pool spans the hosts you expect.
 `disaggr_torch.slurm` writes the per-segment breakdown to
 `<log_dir>/9_mooncake_summary.log`; a single host means a prefill-only pool.
-Pool occupancy and eviction come from `<log_dir>/2_mooncake_master.log`.
+Pool occupancy and eviction come from `<log_dir>/2_mooncake_master.log`, or
+from `$TRTLLM_MOONCAKE_RUN_DIR/mooncake_master.log` when `trtllm-serve`
+launched the master — the startup line reports the path either way.
 
 **Which reuse number counts store hits:** per-request stats
 (`reused_blocks_per_request`, `kv_cache_hit_rate_per_request`) **do**;

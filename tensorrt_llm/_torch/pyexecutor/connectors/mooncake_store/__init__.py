@@ -34,6 +34,11 @@ Enable it with::
 
 with ``MOONCAKE_CONFIG_PATH`` pointing at a Mooncake JSON config.
 
+Describing the pool in ``KvCacheConnectorConfig.mooncake_store`` instead lets
+``trtllm-serve`` provision it during bringup -- resolving or launching the
+master and writing that JSON itself -- so no external script has to. See
+``master.py``.
+
 By default the KV pools themselves are registered with Mooncake, so the store
 reads and writes device memory and no copy is added. That needs the HCA to be
 able to pin GPU pages -- GPUDirect RDMA, through ``nvidia_peermem`` or dma-buf.
@@ -45,6 +50,7 @@ bytes are the same either way, so the two modes can share a pool.
 """
 
 from .config import MooncakeStoreConnectorConfig, StoreRole
+from .master import maybe_provision_pool, provision_pool
 from .scheduler import MooncakeStoreConnectorScheduler
 from .worker import MooncakeStoreConnectorWorker
 
@@ -53,4 +59,6 @@ __all__ = [
     "MooncakeStoreConnectorScheduler",
     "MooncakeStoreConnectorWorker",
     "StoreRole",
+    "maybe_provision_pool",
+    "provision_pool",
 ]

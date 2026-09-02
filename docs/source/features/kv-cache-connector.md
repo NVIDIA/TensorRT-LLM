@@ -108,12 +108,29 @@ This is a **different component** from the Mooncake transfer engine that the C++
 
 * `KVCacheManagerV2` (`kv_cache_config.use_kv_cache_manager_v2: true`), since that is the manager that can describe its pools through `register_kv_cache_layout`.
 * The Mooncake Python bindings: `pip install mooncake-transfer-engine`. These are installed in the release container; the source build of the C++ transfer engine does not provide them.
-* A running Mooncake master (and metadata server, unless using `P2PHANDSHAKE`). See the [Mooncake documentation](https://kvcache-ai.github.io/Mooncake/).
+* A reachable Mooncake master (and metadata server, unless using `P2PHANDSHAKE`). See the [Mooncake documentation](https://kvcache-ai.github.io/Mooncake/). `trtllm-serve` can start one for a single engine; see below.
 * GPU-only KV cache tiers: set `kv_cache_config.host_cache_size: 0` and `disk_cache_size: 0`. A page evicted to another tier has its GPU slot reassigned, which would invalidate the addresses registered with the store.
 
 #### Configuration
 
-Topology comes from a JSON file named by `MOONCAKE_CONFIG_PATH`, using the same schema as the vLLM Mooncake store connector so one deployment can point both engines at the same pool:
+Describe the pool in `kv_connector_config.mooncake_store` and `trtllm-serve` provisions it during bringup: it resolves the master, renders the client config, and exports `MOONCAKE_CONFIG_PATH` before the ranks that open store handles are spawned.
+
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    master_server_address: 10.0.0.1:50051   # a master with its own lifetime
+    protocol: rdma
+    device_name: mlx5_0
+    global_segment_size: 32GiB
+    local_buffer_size: 1GiB
+```
+
+Replacing `master_server_address` with `launch_master: true` makes the server start a `mooncake_master` itself and use it, so a single-instance deployment needs nothing prepared outside `trtllm-serve`. **That master lives and dies with the server**, which makes it wrong for anything else: several engines that should share one pool would each get their own, and a pool meant to survive a restart cannot be owned by the thing restarting. Those deployments run a master with its own lifetime and name it in `master_server_address`.
+
+`TRTLLM_MOONCAKE_MASTER_BINARY` overrides the binary a launched master runs, and `TRTLLM_MOONCAKE_MASTER_TIMEOUT` (default 60s) how long startup waits for any master to accept connections -- reaching a master that is not there otherwise fails inside every rank after the model has loaded. Set `TRTLLM_MOONCAKE_RUN_DIR` to keep the generated client config and the master's log, which are otherwise in a temporary directory removed at shutdown.
+
+Topology can equally come from a JSON file named by `MOONCAKE_CONFIG_PATH`, using the same schema as the vLLM Mooncake store connector so one deployment can point both engines at the same pool:
 
 ```json
 {
@@ -126,7 +143,9 @@ Topology comes from a JSON file named by `MOONCAKE_CONFIG_PATH`, using the same 
 }
 ```
 
-Two further settings are TensorRT-LLM's rather than Mooncake's, and are read from the environment because `KvCacheConnectorConfig` carries no free-form dictionary:
+An inherited `MOONCAKE_CONFIG_PATH` wins over `mooncake_store` and is logged as doing so, so an orchestrator that already provisions the pool -- as the SLURM benchmark harness does -- keeps working unchanged.
+
+Three further settings are TensorRT-LLM's rather than Mooncake's, and stay in the environment because they are per process rather than per pool:
 
 | Variable | Default | Meaning |
 |---|---|---|

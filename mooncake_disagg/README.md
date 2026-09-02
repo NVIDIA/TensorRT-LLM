@@ -323,6 +323,15 @@ reports on the same line.
 `master_server_address` is mandatory, so a master must exist and be reachable
 from every worker.
 
+**Outside SLURM you can skip this section too.** A worker config carrying
+`kv_connector_config.mooncake_store` makes `trtllm-serve` provision the pool
+during its own bringup — `launch_master: true` starts a master for that server
+alone, `master_server_address` joins one that already exists — and write the
+client config itself. That covers aggregated and single-instance runs, which is
+what `m3_agg_mooncake.yaml` now does; `mooncake_usage.md` §2 has the table. The
+rest of this section is about the master the experiments below need, which
+outlives any one server and therefore cannot be owned by one.
+
 **For a single-job experiment you can skip this section.**
 `disaggr_torch.slurm` now starts a `mooncake_master` on the first node of the
 allocation, waits for its port to accept connections, and writes
