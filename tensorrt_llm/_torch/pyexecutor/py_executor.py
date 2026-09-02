@@ -43,7 +43,8 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
+from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType, PeftCacheConfig,
+                                          WaitingQueuePolicy)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
@@ -51,6 +52,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
 
+from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.executor.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.executor.pp_termination import DisaggPPTerminationHandler
@@ -69,7 +71,8 @@ from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
-from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
+from .executor_request_queue import (ExecutorRequestQueue,
+                                     RequestAdmissionState, RequestQueueItem)
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
@@ -104,6 +107,8 @@ from .scheduler.adp_router import ADPRouter
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
+
+    from ..moe.fused_moe.communication.base import CheckpointableCommunication
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -234,23 +239,16 @@ def _recv_sleep_wakeup_ack_until(comm,
             if (expected_op_id is not None
                     and ack.get("op_id") != expected_op_id):
                 logger.warning(
-                    "Ignoring stale sleep/wakeup ACK from rank %d for op_id=%s "
-                    "(expected op_id=%s).",
-                    source,
-                    ack.get("op_id"),
-                    expected_op_id,
+                    f"Ignoring stale sleep/wakeup ACK from rank {source} for "
+                    f"op_id={ack.get('op_id')} (expected op_id={expected_op_id})."
                 )
                 continue
             ack_phase = ack.get("phase")
             if (expected_phase is not None and ack_phase is not None
                     and ack_phase != expected_phase):
                 logger.warning(
-                    "Ignoring stale sleep/wakeup ACK from rank %d for phase=%s "
-                    "(expected phase=%s).",
-                    source,
-                    ack_phase,
-                    expected_phase,
-                )
+                    f"Ignoring stale sleep/wakeup ACK from rank {source} for "
+                    f"phase={ack_phase} (expected phase={expected_phase}).")
                 continue
             return ack
         if time.monotonic() >= deadline:
@@ -658,6 +656,7 @@ class PyExecutor:
         # responses and flushing them at a synchronised point in the executor
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
+        self._pending_ctx_transfer_failures: set[int] = set()
         # Requests with a buffered terminal response are terminated only after
         # the synchronized flush has published that response.  This preserves
         # queue-backed client delivery while retaining normal termination as
@@ -692,6 +691,8 @@ class PyExecutor:
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
+        self._iter_adp_dummy_ctx_tokens = 0
+        self._iter_adp_dummy_gen_tokens = 0
         self._configure_benchmark_req_queues_size()
         # Deadline state for the benchmark-disagg fill gate's retry loop.
         # None means "not currently stalled"; progress resets it.
@@ -1373,10 +1374,8 @@ class PyExecutor:
             return
 
         if self.dist.rank == 0:
-            logger.info(
-                "Sending shutdown to %d sleep/wakeup listener thread(s).",
-                self.dist.world_size - 1,
-            )
+            logger.info(f"Sending shutdown to {self.dist.world_size - 1} "
+                        "sleep/wakeup listener thread(s).")
             shutdown_ack_deadline = (time.monotonic() +
                                      _SLEEP_WAKEUP_ACK_TIMEOUT_S)
             shutdown_errors = []
@@ -1397,7 +1396,7 @@ class PyExecutor:
                         f"rank {dest} shutdown send failed: {exc}")
                     logger.warning(
                         "Failed to send sleep/wakeup listener shutdown to "
-                        "rank %d: %s", dest, exc)
+                        f"rank {dest}: {exc}")
             for src in shutdown_ranks:
                 try:
                     ack = _recv_sleep_wakeup_ack_until(self._sleep_wakeup_comm,
@@ -1408,7 +1407,7 @@ class PyExecutor:
                         f"rank {src} shutdown ACK recv failed: {exc}")
                     logger.warning(
                         "Failed to receive sleep/wakeup listener shutdown ACK "
-                        "from rank %d: %s", src, exc)
+                        f"from rank {src}: {exc}")
                     continue
                 if ack.get("status") != "ok":
                     shutdown_errors.append(
@@ -1416,18 +1415,16 @@ class PyExecutor:
                         or f"rank {src} returned unknown shutdown ACK")
             if shutdown_errors:
                 logger.warning(
-                    "Sleep/wakeup listener shutdown completed with errors: %s",
-                    "; ".join(shutdown_errors))
+                    "Sleep/wakeup listener shutdown completed with errors: "
+                    f"{'; '.join(shutdown_errors)}")
         elif self._sleep_wakeup_listener_thread is not None:
             self._sleep_wakeup_listener_thread.join(
                 timeout=_SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S)
             if self._sleep_wakeup_listener_thread.is_alive():
                 logger.warning(
-                    "Sleep/wakeup listener thread did not exit within %.1f "
-                    "seconds on rank %d.",
-                    _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S,
-                    self.dist.rank,
-                )
+                    "Sleep/wakeup listener thread did not exit within "
+                    f"{_SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S:.1f} seconds on "
+                    f"rank {self.dist.rank}.")
 
     def _record_sleep_wakeup_abort(self, control_id: str,
                                    error_msg: str) -> None:
@@ -1574,6 +1571,35 @@ class PyExecutor:
         Indicates if the current process is allowed to enqueue requests
         """
         return self.executor_request_queue.can_enqueue_request()
+
+    def begin_sleep_transition(self, tags: list[ExecutorMemoryType]) -> None:
+        self.executor_request_queue.begin_sleep_transition(tag.value
+                                                           for tag in tags)
+
+    def complete_sleep_transition(self) -> None:
+        self.executor_request_queue.complete_sleep_transition()
+
+    def abort_sleep_transition(self) -> None:
+        self.executor_request_queue.abort_sleep_transition()
+
+    def begin_wakeup_transition(self, tags: list[ExecutorMemoryType]) -> None:
+        self.executor_request_queue.begin_wakeup_transition(tag.value
+                                                            for tag in tags)
+
+    def complete_wakeup_transition(self) -> None:
+        self.executor_request_queue.complete_wakeup_transition()
+
+    def abort_wakeup_transition(self) -> None:
+        self.executor_request_queue.abort_wakeup_transition()
+
+    def fail_sleep_wakeup_transition(self) -> None:
+        self.executor_request_queue.fail_sleep_wakeup_transition()
+
+    def get_request_admission_state(self) -> RequestAdmissionState:
+        return self.executor_request_queue.get_admission_state()
+
+    def can_shutdown(self) -> bool:
+        return self.executor_request_queue.can_enqueue_control_request()
 
     def get_latest_iteration_stats(self):
         """
@@ -1783,6 +1809,8 @@ class PyExecutor:
                         f"global_rank = {self.global_rank}, "
                         f"rank = {self.dist.rank}, "
                         f"num_scheduled_requests = {self.num_scheduled_requests}, "
+                        f"adp_dummy_ctx_tokens = {self._iter_adp_dummy_ctx_tokens}, "
+                        f"adp_dummy_gen_tokens = {self._iter_adp_dummy_gen_tokens}, "
                         f"kv_cache_util = {kv_util_str}, "
                         f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
                         f"{self.num_fetch_requests}, "
@@ -1791,6 +1819,11 @@ class PyExecutor:
                         f"timestamp = {formatted_timestamp}, "
                         f"states = {self.model_engine.iter_states}")
 
+            # profile_step runs at the start of each executor loop after
+            # logging the preceding loop. Clear the counters before the next
+            # batch records its ADP dummy work.
+            self._iter_adp_dummy_ctx_tokens = 0
+            self._iter_adp_dummy_gen_tokens = 0
             it += 1
 
             if (self.iter_counter in self.profile_start_iters
@@ -3045,8 +3078,8 @@ class PyExecutor:
                                                    tag=_SleepWakeupTag.ACTION)
                 if msg.get("action") == _SleepWakeupAction.SHUTDOWN:
                     logger.debug(
-                        "Sleep/wakeup listener (rank %d): received shutdown, "
-                        "exiting.", self.dist.rank)
+                        f"Sleep/wakeup listener (rank {self.dist.rank}): "
+                        "received shutdown, exiting.")
                     self._sleep_wakeup_comm.send(
                         {
                             "status": "ok",
@@ -3062,7 +3095,9 @@ class PyExecutor:
                 action = msg.get("action", "<unknown>")
                 op_id = msg.get("op_id")
                 error_msg = None
+                abort_acknowledged = False
                 release_control_request = True
+                has_mnnvl_resources = False
                 try:
                     # Decode tags inside the try so KeyError / ValueError from
                     # a malformed message still results in an error ACK being
@@ -3090,11 +3125,14 @@ class PyExecutor:
                                                     None)
                         if op_id is None:
                             release_control_request = False
-                        elif (not self.control_request_barrier.is_set()
-                              or active_control_id != op_id):
-                            self._record_sleep_wakeup_abort(op_id, error_msg)
-                            release_control_request = False
-                        logger.warning("Sleep/wakeup listener: %s", error_msg)
+                        else:
+                            if (not self.control_request_barrier.is_set()
+                                    or active_control_id != op_id):
+                                self._record_sleep_wakeup_abort(
+                                    op_id, error_msg)
+                                release_control_request = False
+                            abort_acknowledged = True
+                        logger.warning(f"Sleep/wakeup listener: {error_msg}")
                     elif action in (_SleepWakeupAction.PREPARE,
                                     _SleepWakeupAction.COMMIT,
                                     _SleepWakeupAction.SLEEP,
@@ -3107,15 +3145,19 @@ class PyExecutor:
                                 f"stale control message for op_id={op_id}; "
                                 f"active control_id={active_control_id}")
                             release_control_request = False
-                            logger.warning("Sleep/wakeup listener: %s",
-                                           error_msg)
+                            logger.warning(
+                                f"Sleep/wakeup listener: {error_msg}")
                         else:
                             torch.cuda.synchronize()
                             if action == _SleepWakeupAction.PREPARE:
                                 # Prepared means this rank is quiesced and
                                 # ready to commit, but VMM state is unchanged.
+                                has_mnnvl_resources = (
+                                    self._has_mnnvl_checkpoint_resources(tags))
                                 release_control_request = False
                             elif target_action == _SleepWakeupAction.SLEEP:
+                                self._run_mnnvl_checkpoint_resources(
+                                    target_action, tags)
                                 release_with_tag(*tags)
                                 torch.cuda.synchronize()
                                 gc.collect()
@@ -3123,23 +3165,23 @@ class PyExecutor:
                             elif target_action == _SleepWakeupAction.WAKEUP:
                                 materialize_with_tag(*tags)
                                 torch.cuda.synchronize()
+                                self._run_mnnvl_checkpoint_resources(
+                                    target_action, tags)
                             else:
                                 error_msg = (
                                     f"unknown target action '{target_action}'")
                                 logger.warning(
-                                    "Sleep/wakeup listener: %s, ignoring.",
-                                    error_msg)
+                                    f"Sleep/wakeup listener: {error_msg}, ignoring."
+                                )
                     else:
                         error_msg = f"unknown action '{action}'"
-                        logger.warning("Sleep/wakeup listener: %s, ignoring.",
-                                       error_msg)
+                        logger.warning(
+                            f"Sleep/wakeup listener: {error_msg}, ignoring.")
                 except (KeyError, TypeError, ValueError, RuntimeError,
-                        torch.OutOfMemoryError) as exc:
+                        TimeoutError, torch.OutOfMemoryError) as exc:
                     error_msg = (f"rank {self.dist.rank} '{action}' failed: "
                                  f"{exc}\n{traceback.format_exc()}")
-                    logger.error("Sleep/wakeup listener: error executing '%s':",
-                                 action,
-                                 exc_info=True)
+                    logger.error(f"Sleep/wakeup listener: {error_msg}")
                 finally:
                     # Always ACK so rank-0 does not deadlock; carry error
                     # details so rank-0 can raise after all ranks respond.
@@ -3151,14 +3193,9 @@ class PyExecutor:
                         exc = sys.exc_info()[1]
                         error_msg = (
                             f"rank {self.dist.rank} '{action}' failed with "
-                            f"uncaught {type(exc).__name__}: {exc!r}")
-                        logger.error(
-                            "Sleep/wakeup listener: uncaught exception on "
-                            "rank %d during '%s':",
-                            self.dist.rank,
-                            action,
-                            exc_info=True,
-                        )
+                            f"uncaught {type(exc).__name__}: {exc!r}\n"
+                            f"{traceback.format_exc()}")
+                        logger.error(f"Sleep/wakeup listener: {error_msg}")
                     # Unblock the executor loop that is waiting in
                     # _handle_control_request().  Clear control_request_barrier
                     # first so that it is clean for the next sleep/wakeup cycle
@@ -3172,18 +3209,77 @@ class PyExecutor:
                     # exiting control_action() and broadcasting new requests
                     # before our executor loop has cleared its control barrier
                     # and is ready to participate in the next collective.
+                    ack_error = None if abort_acknowledged else error_msg
+                    ack = {
+                        "status": "ok" if ack_error is None else "error",
+                        "error": ack_error,
+                        "op_id": op_id,
+                        "phase": action,
+                        "has_mnnvl_resources": has_mnnvl_resources,
+                    }
+                    if abort_acknowledged:
+                        ack["reason"] = error_msg
                     self._sleep_wakeup_comm.send(
-                        {
-                            "status": "ok" if error_msg is None else "error",
-                            "error": error_msg,
-                            "op_id": op_id,
-                            "phase": action,
-                        },
+                        ack,
                         dest=0,
                         tag=_SleepWakeupTag.ACK,
                     )
         finally:
             set_thread_local_mpi_comm(None)
+
+    def _mnnvl_checkpoint_resources(
+        self,
+        tags: list[ExecutorMemoryType],
+    ) -> list["CheckpointableCommunication"]:
+        """Return unique native MNNVL MoE resources selected by engine tags."""
+        from tensorrt_llm._torch.moe.fused_moe.communication.base import \
+            CheckpointableCommunication
+
+        selected_engines = []
+        if ExecutorMemoryType.MODEL_ENGINE_MAIN in tags:
+            selected_engines.append(self.model_engine)
+        if ExecutorMemoryType.MODEL_ENGINE_DRAFT in tags and self.draft_model_engine is not None:
+            selected_engines.append(self.draft_model_engine)
+
+        resources: list[CheckpointableCommunication] = []
+        seen = set()
+        for engine in selected_engines:
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                resource = getattr(module, "comm", None)
+                if not isinstance(resource, CheckpointableCommunication):
+                    continue
+                key = resource.checkpoint_resource_key()
+                if key in seen:
+                    continue
+                seen.add(key)
+                resources.append(resource)
+        return resources
+
+    def _has_mnnvl_checkpoint_resources(
+        self,
+        tags: list[ExecutorMemoryType],
+    ) -> bool:
+        return bool(self._mnnvl_checkpoint_resources(tags))
+
+    def _run_mnnvl_checkpoint_resources(
+        self,
+        action: _SleepWakeupAction,
+        tags: list[ExecutorMemoryType],
+    ) -> None:
+        """Execute process-local native MNNVL hooks while the engine is parked."""
+        resources = self._mnnvl_checkpoint_resources(tags)
+        if action == _SleepWakeupAction.SLEEP:
+            for resource in resources:
+                resource.checkpoint_prepare()
+            return
+        if action == _SleepWakeupAction.WAKEUP:
+            for resource in resources:
+                resource.checkpoint_restore()
+            return
+        raise ValueError(f"unknown MNNVL checkpoint action '{action}'")
 
     def _ring_broadcast_sample_state(
         self,
@@ -4087,6 +4183,15 @@ class PyExecutor:
         if not self.kv_cache_transceiver:
             return
 
+        pending_ids = getattr(self, "_pending_ctx_transfer_failures", set())
+        pending_requests = ([
+            request for request in self.active_requests
+            if get_unique_rid(request) in pending_ids
+        ] if pending_ids else [])
+        pending_ids.clear()
+        for request in pending_requests:
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
+
         if self._is_disagg_inflight_cancel_active():
             local_poisoned = self.kv_cache_transceiver.has_poisoned_transfer_buffer(
             )
@@ -4108,6 +4213,8 @@ class PyExecutor:
                 return
 
         if not (self.enable_attention_dp and self.dist.world_size != 1):
+            if pending_requests:
+                self._check_cache_transfer_errors("context requests")
             return
 
         local_error_requests = [
@@ -4511,10 +4618,8 @@ class PyExecutor:
         pending_abort = self._pop_sleep_wakeup_abort(control_id)
         if pending_abort is not None:
             logger.warning(
-                "[control_action] skipping aborted control request %s: %s",
-                control_id,
-                pending_abort,
-            )
+                f"[control_action] skipping aborted control request {control_id}: "
+                f"{pending_abort}")
             self.control_request_barrier.set()
             self.control_request_barrier.clear()
             self._active_control_id = None
@@ -5529,6 +5634,36 @@ class PyExecutor:
                     f"beam_width={request.py_beam_width}).")
 
     def _validate_request(self, request: LlmRequest):
+        # Validate context-side pipelined-transfer constraints.
+        disagg_params = request.py_disaggregated_params
+        if (self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.pipeline_transfer_enabled
+                and disagg_params is not None and request.llm_request_type
+                == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY):
+            runtime_features = getattr(self.model_engine,
+                                       "attn_runtime_features", None)
+            enable_chunked_prefill = (getattr(
+                runtime_features,
+                "chunked_prefill") if runtime_features is not None else getattr(
+                    self.model_engine, "_enable_chunked_prefill", False))
+            if not enable_chunked_prefill:
+                raise ValueError(
+                    "enable_chunked_prefill is required when enable_pipelined_transfer is set."
+                )
+            if request.py_beam_width != 1:
+                raise ValueError(
+                    "enable_pipelined_transfer requires beam_width == 1, got "
+                    f"{request.py_beam_width}.")
+            if disagg_params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST:
+                raise ValueError(
+                    "enable_pipelined_transfer requires "
+                    "schedule_style='generation_first' on the request.")
+            if self.dist.pp_size != 1:
+                raise ValueError(
+                    "enable_pipelined_transfer is not supported with "
+                    f"pipeline_parallel_size={self.dist.pp_size} on context workers."
+                )
+
         # Validate beam width
         sampling_config = request.sampling_config
         if sampling_config is not None:
@@ -6060,6 +6195,18 @@ class PyExecutor:
         num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
                                        for gen_req in generation_requests)
         return num_scheduled_ctx_tokens + num_scheduled_gen_tokens
+
+    @staticmethod
+    def _compute_adp_dummy_tokens(
+            scheduled_requests: ScheduledRequests) -> Tuple[int, int]:
+        """Return CTX and GEN compute tokens from attention-DP dummies."""
+        num_ctx_tokens = sum(req.context_chunk_size
+                             for req in scheduled_requests.context_requests
+                             if getattr(req, "is_attention_dp_dummy", False))
+        num_gen_tokens = sum(1 + get_draft_token_length(req)
+                             for req in scheduled_requests.generation_requests
+                             if getattr(req, "is_attention_dp_dummy", False))
+        return num_ctx_tokens, num_gen_tokens
 
     def _waiting_requests(self, context_requests: list[LlmRequest],
                           generation_requests: list[LlmRequest]):
@@ -6827,6 +6974,8 @@ class PyExecutor:
                     f"kv_transfer_timeout_ms={timeout_ms}ms")
                 req.py_kv_transfer_timed_out = True
 
+        # Context requests start their clock on the last chunk, which is also when
+        # they enter the transfer manager, so this covers the whole context side.
         for req in self.async_transfer_manager.requests_in_transfer().values():
             flag_if_kv_transfer_timed_out(req, "context")
 
@@ -6915,9 +7064,9 @@ class PyExecutor:
         """Check the full dummy allocation before entering rank-local code.
 
         V1's dummy allocator historically checked only that one block was
-        free. A context-side ADP dummy can be ``max_num_tokens`` long, while a
-        generation dummy also reserves draft tokens, so that check can still
-        let the C++ batch allocation fail after a peer rank has succeeded.
+        free. Generation dummies also reserve draft tokens, so that check can
+        still let the C++ batch allocation fail after a peer rank has
+        succeeded.
         """
         token_num = (token_nums[0] if token_nums is not None else 1 +
                      self.max_total_draft_tokens)
@@ -6985,9 +7134,9 @@ class PyExecutor:
                 has_ctx = True
             elif rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
                 has_gen = True
-        # Prefer the CTX role when both types are present this iteration: a CTX
-        # dummy is padded to max_num_tokens so idle ranks keep MoE all-to-all
-        # token counts comparable with ranks doing real context work.
+        # Prefer the CTX role when both types are present this iteration so the
+        # dummy follows the same request lifecycle as ranks doing real context
+        # work.
         if has_ctx:
             self._adp_dummy_is_gen = False
         elif has_gen:
@@ -6995,9 +7144,7 @@ class PyExecutor:
 
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
-        """
-        Pad with a generation dummy request, if required, to ensure every attention_dp rank has at least one active request.
-        """
+        """Pad an idle attention-DP rank with a role-matched dummy request."""
         if not self.enable_attention_dp:
             return
 
@@ -7051,25 +7198,13 @@ class PyExecutor:
 
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
         token_nums = None
-        if (not self._adp_dummy_is_gen and self.kv_cache_transceiver is not None
-                and self.max_num_tokens is not None):
-            # max_num_tokens is the aggregate per-iteration budget and can
-            # exceed the legal capacity of one sequence.
-            token_num = min(
-                self.max_num_tokens,
-                self.model_engine.max_num_tokens,
-                self.model_engine.max_seq_len,
-                self.kv_cache_manager.max_seq_len,
-            )
-            # One-engine speculative decoding appends extra KV tokens after
-            # add_sequence_batch(). Keep them in the same block count that
-            # the capacity scheduler reserves from the prompt length.
-            extra_kv_tokens = self.kv_cache_manager.num_extra_kv_tokens
-            tokens_per_block = self.kv_cache_manager.tokens_per_block
-            block_capacity = ((token_num + tokens_per_block - 1) //
-                              tokens_per_block) * tokens_per_block
-            token_num = max(1, min(token_num, block_capacity - extra_kv_tokens))
-            token_nums = [token_num]
+        if not self._adp_dummy_is_gen and self.kv_cache_transceiver is not None:
+            # The dummy only needs a non-empty context request to enter the
+            # context lifecycle and collectives. max_num_tokens is a batch-wide
+            # scheduling limit; using it as one synthetic prompt performs a
+            # full max-sized prefill on every idle ADP rank. Helix raises this
+            # minimum to two tokens in the KV manager and capacity check.
+            token_nums = [1]
 
         if not self._has_adp_dummy_kv_capacity(token_nums):
             logger.warning_once(
@@ -7519,22 +7654,42 @@ class PyExecutor:
         """Start async KV sends for finished context-only disagg requests."""
         if not self.kv_cache_transceiver:
             return
+        # Do not send more chunks after an in-flight cancellation.
+        cancel_pending_ids = set(getattr(self, "canceled_req_ids", ()))
         for req in scheduled_requests:
-            if req.is_context_only_request and (
-                    req.is_context_finished or req.is_finished_due_to_length
-            ) and not req.is_finished_due_to_cancellation:
-                # Forward is done for this request — release the
-                # IndexMapper slot so new requests can reuse it.
-                # KV blocks stay allocated for the upcoming transfer.
-                if hasattr(self.kv_cache_manager, 'release_index_slot'):
-                    self.kv_cache_manager.release_index_slot(req.py_request_id)
-                # Order is important here: we need to start the transfer before responding
-                # to make sure the blocks are stored for reuse before they are sent.
-                self.async_transfer_manager.start_transfer(req)
-                self.kv_cache_transceiver.respond_and_send_async(req)
+            if req.is_context_only_request and not req.is_finished_due_to_cancellation:
+                request_id = (req.parent_request_id
+                              if req.is_child else req.py_request_id)
+                if request_id in cancel_pending_ids:
+                    continue
+                if self.kv_cache_transceiver.has_retired_send_session(req):
+                    # The peer registration went away with the session, so
+                    # no further slice can land.
+                    continue
+                if req.is_context_finished or req.is_finished_due_to_length:
+                    # Forward is done for this request — release the
+                    # IndexMapper slot so new requests can reuse it.
+                    # KV blocks stay allocated for the upcoming transfer.
+                    if hasattr(self.kv_cache_manager, 'release_index_slot'):
+                        self.kv_cache_manager.release_index_slot(
+                            req.py_request_id)
+                    # Order matters: start_transfer commits the request's blocks to the reuse
+                    # tree and pins them, and must run before respond_and_send_async sends the
+                    # final KV slice and (for the Python transceiver) transitions the request toward completion.
+                    self.async_transfer_manager.start_transfer(req)
 
-                if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-                    req.py_kv_transfer_start_time = time.monotonic()
+                    # Send the monolithic slice or final pipelined chunk.
+                    self.kv_cache_transceiver.respond_and_send_async(req)
+
+                    if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+                        req.py_kv_transfer_start_time = time.monotonic()
+                elif (self.kv_cache_transceiver.pipeline_transfer_enabled
+                      and req.state != LlmRequestState.GENERATION_COMPLETE):
+                    # send intermediate chunk for pipelined transfer.
+                    # GENERATION_COMPLETE means an error path already failed
+                    # and freed this request; _update_request_states skips
+                    # those, so its chunk bounds are unset.
+                    self.kv_cache_transceiver.respond_and_send_async(req)
 
     def _save_kv_to_connector_async(
             self, scheduled_requests: List[LlmRequest]) -> None:
@@ -7607,8 +7762,9 @@ class PyExecutor:
         ctx_status = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
 
-        completed_req_ids = set(ctx_status.completed_request_ids) | set(
-            ctx_status.error_request_ids)
+        failed_req_ids = set(ctx_status.error_request_ids)
+        completed_req_ids = set(
+            ctx_status.completed_request_ids) | failed_req_ids
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
@@ -7616,12 +7772,17 @@ class PyExecutor:
         for request_id in completed_req_ids:
 
             if request_id not in requests_in_transfer:
-                logger.warning(
-                    f"Request {request_id} not found in transfer manager")
+                if request_id in failed_req_ids:
+                    self._pending_ctx_transfer_failures.add(request_id)
+                else:
+                    logger.warning(
+                        f"Request {request_id} not found in transfer manager")
                 continue
 
             request = requests_in_transfer[request_id]
-
+            if request_id in failed_req_ids:
+                # Past the context phase: writing the error state here is safe
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
             self._end_transfer_and_maybe_terminate(request)
 
         # The set of requests in transfer may have changed since we terminated some requests.
@@ -7734,6 +7895,10 @@ class PyExecutor:
 
         num_ctx_tokens = sum(req.context_chunk_size
                              for req in scheduled_requests.context_requests)
+        adp_dummy_ctx_tokens, adp_dummy_gen_tokens = \
+            self._compute_adp_dummy_tokens(scheduled_requests)
+        self._iter_adp_dummy_ctx_tokens += adp_dummy_ctx_tokens
+        self._iter_adp_dummy_gen_tokens += adp_dummy_gen_tokens
 
         @nvtx_range(
             f"[Executor] _forward_step {self.iter_counter}: {scheduled_requests.num_context_requests} ctx reqs, {num_ctx_tokens} ctx tokens, {scheduled_requests.num_generation_requests} gen reqs"
@@ -8174,11 +8339,19 @@ class PyExecutor:
         self.inflight_req_ids.erase(request_id)
 
     def _is_request_in_transmission(self, request) -> bool:
-        """Check if a request is currently in transmission state."""
-        return (request.state
-                == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        """Check if a request's KV cache may still be read by the fabric.
+
+        The request state only tracks the compute phase. Under pipelined
+        transfer a chunk can be in flight while the request is still being
+        prefilled, so the transceiver's own ownership record has to be
+        consulted as well.
+        """
+        if (request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
                 or request.state
-                == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
+                == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS):
+            return True
+        return (self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.has_inflight_transfer(request))
 
     def _try_cancel_request(self, request) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.

@@ -25,6 +25,8 @@ from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._torch.auto_deploy.llm_args import \
     LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
+    HfCheckpointLoader
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
@@ -87,6 +89,85 @@ def test_generation_config_auto_rejects_autodeploy() -> None:
     with pytest.raises(ValidationError,
                        match="AutoDeploy does not support generation_config"):
         AutoDeployLlmArgs(model=llama_model_path, generation_config="auto")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("policy",
+                         ["auto", "native", "rank_striped_read_ahead"])
+def test_checkpoint_io_policy_defaults_to_auto_and_accepts_supported_values(
+        policy: str) -> None:
+    assert TorchLlmArgs(model=llama_model_path).checkpoint_io_policy == "auto"
+    args = TorchLlmArgs(model=llama_model_path, checkpoint_io_policy=policy)
+    assert args.checkpoint_io_policy == policy
+    assert args.checkpoint_format == "HF"
+
+
+@pytest.mark.cpu_only
+def test_checkpoint_io_policy_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError, match="checkpoint_io_policy"):
+        TorchLlmArgs(model=llama_model_path, checkpoint_io_policy="unknown")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("model_kwargs", "expected"),
+    [
+        (None, False),
+        ({}, False),
+        ({
+            "unrelated_override": 1
+        }, False),
+        ({
+            "num_hidden_layers": 1
+        }, True),
+    ],
+)
+def test_is_partial_model_loading(model_kwargs: dict[str, Any] | None,
+                                  expected: bool) -> None:
+    args = TorchLlmArgs(model=llama_model_path, model_kwargs=model_kwargs)
+
+    assert args.is_partial_model_loading is expected
+    assert "is_partial_model_loading" not in args.model_dump()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {
+            "checkpoint_format": "MX"
+        },
+        {
+            "checkpoint_loader": HfCheckpointLoader()
+        },
+        {
+            "load_format": "dummy"
+        },
+    ],
+)
+def test_rank_striped_checkpoint_io_accepts_best_effort_config(
+        kwargs: dict[str, Any]) -> None:
+    args = TorchLlmArgs(
+        model=llama_model_path,
+        checkpoint_io_policy="rank_striped_read_ahead",
+        **kwargs,
+    )
+    assert args.checkpoint_io_policy == "rank_striped_read_ahead"
+
+
+@pytest.mark.cpu_only
+def test_rank_striped_checkpoint_io_warns_and_preserves_request_for_autodeploy(
+) -> None:
+    with patch.object(llm_args_mod.logger, "warning") as warning:
+        args = AutoDeployLlmArgs(
+            model=llama_model_path,
+            checkpoint_io_policy="rank_striped_read_ahead",
+        )
+    assert args.checkpoint_io_policy == "rank_striped_read_ahead"
+    serialized_args = args.model_dump()
+    assert serialized_args["checkpoint_io_policy"] == "rank_striped_read_ahead"
+    assert any("selected=native" in call.args[0]
+               for call in warning.call_args_list)
 
 
 @pytest.mark.cpu_only
@@ -3461,8 +3542,46 @@ class TestPydanticBestPractices:
 
 @pytest.mark.cpu_only
 def test_kv_cache_compression_config_dispatches_by_algorithm():
-    from tensorrt_llm.llmapi.llm_args import \
-        TriAttentionKvCacheCompressionConfig
+    from tensorrt_llm.llmapi.llm_args import (
+        ColdPageQuantizationCompressionConfig,
+        TriAttentionKvCacheCompressionConfig)
+
+    cold_config = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_compression_config={
+            "algorithm": "quantization_for_cold_page",
+            "quant": "nvfp4",
+        },
+    ).kv_cache_compression_config
+
+    assert isinstance(cold_config, ColdPageQuantizationCompressionConfig)
+    assert cold_config.model_dump() == {
+        "algorithm": "quantization_for_cold_page",
+        "quant": "nvfp4",
+        "scale_checkpoint_path": None,
+    }
+    assert not cold_config.changes_physical_kv_length
+    assert cold_config.supports_block_reuse()
+    assert cold_config.supports_speculative_decoding()
+
+    cold_config_with_scales = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_compression_config={
+            "algorithm": "quantization_for_cold_page",
+            "quant": "nvfp4",
+            "scale_checkpoint_path": "/tmp/nvfp4-kv-scales",
+        },
+    ).kv_cache_compression_config
+    assert cold_config_with_scales.scale_checkpoint_path == "/tmp/nvfp4-kv-scales"
+
+    with pytest.raises(ValidationError):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_compression_config={
+                "algorithm": "quantization_for_cold_page",
+                "quant": "fp8",
+            },
+        )
 
     config_dict = yaml.safe_load("""
 kv_cache_compression_config:

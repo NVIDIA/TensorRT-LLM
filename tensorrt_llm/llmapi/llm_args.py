@@ -3785,9 +3785,10 @@ class KvCacheCompressionConfig(StrictBaseModel):
     algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
 
     Kept separate from SparseAttentionConfig by design -- compression changes
-    which KV is stored, not the attention computation. The manager is registered
-    as a resource manager in create_py_executor (_util.py), like the KV cache
-    manager itself. Concrete algorithms subclass this and add their parameters.
+    which KV is stored, not the attention computation. Iteration-driven methods
+    use the resource-manager cycle; storage-bound managers provide a native
+    codec that KVCacheManagerV2 retains and invokes. Concrete algorithms
+    subclass this and add their parameters.
     """
 
     changes_physical_kv_length: ClassVar[bool] = False
@@ -3806,6 +3807,37 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
+_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY = TelemetryField.categorical(
+    "quantization_for_cold_page", "triattention")
+
+
+class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
+    """Quantize Host and Disk KV pages without changing the active GPU cache."""
+
+    algorithm: Literal["quantization_for_cold_page"] = Field(
+        default="quantization_for_cold_page",
+        telemetry=False,
+    )
+    quant: Literal["nvfp4"] = Field(
+        default="nvfp4",
+        description="Quantization format stored in the compressed cache tier.")
+    scale_checkpoint_path: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        telemetry=False,
+        description=
+        "Optional local ModelOpt NVFP4 checkpoint directory supplying per-layer "
+        "K/V global scales. Omit it to use identity global scales.")
+
+    def supports_block_reuse(self) -> bool:
+        """Block reuse is unchanged because token identity is preserved."""
+        return True
+
+    def supports_speculative_decoding(self) -> bool:
+        """Target and draft KVCMs encode their own cold pages independently."""
+        return True
+
+
 class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     """TriAttention KV-cache compression: periodic decode-time eviction.
 
@@ -3816,7 +3848,10 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
     changes_physical_kv_length: ClassVar[bool] = True
 
-    algorithm: Literal["triattention"] = "triattention"
+    algorithm: Literal["triattention"] = Field(
+        default="triattention",
+        telemetry=_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY,
+    )
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
         description=
@@ -3858,7 +3893,8 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
 
 KvCacheCompressionConfigType: TypeAlias = Annotated[
-    Union[TriAttentionKvCacheCompressionConfig],
+    Union[ColdPageQuantizationCompressionConfig,
+          TriAttentionKvCacheCompressionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -4486,6 +4522,16 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
     )
 
+    enable_pipelined_transfer: bool = Field(
+        default=False,
+        description=
+        "Transfer each completed prefill chunk's KV cache while later chunks "
+        "compute. Requires Python NIXL, generation-first scheduling, chunked "
+        "prefill, pipeline_parallel_size=1, context_parallel_size=1 on both "
+        "peers, beam_width=1, no bounce buffer or Mamba/hybrid cache, and block "
+        "reuse disabled or set to all_reusable. Invalid static settings fail at "
+        "startup; per-request constraints reject the request.")
+
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
 
@@ -4501,6 +4547,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         return "NIXL", None
 
     def _to_pybind(self):
+        # Python-transceiver-only option.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
@@ -5548,6 +5595,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
         status="prototype")
 
+    use_fine_grained_sync: bool = Field(
+        default=False,
+        description=
+        "Enable fine-grained synchronization for MoE kernels on SM107. The FC1 producer kernel signals "
+        "per-tile completion flags in device memory and the FC2 consumer kernel waits on them, so the "
+        "two GEMMs overlap instead of serializing at kernel launch boundaries.",
+        status="prototype")
+
     enable_layerwise_nvtx_marker: bool = Field(
         default=False,
         description="If true, enable layerwise nvtx marker.",
@@ -5614,6 +5669,31 @@ class TorchLlmArgs(BaseLlmArgs):
         "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
         status="prototype",
     )
+
+    checkpoint_io_policy: Literal[
+        "auto", "native", "rank_striped_read_ahead"] = Field(
+            default="auto",
+            description=
+            "Controls checkpoint storage I/O independently of checkpoint format. "
+            "'auto' selects rank-striped read-ahead for compatible built-in "
+            "PyTorch/HF loads and selects native I/O otherwise. "
+            "'native' preserves the existing loader. "
+            "'rank_striped_read_ahead' lets node-local ranks read disjoint "
+            "SafeTensors extents while native mapping, materialization, and H2D "
+            "continue. Incompatible configurations select native I/O before "
+            "optimized reader or collective setup. Runtime-ineligible loads fall "
+            "back to native before model mutation.",
+            status="prototype",
+            json_schema_extra={
+                "type": "Literal['auto', 'native', 'rank_striped_read_ahead']"
+            },
+        )
+
+    @property
+    def is_partial_model_loading(self) -> bool:
+        """Whether model overrides request loading only part of the model."""
+        return (self.model_kwargs is not None
+                and "num_hidden_layers" in self.model_kwargs)
 
     mx_config: ModelExpressConfig = Field(
         default_factory=ModelExpressConfig,
@@ -6255,6 +6335,20 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
+        return self
+
+    @model_validator(mode="after")
+    def warn_non_pytorch_checkpoint_io_policy_fallback(self) -> 'TorchLlmArgs':
+        # AutoDeploy does not construct a checkpoint loader. Preserve the
+        # requested policy for telemetry while reporting its native selection.
+        # PyTorch requests are resolved at loader construction, where the actual
+        # format and registered loader implementations are known.
+        if (self.checkpoint_io_policy == "rank_striped_read_ahead"
+                and self.backend != "pytorch"):
+            logger.warning(
+                "Checkpoint I/O policy resolved before loading: "
+                "requested=rank_striped_read_ahead, selected=native, "
+                "reason=rank-striped read-ahead requires the PyTorch backend.")
         return self
 
     @model_validator(mode="after")

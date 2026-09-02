@@ -296,59 +296,158 @@ def submitProfileGen(pipeline)
         Utils.exec(pipeline, timeout: false, numRetries: 2,
             script: Utils.sshUserCmd(remote, "\"mkdir -p ${ws}/builds ${ws}/runs\""))
 
-        // Download the tarball from Artifactory to the cluster frontend.
-        // curl (not wget): --speed-time/--speed-limit aborts a STALLED transfer
-        // (< ~10KB/s for 120s) and --retry restarts it, so a flaky cross-region
-        // link can't hang the job (Utils.exec runs with timeout:false). NO -C -:
-        // a resumed/appended transfer is a corruption vector; a clean restart on
-        // retry is safer. gzip -t verifies integrity so a truncated/corrupt
-        // download fails fast rather than poisoning the extract step.
+        // Download the build tarball (Artifactory) and, later, llvm-bolt (GitHub)
+        // to the cluster frontend. A single curl stream is throughput-capped by RTT
+        // on a high-latency cross-region link (one TCP window can't fill a fat, far
+        // pipe) -- in practice the llvm-bolt pull alone took ~15 min. aria2c would
+        // fix this with segmented range downloads but isn't installed on these
+        // clusters, so fetch_verified() does the same with stock tools only (curl +
+        // xargs + coreutils): HEAD-probe for size + range support, fan out PARTS
+        // ranged `curl -r` GETs via `xargs -P`, reassemble, verify. Falls back to a
+        // single-stream curl when the server doesn't advertise byte ranges or on
+        // ANY failure, so nothing regresses. Defined once here, reused for BOTH
+        // downloads. NO resume on retry (append is a corruption vector); the
+        // per-file verify (gzip -t / tar -tJf) catches truncation/corruption.
+        def boltFetchLib = '''
+            _verify_txz() { tar -tJf "$1" >/dev/null 2>&1; }
+            # _bolt_range_download URL DEST PARTS -> 0 if the whole file was fetched
+            # via parallel byte ranges (size-verified), else 1 (nothing usable).
+            _bolt_range_download() {
+                local url="$1" dest="$2" parts="$3"
+                local hdr total accept
+                # HEAD (not a ranged GET) so a server that ignores Range can't make
+                # us stream the whole file just to probe; -L follows the redirect to
+                # the storage/CDN backend; || true so a probe miss doesn't trip set -e.
+                hdr=$(curl -fsSL -I --retry 5 --retry-all-errors "$url" 2>/dev/null | tr -d '\\r' || true)
+                total=$(printf '%s\\n' "$hdr" | awk 'tolower($1)=="content-length:"{v=$2} END{print v}')
+                accept=$(printf '%s\\n' "$hdr" | awk 'tolower($1)=="accept-ranges:"{v=tolower($2)} END{print v}')
+                case "$total" in ''|*[!0-9]*) return 1 ;; esac
+                [ "$total" -gt 0 ] || return 1
+                [ "$accept" = "bytes" ] || return 1
+                local chunk=$(( (total + parts - 1) / parts ))
+                local ranges; ranges=$(mktemp)
+                local i start end
+                for i in $(seq 0 $((parts - 1))); do
+                    start=$(( i * chunk ))
+                    [ "$start" -ge "$total" ] && break
+                    end=$(( start + chunk - 1 ))
+                    [ "$end" -ge "$total" ] && end=$(( total - 1 ))
+                    printf '%s %s %s\\n' "$i" "$start" "$end" >> "$ranges"
+                done
+                # One ranged curl per chunk, PARTS at a time. $0/$1/$2 = i/start/end
+                # (xargs -n 3); URL/DEST come from the inline-exported environment.
+                if ! BOLT_FETCH_URL="$url" BOLT_FETCH_DEST="$dest" \\
+                     xargs -P "$parts" -n 3 bash -c '
+                         curl -fsSL --retry 10 --retry-all-errors --retry-delay 5 \\
+                              -r "$1-$2" -o "$BOLT_FETCH_DEST.part.$0" "$BOLT_FETCH_URL"
+                     ' < "$ranges"; then
+                    rm -f "$ranges" "$dest".part.*
+                    return 1
+                fi
+                : > "$dest"
+                while read -r i start end; do
+                    local part="$dest.part.$i"
+                    local want=$(( end - start + 1 ))
+                    [ -f "$part" ] || { rm -f "$ranges" "$dest".part.*; return 1; }
+                    local got; got=$(stat -c %s "$part" 2>/dev/null || echo 0)
+                    [ "$got" -eq "$want" ] || { rm -f "$ranges" "$dest".part.*; return 1; }
+                    cat "$part" >> "$dest"; rm -f "$part"
+                done < "$ranges"
+                rm -f "$ranges"
+                local final; final=$(stat -c %s "$dest" 2>/dev/null || echo 0)
+                [ "$final" -eq "$total" ] || return 1
+                return 0
+            }
+            # fetch_verified URL DEST VERIFY... : parallel fetch then `VERIFY DEST`;
+            # single-stream curl fallback on any failure. Reads PARTS (default 16).
+            fetch_verified() {
+                local url="$1" dest="$2"; shift 2
+                local parts="${PARTS:-16}"
+                if _bolt_range_download "$url" "$dest" "$parts" && "$@" "$dest"; then
+                    echo "[INFO] fetched via ${parts}-way parallel: $dest"
+                    return 0
+                fi
+                echo "[INFO] parallel fetch unavailable/failed; single-stream curl: $dest"
+                rm -f "$dest"
+                curl -fSL --retry 10 --retry-all-errors --retry-delay 15 \\
+                     --connect-timeout 60 --speed-time 120 --speed-limit 10000 \\
+                     -o "$dest" "$url" || { rm -f "$dest"; return 1; }
+                "$@" "$dest" || { echo "[ERROR] verification failed: $dest"; rm -f "$dest"; return 1; }
+                return 0
+            }
+        '''.stripIndent()
         def tarStage = """
+            URL='${llmTarfile}'
+            DEST='${ws}/builds/${BOLT_TARNAME}'
+            PARTS=16
+        """.stripIndent() + boltFetchLib + '''
             set -e
-            curl -fSL --retry 10 --retry-all-errors --retry-delay 15 \
-                 --connect-timeout 60 --speed-time 120 --speed-limit 10000 \
-                 -o ${ws}/builds/${BOLT_TARNAME} ${llmTarfile}
-            if ! gzip -t ${ws}/builds/${BOLT_TARNAME}; then
-                echo '[ERROR] downloaded tarball failed gzip -t (corrupt/truncated)'
-                rm -f ${ws}/builds/${BOLT_TARNAME}
-                exit 1
-            fi
-        """.stripIndent()
-        // bashWrappedRemoteCmd: not all clusters default to bash, so wrap the
-        // multi-line script instead of relying on the login shell.
-        Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, b64BashRemoteCmd(tarStage)))
-
-        // Extract the full source tree + wheel from the tarball (which packs the
-        // build commit's TensorRT-LLM/src). The perf harness runs from this
-        // checkout (jenkins/scripts/perf + tests/scripts/perf-sanity), and
-        // install_mode=wheel uses the bundled TensorRT-LLM/tensorrt_llm-*.whl;
-        // scripts/bolt (TOOLKIT_HOST for the merge job) lives under src/ too.
-        Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, "\"tar -xf ${ws}/builds/${BOLT_TARNAME} -C ${ws} TensorRT-LLM\""))
-
-        // Stage llvm-bolt ONCE here (shared ${ws}/builds/llvm), before the fan-out.
-        // The per-node instrument hook (perf_instrument_hook.sh, via BOLT_LLVM_DIR)
-        // and the merge job both reuse it, so no worker re-downloads llvm and
-        // parallel runs can't race extracting into the same dir.
+            fetch_verified "$URL" "$DEST" gzip -t
+        '''.stripIndent()
+        // Stage llvm-bolt into the shared ${ws}/builds/llvm (the per-node instrument
+        // hook via BOLT_LLVM_DIR and the merge job both reuse it). The GitHub
+        // download is amortized by a PERSISTENT version-keyed cache on lustre:
+        // llvm-bolt is pinned + immutable, so -- unlike the per-commit build tarball
+        // -- it's safe to cache forever. Pull from GitHub once per version/arch,
+        // then every later run just does a local lustre extract from the cached
+        // .tar.xz (no WAN). The one-time fetch reuses fetch_verified().
         def llvmArch = (TARGET_ARCH == AARCH64_TRIPLE) ? "ARM64" : "X64"
         def llvmVer  = "21.1.5"   // keep in sync with internal/slurm_merge.sh LLVM_BOLT_VERSION
         def llvmTb   = "LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz"
+        // Cache lives OUTSIDE the bolt-ci retention root (purged at depth 4 after 7
+        // days) so the per-run workspace reaper can't delete it.
+        def llvmCacheDir = "${scratch}/users/svc_tensorrt/bolt-cache/llvm"
         def llvmStage = """
+            LLVM_URL='https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/${llvmTb}'
+            LLVM_CACHE_DIR='${llvmCacheDir}'
+            LLVM_CACHE_TB='${llvmCacheDir}/${llvmTb}'
+            LLVM_DIR='${ws}/builds/llvm'
+            PARTS=16
+        """.stripIndent() + boltFetchLib + '''
             set -e
-            if [ ! -x ${ws}/builds/llvm/bin/llvm-bolt ]; then
-                echo '[INFO] staging llvm-bolt ${llvmVer} once (shared by all workloads)'
-                mkdir -p ${ws}/builds/llvm
-                curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
-                     -o /tmp/${llvmTb} https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/${llvmTb}
-                tar -xJf /tmp/${llvmTb} -C ${ws}/builds/llvm --strip-components=1
-                rm -f /tmp/${llvmTb}
+            if [ -x "$LLVM_DIR/bin/llvm-bolt" ]; then
+                echo '[INFO] llvm-bolt already staged this run'
             else
-                echo '[INFO] llvm-bolt already staged'
+                mkdir -p "$LLVM_DIR" "$LLVM_CACHE_DIR"
+                if [ -f "$LLVM_CACHE_TB" ] && tar -tJf "$LLVM_CACHE_TB" >/dev/null 2>&1; then
+                    echo "[INFO] llvm-bolt cache HIT: $LLVM_CACHE_TB"
+                else
+                    echo "[INFO] llvm-bolt cache MISS; one-time parallel fetch from GitHub"
+                    tmp=$(mktemp "$LLVM_CACHE_DIR/.llvm.XXXXXX")
+                    fetch_verified "$LLVM_URL" "$tmp" _verify_txz
+                    # Atomic publish on the same FS: concurrent first-runs may both
+                    # fetch, but rename is atomic so readers never see a partial file.
+                    mv -f "$tmp" "$LLVM_CACHE_TB"
+                fi
+                echo "[INFO] extracting llvm-bolt from cache -> $LLVM_DIR"
+                tar -xJf "$LLVM_CACHE_TB" -C "$LLVM_DIR" --strip-components=1
             fi
-        """.stripIndent()
-        Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, b64BashRemoteCmd(llvmStage)))
+        '''.stripIndent()
+
+        // Bootstrap SEQUENTIALLY, each its own stage() for per-phase Blue Ocean
+        // durations. Kept sequential rather than a second parallel{} block: Blue
+        // Ocean renders only one parallel per declarative stage, so a parallel
+        // bootstrap (a second parallel alongside the collect fan-out) dropped later
+        // stages from the UI. The real transfer wins (parallel chunked downloads +
+        // the llvm cache) live INSIDE these stages; only the tarball<->llvm overlap
+        // is lost -- marginal, especially on a cache HIT (a quick local extract).
+        // bashWrappedRemoteCmd: not all clusters default to bash, so wrap the scripts.
+        stage("Bootstrap: download tarball") {
+            Utils.exec(pipeline, timeout: false, numRetries: 2,
+                script: Utils.sshUserCmd(remote, b64BashRemoteCmd(tarStage)))
+        }
+        // Extract the full source tree + wheel (packs the build commit's
+        // TensorRT-LLM/src). The perf harness runs from this checkout
+        // (jenkins/scripts/perf + tests/scripts/perf-sanity), install_mode=wheel
+        // uses the bundled wheel, and scripts/bolt (merge TOOLKIT_HOST) is here.
+        stage("Bootstrap: extract tarball") {
+            Utils.exec(pipeline, timeout: false, numRetries: 2,
+                script: Utils.sshUserCmd(remote, "\"tar -xf ${ws}/builds/${BOLT_TARNAME} -C ${ws} TensorRT-LLM\""))
+        }
+        stage("Bootstrap: stage llvm-bolt") {
+            Utils.exec(pipeline, timeout: false, numRetries: 2,
+                script: Utils.sshUserCmd(remote, b64BashRemoteCmd(llvmStage)))
+        }
 
         // 2) Fan-out: ONE perf-sanity run per workload (Jenkins parallel{}).
         //    Each drives the perf harness (run_disagg.sh) for its test id, with
@@ -532,6 +631,41 @@ def pollSlurm(pipeline, remote, String jobId, String label)
             error("BoltProfileGen: SLURM job ${jobId} (${label}) did not complete cleanly: ${st}")
         }
         return true
+    }
+    // The waitUntil wall-clock (what Blue Ocean shows for this stage) lumps SLURM
+    // queue wait + actual run time together -- Jenkins can't see inside the
+    // scheduler. Split them from sacct so an oversubscribed cluster (long queue)
+    // is distinguishable from a genuinely slow job. Diagnostic only.
+    logSlurmJobTiming(pipeline, remote, jobId, label)
+}
+
+// Best-effort SLURM timing breakdown for a COMPLETED job: queue wait
+// (Start-Submit) vs run time (End-Start). Emitted as a single [TIMING] line so
+// runs are easy to grep/compare across regions and clusters. NEVER fails the
+// caller -- timing is diagnostic, so any sacct/date hiccup is swallowed.
+def logSlurmJobTiming(pipeline, remote, String jobId, String label)
+{
+    try {
+        def script = """
+            set -o pipefail
+            row=\$(sacct -j ${jobId} --format=Submit,Start,End -Pn --allocations | head -1)
+            sub=\$(echo "\$row" | cut -d'|' -f1)
+            beg=\$(echo "\$row" | cut -d'|' -f2)
+            end=\$(echo "\$row" | cut -d'|' -f3)
+            ss=\$(date -d "\$sub" +%s 2>/dev/null || echo "")
+            bs=\$(date -d "\$beg" +%s 2>/dev/null || echo "")
+            es=\$(date -d "\$end" +%s 2>/dev/null || echo "")
+            if [ -n "\$ss" ] && [ -n "\$bs" ] && [ -n "\$es" ]; then
+                echo "queue=\$((bs-ss))s run=\$((es-bs))s total=\$((es-ss))s"
+            else
+                echo "unavailable (\$row)"
+            fi
+        """.stripIndent()
+        def t = Utils.exec(pipeline, returnStdout: true, numRetries: 1, timeout: false,
+            script: Utils.sshUserCmd(remote, b64BashRemoteCmd(script))).trim()
+        pipeline.echo("[TIMING] ${label} job ${jobId}: ${t}")
+    } catch (Throwable e) {
+        pipeline.echo("[TIMING] ${label} job ${jobId}: timing unavailable (${e.message})")
     }
 }
 
