@@ -80,12 +80,15 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
+@Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
+    (MAINTENANCE_ENTRIES): [],
 ]
 
 @Field

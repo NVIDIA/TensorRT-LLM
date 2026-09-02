@@ -154,6 +154,10 @@ def CBTS_COVERAGE = "cbts_coverage"
 def DISABLE_CBTS = "disable_cbts"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
+@Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
+@Field
+def MAINTENANCE_CONFIG_PATH = "jenkins/config/maintenance_stages.txt"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
@@ -229,6 +233,7 @@ def globalVars = [
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): runMode,
+    (MAINTENANCE_ENTRIES): [],
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 if (runMode == "nightly_release") {
@@ -420,6 +425,51 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     }
 }
 
+def parseMaintenanceConfig(String content, String source)
+{
+    def entries = [:]
+    content.readLines().eachWithIndex { rawLine, index ->
+        def line = rawLine.trim()
+        if (!line || line.startsWith('#')) {
+            return
+        }
+        def fields = line.split(/\|/, 2)*.trim()
+        if (fields.size() != 2 || !fields[0] || !fields[1]) {
+            error "Invalid maintenance entry at ${source}:${index + 1}; " +
+                  "expected '<stage-or-pattern> | <reason>'."
+        }
+        if (entries.containsKey(fields[0])) {
+            echo "WARNING: Duplicate maintenance pattern '${fields[0]}' at " +
+                 "${source}:${index + 1}; " +
+                 "the first entry is used."
+        } else {
+            entries[fields[0]] = [pattern: fields[0], reason: fields[1]]
+        }
+    }
+    return entries
+}
+
+def mergeMaintenanceConfig(String totContent, String currentContent, String diff)
+{
+    def effective = parseMaintenanceConfig(totContent, "target TOT")
+    def current = parseMaintenanceConfig(currentContent, "PR file")
+    def additions = parseMaintenanceConfig(diff.readLines().findAll { line ->
+        line.startsWith('+') && !line.startsWith('+++')
+    }.collect { line -> line.substring(1) }.join('\n'), "PR additions")
+    def deletions = parseMaintenanceConfig(diff.readLines().findAll { line ->
+        line.startsWith('-') && !line.startsWith('---')
+    }.collect { line -> line.substring(1) }.join('\n'), "PR deletions")
+
+    (deletions.keySet() - additions.keySet()).each { pattern -> effective.remove(pattern) }
+    additions.keySet().each { pattern ->
+        if (!current.containsKey(pattern)) {
+            error "Maintenance pattern '${pattern}' was added in the diff but is missing from the PR file."
+        }
+        effective[pattern] = current[pattern]
+    }
+    return effective.values().toList()
+}
+
 def mergeWaiveList(pipeline, globalVars)
 {
     // Get current waive list
@@ -475,6 +525,20 @@ def mergeWaiveList(pipeline, globalVars)
         }
         return
     }
+
+    def maintenanceTot = "maintenance_stages_TOT_${targetBranchTOTCommit}.txt"
+    def maintenanceSource = "${LLM_ROOT}/${MAINTENANCE_CONFIG_PATH}"
+    sh "wget https://urm.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/" +
+       "${targetBranchTOTCommit}/${MAINTENANCE_CONFIG_PATH} -O ${maintenanceTot}"
+    def maintenanceDiff = getMergeRequestOneFileChanges(
+        pipeline, globalVars, MAINTENANCE_CONFIG_PATH)
+    if (!fileExists(maintenanceSource) && maintenanceDiff) {
+        error "Deleting or renaming ${MAINTENANCE_CONFIG_PATH} is not allowed."
+    }
+    def maintenanceCurrent = fileExists(maintenanceSource) ? readFile(maintenanceSource) : ""
+    globalVars[MAINTENANCE_ENTRIES] = mergeMaintenanceConfig(
+        readFile(maintenanceTot), maintenanceCurrent, maintenanceDiff)
+    echo "Effective maintenance entries: ${globalVars[MAINTENANCE_ENTRIES]}"
 
     try {
         // Get waive list diff in current MR
