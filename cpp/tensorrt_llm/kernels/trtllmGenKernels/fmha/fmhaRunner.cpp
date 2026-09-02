@@ -67,6 +67,10 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_ty
 
 void TllmGenFmhaRunner::run(TllmGenFmhaRunnerParams const& runnerParams)
 {
+    if (mKernel == nullptr)
+    {
+        TLLM_THROW("TRTLLM-GEN: mKernel is null. Cannot run FMHA kernel.");
+    }
     mKernel->run(runnerParams);
 }
 
@@ -74,6 +78,14 @@ void TllmGenFmhaRunner::run(TllmGenFmhaRunnerParams const& runnerParams)
 
 bool TllmGenFmhaRunner::isSupported(TllmGenFmhaRunnerParams const& runnerParams) const
 {
+    if (mKernel == nullptr)
+    {
+        TLLM_LOG_WARNING(
+            "TRTLLM-GEN: mKernel is null. No kernels available for dtypeQ=%d, dtypeK=%d, dtypeV=%d, dtypeOut=%d, SM=%d",
+            static_cast<int>(mDtypeQ), static_cast<int>(mDtypeK), static_cast<int>(mDtypeV),
+            static_cast<int>(mDtypeOut), mSM);
+        return false;
+    }
     return mKernel->checkIfKernelExist(runnerParams).first;
 }
 
@@ -81,6 +93,14 @@ bool TllmGenFmhaRunner::isSupported(TllmGenFmhaRunnerParams const& runnerParams)
 
 std::pair<bool, std::string> TllmGenFmhaRunner::isSupportedWithInfo(TllmGenFmhaRunnerParams const& runnerParams) const
 {
+    if (mKernel == nullptr)
+    {
+        std::string errorMsg = "TRTLLM-GEN: mKernel is null. No kernels available for dtypeQ="
+            + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeK=" + std::to_string(static_cast<int>(mDtypeK))
+            + ", dtypeV=" + std::to_string(static_cast<int>(mDtypeV))
+            + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut)) + ", SM=" + std::to_string(mSM);
+        return std::make_pair(false, errorMsg);
+    }
     return mKernel->checkIfKernelExist(runnerParams);
 }
 

@@ -83,7 +83,11 @@ constexpr bool isFamilySpecificSMPair(int sm1, int sm2)
 
 constexpr bool isSMCompatible(int gpuSM, int kernelSM)
 {
-    if (gpuSM == kSM_103)
+    if (gpuSM == kSM_107)
+    {
+        return kernelSM == kSM_100f || kernelSM == kSM_107;
+    }
+    else if (gpuSM == kSM_103)
     {
         return kernelSM == kSM_100f || kernelSM == kSM_103;
     }
@@ -91,9 +95,9 @@ constexpr bool isSMCompatible(int gpuSM, int kernelSM)
     {
         return kernelSM == kSM_100f || kernelSM == kSM_100;
     }
-    else if (gpuSM == kSM_107)
+    else if (tensorrt_llm::common::isSM100Family(gpuSM))
     {
-        return kernelSM == kSM_100f || kernelSM == kSM_107;
+        return kernelSM == kSM_100f;
     }
 
     return gpuSM == kernelSM;
