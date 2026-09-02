@@ -1541,6 +1541,8 @@ class PyTorchModelEngine(ModelEngine):
             # no-op for non-Mamba models.
             self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
+            self._run_small_ctx_shape_warmup(resource_manager)
+            log_mem_snapshot("warmup/after_small_ctx_shapes")
             # Release the autotuner's exploration-mode intermediates. The
             # exploration leftovers are pure waste that hide tens of GiB from
             # non-torch allocators (cuBLAS handle workspace, UCX/NIXL,
@@ -2276,6 +2278,64 @@ class PyTorchModelEngine(ModelEngine):
         # profiler, reducing memory available for activations during inference.
         clear_memory_buffers()
         torch.cuda.empty_cache()
+
+    def _run_small_ctx_shape_warmup(self,
+                                    resource_manager: ResourceManager) -> None:
+        """Pre-touch small context token-count shapes so per-shape JIT kernels
+        compile during warmup rather than mid-serving.
+
+        The stock warmup only exercises context shapes with num_tokens in
+        {1, 2, max_num_tokens} (and skips even those on Mamba hybrid models,
+        where ``can_run_general_warmup`` is False). Kernels that JIT-compile
+        per shape with a per-process cache -- e.g. the DeepGEMM
+        ``fp8_swap_ab_gemm`` behind Kimi K3's FP8-resident attention/KDA
+        projections -- then compile on the first real request whose context
+        chunk lands in an untouched shape: measured 45-48 s (8 projection
+        configs x ~6 s of nvcc) on GB300, once per rank, and under lockstep
+        attention-DP each such compile stalls the whole iteration. Small
+        chunks are routine tails of chunked prefill, so a long-context
+        workload keeps hitting new small shapes well into serving.
+
+        Sweeping 128..512 (step 64) funnels those compiles into warmup: on a
+        Kimi K3 ctx-only DEP16 AgentX benchmark it removed 7 of 8 mid-serving
+        compile stalls. The step wraps in ``autotune()`` like the other warmup
+        forwards so tactic caches also get primed for these shapes. It cannot
+        be complete -- DeepGEMM's cache hits follow internal tile heuristics,
+        so an unaligned num_tokens can still trigger a compile -- but the
+        remaining fixes (a persistent JIT cache, or padding GEMM M to an
+        alignment) belong to the kernel layer. Set
+        ``TLLM_SMALL_CTX_SHAPE_WARMUP=0`` to disable.
+        """
+        if os.environ.get("TLLM_SMALL_CTX_SHAPE_WARMUP", "1") != "1":
+            return
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        if kv_cache_manager is None:
+            return
+
+        logger.info(
+            "Running small context shape warmup (num_tokens 128..512)...")
+        autotuner_enabled = self.llm_args.enable_autotuner
+        cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+        autotune_ctx = (autotune(cache_path=cache_path)
+                        if autotuner_enabled else contextlib.nullcontext())
+        with self.no_cuda_graph(), autotune_ctx:
+            for num_tokens in range(128, 513, 64):
+                warmup_request = self._create_warmup_request(
+                    resource_manager, num_tokens, 0)
+                with self._release_batch_context(warmup_request,
+                                                 resource_manager) as batch:
+                    if batch is None and self.mapping.tp_size <= 1:
+                        continue
+                    self._assert_all_tp_ranks_have_warmup_batch(
+                        batch, num_tokens)
+                    if batch is None:
+                        continue
+                    self.forward(batch,
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
+                    torch.cuda.synchronize()
+        logger.info("Small context shape warmup done.")
 
     def _run_mamba_hybrid_warmup(self,
                                  resource_manager: ResourceManager) -> None:
