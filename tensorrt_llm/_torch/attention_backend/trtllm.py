@@ -2151,43 +2151,50 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         context_fmha = None
         generation_fmha = None
         for fmha in self.fmha_libs:
-            if isinstance(fmha, PhasedFmha):
-                if (has_context and context_fmha is None and fmha.is_supported(
+            if fmha.is_supported(q, k, v, metadata, forward_args):
+                return fmha
+
+            if not isinstance(fmha, PhasedFmha):
+                continue
+
+            if has_context and context_fmha is None:
+                if fmha.is_supported(
                         q,
                         k,
                         v,
                         metadata,
                         forward_args,
                         phase=FmhaPhase.CONTEXT,
-                )):
+                ):
                     context_fmha = fmha
-                if (has_generation and generation_fmha is None
-                        and fmha.is_supported(
-                            q,
-                            k,
-                            v,
-                            metadata,
-                            forward_args,
-                            phase=FmhaPhase.GENERATION,
-                        )):
+            if has_generation and generation_fmha is None:
+                if fmha.is_supported(
+                        q,
+                        k,
+                        v,
+                        metadata,
+                        forward_args,
+                        phase=FmhaPhase.GENERATION,
+                ):
                     generation_fmha = fmha
 
-                if (has_context and context_fmha is None) or (
-                        has_generation and generation_fmha is None):
-                    continue
-                if context_fmha is None:
-                    return generation_fmha
-                if generation_fmha is None or context_fmha is generation_fmha:
-                    return context_fmha
+            if has_context and context_fmha is None:
+                continue
+            if has_generation and generation_fmha is None:
+                continue
+            if context_fmha is None:
+                return generation_fmha
+            if generation_fmha is None:
+                return context_fmha
+            if context_fmha is generation_fmha:
+                continue
 
-                combined_fmha = CombinedFmha(self)
-                combined_fmha.set_fmha_impls(
-                    context_fmha,
-                    generation_fmha,
-                )
-                return combined_fmha
-            if fmha.is_supported(q, k, v, metadata, forward_args):
-                return fmha
+            combined_fmha = CombinedFmha(self)
+            combined_fmha.set_fmha_impls(
+                context_fmha,
+                generation_fmha,
+            )
+            return combined_fmha
         return None
 
     def _select_mla_fmha(

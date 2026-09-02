@@ -22,10 +22,10 @@ import torch
 
 from tensorrt_llm._torch.attention_backend import trtllm as trtllm_backend
 from tensorrt_llm._torch.attention_backend.fmha.combined import CombinedFmha
-from tensorrt_llm._torch.attention_backend.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from tensorrt_llm._torch.attention_backend.fmha.interface import Fmha, FmhaPhase
 from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams, PhasedFmha
+from tensorrt_llm._torch.attention_backend.fmha.triton_custom_mask import TritonCustomMaskFmha
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -52,7 +52,7 @@ class _TestPhasedFmha(PhasedFmha):
     def __init__(
         self,
         attn: _TestAttention,
-        supported_phases: set[FmhaPhase],
+        supported_phases: set[FmhaPhase | None],
         name: str,
         events: list[tuple],
         workspace_size: int = 0,
@@ -162,8 +162,10 @@ def test_select_non_mla_fmha_combines_supported_phases() -> None:
     assert selected._get_context_impl() is context_fmha
     assert selected._get_generation_impl() is generation_fmha
     assert events == [
+        ("support", "context", None),
         ("support", "context", FmhaPhase.CONTEXT),
         ("support", "context", FmhaPhase.GENERATION),
+        ("support", "generation", None),
         ("support", "generation", FmhaPhase.GENERATION),
     ]
 
@@ -188,7 +190,13 @@ def test_select_non_mla_fmha_checks_followup_support() -> None:
     )
 
     assert selected is None
-    assert events[-1] == ("support", "followup", FmhaPhase.GENERATION)
+    assert events == [
+        ("support", "context", None),
+        ("support", "context", FmhaPhase.CONTEXT),
+        ("support", "context", FmhaPhase.GENERATION),
+        ("support", "followup", None),
+        ("support", "followup", FmhaPhase.GENERATION),
+    ]
 
 
 def test_select_non_mla_fmha_reuses_one_implementation() -> None:
@@ -196,7 +204,7 @@ def test_select_non_mla_fmha_reuses_one_implementation() -> None:
     attn = _TestAttention()
     fmha = _TestPhasedFmha(
         attn,
-        {FmhaPhase.CONTEXT, FmhaPhase.GENERATION},
+        {None, FmhaPhase.CONTEXT, FmhaPhase.GENERATION},
         "both",
         events,
     )
@@ -215,6 +223,65 @@ def test_select_non_mla_fmha_reuses_one_implementation() -> None:
     )
 
     assert selected is fmha
+    assert events == [("support", "both", None)]
+
+
+def test_select_non_mla_fmha_skips_same_phased_implementation_after_full_rejection() -> None:
+    events: list[tuple] = []
+    attn = _TestAttention()
+    phased_fmha = _TestPhasedFmha(
+        attn,
+        {FmhaPhase.CONTEXT, FmhaPhase.GENERATION},
+        "phased",
+        events,
+    )
+    fallback_fmha = _TestFmha(attn, "fallback", events)
+    backend = SimpleNamespace(
+        fmha_libs=[phased_fmha, fallback_fmha],
+        phased_fmha_libs=[phased_fmha],
+    )
+
+    selected = TrtllmAttention._select_non_mla_fmha(
+        backend,
+        torch.empty((2, 4)),
+        None,
+        None,
+        SimpleNamespace(num_contexts=1, num_generations=1),
+        AttentionForwardArgs(attention_input_type=AttentionInputType.mixed),
+    )
+
+    assert selected is fallback_fmha
+    assert events == [
+        ("support", "phased", None),
+        ("support", "phased", FmhaPhase.CONTEXT),
+        ("support", "phased", FmhaPhase.GENERATION),
+        ("support", "fallback", None),
+    ]
+
+
+def test_select_non_mla_fmha_uses_context_only_phased_implementation() -> None:
+    events: list[tuple] = []
+    attn = _TestAttention()
+    context_fmha = _TestPhasedFmha(attn, {FmhaPhase.CONTEXT}, "context", events)
+    backend = SimpleNamespace(
+        fmha_libs=[context_fmha],
+        phased_fmha_libs=[context_fmha],
+    )
+
+    selected = TrtllmAttention._select_non_mla_fmha(
+        backend,
+        torch.empty((2, 4)),
+        None,
+        None,
+        SimpleNamespace(num_contexts=1, num_generations=0),
+        AttentionForwardArgs(attention_input_type=AttentionInputType.mixed),
+    )
+
+    assert selected is context_fmha
+    assert events == [
+        ("support", "context", None),
+        ("support", "context", FmhaPhase.CONTEXT),
+    ]
 
 
 def test_select_non_mla_fmha_preserves_registry_order() -> None:
@@ -324,12 +391,24 @@ def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
     assert not fmha._use_fp8_context_fmha(output, AttentionInputType.generation_only)
 
 
+def test_triton_custom_mask_rejects_whole_request_probe() -> None:
+    fmha = object.__new__(TritonCustomMaskFmha)
+
+    assert not fmha.is_supported(
+        torch.empty((1, 4)),
+        None,
+        None,
+        SimpleNamespace(),
+        AttentionForwardArgs(),
+    )
+
+
 @pytest.mark.parametrize("is_fused_qkv", [True, False], ids=["fused_qkv", "q_only"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("sm_version", [100, 103])
 @pytest.mark.parametrize("tokens_per_block", [32, 64])
 @pytest.mark.parametrize("num_contexts", [1, 4, 5])
-@pytest.mark.parametrize("head_dim", [64, 512])
+@pytest.mark.parametrize("head_dim", [64, 256, 512])
 def test_flashinfer_context_fallback_scope(
     monkeypatch: pytest.MonkeyPatch,
     dtype: torch.dtype,
@@ -349,7 +428,6 @@ def test_flashinfer_context_fallback_scope(
     attn.sparse_params = None
     attn.position_embedding_type = 0
     attn.head_dim = head_dim
-    attn.non_phased_fmha_libs = [FallbackFmha(attn)]
     q_hidden_size = attn.num_heads * attn.head_dim
     # Both layouts the trtllm-gen self-attention path accepts, wired the way
     # TrtllmAttention.forward wires them: fused QKV carries K/V inline and writes
@@ -378,26 +456,26 @@ def test_flashinfer_context_fallback_scope(
         update_kv_cache=is_fused_qkv,
     )
 
-    supported, reason = fmha._is_supported_with_reason(
-        q,
-        None,
-        None,
-        attn,
-        metadata,
-        forward_args,
-        phase=FmhaPhase.CONTEXT,
-    )
-
     small_bf16_fallback = (
-        dtype == torch.bfloat16 and num_contexts <= 4 and is_fused_qkv and head_dim == 64
+        dtype == torch.bfloat16 and num_contexts <= 4 and is_fused_qkv and head_dim != 512
     )
     expected_fallback = small_bf16_fallback or sm_version == 103
-    if expected_fallback:
-        assert not supported
-        assert "fallback FMHA" in reason
-    else:
-        assert supported, reason
-        assert reason == ""
+    for phase in (None, FmhaPhase.CONTEXT):
+        supported, reason = fmha._is_supported_with_reason(
+            q,
+            None,
+            None,
+            attn,
+            metadata,
+            forward_args,
+            phase=phase,
+        )
+        if expected_fallback:
+            assert not supported
+            assert "fallback FMHA" in reason
+        else:
+            assert supported, reason
+            assert reason == ""
 
     generation_supported, generation_reason = fmha._is_supported_with_reason(
         q,

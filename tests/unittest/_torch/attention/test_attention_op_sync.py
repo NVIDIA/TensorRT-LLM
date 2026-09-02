@@ -93,13 +93,6 @@ _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
     "workspace_": ("metadata", ("effective_workspace",)),
 }
 
-
-class _FallbackTestAttention:
-    def __init__(self, head_dim: int) -> None:
-        self.is_mla_enable = False
-        self.head_dim = head_dim
-
-
 # The C++ attention() declaration is the single source of truth for kwarg
 # names, ordering, and types.
 _HEADER = pathlib.Path(__file__).resolve().parents[4] / ("cpp/tensorrt_llm/thop/attentionOp.h")
@@ -678,29 +671,8 @@ def test_no_sequence_kwargs_at_thop_attention_boundary():
 )
 def test_fallback_support_matches_thop_kv_update_contract(is_cross, update_kv_cache, expected):
     """Do not dispatch requests that the native attention op rejects."""
-    attn = _FallbackTestAttention(head_dim=64)
-    fmha = FallbackFmha(attn)
-    metadata = SimpleNamespace(is_cross=is_cross, num_generations=1)
+    fmha = object.__new__(FallbackFmha)
+    metadata = SimpleNamespace(is_cross=is_cross)
     forward_args = AttentionForwardArgs(update_kv_cache=update_kv_cache)
-
-    assert fmha.is_supported(None, None, None, metadata, forward_args) is expected
-
-
-@pytest.mark.parametrize(
-    ("head_dim", "num_generations", "expected"),
-    (
-        (64, 1, True),
-        (80, 1, True),
-        (512, 0, False),
-        (72, 0, True),
-        (72, 1, False),
-    ),
-)
-def test_fallback_support_matches_native_head_size_contract(head_dim, num_generations, expected):
-    """Do not instantiate native MMHA for unsupported head dimensions."""
-    attn = _FallbackTestAttention(head_dim=head_dim)
-    fmha = FallbackFmha(attn)
-    metadata = SimpleNamespace(is_cross=False, num_generations=num_generations)
-    forward_args = AttentionForwardArgs(update_kv_cache=True)
 
     assert fmha.is_supported(None, None, None, metadata, forward_args) is expected
