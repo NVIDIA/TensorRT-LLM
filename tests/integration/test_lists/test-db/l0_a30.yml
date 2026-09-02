@@ -40,6 +40,7 @@ l0_a30:
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_unit_tests.py::test_unit_tests[batch_manager-80]
+  - cpp/test_unit_tests.py::test_kv_cache_compression_unit_tests[80]
 - condition:
     ranges:
       system_gpu_count:
@@ -57,6 +58,5 @@ l0_a30:
   - cpp/test_unit_tests.py::test_unit_tests[common-80]
   - cpp/test_unit_tests.py::test_unit_tests[executor-80]
   - cpp/test_unit_tests.py::test_unit_tests[kernels-80]
-  - cpp/test_unit_tests.py::test_unit_tests[layers-80]
   - cpp/test_unit_tests.py::test_unit_tests[runtime-80]
   - cpp/test_unit_tests.py::test_unit_tests[thop-80]

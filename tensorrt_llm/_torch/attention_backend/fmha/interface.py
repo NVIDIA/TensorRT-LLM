@@ -109,7 +109,15 @@ class Fmha(ABC):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        """Return whether this library supports the request or requested phase."""
+        """Return whether this library supports the request or requested phase.
+
+        Forward-varying selection conditions must be represented in
+        ``TrtllmAttention._make_fmha_cache_key``. Conditions omitted
+        from that key must remain invariant for the attention instance. Size-
+        based conditions must also preserve the same result throughout each
+        FMHA cache grid cell or add the relevant boundary to the grid's
+        candidate list.
+        """
         return True
 
     @abstractmethod
