@@ -3220,6 +3220,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._ssm_page_index_scale = 1
             self.all_ssm_states = []
             self.all_conv_states = []
+            self._stacked_ssm_states = None
+            self._stacked_conv_states = None
             self._setup_replay_buffers(spec_config)
 
     def _init_qwen4_exp_ple_geometry(
@@ -3851,6 +3853,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                    self.conv_state_dtype, self.conv_state_shape)
             for local_layer_idx in local_layer_ids
         ]
+        self._stacked_ssm_states = self._stack_state_views(self.all_ssm_states)
+        self._stacked_conv_states = self._stack_state_views(
+            self.all_conv_states)
         if self._use_gdn_cached_replay_all_layer_commit:
             expected_inner_strides = (
                 self.ssm_state_shape[1] * self.ssm_state_shape[2],
@@ -3894,6 +3899,44 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     dtype=torch.int64,
                     device=reference.device,
                 )
+
+    @staticmethod
+    def _stack_state_views(
+            states: List[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Returns one ``[num_layers, num_slots, *state_shape]`` view of ``states``.
+
+        A stacked view collapses per-layer promotion loop into a single launch of _promote_mamba_state_triton.
+        This requires per-layer pool views to be *affine*: identical dtype/device/shape/strides, and base
+        pointers spaced by a constant. returns ``None`` otherwise.
+        """
+        if not states:
+            return None
+        ref = states[0]
+        if len(states) == 1:
+            return ref.unsqueeze(0)
+        for state in states[1:]:
+            if (state.dtype != ref.dtype or state.device != ref.device
+                    or state.shape != ref.shape
+                    or state.stride() != ref.stride()):
+                return None
+        itemsize = ref.element_size()
+        layer_stride_bytes = states[1].data_ptr() - states[0].data_ptr()
+        if layer_stride_bytes <= 0 or layer_stride_bytes % itemsize != 0:
+            return None
+        base = states[0].data_ptr()
+        if any(state.data_ptr() != base + layer * layer_stride_bytes
+               for layer, state in enumerate(states)):
+            return None
+        layer_stride = layer_stride_bytes // itemsize
+        # Highest element one layer's view can reach, so the flat wrapper below
+        # covers every byte the stacked view addresses and no more.
+        layer_extent = 1 + sum((size - 1) * stride
+                               for size, stride in zip(ref.shape, ref.stride()))
+        total_elems = (len(states) - 1) * layer_stride + layer_extent
+        flat = convert_to_torch_tensor(
+            TensorWrapper(base, ref.dtype, [total_elems]))
+        return flat.as_strided([len(states)] + list(ref.shape),
+                               [layer_stride] + list(ref.stride()))
 
     def _setup_replay_buffers(self, spec_config) -> None:
         cache_size = 0
@@ -4133,19 +4176,36 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 is_dummy_request,
             )
         else:
-            for layer_offset, dst in enumerate(self.all_ssm_states):
-                _promote_mamba_state_triton(
-                    dst.unsqueeze(0),
-                    self.intermediate_ssm_states[layer_offset:layer_offset + 1],
-                    src_state_indices,
-                    accepted_positions,
-                    state_indices_d,
-                )
+            self._promote_state(self.all_ssm_states, self._stacked_ssm_states,
+                                self.intermediate_ssm_states, src_state_indices,
+                                accepted_positions, state_indices_d)
 
-        for layer_offset, dst in enumerate(self.all_conv_states):
+        self._promote_state(self.all_conv_states, self._stacked_conv_states,
+                            self.intermediate_conv_states, src_state_indices,
+                            accepted_positions, state_indices_d)
+
+    @staticmethod
+    def _promote_state(per_layer: List[torch.Tensor],
+                       stacked: Optional[torch.Tensor],
+                       intermediate: torch.Tensor,
+                       src_state_indices: torch.Tensor,
+                       accepted_positions: torch.Tensor,
+                       state_indices_d: torch.Tensor) -> None:
+        """Promote every layer's accepted state, in one launch where possible.
+
+        The kernel's grid is ``(num_layers * num_gens, tiles)``, so handing it
+        the stacked view does all layers at once; the per-layer loop is only
+        the fallback for a non-affine pool layout.
+        """
+        if stacked is not None:
+            _promote_mamba_state_triton(stacked, intermediate,
+                                        src_state_indices, accepted_positions,
+                                        state_indices_d)
+            return
+        for layer_offset, dst in enumerate(per_layer):
             _promote_mamba_state_triton(
                 dst.unsqueeze(0),
-                self.intermediate_conv_states[layer_offset:layer_offset + 1],
+                intermediate[layer_offset:layer_offset + 1],
                 src_state_indices,
                 accepted_positions,
                 state_indices_d,
@@ -4236,6 +4296,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._gdn_cached_replay_state_strides = None
         self.all_ssm_states = []
         self.all_conv_states = []
+        self._stacked_ssm_states = None
+        self._stacked_conv_states = None
         self._ple_ngram_contexts = {}
         self._ple_conv_states = {}
         self.intermediate_ssm_states = None
