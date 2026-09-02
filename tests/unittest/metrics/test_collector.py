@@ -20,7 +20,12 @@ import pytest
 from prometheus_client import REGISTRY
 
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.metrics.enums import MetricNames, RequestEventTiming
+from tensorrt_llm.metrics.enums import (
+    CACHE_TIER_BLOCK_LABELS,
+    CACHE_TIER_LABELS,
+    MetricNames,
+    RequestEventTiming,
+)
 from tensorrt_llm.metrics.perf_utils import process_req_perf_metrics
 
 pytestmark = pytest.mark.cpu_only
@@ -1314,8 +1319,6 @@ class TestRequestErrorCounter:
 # ---------------------------------------------------------------------------
 # Tests for the cache_tier labelled counters (KV-cache hits by storage tier)
 # ---------------------------------------------------------------------------
-
-from tensorrt_llm.metrics.enums import CACHE_TIER_BLOCK_LABELS, CACHE_TIER_LABELS  # noqa: E402
 
 
 def _tier_value(collector: MetricsCollector, metric_name: str, tier: str) -> float:

@@ -108,9 +108,11 @@ def test_fill_slot_get_slot_tokens_round_trip():
 
     buf.fill_slot(slot.id, mock_request)
     first_tokens, draft_tokens = buf.get_slot_tokens(slot.id)
-    first_tokens_with_usage, draft_tokens_with_usage, (prompt_tokens, cached_tokens) = (
+    first_tokens_with_usage, draft_tokens_with_usage, (prompt_tokens, cached_tokens), details = (
         buf.get_slot_data(slot.id)
     )
+    # The mock request carries no tier attribution, so none is transported.
+    assert details == {}
 
     print(
         f"[usage_check] aux_buffer get_slot_data: "

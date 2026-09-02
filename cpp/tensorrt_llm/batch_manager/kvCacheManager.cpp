@@ -1863,6 +1863,22 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
     return result;
 }
 
+namespace
+{
+//! \brief Keep only the first \p numTokens tokens of the ordered (tier, num tokens) runs.
+void clipReuseTierSegments(LlmRequest::ReuseTierSegments& segments, SizeType32 numTokens)
+{
+    SizeType32 remaining = numTokens;
+    auto segmentItr = segments.begin();
+    for (; segmentItr != segments.end() && remaining > 0; ++segmentItr)
+    {
+        segmentItr->second = std::min(segmentItr->second, remaining);
+        remaining -= segmentItr->second;
+    }
+    segments.erase(segmentItr, segments.end());
+}
+} // namespace
+
 SizeType32 WindowBlockManager::onboardAndAllocateBlocks(GenerationRequest& sequence, LlmRequest& llmRequest,
     ClaimResult& claimResult, bool isEnableBlockReuse, LlmRequest::ReuseTierSegments& tierSegments)
 {
@@ -1901,7 +1917,7 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(GenerationRequest& seque
                 mLogPrefix.c_str(), sequence.getRequestId());
             addBlockToAllBeams(claimed.block, sequence);
             // The anchor's tokens are skipped by reuse but no KV is loaded for them.
-            appendTierSegment(KvCacheTier::kNONE, claimed.numMatchedTokens);
+            appendTierSegment(KvCacheTier::kNone, claimed.numMatchedTokens);
             ++blockItr;
             ++bi;
             continue;
@@ -1915,13 +1931,13 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(GenerationRequest& seque
         {
             if (claimed.isPlaceholder)
             {
-                return KvCacheTier::kNONE;
+                return KvCacheTier::kNone;
             }
             if (claimed.block->isPrimary())
             {
-                return KvCacheTier::kGPU;
+                return KvCacheTier::kGpu;
             }
-            return claimResult.mode == executor::KvCacheTransferMode::DRAM ? KvCacheTier::kHOST : KvCacheTier::kDISK;
+            return claimResult.mode == executor::KvCacheTransferMode::DRAM ? KvCacheTier::kHost : KvCacheTier::kDisk;
         }();
         appendTierSegment(tier, claimed.numMatchedTokens);
 
@@ -2081,16 +2097,7 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(GenerationRequest& seque
 
     // The claimed blocks may cover more tokens than the engine will skip (rounding for beam > 1, trailing
     // recurrent-state placeholders); clip the attribution so it sums to the prepopulated length.
-    {
-        SizeType32 remaining = numMatchedTokens;
-        auto segmentItr = tierSegments.begin();
-        for (; segmentItr != tierSegments.end() && remaining > 0; ++segmentItr)
-        {
-            segmentItr->second = std::min(segmentItr->second, remaining);
-            remaining -= segmentItr->second;
-        }
-        tierSegments.erase(segmentItr, tierSegments.end());
-    }
+    clipReuseTierSegments(tierSegments, numMatchedTokens);
 
     // Update stats and return prepopulated length
     mReusedTokens += static_cast<double>(numMatchedTokens);
@@ -2116,19 +2123,23 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(GenerationRequest& seque
             = mKvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, sequence.getCurrentPrepopulatedPromptLen());
     }
 
-    if (numConnectorMatchedTokens > 0)
+    if (isEnableBlockReuse && numConnectorMatchedTokens > 0)
     {
         // Blocks the connector fills from the external store went through the miss path above (nothing matched
         // locally) but skip recomputation exactly like a local hit. Account the whole blocks it covers as reuse
-        // from the remote tier so the aggregate hit rate and the per-tier split agree; a partially covered
-        // trailing block stays a miss.
-        auto const numRemoteBlocks = std::min(numConnectorMatchedTokens / mTokensPerBlock, numMissedThisRequest);
+        // from the remote tier so the aggregate hit rate and the per-tier split agree. The connector tokens start
+        // right after the (possibly unaligned) local prefix, so only blocks lying entirely within
+        // [localLen, localLen + connector) count; a partially covered block stays a miss.
+        auto const localLen = sequence.getCurrentPrepopulatedPromptLen();
+        auto const numRemoteBlocks = std::max(0,
+            std::min((localLen + numConnectorMatchedTokens) / mTokensPerBlock - tc::ceilDiv(localLen, mTokensPerBlock),
+                numMissedThisRequest));
         mMissedBlocks -= numRemoteBlocks;
         mReusedBlocks += numRemoteBlocks;
         mFullReusedBlocks += numRemoteBlocks;
-        mReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kREMOTE)] += numRemoteBlocks;
+        mReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kRemote)] += numRemoteBlocks;
         mReusedTokens += static_cast<double>(numConnectorMatchedTokens);
-        appendTierSegment(KvCacheTier::kREMOTE, numConnectorMatchedTokens);
+        appendTierSegment(KvCacheTier::kRemote, numConnectorMatchedTokens);
     }
 
     auto const totalPrepopulatedLen = sequence.getCurrentPrepopulatedPromptLen() + numConnectorMatchedTokens;
@@ -3044,14 +3055,14 @@ KvCacheIterationStats WindowBlockManager::getAndResetIterationStats()
     stats.iterFullReusedBlocks = mFullReusedBlocks - mPrevFullReusedBlocks;
     stats.iterPartialReusedBlocks = mPartialReusedBlocks - mPrevPartialReusedBlocks;
     stats.iterMissedBlocks = mMissedBlocks - mPrevMissedBlocks;
-    stats.iterReusedBlocksGpu = mReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kGPU)]
-        - mPrevReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kGPU)];
-    stats.iterReusedBlocksHost = mReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kHOST)]
-        - mPrevReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kHOST)];
-    stats.iterReusedBlocksDisk = mReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kDISK)]
-        - mPrevReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kDISK)];
-    stats.iterReusedBlocksRemote = mReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kREMOTE)]
-        - mPrevReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kREMOTE)];
+    stats.iterReusedBlocksGpu = mReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kGpu)]
+        - mPrevReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kGpu)];
+    stats.iterReusedBlocksHost = mReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kHost)]
+        - mPrevReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kHost)];
+    stats.iterReusedBlocksDisk = mReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kDisk)]
+        - mPrevReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kDisk)];
+    stats.iterReusedBlocksRemote = mReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kRemote)]
+        - mPrevReusedBlocksByTier[static_cast<size_t>(KvCacheTier::kRemote)];
 
     auto const iterTotal = stats.iterReusedBlocks + stats.iterMissedBlocks;
     stats.iterCacheHitRate
@@ -4032,9 +4043,11 @@ void KVCacheManager::addSequenceBatch(
     std::vector<SizeType32> totalAllocNewDelta(n, 0);
     std::vector<SizeType32> totalReusedDelta(n, 0);
     std::vector<SizeType32> totalMissedDelta(n, 0);
-    // Storage-tier attribution of the reused prefix, taken from the window that bounds the prepopulated
-    // length (see below).
+    // Storage-tier attribution of the reused prefix: the largest attention window's runs, clipped below to
+    // the prepopulated length the engine ends up skipping (min over all windows). The recurrent-state window
+    // only holds placeholders, so it never provides the attribution.
     std::vector<LlmRequest::ReuseTierSegments> tierSegments(n);
+    std::vector<bool> tierSegmentsSet(n, false);
 
     // --- Iterate over all window sizes (single iteration for non-VSWA) ---
     // Onboard longer windows first to match the assumption in setCurrentPrepopulatedPromptLen
@@ -4069,12 +4082,11 @@ void KVCacheManager::addSequenceBatch(
             mBlockManager.updateSequenceCacheBlockOffsets(*sequences[i], windowSize);
 
             auto const& stats = windowResults[i];
-            if (stats.prepopulatedLen < minPrepopulatedLen[i])
+            if (!tierSegmentsSet[i] && !LinearAttentionMetadata::hasLinearCache(windowSize))
             {
-                // The window with the shortest match decides how many tokens the engine skips, so its
-                // attribution is the one that describes them. Windows iterate from largest to smallest, so
-                // ties keep the largest window.
+                // Windows iterate from largest to smallest, so this is the largest attention window.
                 tierSegments[i] = stats.tierSegments;
+                tierSegmentsSet[i] = true;
             }
             minPrepopulatedLen[i] = std::min(minPrepopulatedLen[i], stats.prepopulatedLen);
             totalAllocTotalDelta[i] += stats.allocTotalDelta;
@@ -4094,6 +4106,7 @@ void KVCacheManager::addSequenceBatch(
             TLLM_LOG_DEBUG("KVCacheManager::addSequenceBatch: Setting prepopulatedPromptLen to %d for request %lu",
                 minPrepopulatedLen[i], llmRequest.mRequestId);
             llmRequest.setPrepopulatedPromptLen(minPrepopulatedLen[i], getTokensPerBlock());
+            clipReuseTierSegments(tierSegments[i], minPrepopulatedLen[i]);
             llmRequest.setReuseTierSegments(std::move(tierSegments[i]));
             // Clear the scheduling estimate now that the authoritative value is set.
             // This prevents subsequent chunks from double-counting reusable tokens.

@@ -110,7 +110,8 @@ TEST(KvCacheManagerV2StatsTest, PendingReuseSurvivesAllocationRollbackUntilClear
     PendingStats pending;
     EXPECT_TRUE(pending.recordAllocationRange(
         LifeCycleId{0}, BlockOrdinal{0}, BlockOrdinal{1}, /*beamWidth=*/1, /*countAsMissed=*/true));
-    EXPECT_TRUE(pending.recordReuse(LifeCycleId{0}, /*fullReusedBlocks=*/2, /*partialReusedBlocks=*/1));
+    EXPECT_TRUE(pending.recordReuse(
+        LifeCycleId{0}, /*fullReusedBlocks=*/2, /*partialReusedBlocks=*/1, /*reusedBlocksByTier=*/{3, 0, 0, 0}));
 
     EXPECT_TRUE(pending.subtractAllocationRange(BlockOrdinal{0}, BlockOrdinal{1}));
     EXPECT_EQ(pending.globalStats().allocTotalBlocks, 0);

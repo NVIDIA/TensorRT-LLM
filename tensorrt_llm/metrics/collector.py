@@ -878,14 +878,9 @@ class MetricsCollector:
                 total_full_reused += stats.get("iterFullReusedBlocks", 0)
                 total_partial_reused += stats.get("iterPartialReusedBlocks", 0)
                 total_missed += stats.get("iterMissedBlocks", 0)
-                total_reused_by_tier["gpu"] += stats.get(
-                    "iterReusedBlocksGpu", 0)
-                total_reused_by_tier["host"] += stats.get(
-                    "iterReusedBlocksHost", 0)
-                total_reused_by_tier["disk"] += stats.get(
-                    "iterReusedBlocksDisk", 0)
-                total_reused_by_tier["remote"] += stats.get(
-                    "iterReusedBlocksRemote", 0)
+                for tier in CACHE_TIER_BLOCK_LABELS:
+                    total_reused_by_tier[tier] += stats.get(
+                        f"iterReusedBlocks{tier.capitalize()}", 0)
 
             for stats in secondary_stats.values():
                 total_secondary_max += stats.get("secondaryMaxNumBlocks", 0)

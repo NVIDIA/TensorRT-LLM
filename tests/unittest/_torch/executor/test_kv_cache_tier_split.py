@@ -65,6 +65,11 @@ def test_no_attribution_or_no_cached_tokens_gives_empty_dict():
     assert split_cached_tokens_by_tier([(GPU, 8)], 0) == {}
 
 
+def test_segments_not_covering_the_cached_prefix_give_no_attribution():
+    """A breakdown that explains only part of cached_tokens is dropped rather than reported."""
+    assert split_cached_tokens_by_tier([(GPU, 32)], 40) == {}
+
+
 def test_remote_and_none_tiers_round_trip():
     segments = [(REMOTE, 128), (NONE, 16)]
     assert split_cached_tokens_by_tier(segments, 144) == {"remote": 128, "none": 16}

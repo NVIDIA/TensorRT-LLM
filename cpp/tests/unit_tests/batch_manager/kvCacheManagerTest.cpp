@@ -2672,7 +2672,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerReuseTierAttributionGpuTest)
     // One run of 11 gpu tokens, matching the prepopulated length.
     auto const& segments = llmRequest1->getReuseTierSegments();
     ASSERT_EQ(segments.size(), 1U);
-    EXPECT_EQ(segments[0].first, static_cast<std::int8_t>(KvCacheTier::kGPU));
+    EXPECT_EQ(segments[0].first, static_cast<std::int8_t>(KvCacheTier::kGpu));
     EXPECT_EQ(segments[0].second, llmRequest1->getPrepopulatedPromptLen());
 
     // Deltas were consumed by the previous read.
@@ -2755,9 +2755,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerReuseTierAttributionHostTest)
     // Segments follow prompt order: 4 gpu tokens, then 4 host tokens, summing to the prepopulated length.
     auto const& segments = llmRequest2->getReuseTierSegments();
     ASSERT_EQ(segments.size(), 2U);
-    EXPECT_EQ(segments[0].first, static_cast<std::int8_t>(KvCacheTier::kGPU));
+    EXPECT_EQ(segments[0].first, static_cast<std::int8_t>(KvCacheTier::kGpu));
     EXPECT_EQ(segments[0].second, tokensPerBlock);
-    EXPECT_EQ(segments[1].first, static_cast<std::int8_t>(KvCacheTier::kHOST));
+    EXPECT_EQ(segments[1].first, static_cast<std::int8_t>(KvCacheTier::kHost));
     EXPECT_EQ(segments[1].second, tokensPerBlock);
     SizeType32 numAttributedTokens = 0;
     for (auto const& [tier, numTokens] : segments)

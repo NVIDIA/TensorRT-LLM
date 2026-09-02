@@ -802,8 +802,7 @@ class PyExecutor:
         # Drain the per-iteration KV cache deltas accumulated during warmup so the
         # first reported iteration stats (and the Prometheus counters fed from
         # them) only cover real traffic, matching the baselined cumulative counters.
-        if self.kv_cache_manager is not None and hasattr(
-                self.kv_cache_manager, 'get_iteration_stats'):
+        if self.kv_cache_manager is not None:
             self.kv_cache_manager.get_iteration_stats()
 
         self.is_shutdown = False

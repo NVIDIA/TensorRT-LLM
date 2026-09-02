@@ -246,7 +246,7 @@ matched, before any copy back to GPU**, and exports two additional Prometheus co
 |---|---|---|---|
 | `gpu` | block resident in GPU memory when matched | primary pool | `GPU_MEM` tier |
 | `host` | block in the host (secondary) pool when matched, copied back to GPU for this request | secondary pool, transfer mode `DRAM` | `HOST_MEM` tier |
-| `disk` | block stored in a file when matched | secondary pool with `KvCacheTransferMode` `GDS` / `POSIX_DEBUG_FALLBACK` (executor API only) | `DISK` tier |
+| `disk` | block stored in a file when matched | secondary pool with `KvCacheTransferMode` `GDS` / `POSIX_DEBUG_FALLBACK` (executor API only); the mode of the request that hits the block is assumed to be the mode that offloaded it, i.e. one transfer mode per deployment | `DISK` tier |
 | `remote` | whole blocks provided by the KV cache connector (external store) | connector-matched blocks | not yet supported (connector not available on V2) |
 | `none` | tokens skipped by prefix reuse whose KV was never loaded from any tier, i.e. blocks outside every sliding attention window of the model | SWA out-of-window anchors | stale sliding-window blocks |
 
@@ -255,8 +255,8 @@ because the model does not recompute them, but no block is loaded, so they never
 counter.
 
 The same split is also available per request in the OpenAI-compatible response as
-`usage.prompt_tokens_details.cached_tokens_details` (a `{tier: tokens}` map, omitted when the engine
-did not attribute the request) and in the `kvCacheStats` / `kvCacheIterationStats` sections of the
+`usage.prompt_tokens_details.cached_tokens_details` (a `{tier: tokens}` map, absent from the response
+when the engine did not attribute the request) and in the `kvCacheStats` / `kvCacheIterationStats` sections of the
 iteration statistics (`reusedBlocksGpu`, `reusedBlocksHost`, `reusedBlocksDisk`, `reusedBlocksRemote`
 and their `iter*` counterparts).
 
@@ -276,9 +276,11 @@ and their `iter*` counterparts).
   prompt token). With variable sliding-window attention the attribution follows the window that
   determined the number of skipped tokens.
 - Disaggregated serving: prefix reuse happens on the context worker, so that is where the tier counters
-  move. The generation worker receives the prompt KV by transfer, which is neither a hit nor a miss;
-  its own counters do not change. The context worker's split travels with the request and is reported
-  in the final response's `usage.prompt_tokens_details.cached_tokens_details`.
+  move. The generation worker receives the prompt KV by transfer: no tier counter moves there and its
+  requests carry no attribution of their own. The context worker's split travels with the request in
+  the KV-transfer auxiliary buffer and is reported in the final response's
+  `usage.prompt_tokens_details.cached_tokens_details`; context and generation workers must run the same
+  TensorRT-LLM version (the auxiliary buffer layout is not versioned).
 - `remote` also moves connector-provided whole blocks from the miss count to the reuse count of the
   aggregate metrics, so `trtllm_kv_cache_hit_rate` reflects avoided recomputation when a connector is
   used.

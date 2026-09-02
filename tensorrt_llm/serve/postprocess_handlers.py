@@ -64,11 +64,11 @@ from .tool_parser.tool_parser_factory import ToolParserFactory
 
 def _prompt_tokens_details(rsp: GenerationResult) -> PromptTokensDetails:
     """Usage details for one result: cached prompt tokens plus their storage-tier split when known."""
-    return PromptTokensDetails(
-        cached_tokens=rsp.cached_tokens,
-        cached_tokens_details=(dict(rsp.cached_tokens_by_tier)
-                               if rsp.cached_tokens_by_tier else None),
-    )
+    details = PromptTokensDetails(cached_tokens=rsp.cached_tokens)
+    cached_tokens_by_tier = getattr(rsp, "cached_tokens_by_tier", None)
+    if cached_tokens_by_tier:
+        details.cached_tokens_details = cached_tokens_by_tier
+    return details
 
 
 def _ctx_usage_from_outputs(outputs: List[Any]) -> Optional[UsageInfo]:
@@ -927,6 +927,7 @@ def chat_harmony_post_processor(
         model=args.model,
         num_prompt_tokens=args.num_prompt_tokens,
         cached_tokens=rsp.cached_tokens,
+        cached_tokens_details=getattr(rsp, "cached_tokens_by_tier", None),
     )
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     rewrite_usage_response_from_ctx(response, ctx_usage)
@@ -943,11 +944,15 @@ def chat_harmony_streaming_post_processor(
     # args.request_id is always None with num_postprocess_workers > 0.
     prompt_tokens = args.num_prompt_tokens
     cached_tokens = rsp.cached_tokens
+    cached_tokens_details = getattr(rsp, "cached_tokens_by_tier", None)
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     ctx_prompt_tokens, ctx_cached_tokens = get_usage_tokens_from_ctx(ctx_usage)
     if ctx_prompt_tokens is not None:
         prompt_tokens = ctx_prompt_tokens
         cached_tokens = ctx_cached_tokens
+        ctx_details = ctx_usage.prompt_tokens_details
+        cached_tokens_details = (ctx_details.cached_tokens_details
+                                 if ctx_details is not None else None)
     stream_response_id, stream_created = _ensure_stream_metadata(
         args, rsp, "chatcmpl")
     response = handle_streaming_response(
@@ -961,6 +966,7 @@ def chat_harmony_streaming_post_processor(
         first_iteration=args.first_iteration,
         stream_options=args.stream_options,
         cached_tokens=cached_tokens,
+        cached_tokens_details=cached_tokens_details,
         stream_response_id=stream_response_id,
         stream_created=stream_created,
     )

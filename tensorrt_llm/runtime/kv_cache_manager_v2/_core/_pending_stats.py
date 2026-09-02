@@ -175,7 +175,7 @@ class _PendingStats:
         *,
         full_reused_blocks: int,
         partial_reused_blocks: int,
-        reused_blocks_by_tier: tuple[int, int, int, int] = (0, 0, 0, 0),
+        reused_blocks_by_tier: tuple[int, int, int, int],
         record_manager_stats: bool,
         record_request_stats: bool,
     ) -> bool:

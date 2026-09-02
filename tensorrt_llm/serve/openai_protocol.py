@@ -48,7 +48,7 @@ from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field, PositiveInt,
-                      field_validator, model_validator)
+                      field_validator, model_serializer, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -158,8 +158,15 @@ class PromptTokensDetails(OpenAIBaseModel):
     cached_tokens: int = 0
     # cached_tokens split by the storage tier that served them
     # (gpu / host / disk / remote / none, see tensorrt_llm.metrics.enums.CACHE_TIER_LABELS).
-    # Omitted when the engine did not attribute the reused prefix to tiers.
+    # Omitted from the wire when the engine did not attribute the reused prefix to tiers.
     cached_tokens_details: Optional[Dict[str, int]] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_details(self, handler):
+        data = handler(self)
+        if data.get("cached_tokens_details") is None:
+            data.pop("cached_tokens_details", None)
+        return data
 
 
 class UsageInfo(OpenAIBaseModel):

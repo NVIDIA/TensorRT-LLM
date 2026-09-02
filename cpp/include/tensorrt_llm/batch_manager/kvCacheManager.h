@@ -72,11 +72,11 @@ static constexpr SizeType32 kSecondaryLevel = 1;
 //! The numeric values are shared with the Python side (tensorrt_llm/metrics/enums.py, CACHE_TIER_LABELS).
 enum class KvCacheTier : std::int8_t
 {
-    kGPU = 0,    //!< block resident in the primary (GPU) pool
-    kHOST = 1,   //!< block in the secondary pool backed by host memory (transfer mode DRAM)
-    kDISK = 2,   //!< block in the secondary pool backed by a file (transfer mode GDS / POSIX)
-    kREMOTE = 3, //!< tokens provided by the KV cache connector (external store)
-    kNONE = 4,   //!< tokens skipped by reuse but with no KV loaded from any tier (SWA out-of-window anchors)
+    kGpu = 0,    //!< block resident in the primary (GPU) pool
+    kHost = 1,   //!< block in the secondary pool backed by host memory (transfer mode DRAM)
+    kDisk = 2,   //!< block in the secondary pool backed by a file (transfer mode GDS / POSIX)
+    kRemote = 3, //!< tokens provided by the KV cache connector (external store)
+    kNone = 4,   //!< tokens skipped by reuse but with no KV loaded from any tier (SWA out-of-window anchors)
 };
 
 // Extra block buffer allocated for SWA to be able to always keep "window size"
@@ -1120,6 +1120,8 @@ public:
     //! \brief Number of reused blocks that were served from \p tier (gpu, host, disk or remote) when matched.
     [[nodiscard]] SizeType32 getNumReusedBlocksByTier(KvCacheTier tier) const
     {
+        TLLM_CHECK_WITH_INFO(
+            tier != KvCacheTier::kNone, "kNone is a token-only tier, blocks are never attributed to it");
         return mReusedBlocksByTier.at(static_cast<size_t>(tier));
     }
 
@@ -1483,7 +1485,7 @@ private:
     // Number of blocks that were reused (full + partial, context phase)
     SizeType32 mReusedBlocks;
     // mReusedBlocks split by the storage tier the block was served from when matched, indexed by KvCacheTier
-    // (kGPU..kREMOTE); the four entries sum to mReusedBlocks.
+    // (kGpu..kRemote); the four entries sum to mReusedBlocks.
     std::array<SizeType32, 4> mReusedBlocksByTier{};
     // Number of unique blocks that were reused
     SizeType32 mReusedUniqueBlocks;
@@ -2500,10 +2502,10 @@ public:
         kvCacheStats.allocNewBlocks = getNumAllocNewBlocks();
         kvCacheStats.reusedBlocks = getNumReusedBlocks();
         kvCacheStats.missedBlocks = getNumMissedBlocks();
-        kvCacheStats.reusedBlocksGpu = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kGPU);
-        kvCacheStats.reusedBlocksHost = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kHOST);
-        kvCacheStats.reusedBlocksDisk = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kDISK);
-        kvCacheStats.reusedBlocksRemote = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kREMOTE);
+        kvCacheStats.reusedBlocksGpu = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kGpu);
+        kvCacheStats.reusedBlocksHost = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kHost);
+        kvCacheStats.reusedBlocksDisk = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kDisk);
+        kvCacheStats.reusedBlocksRemote = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kRemote);
         kvCacheStats.cacheHitRate = kvCacheStats.reusedBlocks == 0 ? 0
                                                                    : static_cast<float>(kvCacheStats.reusedBlocks)
                 / static_cast<float>(kvCacheStats.reusedBlocks + kvCacheStats.missedBlocks);

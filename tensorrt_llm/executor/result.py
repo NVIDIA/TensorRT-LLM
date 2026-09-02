@@ -731,7 +731,7 @@ class GenerationResultBase:
                 self.cached_tokens
             if self.cached_tokens_by_tier:
                 metrics_stats[MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER] = \
-                    dict(self.cached_tokens_by_tier)
+                    self.cached_tokens_by_tier
 
             spec_dec_logged = False
             if self.per_pos_drafted is not None and any(

@@ -26,11 +26,12 @@ def split_cached_tokens_by_tier(
 
     ``segments`` are the ordered ``(tier index, num tokens)`` runs a KV cache manager recorded when
     the request's prefix was matched (indices follow ``CACHE_TIER_LABELS``). ``num_tokens`` is the
-    request's latched ``cached_tokens``: a prefix of the matched tokens (both come from the same
+    request's latched ``cached_tokens``, a prefix of the matched tokens (both come from the same
     ``prepopulated_prompt_len``), so the returned counts sum to ``num_tokens``. Returns an empty dict
-    when no attribution is available or nothing was cached.
+    when nothing was cached or when no attribution covering the cached prefix is available; a
+    partial breakdown is never reported.
     """
-    if not segments or num_tokens <= 0:
+    if not segments or num_tokens <= 0 or sum(tokens for _, tokens in segments) < num_tokens:
         return {}
     by_tier: dict[str, int] = {}
     remaining = num_tokens

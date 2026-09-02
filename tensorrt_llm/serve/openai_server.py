@@ -2459,9 +2459,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 completion_tokens=num_gen_tokens,
                 total_tokens=num_gen_tokens + num_prompt_tokens,
                 prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=num_cached_tokens,
-                    cached_tokens_details=cached_tokens_details or None),
+                    cached_tokens=num_cached_tokens),
             )
+            if cached_tokens_details:
+                usage_info.prompt_tokens_details.cached_tokens_details = cached_tokens_details
             merged_rsp = CompletionResponse(
                 model=self.model,
                 choices=all_choices,

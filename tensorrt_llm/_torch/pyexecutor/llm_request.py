@@ -1123,6 +1123,19 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self._cached_tokens_set = True
 
     @property
+    def py_reuse_tier_segments(self) -> Optional[List[Tuple[int, int]]]:
+        """Ordered ``(tier, num tokens)`` runs the KV cache manager recorded for the reused prefix."""
+        return self._reuse_tier_segments
+
+    @py_reuse_tier_segments.setter
+    def py_reuse_tier_segments(self, segments: Optional[List[Tuple[int, int]]]):
+        # The attribution must describe the match that produced the latched cached_tokens: a
+        # sequence re-added after preemption keeps its original split, and a disaggregated
+        # generation request receives its prompt KV by transfer, not from a local match.
+        if not self._cached_tokens_set and not self.is_disagg_generation_init_state:
+            self._reuse_tier_segments = segments
+
+    @property
     def cached_tokens_by_tier(self) -> Dict[str, int]:
         """``cached_tokens`` split by the storage tier that served them.
 
@@ -1131,7 +1144,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         recorded when the prefix was matched, so it is empty until the manager reports them
         (e.g. requests whose KV arrives by disaggregated transfer, or managers without tier support).
         """
-        return split_cached_tokens_by_tier(self.py_reuse_tier_segments,
+        return split_cached_tokens_by_tier(self._reuse_tier_segments,
                                            self._cached_tokens)
 
     def _initialize_execution_state(self,
@@ -1187,7 +1200,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self._cached_tokens = 0
         self._cached_tokens_set = False
         # Set by the KV cache manager when the prefix is matched; see cached_tokens_by_tier.
-        self.py_reuse_tier_segments: Optional[List[Tuple[int, int]]] = None
+        self._reuse_tier_segments: Optional[List[Tuple[int, int]]] = None
 
     def reset_for_recompute(self, max_input_len: int) -> None:
         """Reset Python-side execution state so the request can replay prefill."""
