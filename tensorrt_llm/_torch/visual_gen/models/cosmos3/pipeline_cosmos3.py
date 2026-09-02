@@ -932,6 +932,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     def infer(self, req):
         extra_params = req.params.extra_params or {}
+        if extra_params.get("view_point") is not None:
+            logger.warning(
+                "Cosmos3 extra_params['view_point'] is deprecated and ignored; "
+                "supply any trained structured action caption directly in the request prompt."
+            )
         output_type = extra_params.get("output_type", "video")
         is_t2i = str(output_type).lower() == "image"
         transfer_config = resolve_transfer_config(extra_params, req.params, req.prompt)

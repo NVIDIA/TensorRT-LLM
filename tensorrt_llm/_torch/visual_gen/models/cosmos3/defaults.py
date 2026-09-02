@@ -866,6 +866,14 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         # No range: the buckets are not an interval, and validation stops at the
         # literal check anyway.
     ),
+    "view_point": ExtraParamSchema(
+        type="Literal['ego_view', 'third_person_view', 'wrist_view', 'concat_view']",
+        default=None,
+        description=(
+            "Deprecated compatibility parameter; accepted and ignored. Supply any "
+            "trained structured action caption directly in the request prompt."
+        ),
+    ),
     "action_fps": ExtraParamSchema(
         type="float",
         default=None,

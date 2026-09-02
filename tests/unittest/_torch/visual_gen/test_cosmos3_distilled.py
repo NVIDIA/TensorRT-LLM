@@ -427,6 +427,20 @@ class TestInferModeResolution:
         for field in ("height", "width", "num_inference_steps", "guidance_scale", "frame_rate"):
             assert got[field] is None, field
 
+    def test_deprecated_view_point_warns_and_is_not_forwarded(self):
+        req = _fake_request(
+            "video",
+            extra_params={"action_mode": "policy", "view_point": "ego_view"},
+        )
+        with patch(
+            "tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3.logger.warning"
+        ) as warning:
+            got = self._captured_forward_kwargs(_bare_pipeline(), req)
+
+        warning.assert_called_once()
+        assert "deprecated and ignored" in warning.call_args.args[0]
+        assert "view_point" not in got
+
     def test_video_keeps_its_materialised_frame_rate(self):
         """Only action drops it: the serve layer derives num_frames from
         seconds x frame_rate, so the video default has to stay materialised."""

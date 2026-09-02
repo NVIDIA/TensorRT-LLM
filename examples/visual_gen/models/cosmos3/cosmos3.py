@@ -442,6 +442,16 @@ def main():
         help="Action-token temporal rate for mRoPE (Hz). Defaults to frame_rate.",
     )
     parser.add_argument(
+        "--view_point",
+        type=str,
+        default=None,
+        choices=["ego_view", "third_person_view", "wrist_view", "concat_view"],
+        help=(
+            "Deprecated compatibility option; accepted and ignored. Supply the trained "
+            "structured action caption through --prompt or --prompt_file."
+        ),
+    )
+    parser.add_argument(
         "--action_output_path",
         type=str,
         default=None,
@@ -518,6 +528,8 @@ def main():
         params.extra_params["action_resolution"] = args.action_resolution
     if args.action_fps is not None:
         params.extra_params["action_fps"] = args.action_fps
+    if args.view_point is not None:
+        params.extra_params["view_point"] = args.view_point
     if args.action_json is not None:
         with open(args.action_json, encoding="utf-8") as f:
             params.extra_params["action"] = json.load(f)
