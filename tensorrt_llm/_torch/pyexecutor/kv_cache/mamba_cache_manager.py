@@ -2945,8 +2945,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     _supports_additional_snapshot_offsets = True
     # Recurrent-state snapshots use a specialized commit/history protocol, so
-    # stay on the existing unpaired draft allocation path.
-    _supports_joint_kv_cache_reuse = False
+    # keep main-like reuse endpoints and the existing unpaired draft path.
+    _supports_reuse_match_backoff = False
 
     # Qwen4-Exp PLE state is opt-in. These class-level defaults keep every other
     # model — and any partially-constructed instance that sets only the fields it
