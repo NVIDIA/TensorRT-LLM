@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
@@ -20,6 +21,7 @@ from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
 from .cache_manager import is_dsa_cache_manager
+from .fused_metadata import fused_dsa_decode_metadata
 from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
     Indexer,
@@ -40,6 +42,21 @@ _INDEXER_LOGITS_DTYPE = torch.float32
 if TYPE_CHECKING:
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
+
+
+@functools.lru_cache(maxsize=1)
+def _fused_dsa_meta_enabled() -> bool:
+    """Read the fused-DSA-metadata env gate (once, process-constant).
+
+    ``TRTLLM_FUSED_DSA_METADATA=1`` replaces the eager slot-mapping + gen-indptr
+    chain in on_update_kv_lens with one fused Triton launch (see
+    fused_metadata.py); any other value keeps the eager chain.
+
+    Cached so the gate is fixed for the whole process: a mid-run flip would
+    otherwise let the first fused launch happen inside CUDA-graph capture,
+    voiding the "pre-compiled at warmup" capture-safety guarantee.
+    """
+    return os.environ.get("TRTLLM_FUSED_DSA_METADATA", "0") == "1"
 
 
 def build_req_idx_per_token(seq_lens: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -441,13 +458,33 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # transform_local_topk_and_prepare_pool_view() call.
         self._invalidate_pool_view_cache()
 
+        # Optional fused path: collapse the eager DSA decode-metadata chain
+        # (req_idx_per_token + slot mappings + the two gen indptr cumsums) into
+        # one fused Triton launch. Only for the pure-decode/generation step
+        # (num_contexts == 0); see fused_metadata.py and
+        # _run_fused_dsa_decode_metadata().
+        #
+        # The fused kernel produces the five shared decode-metadata outputs but
+        # NOT token_positions_cuda, which the eager slot block writes only when
+        # use_fp8_ds_mla is set (consumed by the FlashInfer sparse-attention
+        # paths for RoPE). Exclude that cache mode so the fused path never leaves
+        # it stale; those configs keep the eager chain.
+        fused_eligible = (
+            _fused_dsa_meta_enabled()
+            and self.kv_cache_manager is not None
+            and self.num_tokens > 0
+            and self.num_generations > 0
+            and self.num_contexts == 0
+            and not self.use_fp8_ds_mla
+        )
+
         # The draft loop can rewrite seq_lens after prepare() built this map.
-        if self.num_tokens > 0:
+        if self.num_tokens > 0 and not fused_eligible:
             self.req_idx_per_token[: self.num_tokens] = build_req_idx_per_token(
                 self.seq_lens_cuda[: self.num_seqs], self.num_tokens
             ).to(self.req_idx_per_token.dtype)
 
-        if self.kv_cache_manager is not None and self.num_tokens > 0:
+        if self.kv_cache_manager is not None and self.num_tokens > 0 and not fused_eligible:
             seq_lens = self.seq_lens_cuda[: self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
             start_positions = self.kv_lens_cuda[: self.num_seqs] - seq_lens
@@ -480,21 +517,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.slot_mapping_scale[: self.num_tokens] = scale_indices
 
         if self.num_generations > 0:
-            torch.cumsum(
-                self.kv_lens_cuda[self.num_contexts : self.num_seqs],  # num_contexts should be 0
-                dim=0,
-                dtype=torch.int64,
-                out=self.gen_kv_indptr[1 : self.num_generations + 1],
-            )
-            torch.cumsum(
-                (
-                    self.kv_lens_cuda[self.num_contexts : self.num_seqs]
-                    - self.seq_lens_cuda[self.num_contexts : self.num_seqs]
-                ),
-                dim=0,
-                dtype=torch.int64,
-                out=self.gen_cached_token_indptr[1 : self.num_generations + 1],
-            )
+            if not fused_eligible:
+                torch.cumsum(
+                    self.kv_lens_cuda[
+                        self.num_contexts : self.num_seqs
+                    ],  # num_contexts should be 0
+                    dim=0,
+                    dtype=torch.int64,
+                    out=self.gen_kv_indptr[1 : self.num_generations + 1],
+                )
+                torch.cumsum(
+                    (
+                        self.kv_lens_cuda[self.num_contexts : self.num_seqs]
+                        - self.seq_lens_cuda[self.num_contexts : self.num_seqs]
+                    ),
+                    dim=0,
+                    dtype=torch.int64,
+                    out=self.gen_cached_token_indptr[1 : self.num_generations + 1],
+                )
             gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
             gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
             self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
@@ -543,8 +583,55 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True
                 )
+
+        if fused_eligible:
+            if not getattr(self, "_fused_dsa_meta_armed", False):
+                logger.info(
+                    "[TRTLLM_FUSED_DSA_METADATA] fused DSA decode-metadata "
+                    f"kernel armed (num_seqs={self.num_seqs}, "
+                    f"num_tokens={self.num_tokens})."
+                )
+                self._fused_dsa_meta_armed = True
+            self._run_fused_dsa_decode_metadata()
+
         self._compute_kv_lens_row_reorder()
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
+
+    def _run_fused_dsa_decode_metadata(self):
+        """Fill req_idx_per_token + slot mappings + gen indptrs via one Triton
+        launch (see fused_metadata.py), replacing the eager chain for the
+        pure-decode step. Capture-safe: the launch is pre-compiled at warmup and
+        replays inside the decode CUDA graph."""
+        num_tokens = self.num_tokens
+        num_seqs = self.num_seqs
+        # The fused header writes gen_*_indptr[1 : num_seqs + 1] while the eager
+        # chain writes [1 : num_generations + 1]; they coincide only because the
+        # eligibility gate requires num_contexts == 0 (=> num_seqs ==
+        # num_generations). Pin that coupling down explicitly.
+        assert num_seqs == self.num_generations, (
+            f"fused DSA metadata expects num_seqs ({num_seqs}) == "
+            f"num_generations ({self.num_generations})"
+        )
+        index_head_dim = self.kv_cache_manager.index_head_dim
+        use_fp4 = getattr(self.kv_cache_manager, "use_fp4", False)
+        data_bytes_per_token = index_head_dim // 2 if use_fp4 else index_head_dim
+
+        fused_dsa_decode_metadata(
+            self.seq_lens_cuda[:num_seqs],
+            self.kv_lens_cuda[:num_seqs],
+            self.indexer_k_cache_block_offsets[:num_seqs],
+            self.req_idx_per_token[:num_tokens],
+            self.slot_mapping_fp8[:num_tokens],
+            self.slot_mapping_scale[:num_tokens],
+            self.gen_kv_indptr[: num_seqs + 1],
+            self.gen_cached_token_indptr[: num_seqs + 1],
+            num_tokens=num_tokens,
+            max_query_len=1 + self.max_draft_tokens,
+            tokens_per_block=self._tokens_per_block,
+            index_head_dim=index_head_dim,
+            quant_block_size=self.kv_cache_manager.quant_block_size,
+            data_bytes_per_token=data_bytes_per_token,
+        )
 
     def _compute_kv_lens_row_reorder(self) -> None:
         """Prepare the longest-job-first GVR row order once per forward step."""
