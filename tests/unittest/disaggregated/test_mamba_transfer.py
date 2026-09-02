@@ -567,7 +567,7 @@ def run_mamba_transfer_test(
             llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
         )
         gen_req.py_disaggregated_params = DisaggregatedParams(
-            ctx_request_id=ctx_rid,
+            ctx_request_id=unique_rid,
             ctx_dp_rank=0,
             ctx_info_endpoint=ctx_endpoint,
             disagg_request_id=unique_rid,

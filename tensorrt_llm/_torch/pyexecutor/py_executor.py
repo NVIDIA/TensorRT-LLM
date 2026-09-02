@@ -208,6 +208,13 @@ _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 
+# With in-flight cancellation inactive, a timed-out context transfer is
+# observe-only: the receiver that gave up is expected to request the abort
+# itself. Past this multiple of kv_transfer_timeout_ms with still no word from
+# the receiver (crashed, never scheduled, abort message lost), the sender
+# assumes the peer is gone and reclaims the request locally.
+_DISAGG_CTX_TRANSFER_ABANDON_MULTIPLIER = 3
+
 # How many executor iterations between KV pool rebalance checks.  The V2
 # auto-tuner rate-limits itself to one adjustment per 120s, so a check every
 # iteration is pure overhead -- and under TP each check costs a broadcast (see
@@ -6845,14 +6852,6 @@ class PyExecutor:
             self._disagg_inflight_cancel_unsupported_logged = True
         return False
 
-    def _request_remote_kv_transfer_abort(self, request: LlmRequest) -> None:
-        """Best-effort abort request to the peer; failures are retried later."""
-        try:
-            self.kv_cache_transceiver.request_remote_abort(request)
-        except Exception as error:
-            logger.warning(f"KV transfer abort request failed for request "
-                           f"{request.py_request_id}: {error}")
-
     def _request_kv_transfer_cancellation(self, request: LlmRequest) -> bool:
         """Best-effort cancellation that leaves ownership intact on errors."""
         try:
@@ -6981,10 +6980,6 @@ class PyExecutor:
                     f"cache transfer timeout: elapsed {elapsed_time:.0f}ms > "
                     f"kv_transfer_timeout_ms={timeout_ms}ms")
                 req.py_kv_transfer_timed_out = True
-                if type == "generation":
-                    # Only the sender can end this transfer, and it may not know
-                    # the request exists. Ask it rather than decide locally.
-                    self._request_remote_kv_transfer_abort(req)
 
         # Context requests start their clock on the last chunk, which is also when
         # they enter the transfer manager, so this covers the whole context side.
@@ -7797,9 +7792,10 @@ class PyExecutor:
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
             self._end_transfer_and_maybe_terminate(request)
 
-        # Otherwise observe-only, matching the C++ transceiver: this deadline
-        # spans the receiver's admission wait, so expiry does not mean the peer
-        # is gone. A receiver that gave up asks for the abort itself.
+        # Otherwise observe-only until the abandon deadline, matching the C++
+        # transceiver: this deadline spans the receiver's admission wait, so
+        # expiry does not mean the peer is gone. A receiver that gave up asks
+        # for the abort itself.
         if self._is_disagg_inflight_cancel_active():
             # The set of requests in transfer may have changed since we
             # terminated some requests.
@@ -7820,6 +7816,39 @@ class PyExecutor:
                 logger.warning(f"Cancelled timed-out context KV transfer for "
                                f"request {request.py_request_id}; waiting for "
                                "C++ transfer status to report final cleanup")
+        elif self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+            # Sender-local last resort: waiting on the receiver's abort leaves
+            # no owner when the receiver crashed, was never scheduled, or its
+            # abort message was lost. Past the abandon deadline, reclaim the
+            # request locally with the legacy timeout cleanup.
+            timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
+            abandon_after_s = (timeout_ms *
+                               _DISAGG_CTX_TRANSFER_ABANDON_MULTIPLIER) / 1000.0
+            current_time = time.monotonic()
+            requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
+            )
+            for request_id in list(requests_in_transfer.keys()):
+                request = requests_in_transfer[request_id]
+                if (not request.py_kv_transfer_timed_out
+                        or request_id in completed_req_ids
+                        or request.py_kv_transfer_start_time is None):
+                    continue
+                elapsed_s = current_time - request.py_kv_transfer_start_time
+                if elapsed_s < abandon_after_s:
+                    continue
+
+                # Mid-write transfers are left alone; retried next iteration.
+                if not self._request_kv_transfer_cancellation(request):
+                    continue
+
+                logger.warning(
+                    f"Reclaiming abandoned context KV transfer for request "
+                    f"{request.py_request_id}: no receiver abort after "
+                    f"{elapsed_s * 1000:.0f}ms "
+                    f"(> {abandon_after_s * 1000:.0f}ms)")
+                request.py_kv_transfer_start_time = None
+                request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+                self._end_transfer_and_maybe_terminate(request)
 
         self._check_cache_transfer_errors("context requests")
 

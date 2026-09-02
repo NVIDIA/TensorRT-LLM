@@ -420,10 +420,6 @@ class KvCacheTransceiver(ABC):
         """
         raise NotImplementedError
 
-    def request_remote_abort(self, req: LlmRequest) -> None:
-        """Ask the peer to abort a transfer. No-op unless implemented."""
-        return None
-
     def supports_inflight_request_cancellation(self) -> bool:
         """Return True when in-flight transfers can be cancelled safely."""
         return False

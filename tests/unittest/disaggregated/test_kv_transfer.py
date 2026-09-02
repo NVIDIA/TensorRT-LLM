@@ -942,7 +942,7 @@ def add_and_verify_request(
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
     )
     gen_request.py_disaggregated_params = DisaggregatedParams(
-        ctx_request_id=ctx_request.py_request_id,
+        ctx_request_id=unique_rid,
         ctx_dp_rank=ctx_dp_rank,
         ctx_info_endpoint=ctx_info_endpoint,
         disagg_request_id=unique_rid,
@@ -1412,7 +1412,7 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
     )
     gen_request.py_disaggregated_params = DisaggregatedParams(
-        ctx_request_id=0,
+        ctx_request_id=unique_rid,
         ctx_dp_rank=0,
         ctx_info_endpoint=ctx_info_endpoint,
         disagg_request_id=unique_rid,
@@ -1840,7 +1840,7 @@ def test_session_has_transferring_tasks_false():
     )
     gen_request.py_disaggregated_params = DisaggregatedParams(
         disagg_request_id=unique_rid,
-        ctx_request_id=ctx_request.py_request_id,
+        ctx_request_id=unique_rid,
         schedule_style=1,
     )
 
@@ -1907,7 +1907,7 @@ def test_incompatible_peer_fails_only_affected_requests():
             llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
         )
         req.py_disaggregated_params = DisaggregatedParams(
-            ctx_request_id=request_id,
+            ctx_request_id=rid,
             ctx_dp_rank=0,
             ctx_info_endpoint=bad_endpoint,
             disagg_request_id=rid,
@@ -2162,6 +2162,60 @@ def test_transfer_worker_pipelined_unaligned_chunk_boundaries(
             worker.shutdown()
         for worker in setup["gen_transfer_workers"]:
             worker.shutdown()
+
+
+def _make_fanin_rx_session(expected_transfers):
+    """RxSession with one dispatched fan-in task; no GPU or worker needed."""
+    from unittest.mock import Mock
+
+    receiver = Mock()
+    receiver._bounce.is_bounced.return_value = False  # inline (non-bounced) result path
+    params = DisaggregatedParams(disagg_request_id=1234)
+    session = transfer_mod.RxSession(request_id=7, params=params, receiver=receiver)
+    task = transfer_mod.KVRecvTask(
+        unique_rid=1234, kv_slice=Mock(), slice_id=0, params=params, aux_slot=None
+    )
+    task.expected_transfers = expected_transfers
+    task.status = transfer_mod.TaskStatus.TRANSFERRING  # dispatched
+    session._kv_tasks.append(task)
+    return session, task
+
+
+def test_fanin_failed_writer_defers_resolution_until_drain():
+    """A failed writer must not resolve the task before the fan-in drains.
+
+    One writer's FAILED must not resolve the task while a sibling fan-in
+    writer may still be mid-write into the same KV blocks: the task resolves
+    only once every expected writer is terminal (drain-before-release).
+    """
+    session, task = _make_fanin_rx_session(expected_transfers=2)
+
+    session.process_kv_agent_result(
+        peer_rank=0, sender_slice_id=0, is_last_slice=True, status=transfer_mod.AgentResult.FAILED
+    )
+    # Not drained: the sibling writer is unaccounted for, guards must hold.
+    assert task.status == transfer_mod.TaskStatus.TRANSFERRING
+    assert session.has_transferring_tasks()
+    assert session.wait_complete(blocking=False) is None
+
+    session.process_kv_agent_result(
+        peer_rank=1, sender_slice_id=0, is_last_slice=True, status=transfer_mod.AgentResult.SUCCESS
+    )
+    # Drained (everything quiesced): resolves as failure, data is incomplete.
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    assert not session.has_transferring_tasks()
+    assert session.wait_complete(blocking=False) == WaitResult.FAILED
+
+
+def test_single_writer_failed_resolves_immediately():
+    session, task = _make_fanin_rx_session(expected_transfers=1)
+
+    session.process_kv_agent_result(
+        peer_rank=0, sender_slice_id=0, is_last_slice=True, status=transfer_mod.AgentResult.FAILED
+    )
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    assert session.status == SessionStatus.ERROR
+    assert session.wait_complete(blocking=False) == WaitResult.FAILED
 
 
 if __name__ == "__main__":
