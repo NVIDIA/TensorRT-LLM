@@ -255,8 +255,18 @@ def run_sanity_check(examples_path="../../examples"):
     create_link_for_models()
 
     print("##########  Test quickstart example  ##########")
+    # TEMPORARY diagnostic for https://nvbugspro.nvidia.com/bug/6646201: dump
+    # every thread's stack to stderr every 60s until the process exits, so a
+    # hang inside the ~20min silent window shows up directly in the Jenkins
+    # console log without needing to SSH/kubectl into the CI node. Remove
+    # once the root cause of the silent window is found.
+    quickstart_script = f"{examples_path}/llm-api/quickstart_example.py"
     subprocess.check_call(
-        f"python3 {examples_path}/llm-api/quickstart_example.py", shell=True)
+        "python3 -c \""
+        "import faulthandler, runpy; "
+        "faulthandler.dump_traceback_later(60, repeat=True); "
+        f"runpy.run_path('{quickstart_script}', run_name='__main__')\"",
+        shell=True)
 
 
 def install_system_libs():
