@@ -17,7 +17,6 @@
   "fp32_matmul_precision": "highest",
   "cudnn_allow_tf32": true,
   "lpips_net": "alex",
-  "lpips_threshold": 0.05,
   "measured_lpips_at_creation": 0.0,
   "threshold_rationale": "self-regeneration distance on the cutting host; threshold kept at the pre-existing gate for this test",
   "diffusers_version": "0.39.0",

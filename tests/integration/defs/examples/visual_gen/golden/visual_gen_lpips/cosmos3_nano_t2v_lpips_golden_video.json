@@ -18,7 +18,6 @@
   "fp32_matmul_precision": "highest",
   "cudnn_allow_tf32": true,
   "lpips_net": "alex",
-  "lpips_threshold": 0.2,
   "measured_lpips_at_creation": 0.0,
   "threshold_rationale": "relaxed KPI-backstop band (nvbugs/6655359): media is cut on the gating lane's own GPU (self-distance ~0), and the bar sits above the measured 9-frame cross-stepping floor (0.075, B300-cut media on B200) so a future CI GPU change does not force a re-cut; severe regressions (historical reds 0.45-0.61) still fire it.",
   "diffusers_version": "0.39.0",

@@ -20,7 +20,6 @@
   "fp32_matmul_precision": "highest",
   "cudnn_allow_tf32": true,
   "lpips_net": "alex",
-  "lpips_threshold": 0.15,
   "measured_lpips_at_creation": 0.0,
   "threshold_rationale": "relaxed KPI-backstop band (nvbugs/6655359): the bar sits above the measured cross-stepping floor - this B300-cut media scores LPIPS 0.0749 on the B200 lane that gates it - so the gate catches severe model regressions (historical reds 0.45-0.61), not GPU/kernel drift, and survives a CI GPU change without re-cutting media. Self-regeneration on the cutting host remains 0.0.",
   "diffusers_version": "0.39.0",
