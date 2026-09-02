@@ -5004,7 +5004,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             // never on the CBTS scope: `scopes` is the union of every fired
             // rule's scope, so a mixed selection (openengine source + any other
             // narrowing change) would push these pins into every shard it runs.
-            if (stageName.startsWith("CPU-Generic")) {
+            // Matched as a substring, like the Ray guard below: a stage name that
+            // picks up a prefix or suffix must keep matching, because a missed
+            // match here is a silent `importorskip` skip rather than a failure.
+            if (stageName.contains("CPU-Generic")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
             } else {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
