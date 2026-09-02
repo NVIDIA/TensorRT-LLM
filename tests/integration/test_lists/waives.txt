@@ -177,7 +177,6 @@ full:DGX_H100/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_blo
 full:DGX_H100/accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse SKIP (https://nvbugs/6707045)
 full:DGX_H100/accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_without_reuse_disable_overlap_scheduler SKIP (https://nvbugs/6704099)
 full:DGX_H100/accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_without_reuse_low_memory_available SKIP (https://nvbugs/6704103)
-full:DGX_H200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline] SKIP (https://nvbugs/6633931)
 full:GB200/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[ctx_block_reuse_only] SKIP (https://nvbugs/6525893)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy SKIP (https://nvbugs/6276923)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt SKIP (https://nvbugs/6276923)

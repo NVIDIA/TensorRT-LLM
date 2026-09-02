@@ -3636,7 +3636,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
-            moe_config = MoeConfig()
+            # Chunk MoE so its workspace fits alongside the KV cache, which is sized
+            # from a profile taken before that workspace is allocated (NVBug 6633931).
+            moe_config = MoeConfig(max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
             # Cap max_seq_len based on the evaluation task (NVBug 6476233).
