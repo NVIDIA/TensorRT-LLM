@@ -334,7 +334,10 @@ class ReportUtility:
             physical_idx = int(
                 cuda_visible.split(",")[0].strip()) if cuda_visible else 0
 
-            props = torch.cuda.get_device_properties(physical_idx)
+            # torch indexes into the visible device set, so the first visible
+            # GPU is always logical index 0; the physical index is only valid
+            # for NVML, which enumerates all devices on the node.
+            props = torch.cuda.get_device_properties(0)
             gpu_info = {
                 "name":
                 getattr(props, "name", "Unknown"),
