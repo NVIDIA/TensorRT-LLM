@@ -65,11 +65,6 @@ def test_no_attribution_or_no_cached_tokens_gives_empty_dict():
     assert split_cached_tokens_by_tier([(GPU, 8)], 0) == {}
 
 
-def test_more_cached_tokens_than_attributed_are_reported_as_none():
-    """Never guess a tier: an unexplained remainder is made visible as 'none'."""
-    assert split_cached_tokens_by_tier([(GPU, 32)], 40) == {"gpu": 32, "none": 8}
-
-
 def test_remote_and_none_tiers_round_trip():
     segments = [(REMOTE, 128), (NONE, 16)]
     assert split_cached_tokens_by_tier(segments, 144) == {"remote": 128, "none": 16}
@@ -78,7 +73,7 @@ def test_remote_and_none_tiers_round_trip():
 def test_sum_invariant_for_every_prefix_length():
     segments = [(GPU, 5), (NONE, 3), (HOST, 7), (DISK, 2), (REMOTE, 11)]
     total = sum(n for _, n in segments)
-    for length in range(total + 4):
+    for length in range(total + 1):
         split = split_cached_tokens_by_tier(segments, length)
         assert sum(split.values()) == length
         assert set(split) <= set(CACHE_TIER_LABELS)

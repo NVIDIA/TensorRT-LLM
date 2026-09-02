@@ -231,10 +231,6 @@ _TIER_INDEX_BY_CACHE_TIER: dict[CacheTier, int] = {
 _TIER_INDEX_NONE = 4
 
 
-def _cache_tier_index(tier: CacheTier) -> int:
-    return _TIER_INDEX_BY_CACHE_TIER[tier]
-
-
 def _build_reuse_tier_segments(
     block_levels: list[int],
     cache_tiers: Sequence[CacheTier],
@@ -253,7 +249,7 @@ def _build_reuse_tier_segments(
             break
         tokens = min(tokens_per_block, remaining)
         remaining -= tokens
-        tier = _TIER_INDEX_NONE if level < 0 else _cache_tier_index(cache_tiers[level])
+        tier = _TIER_INDEX_NONE if level < 0 else _TIER_INDEX_BY_CACHE_TIER[cache_tiers[level]]
         if segments and segments[-1][0] == tier:
             segments[-1] = (tier, segments[-1][1] + tokens)
         else:
@@ -2227,7 +2223,7 @@ class _KVCache:
                         partial_reused_blocks = 1
                         counted = True
                     if counted:
-                        reused_by_tier[_cache_tier_index(cache_tiers[level])] += 1
+                        reused_by_tier[_TIER_INDEX_BY_CACHE_TIER[cache_tiers[level]]] += 1
             if record_shared_stats and is_attn:
                 changed = self._pending_stats.record_reuse(
                     lc_idx,

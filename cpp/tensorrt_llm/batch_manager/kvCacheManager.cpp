@@ -2237,7 +2237,6 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         SizeType32 const preNewBlocks = mAllocNewBlocks;
         SizeType32 const preReused = mReusedBlocks;
         SizeType32 const preMissed = mMissedBlocks;
-        auto const preReusedByTier = mReusedBlocksByTier;
 
         results[i].prepopulatedLen = onboardAndAllocateBlocks(
             *sequences[i], llmRequests[i].get(), claimResults[i], isEnableBlockReuse, results[i].tierSegments);
@@ -2246,10 +2245,6 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         results[i].allocNewDelta = mAllocNewBlocks - preNewBlocks;
         results[i].reusedDelta = mReusedBlocks - preReused;
         results[i].missedDelta = mMissedBlocks - preMissed;
-        for (size_t tierIdx = 0; tierIdx < preReusedByTier.size(); ++tierIdx)
-        {
-            results[i].reusedByTierDelta[tierIdx] = mReusedBlocksByTier[tierIdx] - preReusedByTier[tierIdx];
-        }
     }
 
     // No deferred release needed: non-leaf copy sources are released in Phase 2

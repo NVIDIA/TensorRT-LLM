@@ -2035,6 +2035,10 @@ class PyExecutor:
             kv_stats_to_save.reused_blocks = kv_stats.reused_blocks
             kv_stats_to_save.missed_blocks = kv_stats.missed_blocks
             kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
+            kv_stats_to_save.reused_blocks_gpu = kv_stats.reused_blocks_gpu
+            kv_stats_to_save.reused_blocks_host = kv_stats.reused_blocks_host
+            kv_stats_to_save.reused_blocks_disk = kv_stats.reused_blocks_disk
+            kv_stats_to_save.reused_blocks_remote = kv_stats.reused_blocks_remote
             stats.kv_cache_stats = kv_stats_to_save
 
             # Collect per-iteration stats (with deltas) at configured interval.

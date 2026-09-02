@@ -78,7 +78,6 @@ enum class KvCacheTier : std::int8_t
     kREMOTE = 3, //!< tokens provided by the KV cache connector (external store)
     kNONE = 4,   //!< tokens skipped by reuse but with no KV loaded from any tier (SWA out-of-window anchors)
 };
-static constexpr SizeType32 kNumKvCacheTiers = 5;
 
 // Extra block buffer allocated for SWA to be able to always keep "window size"
 // tokens held in the blocks.
@@ -960,8 +959,6 @@ public:
         SizeType32 allocNewDelta{0};
         SizeType32 reusedDelta{0};
         SizeType32 missedDelta{0};
-        //! reusedDelta split by KvCacheTier (gpu, host, disk, remote).
-        std::array<SizeType32, 4> reusedByTierDelta{};
         //! Ordered (tier, num tokens) runs over the reused prefix; the token counts sum to prepopulatedLen.
         LlmRequest::ReuseTierSegments tierSegments;
     };
