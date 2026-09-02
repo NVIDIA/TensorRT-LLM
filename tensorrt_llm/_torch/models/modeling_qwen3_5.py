@@ -529,12 +529,13 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
     linear_attn.out_proj) silently fall back to the MIXED_PRECISION global
     config -> unquantized, and their quantized checkpoint weights fail to load.
 
-    On SM100/SM103, W4A16_NVFP4 routed experts AND dense MLP projections
-    (gate_proj/up_proj/down_proj) are promoted to NVFP4 so the CuteDSL/TRTLLM
-    GEMM path can consume the checkpoint's packed FP4 weights and static input
-    scales. Dense MLP keys are additionally re-pathed to the doubled
-    ``.mlp.mlp.`` form to match the ``_DenseMlpAdapter`` runtime module tree.
-    Other W4A16_NVFP4 modules retain their original algorithm.
+    Dense MLP projections (gate_proj/up_proj/down_proj directly under ``.mlp``)
+    are re-pathed to the doubled ``.mlp.mlp.`` form to match the
+    ``_DenseMlpAdapter`` runtime module tree, whatever their algorithm.  On
+    SM100/SM103, W4A16_NVFP4 routed experts and dense MLP projections are
+    additionally promoted to NVFP4 so the CuteDSL/TRTLLM GEMM path can consume
+    the checkpoint's packed FP4 weights and static input scales.  Other
+    W4A16_NVFP4 modules retain their original algorithm.
 
     Mutates ``quant_config_dict`` in place (model_config is frozen).
 
@@ -544,7 +545,15 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
     FP8 entry is synthesized under the fused module name so the Linear is
     built FP8; the weight mapper then requantizes the split weights onto one
     shared scale (_requantize_linear_attn_fp8_qkvz).  Incomplete or non-FP8
-    sets get no fused entry, and the mapper dequantizes them to bf16 instead.
+    sets get no fused entry, and the mapper dequantizes them to bf16 instead
+    (_dequantize_linear_attn_fp8_per_tensor).  That includes rowwise
+    FP8_PER_CHANNEL_PER_TOKEN in_proj (the compressed-tensors Qwen3.8-27B
+    recipe): requantizing split projections onto one shared scale is only
+    lossless for a per-tensor scale, so the rowwise case takes the bf16 dequant,
+    which is exact.  Their per-projection entries are left keyed on the split
+    checkpoint names, which no runtime module carries, so the fused Linear stays
+    unquantized -- correct, and a fused rowwise-FP8 path would be a performance
+    change, not a correctness fix.
 
     The ``lm_head`` entry is kept when ``keep_lm_head_quant`` (see
     _lm_head_nvfp4_enabled) -- promoted to NVFP4 on SM100/103, left
@@ -614,12 +623,22 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
             # Translate the per-layer key to that path so
             # ``apply_layerwise_quant_config`` matches it; otherwise the dense
             # MLP silently falls back to the global MIXED_PRECISION config and
-            # its quantized checkpoint weights fail to load. On SM100/SM103 also
-            # promote W4A16_NVFP4 -> NVFP4 so the CuteDSL/TRTLLM GEMM path can
-            # consume the checkpoint's packed FP4 weights and static input scales.
+            # its quantized checkpoint weights fail to load. The re-path is
+            # independent of the algorithm -- the weight mapper's
+            # ``_remap_dense_mlp_weights`` moves *every* dense MLP tensor to the
+            # doubled path, so any per-layer entry that keeps the checkpoint
+            # path is dead. Mixed compressed-tensors checkpoints exercise both
+            # sides of that: Qwen3.8-27B-NVFP4 has NVFP4 dense MLP in blocks
+            # 0-55 and FP8 dense MLP in blocks 56-63.
             dense_mlp_match = re.search(r"\.mlp\.(gate_proj|up_proj|down_proj)$", name)
-            if dense_mlp_match and cfg.quant_algo == QuantAlgo.W4A16_NVFP4:
-                if convert_to_nvfp4:
+            if dense_mlp_match:
+                # On SM100/SM103 promote W4A16_NVFP4 -> NVFP4 so the
+                # CuteDSL/TRTLLM GEMM path can consume the checkpoint's packed
+                # FP4 weights and static input scales. Algorithms the
+                # checkpoint states outright (NVFP4, FP8, FP8 rowwise) are
+                # never rewritten: their Linear methods load the stored tensors
+                # directly on every SM that has the kernels.
+                if convert_to_nvfp4 and cfg.quant_algo == QuantAlgo.W4A16_NVFP4:
                     cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
                 proj = dense_mlp_match.group(1)
                 name = name[: -len(dense_mlp_match.group(0))] + f".mlp.mlp.{proj}"
