@@ -17,7 +17,7 @@ import concurrent.futures
 import os
 import re
 from collections import defaultdict
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import pytest
 import requests
@@ -145,7 +145,7 @@ def _extract_urls(file_path):
     return normalized
 
 
-def _check_url(url_info):
+def _check_url(url_info, root_dir):
     """Return (is_valid, url, line_num, reason)."""
     url, line_num = url_info
 
@@ -165,6 +165,26 @@ def _check_url(url_info):
         and github_path.startswith("/nvidia/tensorrt-llm/")
         and ("/blob/" in github_path or "/tree/" in github_path)
     ):
+        path_parts = parsed.path.split("/", 5)
+        if (
+            len(path_parts) == 6
+            and path_parts[3].lower() in ("blob", "tree")
+            and path_parts[4] == "main"
+        ):
+            link_type = path_parts[3].lower()
+            local_path = os.path.abspath(os.path.join(root_dir, unquote(path_parts[5])))
+            root_dir = os.path.abspath(root_dir)
+            if os.path.commonpath((root_dir, local_path)) != root_dir:
+                return False, url, line_num, "Path escapes the TensorRT-LLM repository"
+
+            if link_type == "blob":
+                is_valid = os.path.isfile(local_path)
+                target_type = "file"
+            else:
+                is_valid = os.path.isdir(local_path)
+                target_type = "directory"
+            reason = f"TensorRT-LLM {target_type} {'exists' if is_valid else 'not found'} locally"
+            return is_valid, url, line_num, reason
         return True, url, line_num, "TensorRT-LLM repo-internal ref"
 
     session = _get_session()
@@ -219,7 +239,7 @@ def test_url_validity(llm_root):
 
     invalid = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(_check_url, item): item for item in url_items}
+        futures = {executor.submit(_check_url, item, llm_root): item for item in url_items}
         for future in concurrent.futures.as_completed(futures):
             is_valid, url, _, reason = future.result()
             if not is_valid:
