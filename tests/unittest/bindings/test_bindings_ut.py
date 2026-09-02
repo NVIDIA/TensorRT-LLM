@@ -14,6 +14,7 @@ import torch
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 import tensorrt_llm.bindings as _tb
+import tensorrt_llm.bindings.executor as _tbe
 from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.mapping import Mapping
 
@@ -503,6 +504,42 @@ def test_Mpicomm():
 
     assert rank2 == session_rank
     assert size2 == session_size
+
+
+@pytest.mark.cpu_only
+def test_SamplingConfig_is_executor_alias():
+    # `tensorrt_llm.bindings.SamplingConfig` used to be a distinct runtime type whose
+    # fields were one-element lists. It is now an alias of the executor type, which
+    # spells `min_tokens`/`seed` and stores scalars. Pin that contract so the rename
+    # cannot regress silently.
+    assert _tb.SamplingConfig is _tbe.SamplingConfig
+
+    config = _tb.SamplingConfig(beam_width=2)
+    assert config.beam_width == 2
+
+    config.temperature = 0.7
+    config.top_k = 3
+    assert config.temperature == 0.7
+    assert config.top_k == 3
+
+    assert not hasattr(config, "min_length")
+    assert not hasattr(config, "random_seed")
+    config.min_tokens = 4
+    config.seed = 7
+    assert config.min_tokens == 4
+    assert config.seed == 7
+
+    # LlmRequest construction goes through this copy constructor, which is registered
+    # after the keyword constructor whose first parameter is an int.
+    copied = _tb.SamplingConfig(config)
+    assert copied.beam_width == 2
+    assert copied.temperature == 0.7
+
+    unpickled = pickle.loads(pickle.dumps(config))
+    assert unpickled.beam_width == 2
+    assert unpickled.temperature == 0.7
+    assert unpickled.min_tokens == 4
+    assert unpickled.seed == 7
 
 
 def test_KvCache_events_binding():
