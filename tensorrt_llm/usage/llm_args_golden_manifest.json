@@ -2040,13 +2040,6 @@
     },
     {
       "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.max_ngram_size"
-    },
-    {
-      "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
@@ -2058,20 +2051,6 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.max_total_draft_tokens"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.max_verification_set_size"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.max_window_size"
     },
     {
       "allowed_values": [],
