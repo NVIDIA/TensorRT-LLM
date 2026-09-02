@@ -20,6 +20,7 @@ from unittest import mock
 
 import pytest
 import torch
+import torch._inductor.config as inductor_config
 from datasets import load_dataset
 from defs.conftest import get_sm_version, is_sm_100f
 from mpi4py.futures import MPIPoolExecutor
@@ -1599,7 +1600,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(60000)
-    @pytest.mark.threadleak(enabled=False)
     def test_prims_ts_bfloat16(self, mocker):
         if not is_sm_100f(get_sm_version()):
             pytest.skip("PrimTS requires SM100 or SM103")
@@ -1614,7 +1614,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             tokens_per_block=32,
             use_kv_cache_manager_v2=False,
         )
-        with mock.patch.dict(os.environ, env):
+        # Keep the TP=1 worker in this process so the call counter observes the
+        # real PrimTS launch. Compile Inductor kernels synchronously because its
+        # process-global async reader thread otherwise outlives this test and is
+        # reported as a leak; persistent compiler caches remain enabled.
+        with (inductor_config.patch(compile_threads=1),
+              mock.patch.dict(os.environ, env)):
             with LLM(self.MODEL_PATH,
                      attn_backend="TRTLLM",
                      kv_cache_config=kv_cache_config,
