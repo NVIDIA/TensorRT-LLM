@@ -499,14 +499,106 @@ compatibility validation and document the limitation.
 ### 6. Document the method
 
 Add a concise method section to the user-facing feature page and a complete,
-runnable example under `examples/kv_cache_compression/`. Keep algorithm details
-out of the KVCM storage-ABI document.
+runnable example under `examples/kv_cache_compression/`. Document the method's
+measured accuracy or output-quality impact, tested model and workload scope,
+performance evidence, and known unsupported combinations. Keep algorithm
+details out of the KVCM storage-ABI document.
 
 ## Validation
 
-Start with focused CPU tests, then exercise the real native and model paths.
+Validation is an evidence workflow, not only a collection of unit tests. A new
+method is not ready when its kernels merely run or its configuration parses.
+Complete the following stages in order, then preserve the validated behavior
+with automated regression tests.
 
-### Common framework tests
+```text
+Accuracy and output quality
+  -> real end-to-end activation and compatibility
+  -> end-to-end performance
+  -> automated regression gates
+```
+
+### 1. Establish the accuracy and output-quality contract
+
+Choose the uncompressed or full-KV path as the reference before measuring
+performance. Define the method's acceptance criterion and evaluate the real
+end-to-end model path on representative models, cache layouts, context lengths,
+and workloads. Lossy compression is allowed, but its impact must be measured;
+do not assume that a numerically small tensor error implies unchanged model
+output.
+
+Record enough information to reproduce the comparison:
+
+- exact model checkpoint, backend, runtime KV dtype, and compression settings;
+- calibration artifact and generation workflow, when the method requires one;
+- dataset or traffic trace, prompt/chat template, context and output lengths,
+  sampling parameters, and repeat protocol;
+- reference and compressed scores, absolute and relative deltas, and run-to-run
+  variation; and
+- compression pressure or frequency, including repeated lossy transforms when
+  they can occur in production.
+
+Lossless behavior is preferred when the method can provide it, but it is not a
+universal requirement. The acceptable trade-off is method- and
+workload-specific. Publish the measured quality impact, tested scope, and known
+limitations in the user-facing method documentation so users do not have to
+infer them from unit tests.
+
+### 2. Prove real end-to-end behavior and compatibility
+
+Run supported models through the production executor, model engine, KVCM, and
+native kernels. Prove that compression actually activated; a successfully
+parsed configuration is not activation evidence. Use counters, traces, or
+other route evidence to show that the intended lifecycle hook or hot/cold codec
+ran and that the compressed state was later consumed correctly.
+
+Exercise the combinations the method claims to support, including:
+
+- prefill and generation lifecycles, request completion and abort;
+- non-contiguous and partial Pages, suspend/resume, rewind, and repeated
+  compression where applicable;
+- block reuse, including reuse of a previously compressed or restored prefix;
+- disaggregated serving, including context/generation ownership and KV
+  transfer boundaries;
+- target and independent draft caches for supported speculative modes; and
+- every supported model layout, runtime KV dtype, and cold-tier route,
+  including secondary GPU, Host, or Disk as applicable.
+
+Block reuse and disaggregated serving are high-value compression scenarios.
+Preserve and validate them whenever the method's semantics permit it. If a
+combination is unsupported, reject it before execution and document the
+limitation instead of silently disabling the feature. A kernel round-trip test
+alone does not establish end-to-end compatibility.
+
+### 3. Measure end-to-end performance
+
+Measure performance only after the accuracy and functional gates pass. Start
+with an uninstrumented A/B comparison against the uncompressed path in which
+only the compression setting changes. Hold the model, workload, sampling
+contract, parallel topology, cache quotas, and serving duration constant. When
+capacity is the expected benefit, state whether the comparison holds physical
+bytes or logical Page capacity constant.
+
+Report the metrics affected by the method, such as TTFT, inter-token latency,
+request and token throughput, cache hit rate, retained KV capacity, migration
+bytes, and Host/Disk traffic. Use repeated runs and report variation rather
+than selecting one favorable sample. A transform or migration microbenchmark
+is useful for kernel development, but it is not evidence of end-to-end benefit.
+
+After the unprofiled result is established, profile the same workload to
+separate kernel-work sum, GPU-busy critical path, exposed CPU submission, and
+application wall time. Preserve the raw profiler artifacts and distinguish
+work that overlaps model execution from latency exposed to the request.
+
+### 4. Turn validated behavior into regression gates
+
+Automated tests should protect the contracts established above. Keep focused
+CPU tests fast, add native and kernel tests for data-path contracts, and retain
+small end-to-end smoke gates for activation and integration. These tests catch
+regressions; they do not replace the documented accuracy and performance
+validation.
+
+#### Common framework tests
 
 - configuration parsing, serialization, and factory dispatch;
 - telemetry allowlisting, privacy exclusions, and golden-manifest parity;
@@ -518,7 +610,7 @@ Start with focused CPU tests, then exercise the real native and model paths.
 - request completion and abort cleanup; and
 - proof that compression activated rather than merely parsing a configuration.
 
-### Iteration-driven tests
+#### Iteration-driven tests
 
 - stable-prefix and protected-tail boundaries;
 - repeated compression, Page reuse, rewind, suspend/resume, and overlap;
@@ -526,18 +618,15 @@ Start with focused CPU tests, then exercise the real native and model paths.
 - completion ordering before published lengths and KVCM resize; and
 - aligned end-to-end accuracy and performance checks.
 
-### Storage-bound tests
+#### Storage-bound tests
 
 - independent codec state for every KVCM construction;
 - hot-layout resolution, provider/fallback lifecycle routing, and rejection of
   mixed ownership;
-- fixed cold-page geometry and byte-exact lossless spans;
+- fixed cold-page geometry and byte-exact preservation of buffers or spans
+  declared lossless;
 - encode/decode round-trip accuracy for every supported runtime dtype;
 - non-contiguous, partial, and large multi-Page batches;
 - non-default stream behavior and pointer lifetime;
 - Host and Disk offload/onboard paths, including failure rollback; and
 - activation evidence that hot/cold conversion invoked the intended codec.
-
-Performance validation follows correctness. Compare an uninstrumented,
-same-shape baseline before using a profiler to attribute kernel work, GPU-busy
-critical path, CPU submission, and application wall time separately.
