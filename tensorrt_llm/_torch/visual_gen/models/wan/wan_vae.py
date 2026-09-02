@@ -693,7 +693,6 @@ def _fp4_conv_run(
         residual_ct = None
         beta = 0.0
     alpha = from_dlpack(((1.0 / pq["global_scale"]) / gs).to(torch.float32), assumed_align=4)
-    stream = cudadrv.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     cta_tile_k = min(256, Cp)
     from ...modules.vae.nvfp4_conv_autotuner import FP4ConvTactic, run_tuned_fp4_conv
 
@@ -743,6 +742,7 @@ def _fp4_conv_run(
     runtime_geometry = tuple(cutlass.Int32(v) for v in (*pad, *pad, *stride, *dil))
 
     def launch(fn) -> None:
+        stream = cudadrv.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
         fn(
             inp,
             pq["filter"],
