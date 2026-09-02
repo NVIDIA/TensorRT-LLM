@@ -83,6 +83,30 @@ def test_subclass_without_super_init_uses_native_compatibility_defaults(
     reader_start.assert_not_called()
 
 
+def test_sessionless_rank_striped_load_uses_native_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _rank_striped_loader()
+    native_weights = {"native": object()}
+    native_load = mock.Mock(return_value=native_weights)
+    reader_start = mock.Mock(side_effect=AssertionError("must not start"))
+    monkeypatch.setattr(loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(read_ahead.RankStripedReadAheadSession, "start", reader_start)
+    mapping = Mapping()
+
+    weights = loader.load_weights("/unused", mapping=mapping)
+
+    assert weights is native_weights
+    native_load.assert_called_once_with("/unused", mapping, False)
+    status = loader.last_checkpoint_io_status
+    assert status.requested == "rank_striped_read_ahead"
+    assert status.selected == "native"
+    assert status.activated is False
+    assert status.effective == "native"
+    assert "open_weight_session" in status.fallback_reason
+    reader_start.assert_not_called()
+
+
 def test_extent_plan_is_complete_disjoint_and_fair(tmp_path, monkeypatch):
     monkeypatch.setattr(read_ahead, "_CHUNK_SIZE", 4)
     monkeypatch.setattr(read_ahead, "_WORKERS_PER_LOAD_GROUP", 3)

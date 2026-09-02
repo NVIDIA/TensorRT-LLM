@@ -427,19 +427,27 @@ class HfWeightLoader(BaseWeightLoader):
                      mapping: Mapping,
                      use_consolidated: bool = False,
                      **kwargs) -> dict[str, Any]:
-        """Load synchronously for callers without a materialization session."""
-        if self._checkpoint_io_policy == _NATIVE_IO_POLICY:
-            self._reset_checkpoint_io_status()
-            weights = self._load_weights_native(checkpoint_dir, mapping,
-                                                use_consolidated, **kwargs)
-            self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
-            self._log_checkpoint_io_status()
-            return weights
-        with self.open_weight_session(checkpoint_dir,
-                                      mapping=mapping,
-                                      use_consolidated=use_consolidated,
-                                      **kwargs) as weights:
-            return weights
+        """Load synchronously without activating session-scoped read-ahead."""
+        self._reset_checkpoint_io_status()
+        if self._checkpoint_io_policy != _NATIVE_IO_POLICY:
+            status = self._last_checkpoint_io_status
+            status.selected = _NATIVE_IO_POLICY
+            status.fallback_reason = (
+                "rank-striped read-ahead requires open_weight_session() to "
+                "overlap I/O with model materialization")
+            message = (
+                "Checkpoint I/O policy is falling back for a sessionless "
+                f"load: requested={status.requested}, "
+                f"selected={status.selected}, reason={status.fallback_reason}.")
+            if status.requested == _RANK_STRIPED_IO_POLICY:
+                logger.warning(message)
+            else:
+                logger.info(message)
+        weights = self._load_weights_native(checkpoint_dir, mapping,
+                                            use_consolidated, **kwargs)
+        self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
+        self._log_checkpoint_io_status()
+        return weights
 
     @contextmanager
     def open_weight_session(self,
