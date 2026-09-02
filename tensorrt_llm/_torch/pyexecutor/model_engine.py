@@ -12,7 +12,7 @@ import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import (Any, Callable, Dict, Hashable, List, Optional, Sequence,
-                    Tuple, Union)
+                    Tuple, Type, Union)
 
 import torch
 import torch._dynamo.config
@@ -99,7 +99,7 @@ from .llm_request import (LlmRequest, LlmRequestState,
                           MultimodalEncoderRequestError, _Unset,
                           get_draft_token_length,
                           get_multimodal_embedding_lengths)
-from .mamba_cache_manager import MambaHybridCacheManager
+from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
@@ -116,6 +116,11 @@ def _get_context_prompt_lookahead_token(request: LlmRequest,
     if chunk_end >= request.py_prompt_len:
         return INVALID_PROMPT_LOOKAHEAD_TOKEN
     return request.get_token(0, chunk_end)
+
+
+def resolve_mamba_metadata_cls(model: torch.nn.Module) -> Type[Mamba2Metadata]:
+    """Resolve the model-specific Mamba metadata class with a default."""
+    return getattr(model, 'mamba_metadata_cls', None) or Mamba2Metadata
 
 
 def _make_single_token_context_graph_batch(
@@ -3606,6 +3611,11 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
         )
+        if isinstance(kv_cache_manager, BaseMambaCacheManager):
+            self.attn_metadata.mamba_chunk_size = getattr(
+                config, 'chunk_size', self.attn_metadata.mamba_chunk_size)
+        self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(
+            self.model)
 
         return self.attn_metadata
 

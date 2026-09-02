@@ -119,6 +119,7 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
   - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_k3_mamba_metadata.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
