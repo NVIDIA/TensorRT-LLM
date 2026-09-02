@@ -426,6 +426,7 @@ def generate_llmapi():
 
 """
     content += ".. toctree::\n"
+    content += "    :hidden:\n"
     content += "    :maxdepth: 1\n\n"
     search_content = ""
 
@@ -463,8 +464,7 @@ def generate_llmapi():
             f"    :doc:`View the full {cls_name} reference <reference/{cls_name}>`\n\n"
         )
 
-    content += "\n" + underline("Search the full LLM API", "~") + "\n\n"
-    content += (
+    content += "\n" + (
         "This page provides a searchable index of API names and parameters. "
         "Open an entry's full reference for complete member and inheritance "
         "documentation.\n\n")
