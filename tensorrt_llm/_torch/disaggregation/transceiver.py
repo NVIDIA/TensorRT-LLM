@@ -566,16 +566,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             if not self._ownership_blocks_retirement(session):
                 locally_retirable.append(rid)
-        new_cancelled, new_failed, new_completed, globally_retirable = (
-            self._consensus_outcome(
-                to_process,
-                cancelled,
-                failed,
-                completed,
-                self._gen_allgather,
-                self._gen_need_sync,
-                locally_retirable,
-            )
+        new_cancelled, new_failed, new_completed, globally_retirable = self._consensus_outcome(
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            self._gen_allgather,
+            self._gen_need_sync,
+            locally_retirable,
         )
         retirable = set(globally_retirable)
         return (
