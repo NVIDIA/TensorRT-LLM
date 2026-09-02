@@ -759,6 +759,18 @@ class DFlashForCausalLM(nn.Module):
                 counter_bytes, dtype=torch.uint8, device=device
             )
 
+        self._prepare_dflash_index_buffers(device, max_batch_size, block_size)
+
+    def _prepare_dflash_index_buffers(
+        self,
+        device: torch.device,
+        max_batch_size: int,
+        block_size: int,
+    ) -> None:
+        """Allocate the static indices that place a block's K/V in the cache.
+        Shared by both attention backends
+        """
+        device = torch.device(device)
         append_batch_indices = self._dflash_batch_indices
         block_offsets = self._dflash_block_offsets
         static_indices_need_allocation = (
@@ -771,10 +783,10 @@ class DFlashForCausalLM(nn.Module):
             or block_offsets.numel() != block_size
         )
         if static_indices_need_allocation:
-            if is_capturing:
+            if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    "DFlash TRTLLM-Gen index buffers must be allocated at the "
-                    "required size before CUDA graph capture."
+                    "DFlash index buffers must be allocated at the required "
+                    "size before CUDA graph capture."
                 )
             self._dflash_batch_indices = (
                 torch.arange(max_batch_size, dtype=torch.int32, device=device)
@@ -855,10 +867,10 @@ class DFlashForCausalLM(nn.Module):
             q_rope_cos, q_rope_sin = self._get_rope_cos_sin(query_positions, dtype=rope_dtype)
         _rope = RotaryEmbedding.apply_rotary_pos_emb
 
-        # cache_seqlens (BEFORE append). flash_attn appends block_size
-        # k/v at cache_seqlens[i]..+block_size for batch i.
+        # cache_seqlens BEFORE the block's K/V are stored.
         cache_seqlens_i32 = num_ctx_per_req[:B].to(torch.int32)
         cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
+        seq_lens_after = cache_seqlens_i32 + block_size
 
         if self.dflash_attention_backend == "TRTLLM":
             max_batch_size = ctx_page_table.size(0)
@@ -882,7 +894,6 @@ class DFlashForCausalLM(nn.Module):
                 dtype=torch.int32,
                 device=hidden_states.device,
             )
-            seq_lens_after = cache_seqlens_i32 + block_size
             kv_last_page_len = ((seq_lens_after - 1) % page_size) + 1
             batch_indices = self._dflash_batch_indices
             append_batch_indices = batch_indices[:B].reshape(-1)
@@ -890,6 +901,15 @@ class DFlashForCausalLM(nn.Module):
                 (cache_seqlens_i32.view(-1, 1) + self._dflash_block_offsets)
                 .reshape(-1)
                 .contiguous()
+            )
+        else:  # VANILLA
+            # Slot and column that each block K/V row occupies
+            self._prepare_dflash_index_buffers(ctx_k_cache.device, ctx_k_cache.size(0), block_size)
+            append_batch_indices = (
+                cache_batch_idx_i32.view(-1, 1).expand(-1, block_size).reshape(-1).long()
+            )
+            append_positions = (
+                (cache_seqlens_i32.view(-1, 1) + self._dflash_block_offsets).reshape(-1).long()
             )
 
         # Flatten query positions once for the fused QK-norm-RoPE kernel.
@@ -1071,6 +1091,14 @@ class DFlashForCausalLM(nn.Module):
                         multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
                     )
             else:  # VANILLA, validated before entering the layer loop.
+                # Store this layer's block K/V, then attend read-only.
+                kv_row_shape = (-1, num_kv_heads_per_rank, head_dim)
+                ctx_k_cache[append_batch_indices, layer_idx, append_positions] = (
+                    k_noise_bshd.reshape(kv_row_shape)
+                )
+                ctx_v_cache[append_batch_indices, layer_idx, append_positions] = (
+                    v_noise_bshd.reshape(kv_row_shape)
+                )
                 layer_k_cache = ctx_k_cache[:, layer_idx]
                 layer_v_cache = ctx_v_cache[:, layer_idx]
 
@@ -1096,9 +1124,7 @@ class DFlashForCausalLM(nn.Module):
                     q=q_in,
                     k_cache=layer_k_cache,
                     v_cache=layer_v_cache,
-                    k=k_noise_bshd,
-                    v=v_noise_bshd,
-                    cache_seqlens=cache_seqlens_i32,
+                    cache_seqlens=seq_lens_after,
                     cache_batch_idx=cache_batch_idx_i32,
                     causal=causal,
                     window_size=window_size,
