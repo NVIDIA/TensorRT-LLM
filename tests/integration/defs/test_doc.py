@@ -159,8 +159,13 @@ def _check_url(url_info):
         return True, url, line_num, "local"
     if "drive.google.com" in parsed.netloc:
         return True, url, line_num, "Google Drive (auth required)"
-    if parsed.netloc == "github.com" and ("/blob/" in parsed.path or "/tree/" in parsed.path):
-        return True, url, line_num, "GitHub repo-internal ref"
+    github_path = parsed.path.lower()
+    if (
+        parsed.netloc.lower() == "github.com"
+        and github_path.startswith("/nvidia/tensorrt-llm/")
+        and ("/blob/" in github_path or "/tree/" in github_path)
+    ):
+        return True, url, line_num, "TensorRT-LLM repo-internal ref"
 
     session = _get_session()
     try:
