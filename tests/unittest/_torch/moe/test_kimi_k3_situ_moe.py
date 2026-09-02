@@ -208,6 +208,7 @@ def test_communication_factory_accepts_model_selected_method(monkeypatch):
         dp_size=16,
         moe_tp_size=1,
         moe_ep_size=16,
+        has_cp_helix=lambda: False,
     )
     model_config = SimpleNamespace(
         mapping=mapping,
