@@ -415,15 +415,15 @@ prompt=$(jq -c '.prompt' ../models/cosmos3/prompts/action_edge_policy_droid.json
 curl -X POST "http://localhost:8000/v1/videos/sync" \
   -F "prompt=${prompt}" \
   -F "input_reference=@./droid_observation.png" \
-  -F 'format=safetensors' \
   -F 'extra_params={"action": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}' \
   -o droid_policy.safetensors
 ```
 
 The tensor payload contains both `video` and `action`; `action` has shape
-`[32, 8]` for one request. An explicit tensor format is required when omitting
-`action_mode`: the checkpoint selects Policy inside the model worker, after the
-HTTP route has resolved `format=auto`.
+`[32, 8]` for one request. The checkpoint-selected Policy default is applied
+before format resolution, so omitting both `action_mode` and `format` still
+resolves `format=auto` to `safetensors`. An explicit `-F 'format=safetensors'`
+is optional.
 
 ### Check Video Status
 ```bash
