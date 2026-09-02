@@ -218,15 +218,11 @@ private:
         // KVCM never submits a negative index, so this is a debug-only sanity check rather than a
         // validated precondition -- an O(numBasePages) host scan does not belong on the eviction
         // critical path. The copy path carries matching assertions.
-#ifndef NDEBUG
         if (mCopier.pageIndexLocation() == PageIndexLocation::kHost)
         {
-            for (size_t page = 0; page < numBasePages; ++page)
-            {
-                TLLM_CHECK_DEBUG(pageIndices[page].dst >= 0 && pageIndices[page].src >= 0);
-            }
+            TLLM_CHECK_DEBUG(std::all_of(pageIndices, pageIndices + numBasePages,
+                [](PageIndexPair const& pair) { return pair.dst >= 0 && pair.src >= 0; }));
         }
-#endif
 
         // One dispatcher launch per pool, all on the same stream. Stream ordering serialises them,
         // so each may use the full grid. The dispatcher picks the copy kernel or cuMemcpyBatchAsync

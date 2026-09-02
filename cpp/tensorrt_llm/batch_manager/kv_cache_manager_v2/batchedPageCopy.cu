@@ -571,9 +571,23 @@ double pcieGigaTransfersPerSecond(unsigned int generation)
     }
 }
 
-//! Fills in link topology from NVML. Returns false if NVML is unavailable, in which case the
-//! caller falls back to CUDA-only detection.
-bool queryNvmlLink(int device, bool& coherent, int& linkCount, double& bandwidthGBs)
+//! The two link properties the copier needs.
+struct LinkInfo
+{
+    //! True on a coherent CPU-GPU link (NVLink-C2C). Selects the copy path.
+    bool coherent = false;
+    //! Aggregate one-direction link bandwidth, always populated -- a conservative default when it
+    //! cannot be measured. Only feeds the CTA count.
+    double bandwidthGBs = 0.0;
+};
+
+//! Best-effort NVML refinement of what CUDA already established. Every output is optional in the
+//! "may be left as the caller set it" sense: nvmlDeviceGetFieldValues() returns NVML_SUCCESS when
+//! *any* requested field was populated, each field carrying its own nvmlReturn, so partial answers
+//! are ordinary. `coherent` is only ever raised, never cleared -- NVML failing to describe a link
+//! says nothing about whether one exists. The two bandwidths stay separate because a PCIe reading
+//! must not be applied to a coherent link.
+void refineFromNvml(int device, bool& coherent, double& c2cBandwidthGBs, double& pcieBandwidthGBs)
 {
     // NVML is reached through NVMLWrapper, which dlopens libnvidia-ml.so.1 and resolves symbols at
     // runtime. TensorRT-LLM deliberately does not link NVML: the only build-time library available
@@ -591,13 +605,12 @@ bool queryNvmlLink(int device, bool& coherent, int& linkCount, double& bandwidth
         // absent, or a required symbol missing. Anything else propagates rather than being
         // silently downgraded to "no NVML".
         TLLM_LOG_DEBUG("NVML unavailable, falling back to CUDA-only link detection: %s", error.what());
-        return false;
+        return;
     }
     if (nvml->nvmlInit() != NVML_SUCCESS)
     {
-        return false;
+        return;
     }
-    bool ok = false;
     // Match by PCI bus id: NVML enumerates all GPUs, CUDA only the visible ones.
     char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE] = {};
     nvmlDevice_t handle{};
@@ -609,37 +622,75 @@ bool queryNvmlLink(int device, bool& coherent, int& linkCount, double& bandwidth
         fields[1].fieldId = NVML_FI_DEV_C2C_LINK_GET_MAX_BW;
         if (nvml->nvmlDeviceGetFieldValues(handle, 2, fields) == NVML_SUCCESS && fields[0].nvmlReturn == NVML_SUCCESS)
         {
-            linkCount = static_cast<int>(
+            int const linkCount = static_cast<int>(
                 fields[0].valueType == NVML_VALUE_TYPE_UNSIGNED_INT ? fields[0].value.uiVal : fields[0].value.ullVal);
-            if (linkCount > 0 && fields[1].nvmlReturn == NVML_SUCCESS)
+            if (linkCount > 0)
             {
-                // NVML reports C2C link speed in MBps.
-                double const perLink = (fields[1].valueType == NVML_VALUE_TYPE_UNSIGNED_INT
-                                               ? static_cast<double>(fields[1].value.uiVal)
-                                               : static_cast<double>(fields[1].value.ullVal))
-                    / 1000.0;
                 coherent = true;
-                bandwidthGBs = linkCount * perLink;
-                ok = true;
+                if (fields[1].nvmlReturn == NVML_SUCCESS)
+                {
+                    // NVML reports C2C link speed in MBps.
+                    double const perLink = (fields[1].valueType == NVML_VALUE_TYPE_UNSIGNED_INT
+                                                   ? static_cast<double>(fields[1].value.uiVal)
+                                                   : static_cast<double>(fields[1].value.ullVal))
+                        / 1000.0;
+                    c2cBandwidthGBs = linkCount * perLink;
+                }
+                else
+                {
+                    // C2C_LINK_GET_MAX_BW reports the speed of *active* links, so it can
+                    // legitimately be unavailable while the link count is known -- links still
+                    // training, a driver that predates the field, or a virtualized or
+                    // permission-restricted environment. The count already settles the topology;
+                    // only the tuning input is missing.
+                    TLLM_LOG_DEBUG("NVML reported %d C2C link(s) but no max bandwidth; using the default.", linkCount);
+                }
             }
         }
-        if (!ok)
+        if (c2cBandwidthGBs <= 0.0)
         {
-            // No C2C links: discrete PCIe attachment.
+            // Read whenever no C2C bandwidth was obtained, inferring nothing about the attachment:
+            // the caller applies it only if the link is not coherent. Gating it on a link count of
+            // 0 would skip it on every host where the C2C fields are NOT_SUPPORTED -- ordinary
+            // discrete GPUs, exactly where it is the only real reading available.
             unsigned int generation = 0;
             unsigned int width = 0;
             if (nvml->nvmlDeviceGetMaxPcieLinkGeneration(handle, &generation) == NVML_SUCCESS
                 && nvml->nvmlDeviceGetMaxPcieLinkWidth(handle, &width) == NVML_SUCCESS)
             {
-                coherent = false;
-                linkCount = 0;
-                bandwidthGBs = pcieGigaTransfersPerSecond(generation) * width / 8.0;
-                ok = bandwidthGBs > 0.0;
+                pcieBandwidthGBs = pcieGigaTransfersPerSecond(generation) * width / 8.0;
             }
         }
     }
     nvml->nvmlShutdown();
-    return ok;
+}
+
+//! Detects the CPU-GPU link. Both fields are always resolved: anything NVML cannot answer falls
+//! back to a conservative default here rather than at the call site.
+LinkInfo detectLink(int device)
+{
+    LinkInfo info;
+
+    // Coherence comes from CUDA, not NVML: ATS-backed pageable access is the Grace/C2C signature,
+    // and unlike a multi-field NVML query it cannot partially fail. (Compute capability cannot be
+    // used because B200 and GB200 are both sm_100, and H100 and GH200 are both sm_90. HMM does not
+    // false-positive: it sets cudaDevAttrPageableMemoryAccess, not ...UsesHostPageTables.)
+    int usesHostPageTables = 0;
+    if (cudaDeviceGetAttribute(&usesHostPageTables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device)
+        != cudaSuccess)
+    {
+        usesHostPageTables = 0;
+        cudaGetLastError();
+    }
+    info.coherent = usesHostPageTables != 0;
+
+    double c2cBandwidthGBs = 0.0;
+    double pcieBandwidthGBs = 0.0;
+    refineFromNvml(device, info.coherent, c2cBandwidthGBs, pcieBandwidthGBs);
+
+    double const measured = info.coherent ? c2cBandwidthGBs : pcieBandwidthGBs;
+    info.bandwidthGBs = measured > 0.0 ? measured : (info.coherent ? kFallbackCoherentGBs : kFallbackPcieGBs);
+    return info;
 }
 
 } // namespace
@@ -676,28 +727,12 @@ void BatchedPageCopier::detect(int device)
         cudaGetLastError();
     }
 
-    bool coherent = false;
-    int linkCount = 0;
-    double bandwidth = 0.0;
-    if (!queryNvmlLink(device, coherent, linkCount, bandwidth))
-    {
-        // CUDA-only fallback. ATS-backed pageable access is the Grace/C2C signature; compute
-        // capability cannot be used here because B200 and GB200 are both sm_100, and H100 and
-        // GH200 are both sm_90.
-        int usesHostPageTables = 0;
-        if (cudaDeviceGetAttribute(&usesHostPageTables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device)
-            != cudaSuccess)
-        {
-            usesHostPageTables = 0;
-            cudaGetLastError();
-        }
-        coherent = usesHostPageTables != 0;
-        linkCount = 0;
-        bandwidth = coherent ? kFallbackCoherentGBs : kFallbackPcieGBs;
-    }
-    mTopology.coherentLink = coherent;
-    mTopology.c2cLinkCount = linkCount;
-    mTopology.linkBandwidthGBs = bandwidth;
+    // `coherent` selects the copy path; `bandwidthGBs` only feeds the CTA count below. Keeping them
+    // independent is the point: treating an unanswerable bandwidth query as "discrete PCIe" is what
+    // silently disabled the kernel on Grace.
+    LinkInfo const link = detectLink(device);
+    mTopology.coherentLink = link.coherent;
+    mTopology.linkBandwidthGBs = link.bandwidthGBs;
 
     // How many GPUs share this host NUMA node? Affects achievable bandwidth under load, but
     // deliberately NOT the CTA count: contention does not reduce the concurrency needed to
