@@ -24,12 +24,13 @@ Shape::
       - kernel: gdn_bf16_state              # distinctive stem / group label (unique)
         full_name: "void tensorrt_llm::..." # representative full name(s)
         share_pct: 18.4                     # % of profiled GPU time (nsys kern_sum)
-        ncu:                                # per-kernel deep-dive metrics, or the
-          duration_us: 41.2                 # string degrade "unavailable: <reason>"
-          sm_sol_pct: 12.1
-          mem_sol_pct: 78.5
+        ncu:                                # metrics mapping, OR the whole-block
+          duration_us: 41.2                 #   degrade string "unavailable: <reason>"
+          sm_sol_pct: 12.1                  # any metric may be null if `note` says
+          mem_sol_pct: 78.5                 #   why the capture did not yield it
           occupancy_pct: 62.0
-          bound: memory                     # compute | memory | latency | balanced
+          bound: memory                     # compute | memory | latency | balanced | comm
+          note: ""                          # required when a metric above is null
         faster:                             # question 1 — make this kernel faster
           disposition: item                 # item | dismissed
           ref: opt-003                      # item id, or the dismissal evidence
@@ -58,7 +59,7 @@ LEDGER_FILENAME = "kernel_ledger.yaml"
 DISPOSITIONS = ("item", "dismissed")
 
 # ncu bound classes per the perf-nsight-compute-analysis skill.
-BOUND_CLASSES = ("compute", "memory", "latency", "balanced")
+BOUND_CLASSES = ("compute", "memory", "latency", "balanced", "comm")
 
 # Shorthand analyzers have written (or plausibly will) for the bound
 # enum, mapped to the canonical value. Normalized on load — an alias here
@@ -75,6 +76,10 @@ _BOUND_ALIASES = {
     "launch": "latency",
     "launch-latency": "latency",
     "mixed": "balanced",
+    "communication": "comm",
+    "comm-bound": "comm",
+    "nccl": "comm",
+    "collective": "comm",
 }
 
 _NCU_METRIC_FIELDS = ("duration_us", "sm_sol_pct", "mem_sol_pct", "occupancy_pct")
@@ -136,10 +141,26 @@ def _validate_ncu(entry: Any, where: str, errors: list[str]) -> None:
             f"'unavailable: <reason>' string, got {entry!r}"
         )
         return
+    # ncu often times a kernel while its SOL / occupancy sections come back
+    # empty (replay stalls, LaunchFailed, the hang-detector budget). Those
+    # metrics may be null, but only with a non-empty `note` saying why.
+    note = entry.get("note")
+    has_note = isinstance(note, str) and bool(note.strip())
+    missing: list[str] = []
     for field in _NCU_METRIC_FIELDS:
         value = entry.get(field)
+        if value is None:
+            missing.append(field)
+            continue
         if not _is_number(value) or value < 0:
             errors.append(f"'{where}.ncu.{field}' must be a number >= 0, got {value!r}")
+    if missing and not has_note:
+        errors.append(
+            f"'{where}.ncu' leaves {missing} null without a 'note' — a null "
+            f"metric must be accompanied by a non-empty 'note' explaining why "
+            f"the capture did not yield it (or use the whole-block "
+            f"'unavailable: <reason>' string form)"
+        )
     bound = entry.get("bound")
     if isinstance(bound, str) and bound not in BOUND_CLASSES:
         canonical = _BOUND_ALIASES.get(bound.strip().lower(), bound.strip().lower())
@@ -172,12 +193,15 @@ def _validate_disposition(
             f"'{where}.{question}.ref' must be a non-empty string (a roadmap "
             f"item id, or the evidence-backed dismissal), got {ref!r}"
         )
-    if question == "fusion":
+    if question == "fusion" and disposition == "dismissed":
+        # `neighbors` is the evidence a dismissal rests on; a promoted
+        # `item` carries its adjacency in the roadmap entry `ref` names.
         neighbors = block.get("neighbors")
         if not isinstance(neighbors, str) or not neighbors.strip():
             errors.append(
-                f"'{where}.fusion.neighbors' must be a non-empty string — the "
-                f"observed adjacency a fusion verdict rests on; got {neighbors!r}"
+                f"'{where}.fusion.neighbors' must be a non-empty string when the "
+                f"disposition is 'dismissed' — the observed adjacency the "
+                f"dismissal rests on; got {neighbors!r}"
             )
 
 

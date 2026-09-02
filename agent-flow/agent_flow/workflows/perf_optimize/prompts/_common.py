@@ -1084,11 +1084,12 @@ kernels:                        # descending share_pct; one row per kernel/group
     full_name: "void tensorrt_llm::..." # representative full name(s); group members
     share_pct: 18.4                     # % of profiled GPU time (nsys kern_sum)
     ncu:                                # from your capture passes, or the string
-      duration_us: 41.2                 # "unavailable: <reason>"
-      sm_sol_pct: 12.1
-      mem_sol_pct: 78.5
+      duration_us: 41.2                 # "unavailable: <reason>". A metric the
+      sm_sol_pct: 12.1                  # capture did not yield may be null when
+      mem_sol_pct: 78.5                 # `note` says why — never invent one.
       occupancy_pct: 62.0
-      bound: memory                     # compute | memory | latency | balanced
+      bound: memory                     # compute | memory | latency | balanced | comm
+      note: ""                          # required when a metric above is null
     faster:
       disposition: item                 # item | dismissed
       ref: opt-003                      # roadmap item id | evidence-backed dismissal
@@ -1108,6 +1109,14 @@ Rules:
   dismissed` carries the evidence in `ref`, tagged per the vocabularies
   above, citing the artifact (an ncu row, the torch trace, a source
   file, a failed item's `evaluation.md`).
+- **Say "not measured", never guess it.** A collective never goes under
+  `ncu` — kernel replay deadlocks it — so disposition an allreduce from
+  its nsys share and the source, and record `bound: comm`. When a pass
+  reaches a kernel but a section comes back empty, null that metric and
+  say why in `note`, rather than fabricating a percentage or throwing
+  away the numbers you did measure; `bound` is the one field always
+  owed. `neighbors` is the evidence a fusion *dismissal* rests on — a
+  fusion `item` carries its adjacency in the roadmap entry `ref` names.
 - **An unactionable item is not an answer.** Do not park a kernel on an
   item whose `expected_gain_pct` sits below `optimize.noise_floor_pct`
   (the orchestrator never dispatches it) — that is a
