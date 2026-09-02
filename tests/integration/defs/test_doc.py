@@ -46,6 +46,11 @@ EXCEPTION_URLS = [
 ]
 
 HTML_LINK_PATTERN = re.compile(r'<a\s+(?:[^>]*?\s+)?href="([^"]*)"')
+TRTLLM_GITHUB_PATH_PATTERN = re.compile(
+    r"^/nvidia/tensorrt-llm/(?P<link_type>blob|tree)/"
+    r"(?P<git_ref>[^/]+)/(?P<repo_path>.+)$",
+    re.IGNORECASE,
+)
 
 
 def _get_session():
@@ -165,14 +170,11 @@ def _check_url(url_info, root_dir):
         and github_path.startswith("/nvidia/tensorrt-llm/")
         and ("/blob/" in github_path or "/tree/" in github_path)
     ):
-        path_parts = parsed.path.split("/", 5)
-        if (
-            len(path_parts) == 6
-            and path_parts[3].lower() in ("blob", "tree")
-            and path_parts[4] == "main"
-        ):
-            link_type = path_parts[3].lower()
-            local_path = os.path.abspath(os.path.join(root_dir, unquote(path_parts[5])))
+        path_match = TRTLLM_GITHUB_PATH_PATTERN.fullmatch(parsed.path)
+        if path_match and path_match.group("git_ref") == "main":
+            link_type = path_match.group("link_type").lower()
+            repo_path = unquote(path_match.group("repo_path"))
+            local_path = os.path.abspath(os.path.join(root_dir, repo_path))
             root_dir = os.path.abspath(root_dir)
             if os.path.commonpath((root_dir, local_path)) != root_dir:
                 return False, url, line_num, "Path escapes the TensorRT-LLM repository"
