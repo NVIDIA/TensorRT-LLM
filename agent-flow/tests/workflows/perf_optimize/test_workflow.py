@@ -300,9 +300,12 @@ def _stub_agents(
         integration_dir = workflow._round_dir(state) / "integration"
         (integration_dir / "integration.md").write_text("# integration\n", encoding="utf-8")
         included = [str(entry["current_item_id"]) for entry in candidates]
-        best = candidates[0] if candidates else {}
+        best = max(candidates, key=lambda entry: float(entry["measured_gain_pct"]))
+        noise_floor = float(workflow._optimize_block()["noise_floor_pct"])
+        best_gain = max(float(entry["measured_gain_pct"]) for entry in candidates)
         verdict = {
             "agent": "integrator",
+            "round": state.round_index + 1,
             "summary": "integrated",
             "decision": "APPROVE",
             "included_item_ids": included,
@@ -310,7 +313,7 @@ def _stub_agents(
             "remediation_attempts": 0,
             "measured_gain_pct": float(best.get("measured_gain_pct") or 0),
             "measured_value": float(best.get("measured_value") or 100),
-            "required_gain_pct": 0.0,
+            "required_gain_pct": max(noise_floor, best_gain - noise_floor),
             "best_candidate_id": included[0] if included else "",
         }
         if best.get("curve"):
@@ -413,8 +416,20 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     ) == "{}\n"
 
 
-def test_integrator_verdict_is_not_recomputed_by_python(tmp_path, fake_git):
-    """The prototype treats the Integrator's structured gate as authoritative."""
+@pytest.mark.parametrize(
+    ("verdict_overrides", "error"),
+    [
+        ({"measured_gain_pct": 0.1}, "below required"),
+        ({"required_gain_pct": 0.0}, "required_gain_pct mismatch"),
+        ({"included_item_ids": []}, "included no candidates"),
+        ({"included_item_ids": ["opt-failed"]}, "non-candidate item"),
+        ({"round": 0}, "without a structured verdict"),
+    ],
+)
+def test_integrator_rejects_invalid_acceptance_verdict(
+    tmp_path, fake_git, verdict_overrides, error
+):
+    """A contradictory APPROVE cannot mutate the campaign checkout."""
     task = _write_task(tmp_path)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -427,32 +442,32 @@ def test_integrator_verdict_is_not_recomputed_by_python(tmp_path, fake_git):
         integration_dir = workflow._round_dir(state) / "integration"
         (integration_dir / "integration.md").write_text("# authoritative\n", encoding="utf-8")
         data = progress_module.read_progress(workflow.progress_path)
-        data["optimization"].append(
-            {
-                "step": len(data["optimization"]) + 1,
-                "agent": "integrator",
-                "summary": "agent accepts despite a deliberately odd reported gate",
-                "decision": "APPROVE",
-                "included_item_ids": ["opt-001"],
-                "dropped_item_ids": [],
-                "remediation_attempts": 0,
-                "measured_gain_pct": -50.0,
-                "measured_value": 50.0,
-                "required_gain_pct": 999.0,
-                "best_candidate_id": "opt-001",
-            }
-        )
+        verdict = {
+            "step": len(data["optimization"]) + 1,
+            "agent": "integrator",
+            "round": state.round_index + 1,
+            "summary": "agent accepts despite a deliberately invalid verdict",
+            "decision": "APPROVE",
+            "included_item_ids": ["opt-001"],
+            "dropped_item_ids": [],
+            "remediation_attempts": 0,
+            "measured_gain_pct": 8.4,
+            "measured_value": 108.4,
+            "required_gain_pct": 7.4,
+            "best_candidate_id": "opt-001",
+        }
+        verdict.update(verdict_overrides)
+        data["optimization"].append(verdict)
         progress_module.write_progress(workflow.progress_path, data)
 
     workflow.integrator = authoritative_integrator
-    try:
-        workflow.run(str(task))
-    finally:
-        workflow.close()
+    with pytest.raises(RuntimeError, match=error):
+        try:
+            workflow.run(str(task))
+        finally:
+            workflow.close()
 
-    roadmap = roadmap_schema.load_roadmap(workflow.roadmap_path)
-    assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "accepted"
-    assert roadmap["current_best"]["value"] == 50.0
+    assert fake_git.count("fast_forward") == 0
     active_repo = str(ws / "worktrees" / "round_1" / "integration")
     assert f"Active runtime checkout: `{active_repo}`" in integrator_prompts[0]
     assert (
@@ -1856,7 +1871,36 @@ def test_curve_mode_accept_records_current_best_curve(tmp_path, fake_git):
     assert roadmap["current_best"]["curve"] == measured
 
 
-def test_curve_mode_accept_without_curve_degrades_to_scalar(tmp_path, fake_git):
+def test_integrator_rejects_curve_point_beyond_regression_budget(tmp_path, fake_git):
+    task = _write_task(
+        tmp_path,
+        {
+            "benchmark": {"concurrency": [8, 32]},
+            "optimize": {"max_regression_pct": 1.0},
+        },
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    measured = [
+        {"concurrency": 8, "value": 108.0, "tok_s_user": 22.0, "tok_s_gpu": 108.0},
+        {"concurrency": 32, "value": 107.8, "tok_s_user": 11.8, "tok_s_gpu": 107.8},
+    ]
+    _stub_agents(
+        workflow,
+        evaluator_verdicts=[("APPROVE", "none", 8.0, 107.9)],
+        baseline_curve=_WF_CURVE,
+        evaluator_curve=measured,
+    )
+    with pytest.raises(RuntimeError, match="regresses concurrency 32"):
+        try:
+            workflow.run(str(task))
+        finally:
+            workflow.close()
+
+    assert fake_git.count("fast_forward") == 0
+
+
+def test_integrator_rejects_curve_mode_accept_without_curve(tmp_path, fake_git):
     task = _write_task(tmp_path, {"benchmark": {"concurrency": [8, 32]}})
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -1865,16 +1909,13 @@ def test_curve_mode_accept_without_curve_degrades_to_scalar(tmp_path, fake_git):
         evaluator_verdicts=[("APPROVE", "none", 5.5, 105.15)],
         baseline_curve=_WF_CURVE,
     )
-    try:
-        workflow.run(str(task))
-    finally:
-        workflow.close()
+    with pytest.raises(RuntimeError, match="curve verdict is missing a curve"):
+        try:
+            workflow.run(str(task))
+        finally:
+            workflow.close()
 
-    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
-    # No curve in the evaluator entry: the watermark degrades to scalar
-    # rather than keeping a stale curve.
-    assert roadmap["current_best"]["value"] == pytest.approx(105.15)
-    assert "curve" not in roadmap["current_best"]
+    assert fake_git.count("fast_forward") == 0
 
 
 # Per-point measurements shared by the focus-scored target tests:

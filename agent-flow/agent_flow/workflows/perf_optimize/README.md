@@ -113,8 +113,9 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   defects, benchmarks the combined state, and emits the authoritative
   `APPROVE | FALLBACK_BEST | REJECT` verdict. It may diagnose/remediate twice;
   after that it validates only the best standalone candidate, or rejects all.
-  The Python orchestrator applies this structured verdict directly; it does
-  not independently recompute the threshold or Pareto gate.
+  Before applying the structured verdict, the Python orchestrator verifies
+  that included ids are non-empty candidate-ready items and cross-checks the
+  reported threshold, measured gain, and Pareto-curve regression budget.
 - **candidate evidence capture** — inside the evaluator's APPROVE turns,
   not a separate stage: after the clean measurement, the evaluator
   relaunches the server under the canonical nsys wrap, replays the load

@@ -14,8 +14,9 @@ conflicts and minimal combination defects; do not invent a new optimization.
 
 Measure the combined result against the campaign current_best using the same
 target-metric direction, noise-floor discipline, full-metric review, and
-Pareto-curve regression rules used by the Evaluator. The orchestrator trusts
-your structured verdict; show the arithmetic and evidence in integration.md.
+Pareto-curve regression rules used by the Evaluator. The orchestrator
+cross-checks your structured verdict before applying it; show the arithmetic
+and evidence in integration.md.
 The requested combined threshold is supplied in the turn prompt because it is
 derived from the candidates' standalone measurements.
 
@@ -33,6 +34,6 @@ Use the workflow's canonical benchmark contract:
 {BENCHMARK_FLAGS_REFERENCE}
 
 Finish by writing integration.md and calling append_integrator_progress once.
-Its decision and measurement fields are authoritative. Never commit to or edit
-the campaign checkout directly.
+Its decision and measurement fields drive the outcome after the orchestrator's
+consistency checks. Never commit to or edit the campaign checkout directly.
 """

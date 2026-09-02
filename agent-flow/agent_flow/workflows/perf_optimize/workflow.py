@@ -1255,7 +1255,7 @@ class PerfOptimizeWorkflow:
         self._finish_item_batch(state, log)
 
     def _integrate_batch(self, state: WorkflowState, log) -> None:
-        """Combine candidate-ready items and trust the Integrator's verdict."""
+        """Combine candidate-ready items and validate the Integrator's verdict."""
         candidates = [
             dict(entry) for entry in state.item_batch if entry.get("status") == "candidate_ready"
         ]
@@ -1334,9 +1334,10 @@ class PerfOptimizeWorkflow:
                 f"Evaluator measurement/Pareto rules. Compute the combined "
                 f"required gain as `max(noise_floor_pct, best standalone "
                 f"measured_gain_pct - noise_floor_pct)` from task.yaml and the "
-                f"manifest. Your threshold and curve-gate conclusion are "
-                f"authoritative; the Python orchestrator will not recalculate "
-                f"them. You may diagnose/remediate at most twice. If the combined "
+                f"manifest. Report that threshold exactly; the Python "
+                f"orchestrator cross-checks it and the measured gain before "
+                f"applying your verdict. You may diagnose/remediate at most "
+                f"twice. If the combined "
                 f"state still fails, retain and validate only the highest standalone "
                 f"gain candidate (manifest order breaks ties); if that also fails, "
                 f"restore the base and REJECT.\n\n"
@@ -1347,11 +1348,83 @@ class PerfOptimizeWorkflow:
             )
         self._require_stage_outputs(STAGE_INTEGRATOR, [report_path])
         verdict = latest_entry(self.progress_path, "integrator")
-        if verdict is None or verdict.get("decision") not in INTEGRATOR_DECISIONS:
+        if (
+            verdict is None
+            or verdict.get("round") != round_no
+            or verdict.get("decision") not in INTEGRATOR_DECISIONS
+        ):
             raise RuntimeError("integrator finished without a structured verdict")
 
         decision = str(verdict["decision"])
+        candidate_ids = {str(entry["current_item_id"]) for entry in candidates}
         included = {str(item_id) for item_id in verdict.get("included_item_ids", [])}
+        unknown = included - candidate_ids
+        if unknown:
+            raise RuntimeError(
+                "integrator included non-candidate item(s): " + ", ".join(sorted(unknown))
+            )
+        if decision == "REJECT":
+            if included:
+                raise RuntimeError("integrator REJECT verdict must include no candidates")
+        else:
+            if not included:
+                raise RuntimeError(f"integrator {decision} verdict included no candidates")
+            noise_floor = float(self._optimize_block()["noise_floor_pct"])
+            best_standalone_gain = max(float(entry["measured_gain_pct"]) for entry in candidates)
+            expected_required_gain = max(
+                noise_floor,
+                best_standalone_gain - noise_floor,
+            )
+            reported_required_gain = float(verdict["required_gain_pct"])
+            if abs(reported_required_gain - expected_required_gain) > 1e-6:
+                raise RuntimeError(
+                    "integrator required_gain_pct mismatch: "
+                    f"reported {reported_required_gain}, expected {expected_required_gain}"
+                )
+            measured_gain = float(verdict["measured_gain_pct"])
+            if measured_gain < reported_required_gain:
+                raise RuntimeError(
+                    f"integrator {decision} gain {measured_gain} is below required "
+                    f"{reported_required_gain}"
+                )
+            if self._curve_mode():
+                roadmap = roadmap_schema.load_roadmap(self.roadmap_path)
+                reference_curve = roadmap["current_best"].get("curve")
+                measured_curve = verdict.get("curve")
+                if not isinstance(reference_curve, list) or not isinstance(measured_curve, list):
+                    raise RuntimeError("integrator curve verdict is missing a curve")
+                reference_by_point = {
+                    int(point["concurrency"]): float(point["value"]) for point in reference_curve
+                }
+                measured_by_point = {
+                    int(point["concurrency"]): float(point["value"]) for point in measured_curve
+                }
+                expected_points = set(self._curve_points())
+                if (
+                    set(reference_by_point) != expected_points
+                    or set(measured_by_point) != expected_points
+                ):
+                    raise RuntimeError(
+                        "integrator curve verdict does not cover the configured concurrency points"
+                    )
+                metric = str(self._optimize_block()["target_metric"])
+                regression_budget = self._regression_budget()
+                allowed_regression = noise_floor if regression_budget is None else regression_budget
+                for point in sorted(expected_points):
+                    gain = self._normalized_gain_pct(
+                        reference_by_point[point], measured_by_point[point], metric
+                    )
+                    if gain is None or gain < -allowed_regression:
+                        raise RuntimeError(
+                            f"integrator curve regresses concurrency {point} beyond "
+                            f"the {allowed_regression}% budget"
+                        )
+            if decision == "FALLBACK_BEST":
+                best_id = str(verdict["best_candidate_id"])
+                if best_id not in candidate_ids or included != {best_id}:
+                    raise RuntimeError(
+                        "integrator FALLBACK_BEST must include exactly its best_candidate_id"
+                    )
         if decision != "REJECT":
             # Persist the stale-profile decision before mutating the accepted
             # campaign state so a crash cannot resume into replan-only mode.
