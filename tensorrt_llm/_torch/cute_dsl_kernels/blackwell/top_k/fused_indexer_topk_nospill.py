@@ -569,15 +569,34 @@ def _dsv4_kernel(
     if cutlass.const_expr(CS > 1):
         cute.arch.cluster_wait()
         cnt = cute.arch.map_dsmem_ptr(sCtl.iterator + 8, 0)
-        # broadcast-reduce the CS per-CTA histograms through DSMEM: every CTA
-        # pushes its non-empty bins into every peer's running total, so each CTA
-        # ends up with the full row histogram in its own SMEM.
         pts = [cute.arch.map_dsmem_ptr(sTot.iterator, c) for c in range(CS)]
-        for i in cutlass.range(tidx, NBINS, NTHREADS, unroll=1):
-            v = sHist[i]
-            if v != 0:
-                for c in cutlass.range_constexpr(CS):
-                    cute.arch.atomic_add(pts[c] + i, v, scope="cluster")
+        if cutlass.const_expr(CS >= 8):
+            # Reduce-scatter to bin owners, then owners broadcast their final
+            # segment: 2*NBINS remote adds per CTA instead of NBINS*CS. Below
+            # CS=8 the all-to-all traffic is cheaper than the extra rendezvous.
+            SEG = NBINS // CS
+            for i in cutlass.range(tidx, NBINS, NTHREADS, unroll=1):
+                v = sHist[i]
+                if v != 0:
+                    own = i // SEG
+                    for c in cutlass.range_constexpr(CS):
+                        if own == c:
+                            cute.arch.atomic_add(pts[c] + i, v, scope="cluster")
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            for i in cutlass.range(tidx, SEG, NTHREADS, unroll=1):
+                bi = crk * SEG + i
+                v = sTot[bi]
+                if v != 0:
+                    for c in cutlass.range_constexpr(CS):
+                        if c != crk:
+                            cute.arch.atomic_add(pts[c] + bi, v, scope="cluster")
+        else:
+            for i in cutlass.range(tidx, NBINS, NTHREADS, unroll=1):
+                v = sHist[i]
+                if v != 0:
+                    for c in cutlass.range_constexpr(CS):
+                        cute.arch.atomic_add(pts[c] + i, v, scope="cluster")
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
 
