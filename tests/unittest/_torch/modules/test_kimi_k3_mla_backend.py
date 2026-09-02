@@ -8,9 +8,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.kimi_k3_mla import KimiK3MLAAttention
-from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import (
+from tensorrt_llm._torch.models.modeling_kimi_linear import (
     _KIMI_K3_MLA_GEN_BACKEND_ENV,
+    KimiK3MLAAttention,
     _kimi_k3_mla_decode_backend_policy,
     _select_mla_generation_backend,
     _validate_mla_generation_backend,

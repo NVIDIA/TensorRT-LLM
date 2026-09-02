@@ -168,7 +168,6 @@ class ConfigurableMoE(MoE):
         trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
         trtllm_gen_activation_alpha: Optional[float] = None,
         trtllm_gen_activation_beta: Optional[float] = None,
-        communication_method: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(
@@ -190,7 +189,6 @@ class ConfigurableMoE(MoE):
         # Store model_config and aux_stream_dict for later use (e.g., backend setter)
         self.model_config = model_config
         self.aux_stream_dict = aux_stream_dict
-        self.communication_method = communication_method
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -640,7 +638,6 @@ class ConfigurableMoE(MoE):
             alltoall_result_do_sum=True,
             use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
-            communication_method=self.communication_method,
         )
 
     def forward_impl(
