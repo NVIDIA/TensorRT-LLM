@@ -1171,41 +1171,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__eq__", &kv::KVCacheStatsDelta::operator==, nb::arg("other"))
         .def("__repr__", &statsDeltaRepr);
 
+    // Drained snapshots only: callers read the per-level counts, the accumulation itself stays
+    // in C++.
     nb::class_<kv::ReusedBlocksByLevel>(m, "ReusedBlocksByLevel")
-        .def(
-            "__init__",
-            [](kv::ReusedBlocksByLevel* self, std::vector<int64_t> full, std::vector<int64_t> partial)
-            {
-                new (self) kv::ReusedBlocksByLevel{};
-                self->full = std::move(full);
-                self->partial = std::move(partial);
-            },
-            nb::arg("full") = std::vector<int64_t>{}, nb::arg("partial") = std::vector<int64_t>{})
-        .def_rw("full", &kv::ReusedBlocksByLevel::full)
-        .def_rw("partial", &kv::ReusedBlocksByLevel::partial)
-        .def_prop_ro("empty", &kv::ReusedBlocksByLevel::empty)
-        .def("add", &kv::ReusedBlocksByLevel::add, nb::arg("other"))
-        .def("copy", [](kv::ReusedBlocksByLevel const& self) { return self; })
-        .def("__repr__",
-            [](kv::ReusedBlocksByLevel const& self)
-            {
-                std::ostringstream stream;
-                auto const format = [&stream](std::vector<int64_t> const& counts)
-                {
-                    stream << "[";
-                    for (size_t i = 0; i < counts.size(); ++i)
-                    {
-                        stream << (i == 0 ? "" : ", ") << counts[i];
-                    }
-                    stream << "]";
-                };
-                stream << "ReusedBlocksByLevel(full=";
-                format(self.full);
-                stream << ", partial=";
-                format(self.partial);
-                stream << ")";
-                return stream.str();
-            });
+        .def_ro("full", &kv::ReusedBlocksByLevel::full)
+        .def_ro("partial", &kv::ReusedBlocksByLevel::partial);
 
     nb::class_<kv::KVCacheIterationStatsDelta>(m, "KVCacheIterationStatsDelta")
         .def(

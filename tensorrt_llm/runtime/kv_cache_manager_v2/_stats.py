@@ -101,9 +101,6 @@ class ReusedBlocksByLevel:
     def empty(self) -> bool:
         return not any(self.full) and not any(self.partial)
 
-    def copy(self) -> "ReusedBlocksByLevel":
-        return ReusedBlocksByLevel(full=list(self.full), partial=list(self.partial))
-
 
 def _add_into(dst: list[int], src: list[int]) -> list[int]:
     if len(dst) < len(src):
