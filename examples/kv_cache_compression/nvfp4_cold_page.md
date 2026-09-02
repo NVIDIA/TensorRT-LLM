@@ -10,6 +10,9 @@ while their Pages reside in a Host or Disk cache tier. It is a storage-boundary
 optimization: the active GPU cache and Attention kernels continue to use the
 model's normal runtime KV type.
 
+For an overview of all available compression methods, see
+[KV Cache Compression](../../docs/source/features/kv-cache-compression.md).
+
 ## Motivation
 
 Agentic workloads repeatedly revisit long prompts, tool histories, and
@@ -117,21 +120,22 @@ This is different from an active NVFP4 KV cache. Do not set
 change Page identity, token count, block reuse, scheduling, or the
 Attention-visible GPU layout.
 
-## Support Matrix
+## Supported Cache Types
 
-| Dimension | Status | Behavior |
-| --- | --- | --- |
-| Backend and hardware | Supported | PyTorch backend, native C++ KVCacheManagerV2, and SM100 or SM103 GPU |
-| Hot Attention KV dtype | Supported | FP16, BF16, or FP8; the Page is decoded before Attention reads it |
-| MHA and GQA | Supported | Conventional K and V buffers are stored as NVFP4 data plus block scales |
-| Key-only MLA | Supported | The latent Attention key is compressed; auxiliary buffers remain lossless |
-| Host and Disk cold tiers | Supported | Both tiers use the same compact representation; Disk uses pinned-Host staging |
-| KV-cache block reuse | Supported | Page and token identity are unchanged |
-| GDN, SSM, and Conv state | Not quantized | Non-Attention lifecycles preserve their original representation through the lossless codec |
-| DSA and other side buffers | Not quantized | `index_key` and other auxiliary roles are copied losslessly beside compressed Attention data |
-| Speculative decoding | Limited | One-model MTP-EAGLE and one-model EAGLE3 |
-| HELIX context parallelism | Not supported | Rejected during configuration |
-| DeepSeek-V4 specialized cache | Not supported | Its already-compressed cache uses dedicated `deepseek_v4_*` roles instead of the standard K/V or key-only MLA contract, so configuration fails closed |
+| Cache type | Cold-page behavior |
+| --- | --- |
+| MHA and GQA Attention KV | Supported; K and V are encoded as NVFP4 data and block scales |
+| Key-only MLA Attention KV | Supported; the latent Attention key is encoded as NVFP4 |
+| GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly |
+| DSA and other auxiliary buffers | Skipped by quantization and preserved losslessly |
+| DeepSeek-V4 specialized sparse cache | Not supported |
+
+The current implementation requires the PyTorch backend, native C++
+KVCacheManagerV2, and an SM100 or SM103 GPU. Hot Attention KV can use FP16,
+BF16, or FP8. Host and Disk cold tiers share the same compact representation,
+and KV-cache block reuse remains supported because Page and token identity are
+unchanged. One-model MTP-EAGLE and EAGLE3 are supported; HELIX context
+parallelism is not currently supported.
 
 Set `kv_cache_config.use_kv_cache_manager_v2: true` explicitly, and do not set
 `TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`. A nonzero Host or Disk cache is also
@@ -142,19 +146,19 @@ lifecycles and lossless SSM/GDN fallback lifecycles are currently rejected.
 Those kernels require chunked pinned-memory registration, which the embedded
 lossless fallback cannot yet split safely at registration boundaries.
 
-### Model Compatibility and Validation
+### Tested Models
 
-The following model families cover the major cache structures exercised during
-development. Exact checkpoint, parallelism, Attention-backend, and hardware
-requirements still apply.
+The feature has been tested with representative checkpoints from these model
+families:
 
-| Model family | Attention and cache structure | Validation status | Cold-page behavior |
-| --- | --- | --- | --- |
-| Qwen3 | Conventional MHA/GQA K/V | Validated | K and V are compressed to NVFP4 |
-| Qwen3.5 | GQA Attention plus GDN/SSM state | Validated | Attention K/V is compressed; recurrent state remains lossless |
-| GLM-5.2 (GLM family) | Key-only MLA plus DSA side data | Validated | The latent key is compressed; DSA index and side buffers remain lossless |
-| DeepSeek-R1/V3 family | Key-only MLA | Supported by the MLA contract; the DeepSeek-V3.2 layout is directly validated | The latent Attention cache is compressed; auxiliary data remains lossless |
-| DeepSeek-V4 | Specialized `deepseek_v4_*` cache roles | Not currently supported | The already-compressed cache does not enter the generic NVFP4 cold-page codec |
+* Qwen3 family
+* Qwen3.5 family
+* GLM family, including GLM-5.2
+* DeepSeek-R1 family
+
+This is a tested-model list, not an exhaustive support list. Other models that
+use the supported cache types above are expected to work, subject to their
+checkpoint, parallelism, Attention-backend, and hardware requirements.
 
 ## Qwen3.5-4B on One GPU
 
