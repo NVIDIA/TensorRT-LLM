@@ -54,7 +54,7 @@ def _load_sol_attn() -> Callable:
 # Architectures with a Sol-Attn CuTe kernel. Kept in sync with
 # ``sol_attn/interface.py::_CUTE_BACKENDS``; duplicated here so the eligibility
 # check does not have to import the CuTe DSL.
-SUPPORTED_ARCHS = frozenset({(10, 0), (12, 0)})
+SUPPORTED_ARCHS = frozenset({(10, 0)})
 
 
 def sol_attn_ineligible_reason(q) -> Optional[str]:
@@ -109,7 +109,7 @@ def _resolve_kv_splits(q, kv_splits: int | str | None) -> int:
     """Resolve the integration-only ``auto`` policy to the public integer API.
 
     ``auto`` is always 1 here: kv_splits=2/4 was an SM90-only path, and this
-    build ships SM100/SM120 kernels only.
+    build ships SM100 kernels only.
     """
 
     if kv_splits in (None, "auto"):
