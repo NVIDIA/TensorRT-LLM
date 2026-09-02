@@ -1537,8 +1537,20 @@ legacy-files: &legacy_files |
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
 exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
 
+ci:
+    # trufflehog is not available in the hosted pre-commit.ci sandbox; the
+    # server-side Pulse workflow is the authoritative secret-scan enforcement.
+    skip: [secret-scan-trufflehog]
+
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
+# Runs first so a leaked credential blocks the commit before any formatter runs.
+# Self-installing: downloads a pinned, checksum-verified trufflehog on first use
+# (no manual install). Skipped on pre-commit.ci; Pulse CI enforces server-side.
+-   repo: https://github.com/NVIDIA/security-workflows
+    rev: v0.2.0
+    hooks:
+    -   id: secret-scan-trufflehog
 -   repo: https://github.com/pycqa/isort
     rev: 5.12.0
     hooks:
