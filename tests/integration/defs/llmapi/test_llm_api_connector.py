@@ -596,6 +596,13 @@ def test_connector_e2e_persistent_cache(enforce_single_worker):
     os.environ["CONNECTOR_CACHE_FOLDER"] = cache_dir
 
     try:
+        # TEMPORARY: deliberately fail after >10 min with a message that
+        # matches none of the CI rerun fail-signatures, to verify that
+        # unrerunnable failures are reported as stage FAILURE (see
+        # jenkins/L0_Test.groovy rerun_0.txt handling). Remove before merge.
+        time.sleep(605)
+        assert False, "CI_UNRERUNNABLE_FAILURE_TEST_MARKER: intentional failure to validate rerun_0.txt stage-failure reporting"
+
         kv_connector_config = KvCacheConnectorConfig(
             connector_module="llm_kv_cache_connector",
             connector_scheduler_class="PersistentKvCacheConnectorLeader",
