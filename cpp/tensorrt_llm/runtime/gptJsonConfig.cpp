@@ -25,9 +25,9 @@
 #include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
 #include "tensorrt_llm/runtime/jsonSerialization.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
-#include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/runtimeDefaults.h"
+#include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -592,8 +592,9 @@ GptJsonConfig parseJson(InputType&& input)
             TLLM_CHECK_WITH_INFO(medusaHeads.has_value() && maxDraftLen > 0,
                 "Both num_medusa_heads and max_draft_len have to be provided for Medusa model");
 
-            auto medusaModule = std::make_shared<MedusaModule>(medusaHeads.value(), maxDraftLen);
-            modelConfig.setSpeculativeDecodingModule(medusaModule);
+            auto speculativeDecodingModule
+                = std::make_shared<SpeculativeDecodingModule>(medusaHeads.value(), maxDraftLen, maxDraftLen);
+            modelConfig.setSpeculativeDecodingModule(speculativeDecodingModule);
         }
         else
         {
