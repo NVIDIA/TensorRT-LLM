@@ -4,6 +4,7 @@
 
 import importlib
 import math
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -194,6 +195,41 @@ def test_flashinfer_attention_matches_sdpa(
         rtol=0,
         atol=6e-2,
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("capability", "expected_runner"),
+    (
+        pytest.param((10, 0), "batch", id="sm100"),
+        pytest.param((10, 3), "batch", id="sm103"),
+        pytest.param((12, 0), "single", id="sm120"),
+    ),
+)
+def test_flashinfer_unquantized_batch_size_one_dispatches_by_architecture(
+    capability: tuple[int, int],
+    expected_runner: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = torch.empty((1, 4, 2, 64), dtype=torch.bfloat16)
+    attention = FlashInferAttention(num_heads=2, head_dim=64)
+    single_prefill = Mock(return_value=(q, torch.empty(0)))
+    batch_prefill = Mock(return_value=(q, torch.empty(0)))
+
+    def get_device_capability(_device: object = None) -> tuple[int, int]:
+        return capability
+
+    monkeypatch.setattr(attention, "_validate_inputs", Mock())
+    monkeypatch.setattr(attention, "_run_single_prefill", single_prefill)
+    monkeypatch.setattr(attention, "_run_batch_prefill", batch_prefill)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_device_capability)
+
+    attention.forward_with_lse(q, q, q)
+
+    expected = single_prefill if expected_runner == "single" else batch_prefill
+    unexpected = batch_prefill if expected_runner == "single" else single_prefill
+    expected.assert_called_once()
+    unexpected.assert_not_called()
 
 
 @pytest.mark.usefixtures("require_flashinfer_cuda")

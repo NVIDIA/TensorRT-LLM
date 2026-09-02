@@ -372,7 +372,8 @@ class FlashInferAttention(AttentionBackend):
 
         quant_config = self.quant_attention_config
         if quant_config is None:
-            if q.shape[0] == 1:
+            # FlashInfer's single-prefill FA2/FA3 heuristics regress on SM10x.
+            if q.shape[0] == 1 and torch.cuda.get_device_capability(q.device)[0] != 10:
                 return self._run_single_prefill(
                     q,
                     k,
