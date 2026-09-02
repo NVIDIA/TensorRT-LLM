@@ -2353,8 +2353,6 @@ def benchmark_model_root(request):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "fp8")
     elif (request.param == "DeepSeek-V3-Lite-bf16"):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "bf16")
-    elif request.param == "llama-v3-8b-hf":
-        model_path = os.path.join(models_root, "llama-models-v3", "8B")
     elif request.param == "llama-3.1-8b-instruct-hf-fp8":
         model_path = os.path.join(models_root, "llama-3.1-model",
                                   "Llama-3.1-8B-Instruct-FP8")
