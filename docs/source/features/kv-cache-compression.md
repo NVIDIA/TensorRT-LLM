@@ -24,34 +24,45 @@ evicted and must be recomputed. KV cache compression reduces this pressure by
 changing either how KV data is represented in storage or how much KV data is
 retained.
 
-KV cache compression runs outside the Attention kernel. A compression manager
-transforms the stored representation or retained token set at defined Page
-migration and request-lifecycle boundaries. After the operation completes,
-KVCM publishes an active GPU cache with the layout and logical length expected
-by the existing Attention implementation. Compression methods can use their own
-transform or scoring kernels, but they do not add compression-specific branches
-to the Attention kernel.
-
-The ownership boundary is:
+Compression runs at well-defined safe points outside the Attention kernel. For
+example, a method can compress the cache after a prefill or generation step, or
+when KVCM moves a Page from the GPU's hot layout into the cold representation
+used by Host or Disk, or restores it to the GPU. The method uses the current
+cache state either to reduce what is retained or to encode and decode a compact
+Page representation.
 
 ```text
-KvCacheConfig
-  `-- capacity, cache levels, reuse, offloading, and Page lifecycle
-
-KvCacheCompressionConfig
-  `-- out-of-Attention compression method and algorithm-specific policy
-
-Attention implementation
-  `-- consumes the published active GPU cache without compression awareness
+Prefill, generation, or a hot/cold Page transition reaches a safe boundary
+  |
+  v
+Compression manager reads the current KV-cache state
+  |
+  +-- iteration-driven method: reduce or compact the retained KV state
+  |
+  `-- storage-bound method: encode hot Pages into a compact cold format and
+                            decode them when they return
+  |
+  v
+Use the resulting smaller cache for storage, transfer, or later inference
+  |
+  v
+Continue inference through the existing KVCM and Attention interfaces
 ```
 
-This boundary is designed to keep the compression framework broadly compatible
-across models and Attention backends without modifying their Attention kernels.
-A concrete method still has to understand the cache layout it transforms. It
-can preserve unsupported or non-Attention state losslessly, or reject a layout
-that it cannot handle. `SparseAttentionConfig` is an orthogonal feature: it
-changes how Attention selects or processes KV, rather than compressing Pages
-outside the Attention kernel.
+Depending on the method, this design can reduce KV-cache storage, transfer
+bytes, Attention work, or a combination of them without adding
+compression-specific code to the model or Attention kernel. A method can use
+its own scoring or transform kernels. Each method is designed to preserve useful
+KV information while minimizing its impact on accuracy and output quality. The
+exact trade-off depends on the method, its settings, and the workload, and
+should be validated before deployment.
+
+`KvCacheConfig` continues to control cache capacity, levels, reuse, offloading,
+and Page lifetime. `KvCacheCompressionConfig` selects how KV is compressed at
+the supported boundaries. A concrete method must understand the cache layout it
+transforms; it can preserve unsupported or non-Attention state losslessly, or
+reject a layout that it cannot handle. `SparseAttentionConfig` is orthogonal: it
+changes how Attention selects or processes KV during computation.
 
 Currently, only one KV cache compression method can be enabled for each LLM
 instance.
@@ -114,9 +125,10 @@ For complete single-GPU and disaggregated-serving configurations, see the
 
 ### TriAttention
 
-TriAttention periodically scores generation KV tokens, retains the most useful
-tokens, and physically compacts the cache. The prompt remains preserved, and
-the model's standard Attention implementation runs over the compacted cache.
+[TriAttention](https://arxiv.org/abs/2604.04921) (ICML 2026) periodically scores
+generation KV tokens, retains the most useful tokens, and physically compacts
+the cache. The prompt remains preserved, and the model's standard Attention
+implementation runs over the compacted cache.
 
 TriAttention requires an offline calibration file. A minimal configuration is:
 
