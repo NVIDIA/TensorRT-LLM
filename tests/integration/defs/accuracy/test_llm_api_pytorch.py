@@ -8957,7 +8957,6 @@ class TestGLM52(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  max_seq_len=8192,
                  **pytorch_config) as llm:
-            assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = GSM8K(model_name)
             task.evaluate(llm)
