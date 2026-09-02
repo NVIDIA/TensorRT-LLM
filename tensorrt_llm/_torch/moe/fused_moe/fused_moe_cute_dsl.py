@@ -40,10 +40,12 @@ from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
-from .fused_moe_cutlass import CutlassFusedMoE
-from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
-                            MoERejectReason, MoERunContext, MoEStaticCapability,
-                            require_comm_plan)
+from .activation import (DEFAULT_MOE_ACTIVATION, ActivationParamShape,
+                         MoEActivation, MoEActivationSupport)
+from .impl_base import MoEImplBase, apply_moe_impl_construction_state
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
+                            MoEProblem, MoERejectReason, MoERunContext,
+                            MoEStaticCapability, require_comm_plan)
 from .interface import _reject
 from .quantization import (BF16CuteDslFusedMoEMethod, MoEWeightLoadingMode,
                            NVFP4CuteDslFusedMoEMethod)
@@ -574,7 +576,7 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
         )
 
 
-class CuteDslFusedMoE(CutlassFusedMoE):
+class CuteDslFusedMoE(MoEImplBase):
     # CuteDSL dispatch/combine path exercises the ceil/floor partition
     # (NVLinkOneSided alltoall with kernel-level remainder handling), so this
     # backend is the only opt-in for non-divisible EP today.
@@ -592,13 +594,22 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         model_config (ModelConfig): Configuration object for the model.
     """
 
-    # ``supports_moe_lora`` is restated because CutlassFusedMoE declares True
-    # and the exact-class comparison it replaces answered False here.
-    # ``supports_dwdp`` is the capability this backend adds. CuteDslB12xFusedMoE
-    # derives from here and needs both, but must spell them out again: setting
-    # the attribute replaces the whole object rather than one field.
-    capabilities = MoEStaticCapability(supports_moe_lora=False,
-                                       supports_dwdp=True)
+    capabilities = MoEStaticCapability(
+        supports_dwdp=True,
+        supports_eplb=True,
+        supports_apply_router_weight_on_input=True)
+
+    input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
+
+    # Kinds mirror the kernel's own SUPPORTED_ACTIVATION_TYPES in
+    # cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py.
+    # The clamp is a kernel-cache-key scalar and the epilogue has no
+    # "clamp absent" branch, so an absent clamp is +inf, not None.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.Relu2}),
+        limit=ActivationParamShape.UNIFORM_SCALAR,
+        limit_when_absent=float("inf"),
+    )
 
     def _has_moe_output_memset_aux_stream(self) -> bool:
         event_dict = getattr(self, 'event_dict', None)
@@ -726,12 +737,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
-        swiglu_limit_scalar: Optional[float] = None,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
         init_load_balancer: bool = False,
-        activation_type: ActivationType = ActivationType.Swiglu,
     ):
-
-        super().__init__(
+        super().__init__(eplb=None)
+        apply_moe_impl_construction_state(
+            self,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -741,13 +752,16 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             model_config=model_config,
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
-            apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
-            swiglu_limit_scalar=swiglu_limit_scalar,
+            activation=activation,
             init_load_balancer=init_load_balancer,
-            activation_type=activation_type,
         )
-        self.swiglu_limit_scalar = swiglu_limit_scalar or float("inf")
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+
+        # Read by run_moe_nvfp4* to pick the fused-finalize epilogue, which
+        # leaves no seam for a LoRA GEMM.
+        self.use_fused_finalize = (not model_config.moe_disable_finalize_fusion
+                                   and model_config.lora_config is None)
 
         # Output-memset overlap is independent of MoE chunking, so ensure its
         # stream and events exist even if the parent creates no chunking event.
@@ -756,11 +770,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         if AuxStreamType.MoeOutputMemset not in self.aux_stream_dict:
             self.aux_stream_dict[
                 AuxStreamType.MoeOutputMemset] = torch.cuda.Stream()
-        if self.event_dict is None:
-            self.event_dict = {}
-        for key in [EventType.Main, EventType.MoeOutputMemset]:
-            if key not in self.event_dict:
-                self.event_dict[key] = torch.cuda.Event()
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MoeOutputMemset]
+        }
+
+        self._weights_created = False
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
 
         self.scaling_vector_size = 16
         # locality domain: fork/join with _locality_domain kernel variants + shared output buffers.
@@ -821,11 +838,15 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CuteDslFusedMoEMethod()
-            return super()._get_quant_method()
-        # Unquantized: use BF16 method on SM107 for FC1 weight interleaving
-        if get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        elif get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            # Unquantized on SM107: the BF16 method interleaves FC1 weights for
+            # the fused gather + grouped GEMM + SwiGLU kernel.
             return BF16CuteDslFusedMoEMethod()
-        return super()._get_quant_method()
+        # ``can_implement`` admits NVFP4, plus unquantized BF16 on SM107, so
+        # selection never lands here. Raise rather than fall back: any other
+        # method owns a weight layout these kernels cannot read.
+        raise ValueError(
+            f"CuteDslFusedMoE only supports NVFP4, got {self.quant_config}")
 
     def supports_moe_output_in_alltoall_workspace(self):
         return self.has_nvfp4 or (not self.has_any_quant
@@ -1060,7 +1081,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             gather_act_kwargs["output_sf_tensor"] = None
         else:
             gather_act_kwargs["activation_type"] = self.activation_type
-            gather_act_kwargs["swiglu_limit_scalar"] = self.swiglu_limit_scalar
+            gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
         gather_act_kwargs["activation_type"] = self.activation_type
 
         x, x_sf = gather_act_op(**gather_act_kwargs)
@@ -1651,7 +1672,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             b_sf=self.quant_scales[0],
             offset_array=expert_first_token_offset,
         )
-        x = swiglu_fused_moe(x, self.swiglu_limit_scalar)
+        x = swiglu_fused_moe(x, self.act_clamp)
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
         x = cute_dsl_fp8_group_blockwise_gemm_ref(
             a=x,

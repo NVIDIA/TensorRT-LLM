@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from torch import nn
@@ -67,6 +69,12 @@ class BaseCheckpointLoader(ABC):
         return self.weight_loader.load_weights(checkpoint_dir,
                                                mapping=mapping,
                                                **kwargs)
+
+    @contextmanager
+    def open_weight_session(self, checkpoint_dir: str, mapping: Mapping,
+                            **kwargs) -> Iterator[dict[str, Any]]:
+        """Keep loader-specific work alive while weights are materialized."""
+        yield self.load_weights(checkpoint_dir, mapping=mapping, **kwargs)
 
     def is_weights_preloaded(self) -> bool:
         """Whether the last load wrote weights directly into the model."""
