@@ -663,7 +663,6 @@ def test_kv_cache_retention_config():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.cpu_only
 def test_lookahead_decoding_config():
     config = trtllm.LookaheadDecodingConfig(3, 5, 7)
     assert config.max_window_size == 3
