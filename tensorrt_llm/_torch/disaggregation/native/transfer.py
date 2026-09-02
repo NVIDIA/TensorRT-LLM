@@ -660,11 +660,6 @@ class Sender(SenderBase):
         )
         self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
 
-        if timer:
-            timer.record_task_end(write_meta.peer_rank)
-        ri = self._registrar.self_rank_info
-        task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
-
         with task.lock:
             task.transferred_count += 1
             count = task.transferred_count
@@ -683,6 +678,20 @@ class Sender(SenderBase):
                 task.complete()
                 if all(t.status == TaskStatus.TRANSFERRED for t in session.kv_tasks):
                     session.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
+
+        # Perf logging only after completion is signalled: the CSV write can
+        # stall on shared storage and must never delay the ctx block-all
+        # waiter (https://nvbugs/6669114).
+        try:
+            if timer:
+                timer.record_task_end(write_meta.peer_rank)
+            ri = self._registrar.self_rank_info
+            task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
+        except Exception as e:  # perf is best-effort; never block completion
+            logger.warning(
+                f"KV transfer perf logging failed for unique_rid={write_meta.unique_rid} "
+                f"slice={write_meta.slice_id}: {e}"
+            )
 
         logger.debug(
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
@@ -723,11 +732,6 @@ class Sender(SenderBase):
             ]
         )
 
-        if timer:
-            timer.record_task_end(write_meta.peer_rank)
-        ri = self._registrar.self_rank_info
-        aux_task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
-
         with aux_task.lock:
             aux_task._transfer_count += 1
             count = aux_task._transfer_count
@@ -741,6 +745,17 @@ class Sender(SenderBase):
         elif count > write_meta.expected_transfers:
             session.set_exception(
                 f"aux task received more than {write_meta.expected_transfers} transfers"
+            )
+
+        # Perf logging only after completion is signalled (https://nvbugs/6669114).
+        try:
+            if timer:
+                timer.record_task_end(write_meta.peer_rank)
+            ri = self._registrar.self_rank_info
+            aux_task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
+        except Exception as e:  # perf is best-effort; never block completion
+            logger.warning(
+                f"aux transfer perf logging failed for unique_rid={write_meta.unique_rid}: {e}"
             )
 
     @staticmethod
@@ -2157,6 +2172,18 @@ class RxSession(RxSessionBase):
                                 return
                             if task.status == TaskStatus.ERROR:
                                 return  # a concurrent FAILED writer already failed it; don't un-fail
+                            # Complete FIRST: perf logging below writes a CSV row (possibly on
+                            # shared storage) and can stall arbitrarily long, and it must never
+                            # delay the block-all waiter past kv_transfer_timeout
+                            # (https://nvbugs/6669114).
+                            task.complete()
+                            # Transfer end for perf/time-sync: only meaningful once every slice has
+                            # landed. Plain attribute write (atomic under the GIL); on_done must stay
+                            # lock-free, and consumers only read it after wait_complete succeeds.
+                            if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
+                                self.transfer_end_time = (
+                                    tensorrt_llm.bindings.global_steady_clock_now()
+                                )
                             try:
                                 if task._perf_timer is not None:
                                     task._perf_timer.record_task_end(peer_rank)
@@ -2165,14 +2192,6 @@ class RxSession(RxSessionBase):
                                 logger.warning(
                                     f"KV transfer perf logging failed for request {request_id} "
                                     f"slice={sender_slice_id}: {e}"
-                                )
-                            task.complete()
-                            # Transfer end for perf/time-sync: only meaningful once every slice has
-                            # landed. Plain attribute write (atomic under the GIL); on_done must stay
-                            # lock-free, and consumers only read it after wait_complete succeeds.
-                            if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
-                                self.transfer_end_time = (
-                                    tensorrt_llm.bindings.global_steady_clock_now()
                                 )
                             logger.debug(
                                 f"KV transfer complete for request {request_id} "
