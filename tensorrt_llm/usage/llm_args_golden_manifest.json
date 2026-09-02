@@ -615,10 +615,11 @@
     },
     {
       "allowed_values": [
+        "quantization_for_cold_page",
         "triattention"
       ],
       "annotation": "Literal['triattention']",
-      "converter": "",
+      "converter": "allowlist",
       "kind": "categorical",
       "path": "kv_cache_compression_config.algorithm"
     },
@@ -653,6 +654,15 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_compression_config.normalize_scores"
+    },
+    {
+      "allowed_values": [
+        "nvfp4"
+      ],
+      "annotation": "Literal['nvfp4']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.quant"
     },
     {
       "allowed_values": [],
@@ -1456,17 +1466,6 @@
     },
     {
       "allowed_values": [
-        "TRTLLMSampler",
-        "TorchSampler",
-        "auto"
-      ],
-      "annotation": "Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]",
-      "converter": "allowlist",
-      "kind": "categorical",
-      "path": "sampler_type"
-    },
-    {
-      "allowed_values": [
         "MAX_UTILIZATION",
         "GUARANTEED_NO_EVICT",
         "STATIC_BATCH"
@@ -2183,7 +2182,8 @@
         "llm_class",
         "cli_serve",
         "cli_bench",
-        "cli_eval"
+        "cli_eval",
+        "disaggregated"
       ],
       "annotation": "<enum 'UsageContext'>",
       "converter": "",
@@ -2283,6 +2283,13 @@
       "converter": "",
       "kind": "value",
       "path": "use_cute_dsl_blockscaling_mm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "use_fine_grained_sync"
     }
   ]
 }

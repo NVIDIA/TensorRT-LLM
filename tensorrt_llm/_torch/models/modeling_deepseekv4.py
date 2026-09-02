@@ -67,7 +67,13 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.engram import Engram, EngramConfig, EngramHashProvider
-from ..modules.fused_moe import (
+from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
+from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
+from ..modules.mla import MLA
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (
     CutlassFusedMoE,
     DeepSeekV4MoeRoutingMethod,
     MoEWeightLoadingMode,
@@ -77,13 +83,7 @@ from ..modules.fused_moe import (
     is_moe_weight_owner,
     resolve_moe_cls,
 )
-from ..modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
-from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
-from ..modules.mla import MLA
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
-from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata, get_num_extra_kv_tokens
 from ..utils import (
@@ -461,6 +461,11 @@ def _remap_deepseek_v4_checkpoint_keys(
             return
         tensor = _maybe_view_deepseek_v4_routed_moe_tensor(model_key, tensor, routed_moe_scale_name)
         out[model_key] = tensor
+        # Hopper's W4A16 MXFP4 loader consumes the legacy suffix, while the
+        # Blackwell loaders consume the canonical suffix. Both keys reference
+        # the same packed E8M0 scale tensor.
+        if ".mlp.experts." in model_key and model_key.endswith(".weight_scale"):
+            out[f"{model_key}_inv"] = tensor
 
     for k, v in weights.items():
         # Top-level keys that don't go through the layer/mtp branches.
@@ -2589,7 +2594,9 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             "tokens_per_block": 128,
             "enable_swa_scratch_reuse": True,
         }
-        if llm_args is not None and llm_args.kv_cache_config.dtype == "fp8_ds_mla":
+        if get_sm_version() == 90:
+            kv_cache_defaults["dtype"] = "fp8_ds_mla"
+        elif llm_args is not None and llm_args.kv_cache_config.dtype == "fp8_ds_mla":
             kv_cache_defaults["tokens_per_block"] = 256
         return {"kv_cache_config": kv_cache_defaults}
 

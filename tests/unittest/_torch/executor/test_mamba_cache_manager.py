@@ -79,6 +79,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _introspection,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
+from tensorrt_llm.sampling_params import SamplingParams
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -212,7 +213,7 @@ def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
     params = extract_mamba_kv_cache_params(config)
 
     assert params.state_size == 8
-    assert params.conv_kernel == 5
+    assert params.conv_kernel == 4
     assert params.num_heads == 4
     assert params.n_groups == 4
     assert params.head_dim == 8
@@ -300,7 +301,7 @@ def test_kimi_explicit_v2_manager_geometry(monkeypatch: pytest.MonkeyPatch) -> N
     assert isinstance(kwargs, dict)
     assert args[:9] == (
         8,
-        5,
+        4,
         4,
         4,
         8,
@@ -1944,6 +1945,31 @@ def test_v2_hybrid_add_dummy_requests_forwards_encoder_output_lens(mocker):
     mgr.add_dummy_requests([123], encoder_output_lens=[17])
 
     assert base_add_dummy_requests.call_args.kwargs["encoder_output_lens"] == [17]
+
+
+@pytest.mark.parametrize(
+    "manager_cls,base_cls",
+    [
+        (MambaHybridCacheManagerV2, KVCacheManagerV2),
+        (CppMambaHybridCacheManager, KVCacheManager),
+    ],
+    ids=["v2", "cpp"],
+)
+def test_add_dummy_requests_forwards_capture_sampling_params(mocker, manager_cls, base_cls):
+    """Regression test: model_engine.py's CUDA graph warmup path always
+    passes capture_sampling_params (None on the greedy pass, a real
+    SamplingParams on non-greedy passes) to whatever concrete
+    kv_cache_manager is active. An override with an explicit signature
+    that doesn't accept/forward this kwarg breaks warmup for that
+    manager type with a TypeError.
+    """
+    mgr = object.__new__(manager_cls)
+    base_add_dummy_requests = mocker.patch.object(base_cls, "add_dummy_requests", return_value=[])
+    sampling_params = SamplingParams(temperature=0.9, top_p=0.95)
+
+    mgr.add_dummy_requests([123], capture_sampling_params=sampling_params)
+
+    assert base_add_dummy_requests.call_args.kwargs["capture_sampling_params"] is sampling_params
 
 
 @pytest.mark.parametrize(

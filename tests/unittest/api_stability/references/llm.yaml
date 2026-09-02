@@ -171,10 +171,6 @@ methods:
         annotation: str
         default: TRTLLM
         status: beta
-      sampler_type:
-        annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
-        default: auto
-        status: deprecated
       sampler_force_async_worker:
         annotation: bool
         default: False
@@ -243,6 +239,10 @@ methods:
         annotation: bool
         default: True
         status: prototype
+      use_fine_grained_sync:
+        annotation: bool
+        default: False
+        status: prototype
       enable_layerwise_nvtx_marker:
         annotation: bool
         default: False
@@ -280,7 +280,7 @@ methods:
         default: null
         status: prototype
       kv_cache_compression_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig, NoneType]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.ColdPageQuantizationCompressionConfig, tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig, NoneType]
         default: null
         status: prototype
       otlp_traces_endpoint:

@@ -304,6 +304,8 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
             numRetries: 1,
         )?.trim()
         pipeline.echo(tailOut ?: "")
+    } catch (InterruptedException e) {
+        throw e
     } catch (Exception tailEx) {
         pipeline.echo("Ignorable warning: could not tail ${remotePath} on ${remote.host}: ${tailEx.message}")
     }
@@ -1282,18 +1284,21 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 if (waitRc == 3) {
                     checkSlurmJobActive()
                 }
+                if (waitRc != 0) {
+                    error "SLURM job ${slurmJobID} did not reach RUNNING during the queue wait. Terminating the job."
+                }
 
                 // Phase 2: job is RUNNING; wait for the Jenkins agent to come online. isNodeOnline()
                 // and Thread.sleep() emit no flow-nodes, so poll every 30s without bloating Blue
                 // Ocean, and probe job status every ~3 min (every 6th iter) to fail fast if the
-                // job dies during bring-up. 120 * 30s = 1h.
+                // job dies during bring-up. 60 * 30s = 30 min.
                 if (waitRc == 0) {
                     // Job is RUNNING: stamp the walltime-budget origin for the
                     // timeout duration fallback (within Phase 1's ~3min poll
                     // granularity of the true RUNNING transition).
                     jobRunningStartMs = System.currentTimeMillis()
                     def onlineCounter = 0
-                    while (!CloudManager.isNodeOnline(nodeName) && onlineCounter < 120) {
+                    while (!CloudManager.isNodeOnline(nodeName) && onlineCounter < 60) {
                         Thread.sleep(30L * 1000L)
                         if (onlineCounter % 6 == 0) {
                             checkSlurmJobActive()
@@ -1375,7 +1380,21 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         }
                     }
                 } else {
-                    error "The Slurm node does not come online in the waiting period. Terminating the job."
+                    def setupLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
+                    try {
+                        CloudManager.withSlurmFrontendFailover(pipeline, remotes) { logRemote ->
+                            echoRemoteLogTail(pipeline, logRemote, setupLogPath)
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception logEx) {
+                        echo "Ignorable warning: could not retrieve ${setupLogPath}: ${logEx.message}"
+                    }
+                    throw new InfraFailure(
+                        "SLURM agent ${nodeName} for job ${slurmJobID} did not come online within 30 minutes " +
+                        "after the job started. Check SLURM logs at ${setupLogPath} on ${cluster.host}.",
+                        null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-agent-online-timeout>"
+                    )
                 }
             }
         }
@@ -1712,6 +1731,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
     def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
     def aggMultiNodeMode = !disaggMultiNodeMode && nodeCount > 1 && stageName.contains("PerfSanity")
+    def singleNvlinkDomainMode = stageName.contains("SingleNvlinkDomain")
     def infraDryRun = isInfraDryRun()
     if (infraDryRun) {
         testList = INFRA_DRY_RUN_TEST_CONTEXT
@@ -1957,7 +1977,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                 }
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
+                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode || singleNvlinkDomainMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
                 }
@@ -2158,7 +2178,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     pipeline.writeFile(file: scriptLaunchSrunArgsPathLocal, text: srunArgs.join(" "))
 
                     sh """
-                        pip3 install pyyaml && \\
+                        pip3 install 'pyyaml>=6.0.1,<6.0.3' && \\
                         python3 ${scriptSubmitLocalPath} \\
                         --llm-src ${llmSrcLocal} \\
                         --test-list ${testListPathLocal} \\
@@ -2910,6 +2930,12 @@ def stageMatchesAnyPattern(String key, List patterns) {
     return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
 }
 
+// Return the OpenSearch regexp for sibling shards and their CBTS variants.
+String getTestReuseStagePattern(String stageName) {
+    def stageNamePrefix = stageName.replaceFirst(/-\d+(-cbts)?$/, "")
+    return "${stageNamePrefix}-[0-9]+(-cbts)?"
+}
+
 // Test filter flags
 // Multi-GPU stages matching any entry here run inside the single-GPU job
 // instead of waiting for the separate multi-GPU dispatch (which requires
@@ -2960,7 +2986,8 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-// Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
+// Suffix for CBTS-narrowed stages so they cannot be reused as whole non-CBTS stages.
+// Their individual passed testcases may still be reused through an OpenSearch query.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
 def CBTS_STAGE_SUFFIX = "-cbts"
@@ -4648,12 +4675,14 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
         sh "mkdir -p ${workDir}"
 
         // 1. OpenSearch lookup -- tests that PASSED in a previous pipeline run
-        //    for this commit + stage.
+        //    for this commit + sibling stage shards. CBTS and non-CBTS results
+        //    are merged only at testcase granularity.
         def passedTestListFile = "${workDir}/passed_test_list.txt"
+        def stageNamePattern = getTestReuseStagePattern(stageName)
         sh """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
-            --stage-name ${stageName} \
+            --stage-name-pattern '${stageNamePattern}' \
             --output-file ${passedTestListFile}
         """
         if (fileExists(passedTestListFile)) {
@@ -6047,8 +6076,10 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
                         (slurmScoped && FailureClassifier.isDeferrableInfra(e, InfraFailure.SLURM))) {
                     def scopeTag = slurmScoped ? "SLURM/K8s" : "K8s"
                     deferred.add([stage: stageName])
-                    echo "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
-                         "siblings continue instead of fail-fast. ${e.toString()}"
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        error "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
+                              "siblings continue instead of fail-fast. ${e.toString()}"
+                    }
                     return
                 }
                 throw e
@@ -6059,8 +6090,8 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
     parallel wrapped
     if (deferred) {
         echo "[INFRA-DEFER] ${deferred.size()} stage(s) infra-incomplete " +
-             "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
-             "(coverage incomplete, no genuine test failure)."
+             "(${deferred.collect { it.stage }.join(', ')}); result already marked UNSTABLE " +
+             "per branch above (coverage incomplete, no genuine test failure)."
         // Distinguish a per-branch infra blip from a cluster-wide outage: when EVERY
         // branch in the group infra-aborted, the shared infra (a SLURM frontend / a
         // whole cluster) is the likely culprit. Flag it loudly so a re-run isn't
@@ -6074,7 +6105,6 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
             echo "[INFRA-DEFER] ALL ${jobs.size()} branch(es) infra-aborted; " +
                  "suspected cluster-wide / shared-frontend outage rather than isolated blips."
         }
-        currentBuild.result = 'UNSTABLE'
     }
 }
 
@@ -6182,6 +6212,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_H100-4_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_B200-CPP-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 9, 1, 1, true],
         "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 9, 1, 1, true],
         "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 9, 1, 1, true],
@@ -6216,8 +6247,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
-        // Single-GPU Gemma4 PerfSanity regression gate and baseline
-        "DGX_B200-PyTorch-PerfSanity-1": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
+        // Single-GPU Gemma4 PerfSanity post-merge baseline
+        "DGX_B200-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
         // PerfSanity post-merge tests
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 2, 4, 8, 1, true],
@@ -6316,13 +6347,19 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
-        // Each testcase uses 8 GPUs and 2 nodes.
+        // Each GB200 testcase below uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
         "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 2, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 2, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex", "l0_gb200_multi_nodes", 3, 3, 8, 2],
+        // GB300 accuracy post-merge aggregated (4 GPUs per node). One test list per topology,
+        // spelled out here rather than via buildStageConfigs: test_to_stage_mapping.py resolves
+        // stage <-> test by list name with a line-based parser, so a shared list or a helper's
+        // output breaks the mapping. For SingleNvlinkDomain see singleNvlinkDomainMode.
+        "GB300-8_GPUs-2_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node2_gpu8", 1, 1, 8, 2],
+        "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 1, 1, 16, 4],
     ]
     // PerfSanity post-merge aggregated
     // 2 Nodes
@@ -6538,6 +6575,19 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
     // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
     // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
+    // GB300 DeepSeek-V4-Pro-DSpark, AgentX agentic trace replay.
+    // These lanes replay a ~1M-token multi-turn conversation trace for a fixed
+    // wall-clock duration instead of a fixed prompt count, so they are pinned to
+    // aws-cmh where the DSpark checkpoint and the trace corpus are staged.
+    // 6 Nodes: ctx2 (2 nodes, 8 GPUs each) + gen1 (2 nodes, 8 GPUs) = 24 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX2-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
+        "gb300-flex-aws-cmh",
+        "l0_gb300_multi_nodes_perf_sanity_ctx2_node2_gpu8_gen1_node2_gpu8",
+        1,
+        24,
+        6
+    )
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -6791,7 +6841,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install 'requests>=2.32.4,<3'")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
                         if (values[5] != DLFW_IMAGE) {
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"

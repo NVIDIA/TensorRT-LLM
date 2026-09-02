@@ -51,7 +51,6 @@ from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMax
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
@@ -63,6 +62,7 @@ from ..modules.linear import (
 )
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..utils import (
     ActivationType,
@@ -85,6 +85,7 @@ from .modeling_utils import (
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
 # and flash SDPA does not accept attn_mask.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
 
 # ---------------------------------------------------------------------------
 # Config normalization helpers
@@ -200,7 +201,9 @@ def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List
     return dense, sparse
 
 
-def get_sparse_disable_index_value_layer_ids(text_config: PretrainedConfig) -> List[int]:
+def get_sparse_disable_index_value_layer_ids(
+    text_config: PretrainedConfig,
+) -> List[int]:
     """Return layer ids where the sparse index-value branch is disabled."""
     sparse_cfg = getattr(text_config, "sparse_attention_config", None)
     if sparse_cfg is None:
@@ -1402,7 +1405,8 @@ class MiniMaxM3Attention(Attention):
         # q may be FP8 on the MSA FP8-KV path, so pin the output to the compute
         # dtype rather than inheriting it from q.
         output = q.new_empty(
-            (q.shape[0], self.num_heads * self.head_dim), dtype=self.attn_activation_dtype
+            (q.shape[0], self.num_heads * self.head_dim),
+            dtype=self.attn_activation_dtype,
         )
         if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
             maybe_bcg_minimax_m3_attn_custom_op_inplace(
@@ -1975,6 +1979,10 @@ class MiniMaxM3Model(DecoderModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
+        # The executor owns the authoritative CUDA-graph configuration. Mark
+        # this model as eligible here and let the executor enable the automatic
+        # FlashInfer MXFP8 path only when its decode graph runner is active.
+        self._use_flashinfer_mxfp8_decode_graph_default = True
         # Final norm is a plain (non-Gemma) RMSNorm for the same reason as the
         # layer-boundary norms (see MiniMaxM3DecoderLayer.__init__): it doubles
         # as the last layer's next_layer_layernorm, so the last MoE/MLP output
