@@ -1,3 +1,7 @@
+from .activation import (ACTIVATION_PAYLOAD, DEFAULT_MOE_ACTIVATION,
+                         ActivationParamShape, MoEActivation,
+                         MoEActivationSupport, SimpleActivation, SiTuActivation,
+                         SwigluActivation, SwigluBiasActivation)
 from .configurable_moe import ConfigurableMoE
 from .create_moe import (MoEImplClass, create_moe, resolve_moe_cls,
                          resolve_moe_impl)
@@ -28,10 +32,19 @@ from .weight_owner import is_moe_weight_owner
 # yapf: enable
 
 __all__ = [
+    "ACTIVATION_PAYLOAD",
+    "ActivationParamShape",
     "BaseMoeRoutingMethod",
     "ConfigurableMoE",
     "create_load_balanced_logits",
     "create_moe",
+    "DEFAULT_MOE_ACTIVATION",
+    "MoEActivation",
+    "MoEActivationSupport",
+    "SimpleActivation",
+    "SiTuActivation",
+    "SwigluActivation",
+    "SwigluBiasActivation",
     "CuteDslB12xFusedMoE",
     "CuteDslFusedMoE",
     "CutlassFusedMoE",

@@ -21,9 +21,9 @@ Covers the SiTU cubin integration behavior:
 * the fused path fails loudly without loaded weights (no silent
   random-weight fallback).
 
-The NVFP4 half of SiTU lives here too, on both FP4 backends: CUTLASS takes
-SiTU as an ``ActivationType``, TRTLLM-Gen as an out-of-band
-``trtllm_gen_activation_type`` served by the fused
+The NVFP4 half of SiTU lives here too, on both FP4 backends. Both take it as
+one ``SiTuActivation`` carrier; they differ only in what serves it -- CUTLASS
+an ``ActivationType`` its kernels branch on, TRTLLM-Gen the fused
 ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins. Tests that apply to both are
 parametrized over ``moe_backend`` rather than duplicated.
 """
@@ -340,7 +340,9 @@ def test_fused_forward_launches_situ_kernel(fmt):
     env["TLLM_BATCHED_GEMM_PRINT_NAME"] = "1"
     env["TLLM_LOG_LEVEL"] = "INFO"
     this_dir = os.path.dirname(os.path.abspath(__file__))
-    unittest_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
+    # The child process imports ``_torch.moe.kimi_k3_ref_moe``, so the root it
+    # needs on PYTHONPATH is tests/unittest, not the repo's tests/ directory.
+    unittest_root = os.path.abspath(os.path.join(this_dir, "..", ".."))
     env["PYTHONPATH"] = os.pathsep.join([this_dir, unittest_root, env.get("PYTHONPATH", "")])
     result = subprocess.run(
         [sys.executable, "-c", _LAUNCH_EVIDENCE_SCRIPTS[fmt]],
@@ -683,7 +685,7 @@ def _make_routed_moe(
     """Mirror KimiK3MoERuntime's create_moe call on a single-rank mapping."""
     from transformers.configuration_utils import PretrainedConfig
 
-    from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, create_moe
+    from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, SiTuActivation, create_moe
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
     pretrained_config = PretrainedConfig()
@@ -713,30 +715,10 @@ def _make_routed_moe(
         ),
         layer_idx=0,
         communication_method=None,
+        # Mirror KimiK3MoERuntime exactly: one activation for every backend,
+        # naming the two soft-caps rather than the ABI registers they land in.
+        activation=SiTuActivation(gate_softcap=4.0, linear_softcap=25.0),
     )
-    if moe_backend == "TRTLLM":
-        moe_kwargs.update(
-            trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-            trtllm_gen_activation_alpha=4.0,
-            trtllm_gen_activation_beta=25.0,
-        )
-    elif moe_backend == "CUTLASS":
-        # Mirror KimiK3MoERuntime exactly: CUTLASS is the one backend that
-        # takes SiTU as an ActivationType (the others carry it out of band),
-        # and that choice decides the FC1 weight geometry.
-        from tensorrt_llm._torch.utils import ActivationType
-
-        moe_kwargs.update(
-            activation_type=ActivationType.SiTu,
-            swiglu_alpha=torch.full((num_experts,), 4.0, dtype=torch.float32, device="cuda"),
-            swiglu_beta=torch.full((num_experts,), 25.0, dtype=torch.float32, device="cuda"),
-        )
-    else:
-        moe_kwargs.update(
-            activation="situ",
-            situ_beta=4.0,
-            situ_linear_beta=25.0,
-        )
     moe = create_moe(**moe_kwargs).cuda()
     assert isinstance(moe, ConfigurableMoE)
     return moe
@@ -997,8 +979,8 @@ def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
 def _make_nvfp4_moe(gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS"):
     """NVFP4 + SiTU routed MoE on either FP4 backend.
 
-    CUTLASS takes SiTU as an ``ActivationType``; TRTLLM-Gen carries it out of
-    band as ``trtllm_gen_activation_type`` and serves it with the fused
+    Both take the same ``SiTuActivation`` carrier; CUTLASS serves it as an
+    ``ActivationType`` its kernels branch on, TRTLLM-Gen with the fused
     ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins (group-16 block scales).
     ``_make_routed_moe`` already mirrors both of KimiK3MoERuntime's branches,
     so the backend is the only variable.
