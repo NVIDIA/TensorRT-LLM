@@ -127,6 +127,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_block_table_gen = None
         self._cached_req_idx_ctx = None
         self._cached_req_idx_gen = None
+        # Cross-layer fan-out of the DSA index remap (TRTLLM_DISABLE_DSA_GROUP_REMAP).
+        # `_group_remap_struct` is the (static) full+shared indexer
+        # group layout; `_group_remap_batched` holds the current forward's
+        # per-group batched remap output (leader writes, shared members read).
+        self._group_remap_struct = None
+        self._group_remap_struct_kv_id = 0
+        self._group_remap_batched = {}
         super().__init__(*args, **kwargs)
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -990,6 +997,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         _ensure_pool_view_cached() recomputes them for the new batch.
         """
         self._pool_cache_valid = False
+        # The grouped remap batches (leader-written, follower-read) are only
+        # valid within one forward. Drop them at the step boundary so a follower
+        # can never read a previous step's batch, and so the tensors are not
+        # retained across idle steps. Python-only -> safe under graph replay
+        # (replay does not re-run this).
+        self._group_remap_batched.clear()
 
     def _ensure_pool_view_cached(self):
         """Compute and cache values used by
@@ -1020,6 +1033,94 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self._cached_kv_mgr_id = id(kv_cache_manager)
         self._pool_cache_valid = True
+
+    def _ensure_group_remap_struct(self):
+        """Build (once) the static full+shared indexer group layout used by the
+        cross-layer fan-out remap (``TRTLLM_DISABLE_DSA_GROUP_REMAP``).
+
+        Groups are runs of consecutive local layers starting at a full-indexer
+        layer (``indexer_k_cache_local_layer_mask[L] == True``, i.e.
+        ``is_full_indexer_layer``); the shared layers that follow reuse the
+        leader's top-k. Within a group, the remap output for each member differs
+        from the leader's only by the additive ``layer_offset * tokens_per_block``
+        term, so one launch (grid.z = group_size) covers the whole group.
+
+        A group is marked active only when it has >= 2 members (a genuine
+        fan-out) and a uniform primary-pool page scale (required for a single
+        stride_factor). Singleton / non-uniform groups fall back to the
+        per-layer single-op path (identical to flag-off behavior).
+        """
+        kvm = self.kv_cache_manager
+        if self._group_remap_struct is not None and self._group_remap_struct_kv_id == id(kvm):
+            return self._group_remap_struct
+
+        # Building the small per-group layer-offset device tensors must happen
+        # eagerly (host->device copy), never inside a CUDA-graph capture. TRT-LLM
+        # runs an eager warmup before capture, so return an uncached empty struct
+        # if somehow reached first during capture; it is (re)built on the next
+        # eager step and grouping simply falls back to per-layer until then.
+        if torch.cuda.is_current_stream_capturing():
+            return {}
+
+        mask = getattr(kvm, "indexer_k_cache_local_layer_mask", None)
+        if mask is None:
+            self._group_remap_struct = {}
+            self._group_remap_struct_kv_id = id(kvm)
+            return self._group_remap_struct
+
+        n = len(mask)
+        leader_of = [-1] * n
+        slot_of = [0] * n
+        members = {}  # leader local idx -> [member local idx, ...]
+        cur_leader = None
+        for local_idx in range(n):
+            if mask[local_idx]:
+                cur_leader = local_idx
+                members[cur_leader] = [local_idx]
+            else:
+                if cur_leader is None:
+                    # Shouldn't happen (layer 0 forced full); be safe.
+                    cur_leader = local_idx
+                    members[cur_leader] = [local_idx]
+                else:
+                    members[cur_leader].append(local_idx)
+            leader_of[local_idx] = cur_leader
+            slot_of[local_idx] = len(members[cur_leader]) - 1
+
+        # Device for the small per-group layer-offset tensors.
+        device = None
+        if self.shared_topk_indices is not None:
+            device = self.shared_topk_indices.device
+        elif self.block_table is not None:
+            device = self.block_table.device
+
+        group_active = {}
+        group_scale = {}
+        group_size = {}
+        group_layer_ids = {}
+        for leader, member_list in members.items():
+            group_size[leader] = len(member_list)
+            params = [kvm.get_primary_pool_page_index_params(m) for m in member_list]
+            scale0 = params[0][0]
+            uniform_scale = all(p[0] == scale0 for p in params)
+            offsets = [int(p[1]) for p in params]
+            active = len(member_list) >= 2 and uniform_scale and device is not None
+            group_active[leader] = active
+            group_scale[leader] = int(scale0)
+            if active:
+                group_layer_ids[leader] = torch.tensor(offsets, dtype=torch.int32, device=device)
+
+        struct = {
+            "leader_of": leader_of,
+            "slot_of": slot_of,
+            "group_active": group_active,
+            "group_scale": group_scale,
+            "group_size": group_size,
+            "group_layer_ids": group_layer_ids,
+        }
+        self._group_remap_struct = struct
+        self._group_remap_struct_kv_id = id(kvm)
+        return struct
 
     @maybe_compile(dynamic=True)
     def _get_dense_topk_indices(self, seq_lens, kv_lens, num_tokens):
@@ -1084,19 +1185,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 )
 
     def prepare_for_spec_decode(self, kv_lens: torch.Tensor):
-        # fp8_paged_mqa_logits supports seq_len 1/2/4 on sm100 and 1/2 on
-        # sm90. Flatten Q and expand kv_lens and block_table for other MTP
-        # configurations.
+        # The DeepGEMM paged-MQA kernel (fp8_paged_mqa_logits) runs a native
+        # next_n >= 1 on sm100+: its scheduler tiles the query tokens into
+        # BLOCK_Q-sized blocks (num_q_blocks = ceil_div(num_q_tokens, BLOCK_Q)),
+        # so any MTP depth is handled without a per-draft-token Q flatten /
+        # kv_lens / block_table expansion on Blackwell. sm90 still lacks native
+        # MTP support (seq_len 1/2 only) and must expand for max_draft_tokens > 1.
         # TODO:
-        # - No distinction between sm90 and sm100 is needed once MTP3 is supported on sm90.
-        # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
+        # - Drop this sm90 branch (and the expanded buffers) once
+        #   fp8_paged_mqa_logits supports an arbitrary next_n on sm90 too.
         use_dsl = self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
-        self.use_expanded_buffers_for_mtp = not use_dsl and (
-            (self.max_draft_tokens > 1 and get_sm_version() == 90)
-            or (
-                (self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                and get_sm_version() >= 100
-            )
+        self.use_expanded_buffers_for_mtp = (
+            not use_dsl and self.max_draft_tokens > 1 and get_sm_version() == 90
         )
         if self.use_expanded_buffers_for_mtp:
             # Expand kv_lens_cuda (only generation)

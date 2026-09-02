@@ -228,6 +228,70 @@ def test_selfsampling_topk_degenerate_hints(hint_kind, top_k, n_valid):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
+@pytest.mark.parametrize("n_valid", [3072, 4096], ids=["n3072", "n4096"])
+def test_selfsampling_topk_high_anchor_hint_completeness(n_valid):
+    """Anchor-only hints whose gathered values all sit ABOVE the true k-th
+    value (an argmax anchor over the all-zero cold-start buffer, with a high
+    row head) bracket the sampling band so it contains fewer than top_k
+    entries. The classify histogram then never reaches k and the crossing
+    scan pins its bin-0 fallback as a fake crossing; the register-family
+    whole-bin emit must escape to the key-space ranking instead of
+    stopping at the histogram total (regression: rows exited with
+    out[tot:k) unwritten -- a prefix-only write). Deterministic worst case:
+    row[0] = second-max, so the bracket holds exactly two entries. The
+    cells pin the vulnerable reg variant (hint-driven bracket + no-clamp
+    classify: BRL variants clamp out-of-bracket values into bin 0 and
+    cannot under-count, so batch/shape are chosen to compile BRL off).
+
+    The production hint-free bracket cannot under-count (its k source
+    values sit inside the band by construction), so this exercises the
+    hinted codegen through the batch-uniform TESTING/BENCH entry."""
+    top_k = 512
+    bs = 256
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((bs, n_valid), generator=gen, dtype=torch.float32, device=_DEV)
+    v2 = torch.topk(logits, 2, dim=1).values[:, 1]
+    logits[:, 0] = v2  # row head = second-max: bracket = [second-max, max]
+    ref_vals, _ = torch.topk(logits, top_k, dim=1)
+    pre_idx = torch.zeros((bs, top_k), dtype=torch.int32, device=_DEV)
+    pre_idx[:, 0] = logits.argmax(dim=1).to(torch.int32)
+    indices = torch.full((bs, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run(logits, pre_idx, n_valid, indices)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots (prefix-only emit)"
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
+def test_selfsampling_topk_neginf_tail_completeness():
+    """The DEG bracket arm folds the row tail element (the last n % 4
+    columns live outside the float4 register batch) into the bracket
+    without the > -inf guard the vector loop has: a single in-window -inf
+    there drags the bracket low edge to -inf, every classify product
+    becomes NaN, the histogram total is zero, and the row exited having
+    written nothing (regression: hint-independent zero-write rows). The
+    escape such rows now take must also not double-count the tail element
+    when the tie class is the -inf key itself (regression: duplicate
+    indices from the -inf fill lanes of the last partial float4) -- odd
+    rows keep fewer than top_k finite entries to exercise that lane
+    bound."""
+    top_k = 1024
+    bs, npad, n_valid = 256, 4096, 4093  # n_valid % 4 = 1: one tail column
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((bs, npad), generator=gen, dtype=torch.float32, device=_DEV)
+    logits[:, n_valid:] = 3e38  # poison past the window
+    logits[:, n_valid - 1] = float("-inf")  # in-window -inf in the tail column
+    logits[1::2, 500:n_valid] = float("-inf")  # odd rows: n_finite < top_k
+    masked = logits.clone()
+    masked[:, n_valid:] = float("-inf")
+    ref_vals, _ = torch.topk(masked, top_k, dim=1)
+    indices = torch.full((bs, top_k), -7, dtype=torch.int32, device=_DEV)
+    kv = torch.full((bs,), n_valid, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, kv, indices, max_seq_len=npad)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots (zero-write rows)"
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
 def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False):
     """Build a per-row-poisoned varlen batch, run run_varlen, verify every
     row against its own n_r (production formula) — short rows included."""
