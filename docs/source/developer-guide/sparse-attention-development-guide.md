@@ -116,13 +116,13 @@ The shared `AttentionOp` path is built around three layers:
 </div>
 <p align="center"><sub><em>Figure 1: Framework support for sparse attention in TensorRT LLM.</em></sub></p>
 
-Hook-based implementations subclass `AttentionBackend`, supply
-`sparse_kv_predict` / `sparse_attn_predict`, and reuse the shared
-`AttentionOp` stack. A dedicated backend can implement sparse
-computation directly; MiniMax-M3's default Triton backend follows this
-model, while its packaged block-sparse implementation uses the hook-based
-path. Different attention layers within a model can use different
-backends, so sparse strategies can be mixed layer by layer.
+Hook-based `TrtllmAttention` implementations supply `sparse_kv_predict` /
+`sparse_attn_predict` and reuse the shared `AttentionOp` stack. RocketKV's
+`VanillaAttention` implementation instead uses per-request Python hooks. A
+dedicated backend can implement sparse computation directly; MiniMax-M3's
+default Triton backend follows this model. Different attention layers within a
+model can use different backends, so sparse strategies can be mixed layer by
+layer.
 
 The current capability matrix is:
 
@@ -136,8 +136,8 @@ Dynamic generation-phase KV eviction is tracked as future work.
 
 ### Prediction hooks
 
-`AttentionBackend` exposes two prediction methods that algorithm-specific
-subclasses override:
+`TrtllmAttention`-based sparse backends expose two prediction methods that
+algorithm-specific subclasses override:
 
 ```python
 sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(q, k, metadata, forward_args)
@@ -199,8 +199,9 @@ For sparse MLA, the kernel consumes token-level indices directly, so
 `gatherKvPageOffsetsKernel` is bypassed — both context and generation
 phases are supported at token granularity. The sparse MLA path
 currently expects **global** KV cache pool addresses with token-level
-offsets, not request-local logical positions. Sparse KV cache for MLA
-is not yet supported.
+offsets, not request-local logical positions. MLA does not support the shared
+`sparse_kv_indices` in-place compaction path. DeepSeek-V4's model-native
+compressed-history pools use a separate cache path.
 
 ### Auxiliary memory pools
 
@@ -248,10 +249,11 @@ the bottom of the file.
 
 ### 2. Prediction module
 
-Create a new backend class inheriting from `TrtllmAttention` (or
-`VanillaAttention` if appropriate) in
+Create a new backend class inheriting from `TrtllmAttention` in
 `tensorrt_llm/_torch/attention_backend/sparse/`. Override one or both
-prediction methods.
+prediction methods. A `VanillaAttention` implementation instead overrides
+`_single_request_sparse_kv_predict` and
+`_single_request_sparse_attn_predict` with its per-request Python contract.
 
 **`sparse_kv_predict(self, q, k, metadata, forward_args)`**
 
@@ -311,10 +313,10 @@ If the algorithm needs extra tensors beyond the main KV cache:
 
 ### 4. Registration and dispatch
 
-- Register the new config + backend in
-  `tensorrt_llm/_torch/attention_backend/sparse/registry.py` and
-  `tensorrt_llm/_torch/pyexecutor/_util.py` so the runtime routes
-  requests to your backend when the config is present.
+- Register the new config and backend in
+  `tensorrt_llm/_torch/attention_backend/sparse/registry.py`. Update executor
+  wiring only when the algorithm requires behavior beyond the registry's
+  generic dispatch.
 - If the algorithm customizes module-layer behavior, implement and register a
   concrete `MLASparseHooks` or `AttentionSparseHooks` adapter from the
   algorithm's `module.py`.
@@ -332,9 +334,10 @@ framework wiring is:
 - A new config subclass with its own `algorithm` discriminator.
 - A lowered `SparseParams` object that carries the resolved kernel
   settings.
-- A switch inside the attention backend (e.g.,
-  `_torch/attention_backend/trtllm_gen.py`) that reads the lowered params
-  and enables the kernel-side fast path.
+- A switch inside the attention backend, such as
+  `_torch/attention_backend/trtllm.py` or an implementation under
+  `_torch/attention_backend/fmha/`, that reads the lowered params and enables
+  the kernel-side fast path.
 
 Skip Softmax Attention follows this pattern — see the
 [BLASST tech blog](../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md)

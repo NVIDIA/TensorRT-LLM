@@ -13,6 +13,11 @@ Use it when modifying the current implementation or adding a new model's
 attention behavior. It covers standard `Attention`, Multi-head Latent
 Attention (MLA), dense backends, and sparse backends.
 
+For user-visible sparse attention capabilities and configuration, see the
+[Sparse Attention feature guide](../../../docs/source/features/sparse-attention.md).
+For the framework hooks and steps for adding a sparse algorithm, see the
+[Sparse Attention Development Guide](../../../docs/source/developer-guide/sparse-attention-development-guide.md).
+
 ## Glossary
 
 | Acronym | Meaning |
@@ -152,10 +157,11 @@ the backend-to-AttentionOp `SparseRuntimeParams`, live in
 
 For MLA-related tasks, first check whether the work fits the current
 projection structure, can stay on an existing backend and metadata family, and
-can preserve the current latent-cache / paged-KV contract. If it can, the
-task usually stays within the existing MLA stack. If it depends on sparse
-helper-level control flow, read `mla.py`, `attention_backend/sparse/hooks.py`,
-and the relevant algorithm's `module.py` directly.
+can preserve the current model-specific shared-KV / paged-KV contract. If it
+can, the task usually stays within the existing MLA stack. If it depends on
+sparse helper-level control flow, read `mla.py`,
+`attention_backend/sparse/hooks.py`, and the relevant algorithm's `module.py`
+directly.
 
 ## 2. Backend Layer Reference
 
@@ -179,14 +185,27 @@ Base backend families:
 
 Sparse attention is not selected by a separate top-level module. User-facing
 `SparseAttentionConfig` objects live in LLM / VisualGen args and `ModelConfig`.
-Attention modules use those configs to select sparse backend classes, then
-lower the configs into `SparseParams` for backend construction. KV-cache
-managers stay model-scope and consume the user-facing config directly.
-Sparse metadata consumes `SparseMetadataParams`, derived independently from the
-same user-facing config.
+`config.attn_backend` still selects the base backend family; the sparse
+algorithm refines that choice through `attention_backend/sparse/registry.py`.
+Attention modules lower the user config into backend-owned `SparseParams`.
+KV-cache managers stay model-scope and consume the user-facing config directly,
+while sparse metadata consumes a separately lowered `SparseMetadataParams`.
+
+Framework-level algorithms either use the hook-based `TrtllmAttention` /
+`AttentionOp` path or own prediction and computation in a dedicated backend.
+The hook-based path carries module inputs through `SparseBackendForwardArgs`
+and backend outputs through `SparseRuntimeParams`. `VanillaAttention` does not
+use that contract; RocketKV's Vanilla implementation uses per-request Python
+hooks. Kernel-level sparsity such as Skip Softmax has no external predictor.
+See the
+[Sparse Attention Development Guide](../../../docs/source/developer-guide/sparse-attention-development-guide.md)
+for algorithm-specific hooks, index layouts, and cache managers.
 
 Sparse registrations are defined in `attention_backend/sparse/registry.py`. Check
-that file for the current supported combinations, as they may change over time.
+that file for the current config/backend combinations. Consult the
+[feature guide](../../../docs/source/features/sparse-attention.md#supported-sparse-attentions)
+for the supported attention shapes; do not infer support from algorithm
+registration alone.
 
 ### 2.3 Backend contract
 
@@ -268,6 +287,10 @@ workspace, page-table KV metadata, and prefill/decode wrapper state.
 sparse-specific runtime state (indexer buffers, routing state, side-cache
 state).
 
+`SparseRuntimeParams` is the backend-to-`AttentionOp` carrier only on the
+`TrtllmAttention` path. Its fields are algorithm-specific, not a generic
+sparse-attention ABI; `VanillaAttention` uses its own per-request contract.
+
 ### 3.2 KV-cache and decode-time semantics
 
 The main question is not just "does the backend read K and V?" but:
@@ -292,7 +315,8 @@ use cache. `KVCacheManager.get_buffers()` exposes a per-layer view of the
 primary pool:
 
 - For standard dense attention, `kv_factor = 2` (separate K and V planes).
-- For MLA-style cache, `kv_factor = 1` (one latent-cache tensor per token).
+- For MLA-style cache, `kv_factor = 1` (one model-specific shared-KV tensor per
+  token in the primary pool).
 
 The main differences across backends:
 
@@ -372,6 +396,8 @@ The FMHA package is split by role:
   `TrtllmAttention` can pair it with a later causal-generation provider through
   `CombinedFmha`.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
+- `fmha/msa_sparse_gqa.py` integrates the packaged SM100/SM103 block-sparse
+  GQA implementation.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
@@ -385,13 +411,15 @@ shape.
 
 #### 3.2.3 MLA cached-context semantics
 
-MLA cached state is not regular dense K and V. The paged cache stores
-latent-cache state rather than separate K and V planes. Backend ops handle
-appending, RoPE application, and loading cached state for attention use.
+MLA cached state is not regular dense K and V. Dense MLA and DSA store a
+low-rank latent representation rather than separate K and V planes.
+DeepSeek-V4 instead combines model-specific sliding-window and compressed
+full-head representations across multiple pools. Backend ops handle appending,
+RoPE application, and loading the appropriate cached state for attention use.
 
 MLA fit cannot be judged from attention math alone. The module and backend must
-agree on latent-cache layout, paged-KV read/write paths, and cached/chunked
-context behavior. Read `mla.py` and the relevant
+agree on the shared-KV representation, paged-KV read/write paths, auxiliary
+pools, and cached/chunked-context behavior. Read `mla.py` and the relevant
 backend code for the current implementation details.
 
 fp8 context-MLA also stages a K/V dequant workspace sized by summed attended KV
@@ -399,13 +427,12 @@ length; it is declared through the workspace memory-accounting contract (§2.3).
 
 #### 3.2.4 Sparse side-cache semantics
 
-Sparse backends may add side caches beyond the main KV cache. Some sparse
-algorithms keep the standard cache manager; others replace it with a
-sparse-aware cache manager that adds side caches for indexing or routing.
-
-When evaluating new sparse attention, check both the main KV-cache contract
-and the side-cache contract. See `attention_backend/sparse/` for the current
-sparse cache managers and their side-cache structures.
+Sparse backends may add side caches for indexing, routing, or compressed
+history. Check their allocation, request lifecycle, block reuse, chunked
+prefill, disaggregated transfer, CUDA Graph, and speculative-decoding contracts.
+See `attention_backend/sparse/` and the
+[Sparse Attention Development Guide](../../../docs/source/developer-guide/sparse-attention-development-guide.md)
+for details.
 
 ## 4. Evaluating New Attention
 
@@ -484,6 +511,8 @@ Working rules:
 | `tensorrt_llm/_torch/attention_backend/fmha/` | Internal TRTLLM FMHA libraries |
 | `tensorrt_llm/_torch/attention_backend/vanilla.py` | Torch fallback backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/flashinfer.py` | FlashInfer backend and metadata |
+| `tensorrt_llm/_torch/attention_backend/sparse/params.py` | Lowered sparse parameters and module/backend runtime carriers |
+| `tensorrt_llm/_torch/attention_backend/sparse/registry.py` | Sparse backend, metadata, and cache-manager registration |
 | `tensorrt_llm/_torch/attention_backend/sparse/hooks.py` | Sparse module hooks and backend prediction orchestration |
 | `tensorrt_llm/_torch/attention_backend/sparse/<algorithm>/module.py` | Algorithm-specific module-hook implementations |
 | `tensorrt_llm/_torch/attention_backend/sparse/` | Sparse prediction backends, metadata, cache managers, and kernels |
@@ -495,6 +524,11 @@ Working rules:
 - Test fresh context, cached context, chunked context, and generation
   separately.
 - Any dispatch change touching `forward_context()` needs chunked-context tests.
+
+Keep reusable sparse computation in the root `test_sparse_mla_forward.py`,
+`test_sparse_mqa_gqa.py`, and `test_sparse_mha.py` modules. Shared framework
+tests live in `test_sparse_attention.py`; selector and cache tests belong in
+algorithm subdirectories such as `dsa/`, `msa/`, and `rocketkv/`.
 
 Key test files:
 
