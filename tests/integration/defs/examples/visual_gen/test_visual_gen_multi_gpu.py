@@ -78,10 +78,10 @@ def _parallel_config(**kwargs):
 #     one-ULP seed amplifies over the denoising steps to a saturation band
 #     (measured: tp2-family 0.2098, attn2d_2x2-family 0.2597, tp3 0.2618;
 #     stable composition -- cfg/ulysses/attn2d-head add exactly 0 on top).
-#     0.32 gives ~0.06 headroom over the measured worst case; genuinely
+#     0.30 gives ~0.04 headroom over the measured worst case; genuinely
 #     broken output (wrong seed control run) measures far above it.
 WAN_MULTI_GPU_EXACT_WITHIN_BUILD_LPIPS_THRESHOLD = 0.05
-WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD = 0.32
+WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD = 0.30
 # Backstop gate: loose catastrophic-quality bound vs the frozen golden. The
 # frozen golden drifts away from the current trajectory whenever bf16
 # numerics legitimately change (even the single-GPU fully-eager run -- the
