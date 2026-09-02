@@ -112,6 +112,7 @@ from ..distributed import AllReduce, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
+from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.linear import TensorParallelMode, load_weight_shard
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -1985,6 +1986,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     text backbone by the multimodal ``KimiK3ForConditionalGeneration`` wrapper
     (``modeling_kimi_k3_vl``). The composite ``KimiK3ForConditionalGeneration``
     architecture is registered by that wrapper, not here."""
+
+    mamba_metadata_cls = KimiK3MambaMetadata
 
     def __init__(self, model_config: ModelConfig):
         cfg = _get_text_config(model_config.pretrained_config)
