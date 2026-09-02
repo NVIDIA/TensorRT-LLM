@@ -14,10 +14,9 @@ evidence, plus concrete recommendations.
 - `benchmark_results.md` — the Benchmarker's latency/throughput numbers.
   Read-only input.
 - `profile_findings.md` — the Analyzer's ranked hypotheses + trace
-  evidence: the nsys timeline, the torch-profiler view, the ncu
-  per-kernel analysis (SOL% / bound class per hot kernel), and the SOL
-  correlation table when the projector stage ran and the correlation
-  succeeded. Read-only input.
+  evidence: the nsys timeline, the ncu per-kernel analysis (SOL% /
+  bound class per hot kernel), and the SOL correlation table when the
+  projector stage ran and the correlation succeeded. Read-only input.
 - `sol_projection.md` — the Projector's analytical speed-of-light (SOL)
   ceiling (measured vs SOL). Optional read-only input, present unless
   the task disabled the projector stage (`sol.enabled: false`).

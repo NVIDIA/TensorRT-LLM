@@ -188,7 +188,7 @@ def test_fresh_run_executes_stages_in_order(tmp_path):
     assert "serve" not in resolved
     assert resolved["sol"] == {"enabled": True}
     assert resolved["benchmark"]["random_input_len"] == 1024
-    assert resolved["profile"]["methods"] == ["nsys", "torch", "ncu"]
+    assert resolved["profile"]["methods"] == ["nsys", "ncu"]
 
 
 def test_fresh_run_with_sol_hint_runs_projector(tmp_path):
@@ -773,7 +773,7 @@ def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
         assert "trtllm-agent-toolkit:perf-nsight-compute-analysis" in prompt
         assert "server_ncu.ncu-rep" in prompt
         assert "ncu kernel analysis" in prompt
-        assert "default all three" in prompt
+        assert "default both" in prompt
 
 
 def test_reporter_prompt_mentions_projection_only_when_enabled(tmp_path):

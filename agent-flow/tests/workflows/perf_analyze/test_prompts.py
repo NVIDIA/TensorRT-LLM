@@ -83,7 +83,7 @@ _NSYS_CALL_STACK_FLAGS = (
     "--cudabacktrace=kernel:5000,sync:10000",
 )
 
-# Canonical ``ncu`` flags the analyzer's Run C must carry.
+# Canonical ``ncu`` flags the analyzer's Run B must carry.
 _NCU_CANONICAL_FLAGS = (
     "--target-processes all",
     "--profile-from-start off",
@@ -216,7 +216,7 @@ def test_findings_contract_carries_the_timeline_decomposition():
 
 
 # --------------------------------------------------------------------------- #
-# ncu deep dive (Run C): a bounded per-kernel profile of the top nsys kernels
+# ncu deep dive (Run B): a bounded per-kernel profile of the top nsys kernels
 # over the same iteration window, interpreted with the
 # perf-nsight-compute-analysis skill; the findings carry a dedicated section
 # and the ranked hypotheses synthesize nsys + ncu + SOL correlation.

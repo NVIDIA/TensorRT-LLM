@@ -596,7 +596,7 @@ profiling:
 - Choose each window from the operating point — the roles count
   iterations on different clocks and `profile.nsys_iter_range` is only a
   default. State the windows you used.
-- torch profiler and ncu have **no path through this harness**: record
+- ncu has **no path through this harness**: record
   `not available in a disagg campaign` and plan from nsys — never
   fabricate a trace.
 - KV-cache transfer (ctx to gen) is a first-class cost here that an
@@ -927,7 +927,7 @@ def kernel_coverage_analyzer_note(min_share_pct: float, coverage_target_pct: flo
     """The analyzer's per-kernel coverage contract, with the task's bars.
 
     Appended only when ``task.yaml`` declares ``profile.kernel_coverage``.
-    It supersedes Run C's top-kernel target selection with coverage-driven
+    It supersedes Run B's top-kernel target selection with coverage-driven
     enumeration, poses the two per-kernel questions (faster? fusible?),
     and defines ``kernel_ledger.yaml`` — the machine-readable proof,
     validated by the orchestrator each round, that every enumerated
@@ -955,9 +955,9 @@ orchestrator waives the contract for it rather than aborting over an
 artifact the round was told not to produce. The standing ledger still
 describes that build — the round changed nothing about it.
 
-### Coverage-driven ncu targeting (supersedes Run C's target selection)
+### Coverage-driven ncu targeting (supersedes Run B's target selection)
 
-Run C's "top 3–6 stems, never profile every kernel blindly" rule is
+Run B's "top 3–6 stems, never profile every kernel blindly" rule is
 superseded — this task pays for breadth:
 
 - **Enumerate from the fresh nsys `cuda_gpu_kern_sum`**: every kernel at
@@ -975,8 +975,8 @@ superseded — this task pays for breadth:
 - **Capture ncu in bounded passes, not one blind sweep.** One pass's
   `--launch-count` is consumed in launch order, so per-layer hot kernels
   exhaust it before once-per-step kernels (final norm, logits GEMM,
-  sampler) ever match. Run Run C's canonical command up to **3 passes**:
-  pass 1 filters on the hottest stems exactly as Run C describes; then
+  sampler) ever match. Run Run B's canonical command up to **3 passes**:
+  pass 1 filters on the hottest stems exactly as Run B describes; then
   check which enumerated stems the report actually captured (`ncu
   --import ... --page raw --csv`), and each further pass filters on
   **only the still-missing stems** (so its budget is spent on them),
@@ -987,7 +987,7 @@ superseded — this task pays for breadth:
 - **Degrade honestly, never fabricate**: a kernel no pass captured (or
   ncu itself unavailable) keeps its ledger row with
   `ncu: "unavailable: <reason>"` — both questions are still owed,
-  answered from the nsys timeline, the torch trace, and the source.
+  answered from the nsys timeline and the source.
 
 ### Question 1 per kernel — can it be made faster?
 
@@ -1040,9 +1040,9 @@ Fusion verdicts rest on **observed adjacency, not guesses**. Derive each
 kernel's neighborhood from the traces: the launch sequence inside one
 steady-state step (`nsys stats --report cuda_gpu_trace`, or the
 timeline around the kernel's instances) gives the predecessor/successor
-kernels; the torch trace's op attribution gives the producer/consumer
-tensors between them. Record it in the row's `fusion.neighbors`. Then
-test the candidate patterns:
+kernels; the NVTX ranges around them, read against the source, give the
+producer/consumer tensors. Record it in the row's `fusion.neighbors`.
+Then test the candidate patterns:
 
 - elementwise/cast/activation chains between two anchors → one fused
   kernel or the producer's epilogue;
@@ -1058,7 +1058,7 @@ opportunity. The recurring legitimate dismissals:
 
 - `multi-consumer-pinned` — the intermediate feeds >1 consumer, so
   fusion cannot remove the round trip (cite the consumers from the
-  torch trace / source).
+  timeline / source).
 - `already-fused` — the kernel is itself the fused form of its
   neighborhood; nothing adjacent left to absorb.
 - `phase-boundary` — the neighbors sit across a CUDA-graph capture,
@@ -1102,7 +1102,7 @@ kernels:                        # descending share_pct; one row per kernel/group
     fusion:
       disposition: dismissed
       neighbors: "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace, step 120)"
-      ref: "multi-consumer-pinned: intermediate feeds residual add + next norm (torch_trace)"
+      ref: "multi-consumer-pinned: intermediate feeds residual add + next norm (cuda_gpu_trace)"
   - kernel: allreduce_fusion            # a collective: never goes under ncu at all
     full_name: "void tensorrt_llm::kernels::ar_fusion::..."
     share_pct: 9.2
@@ -1125,7 +1125,7 @@ Rules:
   the referenced item may already be `accepted`/`failed` (the
   possibility *was* considered — that is the point). `disposition:
   dismissed` carries the evidence in `ref`, tagged per the vocabularies
-  above, citing the artifact (an ncu row, the torch trace, a source
+  above, citing the artifact (an ncu row, the nsys timeline, a source
   file, a failed item's `evaluation.md`).
 - **Say "not measured", never guess it.** A collective never goes under
   `ncu` — kernel replay deadlocks it — so disposition an allreduce from

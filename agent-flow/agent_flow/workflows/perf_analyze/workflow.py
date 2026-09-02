@@ -144,8 +144,8 @@ class PerfAnalyzeWorkflow:
     """Linear benchmarker → projector → analyzer → reporter pipeline.
 
     Serves a model checkpoint with ``trtllm-serve``, benchmarks and
-    profiles it with ``benchmark_serving.py`` (nsys + torch profiler +
-    ncu per-kernel deep dive), and synthesizes a report whose headline
+    profiles it with ``benchmark_serving.py`` (nsys + ncu per-kernel
+    deep dive), and synthesizes a report whose headline
     is the main performance bottleneck. The projector stage — on unless
     ``task.yaml`` sets ``sol.enabled: false`` — derives an analytical
     speed-of-light (SOL) ceiling between the benchmarker and the analyzer
@@ -190,7 +190,7 @@ class PerfAnalyzeWorkflow:
         if clean:
             # Wipe the workflow's managed files so the constructor proceeds
             # as a fresh run. Other files in the workspace (run artifacts
-            # such as serve.log, *.nsys-rep, torch_trace/) are left alone.
+            # such as serve.log, *.nsys-rep, *.ncu-rep) are left alone.
             for path in (
                 self.state_path,
                 self.benchmark_results_path,
@@ -506,8 +506,8 @@ class PerfAnalyzeWorkflow:
         projection_context = ""
         correlation_instruction = ""
         findings_sections = (
-            "Profiling setup / nsys timeline / Torch profiler / ncu kernel "
-            "analysis / Ranked bottleneck hypotheses / Caveats"
+            "Profiling setup / nsys timeline / ncu kernel analysis / "
+            "Ranked bottleneck hypotheses / Caveats"
         )
         if self._sol_enabled():
             projection_context = (
@@ -536,9 +536,8 @@ class PerfAnalyzeWorkflow:
                 f"record `Correlation unavailable: <reason>` there instead.\n\n"
             )
             findings_sections = (
-                "Profiling setup / nsys timeline / Torch profiler / ncu "
-                "kernel analysis / SOL correlation / Ranked bottleneck "
-                "hypotheses / Caveats"
+                "Profiling setup / nsys timeline / ncu kernel analysis / "
+                "SOL correlation / Ranked bottleneck hypotheses / Caveats"
             )
         self.analyzer(
             f"Workspace: {self.workspace}\n\n"
@@ -556,14 +555,12 @@ class PerfAnalyzeWorkflow:
             f"inherits a known precedent.\n\n"
             f"First **verify this checkout's profiling knobs** with "
             f"`grep -rn`/`rg` via `Bash` under "
-            f"`{self._trtllm_hint()}` — `py_executor.py` for both "
-            f"`TLLM_PROFILE_START_STOP` (the iteration-window gate) and the "
-            f"torch-trace env var (e.g. `TLLM_TORCH_PROFILE_TRACE`), and "
+            f"`{self._trtllm_hint()}` — `py_executor.py` for "
+            f"`TLLM_PROFILE_START_STOP` (the iteration-window gate), and "
             f"`openai_server.py` for whether a `/start_profile` endpoint even "
             f"exists — use the names you find. Then run the profilers listed "
-            f"in `profile.methods` (default all three): **nsys** (GPU "
-            f"timeline), the **torch profiler**, and **ncu** (per-kernel deep "
-            f"dive) — nsys and torch gated server-side by "
+            f"in `profile.methods` (default both): **nsys** (GPU timeline) "
+            f"and **ncu** (per-kernel deep dive) — nsys gated server-side by "
             f"`TLLM_PROFILE_START_STOP` over `profile.nsys_iter_range` (not by "
             f"the client's `--profile` flag), ncu over the same window via "
             f"`--profile-from-start off`. Drive nsys from the **canonical "
@@ -594,7 +591,7 @@ class PerfAnalyzeWorkflow:
             f"bullet comes from the pipeline too (it re-reads files only — no "
             f"server, no GPU). Run ncu "
             f"last, "
-            f"per your system prompt's Run C: **load the "
+            f"per your system prompt's Run B: **load the "
             f"`perf-nsight-compute-analysis` skill** (via the `Skill` tool; "
             f"fully-qualified "
             f"`trtllm-agent-toolkit:perf-nsight-compute-analysis` if the bare "
@@ -605,8 +602,7 @@ class PerfAnalyzeWorkflow:
             f"`server_nsys.nsys-rep`, the `nsys stats` output, the "
             f"`nsys_analysis/` directory, "
             f"`server_nsys_metrics.nsys-rep` and `server_nsys_stacks.nsys-rep` "
-            f"from the Run A2 passes, the torch traces "
-            f"under `torch_trace/`, `server_ncu.ncu-rep` + its "
+            f"from the Run A2 passes, `server_ncu.ncu-rep` + its "
             f"`ncu_details.txt` / `ncu_raw.csv` summaries, and "
             f"`perf_metrics.json` if available. Tear "
             f"every server down.\n\n"

@@ -35,14 +35,14 @@ benchmark:
   # dataset_path: /path/to/ShareGPT.json   # for sharegpt / hf datasets
 
 # Optional: which profilers the Analyzer runs, and the steady-state
-# iteration window that gates them (TLLM_PROFILE_START_STOP for
-# nsys/torch; ncu arms on the same window via --profile-from-start off).
+# iteration window that gates them (TLLM_PROFILE_START_STOP for nsys;
+# ncu arms on the same window via --profile-from-start off).
 # The nsys timeline is decomposed with the perf-nsight-system-analysis
 # skill (per-iteration time, busy/idle rungs, compute-absent causes);
 # ncu is the bounded per-kernel deep dive on the top nsys kernels,
 # interpreted with the perf-nsight-compute-analysis skill.
 profile:
-  methods: [nsys, torch, ncu]
+  methods: [nsys, ncu]
   nsys_iter_range: "100-150"
 
 # Optional: include this section only when the server + benchmark must run

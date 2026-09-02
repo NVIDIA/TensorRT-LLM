@@ -37,7 +37,7 @@ Shape::
         fusion:                             # question 2 — fuse with neighbors
           disposition: dismissed
           neighbors: "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace step 120)"
-          ref: "multi-consumer-pinned: intermediate feeds residual + norm (torch_trace)"
+          ref: "multi-consumer-pinned: intermediate feeds residual + norm (cuda_gpu_trace)"
       - kernel: allreduce_fusion            # a collective: never goes under ncu
         full_name: "void tensorrt_llm::kernels::ar_fusion::..."
         share_pct: 9.2

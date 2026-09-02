@@ -25,7 +25,7 @@ def test_minimal_task_gets_all_defaults(tmp_path):
     data = task_schema.load_and_validate_task_yaml(_write_task(tmp_path))
     # perf-analyze base defaults still merge.
     assert data["benchmark"]["random_input_len"] == 1024
-    assert data["profile"]["methods"] == ["nsys", "torch", "ncu"]
+    assert data["profile"]["methods"] == ["nsys", "ncu"]
     # perf-optimize defaults merge.
     assert data["optimize"] == {
         "max_rounds": 5,
@@ -389,7 +389,7 @@ def test_kernel_coverage_absent_by_default(tmp_path):
 def test_empty_kernel_coverage_block_enables_defaults(tmp_path):
     task = _write_task(tmp_path, {"profile": {"kernel_coverage": {}}})
     data = task_schema.load_and_validate_task_yaml(task)
-    # methods defaulted to all three, so the nsys+ncu requirement holds.
+    # methods defaulted to both, so the nsys+ncu requirement holds.
     assert data["profile"]["kernel_coverage"] == {
         "min_share_pct": 0.5,
         "coverage_target_pct": 95.0,
@@ -418,7 +418,7 @@ def test_kernel_coverage_bars_must_be_in_range(tmp_path):
 def test_kernel_coverage_requires_nsys_and_ncu_methods(tmp_path):
     # The enumeration comes from nsys, the per-kernel metrics from ncu —
     # a profile that drops either cannot honor the contract.
-    for methods in (["torch"], ["nsys", "torch"], ["ncu"]):
+    for methods in (["nsys"], ["ncu"]):
         task = _write_task(
             tmp_path,
             {"profile": {"methods": methods, "kernel_coverage": {}}},

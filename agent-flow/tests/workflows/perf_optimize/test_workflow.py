@@ -2258,7 +2258,7 @@ def test_run_evaluator_includes_accept_evidence_duty_when_nsys_configured(tmp_pa
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["nsys", "torch"]}}),
+            yaml.safe_dump({"profile": {"methods": ["nsys", "ncu"]}}),
             encoding="utf-8",
         )
         state = _evaluator_state(ws)
@@ -2289,7 +2289,7 @@ def test_accept_evidence_duty_decomposes_the_capture(tmp_path, fake_git):
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["nsys", "torch"]}}),
+            yaml.safe_dump({"profile": {"methods": ["nsys", "ncu"]}}),
             encoding="utf-8",
         )
         state = _evaluator_state(ws)
@@ -2313,7 +2313,7 @@ def test_run_evaluator_has_no_duty_without_nsys(tmp_path, fake_git):
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["torch"]}}), encoding="utf-8"
+            yaml.safe_dump({"profile": {"methods": ["ncu"]}}), encoding="utf-8"
         )
         workflow._run_evaluator(_evaluator_state(ws))
         assert "Accept-evidence duty" not in recorder.messages[0]
@@ -2328,7 +2328,7 @@ def test_run_evaluator_marks_the_final_attempt(tmp_path, fake_git):
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["torch"]}}), encoding="utf-8"
+            yaml.safe_dump({"profile": {"methods": ["ncu"]}}), encoding="utf-8"
         )
         state = _evaluator_state(ws)
         workflow._run_evaluator(state)
@@ -2381,7 +2381,7 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(tmp_path, f
         assert "byte-identical" not in message
         # The three spends the round exists to avoid.
         assert "Do **not** launch `trtllm-serve`" in message
-        assert "do **not** run nsys / ncu / the torch profiler" in message
+        assert "do **not** run nsys / ncu" in message
         assert "do **not** run the benchmark" in message
         # …and the evidence it plans from instead.
         assert str(ws / "rounds" / "round_1" / "analysis") in message

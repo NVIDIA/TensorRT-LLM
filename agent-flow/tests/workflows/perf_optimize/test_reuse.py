@@ -112,17 +112,13 @@ def test_discover_skips_a_trailing_replan_round(tmp_path):
     assert found.kernel_ledger == found.findings.parent / "kernel_ledger.yaml"
 
 
-@pytest.mark.parametrize("trace_kind", ["torch", "ncu"])
-def test_discover_recognizes_a_profile_that_omitted_nsys(tmp_path, trace_kind):
-    """`profile.methods` supports torch-only and ncu-only profiling rounds."""
+def test_discover_recognizes_a_profile_that_omitted_nsys(tmp_path):
+    """`profile.methods` supports ncu-only profiling rounds."""
     source = tmp_path / "optimize"
     _write(source / "baseline" / "benchmark_results.md", "# baseline\n")
     profiled = source / "rounds" / "round_2" / "analysis"
     _write(profiled / "profile_findings.md", "# profiled without nsys\n")
-    if trace_kind == "torch":
-        _write(profiled / "torch_trace" / "trace.json", "{}\n")
-    else:
-        _write(profiled / "server_ncu.ncu-rep", "capture\n")
+    _write(profiled / "server_ncu.ncu-rep", "capture\n")
     replan = source / "rounds" / "round_3" / "analysis"
     _write(replan / "profile_findings.md", "# trailing replan note\n")
 

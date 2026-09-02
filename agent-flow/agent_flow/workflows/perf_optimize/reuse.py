@@ -82,7 +82,7 @@ _ANALYSIS_FILE_GLOBS = (
     "regions.json",
     "sol.json",
 )
-_ANALYSIS_DIR_GLOBS = ("torch_trace*", "nsys_analysis*")
+_ANALYSIS_DIR_GLOBS = ("nsys_analysis*",)
 
 _ROUND_DIR_RE = re.compile(r"round_(\d+)")
 
@@ -113,10 +113,9 @@ def _first_existing(*candidates: Path) -> Path | None:
 
 # What makes a round's ``analysis/`` a profile rather than a replan note:
 # an artifact from any supported profiler. ``profile.methods`` may omit
-# nsys, so ncu-only and torch-only rounds count too. A perf-optimize round
-# that opened replan-only writes findings without capturing any of these.
+# nsys, so ncu-only rounds count too. A perf-optimize round that opened
+# replan-only writes findings without capturing any of these.
 _PROFILED_ROUND_FILE_GLOBS = ("*.nsys-rep", "nsys_stats*.txt", "*.ncu-rep")
-_PROFILED_ROUND_DIR_GLOBS = ("torch_trace*",)
 
 
 def _has_trace(analysis_dir: Path) -> bool:
@@ -124,10 +123,6 @@ def _has_trace(analysis_dir: Path) -> bool:
     return any(
         path.is_file()
         for pattern in _PROFILED_ROUND_FILE_GLOBS
-        for path in analysis_dir.glob(pattern)
-    ) or any(
-        path.is_dir() and any(path.iterdir())
-        for pattern in _PROFILED_ROUND_DIR_GLOBS
         for path in analysis_dir.glob(pattern)
     )
 

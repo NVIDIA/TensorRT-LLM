@@ -17,7 +17,7 @@ load a methodology skill per profiler run, unprompted —
 ``perf-nsight-system-analysis`` to read the Run A timeline (per-iteration
 anchor, the busy/idle rungs, and what caused each compute-absent
 stretch) and ``perf-nsight-compute-analysis`` to capture and interpret
-the Run C ncu per-kernel deep dive; and the
+the Run B ncu per-kernel deep dive; and the
 projector's own prompt (in ``projector.py``) builds on
 ``internal-perf-sol-analysis`` as its projection methodology (the
 analyzer loads the same skill for the measured↔SOL correlation when the
@@ -364,17 +364,15 @@ relying on them**, confirm what *this* checkout in `trtllm_repo_path`
 actually supports:
 
 - With `grep -rn`/`rg` via `Bash`, search
-  `tensorrt_llm/_torch/pyexecutor/py_executor.py` for **both**
-  server-side profiler gates: `TLLM_PROFILE_START_STOP` (the iteration
-  window, and its exact format, e.g. `"100-150"`) and the **torch-trace
-  env var** (e.g. `TLLM_TORCH_PROFILE_TRACE`, or a `*_TORCH_PROFILE_*` /
-  `*_TORCH_PROFILER_DIR` name). Use the name you find, not a guessed one,
-  and note whether its value is a file path or a directory.
+  `tensorrt_llm/_torch/pyexecutor/py_executor.py` for the server-side
+  profiler gate `TLLM_PROFILE_START_STOP` (the iteration window, and its
+  exact format, e.g. `"100-150"`). Use the name you find, not a guessed
+  one.
 - With `grep -rn`/`rg` via `Bash`, search
   `tensorrt_llm/serve/openai_server.py` for a `/start_profile`
-  endpoint. Many checkouts **do not have one** — both profilers are then
-  driven entirely server-side by the env vars above, and the benchmark
-  client's `--profile` flag is a no-op. Do not assume the endpoint exists.
+  endpoint. Many checkouts **do not have one** — nsys is then driven
+  entirely server-side by the env var above, and the benchmark client's
+  `--profile` flag is a no-op. Do not assume the endpoint exists.
 - If a knob you need does not exist in this checkout, note that in
   `profile_findings.md` and skip that profiler gracefully rather than
   fabricating a trace.
@@ -458,6 +456,14 @@ time nsys runs, without waiting to be asked.
    `<stop>` server iterations to reach the window (raise `num_prompts` or
    lower the window if not), and confirm `serve.log` logs `Profiling
    started at iteration <start>` then `... stopped at iteration <stop>`.
+
+   Also pass **`--save-request-time-breakdown`** on this replay, which
+   fetches `/perf_metrics` (a per-request prefill-vs-decode breakdown) —
+   keep the resulting `*perf_metrics*.json`. That endpoint only returns
+   data when the server was launched with `return_perf_metrics` enabled
+   (it defaults off); set `return_perf_metrics: true` in an
+   `extra_llm_api_options` YAML for this run if you need the breakdown,
+   else drop the flag and note it.
 3. Tear the server down (the PID / process-group teardown below) so nsys
    flushes `server_nsys.nsys-rep`. If the report did not finalize, send
    `SIGINT` to the recorded PID and wait for nsys to write the report
@@ -646,48 +652,10 @@ and "which Python function launched this" is guesswork.
   to that pipeline (its `--launch-sequences` / `--call-stack-trace` flags
   name a different tool's exports); read A2b from its own sqlite.
 
-## Run B — PyTorch profiler (op-level)
-
-In current checkouts the torch profiler is **server-side and
-iteration-gated** by the same `TLLM_PROFILE_START_STOP` window — you turn
-it on by pointing the torch-trace env var you confirmed above (e.g.
-`TLLM_TORCH_PROFILE_TRACE`) at a path under `<workspace>/torch_trace/`,
-**not** with the benchmark client's `--profile` flag (which POSTs to a
-`/start_profile` endpoint that may not exist in this build — see *Verify
-the profiling knobs first*).
-
-1. Relaunch `trtllm-serve` (same flags) with **both** env vars set, so the
-   server writes a torch trace over the same window:
-   ```bash
-   cd <trtllm_repo_path>
-   mkdir -p <workspace>/torch_trace
-   setsid env TLLM_PROFILE_START_STOP="<profile.nsys_iter_range>" \\
-       <TORCH_TRACE_ENV_VAR>=<workspace>/torch_trace/trace.json \\
-       trtllm-serve <checkpoint_path> ...same trtllm-serve flags... \\
-       > <workspace>/serve.log 2>&1 < /dev/null &
-   echo $! > <workspace>/serve.pid
-   ```
-   Use the exact env-var name and value shape (a **file path**, not a
-   directory) you confirmed from `py_executor.py`; some versions append
-   `-rank-<N>` to the base name.
-2. Poll readiness, then replay the **same** load (the canonical benchmark
-   command already includes `--no-test-input`, as in Run A). Add the
-   client-side `--profile` flag **only if** you
-   confirmed `/start_profile` exists in this checkout; otherwise omit it —
-   it is a no-op here and the server-side env vars do the work.
-3. Also pass **`--save-request-time-breakdown`**, which fetches
-   `/perf_metrics` (a per-request prefill-vs-decode breakdown) — keep the
-   resulting `*perf_metrics*.json`. That endpoint only returns data when
-   the server was launched with `return_perf_metrics` enabled (it defaults
-   off); set `return_perf_metrics: true` in an `extra_llm_api_options` YAML
-   for this run if you need the breakdown, else drop the flag and note it.
-4. Tear the server down. Inspect the torch trace(s) under `torch_trace/`
-   for the top operators by self/CUDA time and any host-side stalls.
-
-## Run C — Nsight Compute (ncu, per-kernel deep dive)
+## Run B — Nsight Compute (ncu, per-kernel deep dive)
 
 nsys tells you **where** GPU time goes; ncu tells you **why** those
-kernels are slow (per-kernel SOL%, occupancy, warp stalls). Run C
+kernels are slow (per-kernel SOL%, occupancy, warp stalls). Run B
 therefore runs **last** and targets the top kernels Run A surfaced —
 never profile every kernel blindly.
 
@@ -709,10 +677,9 @@ never profile every kernel blindly.
    3–6 distinctive name stems covering the majority share) and build one
    `--kernel-name "regex:<stem1|stem2|...>"` filter. Record the mapping
    stem → full kernel name in your findings. (If nsys was not run —
-   not in `profile.methods` or its knob was missing — take the stems
-   from the torch trace's top CUDA kernels instead, or as a last resort
-   drop the `--kernel-name` filter and let `--launch-count` alone bound
-   the capture, noting the untargeted sample in *Caveats*.)
+   not in `profile.methods` or its knob was missing — drop the
+   `--kernel-name` filter and let `--launch-count` alone bound the
+   capture, noting the untargeted sample in *Caveats*.)
 3. Relaunch `trtllm-serve` (same flags) wrapped in ncu, gated to the
    same steady-state window. **Start from this canonical invocation —
    do not improvise the ncu flags** (fill the `<...>` placeholders;
@@ -817,7 +784,6 @@ instructions, using this structure. Section headers must match.
 - nsys call-stack pass (Run A2b): backtrace flags used + trace file +
   the graph-kernel share that bounds what it could name, or the reason
   it did not run
-- torch profiler: env var used + trace dir
 - ncu: command + kernels targeted (stem → full name) + launch count +
   report file
 - Operating point replayed: <ISL/OSL/concurrency> (matches the
@@ -852,15 +818,11 @@ instructions, using this structure. Section headers must match.
   sites, or only the eager prologue and host loop. When the pass did not
   run, keep the bullet with one line — `call stacks unavailable:
   <reason>` — and never guess an owner for a kernel.
+- Per-request prefill vs decode split (from perf_metrics, if available)
 - When the skill's pipeline did not run (skill missing, export or
   pipeline error): keep the section with the `nsys stats` numbers plus
   one line — `timeline analysis unavailable: <reason>` — and record it
   in *Caveats*.
-
-## Torch profiler
-- Top operators (name, self/CUDA time) — table
-- Host-side stalls / sync points, if any
-- Per-request prefill vs decode split (from perf_metrics, if available)
 
 ## ncu kernel analysis
 - Per-kernel table: kernel, duration, Compute (SM) SOL%, Memory SOL%,
@@ -993,14 +955,14 @@ srun --partition=<slurm_partition> \\
      --container-image=<docker_image> \\
      --container-mounts=<repo>:<repo>,<ckpt>:<ckpt>,<workspace>:<workspace> \\
      --gres=gpu:<num_gpus> --pty bash
-# then, inside the container, follow the local launch / benchmark / nsys
-# / torch-profiler steps exactly as described, writing all artifacts to
+# then, inside the container, follow the local launch / benchmark /
+# nsys / ncu steps exactly as described, writing all artifacts to
 # <workspace>.
 ```
 
 The local launch, readiness-poll, teardown, and profiling steps are
 otherwise identical — they just run inside the container. All artifacts
-(`serve.log`, result JSON, `*.nsys-rep`, `torch_trace/`, the `.md`
+(`serve.log`, result JSON, `*.nsys-rep`, `*.ncu-rep`, the `.md`
 outputs) must land in `<workspace>` so later stages and the user can read
 them.
 
@@ -1245,9 +1207,9 @@ physically sits:
    reachable here by construction (you just profiled on it).
 3. **Build `regions.json` from your traces — structural facts only.**
    The rows come from the nsys per-kernel sums
-   (`cuda_gpu_kern_sum`, NVTX ranges, torch-trace op attribution),
-   rolled up into the skill's region keys and schema. The shapes come
-   from `sol_projection.md`'s *Arithmetic* (the Projector already
+   (`cuda_gpu_kern_sum`, NVTX ranges, the timeline's kernel-category
+   rollup), rolled up into the skill's region keys and schema. The
+   shapes come from `sol_projection.md`'s *Arithmetic* (the Projector already
    derived them from `config.json`) — reuse them rather than
    re-deriving. A region whose params you cannot ground stays in
    `other` with a note — **never invent params or `measured_ms` rows**.
@@ -1496,7 +1458,7 @@ EVIDENCE_DISCIPLINE = """\
 
 - **Never fabricate numbers.** Every metric, kernel name, or percentage
   you report must come from a file you actually produced (the benchmark
-  JSON, `nsys stats` output, the torch trace, server logs). If a run
+  JSON, `nsys stats` output, the ncu report, server logs). If a run
   failed or a tool was unavailable, say so plainly — do not invent
   plausible-looking results.
 - **Record exact commands.** Anyone reading the workspace must be able to

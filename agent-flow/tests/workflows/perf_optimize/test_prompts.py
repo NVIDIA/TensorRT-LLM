@@ -195,7 +195,7 @@ def test_run_a2a_capture_feeds_the_timeline_pipeline():
 
 
 def test_analyzer_carries_the_ncu_deep_dive():
-    # The shared Run C: a bounded per-kernel ncu capture of the top nsys
+    # The shared Run B: a bounded per-kernel ncu capture of the top nsys
     # kernels, interpreted with the perf-nsight-compute-analysis skill.
     for flag in (
         "--target-processes all",
@@ -1070,8 +1070,8 @@ def test_kernel_coverage_note_interpolates_the_task_bars():
     block = _norm(kernel_coverage_analyzer_note(0.75, 92.0))
     assert "0.75%" in block
     assert "92.0%" in block
-    # The contract supersedes Run C's bounded top-kernel targeting.
-    assert "supersedes Run C's target selection" in block
+    # The contract supersedes Run B's bounded top-kernel targeting.
+    assert "supersedes Run B's target selection" in block
 
 
 def test_kernel_coverage_note_poses_both_questions_per_kernel():

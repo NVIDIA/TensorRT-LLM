@@ -27,9 +27,9 @@ your instructions open the next round **replan-only** — the same job,
 planned from the analysis you already have (see *Round N > 1*). You are
 the diagnosis half of the loop; you never apply optimizations yourself.
 
-**Round 1** — author the roadmap: profile under nsys, the torch
-profiler, and ncu (the per-kernel deep dive on the top nsys kernels),
-classify the dominant bottleneck(s) with the taxonomy below,
+**Round 1** — author the roadmap: profile under nsys and ncu (the
+per-kernel deep dive on the top nsys kernels), classify the dominant
+bottleneck(s) with the taxonomy below,
 and write `roadmap.yaml` from scratch: the `baseline` block (the target
 metric's value from `baseline/benchmark_results.md`), `current_best`
 seeded equal to it, and the `items` list ordered by `expected_gain_pct`,
@@ -124,8 +124,8 @@ acceptance gate, so it must be defensible:
   `perf-nsight-system-analysis` products),
   `server_nsys_metrics.nsys-rep` (Run A2a utilization
   pass), `server_nsys_stacks.nsys-rep` (Run A2b call-stack pass),
-  `torch_trace/`, `server_ncu.ncu-rep` + `ncu_details.txt` /
-  `ncu_raw.csv`, `serve.log`, and any benchmark result JSON you produce
+  `server_ncu.ncu-rep` + `ncu_details.txt` / `ncu_raw.csv`, `serve.log`,
+  and any benchmark result JSON you produce
   while replaying the load.
 - `progress.yaml` — record your turn with `append_analyzer_progress`.
 
@@ -150,11 +150,11 @@ context — do not touch them.
    benchmark load (Pareto-curve mode: one replay at the **largest**
    concurrency point only, with its paired `num_prompts` entry when
    `benchmark.num_prompts` is a list — profiling replays are not curve
-   measurements), capture nsys / torch traces into this round's
+   measurements), capture the nsys traces into this round's
    `analysis/` directory, decompose the nsys timeline with the
    **`perf-nsight-system-analysis` skill** (Run A step 5 below — load it
    unprompted; it re-reads the trace you just captured and costs no
-   extra server launch), then run the ncu deep dive (Run C below) on
+   extra server launch), then run the ncu deep dive (Run B below) on
    the top nsys kernels — **loading the `perf-nsight-compute-analysis`
    skill** as its capture + interpretation methodology — into the same
    directory, and tear every server down.
@@ -163,9 +163,9 @@ context — do not touch them.
    paths — before authoring the roadmap; profiling cannot see levers
    that never run.
 5. `Write` `profile_findings.md` in this round's `analysis/` directory
-   per the findings contract below (setup / nsys timeline / torch
-   profiler / ncu kernel analysis / ranked bottleneck hypotheses /
-   caveats — plus the SOL correlation section when your SOL
+   per the findings contract below (setup / nsys timeline / ncu kernel
+   analysis / ranked bottleneck hypotheses / caveats — plus the SOL
+   correlation section when your SOL
    instructions define it, and round 1's `## Dormant capabilities`
    section — each hypothesis tagged with its casebook row and grounded
    across the analyses per the contract). A replan-only round has no

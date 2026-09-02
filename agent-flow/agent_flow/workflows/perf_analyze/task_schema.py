@@ -105,7 +105,7 @@ SOL_DEFAULTS: dict[str, Any] = {SOL_ENABLED_FIELD: True}
 # silently ignored.
 _RENAMED_SOL_FIELD = "dlsim"
 
-VALID_PROFILE_METHODS: tuple[str, ...] = ("nsys", "torch", "ncu")
+VALID_PROFILE_METHODS: tuple[str, ...] = ("nsys", "ncu")
 
 # Defaults merged under the user's values for the always-present knobs.
 # Keys deliberately absent here (e.g. ``benchmark.request_rate``) stay

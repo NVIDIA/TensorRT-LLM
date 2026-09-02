@@ -51,7 +51,7 @@ def test_valid_minimal_applies_defaults(tmp_path):
     assert data["benchmark"]["num_prompts"] == 200
     assert data["benchmark"]["concurrency"] == 64
     assert data["profile"] == {
-        "methods": ["nsys", "torch", "ncu"],
+        "methods": ["nsys", "ncu"],
         "nsys_iter_range": "100-150",
     }
     assert has_slurm_environment(data) is False
@@ -742,7 +742,7 @@ def test_dump_task_yaml_round_trip(tmp_path):
     reloaded = yaml.safe_load(dump_task_yaml(data))
     assert reloaded["checkpoint_path"] == ckpt
     assert "serve" not in reloaded
-    assert reloaded["profile"]["methods"] == ["nsys", "torch", "ncu"]
+    assert reloaded["profile"]["methods"] == ["nsys", "ncu"]
 
 
 def test_dump_task_yaml_normalizes_float_inf():

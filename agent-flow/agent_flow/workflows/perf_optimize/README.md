@@ -52,9 +52,9 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   profiles the *current* build (nsys — decomposed with the
   `perf-nsight-system-analysis` skill into per-iteration time, busy/idle
   rungs and the compute-absent split (launch-starved / blocking /
-  dependency-stalled) — plus the
-  torch profiler + an ncu per-kernel deep dive on the top nsys kernels,
-  captured over the same iteration window and interpreted with the
+  dependency-stalled) — plus an ncu per-kernel deep dive on the top
+  nsys kernels, captured over the same iteration window and interpreted
+  with the
   `perf-nsight-compute-analysis` skill — per-kernel SOL%, occupancy,
   warp stalls → bound class; perf-analyze methodology), then
   writes/updates
@@ -240,7 +240,7 @@ directly.
 
 - **Profiling round** — round 1; any round opening after an accept; and
   any round whose reverted code attempt may have changed ignored build
-  output. Re-profiles the current runtime (nsys + torch + ncu per
+  output. Re-profiles the current runtime (nsys + ncu per
   `profile.methods`) and re-ranks the roadmap against fresh traces. An
   older checkpoint with no profile-currency marker also buys one
   conservative profile on resume.
@@ -428,7 +428,7 @@ running the CLI.
 │   ├── manifest.md                  #   what was imported, and from where
 │   └── prior_roadmap.yaml           #   source campaign's roadmap — read-only prior art
 ├── rounds/round_<n>/
-│   ├── analysis/                    # analyzer: profile_findings.md, nsys/torch/ncu traces, nsys_analysis/ (+ regions.json / sol.json when the projector ran;
+│   ├── analysis/                    # analyzer: profile_findings.md, nsys/ncu traces, nsys_analysis/ (+ regions.json / sol.json when the projector ran;
 │   │                                #   + kernel_ledger.yaml with a profile.kernel_coverage block)
 │   └── item_<j>_<id>/attempt_<k>/   # per item: optimization_summary.md, evaluation.md, result *.json
 │       └── profile/                 # accept-evidence nsys capture (APPROVEd attempts only)
@@ -546,7 +546,7 @@ running the CLI.
   as read-only reference, used only if it is installed in the
   session.
 - **Cost.** The analyzer re-profiles every round that follows an accept
-  or a potentially build-changing reverted code attempt (nsys + torch +
+  or a potentially build-changing reverted code attempt (nsys plus
   the bounded ncu deep dive by default); set `profile.methods: [nsys]`
   to trim it. When the standing runtime profile is still current, the
   next round opens replan-only and pays no GPU time at all — see *What a
