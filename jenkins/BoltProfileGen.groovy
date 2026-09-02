@@ -451,22 +451,15 @@ def submitProfileGen(pipeline)
         def harnessMounts = params.boltHarnessMounts ?: env.boltHarnessMounts ?: "${ws}:${ws},${modelsRoot}:${modelsRoot}"
         // The merge job still uses our own slurm_merge.sh (not the harness).
         def partArgs = "${partition.additionalArgs} ${SlurmConfig.getTimeArgs(partition)} ${SlurmConfig.getPartitionArgs(partition)}"
-        // TRTLLMINF-365: the merge job is 100% CPU (merge-fdata, llvm-bolt
-        // .fdata->.yaml, packaging, apply_bolt.py) -- run it on the CPU partition so
-        // it doesn't hold a GPU node idle or queue behind GPU demand. These clusters
-        // REJECT a zero GPU request (--gpus-per-node=0 / --gpus=0; any GPU arg must
-        // be a positive integer), so a CPU job omits every --gpus* arg and just uses
-        // --partition=cpu. Deliberately NOT partArgs here: partition.additionalArgs /
-        // getPartitionArgs carry the GPU partition's GPU-request flags. Override the
-        // CPU partition name via boltMergePartition; the CLI args below override
-        // slurm_merge.sh's #SBATCH header (time comes from that header). We pass the
-        // account explicitly (-A) so submission does not depend on the header's
-        // #SBATCH --account (which is extracted from the input tarball and may be
-        // stale): the cpu partition's QOS (cpu-*) caps gres/gpu=0, so any GPU
-        // request that leaked from a stale header would be rejected with
-        // QOSMaxGRESPerJob.
+        // The merge job is 100% CPU (merge-fdata, .fdata->.yaml, packaging,
+        // apply_bolt.py), so submit it to the CPU partition instead of holding a GPU
+        // node idle. Not partArgs: that carries the GPU partition's --gpus* flags,
+        // and these clusters reject a zero GPU request, so a CPU job must omit them
+        // entirely. Only the partition goes on the CLI (overriding slurm_merge.sh's
+        // #SBATCH header) so boltMergePartition can retarget it; account and wall
+        // time stay in the header, which is submitted from this same commit.
         def mergePartition = params.boltMergePartition ?: env.boltMergePartition ?: "cpu"
-        def mergeArgs = "-A coreai_tensorrt_ci --partition=${mergePartition}"
+        def mergeArgs = "--partition=${mergePartition}"
 
         // Wrap each branch in a stage() so Blue Ocean renders one parallel stage
         // per workload (named "Collect: <workload>").
