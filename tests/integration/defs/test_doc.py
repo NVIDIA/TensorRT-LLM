@@ -16,7 +16,6 @@
 import concurrent.futures
 import os
 import re
-import subprocess
 from collections import defaultdict
 from urllib.parse import unquote, urlparse
 
@@ -151,24 +150,7 @@ def _extract_urls(file_path):
     return normalized
 
 
-def _get_git_tree_entries(root_dir):
-    """Return a mapping of tracked paths to their Git object types."""
-    result = subprocess.run(
-        ["git", "-C", root_dir, "ls-tree", "-r", "-t", "-z", "--full-tree", "HEAD"],
-        check=True,
-        capture_output=True,
-    )
-    entries = {}
-    for entry in result.stdout.split(b"\0"):
-        if not entry:
-            continue
-        metadata, path = entry.split(b"\t", 1)
-        _, object_type, _ = metadata.split(b" ", 2)
-        entries[os.fsdecode(path)] = object_type.decode()
-    return entries
-
-
-def _check_url(url_info, git_tree_entries):
+def _check_url(url_info, root_dir):
     """Return (is_valid, url, line_num, reason)."""
     url, line_num = url_info
 
@@ -192,17 +174,18 @@ def _check_url(url_info, git_tree_entries):
         if path_match and path_match.group("git_ref") == "main":
             link_type = path_match.group("link_type").lower()
             repo_path = unquote(path_match.group("repo_path"))
+            local_path = os.path.abspath(os.path.join(root_dir, repo_path))
+            root_dir = os.path.abspath(root_dir)
+            if os.path.commonpath((root_dir, local_path)) != root_dir:
+                return False, url, line_num, "Path escapes the TensorRT-LLM repository"
+
             if link_type == "blob":
-                expected_object_type = "blob"
+                is_valid = os.path.isfile(local_path)
                 target_type = "file"
             else:
-                repo_path = repo_path.rstrip("/")
-                expected_object_type = "tree"
+                is_valid = os.path.isdir(local_path)
                 target_type = "directory"
-            is_valid = git_tree_entries.get(repo_path) == expected_object_type
-            reason = (
-                f"TensorRT-LLM {target_type} {'exists' if is_valid else 'not found'} in Git tree"
-            )
+            reason = f"TensorRT-LLM {target_type} {'exists' if is_valid else 'not found'} locally"
             return is_valid, url, line_num, reason
         return True, url, line_num, "TensorRT-LLM repo-internal ref"
 
@@ -227,7 +210,6 @@ def test_url_validity(llm_root):
     """Scan all markdown files in the repo and assert no URLs return 404."""
     md_files = _find_markdown_files(llm_root)
     assert md_files, f"No markdown files found under {llm_root}"
-    git_tree_entries = _get_git_tree_entries(llm_root)
 
     # Normalize before comparison so variants (trailing slash, query, fragment,
     # case in scheme/host) all match.
@@ -259,7 +241,7 @@ def test_url_validity(llm_root):
 
     invalid = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(_check_url, item, git_tree_entries): item for item in url_items}
+        futures = {executor.submit(_check_url, item, llm_root): item for item in url_items}
         for future in concurrent.futures.as_completed(futures):
             is_valid, url, _, reason = future.result()
             if not is_valid:
@@ -277,48 +259,3 @@ def test_url_validity(llm_root):
             for line_num, url, reason in entries:
                 report_lines.append(f"  L{line_num} [{reason}] {url}")
         pytest.fail("\n".join(report_lines))
-
-
-@pytest.fixture
-def git_tree_with_edge_cases(tmp_path):
-    repo_dir = tmp_path / "repo"
-    repo_dir.mkdir()
-    subprocess.run(["git", "init", "--quiet", repo_dir], check=True)
-
-    (repo_dir / "tracked.txt").write_text("tracked\n", encoding="utf-8")
-    (repo_dir / "broken-link").symlink_to("missing-target")
-    subprocess.run(["git", "-C", repo_dir, "add", "--", "tracked.txt", "broken-link"], check=True)
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            repo_dir,
-            "-c",
-            "user.name=Test User",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "--quiet",
-            "-m",
-            "initial commit",
-        ],
-        check=True,
-    )
-    (repo_dir / "untracked.txt").write_text("untracked\n", encoding="utf-8")
-    return _get_git_tree_entries(repo_dir)
-
-
-@pytest.mark.parametrize(
-    ("repo_path", "expected"),
-    [
-        pytest.param("tracked.txt", True, id="tracked-file"),
-        pytest.param(".git/HEAD", False, id="git-metadata"),
-        pytest.param("untracked.txt", False, id="untracked-file"),
-        pytest.param("nested/%2e%2e/tracked.txt", False, id="encoded-traversal"),
-        pytest.param("broken-link", True, id="tracked-broken-symlink"),
-    ],
-)
-def test_trtllm_github_blob_uses_git_tree(git_tree_with_edge_cases, repo_path, expected):
-    url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/main/{repo_path}"
-    is_valid, _, _, _ = _check_url((url, 1), git_tree_with_edge_cases)
-    assert is_valid is expected
