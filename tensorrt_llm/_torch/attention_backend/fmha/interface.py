@@ -15,6 +15,7 @@
 
 import weakref
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import TYPE_CHECKING, NamedTuple, Optional, Protocol
 
 import torch
@@ -74,6 +75,13 @@ class MlaBackendPolicy(Protocol):
         ...
 
 
+class FmhaPhase(str, Enum):
+    """Attention phase checked by a phased FMHA library."""
+
+    CONTEXT = "context"
+    GENERATION = "generation"
+
+
 class Fmha(ABC):
     """Common runtime contract for TRT-LLM attention FMHA libraries."""
 
@@ -98,7 +106,18 @@ class Fmha(ABC):
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
     ) -> bool:
+        """Return whether this library supports the request or requested phase.
+
+        Forward-varying selection conditions must be represented in
+        ``TrtllmAttention._make_fmha_cache_key``. Conditions omitted
+        from that key must remain invariant for the attention instance. Size-
+        based conditions must also preserve the same result throughout each
+        FMHA cache grid cell or add the relevant boundary to the grid's
+        candidate list.
+        """
         return True
 
     @abstractmethod

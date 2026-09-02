@@ -64,6 +64,7 @@ def _make_creator(
     c._speculative_config = None
     c._mapping = Mock()
     c._model_engine = Mock()
+    c._llm_args = SimpleNamespace(kv_cache_compression_config=None)
 
     c._kv_cache_manager_cls = Mock()
     c._kv_cache_manager_cls.get_cache_size_per_token = Mock(

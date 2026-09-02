@@ -9,6 +9,8 @@ from enum import Enum
 import torch
 import torch.nn as nn
 
+from tensorrt_llm.logger import logger
+
 from ..memory_buffer_utils import get_memory_buffers
 
 
@@ -20,11 +22,13 @@ class TopKImplementation(str, Enum):
     CUTE_DSL_RADIX = "cute_dsl_radix"
     CUDA_GVR = "cuda_gvr"
     CUTE_DSL_GVR = "cute_dsl_gvr"
+    CUTE_DSL_GVR_V2 = "cute_dsl_gvr_v2"
 
 
 _GVR_IMPLEMENTATIONS = {
     TopKImplementation.CUDA_GVR,
     TopKImplementation.CUTE_DSL_GVR,
+    TopKImplementation.CUTE_DSL_GVR_V2,
 }
 _MAX_RADIX_BLOCKS_PER_ROW = 10
 
@@ -55,6 +59,13 @@ class TopK(nn.Module):
             decode_implementation or TopKImplementation.CUDA_RADIX
         )
         self.compress_ratio = compress_ratio
+        # emission-assisted GVR (opt-in via prepare_gvr_emission): the
+        # module owns the closed-loop emission state; the caller passes
+        # the returned kwargs to the scoring op, and the consume side is
+        # injected into the GVR Top-K call while the step stays armed
+        self._gvr_emission_state = None
+        self._gvr_emission_route = None
+        self._gvr_emission_armed = False
 
     def forward(
         self,
@@ -258,7 +269,57 @@ class TopK(nn.Module):
         gvr_row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert gvr_prior_indices is not None
-        if self.decode_implementation == TopKImplementation.CUDA_GVR:
+        if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR_V2:
+            assert max_seq_len is not None
+            if (
+                # engine hardware-format gate (falls through otherwise):
+                # fp32 row-major scores with a float4-aligned row stride and
+                # a 16B-aligned base (the DSL paged-MQA arena view — column-
+                # sliced from a 256-aligned buffer — satisfies this; odd
+                # max_seq_len DeepGEMM layouts do not). Single-row batches
+                # derive their row window from shape[1] (arena last-row
+                # safety), so that width must satisfy the same float4 rule —
+                # otherwise run_varlen raises instead of falling through.
+                scores.dtype == torch.float32
+                and scores.stride(1) == 1
+                and scores.stride(0) % 4 == 0
+                and scores.data_ptr() % 16 == 0
+                and (scores.shape[0] > 1 or scores.shape[1] % 4 == 0)
+            ):
+                from ..cute_dsl_kernels.blackwell.top_k import selfsampling_topk_run_varlen
+
+                logger.info_once(
+                    "self-sampling GVR top-K engaged "
+                    f"(K={self.top_k}, cr={self.compress_ratio}, "
+                    f"next_n={next_n}).",
+                    key="selfsampling_topk_engaged",
+                )
+                # Self-sampling GVR varlen engine (TRTLLM_GVR_SELF_SAMPLING=1):
+                # one launch for the batch; per-row n from device kv_lens,
+                # capture-stable tuning from the max-seq-len engine constant
+                # (no host reads — CUDA-graph safe). Hints are consumed raw
+                # (offset-free contract). The module receives max_seq_len in
+                # COMPRESSED index space; run_varlen's max_seq_len is in
+                # kv-token space like sequence_lengths — multiply back.
+                selfsampling_topk_run_varlen(
+                    scores,
+                    gvr_prior_indices,
+                    sequence_lengths,
+                    output_indices,
+                    next_n=next_n,
+                    compress_ratio=self.compress_ratio,
+                    max_seq_len=max_seq_len * self.compress_ratio,
+                )
+                return output_indices
+            logger.warning_once(
+                "TRTLLM_GVR_SELF_SAMPLING=1 but the decode scores do not "
+                "satisfy the engine's hardware-format gate "
+                f"(dtype={scores.dtype}, strides={tuple(scores.stride())}); "
+                "falling through to the CUDA GVR top-K path.",
+                key="selfsampling_topk_fallthrough",
+            )
+        if self.decode_implementation != TopKImplementation.CUTE_DSL_GVR:
+            # CUDA_GVR, or the V2 hardware-format fall-through above
             workspace = self._get_workspace(
                 scores,
                 (scores.shape[0], self.top_k),
@@ -280,6 +341,16 @@ class TopK(nn.Module):
             )
         else:
             assert max_seq_len is not None
+            emission_kwargs: dict = {}
+            if self._gvr_emission_armed:
+                state = self._gvr_emission_state
+                num_rows = scores.shape[0]
+                emission_kwargs = state.topk_ext_kwargs(
+                    self._gvr_emission_route,
+                    num_rows,
+                    state.block_max[:num_rows] if state.block_max is not None else None,
+                )
+                self._gvr_emission_armed = False
             torch.ops.trtllm.cute_dsl_gvr_topk_decode(
                 scores,
                 gvr_prior_indices,
@@ -290,8 +361,70 @@ class TopK(nn.Module):
                 compress_ratio=self.compress_ratio,
                 max_seq_len=max_seq_len,
                 order_row=gvr_row_order,
+                **emission_kwargs,
             )
         return output_indices
+
+    def prepare_gvr_emission(
+        self,
+        batch: int,
+        n_comp: int,
+        num_sms: int,
+        gvr_prior_indices: torch.Tensor,
+    ) -> dict:
+        """Plan the emission-assisted GVR tier for this decode step.
+
+        Returns the emission kwargs for the paged-MQA scoring op (empty
+        when the planner declines this step); the matching consume-side
+        kwargs are injected into the next GVR Top-K call automatically.
+        Host arithmetic on engine-static shapes plus capturable device
+        ops, so a captured graph bakes the tier and replays refresh the
+        state buffers in place.
+
+        Args:
+            batch: Number of decode requests this step.
+            n_comp: Engine-static compressed maximum sequence length.
+            num_sms: Device SM count.
+            gvr_prior_indices: Caller-owned previous-selection state;
+                defines the emission state's row capacity and device.
+        """
+        # the emission/xstate writes are undeclared mutations (see the op's
+        # schema note), so the tier is eager / CUDA-graph only
+        if torch.compiler.is_dynamo_compiling():
+            return {}
+        from ..cute_dsl_kernels.blackwell.top_k.gvr_emission import (
+            LIST_EMIT_MIN_N,
+            GvrEmissionState,
+        )
+
+        if self._gvr_emission_state is None:
+            self._gvr_emission_state = GvrEmissionState(
+                max_rows=gvr_prior_indices.shape[0],
+                top_k=self.top_k,
+                device=gvr_prior_indices.device,
+                enable_list_tier=n_comp >= LIST_EMIT_MIN_N,
+                own_prior=False,
+            )
+        state = self._gvr_emission_state
+        emit_tier, self._gvr_emission_route = state.plan(
+            batch, n_comp, num_sms, compress_ratio=max(self.compress_ratio, 1)
+        )
+        self._gvr_emission_armed = self._gvr_emission_route.tier != "none"
+        if emit_tier in ("counts", "list", "rungs"):
+            state.update_seed_rows(batch, emit_tier)
+        kwargs: dict = {}
+        if emit_tier in ("counts", "list"):
+            kwargs = state.indexer_emit_kwargs(emit_tier, batch)
+        if self._gvr_emission_route.attach_block_max or emit_tier in ("counts", "list"):
+            kwargs["block_max_out"] = state.ensure_block_max(n_comp)[:batch]
+        return kwargs
+
+    def reset_gvr_emission_rows(self, rows: slice) -> None:
+        """Cold-start the emission closed-loop state for reused request
+        slots (prefill-to-decode handoff): a zeroed xstate reads as
+        invalid and routes those rows to the stock path in-kernel."""
+        if self._gvr_emission_state is not None:
+            self._gvr_emission_state.xstate[rows].zero_()
 
     def update_gvr_prior_from_prefill(
         self,

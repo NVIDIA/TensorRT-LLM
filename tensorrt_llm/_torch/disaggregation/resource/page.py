@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Dict, FrozenSet, List, Optional
+from typing import FrozenSet, List, Optional
 
 import numpy as np
 
@@ -73,6 +73,7 @@ class MapperKind(IntEnum):
     HND = INDEXED
     REPLICATED = 1
     NHD = 2
+    SECTIONED = 3  # Sectioned layout: [Sec0|Sec1|...], each section independently TP-sharded
 
 
 @dataclass
@@ -227,24 +228,46 @@ class PoolView:
         )
 
 
+class CacheKind(IntEnum):
+    """How region IDs in block_ids_per_layer_groups are interpreted.
+
+    PAGED: multiple block IDs per request (attention KV cache).
+           Extraction: per-block base pointers. Alignment: window/beam/SWA.
+    STATE: single slot ID per request (recurrent state, e.g. mamba).
+           Extraction: per-layer pointers within one slot. No block alignment.
+    """
+
+    PAGED = 0
+    STATE = 1
+
+
 @dataclass
 class LayerGroup:
-    """
-    Base class for one life cycle / layer-group.
+    """Base class for one life cycle / layer-group.
+
+    Shared structure:
+      - kind: how this group's region IDs are interpreted (PAGED vs STATE)
+      - pool_group_idx: index into KVCachePageTable.pool_groups
+      - local_layers: local ↔ global layer ID mapping
+      - pool_views: logical views into pool_groups[pool_group_idx].pools
     """
 
     pool_group_idx: int
+    kind: CacheKind = CacheKind.PAGED
+    local_layers: List[LocalLayer] = field(default_factory=list)
+    pool_views: List[PoolView] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         raise NotImplementedError
 
     @classmethod
     def from_dict(cls, data: dict) -> "LayerGroup":
-        if data.get("kv_head_num_per_rank") is not None:
+        kind = int(data["kind"])
+        if kind == CacheKind.PAGED:
             return AttentionLayerGroup.from_dict(data)
-        elif data.get("mamba_layer_offsets") is not None:
+        elif kind == CacheKind.STATE:
             return MambaLayerGroup.from_dict(data)
-        raise ValueError("Invalid layer group")
+        raise ValueError(f"Unknown layer group kind: {kind}")
 
 
 @dataclass
@@ -253,11 +276,10 @@ class AttentionLayerGroup(LayerGroup):
 
     kv_head_num_per_rank: int = 0
     sliding_window_size: Optional[int] = None
-    local_layers: List[LocalLayer] = field(default_factory=list)
-    pool_views: List[PoolView] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
+            "kind": int(self.kind),
             "pool_group_idx": int(self.pool_group_idx),
             "kv_head_num_per_rank": int(self.kv_head_num_per_rank),
             "sliding_window_size": self.sliding_window_size,
@@ -269,46 +291,57 @@ class AttentionLayerGroup(LayerGroup):
     def from_dict(cls, data: dict) -> "AttentionLayerGroup":
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
-            kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
-            sliding_window_size=data.get("sliding_window_size"),
             local_layers=[LocalLayer.from_dict(x) for x in data.get("local_layers", [])],
             pool_views=[PoolView.from_dict(pv) for pv in data.get("pool_views", [])],
+            kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
+            sliding_window_size=data.get("sliding_window_size"),
         )
+
+
+MAMBA_CONV_ROLE = frozenset({"mamba_conv"})
+MAMBA_SSM_ROLE = frozenset({"mamba_ssm"})
 
 
 @dataclass
 class MambaLayerGroup(LayerGroup):
-    """Layer group for Mamba SSM states."""
+    """Layer group for Mamba SSM states.
 
-    mamba_layer_offsets: Dict[int, int] = field(default_factory=dict)
-    conv_states: Optional[PhysicalPool] = None
-    ssm_states: Optional[PhysicalPool] = None
+    Pools are accessed the same way as attention:
+        pool_groups[pool_group_idx].pools[pool_view.pool_idx]
+    where pool_idx=0 is conv, pool_idx=1 is ssm.
+    """
+
     conv_section_bytes: Optional[List[int]] = None
     ssm_bytes_per_head: Optional[int] = None
+    slot_major_layout: bool = False
+
+    def __post_init__(self) -> None:
+        self.kind = CacheKind.STATE
 
     def to_dict(self) -> dict:
         return {
+            "kind": int(self.kind),
             "pool_group_idx": int(self.pool_group_idx),
-            "mamba_layer_offsets": {int(k): int(v) for k, v in self.mamba_layer_offsets.items()},
-            "conv_states": self.conv_states.to_dict(),
-            "ssm_states": self.ssm_states.to_dict(),
+            "local_layers": [ll.to_dict() for ll in self.local_layers],
+            "pool_views": [pv.to_dict() for pv in self.pool_views],
             "conv_section_bytes": self.conv_section_bytes,
             "ssm_bytes_per_head": self.ssm_bytes_per_head,
+            "slot_major_layout": self.slot_major_layout,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "MambaLayerGroup":
-        conv_section_bytes = data.get("conv_section_bytes")
-        ssm_bytes_per_head = data.get("ssm_bytes_per_head")
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
-            mamba_layer_offsets={int(k): int(v) for k, v in data["mamba_layer_offsets"].items()},
-            conv_states=PhysicalPool.from_dict(data["conv_states"]),
-            ssm_states=PhysicalPool.from_dict(data["ssm_states"]),
-            conv_section_bytes=[int(x) for x in conv_section_bytes]
-            if conv_section_bytes is not None
+            local_layers=[LocalLayer.from_dict(x) for x in data["local_layers"]],
+            pool_views=[PoolView.from_dict(pv) for pv in data["pool_views"]],
+            conv_section_bytes=[int(x) for x in data["conv_section_bytes"]]
+            if data.get("conv_section_bytes")
             else None,
-            ssm_bytes_per_head=int(ssm_bytes_per_head) if ssm_bytes_per_head is not None else None,
+            ssm_bytes_per_head=int(data["ssm_bytes_per_head"])
+            if data.get("ssm_bytes_per_head")
+            else None,
+            slot_major_layout=bool(data.get("slot_major_layout", False)),
         )
 
 

@@ -338,9 +338,15 @@ class Mamba2Metadata:
         finally:
             cls._warmup_force_initial_states = prev
 
-    def __init__(self, max_batch_size: int, chunk_size: int):
+    def __init__(
+        self,
+        max_batch_size: int,
+        chunk_size: int,
+        max_num_tokens: int | None = None,
+    ) -> None:
         self.max_batch_size = max_batch_size
         self.chunk_size = chunk_size
+        self.max_num_tokens = max_num_tokens
 
         # cumulative sequence lengths for prefill requests [batch_size+1]
         self.cu_seqlens = torch.zeros(max_batch_size + 1,
@@ -367,14 +373,6 @@ class Mamba2Metadata:
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
-        # int64 mirror of state_indices, refreshed once per prepare() so
-        # per-layer consumers that need long indices (index_select /
-        # index_copy_) do not each launch an int32->int64 cast kernel
-        # inside the decode CUDA graph (69 KDA layers x ~1.7us for Kimi K3).
-        self._state_indices_long = torch.zeros(max_batch_size,
-                                               dtype=torch.long,
-                                               device="cuda")
-        self.state_indices_long = self._state_indices_long[:0]
         # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
@@ -508,12 +506,6 @@ class Mamba2Metadata:
                                     dtype=self.state_indices_cpu.dtype))
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
-
-        # Refresh the int64 mirror once per step (outside the decode graph)
-        # so layers can index pools without a per-layer cast kernel.
-        self._state_indices_long[:batch_size].copy_(
-            self.state_indices[:batch_size])
-        self.state_indices_long = self._state_indices_long[:batch_size]
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)

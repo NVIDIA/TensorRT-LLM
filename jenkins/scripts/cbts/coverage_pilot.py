@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fail-closed pilot allowlist for the CBTS coverage tier."""
+"""Resolve the PR author for the Groovy-owned CBTS coverage pilot policy."""
 
 from __future__ import annotations
 
@@ -24,21 +24,8 @@ import re
 import sys
 import urllib.error
 import urllib.request
-from collections.abc import Mapping, Set
+from collections.abc import Mapping
 from typing import Optional
-
-PILOT_USERS: frozenset[str] = frozenset(
-    {
-        "crazydemo",
-        "QiJune",
-        "sunnyqgg",
-        "Barry-Delaney",
-        "xxi-nv",
-        "leslie-fang25",
-        "rosong11",
-        "tongyuantongyu",
-    }
-)
 
 _GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
 _TRIGGER_PHRASE_ENV = "gitlabTriggerPhrase"
@@ -60,31 +47,27 @@ def pr_api_url_from_trigger_phrase(trigger_phrase: str) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def evaluate_pr_info(pr_info: object, pilot_users: Set[str] = PILOT_USERS) -> tuple[bool, str, str]:
-    """Return ``(eligible, normalized_login, reason)`` for one PR response."""
+def extract_pr_author(pr_info: object) -> tuple[str, str]:
+    """Return ``(normalized_login, reason)`` for one PR response."""
     if not isinstance(pr_info, Mapping):
-        return False, "", "PR API response is not an object"
+        return "", "PR API response is not an object"
     user = pr_info.get("user")
     if not isinstance(user, Mapping):
-        return False, "", "PR API response has no user"
+        return "", "PR API response has no user"
     raw_login = user.get("login")
     login = raw_login.strip() if isinstance(raw_login, str) else ""
     if not login:
-        return False, "", "PR API response has no author login"
-    normalized_pilot_users = {pilot_user.casefold() for pilot_user in pilot_users}
-    if login.casefold() not in normalized_pilot_users:
-        return False, login, "author is not allowlisted"
-    return True, login, "author is allowlisted"
+        return "", "PR API response has no author login"
+    return login, "author resolved"
 
 
-def check_pilot_eligibility(
+def fetch_pr_author(
     pr_api_url: str,
     token: str = "",
-    pilot_users: Set[str] = PILOT_USERS,
-) -> tuple[bool, str, str]:
-    """Fetch one trusted GitHub PR endpoint and evaluate its author."""
+) -> tuple[str, str]:
+    """Fetch one trusted GitHub PR endpoint and return its author."""
     if not _PR_API_URL_RE.fullmatch(pr_api_url):
-        return False, "", "missing or unexpected GitHub PR API URL"
+        return "", "missing or unexpected GitHub PR API URL"
 
     headers = {
         "Accept": "application/vnd.github+json",
@@ -104,12 +87,14 @@ def check_pilot_eligibility(
         TimeoutError,
         OSError,
     ) as error:
-        return False, "", f"PR author lookup failed: {error}"
-    return evaluate_pr_info(pr_info, pilot_users)
+        return "", f"PR author lookup failed: {error}"
+    return extract_pr_author(pr_info)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Check CBTS coverage-tier pilot eligibility.")
+    parser = argparse.ArgumentParser(
+        description="Resolve the PR author for the CBTS coverage pilot."
+    )
     parser.add_argument(
         "--pr-api-url",
         default=None,
@@ -120,17 +105,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     pr_api_url = args.pr_api_url
     if pr_api_url is None:
         pr_api_url = pr_api_url_from_trigger_phrase(os.environ.get(_TRIGGER_PHRASE_ENV, ""))
-    eligible, login, reason = check_pilot_eligibility(
+    login, reason = fetch_pr_author(
         pr_api_url,
         token=os.environ.get(_GITHUB_TOKEN_ENV, ""),
     )
     print(
-        "CBTS coverage pilot: "
-        f"pr_author={login or 'unknown'}, eligible={str(eligible).lower()}, reason={reason}",
+        f"CBTS coverage pilot author lookup: pr_author={login or 'unknown'}, reason={reason}",
         file=sys.stderr,
     )
     # Jenkins consumes stdout; diagnostics stay on stderr in the console log.
-    print(str(eligible).lower())
+    print(login)
     return 0
 
 
