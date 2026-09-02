@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import aiohttp
 import pytest
 from fastapi import Request
 from starlette.datastructures import Headers
@@ -201,6 +203,161 @@ def test_extract_conversation_id_populates_conversation_params_with_existing_dis
     )
 
     assert request.conversation_params.conversation_id == "multi-turn-session-id"
+
+
+class _FakeWorkerResponse:
+    def __init__(self, status: int, payload: dict):
+        self.status = status
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+class _FakeClientSession:
+    """Stands in for ``aiohttp.ClientSession``, replaying ``responses`` by url.
+
+    A value that is an exception instance is raised instead of returned, which
+    is how an unreachable worker is simulated.
+    """
+
+    def __init__(self, responses: dict, requested_urls: list):
+        self._responses = responses
+        self._requested_urls = requested_urls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    def get(self, url, **kwargs):
+        self._requested_urls.append(url)
+        response = self._responses[url]
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def _disagg_server_with_workers(monkeypatch, ctx_servers, gen_servers, responses, config=None):
+    requested_urls = []
+    monkeypatch.setattr(
+        openai_disagg_server.aiohttp,
+        "ClientSession",
+        lambda *args, **kwargs: _FakeClientSession(responses, requested_urls),
+    )
+
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._ctx_router = SimpleNamespace(servers=ctx_servers)
+    server._gen_router = SimpleNamespace(servers=gen_servers)
+    server._config = config or extract_disagg_cfg(
+        context_servers={"num_instances": 0},
+        generation_servers={"num_instances": 0},
+    )
+    return server, requested_urls
+
+
+@pytest.mark.asyncio
+async def test_get_models_proxies_the_context_worker_response(monkeypatch):
+    payload = {"object": "list", "data": [{"id": "TinyLlama-1.1B-Chat-v1.0"}]}
+    server, requested_urls = _disagg_server_with_workers(
+        monkeypatch,
+        ctx_servers=["localhost:8001"],
+        gen_servers=["localhost:8002"],
+        responses={"http://localhost:8001/v1/models": _FakeWorkerResponse(200, payload)},
+    )
+
+    response = await server.get_models()
+
+    assert requested_urls == ["http://localhost:8001/v1/models"]
+    assert json.loads(response.body) == payload
+
+
+@pytest.mark.asyncio
+async def test_get_models_falls_back_to_the_generation_worker(monkeypatch):
+    payload = {"object": "list", "data": [{"id": "TinyLlama-1.1B-Chat-v1.0"}]}
+    server, requested_urls = _disagg_server_with_workers(
+        monkeypatch,
+        ctx_servers=["http://localhost:8001"],
+        gen_servers=["localhost:8002"],
+        responses={
+            "http://localhost:8001/v1/models": aiohttp.ClientConnectionError("worker is down"),
+            "http://localhost:8002/v1/models": _FakeWorkerResponse(200, payload),
+        },
+    )
+
+    response = await server.get_models()
+
+    assert requested_urls == ["http://localhost:8001/v1/models", "http://localhost:8002/v1/models"]
+    assert json.loads(response.body) == payload
+
+
+@pytest.mark.asyncio
+async def test_get_models_falls_back_to_the_configured_model(monkeypatch):
+    config = extract_disagg_cfg(
+        context_servers={
+            "num_instances": 1,
+            "urls": ["localhost:8001"],
+            "model": "Qwen/Qwen3-8B",
+        },
+        generation_servers={"num_instances": 0},
+    )
+    server, _ = _disagg_server_with_workers(
+        monkeypatch,
+        ctx_servers=["localhost:8001"],
+        gen_servers=[],
+        responses={"http://localhost:8001/v1/models": _FakeWorkerResponse(503, {})},
+        config=config,
+    )
+
+    response = await server.get_models()
+
+    assert json.loads(response.body)["data"][0]["id"] == "Qwen/Qwen3-8B"
+
+
+def test_model_name_from_config_skips_entries_without_a_model():
+    config = extract_disagg_cfg(
+        context_servers={"num_instances": 1},
+        generation_servers={"num_instances": 1, "model": "Qwen/Qwen3-8B"},
+    )
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._config = config
+
+    assert server._model_name_from_config() == "Qwen/Qwen3-8B"
+
+
+def test_model_name_from_config_uses_the_directory_name_for_local_models(tmp_path):
+    model_dir = tmp_path / "TinyLlama-1.1B-Chat-v1.0"
+    model_dir.mkdir()
+    config = extract_disagg_cfg(
+        context_servers={"num_instances": 1, "model": str(model_dir)},
+        generation_servers={"num_instances": 0},
+    )
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._config = config
+
+    assert server._model_name_from_config() == "TinyLlama-1.1B-Chat-v1.0"
+
+
+@pytest.mark.asyncio
+async def test_get_models_reports_unknown_when_service_discovery_has_no_worker(monkeypatch):
+    server, requested_urls = _disagg_server_with_workers(
+        monkeypatch,
+        ctx_servers=[],
+        gen_servers=[],
+        responses={},
+    )
+
+    response = await server.get_models()
+
+    assert requested_urls == []
+    assert json.loads(response.body)["data"][0]["id"] == "unknown"
 
 
 def test_disagg_config_allows_request_chat_template_opt_in():

@@ -19,6 +19,7 @@ import signal
 import socket
 import traceback
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Callable, Optional
 
 import aiohttp
@@ -44,8 +45,9 @@ from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionRequest, CompletionRequest, UCompletionRequest,
-    UCompletionResponse, ensure_request_chat_template_allowed)
+    ChatCompletionRequest, CompletionRequest, ModelCard, ModelList,
+    UCompletionRequest, UCompletionResponse,
+    ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -265,6 +267,7 @@ class OpenAIDisaggServer:
         # so /health and /cluster_info hook straight to self._coordinator.
         self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion, CompletionRequest), methods=["POST"])
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
+        self.app.add_api_route("/v1/models", self.get_models, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -369,6 +372,55 @@ class OpenAIDisaggServer:
             logger.error("Internal server error: ", traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
+
+    def _model_name_from_config(self) -> Optional[str]:
+        """Served model name as spelled out in the disagg config, if any.
+
+        ``server_configs`` is empty when the workers are discovered through the
+        disagg cluster instead of being listed in the config file. The name is
+        normalized the same way ``OpenAIServer`` does, so both servers report
+        the same id for a given ``model``.
+        """
+        for server_config in self._config.server_configs or []:
+            model = (server_config.other_args or {}).get("model") or ""
+            if model:
+                model_dir = Path(model)
+                return model_dir.name if model_dir.is_dir() else model
+        return None
+
+    async def get_models(self) -> JSONResponse:
+        """Return model list compatible with OpenAI API /v1/models endpoint.
+
+        The workers are the source of truth for the served model name, so
+        ``/v1/models`` is proxied from the first reachable ctx/gen worker. When
+        no worker answers -- e.g. none is up yet -- fall back to the model named
+        in the disagg config, and to ``"unknown"`` only when the config carries
+        no worker entries either (service discovery).
+        """
+        for router in (self._ctx_router, self._gen_router):
+            servers = router.servers
+            if servers:
+                server = servers[0]
+                server_scheme = "http://" if not server.startswith("http://") else ""
+                url = f"{server_scheme}{server}/v1/models"
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                                url,
+                                timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            if resp.status == 200:
+                                return JSONResponse(content=await resp.json())
+                            logger.warning(
+                                f"Worker {server} returned status {resp.status} for /v1/models"
+                            )
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError,
+                        ValueError) as e:
+                    logger.warning(
+                        f"Failed to fetch /v1/models from worker {server}: {e}"
+                    )
+        model_list = ModelList(
+            data=[ModelCard(id=self._model_name_from_config() or "unknown")])
+        return JSONResponse(content=model_list.model_dump())
 
     async def health(self) -> Response:
         if not await self._coordinator.is_ready():
