@@ -791,7 +791,7 @@ pipeline {
         string(
             name: "boltMergePartition",
             defaultValue: "",
-            description: "SLURM CPU partition for the merge job (TRTLLMINF-365). Empty -> 'cpu'. The merge is 100% CPU and requests no GPUs (these clusters reject a 0-GPU request), so it runs on the CPU partition. Set this if a cluster names its CPU partition differently."
+            description: "SLURM CPU partition for the merge job. The merge is 100% CPU. An empty string maps to the value 'cpu'. Set this if a cluster names its CPU partition differently."
         )
     }
     options {
