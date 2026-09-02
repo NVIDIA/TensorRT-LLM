@@ -2332,6 +2332,14 @@ private:
                     "are provided but unmatched. Please use numReturnSequences in SamplingConfig directly.",
                     mSamplingConfig.getNumReturnSequences().value(), mNumReturnSequences);
             }
+            // setNumReturnSequences validates against the beam width, which the previous raw
+            // field assignment did not. Report that here so the deprecated spelling fails with
+            // an actionable message instead of a bare check failure.
+            TLLM_CHECK_WITH_INFO(
+                mSamplingConfig.getBeamWidth() == 1 || mNumReturnSequences <= mSamplingConfig.getBeamWidth(),
+                "In the Executor class, mNumReturnSequences (%d) must not exceed the beam width (%d). Please set "
+                "numReturnSequences in SamplingConfig directly.",
+                mNumReturnSequences, mSamplingConfig.getBeamWidth());
             mSamplingConfig.setNumReturnSequences(mNumReturnSequences);
         }
 
