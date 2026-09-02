@@ -3344,12 +3344,20 @@ def getStartingPortForHost(String hostNodeName, String stageName = "") {
  * Gets the HOST_NODE_NAME from the current environment.
  * Falls back to hostname if HOST_NODE_NAME is not set.
  *
+ * The name must stay distinct per pod: getStartingPortForHost() hands out a
+ * private port section per name, so two pods sharing one would collide. The
+ * hostname is therefore only the last resort, and jenkins/scripts/mpi_pod_hostname_fix.sh
+ * -- which renames every pod to the same short name for Open MPI's sake -- first
+ * saves the name it replaced, which is read here in preference to it.
+ *
  * @return The host node name
  */
 def getHostNodeName() {
     return sh(script: '''
         if [ -n "$HOST_NODE_NAME" ]; then
             echo "$HOST_NODE_NAME"
+        elif [ -s /etc/mpi-pod-original-hostname ]; then
+            cat /etc/mpi-pod-original-hostname
         else
             hostname -f || hostname
         fi
@@ -5017,6 +5025,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
+
+        // Shorten the pod hostname before anything spawns MPI workers. See the
+        // script header: the 63-character pod name breaks singleton
+        // MPI_Comm_spawn under the Open MPI 5 of the DLFW 26.08 base image.
+        // Kept last in this stage so the pod is logged under its own name for as
+        // long as possible, and only here -- on the multi-node Slurm path every
+        // node would end up answering to the same name.
+        sh "bash ${llmSrc}/jenkins/scripts/mpi_pod_hostname_fix.sh"
     }
 
     if (testFilter[(DEBUG_MODE)]) {
