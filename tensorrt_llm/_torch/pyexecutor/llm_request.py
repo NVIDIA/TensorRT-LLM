@@ -1062,11 +1062,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self._py_embedding_bias_1d: Optional[torch.Tensor] = None
         if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
-            # Pre-squeeze to 1D if needed (remove batch dimension)
-            if self.embedding_bias.dim() > 1:
-                self._py_embedding_bias_1d = self.embedding_bias.squeeze(0)
-            else:
-                self._py_embedding_bias_1d = self.embedding_bias
+            self._py_embedding_bias_1d = self.embedding_bias
 
     def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
         """Beam width of the current (or next) decoding step.
@@ -1086,14 +1082,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         and decoding hangs. test_vbws_cpp_formula_matches_past_array_end
         pins the agreement.
 
-        An empty array (``[]`` or ``[[]]``) falls through to the base
-        implementation rather than indexing it, matching the two emptiness
-        guards the C++ side checks before reading element 0.
+        An empty array falls through to the base implementation rather than
+        indexing it, matching the emptiness guard the C++ side checks before
+        reading element 0.
         """
         beam_width_array = self.sampling_config.beam_width_array
-        if beam_width_array:
-            if isinstance(beam_width_array[0], (list, tuple)):
-                beam_width_array = beam_width_array[0]
         if beam_width_array:
             iteration = self.decoding_iter + (1 if for_next_iteration else 0)
             index = max(min(iteration, len(beam_width_array)) - 1, 0)

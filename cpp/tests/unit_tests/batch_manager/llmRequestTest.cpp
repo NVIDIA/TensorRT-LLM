@@ -77,9 +77,8 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         execReq.setEmbeddingBias(embeddingBias);
         tb::LlmRequest llmReq(requestId, execReq);
         EXPECT_TRUE(llmReq.getEmbeddingBias().has_value());
-        EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().nbDims, 2);
-        EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().d[0], 1);
-        EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().d[1], vocabSize);
+        EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().nbDims, 1);
+        EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().d[0], vocabSize);
     }
 
     // Prompt tuning

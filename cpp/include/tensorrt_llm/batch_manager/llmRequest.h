@@ -371,8 +371,6 @@ public:
         {
             mEmbeddingBias
                 = tensorrt_llm::runtime::ITensor::view(executor::detail::toITensor(req.getEmbeddingBias().value()));
-            // Add leading 1 dimension since that's what IFB code expects
-            mEmbeddingBias.value()->unsqueeze(0);
         }
         if (req.getPositionIds())
         {
