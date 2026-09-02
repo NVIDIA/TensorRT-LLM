@@ -84,7 +84,7 @@ methods:
         annotation: Union[List[str], str, NoneType]
         default: null
       bad_token_ids:
-        annotation: Optional[List[int]]
+        annotation: Optional[List[Union[int, List[int]]]]
         default: null
       # Logits processor and guided decoding
       logits_processor:
