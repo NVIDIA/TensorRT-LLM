@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/kdaDecode/kdaDecodeInternal.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 
 #include <cooperative_groups.h>
 #include <cuda/barrier>
@@ -265,6 +266,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     int const batch_index = kUseCluster ? blockIdx.y : blockIdx.x;
     int const head = kUseCluster ? blockIdx.z : blockIdx.y;
     int const head_offset = head * kDim;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
     int const state_slot = ssm_state_indices == nullptr ? batch_index : ssm_state_indices[batch_index];
     float* const state_head
         = state + static_cast<int64_t>(state_slot) * state_slot_stride + static_cast<int64_t>(head) * kDim * kDim;
@@ -589,6 +593,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
             out[output_index] = bf16_store(raw_output * inverse_rms * preloaded_weight * preloaded_gate);
         }
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 #endif
 }
 
@@ -613,20 +620,23 @@ cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t str
         }
     }
 
-    cudaLaunchAttribute clusterAttribute{};
+    cudaLaunchAttribute launchAttributes[2]{};
     cudaLaunchConfig_t config{};
     config.gridDim = kUseCluster ? dim3(kClusterBlocks, params.batchSize, kHeads) : dim3(params.batchSize, kHeads);
     config.blockDim = dim3(kThreads);
     config.dynamicSmemBytes = kDynamicSharedBytes;
     config.stream = stream;
+    launchAttributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    launchAttributes[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDL();
+    config.attrs = launchAttributes;
+    config.numAttrs = 1;
     if constexpr (kUseCluster)
     {
-        clusterAttribute.id = cudaLaunchAttributeClusterDimension;
-        clusterAttribute.val.clusterDim.x = kClusterBlocks;
-        clusterAttribute.val.clusterDim.y = 1;
-        clusterAttribute.val.clusterDim.z = 1;
-        config.attrs = &clusterAttribute;
-        config.numAttrs = 1;
+        launchAttributes[1].id = cudaLaunchAttributeClusterDimension;
+        launchAttributes[1].val.clusterDim.x = kClusterBlocks;
+        launchAttributes[1].val.clusterDim.y = 1;
+        launchAttributes[1].val.clusterDim.z = 1;
+        config.numAttrs = 2;
     }
 
     cudaError_t const launchStatus = cudaLaunchKernelEx(&config, kda_decode_native_kernel<kSchedule, kHeads>,
