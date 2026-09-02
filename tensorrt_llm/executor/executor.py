@@ -146,7 +146,7 @@ class GenerationExecutor(ABC):
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
         """
-        assert isinstance(prompt_token_ids[0], int)
+        assert isinstance(prompt_token_ids[0], (int, np.integer))
         assert isinstance(sampling_params, SamplingParams)
 
         self._maybe_initialize_iteration_results()
@@ -191,7 +191,7 @@ class GenerationExecutor(ABC):
         """Generate output for the given prompt token ids in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
         """
-        unbatched = isinstance(prompt_token_ids[0], int)
+        unbatched = isinstance(prompt_token_ids[0], (int, np.integer))
 
         if unbatched:
             prompt_token_ids = [prompt_token_ids]
