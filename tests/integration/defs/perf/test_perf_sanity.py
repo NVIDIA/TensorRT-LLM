@@ -59,6 +59,31 @@ SUPPORTED_GPU_MAPPING = {
 # (agentx_client.py). Any other non-empty value is rejected at parse time.
 AGENTX_BENCHMARK_CLIENT = "agentx"
 
+# The benchmark modes whose lanes get a warmup request, i.e. whose measured
+# window would otherwise be charged for a one-time setup cost:
+#   * e2e absorbs the KV cache transceiver's lazy connection setup (ZMQ mesh +
+#     NIXL metadata registration) on the first ctx->gen handover.
+#   * ctx_only forces osl=1, so the very first (cold) prefill lands directly in
+#     the headline TTFT with nothing to amortize it.
+# gen_only is deliberately absent: it does not measure TTFT, and the extra
+# handover leaves a stale mSenderFutures entry that the CTX worker's blocking
+# idle KV-transfer poll then waits on (see #18011).
+#
+# Named rather than inlined at the call site so the set of warmed lanes can be
+# asserted by behaviour instead of by the shape of an expression.
+WARMUP_BENCHMARK_MODES = ("e2e", "ctx_only")
+
+
+def wants_warmup(benchmark_mode: str) -> bool:
+    """Whether a lane in this benchmark mode should issue a warmup request.
+
+    The single source of truth for which lanes warm up. b_warmup is not a
+    baseline match key, and that is only sound while the value stays fully
+    determined by benchmark_mode rather than being settable per lane.
+    """
+    return benchmark_mode in WARMUP_BENCHMARK_MODES
+
+
 BENCH_SERVING_REPO = "https://github.com/kedarpotdar-nv/bench_serving.git"
 BENCH_SERVING_COMMIT = "f3ea022a5780de5d0babc5fffa53634e2023d28f"
 BENCH_SERVING_DIR = "/tmp/bench_serving"
@@ -1388,6 +1413,16 @@ class ClientConfig:
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
+            # Reported, not matched -- see test_warmup_is_not_a_match_key. Not
+            # matching means a warmed lane's first post-merge run compares against
+            # cold history, i.e. a one-time step in the baseline. That is the same
+            # shape as any perf improvement and only ever helps a threshold that
+            # alarms on slowdowns, but the reverse direction is asymmetric: if
+            # warmup is later reverted or disabled on a lane, a cold run is
+            # compared against a warmed baseline and reads as a large regression
+            # (measured: up to ~24% on a ~30s lane, <0.1% on a >1000s one) with no
+            # match key to explain it. This column is how that is diagnosed --
+            # diff b_warmup across the step before hunting for a code cause.
             "b_warmup": self.warmup,
             # Reported, not matched. Case identity is keyed on s_test_case_name
             # (plus GPU type, runtime, branch), and a disagg case name embeds its
@@ -2560,21 +2595,8 @@ class PerfSanityTestConfig:
                 "accuracy_config": accuracy_data,
                 "only_run_accuracy": only_run_accuracy,
             }
-            # Two disagg lanes want benchmark_serving's initial test request, for
-            # two different reasons that come to the same thing: a one-time
-            # cold-start cost that otherwise lands inside the measured window.
-            #
-            # * e2e pays for the KV cache transceiver's lazy connection setup
-            #   (ZMQ mesh + NIXL metadata registration) on the first ctx->gen
-            #   handover; until that has happened once the transfer runs at a
-            #   fraction of steady-state bandwidth, so every measured request in
-            #   a short lane is charged for it.
-            # * ctx_only forces osl=1, so the very first (cold) prefill lands
-            #   directly in the headline TTFT with nothing to amortize it.
-            #
-            # gen_only is deliberately excluded: it does not measure TTFT, and
-            # the extra handover leaves a stale mSenderFutures entry that the CTX
-            # worker's blocking idle KV-transfer poll then waits on (see #18011).
+            # Which modes warm up, and why, is documented on
+            # WARMUP_BENCHMARK_MODES / wants_warmup above.
             #
             # Unlike gen_only there is no concurrency restriction here, because
             # the GEN fill gate (TLLM_BENCHMARK_REQ_QUEUES_SIZE) is only injected
@@ -2589,7 +2611,7 @@ class PerfSanityTestConfig:
                 model_name,
                 env_vars=client_env_var,
                 spec_decoding=spec_decoding,
-                warmup=benchmark_mode in ("e2e", "ctx_only"),
+                warmup=wants_warmup(benchmark_mode),
             )
             client_configs.append(client_config)
 

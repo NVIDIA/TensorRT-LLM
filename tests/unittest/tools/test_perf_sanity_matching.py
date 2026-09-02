@@ -69,13 +69,13 @@ def test_matching_ignores_tuning_changes() -> None:
     assert benchmark_data_matches(previous_data, updated_data, get_test_case_match_keys())
 
 
-def _load_client_config() -> type:
-    """Return the real ClientConfig, without the integration-test packages.
+def _load_module() -> types.ModuleType:
+    """Import test_perf_sanity.py without the integration-test packages.
 
-    The derived-name rule is only worth testing against the class that owns it;
-    re-implementing the f-string here would assert nothing. test_perf_sanity.py
-    reaches torch and the OpenSearch client through its imports, so those are
-    stubbed -- ClientConfig.__init__ touches none of them.
+    Rules under test are only worth asserting against the code that owns them;
+    re-implementing them here would assert nothing. test_perf_sanity.py reaches
+    torch and the OpenSearch client through its imports, so those are stubbed --
+    ClientConfig.__init__ and wants_warmup touch none of them.
     """
     repo_root = pathlib.Path(__file__).resolve().parents[3]
     module_path = repo_root / "tests" / "integration" / "defs" / "perf" / "test_perf_sanity.py"
@@ -132,7 +132,12 @@ def _load_client_config() -> type:
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = previous
-    return module.ClientConfig
+    return module
+
+
+def _load_client_config() -> type:
+    """Return the real ClientConfig."""
+    return _load_module().ClientConfig
 
 
 def _disagg_client_data(multi_round: int) -> dict[str, object]:
@@ -366,61 +371,80 @@ def test_warmup_defaults_off_and_is_reported() -> None:
 def test_warmup_is_derived_from_exactly_the_e2e_and_ctx_only_modes() -> None:
     """Pin warmup to benchmark_mode, the reason b_warmup can skip the match key.
 
-    _parse_disagg_config_file cannot be called here -- PerfSanityTestConfig's
-    constructor shells out to nvidia-smi and raises without a GPU -- so the
-    mapping is asserted against its source, in the same way as
-    test_disagg_iterations_come_from_multi_round above. The tests above cover
+    Asserted through wants_warmup rather than against the source text: the set
+    of warmed lanes is the contract, the expression that computes it is not, so
+    a behaviour-preserving refactor must not fail here. The tests above cover
     what ClientConfig does with the value; only this one covers which lanes get
     it.
 
-    The mode set is asserted exactly, not by substring: a membership test
-    against a tuple still "contains 'e2e'" after gen_only is added to it, so a
-    substring check would wave through the one lane #18011 established must not
-    warm up.
+    Every mode the disagg parser can see is checked explicitly, so adding a mode
+    without deciding whether it warms up fails here rather than silently
+    inheriting a default. gen_only in particular must stay excluded: #18011
+    established that the extra handover leaves a stale mSenderFutures entry that
+    the CTX worker's blocking idle KV-transfer poll then waits on.
+    """
+    module = _load_module()
 
-    This is coupled to the shape of the expression on purpose, because the
-    expression is the contract. If you are here because you refactored it (say
-    to warmup=_wants_warmup(benchmark_mode)), that is fine -- but the set of
-    warmed lanes is review-relevant, so move this assertion to the new home of
-    the mode set rather than deleting it.
+    assert module.wants_warmup("e2e") is True
+    assert module.wants_warmup("ctx_only") is True
+    assert module.wants_warmup("gen_only") is False
+    assert module.wants_warmup("gen_only_no_context") is False
+    assert module.wants_warmup("") is False
+
+    # Pinned as an exact set, not by substring: a membership test against a
+    # tuple still "contains e2e" after gen_only has been added to it.
+    assert set(module.WARMUP_BENCHMARK_MODES) == {"e2e", "ctx_only"}, (
+        "the set of warmup lanes changed; e2e absorbs the KV transceiver's lazy "
+        "connection setup and ctx_only absorbs the first cold prefill, while "
+        "gen_only must stay excluded (#18011)"
+    )
+
+
+def test_warmup_reaches_client_config_only_from_the_disagg_parser() -> None:
+    """No second producer may hand ClientConfig a warmup value.
+
+    Locality, not expression shape: b_warmup is not a baseline match key, which
+    is only sound while one code path decides warmup for every lane. A second
+    ClientConfig(warmup=...) call site elsewhere -- notably in the aggregated
+    parser, which forwards lane yaml keys through verbatim -- would reintroduce
+    exactly the lane-settable warmup that test_warmup_cannot_be_enabled_from_
+    lane_config forbids by value.
+
+    _parse_disagg_config_file cannot be called directly here (PerfSanityTest-
+    Config's constructor shells out to nvidia-smi and raises without a GPU), so
+    this one property is checked against the source, scoped to that function.
     """
     repo_root = pathlib.Path(__file__).resolve().parents[3]
     module_path = repo_root / "tests" / "integration" / "defs" / "perf" / "test_perf_sanity.py"
     tree = ast.parse(module_path.read_text())
 
-    warmup_kwargs = [
-        keyword.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "ClientConfig"
-        for keyword in node.keywords
-        if keyword.arg == "warmup"
-    ]
+    def warmup_call_sites(node: ast.AST) -> list[ast.AST]:
+        return [
+            call
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "ClientConfig"
+            and any(keyword.arg == "warmup" for keyword in call.keywords)
+        ]
 
-    assert len(warmup_kwargs) == 1, (
-        f"expected exactly one ClientConfig(warmup=...) call site, found {len(warmup_kwargs)}; "
-        "warmup must stay determined by benchmark_mode in one place"
+    disagg_parsers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_parse_disagg_config_file"
+    ]
+    assert len(disagg_parsers) == 1, "expected exactly one _parse_disagg_config_file"
+
+    inside = warmup_call_sites(disagg_parsers[0])
+    total = warmup_call_sites(tree)
+    assert len(inside) == 1, (
+        f"expected exactly one ClientConfig(warmup=...) in _parse_disagg_config_file, "
+        f"found {len(inside)}"
     )
-    value = warmup_kwargs[0]
-    assert isinstance(value, ast.Compare) and len(value.ops) == 1, (
-        "warmup= is no longer a single comparison against benchmark_mode; b_warmup "
-        "is not a baseline match key, so a lane-settable warmup would silently "
-        "fork history"
-    )
-    assert isinstance(value.ops[0], ast.In), "warmup= no longer tests mode membership"
-    assert "benchmark_mode" in ast.dump(value.left), "warmup= is not derived from benchmark_mode"
-    container = value.comparators[0]
-    assert isinstance(container, (ast.Tuple, ast.List, ast.Set)), (
-        "the warmup modes are no longer a literal container, so this test can no "
-        "longer verify which lanes warm up"
-    )
-    assert all(isinstance(elt, ast.Constant) for elt in container.elts)
-    assert {elt.value for elt in container.elts} == {"e2e", "ctx_only"}, (
-        "the set of warmup lanes changed; e2e absorbs the KV transceiver's lazy "
-        "connection setup and ctx_only absorbs the first cold prefill, while "
-        "gen_only must stay excluded (#18011: the extra handover leaves a stale "
-        "mSenderFutures entry the CTX worker waits on)"
+    assert len(total) == len(inside), (
+        f"ClientConfig(warmup=...) appears {len(total) - len(inside)} time(s) outside "
+        "_parse_disagg_config_file; warmup must be decided in exactly one place, or "
+        "b_warmup stops being fully determined by benchmark_mode"
     )
 
 
