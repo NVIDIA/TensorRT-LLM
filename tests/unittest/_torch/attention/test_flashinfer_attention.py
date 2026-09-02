@@ -4,7 +4,7 @@
 import random
 import unittest
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional, Union
 from unittest import mock
@@ -172,6 +172,7 @@ class TestFlashInferAttention(unittest.TestCase):
 
         manager.get_batch_cache_indices_flat.assert_called_once_with(
             [7], [1], layer_idx=20)
+
     @staticmethod
     def _make_plan(*,
                    num_generations: int,
@@ -202,6 +203,7 @@ class TestFlashInferAttention(unittest.TestCase):
             workspace_buffer=workspace,
         )
         return workspace, metadata
+
     def test_generation_page_table_uses_reserved_block_count(self):
         manager = SimpleNamespace(get_batch_cache_indices=mock.Mock(
             return_value=[list(range(325))]))
@@ -581,7 +583,6 @@ class TestFlashInferAttention(unittest.TestCase):
                 object():
                 FlashInferWrappers(
                     is_planned=True,
-                    workspace_buffer=metadata.workspace_buffer,
                     decode_wrapper=SimpleNamespace(
                         _kv_lens_buffer=kv_lens_buffer),
                 )
@@ -1259,28 +1260,16 @@ class TestFlashInferAttention(unittest.TestCase):
             for _ in range(2):
                 layer.forward(q, k, v, attn_metadata_cuda_graph)
 
-        # Every persistent CUDA-graph plan must be ready before capture. Plan
-        # kinds use isolated workspaces, while eager plans keep sharing the
-        # original workspace and defer replanning when there is more than one.
+        # prepare() may change the page metadata used by every persistent
+        # wrapper. CUDA graph replay cannot re-enter Python to plan lazily, so
+        # all wrappers must be refreshed before capture or replay.
         attn_metadata_cuda_graph.prepare()
         graph_wrappers = list(
             attn_metadata_cuda_graph._plan_params_to_wrappers.values())
         self.assertTrue(all(wrapper.is_planned for wrapper in graph_wrappers))
-        self.assertEqual(len(attn_metadata_cuda_graph._plan_workspace_buffers),
-                         num_layers)
-        graph_workspace_ptrs = {
-            wrapper.workspace_buffer.data_ptr()
-            for wrapper in graph_wrappers
-        }
-        self.assertEqual(len(graph_workspace_ptrs), num_layers)
-        self.assertNotIn(workspace.data_ptr(), graph_workspace_ptrs)
 
         eager_wrappers = list(
             attn_metadata_ref._plan_params_to_wrappers.values())
-        self.assertEqual(
-            {wrapper.workspace_buffer.data_ptr()
-             for wrapper in eager_wrappers},
-            {attn_metadata_ref.workspace_buffer.data_ptr()})
         attn_metadata_ref.prepare()
         self.assertEqual(
             [wrapper.is_planned for wrapper in eager_wrappers],
