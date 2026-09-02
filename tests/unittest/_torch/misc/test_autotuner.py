@@ -291,6 +291,285 @@ def test_autotuner_try_block():
         m //= 2
 
 
+def test_autotuner_do_preparation_try_block():
+    # do_preparation is another backend call outside the per-tactic try block.
+
+    class CrashedPreparationRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0, 1]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    do_preparation: bool = False) -> torch.Tensor:
+            if do_preparation:
+                raise Exception(
+                    "For preparation try block test: do_preparation crash happens."
+                )
+            return gemm_fallback(*inputs)
+
+    x, w = torch.randn(M, 64), torch.randn(64, 128)
+    runners = [CrashedPreparationRunner()]
+    tuner = AutoTuner.get()
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), ), )
+    with autotune():
+        runner, tactic = tuner.choose_one(
+            "test_autotuner_do_preparation_try_block", runners, tuning_config,
+            [x, w])
+    assert tactic == -1, \
+        f"Expect the fallback tactic -1, but got tactic {tactic}."
+    assert runner is runners[0], \
+        f"Expect the fallback runner, but got {runner}."
+    assert tuner.stats.failed_profiling_count[
+        "test_autotuner_do_preparation_try_block"], \
+        "Expect the failure to be recorded."
+
+
+def test_autotuner_do_preparation_skips_only_failed_runner():
+    # A do_preparation failure skips that runner, not the whole op: the healthy
+    # runner's tactics must still win. With a single runner, `continue`, `break`
+    # and `return` are indistinguishable, so this needs two.
+
+    class CrashedPreparationRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0, 1]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    do_preparation: bool = False) -> torch.Tensor:
+            if do_preparation:
+                raise Exception(
+                    "For preparation try block test: do_preparation crash happens."
+                )
+            return gemm_fallback(*inputs)
+
+    class HealthyRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0, 1]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1) -> torch.Tensor:
+            return gemm_fallback(*inputs)
+
+    x, w = torch.randn(M, 64), torch.randn(64, 128)
+    runners = [CrashedPreparationRunner(), HealthyRunner()]
+    tuner = AutoTuner.get()
+    name = "test_autotuner_do_preparation_skips_only_failed_runner"
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), ), )
+    with autotune():
+        runner, tactic = tuner.choose_one(name, runners, tuning_config, [x, w])
+    assert runner is runners[1], \
+        f"Expect the healthy runner to be chosen, but got {runner}."
+    assert tactic in [0, 1], \
+        f"Expect a real tactic from the healthy runner, but got {tactic}."
+    assert tuner.stats.failed_profiling_count[name], \
+        "Expect the failed runner's preparation failure to be recorded."
+
+
+def test_autotuner_single_pair_do_preparation_failure(monkeypatch):
+    # The single-pair shortcut runs do_preparation in its own try block, a
+    # different failure path from the multi-tactic loop. One runner exposing
+    # exactly one tactic under the default INDEPENDENT strategy lands there.
+    # That handler must clear the CUDA error state, or a fault in
+    # do_preparation resurfaces later in the forward pass (see #13469).
+
+    class SinglePairCrashedPreparationRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    do_preparation: bool = False) -> torch.Tensor:
+            if do_preparation:
+                raise Exception(
+                    "For preparation try block test: single-pair do_preparation crash happens."
+                )
+            return gemm_fallback(*inputs)
+
+    x, w = torch.randn(M, 64), torch.randn(64, 128)
+    runners = [SinglePairCrashedPreparationRunner()]
+    tuner = AutoTuner.get()
+    name = "test_autotuner_single_pair_do_preparation_failure"
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), ), )
+
+    real_synchronize = torch.cuda.synchronize
+    sync_calls = []
+
+    def counting_synchronize(*args, **kwargs):
+        sync_calls.append(1)
+        return real_synchronize(*args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "synchronize", counting_synchronize)
+    with autotune():
+        runner, tactic = tuner.choose_one(name, runners, tuning_config, [x, w])
+    assert tactic == -1, \
+        f"Expect the fallback tactic -1, but got tactic {tactic}."
+    assert runner is runners[0], \
+        f"Expect the fallback runner, but got {runner}."
+    assert tuner.stats.failed_profiling_count[name], \
+        "Expect the failure to be recorded."
+    assert sync_calls, \
+        "Expect torch.cuda.synchronize() to clear the pending CUDA error."
+
+
+def test_autotuner_preparation_try_block():
+    # inputs_pre_hook and get_valid_tactics run backend code before the
+    # per-tactic try block. A throw there used to escape choose_one().
+
+    class CrashedPreHookRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1) -> torch.Tensor:
+            return gemm_fallback(*inputs)
+
+    def crashed_pre_hook(inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        raise Exception(
+            "For preparation try block test: inputs_pre_hook crash happens.")
+
+    class CrashedTacticsRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            raise Exception(
+                "For preparation try block test: get_valid_tactics crash happens."
+            )
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1) -> torch.Tensor:
+            return gemm_fallback(*inputs)
+
+    x, w = torch.randn(M, 64), torch.randn(64, 128)
+    tuner = AutoTuner.get()
+    dynamic_tensor_specs = (DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), )
+
+    for name, runners, tuning_config in (
+        ("test_autotuner_pre_hook_crash", [CrashedPreHookRunner()],
+         TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
+                      inputs_pre_hook=crashed_pre_hook)),
+        ("test_autotuner_get_valid_tactics_crash", [CrashedTacticsRunner()],
+         TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs)),
+    ):
+        with autotune():
+            runner, tactic = tuner.choose_one(name, runners, tuning_config,
+                                              [x, w])
+        assert tactic == -1, \
+            f"{name}: expect the fallback tactic -1, but got tactic {tactic}."
+        assert runner is runners[0], \
+            f"{name}: expect the fallback runner, but got {runner}."
+        assert tuner.stats.failed_profiling_count[name], \
+            f"{name}: expect the failure to be recorded."
+
+
+def test_autotuner_get_valid_tactics_skips_only_failed_runner():
+    # A get_valid_tactics failure takes out that runner only. The surviving
+    # runner still has to be timed: dropping the failed one leaves
+    # total_pairs at 1, and an ungated single-pair shortcut would cache the
+    # survivor at min_time=0.0 without ever profiling it.
+
+    class CrashedTacticsRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            raise Exception(
+                "For preparation try block test: get_valid_tactics crash happens."
+            )
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1) -> torch.Tensor:
+            return gemm_fallback(*inputs)
+
+    class SingleTacticRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1) -> torch.Tensor:
+            return gemm_fallback(*inputs)
+
+    x, w = torch.randn(M, 64), torch.randn(64, 128)
+    runners = [CrashedTacticsRunner(), SingleTacticRunner()]
+    tuner = AutoTuner.get()
+    name = "test_autotuner_get_valid_tactics_skips_only_failed_runner"
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), ), )
+    with autotune():
+        runner, tactic = tuner.choose_one(name, runners, tuning_config, [x, w])
+    assert runner is runners[1], \
+        f"Expect the surviving runner to be chosen, but got {runner}."
+    assert tactic == 0, \
+        f"Expect the surviving runner's only tactic, but got {tactic}."
+    assert tuner.stats.failed_profiling_count[name], \
+        "Expect the get_valid_tactics failure to be recorded."
+    cached = tuner.profiling_cache.get_specific_custom_op(name)
+    assert cached, "Expect the surviving runner to be cached."
+    assert all(min_time > 0.0 for _, _, min_time in cached.values()), \
+        f"Expect a real measurement, but got a shortcut entry: {cached}."
+
+
 @torch.library.custom_op("autotuner_test::recursive_get_best_gemm_tactic",
                          mutates_args=())
 def recursive_get_best_gemm_tactic(x: torch.Tensor, w1: torch.Tensor,
