@@ -145,18 +145,4 @@ void DecodingConfig::setLookaheadDecodingConfig(LookaheadDecodingConfig const& l
     mDecodingMode = DecodingMode::Lookahead();
 }
 
-SizeType32 DecodingConfig::getLookaheadDecodingMaxNumRequest() const
-{
-    return mLookaheadDecodingMaxNumRequest;
-}
-
-void DecodingConfig::enableSeamlessLookaheadDecoding()
-{
-    mDecodingMode = DecodingMode::Lookahead();
-    if (!mLookaheadDecodingConfig.has_value())
-    {
-        mLookaheadDecodingConfig = executor::LookaheadDecodingConfig();
-    }
-}
-
 } // namespace tensorrt_llm::executor

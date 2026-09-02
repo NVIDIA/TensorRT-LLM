@@ -1202,9 +1202,7 @@ public:
     // Lookahead methods.
     /// @brief Sets lookahead decoding mode and config.
     void setLookaheadDecodingConfig(LookaheadDecodingConfig const& lookaheadDecodingConfig);
-    void enableSeamlessLookaheadDecoding();
     [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadDecodingConfig() const;
-    [[nodiscard]] SizeType32 getLookaheadDecodingMaxNumRequest() const;
 
 private:
     friend class Serialization;
@@ -1213,8 +1211,6 @@ private:
     std::optional<DecodingMode> mDecodingMode;
     // Lookahead params.
     std::optional<LookaheadDecodingConfig> mLookaheadDecodingConfig;
-    // The max number of requests that can support running with lookahead decoding
-    static constexpr SizeType32 mLookaheadDecodingMaxNumRequest = 8;
 };
 
 /// @brief Guided decoding configurations for executor.
