@@ -7639,11 +7639,18 @@ class PyTorchModelEngine(ModelEngine):
             # which differs between the graph (padded) and eager (unpadded)
             # branches above. Falling back to eager also means no graph replays,
             # so the tier is dropped and the sampler runs after the forward.
+            #
+            # Promoted one-token contexts join the graph batch's generation
+            # requests, but sample_async is handed the original scheduled batch,
+            # which excludes them. Staging a tier here would sample rows that
+            # are then discarded and advance those requests' Philox streams an
+            # extra time, so keep those steps on the eager path.
             if self._stage_in_graph_sampling is not None:
-                self._stage_in_graph_sampling(
-                    execution_requests,
-                    key.sample_type if can_run_graph else SampleType.FULL,
-                )
+                staged_sample_type = (key.sample_type if can_run_graph
+                                      and not execution_promoted_context_ids
+                                      else SampleType.FULL)
+                self._stage_in_graph_sampling(execution_requests,
+                                              staged_sample_type)
 
             # Fill slot-ID buffer for scatter inside draft loop
             if (self.enable_spec_decode and spec_tree_manager is not None

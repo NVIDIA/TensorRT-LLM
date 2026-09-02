@@ -810,28 +810,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
     @staticmethod
-    def _has_multi_token_stop_word(request: LlmRequest) -> bool:
-        """Whether any stop word spans more than one token.
-
-        A single-token stop word is decided by comparing the token just sampled,
-        exactly like ``py_end_id``; a multi-token one has to be matched against
-        the generated history, which is what needs the finish-reason kernel.
-        ``meet_stop_token_criteria`` draws the same distinction, and models
-        routinely produce the single-token kind: only one EOS can be
-        ``py_end_id``, so the rest spill into the stop-word list.
-        """
-        if not request.py_stop_words_list:
-            return False
-        _, prefix_sum = request.py_stop_words_list
-        if not prefix_sum:
-            return False
-        lengths = [prefix_sum[0]] + [
-            prefix_sum[i] - prefix_sum[i - 1] for i in range(1, len(prefix_sum))
-        ]
-        return any(length > 1 for length in lengths)
-
-    @classmethod
-    def _request_needs_finish_reason_kernel(cls, request: LlmRequest) -> bool:
+    def _request_needs_finish_reason_kernel(request: LlmRequest) -> bool:
         """Whether stopping needs the finish-reason kernel rather than host checks.
 
         Min length compares against a running count the host path does not
@@ -839,7 +818,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         else reduces to the per-token checks
         ``_update_requests_single_beam_single_step`` performs.
         """
-        return bool(request.py_min_length) or cls._has_multi_token_stop_word(request)
+        return bool(request.py_min_length) or check_stop_words_length(request)
 
     def _can_use_fast_path(self, requests: list[LlmRequest]) -> bool:
         """Whether every request is plain temperature / top_k / top_p sampling.
@@ -909,8 +888,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
     def invalidate_in_graph_sampling(self) -> None:
         """Drop any staged in-graph sampling state."""
-        self._in_graph_staged = False
+        self._consume_in_graph_staging()
         self._current_sample_type = SampleType.FULL
+
+    def _consume_in_graph_staging(self) -> None:
+        """Drop the staged buffers, keeping the tier this step ran at.
+
+        Used once the staged tokens have been read: the buffers must not be
+        matched against another batch, but ``current_sample_type`` still
+        describes the step in progress and is recorded on its SampleState.
+        """
+        self._in_graph_staged = False
         self._in_graph_request_ids = []
         self._in_graph_live_rows = 0
 
@@ -1138,11 +1126,20 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         logits_cuda = model_outputs["logits"]
         d2t = model_outputs.get("d2t", None)
 
-        # Staging runs after the batch is settled, so the staged width should
-        # equal the rows the forward produced; a mismatch means an unexpected
-        # path reached here and would scatter the wrong number of tokens.
+        # Staging runs after the batch is settled, so the staged width has to
+        # equal the rows the forward produced. A mismatch means an unexpected
+        # path reached here; skipping silently would be the worst outcome,
+        # because the staged state stays valid and every later replay of this
+        # key would report new_tokens rows nothing ever wrote. Drop the staged
+        # state first so the eager path takes over even when assertions are
+        # compiled out, then fail loudly.
         if logits_cuda.shape[0] != self._in_graph_rows:
-            return
+            staged_rows = self._in_graph_rows
+            self.invalidate_in_graph_sampling()
+            raise AssertionError(
+                f"in-graph sampling staged {staged_rows} rows but the forward "
+                f"produced {logits_cuda.shape[0]}"
+            )
         dest_indices = dest_indices[: self._in_graph_rows]
 
         self._fast_sample_in_graph(logits_cuda, dest_indices, d2t)
@@ -2549,7 +2546,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     # Single-token stop words are checked on the host by
                     # _update_requests_single_beam_single_step, like py_end_id;
                     # only multi-token ones need the finish-reason kernel.
-                    and not self._has_multi_token_stop_word(request)
+                    and not check_stop_words_length(request)
                     and _request_strategy(request, vocab_size=2**31) == GREEDY
                     for request in generation_requests
                 )
@@ -2569,6 +2566,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             staged_matches_batch = (
                 self._in_graph_staged
                 and self._in_graph_dest_indices is not None
+                # A draft request reuses its target's py_request_id, so the id
+                # list alone cannot tell a drafter batch from the target batch
+                # that staged it.
+                and not any(request.py_is_draft for request in live_requests)
                 and [request.py_request_id for request in live_requests]
                 == self._in_graph_request_ids
             )
@@ -2623,6 +2624,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     if single_step_greedy
                     else new_tokens_cuda
                 )
+                # Consumption is one-shot. The id list is not a unique key for a
+                # batch -- a draft request reuses its target's py_request_id and
+                # the drafter shares this sampler -- so leaving the state staged
+                # would let a later drafter step with the same ids be served
+                # these tokens as draft tokens. The next forward restages.
+                self._consume_in_graph_staging()
                 return (
                     live_requests,
                     seq_slots_host,
