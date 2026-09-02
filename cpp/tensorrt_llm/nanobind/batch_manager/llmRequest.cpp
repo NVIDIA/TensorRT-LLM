@@ -84,7 +84,6 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         mIsStreaming,                                              //
         mEndId,                                                    //
         mPadId,                                                    //
-        from_torch(mEmbeddingBias),                                //
         mPositionIds,                                              //
         from_torch(mPromptEmbeddingTable),                         //
         mPromptVocabSize,                                          //

@@ -121,7 +121,6 @@ public:
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
         std::optional<SizeType32> endId = std::nullopt, std::optional<SizeType32> padId = std::nullopt,
-        std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -174,7 +173,6 @@ public:
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(samplingConfig.getBeamWidth(), 0)
         , mMaxSentTokenLen(mPromptLen)
-        , mEmbeddingBias(std::move(embeddingBias))
         , mPositionIds(std::move(positionIds))
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
@@ -234,7 +232,6 @@ public:
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
         std::optional<SizeType32> endId = std::nullopt, std::optional<SizeType32> padId = std::nullopt,
-        std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -263,7 +260,6 @@ public:
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(samplingConfig.getBeamWidth(), 0)
         , mMaxSentTokenLen(mPromptLen)
-        , mEmbeddingBias(std::move(embeddingBias))
         , mPositionIds(std::move(positionIds))
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
@@ -367,11 +363,6 @@ public:
             }
         }
 
-        if (req.getEmbeddingBias())
-        {
-            mEmbeddingBias
-                = tensorrt_llm::runtime::ITensor::view(executor::detail::toITensor(req.getEmbeddingBias().value()));
-        }
         if (req.getPositionIds())
         {
             mPositionIds = std::make_shared<std::vector<SizeType32>>(req.getPositionIds().value());
@@ -1096,11 +1087,6 @@ public:
     void setGuidedDecodingParams(executor::GuidedDecodingParams guidedDecodingParams)
     {
         mGuidedDecodingParams = guidedDecodingParams;
-    }
-
-    [[nodiscard]] std::optional<TensorPtr> getEmbeddingBias() const
-    {
-        return mEmbeddingBias;
     }
 
     [[nodiscard]] bool returnLogProbs() const
@@ -2095,8 +2081,6 @@ protected:
 
     SizeType32 mMaxSentTokenLen;
 
-    std::optional<TensorPtr> mEmbeddingBias{std::nullopt};
-
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mPositionIds{std::nullopt};
 
     std::optional<TensorPtr> mPromptEmbeddingTable{std::nullopt};
@@ -2389,7 +2373,6 @@ public:
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
         std::optional<SizeType32> endId = std::nullopt, std::optional<SizeType32> padId = std::nullopt,
-        std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -2427,7 +2410,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt,
         std::optional<std::string> cacheSalt = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
-            samplingConfig, isStreaming, endId, padId, std::move(embeddingBias),
+            samplingConfig, isStreaming, endId, padId,
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
             std::move(promptEmbeddingTable), promptVocabSize,

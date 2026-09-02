@@ -468,25 +468,6 @@ def test_generation_only_llm_request_adopts_draft_tokens() -> None:
 
 
 @pytest.mark.cpu_only
-def test_llm_request_embedding_bias_stays_1d():
-    # The bias used to be unsqueezed to [1, vocab] for the C++ decoder and
-    # squeezed back on the Python side. Both steps are gone, so it must stay
-    # 1-D through the nanobind constructor that production actually uses.
-    vocab_size = 128
-    bias = torch.zeros(vocab_size, dtype=torch.float32)
-    request = _tb.internal.batch_manager.LlmRequest(
-        request_id=0,
-        max_new_tokens=4,
-        input_tokens=[1, 2, 3],
-        sampling_config=_tb.SamplingConfig(1),
-        is_streaming=False,
-        embedding_bias=bias,
-    )
-    assert request.embedding_bias.dim() == 1
-    assert request.embedding_bias.shape[0] == vocab_size
-
-
-@pytest.mark.cpu_only
 def test_llm_request_kv_cache_transfer_metric_bindings():
     request = _tb.internal.batch_manager.LlmRequest(
         request_id=0,

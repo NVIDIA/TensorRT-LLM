@@ -497,7 +497,7 @@ def apply_embedding_bias(
     #     stay in step with 'bias_gather_indices', which is built in row order.
     row_offset = 0
     for req, steps in zip(requests, request_steps_list):
-        req_bias = req._py_embedding_bias_1d
+        req_bias = req.py_embedding_bias
         if req_bias is not None:
             for j in range(row_offset, row_offset + steps):
                 logits_bias_masks[j] = True

@@ -183,7 +183,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 "decoding. Drop no_repeat_ngram_size from the request, or disable "
                 "speculative decoding."
             )
-        if getattr(request, "_py_embedding_bias_1d", None) is not None:
+        if getattr(request, "py_embedding_bias", None) is not None:
             raise ValueError(
                 "embedding_bias is not supported with one-model speculative decoding. "
                 "Drop embedding_bias from the request, or disable speculative decoding."

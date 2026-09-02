@@ -63,22 +63,8 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         EXPECT_FALSE(llmReq.mSeqSlot);
         // No speculative decoding config, draft tokens should be empty
         EXPECT_EQ(llmReq.getNumDraftTokens(), 0);
-        EXPECT_FALSE(llmReq.getEmbeddingBias().has_value());
         EXPECT_FALSE(llmReq.getPromptEmbeddingTable().has_value());
         EXPECT_FALSE(llmReq.getPromptVocabSize().has_value());
-    }
-
-    // Embedding bias
-    {
-        texec::Request execReq(inputTokens, maxNewTokens);
-        SizeType32 vocabSize = 100;
-        // Try adding embedding bias
-        auto embeddingBias = texec::Tensor::cpu(texec::DataType::kFP32, {vocabSize});
-        execReq.setEmbeddingBias(embeddingBias);
-        tb::LlmRequest llmReq(requestId, execReq);
-        EXPECT_TRUE(llmReq.getEmbeddingBias().has_value());
-        EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().nbDims, 1);
-        EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().d[0], vocabSize);
     }
 
     // Prompt tuning

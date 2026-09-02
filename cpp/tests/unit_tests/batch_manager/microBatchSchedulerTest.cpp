@@ -65,7 +65,7 @@ protected:
         return std::make_shared<LlmRequest>(reqId, maxNewTokens, inputTokens, samplingConfig,
             /*isStreaming=*/false,
             /*endId=*/std::nullopt,
-            /*padId=*/std::nullopt, /*embeddingBias=*/std::nullopt,
+            /*padId=*/std::nullopt,
             /*positionIds=*/std::nullopt,
             /*promptEmbeddingTable=*/std::nullopt, /*promptVocabSize=*/std::nullopt,
             /*multimodalHashes=*/std::nullopt, /*multimodalPos=*/std::nullopt, /*multimodalLength=*/std::nullopt,

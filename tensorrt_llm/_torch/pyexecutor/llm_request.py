@@ -912,6 +912,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
+        # Owned entirely on the Python side: the TorchSampler is the only
+        # consumer, so the C++ request no longer carries a copy.
+        self.py_embedding_bias: Optional[torch.Tensor] = kwargs.pop(
+            "embedding_bias", None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
@@ -1059,10 +1063,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             chunk_size=self.py_logits_chunk_size,
             additional_outputs=additional_outputs)
         self.child_requests = []
-
-        self._py_embedding_bias_1d: Optional[torch.Tensor] = None
-        if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
-            self._py_embedding_bias_1d = self.embedding_bias
 
     def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
         """Beam width of the current (or next) decoding step.
