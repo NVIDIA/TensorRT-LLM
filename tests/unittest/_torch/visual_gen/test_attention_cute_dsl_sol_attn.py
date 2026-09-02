@@ -97,8 +97,18 @@ def _make_config(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Sol-Attn needs CUDA")
-def test_sol_attn_falls_back_to_vanilla_for_cross_attention():
-    """Cross-attention (SEPARATE_QKV) falls back to VANILLA -- Sol-Attn is self-attn only."""
+def test_sol_attn_cross_attention_uses_dense_cutedsl():
+    """Cross-attention must stay on CuTeDSL, not drop to VANILLA.
+
+    Sol-Attn is self-attention only, so SEPARATE_QKV modules fall back -- but to
+    the dense kernel of the *configured* backend, not to torch SDPA. Falling back
+    to VANILLA made a `backend: CUTEDSL` run and a `CUTEDSL + sol_attn` run differ
+    in cross-attention in every block, regardless of any sparse setting, which is
+    a backend difference masquerading as a sparsity difference in any A/B.
+    """
+    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import CuTeDSLAttention
+    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import SolAttnAttention
+
     device = torch.device("cuda")
     dtype = torch.bfloat16
     cfg = _make_config(
@@ -109,8 +119,14 @@ def test_sol_attn_falls_back_to_vanilla_for_cross_attention():
         .to(device=device, dtype=dtype)
         .eval()
     )
-    assert cross_attn.attn_backend == "VANILLA", (
-        f"Sol-Attn on cross-attention should fall back to VANILLA, got {cross_attn.attn_backend!r}"
+    assert cross_attn.attn_backend == "CUTEDSL", (
+        f"expected CUTEDSL cross-attention, got {cross_attn.attn_backend!r}"
+    )
+    assert isinstance(cross_attn.attn, CuTeDSLAttention), (
+        f"expected the dense CuTeDSL kernel, got {type(cross_attn.attn).__name__}"
+    )
+    assert not isinstance(cross_attn.attn, SolAttnAttention), (
+        "cross-attention must not re-select the sparse backend"
     )
 
 

@@ -102,10 +102,19 @@ class Attention(nn.Module):
         _is_sol_attn = base_backend == "CUTEDSL" and _sa_algo == "sol_attn"
 
         # Cross-attention fallback: TRTLLM and CUTEDSL VSA/Sol-Attn are self-attn only.
+        #
+        # VSA/Sol-Attn fall back within their own backend family -- the dense
+        # CuTe DSL kernel serves cross-attention fine. Falling back to VANILLA
+        # instead silently swapped cross-attention from CuTeDSL to torch SDPA in
+        # every block the moment a sparse algorithm was enabled, so a
+        # `backend: CUTEDSL` run and a `CUTEDSL + sol_attn` run differed in
+        # cross-attention regardless of any sparse setting. TRTLLM keeps VANILLA:
+        # TrtllmAttention genuinely cannot serve SEPARATE_QKV.
+        _cross_attn_fallback = "CUTEDSL" if _is_sol_attn else "VANILLA"
         if self.qkv_mode == QKVMode.SEPARATE_QKV and (
             base_backend == "TRTLLM" or _is_vsa or _is_sol_attn
         ):
-            backend_name = "VANILLA"
+            backend_name = _cross_attn_fallback
             requested = (
                 f"{base_backend} (VSA)"
                 if _is_vsa
@@ -255,7 +264,13 @@ class Attention(nn.Module):
             num_kv_heads=backend_num_kv_heads,
             quant_config=self.quant_config,
             dtype=self.dtype,
-            attention_config=config.attention,
+            attention_config=(
+                config.attention.model_copy(update={"sparse_attention_config": None})
+                if backend_name == "CUTEDSL"
+                and _is_sol_attn
+                and self.qkv_mode == QKVMode.SEPARATE_QKV
+                else config.attention
+            ),
             attention_metadata_state=attention_metadata_state,
             sparse_params=sparse_params,
         )
