@@ -24,6 +24,8 @@ from defs.conftest import (get_device_count, get_device_memory, get_llm_root,
 from test_common.llm_data import hf_id_to_local_model_dir
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+from tensorrt_llm._torch.auto_deploy.model_config_loader import \
+    resolve_registry_yaml_extra
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
@@ -33,8 +35,6 @@ from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
-_AD_MODEL_REGISTRY_DIR = Path(
-    get_llm_root()) / 'examples' / 'auto_deploy' / 'model_registry'
 
 
 def _load_ad_config(config_name):
@@ -45,25 +45,20 @@ def _load_ad_config(config_name):
 
 def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
     """Return (yaml_extra paths, world_size) from the AutoDeploy model registry."""
-    with open(_AD_MODEL_REGISTRY_DIR / "models.yaml") as f:
-        registry = yaml.safe_load(f)
-    for entry in registry["models"]:
-        if entry["name"] != model_name:
-            continue
-        config_dir = _AD_MODEL_REGISTRY_DIR / "configs"
-        paths = [str(config_dir / cfg) for cfg in entry["yaml_extra"]]
-        world_size = 1
-        for cfg in entry["yaml_extra"]:
-            cfg_name = str(cfg)
-            if "world_size_" in cfg_name and cfg_name.endswith(".yaml"):
-                world_size = int(
-                    cfg_name.replace("world_size_", "").replace(".yaml", ""))
-            with open(config_dir / cfg) as config_file:
-                config = yaml.safe_load(config_file) or {}
-            if "world_size" in config:
-                world_size = int(config["world_size"])
-        return paths, world_size
-    raise ValueError(f"Model '{model_name}' not found in model registry")
+    # User-facing configs live in the source tree, not next to the installed package.
+    paths = resolve_registry_yaml_extra(model_name,
+                                        required=True,
+                                        user_dirs=[_AD_CONFIGS_DIR])
+    world_size = 1
+    for path in paths:
+        name = Path(path).name
+        if name.startswith("world_size_") and name.endswith(".yaml"):
+            world_size = int(name[len("world_size_"):-len(".yaml")])
+        with open(path) as config_file:
+            config = yaml.safe_load(config_file) or {}
+        if "world_size" in config:
+            world_size = int(config["world_size"])
+    return paths, world_size
 
 
 def _set_quant_config(llm, model_id: str) -> None:

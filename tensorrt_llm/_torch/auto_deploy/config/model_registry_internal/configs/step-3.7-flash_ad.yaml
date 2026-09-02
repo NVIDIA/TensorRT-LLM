@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# AutoDeploy config for StepFun Step-3.7-Flash (text decoder).
+#
+# Step-3.7-Flash is a vision-language model; AutoDeploy onboards the text generation
+# path (model_type step3p7 / text config step3p5). The custom modeling code lives in
+# tensorrt_llm/_torch/auto_deploy/models/custom/modeling_step3p7.py and is selected by
+# registering Step3p7ForCausalLM under the Step3p7Config config class.
+#
+# 45 decoder layers (3 dense + 42 MoE, 288 routed experts top-8 + shared expert),
+# GQA with mixed full/sliding attention and a head-wise attention gate. BF16 weights.
+runtime: trtllm
+compile_backend: torch-cudagraph
+model_factory: AutoModelForCausalLM
+attn_backend: flashinfer
+# Hint-driven sharding IR: the modeling code carries explicit sharding hints
+# (tp_mode / layer_type / tp_scaled_dim / all_reduce), so disable the legacy
+# heuristic sharding and apply the hints instead.
+transforms:
+  detect_sharding:
+    enabled: false
+  sharding_transform_executor:
+    enabled: false
+  apply_sharding_hints:
+    enabled: true
+  gather_logits_before_lm_head:
+    enabled: true
