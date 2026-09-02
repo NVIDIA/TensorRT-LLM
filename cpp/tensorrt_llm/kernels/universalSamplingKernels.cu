@@ -214,6 +214,23 @@ struct OnlineSoftmaxOp
     }
 };
 
+//! Max and argmax without the online mass. The tokens-only rejection path recomputes
+//! that mass in the scan which draws its candidate, so evaluating exp while finding the
+//! max would be duplicate work.
+struct MaxArg
+{
+    float max;
+    int argmax;
+};
+
+struct MaxArgOp
+{
+    __device__ inline MaxArg operator()(MaxArg const& a, MaxArg const& b) const
+    {
+        return a.max >= b.max ? a : b;
+    }
+};
+
 //! How much sits strictly above a candidate weight: how many entries, and how much mass.
 //! Both of the rank/mass criteria are statements about exactly this, so the rejection test
 //! costs one sweep and one reduction rather than one of each per criterion. ``count`` is a
@@ -506,6 +523,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
 
     using BlockReduceF = cub::BlockReduce<float, BLOCK>;
     using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, BLOCK>;
+    using BlockReduceMaxArg = cub::BlockReduce<MaxArg, BLOCK>;
     using BlockReduceCountMass = cub::BlockReduce<CountMass, BLOCK>;
     using BlockScanF = cub::BlockScan<float, BLOCK>;
 
@@ -513,6 +531,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     {
         typename BlockReduceF::TempStorage reduceF;
         typename BlockReduceOnline::TempStorage reduceOnline;
+        typename BlockReduceMaxArg::TempStorage reduceMaxArg;
         typename BlockReduceCountMass::TempStorage reduceCountMass;
         typename BlockScanF::TempStorage scanF;
     } temp;
@@ -539,24 +558,66 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     // from.
     __shared__ float sPivot;
     __shared__ float sCandWeight;
+    __shared__ float sMassTarget;
     __shared__ int sCandIdx;
     __shared__ curandStatePhilox4_32_10_t sRejectRng;
 
-    // --- Pass 1: online softmax -- max, total mass and argmax in a SINGLE read of the
-    //     row (Milakov & Gimelshein). The naive form needs two, one for the max and one
-    //     for the sum, and that second pass is pure overhead here. The argmax rides along
-    //     for free and is the fallback if the inverse-CDF walk falls off the end.
-    OnlineSoftmax local{-FLT_MAX, 0.0f, 0};
-    forEachLogit(rowLogits, vocabSize,
-        [&](int i, float logit) {
-            local = combineOnlineSoftmax(local, OnlineSoftmax{__fmul_rn(logit, rp.tempInv), 1.0f, i});
-        });
-    OnlineSoftmax const rowStats = BlockReduceOnline(temp.reduceOnline).Reduce(local, OnlineSoftmaxOp());
-    if (tid == 0)
+    // --- Pass 1: max, total mass and argmax in one read (Milakov & Gimelshein).
+    //
+    // The tokens-only rejection path is the exception: its first inverse-CDF scan must
+    // compute each thread's mass anyway. For those rows, doing an online mass here also
+    // evaluates one exp per logit and then discards the result, so specialize this pass
+    // down to max + argmax. A pure top-k row retains the mass for the descent path below;
+    // top-k + top-p only needs the max to solve the rank cutoff, then computes the
+    // post-top-k mass in its rejection scan.
+    bool const deferMassToRejection
+        = NEED_TOKENS && !NEED_PROBS && (!rp.needTopK || (rp.needTopP && params.numRows <= 8));
+    if constexpr (NEED_TOKENS && !NEED_PROBS)
     {
-        sMaxScaled = rowStats.max;
-        sArgMax = rowStats.argmax;
-        sTotalMass = rowStats.sum;
+        if (deferMassToRejection)
+        {
+            MaxArg local{-FLT_MAX, 0};
+            forEachLogit(rowLogits, vocabSize,
+                [&](int i, float logit) {
+                    local = MaxArgOp()(local, MaxArg{__fmul_rn(logit, rp.tempInv), i});
+                });
+            MaxArg const rowStats = BlockReduceMaxArg(temp.reduceMaxArg).Reduce(local, MaxArgOp());
+            if (tid == 0)
+            {
+                sMaxScaled = rowStats.max;
+                sArgMax = rowStats.argmax;
+            }
+        }
+        else
+        {
+            OnlineSoftmax local{-FLT_MAX, 0.0f, 0};
+            forEachLogit(rowLogits, vocabSize,
+                [&](int i, float logit) {
+                    local = combineOnlineSoftmax(local, OnlineSoftmax{__fmul_rn(logit, rp.tempInv), 1.0f, i});
+                });
+            OnlineSoftmax const rowStats = BlockReduceOnline(temp.reduceOnline).Reduce(local, OnlineSoftmaxOp());
+            if (tid == 0)
+            {
+                sMaxScaled = rowStats.max;
+                sArgMax = rowStats.argmax;
+                sTotalMass = rowStats.sum;
+            }
+        }
+    }
+    else
+    {
+        OnlineSoftmax local{-FLT_MAX, 0.0f, 0};
+        forEachLogit(rowLogits, vocabSize,
+            [&](int i, float logit) {
+                local = combineOnlineSoftmax(local, OnlineSoftmax{__fmul_rn(logit, rp.tempInv), 1.0f, i});
+            });
+        OnlineSoftmax const rowStats = BlockReduceOnline(temp.reduceOnline).Reduce(local, OnlineSoftmaxOp());
+        if (tid == 0)
+        {
+            sMaxScaled = rowStats.max;
+            sArgMax = rowStats.argmax;
+            sTotalMass = rowStats.sum;
+        }
     }
     __syncthreads();
     float const maxScaled = sMaxScaled;
@@ -568,7 +629,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     //     min-p itself stays free: w == p / p_max is a value the softmax already produced,
     //     so the filter is one comparison, not a pass. This pass exists to re-total, not
     //     to filter.
-    if (rp.needMinP)
+    if (rp.needMinP && !deferMassToRejection)
     {
         float localMass = 0.0f;
         forEachLogit(rowLogits, vocabSize,
@@ -588,6 +649,19 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         __syncthreads();
     }
 
+    // A small tokens-only top-k + top-p row must solve the rank cutoff before entering
+    // rejection. Keep that work inside the hybrid branch; moving every top-k row here
+    // perturbs the hot pure-top-k code layout measurably even though its algorithm is the
+    // same.
+    float threshold = rp.needMinP ? rp.minP : 0.0f;
+    if (deferMassToRejection && rp.needTopK)
+    {
+        float const topKThreshold = findThreshold<T>(rowLogits, vocabSize, rp.tempInv, maxScaled, threshold,
+            static_cast<long long>(rp.topK), 0.0f, /*byCount=*/true, sCount, sMass, sCand, &sCandCount, &sBucketCount,
+            &sChosen, &sCountHi, &sMassHi, &sFired);
+        threshold = fmaxf(threshold, topKThreshold);
+    }
+
     // --- Tokens-only fast path: draw the token by rejection instead of solving for the
     //     cutoff that defines the kept set.
     //
@@ -602,35 +676,24 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     // The descent dominates a filtered tokens call, so removing it outright is worth more
     // than tuning it.
     //
-    // Two things keep a row out of here, and they are different in kind.
-    //
-    // top-k, because rejection has no bound on it. How often a draw is accepted is the
-    // fraction of mass the filter keeps -- for top-p that fraction IS top_p, a number the
-    // caller chose and which sits near 0.9 in practice, so the loop ends in about one
-    // round. top-k keeps k *entries*, and what mass they carry is a property of the
-    // logits: on a flat row, 50 of 131072 hold almost nothing and the support has to be
-    // whittled down instead, and rejection then costs more than the descent it replaced.
-    //
-    // The sharper predicate is how peaked the row is rather than which filter is set --
-    // a top-k row over a small vocabulary does gain here. Estimating peakedness from
-    // pass 1's mass is left undone; "no top-k" is the rule that holds for the reason
-    // stated rather than by coincidence of vocabulary size.
-    //
-    // top-k AND top-p together, because top-p's target is a fraction of the *post-top-k*
-    // mass, which nothing knows without solving for the top-k cutoff first. Subsumed by
-    // the rule above, and noted because it is the constraint that would still bind if
-    // top-k rows were ever admitted.
+    // Pure top-k stays out of here because rejection has no bound on how much mass k
+    // entries keep: on a flat 131k row, drawing one of the top 50 would almost never
+    // succeed. Top-k + top-p is different. Pass 3a has already paid for the rank cutoff,
+    // so rejection starts from the exact post-top-k support and only decides top-p. Its
+    // acceptance rate is then the caller's top_p, normally close to one. This hybrid is
+    // limited to at most eight rows: as the grid grows, the slowest CTA is increasingly
+    // likely to need an extra rejection round, and the deterministic descent wins again.
     if constexpr (NEED_TOKENS && !NEED_PROBS)
     {
-        if (!rp.needTopK)
+        if (deferMassToRejection)
         {
             // Both criteria are thresholds on what lies strictly above a candidate, and
-            // both are taken over the min-p survivors -- which is what pass 2 left in
-            // sTotalMass. `<` for the count and `<=` for the mass mirror findThreshold's
-            // firing rules (count *reaches* k, mass *exceeds* its target), so this test
-            // and the descent accept exactly the same set.
-            float const minPFloor = rp.needMinP ? rp.minP : 0.0f;
-            float const massTarget = rp.topP * sTotalMass;
+            // both are taken over the support left by min-p and Pass 3a. The first
+            // inverse-CDF scan below computes that support's mass. `<` for the count and
+            // `<=` for the mass mirror findThreshold's firing rules (count *reaches* k,
+            // mass *exceeds* its target), so this test and the descent accept exactly the
+            // same set.
+            float const supportFloor = threshold;
             float const countTarget = static_cast<float>(rp.topK);
 
             if (tid == 0)
@@ -658,7 +721,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
                     [&](int, float logit)
                     {
                         float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
-                        if (w >= minPFloor && w > pivot)
+                        if (w >= supportFloor && w > pivot)
                         {
                             localMass += w;
                         }
@@ -669,6 +732,10 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
                 __syncthreads();
                 if (tid == 0)
                 {
+                    if (round == 0)
+                    {
+                        sMassTarget = rp.topP * supportMass;
+                    }
                     sTarget = curand_uniform(&sRejectRng) * supportMass;
                     sCandIdx = -1;
                 }
@@ -689,7 +756,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
                                 return;
                             }
                             float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
-                            if (!(w >= minPFloor && w > pivot))
+                            if (!(w >= supportFloor && w > pivot))
                             {
                                 return;
                             }
@@ -712,9 +779,10 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
                 }
                 float const candWeight = sCandWeight;
 
-                // Nothing can reject: min-p is already built into the support, so the
-                // first draw is the answer. Skipping the sweep is what keeps a neutral or
-                // min-p-only row at the two passes it had before this path existed.
+                // Nothing can reject: all active filters are already built into the
+                // support, so the first draw is the answer. Skipping the sweep is what
+                // keeps a neutral or min-p-only row at the two passes it had before this
+                // path existed.
                 if (!rp.needTopP)
                 {
                     if (tid == 0)
@@ -731,7 +799,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
                     [&](int, float logit)
                     {
                         float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
-                        if (w >= minPFloor && w > candWeight)
+                        if (w >= supportFloor && w > candWeight)
                         {
                             local.count += 1.0f;
                             local.mass += w;
@@ -742,12 +810,11 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
 
                 if (tid == 0)
                 {
-                    // The top-k arm cannot fire while the gate above excludes those rows.
-                    // It is kept because the gate is a performance choice, not a
-                    // correctness one -- admitting top-k rows must stay a one-line change
-                    // rather than one that silently samples from the wrong set.
+                    // Pass 3a's support floor already implies the top-k arm. Keeping the
+                    // explicit predicate documents and checks that invariant at the same
+                    // boundary where top-p is decided.
                     bool const keep
-                        = (!rp.needTopK || above.count < countTarget) && (!rp.needTopP || above.mass <= massTarget);
+                        = (!rp.needTopK || above.count < countTarget) && (!rp.needTopP || above.mass <= sMassTarget);
                     if (keep)
                     {
                         sToken = sCandIdx;
@@ -777,9 +844,18 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         }
     }
 
-    // --- Pass 3: the rank/mass thresholds, skipped wholesale when neither top-k nor
-    //     top-p is active. This is the only expensive stage, and the only one a neutral
-    //     row -- or a neutral row in a mixed batch -- does not run at all.
+    // --- Pass 3: rank/mass thresholds for rows which did not return through rejection.
+    if (rp.needTopK)
+    {
+        float const topKThreshold = findThreshold<T>(rowLogits, vocabSize, rp.tempInv, maxScaled, threshold,
+            static_cast<long long>(rp.topK), 0.0f, /*byCount=*/true, sCount, sMass, sCand, &sCandCount, &sBucketCount,
+            &sChosen, &sCountHi, &sMassHi, &sFired);
+        threshold = fmaxf(threshold, topKThreshold);
+    }
+
+    // Output shapes which must materialize the kept distribution still need the exact
+    // top-p cutoff. Tokens-only rows carrying top-p either returned above or deliberately
+    // took this deterministic fallback because the batch was too wide for rejection.
     //
     // Order matters, and only min-p and top-k are order-free. Both of those are invariant
     // under renormalization -- min-p thresholds p / p_max, top-k thresholds rank, and
@@ -789,14 +865,6 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     // softmax mass keeps far too much (measurably: ~0.2 of L1 mass against the
     // TorchSampler reference at top_k=50, top_p=0.9). Hence a second descent, against the
     // surviving mass, in the documented min-p -> top-k -> top-p order.
-    float threshold = rp.needMinP ? rp.minP : 0.0f;
-    if (rp.needTopK)
-    {
-        float const topKThreshold = findThreshold<T>(rowLogits, vocabSize, rp.tempInv, maxScaled, threshold,
-            static_cast<long long>(rp.topK), 0.0f, /*byCount=*/true, sCount, sMass, sCand, &sCandCount, &sBucketCount,
-            &sChosen, &sCountHi, &sMassHi, &sFired);
-        threshold = fmaxf(threshold, topKThreshold);
-    }
     if (rp.needTopP)
     {
         // The mass top-p takes its fraction of: post-min-p, post-top-k.
@@ -884,6 +952,15 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         float const scale = 1.0f / keptMass;
         int const probVecCount = vocabSize / 4;
         bool const probsAligned = (reinterpret_cast<uintptr_t>(rowProbs) % kVecBytes) == 0;
+        // A neutral tokens+probs row otherwise evaluates every exp a third time in the
+        // sampling scan below. For aligned float logits this loop visits exactly the same
+        // indices, in exactly the same per-thread order, as forEachLogit, so its partial
+        // sum can seed that scan without changing a rounding decision. Half and BF16
+        // vectorize eight logits per thread rather than four and deliberately retain the
+        // old path; so do uncommon unaligned rows.
+        bool const canReuseOutputMass = NEED_TOKENS && !haveLocalKept && sizeof(T) == sizeof(float) && probsAligned
+            && (reinterpret_cast<uintptr_t>(rowLogits) % kVecBytes) == 0;
+        float outputLocalMass = 0.0f;
         if (probsAligned)
         {
             for (int v = tid; v < probVecCount; v += blockDim.x)
@@ -895,6 +972,10 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
                 {
                     float const w = weightOf(rowLogits, v * 4 + j, rp.tempInv, maxScaled);
                     outElems[j] = w >= threshold ? w * scale : 0.0f;
+                    if (canReuseOutputMass && w >= threshold)
+                    {
+                        outputLocalMass += w;
+                    }
                 }
                 reinterpret_cast<float4*>(rowProbs)[v] = out;
             }
@@ -902,6 +983,10 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
             {
                 float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
                 rowProbs[i] = w >= threshold ? w * scale : 0.0f;
+                if (canReuseOutputMass && w >= threshold)
+                {
+                    outputLocalMass += w;
+                }
             }
         }
         else
@@ -911,6 +996,11 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
                 float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
                 rowProbs[i] = w >= threshold ? w * scale : 0.0f;
             }
+        }
+        if (canReuseOutputMass)
+        {
+            localKept = outputLocalMass;
+            haveLocalKept = true;
         }
     }
 
