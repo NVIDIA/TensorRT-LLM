@@ -38,14 +38,8 @@ from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info
 
 from ..conftest import get_llm_root, llm_models_root
-from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
+from ._model_paths import MODEL_PATH_DICT
 from .perf_regression_utils import _percentile, process_and_upload_test_results
-
-# Sanity-side path differs from test_perf for this key; preserve historical value.
-MODEL_PATH_DICT = {
-    **_MODEL_PATH_DICT_BASE,
-    "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
-}
 
 SUPPORTED_GPU_MAPPING = {
     "GB200": "gb200",
