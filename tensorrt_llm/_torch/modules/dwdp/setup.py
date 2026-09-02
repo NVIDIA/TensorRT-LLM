@@ -637,8 +637,11 @@ def fixup_moe_backends(
         # last writer, so re-materialize them here. Backend only: the wrapper
         # declares no ``activation_support`` of its own. Imported locally because
         # ``fused_moe`` reads the DWDP manager, so a module-scope import here
-        # would close that cycle.
-        from ..fused_moe.activation import install_activation_params
+        # would close that cycle. Spelled absolute rather than relative: this
+        # module sits one level deeper than ``modules/``, so the relative form
+        # needs three dots, and getting that wrong resolves to a package that
+        # does not exist without any static check noticing.
+        from tensorrt_llm._torch.moe.fused_moe.activation import install_activation_params
 
         if getattr(experts_module, "activation", None) is not None:
             install_activation_params(experts_module)
