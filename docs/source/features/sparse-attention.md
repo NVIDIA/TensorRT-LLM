@@ -42,16 +42,17 @@ selectors, cache management, and these attention implementations are listed in
 
 ### Sparse MLA
 
-Sparse MLA consumes token-level selections against a latent KV cache. It is
-used by model-native algorithms such as DeepSeek Sparse Attention and
-DeepSeek-V4 hybrid attention. Both prefill and generation are supported,
+Sparse MLA consumes token-level selections against a model-specific shared KV
+representation. DeepSeek Sparse Attention selects entries from a low-rank
+latent KV cache, while DeepSeek-V4 combines compressed full-head non-RoPE K
+with its corresponding RoPE K. Both prefill and generation are supported,
 including mixed batches.
 
 | Parameter | Support |
 |---|---|
 | GPU architecture | SM90, SM100, SM103, SM120, and SM121 through architecture-specific sparse MLA implementations |
 | Sparse compute phase | Packed prefill, generation, and mixed context/generation batches |
-| Attention type | MLA with a shared latent KV representation |
+| Attention type | MLA with a model-specific shared KV representation |
 | Model geometry | Checkpoint-native geometry; tests cover DeepSeek-V3.2 (`qk_head_dim=192`, `v_head_dim=128`) and DeepSeek-V4 (`qk_head_dim=512`, `v_head_dim=512`) |
 | Model input dtype | BF16 |
 | KV-cache dtype | BF16 and the FP8 modes supported by the selected model and GPU architecture |
@@ -116,8 +117,6 @@ produced by a sparse selector. Sparse MHA computation starts during generation;
 prefill attention computation remains dense. An algorithm can still compact
 the retained KV cache after prefill to reduce cache size and later decode work.
 
-#### Support Matrix
-
 | Parameter | Support |
 |---|---|
 | GPU architecture | SM100 is runtime-tested; SM103 is source-supported and enabled by the tests |
@@ -143,6 +142,8 @@ selections, invokes `TrtllmAttention.forward`, and compares the result with an
 equivalent token-level PyTorch reference. RocketKV selector, metadata, and KT
 cache tests remain under the `rocketkv/` subdirectory.
 
+<a id="framework-level-sparse-attention"></a>
+
 ## Supported Algorithms
 
 The public `sparse_attention_config` API connects a sparse algorithm to its
@@ -156,9 +157,9 @@ selector, runtime metadata, cache management, and attention implementation.
 | `minimax_m3` | `MiniMaxM3SparseAttentionConfig` | Learned block selection followed by sparse GQA | Dedicated Triton or packaged block-sparse implementation | MiniMax-M3 sparse layers |
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Dynamically skips eligible softmax work inside the FMHA kernel | TRTLLM | Existing full-attention models with calibrated or direct thresholds |
 
-All five configs select the PyTorch execution backend. The "attention
-implementation" column refers to the attention kernel/backend used inside that
-execution backend.
+All five configs are supported only by the PyTorch execution backend. The
+"attention implementation" column refers to the attention kernel/backend used
+inside that execution backend.
 
 ### Capability Comparison
 
@@ -273,8 +274,10 @@ DeepSeek-V4 interleaves three model-native attention modes:
 TensorRT LLM normally constructs `DeepSeekV4SparseAttentionConfig` from the
 checkpoint. An explicit config overrides matching fields; it must preserve the
 model's attention layout. The current implementation requires
-`window_size=128`, compression ratios from `{1, 4, 128}`, data-center Blackwell
-GPUs, KV-cache blocks of `128` or `256` tokens, and beam width `1`.
+`window_size=128`, compression ratios from `{1, 4, 128}`, Hopper (`SM90`) or
+Blackwell (`SM100+`) GPUs, KV-cache blocks of `128` or `256` tokens, and beam
+width `1`. Hopper requires `kv_cache_config.dtype=fp8_ds_mla`; on SM120 and
+SM121, that cache layout requires 256-token blocks.
 
 ```yaml
 sparse_attention_config:
@@ -317,6 +320,8 @@ reuse or MTP. See the
 [MiniMax-M3 deployment guide](../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md)
 for supported checkpoints and parallel deployment settings.
 
+<a id="kernel-level-sparse-attention"></a>
+
 #### Skip Softmax Attention
 
 Skip Softmax Attention, also known as BLASST, dynamically skips eligible work
@@ -348,7 +353,9 @@ sparse_attention_config:
 
 Alternatively, provide `target_sparsity`. This path requires the checkpoint to
 contain a calibration formula that maps the requested target to the kernel's
-threshold scale factor.
+threshold scale factor. `target_sparsity` is calibration guidance rather than a
+runtime guarantee; the achieved sparsity depends on the model inputs and
+workload.
 
 ```yaml
 sparse_attention_config:
