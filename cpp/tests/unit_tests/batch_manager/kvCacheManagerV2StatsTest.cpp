@@ -140,8 +140,8 @@ TEST(KvCacheManagerV2StatsTest, PendingReuseByLevelRidesAlongWithScalarCounts)
     EXPECT_TRUE(pending.recordReuse(LifeCycleId{0}, /*fullReusedBlocks=*/5, /*partialReusedBlocks=*/0, secondMatch));
 
     auto const& byLevel = pending.reusedBlocksByLevelByLifeCycle().at(LifeCycleId{0});
-    EXPECT_EQ(byLevel.full, (std::vector<int64_t>{3, 4, 1}));
-    EXPECT_EQ(byLevel.partial, (std::vector<int64_t>{0, 1, 0}));
+    EXPECT_EQ(byLevel.full.raw(), (std::vector<int64_t>{3, 4, 1}));
+    EXPECT_EQ(byLevel.partial.raw(), (std::vector<int64_t>{0, 1, 0}));
     // The by-level split must agree with the scalar counters it rides along with.
     auto const& iteration = pending.iterationStatsByLifeCycle().at(LifeCycleId{0});
     EXPECT_EQ(std::accumulate(byLevel.full.begin(), byLevel.full.end(), int64_t{0}), iteration.iterFullReusedBlocks);
@@ -162,14 +162,14 @@ TEST(KvCacheManagerV2StatsTest, ReusedBlocksByLevelAddResizesToLongerVector)
     ReusedBlocksByLevel twoLevels;
     twoLevels.full = {1, 2};
     counts.add(twoLevels);
-    EXPECT_EQ(counts.full, (std::vector<int64_t>{1, 2}));
+    EXPECT_EQ(counts.full.raw(), (std::vector<int64_t>{1, 2}));
     EXPECT_FALSE(counts.empty());
 
     // A deployment reporting more levels than seen so far widens the accumulator.
     ReusedBlocksByLevel fourLevels;
     fourLevels.full = {10, 0, 0, 5};
     counts.add(fourLevels);
-    EXPECT_EQ(counts.full, (std::vector<int64_t>{11, 2, 0, 5}));
+    EXPECT_EQ(counts.full.raw(), (std::vector<int64_t>{11, 2, 0, 5}));
 }
 
 TEST(KvCacheManagerV2StatsTest, ManagerCommitResetAndRequestIdTracking)

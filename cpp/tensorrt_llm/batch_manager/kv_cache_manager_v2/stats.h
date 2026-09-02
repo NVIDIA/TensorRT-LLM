@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <numeric>
 #include <unordered_map>
 #include <vector>
 
@@ -177,46 +178,57 @@ struct KVCacheIterationStatsDelta
 using IterationStatsByLifeCycle = std::unordered_map<LifeCycleId, KVCacheIterationStatsDelta>;
 
 // ---------------------------------------------------------------------------
-// ReusedBlocksByLevel — reuse block counts split by the cache level the reused
-// pages were resident on when the match was taken.
+// CountsByLevel — counters indexed by CacheLevel, so entry i always belongs to
+// the i-th configured cache tier. The length follows the configured tier list
+// instead of a hard-coded GPU/host/disk split, which is what lets a deployment
+// with a hot and a cold GPU level report them as two distinct entries.
 //
-// Kept outside KVCacheIterationStatsDelta on purpose: the number of cache
-// levels is a runtime, config-driven quantity (a deployment may configure two
-// GPU levels, a hot and a cold one), while that struct is a fixed-field record
-// whose field-wise add/subtract helpers assume scalar members. Indices are
-// CacheLevel values, so entry i always refers to the i-th configured tier
-// rather than to a hard-coded GPU/host/disk bucket.
+// Kept outside KVCacheIterationStatsDelta on purpose: the level count is a
+// runtime quantity, while that struct is a fixed-field record whose field-wise
+// add/subtract helpers assume scalar members.
 // ---------------------------------------------------------------------------
 
+using CountsByLevel = TypedVec<CacheLevel, int64_t>;
+
+//! Element-wise accumulate, widening `dst` when `src` covers more levels.
+inline void addCountsByLevel(CountsByLevel& dst, CountsByLevel const& src)
+{
+    if (dst.size() < src.size())
+    {
+        dst.resize(src.size(), 0);
+    }
+    for (CacheLevel level{0}; level < src.size(); ++level)
+    {
+        dst.at(level) += src.at(level);
+    }
+}
+
+inline bool countsByLevelEmpty(CountsByLevel const& counts) noexcept
+{
+    return std::all_of(counts.begin(), counts.end(), [](int64_t count) { return count == 0; });
+}
+
+inline int64_t countsByLevelTotal(CountsByLevel const& counts) noexcept
+{
+    return std::accumulate(counts.begin(), counts.end(), int64_t{0});
+}
+
+//! Reuse block counts split by the cache level the reused pages were resident on when the match
+//! was taken.
 struct ReusedBlocksByLevel
 {
-    std::vector<int64_t> full;
-    std::vector<int64_t> partial;
+    CountsByLevel full;
+    CountsByLevel partial;
 
     void add(ReusedBlocksByLevel const& other)
     {
-        addInto(full, other.full);
-        addInto(partial, other.partial);
+        addCountsByLevel(full, other.full);
+        addCountsByLevel(partial, other.partial);
     }
 
     [[nodiscard]] bool empty() const noexcept
     {
-        auto const allZero = [](std::vector<int64_t> const& counts)
-        { return std::all_of(counts.begin(), counts.end(), [](int64_t count) { return count == 0; }); };
-        return allZero(full) && allZero(partial);
-    }
-
-private:
-    static void addInto(std::vector<int64_t>& dst, std::vector<int64_t> const& src)
-    {
-        if (dst.size() < src.size())
-        {
-            dst.resize(src.size(), 0);
-        }
-        for (size_t i = 0; i < src.size(); ++i)
-        {
-            dst[i] += src[i];
-        }
+        return countsByLevelEmpty(full) && countsByLevelEmpty(partial);
     }
 };
 

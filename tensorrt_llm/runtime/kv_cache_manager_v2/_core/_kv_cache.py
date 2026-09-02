@@ -63,7 +63,12 @@ from .._page import (
     _SharedPageLock,
     batched_lock_to_gpu,
 )
-from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta, ReusedBlocksByLevel
+from .._stats import (
+    CountsByLevel,
+    KVCacheIterationStatsDelta,
+    KVCacheStatsDelta,
+    ReusedBlocksByLevel,
+)
 from .._storage._core import Slot
 from .._storage_manager import StorageManager
 from .._utils import (
@@ -239,8 +244,8 @@ class _KVCache:
         "_blocks",
         "_base_page_indices",
         "_committed_tokens",
-        "_cached_tokens_by_tier",
-        "_last_cached_token_tier",
+        "_cached_tokens_by_level",
+        "_last_cached_token_level",
         "_num_reusable_tokens_before_hybrid_pruning",
         "_num_reusable_tokens_before_pruning",
         "_num_committed_blocks",
@@ -279,9 +284,9 @@ class _KVCache:
     # be computed on the fly, but that would be slow due to python.
     _base_page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _committed_tokens: list[TokenIdExt]
-    # Initial current-residency provenance, observed before reused pages are held or promoted.
-    _cached_tokens_by_tier: dict[str, int]
-    _last_cached_token_tier: CacheTier | None
+    # Initial current-residency provenance, observed while the reused pages are held.
+    _cached_tokens_by_level: CountsByLevel
+    _last_cached_token_level: CacheLevel | None
     # Internal diagnostic captured from the reuse match: see ReuseMatch.
     _num_reusable_tokens_before_hybrid_pruning: int
     _num_reusable_tokens_before_pruning: int
@@ -344,10 +349,10 @@ class _KVCache:
             self.beam_width,
         )
         self._committed_tokens = []
-        # Filled by _setup_for_reuse(), which observes the source tiers in the same walk that
-        # holds the matched pages. Stays empty when there is no reuse match.
-        self._cached_tokens_by_tier = {"gpu": 0, "host": 0, "disk": 0, "remote": 0}
-        self._last_cached_token_tier = None
+        # Filled by _setup_for_reuse(), which observes the source levels in the same walk that
+        # holds the matched pages. Stays all-zero when there is no reuse match.
+        self._cached_tokens_by_level = filled_list(0, manager._storage.num_cache_levels)
+        self._last_cached_token_level = None
         self._num_reusable_tokens_before_hybrid_pruning = (
             reuse_match.num_reusable_tokens_before_hybrid_pruning if reuse_match is not None else 0
         )
@@ -1129,14 +1134,16 @@ class _KVCache:
         return len(self._committed_tokens)
 
     @property
-    def cached_tokens_by_tier(self) -> dict[str, int]:
-        """Return current-residency source tiers observed by the initial reuse match."""
-        return dict(self._cached_tokens_by_tier)
+    def cached_tokens_by_level(self) -> CountsByLevel:
+        """Reused-token counts indexed by each token's coldest required source cache level."""
+        return list(self._cached_tokens_by_level)
 
-    def _get_last_cached_token_tier(self) -> int | None:
-        """Return the final source tier of the last initially reused logical block."""
+    def _get_last_cached_token_level(self) -> int | None:
+        """Return the source cache level of the last initially reused logical block."""
         return (
-            int(self._last_cached_token_tier) if self._last_cached_token_tier is not None else None
+            int(self._last_cached_token_level)
+            if self._last_cached_token_level is not None
+            else None
         )
 
     def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int:
@@ -1503,7 +1510,14 @@ class _KVCache:
         except OutOfPagesError:
             return False
         if has_disk_page:
-            manager.record_disk_prefetch_tokens(self._cached_tokens_by_tier["disk"])
+            # The metric counts disk-to-host movement, so fold together every level the config
+            # maps to the disk tier rather than assuming a single disk level.
+            disk_tokens = sum(
+                count
+                for level, count in enumerate(self._cached_tokens_by_level)
+                if storage.cache_tiers[level] == CacheTier.DISK
+            )
+            manager.record_disk_prefetch_tokens(disk_tokens)
         return True
 
     def _active_pages(self) -> Iterator[tuple[BlockOrdinal, BeamIndex, LifeCycleId]]:
@@ -2141,40 +2155,41 @@ class _KVCache:
         assert remaining == 0
         return ret
 
-    def _finalize_cached_tokens_by_tier(
-        self, num_tokens: int, attention_tiers: list[CacheTier], ssm_tier: CacheTier | None
+    def _finalize_cached_tokens_by_level(
+        self,
+        num_tokens: int,
+        attention_levels: TypedIndexList[BlockOrdinal, CacheLevel],
+        ssm_level: CacheLevel | None,
     ) -> None:
-        """Turn the per-block attention tiers collected while holding the matched pages into
-        logical token counts.
+        """Turn the per-block cache levels collected while holding the matched pages into logical
+        token counts.
 
-        Attention pages cover their block's matched token span. The final SSM checkpoint
-        summarizes and therefore covers the entire recurrent prefix, so it is merged into
-        every block.
+        Cache levels are ordered hottest first, so the coldest level backing a block is simply the
+        largest one. Attention pages cover their block's matched token span; the final SSM
+        checkpoint summarizes the entire recurrent prefix, so it is merged into every block.
         """
-        counts = {"gpu": 0, "host": 0, "disk": 0, "remote": 0}
-        self._cached_tokens_by_tier = counts
-        self._last_cached_token_tier = None
+        counts = filled_list(0, self.manager._storage.num_cache_levels)
+        self._cached_tokens_by_level = counts
+        self._last_cached_token_level = None
         if num_tokens == 0:
             return
 
         tokens_per_block = self.manager.tokens_per_block
-        tier_counts = filled_list(0, len(CacheTier))
-        last_cached_token_tier: CacheTier | None = None
-        for ordinal, attention_tier in enumerate(attention_tiers):
+        last_cached_token_level: CacheLevel | None = None
+        for ordinal, attention_level in enumerate(attention_levels):
             block_start = ordinal * tokens_per_block
             block_end = min(num_tokens, block_start + tokens_per_block)
             if block_start >= block_end:
                 break
-            source_tier = max(attention_tier, ssm_tier) if ssm_tier is not None else attention_tier
-            last_cached_token_tier = source_tier
-            tier_counts[source_tier] += block_end - block_start
+            source_level = (
+                max(attention_level, ssm_level) if ssm_level is not None else attention_level
+            )
+            last_cached_token_level = source_level
+            counts[source_level] += block_end - block_start
 
-        counts["gpu"] = tier_counts[CacheTier.GPU_MEM]
-        counts["host"] = tier_counts[CacheTier.HOST_MEM]
-        counts["disk"] = tier_counts[CacheTier.DISK]
-        self._last_cached_token_tier = last_cached_token_tier
-        assert NDEBUG or sum(counts.values()) == num_tokens
-        assert NDEBUG or last_cached_token_tier is not None
+        self._last_cached_token_level = last_cached_token_level
+        assert NDEBUG or sum(counts) == num_tokens
+        assert NDEBUG or last_cached_token_level is not None
 
     def _setup_for_reuse(self, match: ReuseMatch) -> None:
         manager = self.manager
@@ -2209,12 +2224,13 @@ class _KVCache:
         record_request_stats = self._should_record_request_stats()
         record_shared_stats = record_manager_stats or record_request_stats
         storage = manager._storage
-        num_cache_levels = len(storage.cache_tiers)
-        # Source-tier attribution for the reused tokens, merged across attention life cycles at
+        num_cache_levels = storage.num_cache_levels
+        # Source-level attribution for the reused tokens, merged across attention life cycles at
         # block granularity. It is observed in this same walk rather than in a separate pre-pass:
         # hold() only takes a page holder and unschedules eviction, it never migrates data, so a
-        # page still reports the level it was matched on.
-        attention_tiers = filled_list(CacheTier.GPU_MEM, len(matched))
+        # page still reports the level it was matched on. Levels are ordered hottest first, so
+        # merging takes the max.
+        attention_levels = filled_list(CacheLevel(0), BlockOrdinal(len(matched)))
         for lc_idx, lc in life_cycles.items():
             if lc_idx == ssm_lc_id:
                 continue  # SSM is handled separately below
@@ -2225,12 +2241,15 @@ class _KVCache:
             # Indexed by CacheLevel, so entry i is the i-th configured tier rather than a fixed
             # gpu/host/disk bucket; a deployment with two GPU levels gets two distinct entries.
             by_level = (
-                ReusedBlocksByLevel(full=[0] * num_cache_levels, partial=[0] * num_cache_levels)
+                ReusedBlocksByLevel(
+                    full=filled_list(0, num_cache_levels),
+                    partial=filled_list(0, num_cache_levels),
+                )
                 if record_shared_stats and is_attention
                 else None
             )
-            life_cycle_levels: list[CacheLevel | None] = (
-                [None] * len(matched) if is_attention else []
+            life_cycle_levels: TypedIndexList[BlockOrdinal, CacheLevel | None] = (
+                filled_list(None, BlockOrdinal(len(matched))) if is_attention else []
             )
             for ordinal in chain(
                 typed_range(stale_start), typed_range(stale_end, BlockOrdinal(len(matched)))
@@ -2259,18 +2278,17 @@ class _KVCache:
                         by_level.partial[level] += 1
             if is_attention:
                 # For SWA, only sink and live-window pages at the matched endpoint are
-                # materialized. Stale spans inherit the next live page's tier, because that later
+                # materialized. Stale spans inherit the next live page's level, because that later
                 # anchor is what enables those logical tokens to be skipped.
-                next_anchor_tier: CacheTier | None = None
+                next_anchor_level: CacheLevel | None = None
                 for ordinal in reversed(range(len(matched))):
-                    level_or_none = life_cycle_levels[ordinal]
-                    if level_or_none is not None:
-                        tier = storage.cache_tiers[level_or_none]
-                        next_anchor_tier = tier
+                    level = life_cycle_levels[ordinal]
+                    if level is not None:
+                        next_anchor_level = level
                     else:
-                        tier = next_anchor_tier
-                    if tier is not None and tier > attention_tiers[ordinal]:
-                        attention_tiers[ordinal] = tier
+                        level = next_anchor_level
+                    if level is not None and level > attention_levels[ordinal]:
+                        attention_levels[ordinal] = level
             if record_shared_stats and is_attention:
                 changed = self._pending_stats.record_reuse(
                     lc_idx,
@@ -2286,17 +2304,17 @@ class _KVCache:
         # resume(). Reuse onboards only this final recurrent checkpoint, and it summarizes the
         # entire matched prefix, so its source tier applies to every logical reused token; older
         # checkpoints are traversal history, not inputs.
-        ssm_tier: CacheTier | None = None
+        ssm_level: CacheLevel | None = None
         if ssm_lc_id is not None and matched:
             snapshot_block = matched[-1]
             snapshot_page = snapshot_block.get_page(ssm_lc_id)
             assert snapshot_page is not None, (
                 "Last matched block must have SSM snapshot after truncation"
             )
-            ssm_tier = storage.cache_tiers[snapshot_page.cache_level]
+            ssm_level = snapshot_page.cache_level
             snapshot_holder = snapshot_page.hold()
             self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] = snapshot_holder
-        self._finalize_cached_tokens_by_tier(num_tokens, attention_tiers, ssm_tier)
+        self._finalize_cached_tokens_by_level(num_tokens, attention_levels, ssm_level)
         if record_manager_stats and ssm_lc_id is not None:
             changed = self._pending_stats.record_ssm_snapshot_lookup(
                 ssm_lc_id,

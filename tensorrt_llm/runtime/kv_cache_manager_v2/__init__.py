@@ -90,6 +90,7 @@ if _BACKEND == "python":
     from ._life_cycle_registry import AttnLifeCycle, LayerGroupId, LifeCycleId  # noqa: F401
     from ._stats import (  # noqa: F401
         _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
+        CountsByLevel,
         KVCacheIterationStatsDelta,
         KVCacheStatsDelta,
         ReusedBlocksByLevel,

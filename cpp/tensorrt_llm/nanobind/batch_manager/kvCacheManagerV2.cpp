@@ -1174,8 +1174,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     // Drained snapshots only: callers read the per-level counts, the accumulation itself stays
     // in C++.
     nb::class_<kv::ReusedBlocksByLevel>(m, "ReusedBlocksByLevel")
-        .def_ro("full", &kv::ReusedBlocksByLevel::full)
-        .def_ro("partial", &kv::ReusedBlocksByLevel::partial);
+        .def_prop_ro("full", [](kv::ReusedBlocksByLevel const& self) { return self.full.raw(); })
+        .def_prop_ro("partial", [](kv::ReusedBlocksByLevel const& self) { return self.partial.raw(); });
 
     nb::class_<kv::KVCacheIterationStatsDelta>(m, "KVCacheIterationStatsDelta")
         .def(
@@ -1783,26 +1783,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
-        .def_prop_ro("cached_tokens_by_tier",
-            [](kv::KvCache const& self)
-            {
-                auto const& counts = self.cachedTokensByTier();
-                nb::dict result;
-                result["gpu"] = counts.gpu;
-                result["host"] = counts.host;
-                result["disk"] = counts.disk;
-                result["remote"] = counts.remote;
-                return result;
-            })
-        .def("_get_last_cached_token_tier",
+        .def_prop_ro("cached_tokens_by_level", [](kv::KvCache const& self) { return self.cachedTokensByLevel().raw(); })
+        .def("_get_last_cached_token_level",
             [](kv::KvCache const& self) -> std::optional<int>
             {
-                auto const tier = self.lastCachedTokenTier();
-                if (!tier.has_value())
+                auto const level = self.lastCachedTokenLevel();
+                if (!level.has_value())
                 {
                     return std::nullopt;
                 }
-                return static_cast<int>(*tier);
+                return level->value();
             })
         .def("_get_num_reusable_tokens_before_hybrid_pruning", &kv::KvCache::numReusableTokensBeforeHybridPruning)
         .def("_get_num_reusable_tokens_before_pruning", &kv::KvCache::numReusableTokensBeforePruning)
@@ -2340,28 +2330,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "get_and_reset_iteration_disk_prefetch_tokens", &kv::KvCacheManager::getAndResetIterationDiskPrefetchTokens)
         .def(
-            "record_cached_tokens_by_tier",
-            [](kv::KvCacheManager& self, nb::dict const& counts)
-            {
-                kv::CachedTokensByTier delta;
-                delta.gpu = nb::cast<int>(counts["gpu"]);
-                delta.host = nb::cast<int>(counts["host"]);
-                delta.disk = nb::cast<int>(counts["disk"]);
-                delta.remote = nb::cast<int>(counts["remote"]);
-                self.recordCachedTokensByTier(delta);
-            },
+            "record_cached_tokens_by_level",
+            [](kv::KvCacheManager& self, std::vector<int64_t> counts)
+            { self.recordCachedTokensByLevel(kv::CountsByLevel{std::move(counts)}); },
             nb::arg("counts"))
-        .def("get_and_reset_iteration_cached_tokens_by_tier",
-            [](kv::KvCacheManager& self)
-            {
-                auto const counts = self.getAndResetIterationCachedTokensByTier();
-                nb::dict result;
-                result["gpu"] = counts.gpu;
-                result["host"] = counts.host;
-                result["disk"] = counts.disk;
-                result["remote"] = counts.remote;
-                return result;
-            })
+        .def("get_and_reset_iteration_cached_tokens_by_level",
+            [](kv::KvCacheManager& self) { return self.getAndResetIterationCachedTokensByLevel().raw(); })
         .def("get_and_reset_iteration_reused_blocks_by_level",
             [](kv::KvCacheManager& self)
             {

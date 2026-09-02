@@ -114,20 +114,6 @@ struct SeqBlock
     }
 };
 
-//! Current-residency source-tier token counts observed by a KvCache's initial reuse match.
-struct CachedTokensByTier
-{
-    int gpu = 0;
-    int host = 0;
-    int disk = 0;
-    int remote = 0;
-
-    int total() const noexcept
-    {
-        return gpu + host + disk + remote;
-    }
-};
-
 // ---------------------------------------------------------------------------
 // PlannedDropHandle — tracks committed pages planned for dropping without
 // owning them. Mirrors Python's PlannedDropHandle in _core/_kv_cache.py.
@@ -296,14 +282,16 @@ public:
         return static_cast<int>(mCommittedTokens.size());
     }
 
-    CachedTokensByTier const& cachedTokensByTier() const noexcept
+    //! Reused-token counts indexed by the cache level each token's coldest required page sat on
+    //! when the reuse match was taken.
+    CountsByLevel const& cachedTokensByLevel() const noexcept
     {
-        return mCachedTokensByTier;
+        return mCachedTokensByLevel;
     }
 
-    std::optional<CacheTier> lastCachedTokenTier() const noexcept
+    std::optional<CacheLevel> lastCachedTokenLevel() const noexcept
     {
-        return mLastCachedTokenTier;
+        return mLastCachedTokenLevel;
     }
 
     // Internal diagnostic: prefix supported by the attention pages alone,
@@ -457,10 +445,10 @@ private:
     void activate();
 
     // Internal helpers.
-    // Turn the per-block attention tiers observed while holding the matched pages into logical
-    // token counts. Called at the end of _setupForReuse, which collects them in the same walk.
-    void _finalizeCachedTokensByTier(
-        int numTokens, std::vector<CacheTier> const& attentionTiers, std::optional<CacheTier> ssmTier);
+    // Turn the per-block cache levels observed while holding the matched pages into logical token
+    // counts. Called at the end of _setupForReuse, which collects them in the same walk.
+    void _finalizeCachedTokensByLevel(
+        int numTokens, TypedVec<BlockOrdinal, CacheLevel> const& attentionLevels, std::optional<CacheLevel> ssmLevel);
     void _setupForReuse(BlockRadixTree::ReuseMatch const& match);
     // Reconstruct the committed token sequence from a match's blocks (mirrors
     // Python's _get_matched_tokens); used when reuse-matching no longer has the
@@ -630,8 +618,8 @@ private:
 
     std::vector<TokenIdExt> mCommittedTokens;
     // Initial current-residency provenance, observed before reused pages are held or promoted.
-    CachedTokensByTier mCachedTokensByTier;
-    std::optional<CacheTier> mLastCachedTokenTier;
+    CountsByLevel mCachedTokensByLevel;
+    std::optional<CacheLevel> mLastCachedTokenLevel;
     // Resolved per-sequence text-only state after applying the manager default.
     bool mTextOnly = false;
     int mNumReusableTokensBeforeHybridPruning;

@@ -559,23 +559,20 @@ int64_t KvCacheManager::getAndResetIterationDiskPrefetchTokens()
     return numTokens;
 }
 
-void KvCacheManager::recordCachedTokensByTier(CachedTokensByTier const& counts)
+void KvCacheManager::recordCachedTokensByLevel(CountsByLevel const& counts)
 {
-    TLLM_CHECK_DEBUG(counts.gpu >= 0 && counts.host >= 0 && counts.disk >= 0 && counts.remote >= 0);
+    TLLM_CHECK_DEBUG(std::all_of(counts.begin(), counts.end(), [](int64_t count) { return count >= 0; }));
     if (!mConfig.enableStats)
     {
         return;
     }
-    mIterCachedTokensByTier.gpu += counts.gpu;
-    mIterCachedTokensByTier.host += counts.host;
-    mIterCachedTokensByTier.disk += counts.disk;
-    mIterCachedTokensByTier.remote += counts.remote;
+    addCountsByLevel(mIterCachedTokensByLevel, counts);
 }
 
-CachedTokensByTier KvCacheManager::getAndResetIterationCachedTokensByTier()
+CountsByLevel KvCacheManager::getAndResetIterationCachedTokensByLevel()
 {
-    auto const counts = mIterCachedTokensByTier;
-    mIterCachedTokensByTier = CachedTokensByTier{};
+    CountsByLevel counts;
+    std::swap(counts, mIterCachedTokensByLevel);
     return counts;
 }
 
