@@ -97,8 +97,6 @@ public:
         int smCount = 0;
         //! True for NVLink-C2C (Grace); false for discrete PCIe attachment.
         bool coherentLink = false;
-        //! Number of C2C links, 0 on PCIe.
-        int c2cLinkCount = 0;
         //! Per-GPU CPU-GPU link bandwidth, one direction, in GB/s.
         double linkBandwidthGBs = 0.0;
         //! Host NUMA node closest to this GPU, or -1 if unknown. Pinned cache-tier memory MUST be
