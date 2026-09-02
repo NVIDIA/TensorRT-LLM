@@ -870,6 +870,8 @@ def test_per_conversation_policy_retains_configured_number_of_turns(
 
         assert manager.prepare_context(request_a_probe)
         assert request_a_probe.prepopulated_prompt_len == request_a_probe.prompt_len - 1
+        probe_kv_cache = manager.kv_cache_map[request_a_probe.py_request_id]
+        assert probe_kv_cache.cached_tokens_by_tier["gpu"] == 7
         _free_if_active(manager, request_a_probe)
 
         _run_context(manager, request_c)
@@ -951,6 +953,13 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
         get_and_reset_iteration_stats=lambda: {},
         get_and_reset_ssm_snapshot_iteration_stats=lambda: {3: snapshot_delta},
         get_and_reset_iteration_suspend_resume_stats=lambda: (0, 0),
+        get_and_reset_iteration_disk_prefetch_tokens=lambda: 7,
+        get_and_reset_iteration_cached_tokens_by_tier=lambda: {
+            "gpu": 5,
+            "host": 2,
+            "disk": 1,
+            "remote": 0,
+        },
     )
     manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}
     manager._storage_pool_groups_by_window = lambda: {}
@@ -966,6 +975,8 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     assert ssm_stats.pool_group_id == 1
     assert ssm_stats.snapshot_stats.iter_snapshot_hit_rate == 0.5
     assert ssm_stats.snapshot_stats.iter_reused_tokens == 32
+    assert stats.disk_prefetch_tokens == 7
+    assert stats.cached_tokens_by_tier == {"gpu": 5, "host": 2, "disk": 1, "remote": 0}
 
 
 def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:

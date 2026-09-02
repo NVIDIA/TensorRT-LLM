@@ -194,6 +194,9 @@ class PoolGroupPeakBlockStats:
     evictable: int
 
 
+_CACHED_TOKEN_TIERS = ("gpu", "host", "disk", "remote")
+
+
 class KVCacheManager:
     __slots__ = (
         "_init_config",
@@ -220,6 +223,8 @@ class KVCacheManager:
         "_stats_excluded_kv_cache_ids",
         "_iter_suspended_requests",
         "_iter_resumed_requests",
+        "_iter_disk_prefetch_tokens",
+        "_iter_cached_tokens_by_tier",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -303,6 +308,8 @@ class KVCacheManager:
         self._stats_excluded_kv_cache_ids = set()
         self._iter_suspended_requests = 0
         self._iter_resumed_requests = 0
+        self._iter_disk_prefetch_tokens = 0
+        self._iter_cached_tokens_by_tier = dict.fromkeys(_CACHED_TOKEN_TIERS, 0)
 
     def __del__(self) -> None:
         try:
@@ -657,6 +664,30 @@ class KVCacheManager:
         self._iter_suspended_requests = 0
         self._iter_resumed_requests = 0
         return suspended, resumed
+
+    def record_disk_prefetch_tokens(self, num_tokens: int) -> None:
+        """Count logical tokens scheduled by successful disk-to-host prefetches."""
+        assert num_tokens >= 0
+        if self._stats_enabled:
+            self._iter_disk_prefetch_tokens += num_tokens
+
+    def get_and_reset_iteration_disk_prefetch_tokens(self) -> int:
+        """Return and reset disk-to-host prefetch tokens for this iteration."""
+        num_tokens = self._iter_disk_prefetch_tokens
+        self._iter_disk_prefetch_tokens = 0
+        return num_tokens
+
+    def record_cached_tokens_by_tier(self, counts: dict[str, int]) -> None:
+        """Accumulate a request's initial cached-token tier attribution into this iteration."""
+        if self._stats_enabled:
+            for tier in _CACHED_TOKEN_TIERS:
+                self._iter_cached_tokens_by_tier[tier] += counts[tier]
+
+    def get_and_reset_iteration_cached_tokens_by_tier(self) -> dict[str, int]:
+        """Return {gpu, host, disk, remote} cached-token counts since the last drain and reset them."""
+        counts = self._iter_cached_tokens_by_tier
+        self._iter_cached_tokens_by_tier = dict.fromkeys(_CACHED_TOKEN_TIERS, 0)
+        return counts
 
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel

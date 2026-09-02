@@ -1777,6 +1777,27 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
+        .def_prop_ro("cached_tokens_by_tier",
+            [](kv::KvCache const& self)
+            {
+                auto const& counts = self.cachedTokensByTier();
+                nb::dict result;
+                result["gpu"] = counts.gpu;
+                result["host"] = counts.host;
+                result["disk"] = counts.disk;
+                result["remote"] = counts.remote;
+                return result;
+            })
+        .def("_get_last_cached_token_tier",
+            [](kv::KvCache const& self) -> std::optional<int>
+            {
+                auto const tier = self.lastCachedTokenTier();
+                if (!tier.has_value())
+                {
+                    return std::nullopt;
+                }
+                return static_cast<int>(*tier);
+            })
         .def("_get_num_reusable_tokens_before_hybrid_pruning", &kv::KvCache::numReusableTokensBeforeHybridPruning)
         .def("_get_num_reusable_tokens_before_pruning", &kv::KvCache::numReusableTokensBeforePruning)
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
@@ -1915,6 +1936,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"), nb::arg("tokens"), nb::arg("coverage_per_lc"), nb::arg("parent").none() = nb::none(),
         nb::arg("reuse_scope").none() = nb::none(), nb::keep_alive<0, 1>(), nb::keep_alive<0, 4>());
+    mIntrospection.def(
+        "set_test_block_page_cache_level",
+        [](EventManagerTestBlock& block, int lifeCycleId, int cacheLevel)
+        {
+            auto const page = std::find_if(block.pages.begin(), block.pages.end(),
+                [lifeCycleId](auto const& candidate) { return candidate->lifeCycle == kv::LifeCycleId{lifeCycleId}; });
+            if (page == block.pages.end())
+            {
+                throw std::invalid_argument("test block has no page for the requested life cycle");
+            }
+            if ((*page)->scheduledForEviction())
+            {
+                (*page)->manager->excludeFromEviction(**page);
+            }
+            (*page)->cacheLevel = kv::CacheLevel{cacheLevel};
+        },
+        nb::arg("block"), nb::arg("life_cycle_id"), nb::arg("cache_level"));
     mIntrospection.def(
         "test_block_key", [](EventManagerTestBlock const& block) { return digestBytes(block.block->key); },
         nb::arg("block"));
@@ -2293,6 +2331,31 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("record_request_resumed", &kv::KvCacheManager::recordRequestResumed)
         .def(
             "get_and_reset_iteration_suspend_resume_stats", &kv::KvCacheManager::getAndResetIterationSuspendResumeStats)
+        .def(
+            "get_and_reset_iteration_disk_prefetch_tokens", &kv::KvCacheManager::getAndResetIterationDiskPrefetchTokens)
+        .def(
+            "record_cached_tokens_by_tier",
+            [](kv::KvCacheManager& self, nb::dict const& counts)
+            {
+                kv::CachedTokensByTier delta;
+                delta.gpu = nb::cast<int>(counts["gpu"]);
+                delta.host = nb::cast<int>(counts["host"]);
+                delta.disk = nb::cast<int>(counts["disk"]);
+                delta.remote = nb::cast<int>(counts["remote"]);
+                self.recordCachedTokensByTier(delta);
+            },
+            nb::arg("counts"))
+        .def("get_and_reset_iteration_cached_tokens_by_tier",
+            [](kv::KvCacheManager& self)
+            {
+                auto const counts = self.getAndResetIterationCachedTokensByTier();
+                nb::dict result;
+                result["gpu"] = counts.gpu;
+                result["host"] = counts.host;
+                result["disk"] = counts.disk;
+                result["remote"] = counts.remote;
+                return result;
+            })
         .def(
             "get_and_reset_iteration_peak_block_stats",
             [](kv::KvCacheManager& self, int cacheLevel)

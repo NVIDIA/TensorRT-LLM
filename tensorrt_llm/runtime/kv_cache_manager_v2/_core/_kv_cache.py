@@ -34,6 +34,7 @@ from .._common import (
     BlockOrdinal,
     BlockOrdinalT,
     CacheLevel,
+    CacheTier,
     CudaStream,
     PageIndex,
     PageIndexMode,
@@ -238,6 +239,8 @@ class _KVCache:
         "_blocks",
         "_base_page_indices",
         "_committed_tokens",
+        "_cached_tokens_by_tier",
+        "_last_cached_token_tier",
         "_num_reusable_tokens_before_hybrid_pruning",
         "_num_reusable_tokens_before_pruning",
         "_num_committed_blocks",
@@ -276,6 +279,9 @@ class _KVCache:
     # be computed on the fly, but that would be slow due to python.
     _base_page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _committed_tokens: list[TokenIdExt]
+    # Initial current-residency provenance, observed before reused pages are held or promoted.
+    _cached_tokens_by_tier: dict[str, int]
+    _last_cached_token_tier: CacheTier | None
     # Internal diagnostic captured from the reuse match: see ReuseMatch.
     _num_reusable_tokens_before_hybrid_pruning: int
     _num_reusable_tokens_before_pruning: int
@@ -338,6 +344,9 @@ class _KVCache:
             self.beam_width,
         )
         self._committed_tokens = []
+        self._cached_tokens_by_tier, self._last_cached_token_tier = (
+            self._compute_cached_tokens_by_tier(reuse_match)
+        )
         self._num_reusable_tokens_before_hybrid_pruning = (
             reuse_match.num_reusable_tokens_before_hybrid_pruning if reuse_match is not None else 0
         )
@@ -1115,6 +1124,17 @@ class _KVCache:
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
 
+    @property
+    def cached_tokens_by_tier(self) -> dict[str, int]:
+        """Return current-residency source tiers observed by the initial reuse match."""
+        return dict(self._cached_tokens_by_tier)
+
+    def _get_last_cached_token_tier(self) -> int | None:
+        """Return the final source tier of the last initially reused logical block."""
+        return (
+            int(self._last_cached_token_tier) if self._last_cached_token_tier is not None else None
+        )
+
     def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int:
         """Return the pre-hybrid-pruning prefix for internal diagnostics."""
         return self._num_reusable_tokens_before_hybrid_pruning
@@ -1451,6 +1471,11 @@ class _KVCache:
 
         num_pool_groups = storage.num_pool_groups
         lc2pg = storage.get_pool_group_index
+        track_disk_tokens = (
+            self._should_record_manager_stats()
+            and storage.cache_tiers[target] == CacheTier.HOST_MEM
+        )
+        has_disk_page = False
 
         all_pages = make_typed(
             lambda _: make_typed(lambda _: list[Page](), num_tiers), num_pool_groups
@@ -1464,6 +1489,8 @@ class _KVCache:
             lvl = page.cache_level
             if lvl < target:
                 continue
+            if track_disk_tokens and storage.cache_tiers[lvl] == CacheTier.DISK:
+                has_disk_page = True
             pg_idx = lc2pg(lc_idx)
             all_pages[pg_idx][lvl].append(page)
 
@@ -1471,6 +1498,8 @@ class _KVCache:
             storage.prefetch(target, all_pages)
         except OutOfPagesError:
             return False
+        if has_disk_page:
+            manager.record_disk_prefetch_tokens(self._cached_tokens_by_tier["disk"])
         return True
 
     def _active_pages(self) -> Iterator[tuple[BlockOrdinal, BeamIndex, LifeCycleId]]:
@@ -2107,6 +2136,75 @@ class _KVCache:
             remaining -= num_block_tokens
         assert remaining == 0
         return ret
+
+    def _compute_cached_tokens_by_tier(
+        self, match: ReuseMatch | None
+    ) -> tuple[dict[str, int], CacheTier | None]:
+        """Attribute each initially reused logical token to its coldest required page.
+
+        This runs before ``_setup_for_reuse()`` holds pages and before ``resume()``
+        promotes them to GPU, so every page still reports its source cache level.
+        Attention pages cover their block's matched token span. The final SSM
+        checkpoint summarizes and therefore covers the entire recurrent prefix.
+        """
+        counts = {"gpu": 0, "host": 0, "disk": 0, "remote": 0}
+        if match is None or match.num_tokens == 0:
+            return counts, None
+
+        manager = self.manager
+        num_tokens = match.num_tokens
+        tokens_per_block = manager.tokens_per_block
+        matched = match.blocks
+        gpu_tier = CacheTier.GPU_MEM
+        attention_tiers = filled_list(gpu_tier, len(matched))
+
+        # A token can have pages in several attention life cycles. Merge their
+        # source tiers at block granularity, considering only pages required at
+        # the matched endpoint (sink and live-window blocks for SWA). Stale SWA
+        # spans inherit the next live page's source: that later anchor is what
+        # makes skipping those logical tokens possible.
+        for lc_idx, lc in manager._life_cycles.attention_life_cycles():
+            stale_start, stale_end = _KVCache._get_stale_range(tokens_per_block, num_tokens, lc)
+            life_cycle_tiers: list[CacheTier | None] = [None] * len(matched)
+            for ordinal in chain(
+                typed_range(stale_start), typed_range(stale_end, BlockOrdinal(len(matched)))
+            ):
+                page = unwrap_optional(matched[ordinal].get_page(lc_idx))
+                life_cycle_tiers[ordinal] = manager._storage.cache_tiers[page.cache_level]
+            next_anchor_tier: CacheTier | None = None
+            for ordinal in reversed(range(len(matched))):
+                tier = life_cycle_tiers[ordinal]
+                if tier is None:
+                    tier = next_anchor_tier
+                else:
+                    next_anchor_tier = tier
+                if tier is not None and tier > attention_tiers[ordinal]:
+                    attention_tiers[ordinal] = tier
+
+        # Reuse onboards only the final recurrent checkpoint. It summarizes the
+        # entire matched prefix, so its source tier applies to every logical
+        # reused token; older checkpoints are traversal history, not inputs.
+        ssm_tier: CacheTier | None = None
+        ssm_lc_id = manager._life_cycles.ssm_life_cycle_id
+        if ssm_lc_id is not None:
+            page = unwrap_optional(matched[-1].get_page(ssm_lc_id))
+            ssm_tier = manager._storage.cache_tiers[page.cache_level]
+
+        tier_counts = filled_list(0, len(CacheTier))
+        last_cached_token_tier: CacheTier | None = None
+        for ordinal, attention_tier in enumerate(attention_tiers):
+            block_start = ordinal * tokens_per_block
+            block_end = min(num_tokens, block_start + tokens_per_block)
+            source_tier = max(attention_tier, ssm_tier) if ssm_tier is not None else attention_tier
+            last_cached_token_tier = source_tier
+            tier_counts[source_tier] += block_end - block_start
+
+        counts["gpu"] = tier_counts[CacheTier.GPU_MEM]
+        counts["host"] = tier_counts[CacheTier.HOST_MEM]
+        counts["disk"] = tier_counts[CacheTier.DISK]
+        assert NDEBUG or sum(counts.values()) == num_tokens
+        assert NDEBUG or last_cached_token_tier is not None
+        return counts, last_cached_token_tier
 
     def _setup_for_reuse(self, match: ReuseMatch) -> None:
         manager = self.manager

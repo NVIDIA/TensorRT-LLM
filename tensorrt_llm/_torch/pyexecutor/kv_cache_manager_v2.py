@@ -122,6 +122,8 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
     if field_name not in KV_CACHE_ITERATION_STATS_REUSE_FIELDS
 )
 
+_CACHED_TOKEN_TIERS = ("gpu", "host", "disk", "remote")
+
 
 class Role:
     KEY = DataRole("key")
@@ -2645,6 +2647,36 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
                 self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
 
+            if (
+                not self.is_draft
+                and self.kv_cache_type != CacheTypeCpp.CROSS
+                and not req.is_dummy_request
+                and not self.is_estimating_kv_cache
+            ):
+                counts = dict(kv_cache.cached_tokens_by_tier)
+                if set(counts) != set(_CACHED_TOKEN_TIERS) or any(
+                    type(counts[tier]) is not int or counts[tier] < 0
+                    for tier in _CACHED_TOKEN_TIERS
+                ):
+                    raise RuntimeError(f"Invalid cached-token tier attribution: {counts!r}")
+                if sum(counts.values()) != kv_cache.num_committed_tokens:
+                    raise RuntimeError(
+                        "Cached-token tier attribution does not match the "
+                        f"reused-token count: {counts!r} vs "
+                        f"{kv_cache.num_committed_tokens}"
+                    )
+                counts = {tier: counts[tier] for tier in _CACHED_TOKEN_TIERS}
+                if req.is_disagg_generation_init_state:
+                    counts = self._get_disagg_generation_preserved_cached_tokens_by_tier(
+                        counts,
+                        kv_cache.num_committed_tokens,
+                        kv_cache._get_last_cached_token_tier(),
+                    )
+                    if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+                        counts = None
+                if counts is not None:
+                    self.impl.record_cached_tokens_by_tier(counts)
+
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
                 # scratch blocks are only valid for local prefill chunks.
@@ -2659,6 +2691,24 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache missing for non-first context chunk, request {req.py_request_id}"
             )
             return self._resume_and_restore(req.py_request_id, kv_cache)
+
+    def _get_disagg_generation_preserved_cached_tokens_by_tier(
+        self,
+        counts: Dict[str, int],
+        num_cached_tokens: int,
+        last_cached_token_tier: Optional[int],
+    ) -> Dict[str, int]:
+        """Keep only complete local blocks not overwritten by P/D transfer."""
+        result = dict(counts)
+        partial_tokens = num_cached_tokens % self.tokens_per_block
+        if partial_tokens:
+            if last_cached_token_tier not in range(3):
+                raise RuntimeError("Partial cached prefix is missing its final cache tier")
+            tier = _CACHED_TOKEN_TIERS[last_cached_token_tier]
+            result[tier] -= partial_tokens
+            if result[tier] < 0:
+                raise RuntimeError("Invalid partial cached-prefix attribution")
+        return result
 
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
@@ -3372,6 +3422,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self.enable_stats:
             return None
 
+        disk_prefetch_tokens = self.impl.get_and_reset_iteration_disk_prefetch_tokens()
+        cached_tokens_by_tier = self.impl.get_and_reset_iteration_cached_tokens_by_tier()
+
         life_cycle_metadata = self._stats_life_cycle_metadata()
         pool_groups_by_window = self._storage_pool_groups_by_window()
         windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
@@ -3467,6 +3520,8 @@ class KVCacheManagerV2(BaseResourceManager):
             ),
             suspended_requests=suspended_requests,
             resumed_requests=resumed_requests,
+            disk_prefetch_tokens=disk_prefetch_tokens,
+            cached_tokens_by_tier=cached_tokens_by_tier,
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
@@ -4258,12 +4313,15 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache = self.impl.create_kv_cache(
                 ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
             )
-            # Prefetch to the first tier below GPU (host if present, otherwise
-            # disk). prefetch() is a best-effort hint either way.
-            if not kv_cache.prefetch(CACHE_LEVEL1):
-                logger.warning("prefetch failed for request %s", req.py_request_id)
-                success = False
-            kv_cache.close()
+            try:
+                # Prefetch to the first tier below GPU (host if present,
+                # otherwise disk). prefetch() is a best-effort hint.
+                prefetched = kv_cache.prefetch(CACHE_LEVEL1)
+                if not prefetched:
+                    logger.warning("prefetch failed for request %s", req.py_request_id)
+                    success = False
+            finally:
+                kv_cache.close()
         return success
 
     def reset_reuse_state(self):
