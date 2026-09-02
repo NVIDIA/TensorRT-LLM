@@ -612,7 +612,6 @@ public:
     /// @param badWords A list of bad words tokens. Each "word" can be composed of multiple tokens
     /// @param stopWords A list of stop words tokens. Each "word" can be composed of multiple tokens
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
-    /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
     /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths, optional
     /// exact prompt runs}

@@ -144,7 +144,6 @@ public:
                 ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))         //
                 : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),                                //
             numReturnSequences,                                                                                  //
-            eagleConfig,                                                                                         //
             skipCrossAttnBlocks,                                                                                 //
             returnPerfMetrics,                                                                                   //
             guidedDecodingParams,                                                                                //
