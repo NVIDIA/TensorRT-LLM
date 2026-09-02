@@ -31,6 +31,9 @@ class KdaInputs:
     conv_state_q: torch.Tensor
     conv_state_k: torch.Tensor
     conv_state_v: torch.Tensor
+    conv_state_packed: torch.Tensor | None
+    conv_state_storage: torch.Tensor | None
+    conv_state_slot_stride: int | None
     a_log: torch.Tensor
     g: torch.Tensor
     dt_bias: torch.Tensor
@@ -75,22 +78,32 @@ def _make_inputs(
     num_cache_slots = NUM_CACHE_SLOTS if use_state_indices else batch_size
     conv_slots = num_cache_slots if update_conv_cache else batch_size
 
-    def make_conv_state() -> torch.Tensor:
-        if update_conv_cache:
-            return torch.empty_strided(
-                (conv_slots, projection_size, CONV_WIDTH - 1),
-                (
-                    projection_size * (CONV_WIDTH - 1),
-                    1,
-                    projection_size,
-                ),
-                device="cuda",
-                dtype=torch.bfloat16,
-            ).normal_()
-        return torch.randn(
-            (conv_slots, projection_size, CONV_WIDTH - 1),
+    if update_conv_cache:
+        dense_conv_slot_stride = 3 * projection_size * (CONV_WIDTH - 1)
+        conv_state_slot_stride = dense_conv_slot_stride + 64
+        conv_state_storage = torch.randn(
+            (conv_slots * conv_state_slot_stride,),
             device="cuda",
             dtype=torch.bfloat16,
+        )
+        conv_state_packed = conv_state_storage.as_strided(
+            (conv_slots, 3 * projection_size, CONV_WIDTH - 1),
+            (conv_state_slot_stride, CONV_WIDTH - 1, 1),
+        )
+        conv_state_q = conv_state_packed[:, :projection_size]
+        conv_state_k = conv_state_packed[:, projection_size : 2 * projection_size]
+        conv_state_v = conv_state_packed[:, 2 * projection_size :]
+    else:
+        conv_state_packed = None
+        conv_state_storage = None
+        conv_state_slot_stride = None
+        conv_state_q, conv_state_k, conv_state_v = (
+            torch.randn(
+                (conv_slots, projection_size, CONV_WIDTH - 1),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            for _ in range(3)
         )
 
     dense_slot_stride = num_heads * head_dim * head_dim
@@ -155,9 +168,12 @@ def _make_inputs(
             device="cuda",
             dtype=torch.bfloat16,
         ),
-        conv_state_q=make_conv_state(),
-        conv_state_k=make_conv_state(),
-        conv_state_v=make_conv_state(),
+        conv_state_q=conv_state_q,
+        conv_state_k=conv_state_k,
+        conv_state_v=conv_state_v,
+        conv_state_packed=conv_state_packed,
+        conv_state_storage=conv_state_storage,
+        conv_state_slot_stride=conv_state_slot_stride,
         a_log=torch.empty(num_heads, device="cuda", dtype=torch.float32).uniform_(1.0, 16.0).log_(),
         g=torch.randn(
             (1, batch_size, num_heads, head_dim),
@@ -363,17 +379,33 @@ def test_kda_decode_matches_fla(
         initial_selected_state = actual_state.index_select(0, inputs.state_indices.long()).clone()
         state_before = actual_state.clone()
 
-    actual_conv_q = inputs.conv_state_q.clone(memory_format=torch.preserve_format)
-    actual_conv_k = inputs.conv_state_k.clone(memory_format=torch.preserve_format)
-    actual_conv_v = inputs.conv_state_v.clone(memory_format=torch.preserve_format)
+    if update_conv_cache:
+        assert inputs.conv_state_packed is not None
+        assert inputs.conv_state_storage is not None
+        assert inputs.conv_state_slot_stride is not None
+        projection_size = num_heads * head_dim
+        actual_conv_storage = inputs.conv_state_storage.clone()
+        actual_conv_packed = actual_conv_storage.as_strided(
+            inputs.conv_state_packed.shape,
+            inputs.conv_state_packed.stride(),
+        )
+        actual_conv_q = actual_conv_packed[:, :projection_size]
+        actual_conv_k = actual_conv_packed[:, projection_size : 2 * projection_size]
+        actual_conv_v = actual_conv_packed[:, 2 * projection_size :]
+        dense_conv_slot_stride = 3 * projection_size * (CONV_WIDTH - 1)
+        actual_conv_gap = actual_conv_storage.view(
+            inputs.num_cache_slots, inputs.conv_state_slot_stride
+        )[:, dense_conv_slot_stride:]
+        conv_gap_before = actual_conv_gap.clone()
+    else:
+        actual_conv_q = inputs.conv_state_q.clone()
+        actual_conv_k = inputs.conv_state_k.clone()
+        actual_conv_v = inputs.conv_state_v.clone()
+        actual_conv_gap = conv_gap_before = None
     conv_before = (actual_conv_q.clone(), actual_conv_k.clone(), actual_conv_v.clone())
     if update_conv_cache:
         projection_size = num_heads * head_dim
-        expected_conv_stride = (
-            projection_size * (CONV_WIDTH - 1),
-            1,
-            projection_size,
-        )
+        expected_conv_stride = (inputs.conv_state_slot_stride, CONV_WIDTH - 1, 1)
         for conv_state in (actual_conv_q, actual_conv_k, actual_conv_v):
             assert conv_state.stride() == expected_conv_stride
 
@@ -448,6 +480,7 @@ def test_kda_decode_matches_fla(
             expected_pool = before.clone(memory_format=torch.preserve_format)
             expected_pool.index_copy_(0, state_indices, expected)
             torch.testing.assert_close(actual, expected_pool, rtol=0, atol=0)
+        torch.testing.assert_close(actual_conv_gap, conv_gap_before, rtol=0, atol=0)
     else:
         for actual, before in zip(
             (actual_conv_q, actual_conv_k, actual_conv_v),

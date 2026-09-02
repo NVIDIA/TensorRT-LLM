@@ -27,6 +27,8 @@ from ...peft.lora.layer import (MOE_LORA_MODULE_NAMES,
 from ...peft.lora.validation import has_moe_lora_targets
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
+from .activation import (DEFAULT_MOE_ACTIVATION, ActivationParamShape,
+                         MoEActivation, MoEActivationSupport)
 from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
@@ -88,12 +90,30 @@ class CutlassFusedMoE(MoEImplBase):
             equals to: dynamic quant + routing(topK, etc.) [+ fp4_allgather] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [no allreduce] + reducescatter
     """
 
-    # Routed-expert MoE LoRA is fused into this backend's op only; the
-    # subclasses below each restate ``supports_moe_lora=False``.
-    capabilities = MoEStaticCapability(supports_moe_lora=True)
+    # Routed-expert MoE LoRA is fused into this backend's op only. Subclasses
+    # inherit this object wholesale, so they must restate every field.
+    capabilities = MoEStaticCapability(
+        supports_moe_lora=True,
+        supports_expert_bias=True,
+        supports_eplb=True,
+        supports_apply_router_weight_on_input=True)
 
-    # Inherited by every subclass, matching the isinstance check this replaces.
     input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
+
+    # The CUTLASS epilogue has an adaptor per kind (``moe_kernels.cuh``) and
+    # takes all three constants as ``float*`` indexed by expert.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({
+            ActivationType.Swiglu,
+            ActivationType.SwigluBias,
+            ActivationType.Geglu,
+            ActivationType.SiTu,
+            ActivationType.Relu2,
+            ActivationType.Silu,
+        }),
+        alpha_beta=ActivationParamShape.PER_EXPERT_TENSOR,
+        limit=ActivationParamShape.PER_EXPERT_TENSOR,
+    )
 
     # Quantization algorithm support table for can_implement()
     # Format: quant_algo -> {sm_constraint, dtypes}
@@ -282,12 +302,8 @@ class CutlassFusedMoE(MoEImplBase):
         bias: bool = False,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
-        swiglu_alpha: Optional[torch.Tensor] = None,
-        swiglu_beta: Optional[torch.Tensor] = None,
-        swiglu_limit: Optional[torch.Tensor] = None,
-        swiglu_limit_scalar: Optional[float] = None,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
         init_load_balancer: bool = False,
-        activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
         super().__init__(eplb=None)
@@ -303,18 +319,13 @@ class CutlassFusedMoE(MoEImplBase):
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             bias=bias,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            swiglu_limit_scalar=swiglu_limit_scalar,
+            activation=activation,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
-            activation_type=activation_type,
         )
 
-        # Store original hidden size before any potential padding
-        self.unpadded_hidden_size = self.hidden_size
-
+        # ``unpadded_hidden_size`` is captured by
+        # apply_moe_impl_construction_state() above, before the padding below.
         if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
         ):
             self.hidden_size = ((self.hidden_size + 127) // 128) * 128
@@ -1012,9 +1023,12 @@ class CutlassFusedMoE(MoEImplBase):
             ([self.fc2_weight_scale_2] if use_dynamic_fc2_scale else []),
             input_sf=x_sf,
             swizzled_input_sf=is_sf_swizzled,
-            swiglu_alpha=self.swiglu_alpha,
-            swiglu_beta=self.swiglu_beta,
-            swiglu_limit=self.swiglu_limit,
+            # ``swiglu_*`` are the moe_op schema's names for these registers
+            # (``ActivationParams`` in moe_kernels.h); SiTU fills the same three
+            # with tanh soft-caps.
+            swiglu_alpha=self.act_alpha,
+            swiglu_beta=self.act_beta,
+            swiglu_limit=self.act_clamp,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
@@ -1108,9 +1122,9 @@ class CutlassFusedMoE(MoEImplBase):
             quant_scales=[],
             input_sf=None,
             swizzled_input_sf=False,
-            swiglu_alpha=self.swiglu_alpha,
-            swiglu_beta=self.swiglu_beta,
-            swiglu_limit=self.swiglu_limit,
+            swiglu_alpha=self.act_alpha,
+            swiglu_beta=self.act_beta,
+            swiglu_limit=self.act_clamp,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,

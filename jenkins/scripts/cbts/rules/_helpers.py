@@ -116,6 +116,59 @@ def iter_diff_post_line_numbers(diff: str) -> set[int]:
     return out
 
 
+def iter_diff_added_post_line_numbers(diff: str) -> set[int]:
+    """Post-PR line numbers (1-indexed) touched by `+` lines only.
+
+    Unlike `iter_diff_post_line_numbers`, `-` lines are excluded rather
+    than anchored to the next surviving line. Callers that read meaning
+    from the post-image (YAML section, AST scope) need this: a deleted
+    line's anchor can land in a different section than the one it was
+    deleted from.
+    """
+    out: set[int] = set()
+    new_line = 0
+    for line in diff.splitlines():
+        m = _HUNK_HEADER_RE.match(line)
+        if m is not None:
+            new_line = int(m.group(1))
+            continue
+        if not line or line.startswith(("+++", "---")):
+            continue
+        sign = line[0]
+        if sign == "+":
+            out.add(new_line)
+            new_line += 1
+        elif sign != "-":
+            new_line += 1
+    return out
+
+
+def iter_diff_pre_image(diff: str) -> Iterator[tuple[str, str]]:
+    """Yield `(sign, body)` for the pre-image content of each hunk.
+
+    Context and `-` lines together reconstruct what the file looked like
+    before the change, in order, within each hunk. `sign` is `-` for
+    deleted lines and ` ` for context. A `@@` hunk header yields
+    `("@", "")` so callers can reset any positional state they track —
+    pre-image continuity does not hold across hunk boundaries.
+
+    Blank/comment-only additions may appear as context despite being absent before the change.
+    Line numbers are deliberately not reported: `strip_noop_diff_lines`
+    drops blank / comment-only `-` lines, which shifts every later
+    pre-image line number. Callers must derive meaning from the
+    in-hunk ordering instead.
+    """
+    for line in diff.splitlines():
+        if line.startswith("@@"):
+            yield "@", ""
+            continue
+        if not line or line.startswith(("+++", "---")):
+            continue
+        sign = line[0]
+        if sign in ("-", " "):
+            yield sign, line[1:]
+
+
 def lookup_ids_into_block_filters(
     yaml_index: YAMLIndex,
     test_ids: Iterable[str],
