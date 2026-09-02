@@ -141,6 +141,37 @@ void claimPeftPagesForRequest(std::shared_ptr<LlmRequest> const& req,
     }
 }
 
+//! @brief Charge PEFT pages for requests the state window excludes but whose adapters are still resident.
+//!
+//! kGENERATION_TO_COMPLETE means "final token produced, teardown deferred by the overlap scheduler".
+//! Such a request is never forwarded again, so the admission loop skips it on the
+//! getNoScheduleAfterState() gate -- but its LoRA adapter is still on device, because
+//! LoraCache::markTaskDone runs as part of the teardown that has not happened yet and
+//! LoraCache::claimPagesWithEvict only ever evicts tasks in mDoneTasks. Leaving it uncharged
+//! overstates availablePeftPages, so a pending request carrying a *different* adapter can be admitted
+//! and then fail in PeftCacheManager::ensureBatch with LoraCacheFullException ("Cache is full. There
+//! are no done tasks to evict") -- turning the nvbug-6627795 admission fix into a crash under LoRA.
+//!
+//! Charging without consuming a request slot or a token budget is the point: a retiring request must
+//! count against adapter *residency* while staying out of the forward batch. This mirrors
+//! KVCacheV2Scheduler's pre_claim_peft, which the Python V2 path already needed for the same reason.
+//!
+//! Idempotent with respect to the admission loop: claimPeftPagesForRequest dedupes on uniqTaskIds, so
+//! a window that still admits kGENERATION_TO_COMPLETE charges the same total, and a pending request
+//! reusing a retiring request's adapter is still correctly charged zero new pages.
+void preClaimPeftPagesForRetiringRequests(RequestList const& activeRequests,
+    OptionalRef<BasePeftCacheManager const> peftCacheManager, SizeType32& claimedPeftPages,
+    std::unordered_set<uint64_t>& uniqTaskIds)
+{
+    for (auto const& req : activeRequests)
+    {
+        if (req->isGenerationToCompleteState())
+        {
+            claimPeftPagesForRequest(req, peftCacheManager, claimedPeftPages, uniqTaskIds);
+        }
+    }
+}
+
 } // namespace
 
 MaxRequestsScheduler::MaxRequestsScheduler(
@@ -253,6 +284,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
         : std::nullopt;
     SizeType32 claimedPeftPages{0};
     std::unordered_set<uint64_t> uniqTaskIds{};
+    preClaimPeftPagesForRetiringRequests(activeRequests, peftCacheManager, claimedPeftPages, uniqTaskIds);
     std::size_t numAdmittedRequests{0};
     RequestVector pendingRequests;
     RequestVector pendingDisGenInitRequests;
@@ -471,6 +503,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     }
     SizeType32 numScheduledPeftPages{0};
     std::unordered_set<uint64_t> seenTaskIds;
+    preClaimPeftPagesForRetiringRequests(activeRequests, peftCacheManager, numScheduledPeftPages, seenTaskIds);
 
     // Keep track of blocks contributed by requests in context phase
     std::unordered_set<BlockKey, BlockKeyHasher> newlyContributedContextBlocks;
