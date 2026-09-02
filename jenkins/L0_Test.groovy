@@ -5299,6 +5299,15 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Some tests terminated unexpectedly, please check the test report."
                             }
+                        } else if (fileExists("${WORKSPACE}/${stageName}/rerun/regular/rerun_0.txt")) {
+                            // Failures that finished (not a timeout) but were never
+                            // rerun because duration > 10 min and no known failure
+                            // signature matched: results.xml still carries their
+                            // original <failure>, but neither branch above fires for
+                            // them, so without this the stage silently reports green.
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+                            }
                         }
                     }
 
