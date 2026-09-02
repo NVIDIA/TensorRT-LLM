@@ -36,10 +36,7 @@ namespace
 namespace cg = cooperative_groups;
 
 constexpr int kDim = 128;
-constexpr int kKernelWidth = 4;
-constexpr int kConvCacheWidth = kKernelWidth - 1;
 constexpr int kThreads = 256;
-constexpr int kWarps = kThreads / 32;
 constexpr int kChunkRows = 32;
 constexpr int kChunks = kDim / kChunkRows;
 
@@ -50,6 +47,12 @@ enum class KernelSchedule : int
     kSingleCtaFourStageCpAsyncBulk = 2,
     kFourCtaThreadBlockClusterCpAsync = 3,
 };
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+
+constexpr int kKernelWidth = 4;
+constexpr int kConvCacheWidth = kKernelWidth - 1;
+constexpr int kWarps = kThreads / 32;
 
 template <bool kUseCpAsyncBulk, int kStages>
 struct StateSharedStorage
@@ -220,6 +223,8 @@ __device__ __forceinline__ void cp_async_state_chunk(float* shared_state, float 
     }
     cp_async_commit();
 }
+
+#endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
 
 template <KernelSchedule kSchedule, int kHeads>
 __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfloat16 const* __restrict__ x_q,
