@@ -1,6 +1,5 @@
 import asyncio
 import atexit
-import math
 import os
 import queue
 import socket
@@ -35,9 +34,6 @@ AWAIT_TIMEOUT = 0.05
 THREAD_TIMEOUT = 5.0
 WORKER_TIMEOUT = 2.0
 WORKER_SPAWN_SHUTDOWN_TIMEOUT = 5.0
-_DEFAULT_WORKER_READY_TIMEOUT = 3600.0
-_WORKER_READY_TIMEOUT_ENV = "TLLM_VISUAL_GEN_WORKER_READY_TIMEOUT"
-WORKER_READY_LOG_INTERVAL = 300.0
 
 # Module-local seams keep lifecycle tests from monkeypatching process-wide
 # module objects used by unrelated threads and tests.
@@ -46,31 +42,12 @@ _Thread = threading.Thread
 _get_mp_context = mp.get_context
 _register_atexit = atexit.register
 _get_process_id = os.getpid
-_monotonic = time.monotonic
 _start_coordinator_watchdog = start_coordinator_watchdog
 
 
 # Default cap on the size of the iteration-stats snapshot buffer used by the
 # /metrics endpoint.  Mirrors the LLM ``iter_stats_max_iterations`` default.
 _DEFAULT_ITER_STATS_MAX = 1000
-
-
-def _get_worker_ready_timeout() -> float:
-    value = os.environ.get(_WORKER_READY_TIMEOUT_ENV)
-    if value is None:
-        return _DEFAULT_WORKER_READY_TIMEOUT
-
-    try:
-        timeout = float(value)
-    except ValueError as e:
-        raise ValueError(
-            f"{_WORKER_READY_TIMEOUT_ENV} must be a positive number of seconds, got {value!r}"
-        ) from e
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError(
-            f"{_WORKER_READY_TIMEOUT_ENV} must be a positive number of seconds, got {value!r}"
-        )
-    return timeout
 
 
 def _reap_worker_process(process: mp.Process) -> bool:
@@ -122,7 +99,7 @@ class _WorkerProcessSpawner:
     def cancel_spawn(self) -> None:
         self._spawn_cancelled.set()
 
-    def wait_for_spawn(self, timeout: float, *, raise_error: bool = True) -> bool:
+    def wait_for_spawn(self, timeout: Optional[float] = None, *, raise_error: bool = True) -> bool:
         if not self._spawn_complete.wait(timeout=timeout):
             if raise_error:
                 raise TimeoutError(
@@ -798,9 +775,6 @@ class DiffusionRemoteClient:
         self,
         args: VisualGenArgs,
     ):
-        self._worker_ready_timeout = _get_worker_ready_timeout()
-        self._worker_ready_start_time = _monotonic()
-        self._worker_ready_deadline = self._worker_ready_start_time + self._worker_ready_timeout
         self.args = args
         self.n_workers = args.parallel_config.n_workers
 
@@ -924,9 +898,7 @@ class DiffusionRemoteClient:
                 # process through the native watchdog instead.
                 self._worker_spawner = _WorkerProcessSpawner(self.worker_processes)
                 self._worker_spawner.start()
-                self._worker_spawner.wait_for_spawn(
-                    timeout=max(0.0, self._worker_ready_deadline - _monotonic())
-                )
+                self._worker_spawner.wait_for_spawn()
                 self._monitor_worker_liveness = True
             else:
                 # External launch: rank 0 runs its own worker in a background thread.
@@ -1422,13 +1394,15 @@ class DiffusionRemoteClient:
     async def _wait_ready_async(self):
         """Wait for workers to be ready (async version).
 
-        Raises if the ready signal does not arrive before the startup timeout
-        or if any worker process dies during initialization.
+        Polls indefinitely for the ready signal. Raises if any worker process
+        dies during initialization.
         """
         if self._worker_failure is not None:
             raise RuntimeError(self._worker_failure)
 
-        last_log_time = self._worker_ready_start_time
+        start_time = time.time()
+        last_log_time = start_time
+        log_interval = 300
 
         while True:
             if self._worker_failure is not None:
@@ -1447,7 +1421,7 @@ class DiffusionRemoteClient:
                         self.supports_image_edit = bool(payload.get("supports_image_edit", False))
                     if self._worker_failure is not None:
                         raise RuntimeError(self._worker_failure)
-                    elapsed = _monotonic() - self._worker_ready_start_time
+                    elapsed = time.time() - start_time
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return
 
@@ -1458,15 +1432,9 @@ class DiffusionRemoteClient:
             if worker_dead or ext_dead:
                 raise RuntimeError("DiffusionClient: Worker died during initialization")
 
-            now = _monotonic()
-            elapsed = now - self._worker_ready_start_time
-            if now >= self._worker_ready_deadline:
-                raise TimeoutError(
-                    "DiffusionClient: Workers did not become ready within "
-                    f"{self._worker_ready_timeout:.0f}s"
-                )
-
-            if now - last_log_time >= WORKER_READY_LOG_INTERVAL:
+            now = time.time()
+            if now - last_log_time >= log_interval:
+                elapsed = now - start_time
                 logger.info(f"DiffusionClient: Still waiting for workers ({elapsed:.0f}s elapsed)")
                 last_log_time = now
 

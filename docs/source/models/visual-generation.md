@@ -99,10 +99,6 @@ The `trtllm-serve` command automatically detects diffusion models (by the presen
 
 See [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for server launch instructions, example configurations, and API usage.
 
-The VisualGen worker readiness timeout covers the complete initialization path, not only operating-system process creation. This includes intra-node process-group initialization, pipeline construction, checkpoint loading, optional compilation and warmup, and the final worker barrier. The default is 3600 seconds (one hour), which is intentionally conservative for large checkpoints loaded from cold network storage.
-
-Set `TLLM_VISUAL_GEN_WORKER_READY_TIMEOUT` to any positive, finite number of seconds before creating `VisualGen` or starting `trtllm-serve`. Increase it for slower cold starts or reduce it to enforce a stricter startup deadline. If the timeout expires, the coordinator aborts startup and reaps the workers, escalating to `SIGKILL` when a worker does not exit after the earlier shutdown attempts.
-
 ### Serving Endpoints
 
 When served via `trtllm-serve`, the following OpenAI-compatible endpoints are available:

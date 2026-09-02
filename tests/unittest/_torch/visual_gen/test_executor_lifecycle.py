@@ -709,9 +709,7 @@ def test_cleanup_is_registered_before_waiting_for_ready() -> None:
         patch.object(executor_module, "_detect_external_launch", return_value=None),
         patch.object(executor_module, "find_free_port", side_effect=[29500, 29501, 29502]),
         patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
-        patch.object(executor_module, "_get_worker_ready_timeout", return_value=60.0),
         patch.object(executor_module, "_get_mp_context", return_value=context),
-        patch.object(executor_module, "_monotonic", side_effect=[100.0, 125.0]),
         patch.object(executor_module, "_Thread") as thread_class,
         patch.object(executor_module, "_Event", side_effect=_pre_set_event),
         patch.object(
@@ -731,7 +729,7 @@ def test_cleanup_is_registered_before_waiting_for_ready() -> None:
 
     assert events == ["register", "spawn", "wait_ready"]
     spawner_class.assert_called_once_with([process])
-    spawner.wait_for_spawn.assert_called_once_with(timeout=35.0)
+    spawner.wait_for_spawn.assert_called_once_with()
 
 
 def test_worker_spawner_exits_after_spawn_batch() -> None:
@@ -1162,66 +1160,21 @@ def test_wait_ready_reports_worker_monitor_failure() -> None:
         loop.close()
 
 
-def test_wait_ready_times_out_while_workers_are_alive() -> None:
-    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
-    client.completed_responses = {}
-    client.worker_processes = [MagicMock()]
-    client.worker_processes[0].is_alive.return_value = True
-    client._ext_worker_thread = None
-    client._worker_failure = None
-
-    loop = asyncio.new_event_loop()
-    try:
-        client.lock = asyncio.Lock()
-        client.response_event = asyncio.Event()
-        client._worker_ready_timeout = 0.0
-        client._worker_ready_start_time = time.monotonic()
-        client._worker_ready_deadline = client._worker_ready_start_time
-
-        with pytest.raises(TimeoutError, match="did not become ready within 0s"):
-            loop.run_until_complete(client._wait_ready_async())
-    finally:
-        loop.close()
-
-
-def test_worker_ready_timeout_uses_environment_override(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("TLLM_VISUAL_GEN_WORKER_READY_TIMEOUT", "7200")
-
-    assert executor_module._get_worker_ready_timeout() == 7200.0
-
-
-@pytest.mark.parametrize("value", ["", "abc", "-1", "inf"])
-def test_worker_ready_timeout_rejects_invalid_values_before_spawn(
-    monkeypatch: pytest.MonkeyPatch,
-    value: str,
-) -> None:
-    monkeypatch.setenv("TLLM_VISUAL_GEN_WORKER_READY_TIMEOUT", value)
-    args = MagicMock()
-
-    with patch.object(executor_module, "_get_mp_context") as get_mp_context:
-        with pytest.raises(ValueError, match="must be a positive number of seconds"):
-            DiffusionRemoteClient(args=args)
-
-    get_mp_context.assert_not_called()
-
-
-def test_wait_ready_timeout_shuts_down_workers() -> None:
+def test_wait_ready_failure_shuts_down_workers() -> None:
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     event_loop = asyncio.new_event_loop()
     loop_thread = threading.Thread(target=event_loop.run_forever)
     loop_thread.start()
 
-    async def time_out() -> None:
-        raise TimeoutError("startup timed out")
+    async def fail() -> None:
+        raise RuntimeError("startup failed")
 
     try:
         client._event_loop = event_loop
-        client._wait_ready_async = time_out
+        client._wait_ready_async = fail
         client.shutdown = MagicMock()
 
-        with pytest.raises(TimeoutError, match="startup timed out"):
+        with pytest.raises(RuntimeError, match="startup failed"):
             client._wait_ready()
 
         client.shutdown.assert_called_once_with()
