@@ -23,8 +23,6 @@ TriAttention is integrated into TensorRT-LLM as a KV-cache compression manager o
 * NVIDIA SM100- or SM103-family GPU
 * Paged KV Cache (`KVCacheManagerV2`)
 * PyTorch backend
-* BF16 GQA KV pools with group size 4 or 8
-* Head size 64 or 128, Page size 32 or 128, and uniform scored-layer geometry
 
 **Notes:**
 1. TriAttention supports KV-cache block reuse. V2 reuses the committed prompt prefix, while TriAttention preserves that prefix and compacts only the generation suffix.

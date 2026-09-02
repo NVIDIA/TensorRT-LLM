@@ -18,27 +18,32 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Overview
 
-Long-context and agentic workloads repeatedly revisit prompts, tool histories,
-and intermediate reasoning state. Their reusable KV cache can grow beyond the
-GPU, Host, or Disk capacity available to the serving system. When a cache tier
-cannot retain enough reusable Pages, useful prefixes are evicted, the cache hit
-rate falls, and TensorRT-LLM must recompute more context. This can increase time
-to first token (TTFT) and reduce throughput.
+Long-context and agentic workloads can accumulate large amounts of reusable KV
+state across prompts, tool interactions, and intermediate reasoning. When the
+available GPU, Host, or Disk capacity cannot retain enough of that state, the
+serving system must evict and later reconstruct useful context. At scale, this
+creates substantial redundant work, increases request latency, and limits the
+scale and efficiency of KV-cache reuse.
 
-KV cache compression reduces this pressure by changing either how KV data is
-represented in storage or how much KV data is retained. A compact cold-tier
-representation can keep more reusable Pages within the same Host or Disk byte
-quota and move fewer bytes during Page migration. An iteration-driven method
-can instead reduce the retained token set and the associated storage or
-Attention work. The benefit is workload-dependent and is largest when the
-corresponding cache-capacity, migration, or computation cost is a bottleneck.
+KV cache compression is a family of techniques for reducing the resources
+required to retain and reuse KV state. A method may select or evict less useful
+KV tokens, compact the retained state, encode KV values at lower precision or
+in another compact representation, or apply compression while KV data is
+transferred or stored. Depending on the method and workload, these techniques
+can reduce Attention work, cache footprint, data movement, and recomputation
+while increasing effective cache capacity. Lossy methods may trade some output
+quality for those savings, so their accuracy and quality impact must be
+evaluated for the target workload.
 
-Compression runs at well-defined safe points outside the Attention kernel. For
-example, a method can compress the cache after a prefill or generation step, or
-when KVCM moves a Page from the GPU's hot layout into the cold representation
-used by Host or Disk, or restores it to the GPU. The method uses the current
-cache state either to reduce what is retained or to encode and decode a compact
-Page representation.
+At a high level, a compression method observes the current KV state at an
+appropriate cache-lifecycle boundary, applies a method-specific transformation,
+and makes the resulting state available to the existing inference path.
+TensorRT-LLM provides these integration points outside the Attention kernel so
+compression policies do not require model-specific or compression-specific
+branches in Attention. For example, an iteration-driven implementation can
+transform retained KV state after a prefill or generation step, while a
+storage-bound implementation can encode Pages as they move to Host or Disk and
+decode them when they return.
 
 ```text
 Prefill, generation, or a hot/cold Page transition reaches a safe boundary
@@ -65,12 +70,14 @@ its own scoring or transform kernels. Compression can affect accuracy and output
 quality; the exact trade-off depends on the method, its settings, and the
 workload, and must be validated before deployment.
 
-`KvCacheConfig` continues to control cache capacity, levels, reuse, offloading,
-and Page lifetime. `KvCacheCompressionConfig` selects how KV is compressed at
-the supported boundaries. A concrete method must understand the cache layout it
-transforms; it can preserve unsupported or non-Attention state losslessly, or
-reject a layout that it cannot handle. `SparseAttentionConfig` is orthogonal: it
-changes how Attention selects or processes KV during computation.
+`KvCacheCompressionConfig` selects the compression method and its
+algorithm-specific policy. It is used alongside two related but distinct
+configurations: `KvCacheConfig` controls cache capacity, levels, reuse,
+offloading, and Page lifetime, while `SparseAttentionConfig` controls how
+Attention selects or processes KV during computation. Neither configuration
+selects a compression method. A concrete compression method must understand the
+cache layout it transforms; it can preserve unsupported or non-Attention state
+losslessly, or reject a layout that it cannot handle.
 
 Currently, only one KV cache compression method can be enabled for each LLM
 instance.
@@ -84,9 +91,18 @@ instance.
 
 ### Cold-Page Quantization
 
-Cold-page quantization stores supported Attention KV buffers in NVFP4 while
-their Pages reside in Host or Disk memory. The GPU cache continues to use the
-model's normal runtime KV type, such as FP16, BF16, or FP8.
+Cold-page quantization encodes supported Attention KV into a smaller numerical
+representation while its Pages reside in Host or Disk memory. A format
+implementation can reuse the quantization algorithm and optimized conversion
+primitives from an existing quantization path, then combine them with Page
+migration in a cold-page codec. This builds on established formats, scale
+contracts, and rounding behavior instead of defining a separate numerical
+format only for storage, making the accuracy trade-off easier to understand and
+validate.
+
+NVFP4 is the first supported cold-page quantization format. It stores eligible
+Attention KV in NVFP4 in the cold tiers, while the GPU cache continues to use
+the model's normal runtime KV type, such as FP16, BF16, or FP8.
 
 ```text
 GPU hot Page (runtime KV type)
@@ -190,10 +206,14 @@ KVCM calls a storage-bound codec provider only when migration changes the Page
 representation. NVFP4 cold-page quantization implements these two batched
 operations and does not register for per-iteration callbacks.
 
-| Trigger | Codec-provider method | Purpose |
-| --- | --- | --- |
-| A hot Page moves to a cold tier | `encode_cold_pages()` | Encode and transfer a batch of Pages to cold storage |
-| A cold Page returns to the GPU | `decode_cold_pages()` | Transfer and restore a batch of Pages to the runtime layout |
+At the native storage boundary, KVCM invokes `IKvCacheColdPageCodec::encode()`
+or `IKvCacheColdPageCodec::decode()`. A codec backed by a Python compression
+provider delegates those operations to the provider hooks shown below.
+
+| Trigger | Native codec method | Python provider hook | Purpose |
+| --- | --- | --- | --- |
+| A hot Page moves to a cold tier | `encode()` | `encode_cold_pages()` | Encode and transfer a batch of Pages to cold storage |
+| A cold Page returns to the GPU | `decode()` | `decode_cold_pages()` | Transfer and restore a batch of Pages to the runtime layout |
 
 KVCM still decides when Pages migrate and owns their Slots, streams, completion
 ordering, rollback, and mapping publication. For method signatures and
