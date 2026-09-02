@@ -59,28 +59,11 @@ SUPPORTED_GPU_MAPPING = {
 # (agentx_client.py). Any other non-empty value is rejected at parse time.
 AGENTX_BENCHMARK_CLIENT = "agentx"
 
-# The benchmark modes whose lanes get a warmup request, i.e. whose measured
-# window would otherwise be charged for a one-time setup cost:
-#   * e2e absorbs the KV cache transceiver's lazy connection setup (ZMQ mesh +
-#     NIXL metadata registration) on the first ctx->gen handover.
-#   * ctx_only forces osl=1, so the very first (cold) prefill lands directly in
-#     the headline TTFT with nothing to amortize it.
-# gen_only is deliberately absent: it does not measure TTFT, and the extra
-# handover leaves a stale mSenderFutures entry that the CTX worker's blocking
-# idle KV-transfer poll then waits on (see #18011).
-#
-# Named rather than inlined at the call site so the set of warmed lanes can be
-# asserted by behaviour instead of by the shape of an expression.
 WARMUP_BENCHMARK_MODES = ("e2e", "ctx_only")
 
 
 def wants_warmup(benchmark_mode: str) -> bool:
-    """Whether a lane in this benchmark mode should issue a warmup request.
-
-    The single source of truth for which lanes warm up. b_warmup is not a
-    baseline match key, and that is only sound while the value stays fully
-    determined by benchmark_mode rather than being settable per lane.
-    """
+    """Whether a lane in this benchmark mode should issue a warmup request."""
     return benchmark_mode in WARMUP_BENCHMARK_MODES
 
 
@@ -1231,23 +1214,8 @@ class ClientConfig:
         # agentx_client.py. Reported only -- see the s_benchmark_client note in
         # to_db_data for why it is not a match key.
         self.benchmark_client = client_config_data.get("benchmark_client", "")
-        # Deliberately a constructor argument and NOT a client_config_data key:
-        # b_warmup is not a baseline match key, which is only sound while the
-        # value stays fully determined by benchmark_mode. Reading it from
-        # client_config_data would let any lane yaml enable it and silently fork
-        # that lane's baseline history.
-        #
-        # Recorded as the EFFECTIVE value, the same convention as
-        # b_disable_overlap_scheduler. Only the built-in benchmark_serving client
-        # has an initial test request to reuse as a warmup; the agentx and nv_sa
-        # clients are built by separate to_cmd branches that emit no such flag,
-        # so a requested warmup there would never run while b_warmup claimed it
-        # did -- and a later investigator would rule warmup out as a cause it
-        # never had.
-        # NB: benchmark_client defaults to "" (not None), so an ordinary lane is
-        # falsy here and does get its warmup.
-        uses_default_benchmark_client = not self.benchmark_client and not self.use_nv_sa_benchmark
-        self.warmup = warmup and uses_default_benchmark_client
+        run_agentx_mode = self.benchmark_client == AGENTX_BENCHMARK_CLIENT
+        self.warmup = warmup and not (run_agentx_mode or self.use_nv_sa_benchmark)
         self.env_vars = env_vars
         # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
         # is now always passed; output-length stability with spec decoding comes from
@@ -1358,9 +1326,6 @@ class ClientConfig:
             "ttft,tpot,itl,e2el",
             "--ignore-eos",
         ]
-        # benchmark_serving's initial single-prompt test run is excluded from the
-        # reported metrics, which is exactly what makes it usable as a warmup
-        # request. Keep it suppressed unless the lane asked for one.
         if not self.warmup:
             benchmark_cmd.append("--no-test-input")
         if dataset_path:
@@ -1416,16 +1381,6 @@ class ClientConfig:
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
-            # Reported, not matched -- see test_warmup_is_not_a_match_key. Not
-            # matching means a warmed lane's first post-merge run compares against
-            # cold history, i.e. a one-time step in the baseline. That is the same
-            # shape as any perf improvement and only ever helps a threshold that
-            # alarms on slowdowns, but the reverse direction is asymmetric: if
-            # warmup is later reverted or disabled on a lane, a cold run is
-            # compared against a warmed baseline and reads as a large regression
-            # (measured: up to ~24% on a ~30s lane, <0.1% on a >1000s one) with no
-            # match key to explain it. This column is how that is diagnosed --
-            # diff b_warmup across the step before hunting for a code cause.
             "b_warmup": self.warmup,
             # Reported, not matched. Case identity is keyed on s_test_case_name
             # (plus GPU type, runtime, branch), and a disagg case name embeds its
@@ -2598,17 +2553,6 @@ class PerfSanityTestConfig:
                 "accuracy_config": accuracy_data,
                 "only_run_accuracy": only_run_accuracy,
             }
-            # Which modes warm up, and why, is documented on
-            # WARMUP_BENCHMARK_MODES / wants_warmup above.
-            #
-            # Unlike gen_only there is no concurrency restriction here, because
-            # the GEN fill gate (TLLM_BENCHMARK_REQ_QUEUES_SIZE) is only injected
-            # for gen_only lanes, so a lone warmup request cannot stall behind it.
-            #
-            # Passed as an argument rather than folded into client_config_data
-            # above, so that no lane yaml can reach it -- b_warmup is not a
-            # baseline match key, and that is only sound while the value stays
-            # fully determined by benchmark_mode.
             client_config = ClientConfig(
                 client_config_data,
                 model_name,

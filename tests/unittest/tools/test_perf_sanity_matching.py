@@ -356,6 +356,45 @@ def test_warmup_is_suppressed_for_the_non_default_benchmark_clients() -> None:
     assert default.to_db_data()["b_warmup"] is True
 
 
+def test_warmup_is_suppressed_by_the_same_condition_to_cmd_dispatches_on() -> None:
+    """Only the agentx value suppresses warmup -- not any non-empty string.
+
+    Suppression exists because the agentx and nv_sa builders have no initial test
+    request to un-suppress. to_cmd selects them by `== AGENTX_BENCHMARK_CLIENT`
+    and `use_nv_sa_benchmark`, so warmup must be suppressed on exactly that
+    condition. Testing `not self.benchmark_client` (truthiness) instead looks
+    equivalent and is not: an unrecognised value is falsy-negative there, so
+    warmup gets suppressed while to_cmd still falls through to the default
+    builder -- a lane that asked to warm up, can warm up, and silently does not.
+    Unrecognised values do reach ClientConfig: only _parse_disagg_config_file
+    rejects them, and the aggregated parser passes its yaml dict through
+    unvalidated.
+
+    Asserted on the emitted command, not on self.warmup: b_warmup and
+    --no-test-input are both driven by self.warmup, so comparing them to each
+    other is circular and holds under either condition.
+    """
+    module = _load_module()
+    client_config = module.ClientConfig
+
+    unrecognised = client_config(
+        {**_disagg_client_data(10), "benchmark_client": "some-future-client"},
+        "example_model",
+        warmup=True,
+    )
+    cmd = unrecognised.to_cmd()
+
+    assert any("benchmark_serving" in arg for arg in cmd), (
+        "an unrecognised benchmark_client no longer falls through to the default "
+        "builder; this test's premise needs rechecking"
+    )
+    assert "--no-test-input" not in cmd, (
+        "warmup was suppressed for a lane that runs the default benchmark_serving "
+        "client anyway -- suppression must test == AGENTX_BENCHMARK_CLIENT, not the "
+        "truthiness of benchmark_client"
+    )
+
+
 def test_warmup_defaults_off_and_is_reported() -> None:
     """Every other lane keeps today's behaviour, and the DB records which warmed."""
     client_config = _load_client_config()
