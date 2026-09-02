@@ -53,15 +53,15 @@ including mixed batches.
 | GPU architecture | SM90, SM100, SM103, SM120, and SM121 through architecture-specific sparse MLA implementations |
 | Sparse compute phase | Packed prefill, generation, and mixed context/generation batches |
 | Attention type | MLA with a model-specific shared KV representation |
-| Model geometry | Checkpoint-native geometry; tests cover DeepSeek-V3.2 (`qk_head_dim=192`, `v_head_dim=128`) and DeepSeek-V4 (`qk_head_dim=512`, `v_head_dim=512`) |
+| Model geometry | Checkpoint-native geometry for DeepSeek-V3.2 (`qk_head_dim=192`, `v_head_dim=128`) and DeepSeek-V4 (`qk_head_dim=512`, `v_head_dim=512`) |
 | Model input dtype | BF16 |
 | KV-cache dtype | BF16 and the FP8 modes supported by the selected model and GPU architecture |
 | Sparse indices | `int32` token indices; one selection per query token |
 | Attention semantics | Causal self-attention |
 
+See
 [`test_sparse_mla_forward.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py)
-covers pure prefill, pure generation, mixed batches, BF16/FP8 KV-cache modes,
-and the direct FlashMLA sparse-forward contract.
+for executable sparse MLA examples.
 
 ### Sparse MQA/GQA
 
@@ -78,37 +78,36 @@ the selector, metadata, cache management, and backend integration.
 |---|---|---|
 | Sparse block size | 1 token | 128 tokens |
 | GPU architecture | SM100 and SM103 | SM100 and SM103 |
-| Sparse compute phase | Packed prefill, single-token generation, and linear draft-token generation; query lengths `1` and `4` are tested | Packed prefill, single-token generation, linear multi-query compute, and mixed batches |
+| Sparse compute phase | Packed prefill, single-token generation, and linear draft-token generation | Packed prefill, single-token generation, linear multi-query compute, and mixed batches |
 | Attention type | MQA and GQA; Q heads must be divisible by KV heads | MQA and GQA; Q heads must be divisible by KV heads |
-| Query heads per KV head | At most 32; tests cover `2`, `3`, `4`, `8`, `16`, `24`, `31`, and `32` | `2`, `4`, `8`, or `16`; all are tested |
-| Q/KV head counts | No additional discrete kernel limit; tests cover Q heads `{6, 8, 16, 32, 48, 62, 64}` and KV heads `{1, 2, 4, 8}` | No additional discrete kernel limit; tests cover Q heads `{4, 8, 16, 32}` and KV heads `{1, 2}` |
+| Query heads per KV head | At most 32 | `2`, `4`, `8`, or `16` |
+| Q/KV head counts | No additional discrete kernel limit | No additional discrete kernel limit |
 | Model Q/K/V input dtype | BF16 or FP16 | BF16 or E4M3 FP8 |
 | Model Q/K/V input layout | Fused QKV | Q `[tokens, q_heads, 128]`; paged K/V `[pages, kv_heads, 128, 128]` |
 | Output dtype | BF16 or FP16 for every supported head dimension; E4M3 FP8 for head dimensions `64`, `128`, and `256` | BF16 |
 | KV-cache dtype | BF16 or FP16 for every supported head dimension; E4M3 FP8 for head dimensions `64`, `128`, and `256` | BF16 or E4M3 FP8 |
 | Q/K/V head dimension | Equal dimensions of `64`, `80`, `128`, or `256` | Equal dimension of `128` |
-| KV-cache layout | Paged cache; page size is a power of two and at least 8 tokens; tests cover `8`, `16`, `32`, `64`, `128`, `256`, and `512` | Paged HND cache with page size `128`; shuffled physical pages and strided outer-page storage are tested |
-| Sparse indices | `int32` physical token indices per KV head and query token | `int32` request-local block indices per KV head and query token; per-token lists, `-1` padding, and physical remapping are tested |
-| Sparse Top-K | Positive multiple of 4; tests cover `4`, `32`, `64`, and `128` | `4`, `8`, `16`, or `32` selected blocks; all are tested |
+| KV-cache layout | Paged cache; page size is a power of two and at least 8 tokens | Paged HND cache with page size `128`; supports shuffled physical pages and strided outer-page storage |
+| Sparse indices | `int32` physical token indices per KV head and query token | `int32` request-local block indices per KV head and query token; supports per-token lists, `-1` padding, and physical remapping |
+| Sparse Top-K | Positive multiple of 4 | `4`, `8`, `16`, or `32` selected blocks |
 | Attention semantics | Causal self-attention | Causal self-attention with bottom-right or explicit per-request query offsets |
 
 The token-sparse path is JIT-compiled with NVRTC. Its support is defined by the
 current source checks rather than by the precompiled cubins that were present
-when the feature was introduced. Linear draft-token generation is verified
-with one target token and three draft tokens. Each query has its own causal
-sparse list, including K/V written earlier in the same speculative forward.
-Tree-shaped speculative masks are not applied by this path.
+when the feature was introduced. During linear draft-token generation, each
+query has its own causal sparse list, including K/V written earlier in the same
+speculative forward. Tree-shaped speculative masks are not applied by this
+path.
 
 For an FP8 KV cache, token-sparse Q is quantized to E4M3 during QKV
-preprocessing while the model input remains BF16 or FP16. Tests cover both
-BF16 output with an FP8 KV cache and the E4M3 FP8-output kernel. The shared
-kernel validator also admits head dimension `512`, but the sparse path aborts
-before launch for that configuration, so it is excluded from this matrix.
+preprocessing while the model input remains BF16 or FP16. The path supports
+both BF16 output with an FP8 KV cache and E4M3 FP8 output. The shared kernel
+validator also admits head dimension `512`, but the sparse path aborts before
+launch for that configuration, so it is excluded from this matrix.
 
 Backend developers can use
 [`test_sparse_mqa_gqa.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mqa_gqa.py)
-as an integration example. Its static selectors isolate index/cache layout and
-attention computation without presenting a public application API.
+as an executable integration example.
 
 ### Sparse MHA
 
@@ -119,28 +118,25 @@ the retained KV cache after prefill to reduce cache size and later decode work.
 
 | Parameter | Support |
 |---|---|
-| GPU architecture | SM100 is runtime-tested; SM103 is source-supported and enabled by the tests |
-| Sparse compute phase | Single-token and linear draft-token generation (`qSeqLen=4` is tested) |
+| GPU architecture | SM100 and SM103 |
+| Sparse compute phase | Single-token and linear draft-token generation |
 | Attention type | MHA (`num_q_heads == num_kv_heads`) |
 | Query heads per KV head | `1` |
-| Number of MHA heads | No additional discrete source restriction beyond `num_q_heads == num_kv_heads > 0`; tests cover `1`, `2`, `3`, `4`, `8`, `16`, `24`, `32`, `48`, `64`, `96`, and `128` |
+| Number of MHA heads | No additional discrete source restriction beyond `num_q_heads == num_kv_heads > 0` |
 | Model Q/K/V input dtype | BF16 or FP16 |
 | Model Q/K/V input layout | Fused QKV |
 | Output dtype | Model dtype for head dimensions `64`, `80`, `128`, and `256`; E4M3 FP8 for head dimensions `64`, `128`, and `256` with an FP8 KV cache |
 | KV-cache dtype | Model dtype for head dimensions `64`, `80`, `128`, and `256`; E4M3 FP8 for head dimensions `64`, `128`, and `256` |
 | Q/K/V dimensions | Equal head dimensions of `64`, `80`, `128`, or `256` |
-| KV-cache layout | Paged KV cache; page sizes `8`, `16`, `32`, `64`, `128`, `256`, and `512` are tested |
+| KV-cache layout | Paged KV cache; page size is a power of two and at least 8 tokens |
 | Selection granularity | Block indices expanded to KV-cache pages |
-| Sparse indices | `int32` block indices with `int32` per-request offsets; per-head patterns, unordered indices, and variable request offsets are tested |
-| Sparse index block size | Blocks may cross KV-page boundaries; sizes `1`, `2`, `3`, `4`, `5`, `8`, `16`, `24`, `32`, and `48` are tested |
+| Sparse indices | `int32` block indices with `int32` per-request offsets; supports per-head patterns, unordered indices, and variable request offsets |
+| Sparse index block size | Positive; blocks may cross KV-page boundaries |
 | Attention semantics | Causal self-attention |
 
 Backend developers can use
 [`test_sparse_mha.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mha.py)
-as an architecture-level integration example. It supplies static page
-selections, invokes `TrtllmAttention.forward`, and compares the result with an
-equivalent token-level PyTorch reference. RocketKV selector, metadata, and KT
-cache tests remain under the `rocketkv/` subdirectory.
+as an executable integration example.
 
 <a id="framework-level-sparse-attention"></a>
 
