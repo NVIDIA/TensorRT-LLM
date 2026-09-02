@@ -26,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
     PostTransformQualificationDecision,
     PostTransformQualificationReason,
+    canonical_tensor_bytes,
 )
 
 ModelFactory = Callable[[], nn.Module]
@@ -162,6 +163,12 @@ def _assert_named_tensors_equal(
             )
         except AssertionError as error:
             raise AssertionError(f"Post-transform {tensor_kind} {name!r} values differ") from error
+        # Exact-value equality still accepts `+0.0 == -0.0` and any-NaN == any-NaN;
+        # the byte comparison below is the contract the MX weight manifest enforces.
+        if not torch.equal(
+            canonical_tensor_bytes(receiver_tensor), canonical_tensor_bytes(producer_tensor)
+        ):
+            raise AssertionError(f"Post-transform {tensor_kind} {name!r} bytes differ")
 
 
 def _install_transform_call_recorders(model: nn.Module) -> list[str]:
