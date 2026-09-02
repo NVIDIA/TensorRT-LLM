@@ -368,6 +368,17 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
     else:
         include_usage = False
         include_continuous_usage = False
+    if include_usage and prompt_tokens is None:
+        # The usage chunks below feed prompt_tokens into UsageInfo (int fields)
+        # and into the total_tokens arithmetic. The server records the prompt
+        # length before the first chunk is post-processed (the executor does so
+        # on the postproc-worker path), so a missing count here means the
+        # caller wired PostprocArgs without one; fail with a clear message
+        # instead of a TypeError from the usage math.
+        raise ValueError(
+            "Streaming usage was requested, but PostprocArgs.num_prompt_tokens "
+            "is not set; record the prompt token count before "
+            "chat_stream_post_processor reports usage.")
     if args.first_iteration:
         for i in range(args.num_choices):
             res.append(
