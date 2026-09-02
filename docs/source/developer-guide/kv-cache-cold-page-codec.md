@@ -92,9 +92,9 @@ The methods have these contracts:
 - The default `getBatchingLayerGroupId()` returns its argument, disabling cross-lifecycle batching.
 - `getBatchingLayerGroupId()` returns a negative ID on failure or for an unknown lifecycle.
 - `queryPageIndexLocation()` explicitly selects the pointer location used by both `encode()` and `decode()`.
-  Lifecycles with the same batching ID must return the same location. Compressing codecs normally select `kDevice`; a
-  codec that consumes indices synchronously to construct batched DMA descriptors, page-wise `cudaMemcpyAsync` calls,
-  or kernel parameters may select `kHost`. It returns `kBadLocation` on failure or for an unknown lifecycle;
+  Lifecycles with the same batching ID must return the same location. A codec may select `kDevice` when its asynchronous
+  work reads indices directly, or `kHost` when it consumes the array synchronously to construct batched DMA descriptors,
+  page-wise `cudaMemcpyAsync` calls, or kernel parameters. It returns `kBadLocation` on failure or for an unknown lifecycle;
   `kBadLocation` is never a valid index-array location.
 - KVCM may concatenate index pairs from any subset of lifecycles with the same batching ID and call `encode()` or
   `decode()` once using that representative ID. KVCM does not promise that every member of the class is present.
@@ -109,6 +109,50 @@ The methods have these contracts:
   codec can iterate the same array to issue page-wise copies.
 - GPU-accessible data base pointers may be used by work enqueued on the supplied stream, but must not be retained beyond
   that work.
+
+## Compression-Provider Integration
+
+The compression framework can supply a Python algorithm provider without making Python implement or inherit the C++
+`IKvCacheColdPageCodec` interface directly. The provider is wrapped by an owning native adapter:
+
+```text
+KVCacheCompressionManager
+  -> create_python_cold_page_codec(provider, codec_state)
+  -> PythonColdPageCodec                  (nanobind lifetime bridge)
+  -> NativeColdPageCodec                  (layout resolution and routing)
+  -> IKvCacheColdPageCodec                (KVCM migration ABI)
+```
+
+`NativeColdPageCodec` receives the provider-owned layer IDs from `codec_state`. During its single `configure()` call,
+it resolves KVCM's authoritative pool descriptors into lifecycle records containing the hot buffer base address, Slot
+stride, and live byte count. A lifecycle must be wholly provider-owned or wholly unowned; mixing the two in one
+lifecycle is rejected. Every declared provider layer must appear in exactly one lifecycle.
+
+Provider-owned lifecycles are passed to the provider's `configure(codec_state, lifecycles)` method. The provider returns
+one fixed cold-page size and Page-index location for each lifecycle. The native adapter retains that routing state for
+subsequent migrations. Lifecycles outside the provider's layer set are routed through an embedded instance of the
+default lossless codec. This lets a compression method transform Attention KV while preserving unrelated recurrent or
+auxiliary state without teaching KVCM about the algorithm.
+
+On host kernels where `HostMem` uses chunked pinned-memory registration, the current adapter rejects configurations
+that contain both provider-owned and fallback lifecycles. The embedded lossless codec cannot split its batched copies
+at those registration boundaries when wrapped by the compression adapter, so rejecting configuration preserves the
+copy-lifetime contract.
+
+For an encode or decode, the nanobind adapter acquires the GIL and invokes `encode_cold_pages()` or
+`decode_cold_pages()` once for the complete KVCM batch. It passes the codec state, provider-lifecycle index, cold base
+address, `PageIndexPair` address, Page count, and CUDA stream as scalar values. The provider submits its native work on
+that stream; it does not publish mappings, release Slots, or perform disk I/O. If the provider throws after submission
+has started, `NativeColdPageCodec` drains the supplied stream before returning `false`, preserving KVCM's rollback
+contract.
+
+Each KVCM construction receives a newly created codec state. The native wrapper retains references to both the provider
+and that state until the codec is destroyed. Mutable per-KVCM layout and launch metadata must therefore live in the
+codec state rather than only on the shared provider object.
+
+See the [KV Cache Compression Development Guide](kv-cache-compression-development.md) for the provider methods,
+algorithm lifecycle, and extension checklist. This document remains authoritative for the C++ codec ABI, staging, and
+migration transaction.
 
 ## Storage Layout and Grouping
 
@@ -313,8 +357,9 @@ Normal Python users therefore select the default with:
 manager = KVCacheManager(config)
 ```
 
-Concrete codec classes remain implementation details. Python-defined codec subclasses are not supported, and the
-pure-Python KVCM2 backend does not support the codec feature.
+Concrete codec classes remain implementation details. Direct Python subclasses of `IKvCacheColdPageCodec` are not
+supported. Compression methods can instead use the native provider adapter described above. The pure-Python KVCM2
+backend does not support the codec feature.
 
 KVCM accepts `std::unique_ptr<IKvCacheColdPageCodec>` by value and transfers it directly to `StorageManager`, the
 component that executes migrations. Supplying a codec is consumptive as soon as KVCM construction is invoked, whether
@@ -369,7 +414,8 @@ In particular:
 
 ## Initial Non-Goals
 
-- Python implementations or subclasses of `IKvCacheColdPageCodec`.
+- Direct Python implementations or subclasses of `IKvCacheColdPageCodec`; Python compression providers must use the
+  owning native adapter.
 - Support in the pure-Python KVCM2 backend.
 - Variable-length encoded pages or per-page size metadata.
 - Direct codec access to disk addresses or disk I/O.
@@ -392,3 +438,7 @@ The implementation should cover at least:
 - Layer-group pool-ratio projection across different hot and cold pool-group mappings.
 - Hot-only constraint floors and structural cold-tier minima.
 - Consumptive Python ownership transfer on both successful and failed construction attempts.
+- Independent compression-provider state per KVCM, provider/fallback lifecycle routing, and rejection of mixed
+  lifecycle ownership.
+- Whole-batch provider forwarding, Python/native lifetime retention, and same-stream draining after a provider
+  submission failure.
