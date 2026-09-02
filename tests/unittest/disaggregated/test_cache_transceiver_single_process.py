@@ -21,8 +21,11 @@ TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 """
 
 import os
+import subprocess
+import sys
 import threading
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 # Do not inherit a NIC pin from the host: the selected interface may not exist
@@ -1545,6 +1548,175 @@ def test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp() -> None:
         enable_indexer_k_cache=True,
         indexer_k_cache_layer_mask=[False, False, True, True],
     )
+
+
+_BOUNCE_V2_SUBPROCESS_ENV = "TRTLLM_TEST_BOUNCE_V2_SUBPROCESS"
+
+
+def _run_bounce_v2_child(use_v2: bool, bounce_enabled: bool) -> None:
+    """Child branch of the bounce_v2 subprocess test.
+
+    Runs the real transfer with the Python bounce_v2 engine and verifies its
+    engagement PROGRAMMATICALLY (no log grepping): a spy on
+    ``BounceEngine.submit`` counts admissions, the factory wrapper captures
+    every constructed engine, and after the (byte-exact-verified) transfer we
+    assert on the engines' handshake/rid state. With ``bounce_enabled=False``
+    the real factory must return the ``NoBounceEngine`` null object and the
+    spy must record zero submits (the disabled production default).
+    """
+    import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
+    from tensorrt_llm._torch.disaggregation.bounce_v2.config import BounceV2Config
+    from tensorrt_llm._torch.disaggregation.bounce_v2.engine import (
+        BOUNCE_V2_ENV,
+        BounceEngine,
+        NoBounceEngine,
+    )
+
+    assert (os.environ.get(BOUNCE_V2_ENV) == "1") is bounce_enabled
+    created = []
+    submits = {"count": 0}
+    handshakes = []  # (peer, blob_present, accepted) recorded at add_peer time
+    real_factory = transfer_mod.create_bounce_v2_engine
+    real_submit = BounceEngine.submit
+    real_add_peer = BounceEngine.add_peer
+
+    def _factory(agent, device_id, self_name):
+        if bounce_enabled:
+            # The Python engine is sized by config only (no env knobs, unlike
+            # the C++ TRTLLM_NIXL_BOUNCE_* family): shrink the production
+            # 2 GiB arena and relax the admission floor (1024 descs) so this
+            # modest unit-test transfer is admitted through the REAL
+            # TransferWorker wiring, handshake exchange, and Sender path.
+            engine = BounceEngine(
+                agent,
+                BounceV2Config(
+                    enabled=True,
+                    arena_size_bytes=64 * (1 << 20),
+                    max_chunk_size_bytes=8 * (1 << 20),
+                    min_descriptor_count=1,
+                    max_average_descriptor_size_bytes=1 << 20,
+                ),
+                device_id,
+                self_name,
+            )
+        else:
+            engine = real_factory(agent, device_id, self_name)
+        created.append(engine)
+        return engine
+
+    def _counting_submit(self, *args, **kwargs):
+        submits["count"] += 1
+        return real_submit(self, *args, **kwargs)
+
+    def _recording_add_peer(self, peer, blob):
+        # Recorded AT CALL TIME: TransferWorker.shutdown's invalidate loop
+        # forget_peer()s every peer, so post-transfer engine state cannot
+        # prove the handshake ever happened.
+        accepted = real_add_peer(self, peer, blob)
+        handshakes.append((peer, blob is not None, accepted))
+        return accepted
+
+    transfer_mod.create_bounce_v2_engine = _factory
+    BounceEngine.submit = _counting_submit
+    BounceEngine.add_peer = _recording_add_peer
+    try:
+        run_transfer_test(
+            ctx_tp=1,
+            ctx_pp=1,
+            gen_tp=1,
+            gen_pp=1,
+            ctx_enable_dp=False,
+            gen_enable_dp=False,
+            is_mla=False,
+            use_v2=use_v2,
+            request_lengths=[30, 60],
+        )
+    finally:
+        BounceEngine.add_peer = real_add_peer
+        BounceEngine.submit = real_submit
+        transfer_mod.create_bounce_v2_engine = real_factory
+
+    assert created, "TransferWorker never constructed a bounce_v2 engine object"
+    if not bounce_enabled:
+        assert all(isinstance(e, NoBounceEngine) for e in created)
+        assert submits["count"] == 0, "bounce_v2 engaged despite the disabled default"
+        return
+    assert all(isinstance(e, BounceEngine) for e in created)
+    # The RankInfo.bounce_v2_handshake blob flowed through the rank-info
+    # exchange, arrived non-None, and validated (add_peer returned True).
+    assert any(blob_present and accepted for _, blob_present, accepted in handshakes), (
+        f"no engine accepted a peer handshake: the bounce_v2_handshake rank-info "
+        f"field never arrived/validated (recorded: {handshakes})"
+    )
+    # Engagement: the Sender admitted and submitted through bounce_v2 (the
+    # reactor allocates a rid per accepted request; byte-exactness of what
+    # those requests carried was already verified by run_transfer_test).
+    assert submits["count"] > 0, "BounceEngine.submit was never called"
+    assert sum(e._reactor._next_rid for e in created) > 0
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.parametrize(
+    ("use_v2", "bounce_enabled"),
+    [
+        pytest.param(True, True, id="v2_mha_tp1_pp1"),
+        pytest.param(False, True, id="v1_mha_tp1_pp1"),
+        pytest.param(True, False, id="v2_mha_tp1_pp1_disabled_default"),
+    ],
+)
+def test_python_cache_transceiver_uses_bounce_v2(
+    use_v2: bool,
+    bounce_enabled: bool,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Exercise Python bounce_v2 end to end through the real cache transceiver.
+
+    The parent re-invokes this very test in a SUBPROCESS with a scrubbed
+    environment (mirrors test_python_nixl_cache_transceiver_uses_cpp_bounce on
+    the C++ bounce branch): the enable env var must be consumed by the real
+    ``create_bounce_v2_engine`` factory inside ``TransferWorker``, and a hung
+    or crashed child fails here instead of wedging the whole session.
+    """
+    if os.environ.get(_BOUNCE_V2_SUBPROCESS_ENV) == "1":
+        _run_bounce_v2_child(use_v2, bounce_enabled)
+        return
+
+    env = os.environ.copy()
+    # Scrub every bounce knob (C++ v1 family and any v2 leftovers) so only
+    # this test's settings decide the child's behavior.
+    for name in tuple(env):
+        if name.startswith("TRTLLM_NIXL_BOUNCE_") or name.startswith("TRTLLM_BOUNCE_V2_"):
+            del env[name]
+    env[_BOUNCE_V2_SUBPROCESS_ENV] = "1"
+    if bounce_enabled:
+        env["TRTLLM_BOUNCE_V2_ENABLE"] = "1"
+    # Pin the transport deterministically (same rationale as this module's
+    # top-of-file settings; the child re-applies them, but the parent's env
+    # must not smuggle conflicting values past the scrub).
+    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["TRTLLM_NIXL_NUM_THREADS"] = "1"
+    env.pop("UCX_NET_DEVICES", None)
+    # Deliberately NOT setting TLLM_LOG_LEVEL_BY_MODULE: engagement is
+    # verified programmatically in the child, and a non-empty per-module
+    # level map can hang the child at exit (static-destruction order:
+    # CudaMemPool's deleter logs through an already-destroyed Logger map).
+    env.pop("TLLM_LOG_LEVEL_BY_MODULE", None)
+
+    node_id = f"{__file__}::{request.node.name}"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-s", "-q", "-p", "no:cacheprovider", node_id],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=200,
+        # Run from the repo root so the in-tree tensorrt_llm package wins over
+        # any editable site-packages install pointing at another checkout.
+        cwd=str(Path(__file__).resolve().parents[3]),
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    # A skipped child also exits 0; require the selected case to have RUN.
+    assert "1 passed" in output, f"child pytest did not run the bounce_v2 case:\n{output}"
 
 
 if __name__ == "__main__":

@@ -592,21 +592,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 {
     std::shared_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::submitTransferRequests called after shutdown");
-    nixl_status_t status;
-    nixlXferReqH* handle;
 
-    // Local per-request copy: hasNotif / notifMsg vary per call; a shared mExtraParams
-    // would race between concurrent submits even under shared_lock.
-    nixl_opt_args_t reqParams = mExtraParams;
-    if (request.getSyncMessage().has_value())
-    {
-        reqParams.hasNotif = true;
-        reqParams.notifMsg = request.getSyncMessage().value();
-    }
-    else
-    {
-        reqParams.hasNotif = false;
-    }
     // Split transfer descriptors at VMM chunk boundaries to match registered memory, then coalesce
     // contiguous pieces. A coalesced descriptor never crosses a chunk boundary or a registered
     // region boundary on either side, so every descriptor still falls within a single registered
@@ -622,20 +608,127 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     auto [xferSrc, xferDst] = VmmDescSplitter::splitAndCoalesceTransferDescs(request.getSrcDescs(),
         request.getDstDescs(), mLocalVramRegionInfo, remoteRegionMap, !common::getEnvNixlDisableCoalesce());
 
+    auto status = postXferRequest(request.getOp(), xferSrc, xferDst, request.getRemoteName(), request.getSyncMessage());
+    TLLM_CHECK_WITH_INFO(status != nullptr,
+        " rank: %d createXferReq failed (see warning above) selfname: %s remoteAgent name: %s", mRank, mName.c_str(),
+        request.getRemoteName().c_str());
+    return status;
+}
+
+std::unique_ptr<TransferStatus> NixlTransferAgent::postXferRequest(TransferOp op, TransferDescs const& srcDescs,
+    TransferDescs const& dstDescs, std::string const& remoteName, std::optional<SyncMessage> const& syncMessage)
+{
+    // No mLock and no shutdown gate here: the public path already holds the shared lock, and the
+    // bounce IO thread (the other caller) is joined before agent teardown. mExtraParams is set once
+    // at construction and only read afterwards — its hasNotif is never set, so the no-notif case
+    // (every bounce chunk write, on the sub-ms pipeline) passes it directly without a copy. Only a
+    // notif-carrying call takes a local copy (hasNotif / notifMsg vary per call; mutating the shared
+    // mExtraParams would race between concurrent submits even under shared_lock).
+    nixl_opt_args_t notifParams;
+    nixl_opt_args_t const* reqParams = &mExtraParams;
+    if (syncMessage.has_value())
     {
-        NVTX3_SCOPED_RANGE(createXferReq);
-        status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(xferSrc),
-            NixlHelper::convertXferDist(xferDst), request.getRemoteName(), handle, &reqParams);
+        notifParams = mExtraParams;
+        notifParams.hasNotif = true;
+        notifParams.notifMsg = syncMessage.value();
+        reqParams = &notifParams;
     }
 
-    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
-        " rank: %d createXferReq failed with status: %s selfname: %s remoteAgent name: %s", mRank,
-        nixlEnumStrings::statusStr(status).c_str(), mName.c_str(), request.getRemoteName().c_str());
+    nixl_status_t status;
+    nixlXferReqH* handle = nullptr;
+    {
+        NVTX3_SCOPED_RANGE(createXferReq);
+        status = mRawAgent->createXferReq(NixlHelper::convert(op), NixlHelper::convertXferDist(srcDescs),
+            NixlHelper::convertXferDist(dstDescs), remoteName, handle, reqParams);
+    }
+    if (status != NIXL_SUCCESS)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): createXferReq to %s failed: %s", mName.c_str(), remoteName.c_str(),
+            nixlEnumStrings::statusStr(status).c_str());
+        if (handle != nullptr)
+        {
+            (void) mRawAgent->releaseXferReq(handle);
+        }
+        return nullptr;
+    }
     {
         NVTX3_SCOPED_RANGE(postXferReq);
-        status = mRawAgent->postXferReq(handle, &reqParams);
+        status = mRawAgent->postXferReq(handle, reqParams);
+    }
+    if (status != NIXL_SUCCESS && status != NIXL_IN_PROG)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): postXferReq to %s failed: %s", mName.c_str(), remoteName.c_str(),
+            nixlEnumStrings::statusStr(status).c_str());
+        // The status object still owns the handle; its release()/dtor retries the backend release.
     }
     return std::make_unique<NixlTransferStatus>(std::weak_ptr<nixlAgent>(mRawAgent), handle);
+}
+
+bool NixlTransferAgent::registerRegionImpl(void* base, std::size_t bytes, int deviceId)
+{
+    nixl_reg_dlist_t list{VRAM_SEG};
+    list.addDesc(nixlBlobDesc{reinterpret_cast<uintptr_t>(base), bytes, static_cast<uint64_t>(deviceId)});
+    nixl_status_t const st = mRawAgent->registerMem(list);
+    if (st != NIXL_SUCCESS)
+    {
+        TLLM_LOG_WARNING(
+            "NixlTransferAgent(%s): registerMem failed: %s", mName.c_str(), nixlEnumStrings::statusStr(st).c_str());
+        return false;
+    }
+    return true;
+}
+
+void NixlTransferAgent::deregisterRegionImpl(void* base, std::size_t bytes, int deviceId)
+{
+    try
+    {
+        nixl_reg_dlist_t list{VRAM_SEG};
+        list.addDesc(nixlBlobDesc{reinterpret_cast<uintptr_t>(base), bytes, static_cast<uint64_t>(deviceId)});
+        nixl_status_t const st = mRawAgent->deregisterMem(list);
+        if (st != NIXL_SUCCESS)
+        {
+            TLLM_LOG_WARNING("NixlTransferAgent(%s): deregisterMem failed: %s", mName.c_str(),
+                nixlEnumStrings::statusStr(st).c_str());
+        }
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): deregisterMem threw: %s", mName.c_str(), e.what());
+    }
+}
+
+std::unique_ptr<TransferStatus> NixlTransferAgent::postXferRequestLocked(TransferOp op, TransferDescs const& srcDescs,
+    TransferDescs const& dstDescs, std::string const& remoteName, std::optional<SyncMessage> const& syncMessage)
+{
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    if (mShutdown.load())
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): postXferRequest after shutdown -> dropped", mName.c_str());
+        return nullptr;
+    }
+    return postXferRequest(op, srcDescs, dstDescs, remoteName, syncMessage);
+}
+
+bool NixlTransferAgent::registerRegionLocked(void* base, std::size_t bytes, int deviceId)
+{
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    if (mShutdown.load())
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): registerRegion after shutdown -> dropped", mName.c_str());
+        return false;
+    }
+    return registerRegionImpl(base, bytes, deviceId);
+}
+
+void NixlTransferAgent::deregisterRegionLocked(void* base, std::size_t bytes, int deviceId)
+{
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    if (mShutdown.load())
+    {
+        // Nothing to undo: shutdown() already released the whole NIXL agent (and its registrations).
+        return;
+    }
+    deregisterRegionImpl(base, bytes, deviceId);
 }
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)

@@ -20,8 +20,10 @@
 #include "nixl.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <thread>
 
@@ -72,7 +74,9 @@ private:
     mutable std::mutex mHandleMutex;
 };
 
-class NixlTransferAgent final : public BaseTransferAgent
+// Not `final`: the low-level virtuals below (postXferRequest / registerRegionImpl) are the
+// fault-injection seam — bounce failure tests subclass this agent and override them.
+class NixlTransferAgent : public BaseTransferAgent
 {
 public:
     NixlTransferAgent(BaseAgentConfig const& config);
@@ -92,6 +96,36 @@ public:
     void invalidateRemoteAgent(std::string const& name) override;
 
     [[nodiscard]] std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) override;
+
+    // ---- Low-level transfer primitives (below the VMM splitter) -------------------------------
+    // submitTransferRequests() = VMM split/coalesce + postXferRequest(). The bounce v2 transport
+    // calls these directly: its remote address comes from a credit (already final, no VMM
+    // resolution) and its per-chunk cadence cannot afford the full public path. Virtual so bounce
+    // failure tests can inject deterministic transfer faults.
+
+    /// Post one transfer whose descriptors are already FINAL device addresses (no VMM splitting).
+    /// Returns nullptr on submission failure (logged) instead of aborting.
+    /// Takes no agent lock: safe from the bounce IO thread, which is joined before agent teardown.
+    [[nodiscard]] virtual std::unique_ptr<TransferStatus> postXferRequest(TransferOp op, TransferDescs const& srcDescs,
+        TransferDescs const& dstDescs, std::string const& remoteName, std::optional<SyncMessage> const& syncMessage);
+
+    /// Register/deregister one raw device range with NIXL, WITHOUT the VMM split or the AgentDesc
+    /// VRAM-region bookkeeping (the bounce arena must not enter the splitter's region maps).
+    [[nodiscard]] virtual bool registerRegionImpl(void* base, std::size_t bytes, int deviceId);
+    virtual void deregisterRegionImpl(void* base, std::size_t bytes, int deviceId);
+
+    // ---- Locked wrappers for external (Python-binding) callers --------------------------------
+    // The virtuals above are deliberately unlocked (submitTransferRequests already holds the
+    // shared lock; re-acquiring the shared_mutex could deadlock behind a queued writer). External
+    // callers hold no lock of their own and race shutdown() — which resets mRawAgent under
+    // unique_lock, and runs from the destructor, so plain Python GC triggers it. They go through
+    // these thin wrappers instead: shared_lock(mLock) + shutdown check (fail soft with
+    // false/nullptr, no throw), then delegate to the unlocked virtual seam.
+
+    [[nodiscard]] std::unique_ptr<TransferStatus> postXferRequestLocked(TransferOp op, TransferDescs const& srcDescs,
+        TransferDescs const& dstDescs, std::string const& remoteName, std::optional<SyncMessage> const& syncMessage);
+    [[nodiscard]] bool registerRegionLocked(void* base, std::size_t bytes, int deviceId);
+    void deregisterRegionLocked(void* base, std::size_t bytes, int deviceId);
 
     [[nodiscard]] nixlAgent* getRawAgent() const noexcept
     {

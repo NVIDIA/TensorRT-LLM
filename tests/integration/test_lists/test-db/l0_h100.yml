@@ -87,6 +87,13 @@ l0_h100:
   - unittest/disaggregated/test_agent_multi_backends.py
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_bounce.py
+  # bounce_v2 GPU suites (the pure-logic bounce_v2 suites run in l0_cpu.yml
+  # via its whole-directory unittest/disaggregated entry).
+  - unittest/disaggregated/bounce_v2/test_mechanism_bindings.py
+  - unittest/disaggregated/bounce_v2/test_reactor_engine.py
+  - unittest/disaggregated/bounce_v2/test_engine_lifecycle.py
+  - unittest/disaggregated/bounce_v2/test_integration.py
+  - unittest/disaggregated/bounce_v2/test_event_chain.py
   - unittest/disaggregated/test_sync_transfer_timing.py
   - unittest/disaggregated/test_kv_transfer.py
   - unittest/disaggregated/test_kv_transfer_mp.py
@@ -111,6 +118,8 @@ l0_h100:
   # DSA indexer-K side cache (V1, REPLICATED).
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_dsa_indexer
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp
+  # bounce_v2 end-to-end through the Python cache transceiver.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_python_cache_transceiver_uses_bounce_v2
   - unittest/disaggregated/test_cache_transceiver_harness_report.py
   - unittest/disaggregated/test_cache_transceiver_harness.py
   - unittest/disaggregated/test_cache_transceiver_precheck_e2e.py
