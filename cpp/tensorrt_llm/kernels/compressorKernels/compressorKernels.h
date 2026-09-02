@@ -74,25 +74,26 @@ void prefillReductionLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or 
 //
 // Grid:  (total_tokens) -- one block per compressed token
 // Block: (head_dim / VEC), always >= 32
-void postProcessScatterLaunch(void const* kv_comp, // [total_tokens, head_dim] input
-    void* kv_out,                                  // [total_tokens, head_dim] postprocessed output (nullptr to skip)
-    void const* rms_weight,                        // [head_dim]
+void postProcessScatterLaunch(void const* kv_comp,  // [total_tokens, head_dim] input
+    void* kv_out,                                   // [total_tokens, head_dim] postprocessed output (nullptr to skip)
+    void const* rms_weight,                         // [head_dim]
     float rms_eps,
-    float const* cos_sin_table,                    // [max_pos, 2, rope_dim/2]
-    int32_t const* position_ids,                   // [total_tokens]
+    float const* cos_sin_table,                     // [max_pos, 2, rope_dim/2]
+    int32_t const* position_ids,                    // [total_tokens]
     int nope_dim, int rope_dim,
-    void* kv_cache,                                // paged cache buffer
-    int32_t const* num_outputs,                    // [bsz]
-    int32_t const* cu_kv_comp,                     // [bsz+1]
-    int32_t const* start_pos,                      // [bsz]
-    int32_t const* block_offsets,                  // [bsz, max_blocks]
-    bool const* compressed_mask,                   // [total_tokens] — per-token mask, false ⇒ skip
+    void* kv_cache,                                 // paged cache buffer
+    void* kv_cache_scale,                           // separate NVFP4 E4M3 scale buffer
+    int32_t const* num_outputs,                     // [bsz]
+    int32_t const* cu_kv_comp,                      // [bsz+1]
+    int32_t const* start_pos,                       // [bsz]
+    int32_t const* block_offsets,                   // [bsz, max_blocks]
+    bool const* compressed_mask,                    // [total_tokens] — per-token mask, false ⇒ skip
     int batch_size, int tokens_per_block, int head_dim, int max_blocks_per_seq, int elem_bytes, int total_tokens,
-    int cache_scale_type,                          // 0=none (bf16/fp32 by elem_bytes), 1=fp8_pertensor,
-                                                   // 2=fp8_blockwise, 3=mxfp4 (packed FP4)
-    bool rotate_activation,                        // whether to apply Hadamard transform (false to skip)
-    void* quant_output,                            // optional fp8/fp4 packed output (nullptr if unused)
-    void* scale_output,                            // optional scale output (float* for fp8, uint8_t* for fp4)
+    int cache_scale_type, float nvfp4_global_scale, // 0=none (bf16/fp32 by elem_bytes), 1=fp8_pertensor,
+                                                    // 2=fp8_blockwise, 3=mxfp4, 4=nvfp4 (packed FP4)
+    bool rotate_activation,                         // whether to apply Hadamard transform (false to skip)
+    void* quant_output,                             // optional fp8/fp4 packed output (nullptr if unused)
+    void* scale_output,                             // optional scale output (float* for fp8, uint8_t* for fp4)
     cudaStream_t stream);
 
 } // namespace kernels::compressor

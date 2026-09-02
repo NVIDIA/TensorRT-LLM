@@ -87,12 +87,13 @@ void compressorPostProcessScatterOp(torch::Tensor kv_comp, // [total_tokens, hea
     torch::Tensor position_ids,                            // [total_tokens]
     int64_t nope_dim, int64_t rope_dim,
     torch::Tensor kv_cache,                                // paged cache buffer
+    std::optional<torch::Tensor> kv_cache_scale,           // NVFP4 E4M3 scale buffer
     torch::Tensor num_outputs,                             // [bsz] int32
     torch::Tensor cu_kv_comp,                              // [bsz+1] int32
     torch::Tensor start_pos,                               // [bsz] int32
     torch::Tensor block_offsets,                           // [bsz, max_blocks] int32
     torch::Tensor compressed_mask,                         // [total_tokens] bool — per-token mask
-    int64_t tokens_per_block, int64_t cache_scale_type, bool rotate_activation,
+    int64_t tokens_per_block, int64_t cache_scale_type, double nvfp4_global_scale, bool rotate_activation,
     std::optional<torch::Tensor> quant_output, std::optional<torch::Tensor> scale_output)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -104,19 +105,27 @@ void compressorPostProcessScatterOp(torch::Tensor kv_comp, // [total_tokens, hea
     TORCH_CHECK(position_ids.is_contiguous(), "position_ids must be contiguous");
     TORCH_CHECK(compressed_mask.scalar_type() == at::kBool, "compressed_mask must be bool, got ",
         compressed_mask.scalar_type());
+    if (kv_cache_scale.has_value())
+    {
+        TORCH_CHECK(kv_cache_scale->is_cuda() && kv_cache_scale->device() == kv_cache.device(),
+            "kv_cache_scale and kv_cache must be on the same CUDA device");
+        TORCH_CHECK(kv_cache_scale->scalar_type() == at::kFloat8_e4m3fn && kv_cache_scale->is_contiguous(),
+            "kv_cache_scale must be contiguous float8_e4m3fn");
+    }
 
     tk::postProcessScatterLaunch(kv_comp.data_ptr(), kv_out.has_value() ? kv_out->data_ptr() : nullptr,
         rms_weight.data_ptr(), static_cast<float>(rms_eps), cos_sin_table.data_ptr<float>(),
         position_ids.data_ptr<int32_t>(), static_cast<int>(nope_dim), static_cast<int>(rope_dim), kv_cache.data_ptr(),
-        num_outputs.data_ptr<int32_t>(), cu_kv_comp.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(),
-        block_offsets.data_ptr<int32_t>(), reinterpret_cast<bool const*>(compressed_mask.data_ptr()),
+        kv_cache_scale.has_value() ? kv_cache_scale->data_ptr() : nullptr, num_outputs.data_ptr<int32_t>(),
+        cu_kv_comp.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(), block_offsets.data_ptr<int32_t>(),
+        reinterpret_cast<bool const*>(compressed_mask.data_ptr()),
         static_cast<int>(num_outputs.size(0)),    // batch_size
         static_cast<int>(tokens_per_block),
         static_cast<int>(kv_comp.size(1)),        // head_dim
         static_cast<int>(block_offsets.size(1)),  // max_blocks
         static_cast<int>(kv_comp.element_size()), // elem_bytes
         static_cast<int>(kv_comp.size(0)),        // total_tokens
-        static_cast<int>(cache_scale_type), rotate_activation,
+        static_cast<int>(cache_scale_type), static_cast<float>(nvfp4_global_scale), rotate_activation,
         quant_output.has_value() ? quant_output->data_ptr() : nullptr,
         scale_output.has_value() ? scale_output->data_ptr() : nullptr, stream);
 }
@@ -156,10 +165,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor cos_sin_table, Tensor position_ids, "
         "int nope_dim, int rope_dim, "
         "Tensor(b!) kv_cache, "
+        "Tensor(e!)? kv_cache_scale, "
         "Tensor num_outputs, Tensor cu_kv_comp, "
         "Tensor start_pos, Tensor block_offsets, "
         "Tensor compressed_mask, "
         "int tokens_per_block, int cache_scale_type, "
+        "float nvfp4_global_scale, "
         "bool rotate_activation, "
         "Tensor(c!)? quant_output, Tensor(d!)? scale_output) -> ()");
 }
