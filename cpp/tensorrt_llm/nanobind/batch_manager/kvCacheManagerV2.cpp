@@ -1171,6 +1171,42 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__eq__", &kv::KVCacheStatsDelta::operator==, nb::arg("other"))
         .def("__repr__", &statsDeltaRepr);
 
+    nb::class_<kv::ReusedBlocksByLevel>(m, "ReusedBlocksByLevel")
+        .def(
+            "__init__",
+            [](kv::ReusedBlocksByLevel* self, std::vector<int64_t> full, std::vector<int64_t> partial)
+            {
+                new (self) kv::ReusedBlocksByLevel{};
+                self->full = std::move(full);
+                self->partial = std::move(partial);
+            },
+            nb::arg("full") = std::vector<int64_t>{}, nb::arg("partial") = std::vector<int64_t>{})
+        .def_rw("full", &kv::ReusedBlocksByLevel::full)
+        .def_rw("partial", &kv::ReusedBlocksByLevel::partial)
+        .def_prop_ro("empty", &kv::ReusedBlocksByLevel::empty)
+        .def("add", &kv::ReusedBlocksByLevel::add, nb::arg("other"))
+        .def("copy", [](kv::ReusedBlocksByLevel const& self) { return self; })
+        .def("__repr__",
+            [](kv::ReusedBlocksByLevel const& self)
+            {
+                std::ostringstream stream;
+                auto const format = [&stream](std::vector<int64_t> const& counts)
+                {
+                    stream << "[";
+                    for (size_t i = 0; i < counts.size(); ++i)
+                    {
+                        stream << (i == 0 ? "" : ", ") << counts[i];
+                    }
+                    stream << "]";
+                };
+                stream << "ReusedBlocksByLevel(full=";
+                format(self.full);
+                stream << ", partial=";
+                format(self.partial);
+                stream << ")";
+                return stream.str();
+            });
+
     nb::class_<kv::KVCacheIterationStatsDelta>(m, "KVCacheIterationStatsDelta")
         .def(
             "__init__",
@@ -2354,6 +2390,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 result["host"] = counts.host;
                 result["disk"] = counts.disk;
                 result["remote"] = counts.remote;
+                return result;
+            })
+        .def("get_and_reset_iteration_reused_blocks_by_level",
+            [](kv::KvCacheManager& self)
+            {
+                nb::dict result;
+                for (auto const& [lifeCycle, byLevel] : self.getAndResetIterationReusedBlocksByLevel())
+                {
+                    result[nb::cast(lifeCycle.value())] = nb::cast(byLevel);
+                }
                 return result;
             })
         .def(

@@ -67,6 +67,7 @@ public:
         mGlobalStats.clear();
         mIterationStatsByLifeCycle.clear();
         mSsmSnapshotIterationStatsByLifeCycle.clear();
+        mReusedBlocksByLevelByLifeCycle.clear();
         mAllocationSegments.clear();
     }
 
@@ -88,8 +89,11 @@ public:
         return true;
     }
 
+    // `byLevel` splits the same full/partial counts across the cache levels the reused pages were
+    // resident on. It rides along with the scalar counters so both are committed or discarded
+    // together; reuse is never rolled back (only allocation ranges are), so add-only is enough.
     bool recordReuse(LifeCycleId lifeCycle, int fullReusedBlocks, int partialReusedBlocks,
-        bool recordManagerStats = true, bool recordRequestStats = true)
+        ReusedBlocksByLevel const& byLevel = {}, bool recordManagerStats = true, bool recordRequestStats = true)
     {
         int const reusedBlocks = fullReusedBlocks + partialReusedBlocks;
         if (reusedBlocks == 0 || (!recordManagerStats && !recordRequestStats))
@@ -105,6 +109,7 @@ public:
             delta.iterationStats.iterFullReusedBlocks = fullReusedBlocks;
             delta.iterationStats.iterPartialReusedBlocks = partialReusedBlocks;
             delta.lifeCycle = lifeCycle;
+            mReusedBlocksByLevelByLifeCycle[lifeCycle].add(byLevel);
         }
         if (recordRequestStats)
         {
@@ -198,6 +203,11 @@ public:
         return mSsmSnapshotIterationStatsByLifeCycle;
     }
 
+    ReusedBlocksByLevelByLifeCycle const& reusedBlocksByLevelByLifeCycle() const noexcept
+    {
+        return mReusedBlocksByLevelByLifeCycle;
+    }
+
 private:
     static PendingStatsDelta allocationDelta(
         PendingAllocationSegment const& segment, BlockOrdinal blockBegin, BlockOrdinal blockEnd)
@@ -268,6 +278,7 @@ private:
     KVCacheStatsDelta mGlobalStats;
     IterationStatsByLifeCycle mIterationStatsByLifeCycle;
     SsmSnapshotIterationStatsByLifeCycle mSsmSnapshotIterationStatsByLifeCycle;
+    ReusedBlocksByLevelByLifeCycle mReusedBlocksByLevelByLifeCycle;
     std::vector<PendingAllocationSegment> mAllocationSegments;
 };
 

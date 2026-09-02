@@ -17,7 +17,12 @@ from dataclasses import dataclass, field
 
 from .._common import BlockOrdinal
 from .._life_cycle_registry import LifeCycleId
-from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta, SsmSnapshotIterationStatsDelta
+from .._stats import (
+    KVCacheIterationStatsDelta,
+    KVCacheStatsDelta,
+    ReusedBlocksByLevel,
+    SsmSnapshotIterationStatsDelta,
+)
 
 
 @dataclass(slots=True)
@@ -54,6 +59,9 @@ class _PendingStats:
     ssm_snapshot_iteration_stats_by_life_cycle: dict[
         LifeCycleId, SsmSnapshotIterationStatsDelta
     ] = field(default_factory=dict)
+    reused_blocks_by_level_by_life_cycle: dict[LifeCycleId, ReusedBlocksByLevel] = field(
+        default_factory=dict
+    )
     allocation_segments: list[_PendingAllocationSegment] = field(default_factory=list)
 
     @property
@@ -70,6 +78,7 @@ class _PendingStats:
         self.global_stats.clear()
         self.iteration_stats_by_life_cycle.clear()
         self.ssm_snapshot_iteration_stats_by_life_cycle.clear()
+        self.reused_blocks_by_level_by_life_cycle.clear()
         self.allocation_segments.clear()
 
     def add(self, delta: _PendingStatsDelta) -> bool:
@@ -175,12 +184,24 @@ class _PendingStats:
         *,
         full_reused_blocks: int,
         partial_reused_blocks: int,
+        by_level: ReusedBlocksByLevel | None = None,
         record_manager_stats: bool,
         record_request_stats: bool,
     ) -> bool:
+        """Record reuse counts for one life cycle.
+
+        ``by_level`` splits the same full/partial counts across the cache levels the reused
+        pages were resident on. It rides along with the scalar counters so both are committed
+        or discarded together; reuse is never rolled back (only allocation ranges are), so
+        add-only is enough.
+        """
         reused_blocks = full_reused_blocks + partial_reused_blocks
         if reused_blocks == 0 or not (record_manager_stats or record_request_stats):
             return False
+        if record_manager_stats and by_level is not None:
+            self.reused_blocks_by_level_by_life_cycle.setdefault(
+                life_cycle, ReusedBlocksByLevel()
+            ).add(by_level)
         return self.add(
             _PendingStatsDelta(
                 global_stats=(

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 from dataclasses import dataclass, fields
 
 
@@ -76,6 +77,40 @@ class KVCacheIterationStatsDelta(_StatsDeltaMixin):
         if self.iter_reused_blocks == 0 or total == 0:
             return 0.0
         return self.iter_reused_blocks / total
+
+
+@dataclass(slots=True)
+class ReusedBlocksByLevel:
+    """Reuse block counts split by the cache level the reused pages were resident on.
+
+    Kept outside ``KVCacheIterationStatsDelta`` on purpose: the number of cache levels is a
+    runtime, config-driven quantity (a deployment may configure two GPU levels, a hot and a
+    cold one), while that dataclass is a fixed-field record whose field-wise add/subtract
+    helpers assume scalar members. Indices are ``CacheLevel`` values, so entry ``i`` always
+    refers to the i-th configured tier rather than to a hard-coded gpu/host/disk bucket.
+    """
+
+    full: list[int] = dataclasses.field(default_factory=list)
+    partial: list[int] = dataclasses.field(default_factory=list)
+
+    def add(self, other: "ReusedBlocksByLevel") -> None:
+        self.full = _add_into(self.full, other.full)
+        self.partial = _add_into(self.partial, other.partial)
+
+    @property
+    def empty(self) -> bool:
+        return not any(self.full) and not any(self.partial)
+
+    def copy(self) -> "ReusedBlocksByLevel":
+        return ReusedBlocksByLevel(full=list(self.full), partial=list(self.partial))
+
+
+def _add_into(dst: list[int], src: list[int]) -> list[int]:
+    if len(dst) < len(src):
+        dst = dst + [0] * (len(src) - len(dst))
+    for i, value in enumerate(src):
+        dst[i] += value
+    return dst
 
 
 @dataclass(slots=True)

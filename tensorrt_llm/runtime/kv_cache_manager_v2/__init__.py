@@ -92,6 +92,7 @@ if _BACKEND == "python":
         _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
         KVCacheIterationStatsDelta,
         KVCacheStatsDelta,
+        ReusedBlocksByLevel,
         SsmSnapshotIterationStatsDelta,
     )
     from ._storage import BufferId  # noqa: F401
@@ -228,6 +229,7 @@ else:
     ReuseScope = getattr(_cpp, "ReuseScope", ReuseScope)
     ScratchDesc = getattr(_cpp, "ScratchDesc", None)
     SsmSnapshotIterationStatsDelta = _cpp.SsmSnapshotIterationStatsDelta
+    ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
     SwaScratchReuseConfig = getattr(_cpp, "SwaScratchReuseConfig", None)
     UniqueToken = _cpp.UniqueToken
 
@@ -342,6 +344,7 @@ __all__ = [
     "ReuseScope",
     "ScratchDesc",
     "KVCacheIterationStatsDelta",
+    "ReusedBlocksByLevel",
     "KVCacheStatsDelta",
     "SsmSnapshotIterationStatsDelta",
     "SlidingWindowSize",

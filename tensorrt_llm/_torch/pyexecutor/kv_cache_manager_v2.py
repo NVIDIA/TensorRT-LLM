@@ -3335,6 +3335,7 @@ class KVCacheManagerV2(BaseResourceManager):
         primary_peak_stats,
         secondary_peak_stats_by_level,
         reuse_delta,
+        reused_blocks_by_level=None,
     ) -> KVCacheV2LifeCycleIterationStats:
         pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
         assert kind == "attention"
@@ -3352,6 +3353,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 secondary_peak_stats_by_level,
                 reuse_delta,
                 KV_CACHE_ITERATION_STATS_REUSE_FIELDS,
+            ),
+            full_reused_blocks_by_level=(
+                list(reused_blocks_by_level.full) if reused_blocks_by_level is not None else []
+            ),
+            partial_reused_blocks_by_level=(
+                list(reused_blocks_by_level.partial) if reused_blocks_by_level is not None else []
             ),
         )
 
@@ -3424,6 +3431,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         disk_prefetch_tokens = self.impl.get_and_reset_iteration_disk_prefetch_tokens()
         cached_tokens_by_tier = self.impl.get_and_reset_iteration_cached_tokens_by_tier()
+        reused_blocks_by_level = self.impl.get_and_reset_iteration_reused_blocks_by_level()
 
         life_cycle_metadata = self._stats_life_cycle_metadata()
         pool_groups_by_window = self._storage_pool_groups_by_window()
@@ -3495,6 +3503,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 primary_peak_stats,
                 secondary_peak_stats_by_level,
                 reuse_delta,
+                reused_blocks_by_level.get(life_cycle_id),
             )
             for life_cycle_id, reuse_delta in sorted(reuse_deltas_by_life_cycle.items())
         }

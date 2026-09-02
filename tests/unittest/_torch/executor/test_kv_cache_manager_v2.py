@@ -960,6 +960,7 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
             "disk": 1,
             "remote": 0,
         },
+        get_and_reset_iteration_reused_blocks_by_level=lambda: {},
     )
     manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}
     manager._storage_pool_groups_by_window = lambda: {}

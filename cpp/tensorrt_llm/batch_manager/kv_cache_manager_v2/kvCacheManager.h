@@ -233,6 +233,11 @@ public:
     void commitSsmSnapshotIterationStats(SsmSnapshotIterationStatsByLifeCycle const& statsByLifeCycle);
     SsmSnapshotIterationStatsByLifeCycle getAndResetSsmSnapshotIterationStats();
 
+    // Per-cache-level split of the reuse block counts, committed alongside the scalar
+    // iteration stats so both views cover exactly the same requests.
+    void commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle);
+    ReusedBlocksByLevelByLifeCycle getAndResetIterationReusedBlocksByLevel();
+
     // Count one ACTIVE->SUSPENDED transition for the current iteration window.
     void recordRequestSuspended();
     // Count one preemption recovery for the current iteration window. Only a
@@ -370,6 +375,7 @@ private:
     KVCacheStatsDelta mCommittedStats;
     IterationStatsByLifeCycle mIterationStatsByLifeCycle;
     SsmSnapshotIterationStatsByLifeCycle mSsmSnapshotIterationStatsByLifeCycle;
+    ReusedBlocksByLevelByLifeCycle mIterReusedBlocksByLevel;
     PeakBlockStatsByCacheLevel mIterationPeakNumBlocksByCacheLevel;
     std::unordered_set<RequestIdType> mDirtyStatsKvCacheIds;
     std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;

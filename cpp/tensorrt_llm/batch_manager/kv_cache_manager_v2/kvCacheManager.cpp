@@ -506,6 +506,24 @@ SsmSnapshotIterationStatsByLifeCycle KvCacheManager::getAndResetSsmSnapshotItera
     return stats;
 }
 
+void KvCacheManager::commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle)
+{
+    for (auto const& [lifeCycle, byLevel] : byLifeCycle)
+    {
+        if (!byLevel.empty())
+        {
+            mIterReusedBlocksByLevel[lifeCycle].add(byLevel);
+        }
+    }
+}
+
+ReusedBlocksByLevelByLifeCycle KvCacheManager::getAndResetIterationReusedBlocksByLevel()
+{
+    ReusedBlocksByLevelByLifeCycle byLifeCycle;
+    byLifeCycle.swap(mIterReusedBlocksByLevel);
+    return byLifeCycle;
+}
+
 void KvCacheManager::recordRequestSuspended()
 {
     if (!mConfig.enableStats)
