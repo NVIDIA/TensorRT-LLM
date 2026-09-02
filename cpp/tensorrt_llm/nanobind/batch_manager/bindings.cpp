@@ -212,6 +212,19 @@ void initBindings(nb::module_& m)
         .def_prop_rw(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_prop_ro("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
+        .def_prop_ro("reuse_tier_segments",
+            [](GenLlmReq const& self)
+            {
+                // (storage tier, num tokens) runs over the reused prefix; tier values follow
+                // tensorrt_llm.metrics.enums.CACHE_TIER_LABELS.
+                std::vector<std::tuple<int, GenLlmReq::SizeType32>> segments;
+                segments.reserve(self.getReuseTierSegments().size());
+                for (auto const& [tier, numTokens] : self.getReuseTierSegments())
+                {
+                    segments.emplace_back(static_cast<int>(tier), numTokens);
+                }
+                return segments;
+            })
         .def("set_prepopulated_prompt_len", &GenLlmReq::setPrepopulatedPromptLen, nb::arg("prepopulated_prompt_len"),
             nb::arg("kv_tokens_per_block"))
         .def_prop_rw(

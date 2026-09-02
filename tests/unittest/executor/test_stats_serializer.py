@@ -69,8 +69,16 @@ def _make_mock_kv_iter_stats(
     partial_reused=1,
     missed=3,
     gen_alloc=2,
+    reused_gpu=4,
+    reused_host=1,
+    reused_disk=0,
+    reused_remote=0,
 ):
-    """Create a mock KvCacheIterationStats nanobind object."""
+    """Create a mock KvCacheIterationStats nanobind object.
+
+    The per-tier reused block counts default to a 4 gpu + 1 host split of the 5 reused
+    blocks so the sum invariant holds.
+    """
     primary_free = primary_max - primary_used
     if primary_peak_free is None:
         primary_peak_free = primary_free
@@ -108,6 +116,10 @@ def _make_mock_kv_iter_stats(
         iter_partial_reused_blocks=partial_reused,
         iter_missed_blocks=missed,
         iter_cache_hit_rate=reused / (reused + missed) if (reused + missed) > 0 else 0.0,
+        iter_reused_blocks_gpu=reused_gpu,
+        iter_reused_blocks_host=reused_host,
+        iter_reused_blocks_disk=reused_disk,
+        iter_reused_blocks_remote=reused_remote,
         iter_gen_alloc_blocks=gen_alloc,
         iter_onboard_blocks=1,
         iter_onboard_bytes=4096,
@@ -203,6 +215,11 @@ class TestStatsSerializer:
         assert ws_stats["iterFullReusedBlocks"] == 4
         assert ws_stats["iterPartialReusedBlocks"] == 1
         assert ws_stats["iterMissedBlocks"] == 3
+        # Storage-tier split of the reused blocks (sums to iterReusedBlocks).
+        assert ws_stats["iterReusedBlocksGpu"] == 4
+        assert ws_stats["iterReusedBlocksHost"] == 1
+        assert ws_stats["iterReusedBlocksDisk"] == 0
+        assert ws_stats["iterReusedBlocksRemote"] == 0
         assert ws_stats["iterGenAllocBlocks"] == 2
         assert ws_stats["iterOnboardBlocks"] == 1
         assert ws_stats["iterOnboardBytes"] == 4096
@@ -437,6 +454,7 @@ class TestStatsSerializer:
         assert pool_group["primaryPeakEvictableNumBlocks"] == 4
         assert pool_group["iterGenAllocBlocks"] == 2
         assert "iterReusedBlocks" not in pool_group
+        assert "iterReusedBlocksHost" not in pool_group
         assert "iterMissedBlocks" not in pool_group
         assert "iterCacheHitRate" not in pool_group
         # A hot pool group cannot index a cold level, so it reports no cold blocks either.
@@ -461,6 +479,9 @@ class TestStatsSerializer:
         assert life_cycle["kind"] == "attention"
         assert life_cycle["iterReusedBlocks"] == 5
         assert life_cycle["iterMissedBlocks"] == 3
+        # Tier split is reuse data: reported per life cycle, not per pool group.
+        assert life_cycle["iterReusedBlocksGpu"] == 4
+        assert life_cycle["iterReusedBlocksHost"] == 1
         assert "iterGenAllocBlocks" not in life_cycle
         ssm_life_cycle = d["kvCacheIterationStatsByLifecycle"]["4"]
         assert ssm_life_cycle == {

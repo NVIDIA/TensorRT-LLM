@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm.metrics.enums import CACHE_TIER_LABELS
 
 
 @dataclass
@@ -155,12 +156,16 @@ class AuxBufferBase(ABC):
         ...
 
     @abstractmethod
-    def get_slot_data(self, slot: int) -> tuple[list[int], list[int], tuple[int, int]]:
+    def get_slot_data(
+        self, slot: int
+    ) -> tuple[list[int], list[int], tuple[int, int], dict[str, int]]:
         """
         Get the token data and prompt token counts from the specified slot.
 
         Returns:
-            (first_gen_tokens, draft_tokens, (prompt_tokens, cached_tokens))
+            (first_gen_tokens, draft_tokens, (prompt_tokens, cached_tokens), cached_tokens_details)
+            where cached_tokens_details splits cached_tokens by storage tier and is empty when the
+            context worker reported no attribution.
         """
         ...
 
@@ -193,8 +198,11 @@ class AuxBuffer(AuxBufferBase):
         self._token_counts_buffer = torch.zeros(
             self._max_slot_num, 2, dtype=data_type, device=self._device
         )
+        # (prompt_tokens, cached_tokens) followed by cached_tokens split per storage tier in
+        # CACHE_TIER_LABELS order, so the tier attribution made on the context worker survives
+        # the KV transfer to the generation worker.
         self._prompt_token_counts_buffer = torch.zeros(
-            self._max_slot_num, 2, dtype=data_type, device=self._device
+            self._max_slot_num, 2 + len(CACHE_TIER_LABELS), dtype=data_type, device=self._device
         )
 
         self._meta = AuxBufferMeta(
@@ -297,13 +305,18 @@ class AuxBuffer(AuxBufferBase):
                 [len(first_gen_tokens), len(draft_tokens)], dtype=torch.int32, device=self._device
             )
         )
-        prompt_tokens, cached_tokens = self._resolve_prompt_token_counts(request)
+        prompt_tokens, cached_tokens, cached_by_tier = self._resolve_prompt_token_counts(request)
         self._prompt_token_counts_buffer[slot].copy_(
-            torch.tensor([prompt_tokens, cached_tokens], dtype=torch.int32, device=self._device)
+            torch.tensor(
+                [prompt_tokens, cached_tokens]
+                + [int(cached_by_tier.get(tier, 0)) for tier in CACHE_TIER_LABELS],
+                dtype=torch.int32,
+                device=self._device,
+            )
         )
 
     @staticmethod
-    def _resolve_prompt_token_counts(request: LlmRequest) -> tuple[int, int]:
+    def _resolve_prompt_token_counts(request: LlmRequest) -> tuple[int, int, dict[str, int]]:
         ctx_usage = (
             request.py_disaggregated_params.ctx_usage
             if request.py_disaggregated_params is not None
@@ -313,10 +326,12 @@ class AuxBuffer(AuxBufferBase):
             prompt_tokens = ctx_usage.get("prompt_tokens", 0)
             details = ctx_usage.get("prompt_tokens_details") or {}
             cached_tokens = details.get("cached_tokens", 0)
+            cached_by_tier = details.get("cached_tokens_details") or {}
         else:
             prompt_tokens = request.prompt_len
             cached_tokens = request.cached_tokens
-        return int(prompt_tokens or 0), int(cached_tokens or 0)
+            cached_by_tier = request.cached_tokens_by_tier
+        return int(prompt_tokens or 0), int(cached_tokens or 0), dict(cached_by_tier)
 
     def get_slot_tokens(self, slot: int) -> tuple[list[int], list[int]]:
         if slot not in self._occupied_slots:
@@ -327,7 +342,17 @@ class AuxBuffer(AuxBufferBase):
 
         return first_gen_tokens, draft_tokens
 
-    def get_slot_data(self, slot: int) -> tuple[list[int], list[int], tuple[int, int]]:
+    def get_slot_data(
+        self, slot: int
+    ) -> tuple[list[int], list[int], tuple[int, int], dict[str, int]]:
         first_gen_tokens, draft_tokens = self.get_slot_tokens(slot)
-        prompt_tokens, cached_tokens = self._prompt_token_counts_buffer[slot].tolist()
-        return first_gen_tokens, draft_tokens, (int(prompt_tokens), int(cached_tokens))
+        prompt_tokens, cached_tokens, *by_tier = self._prompt_token_counts_buffer[slot].tolist()
+        cached_tokens_details = {
+            tier: int(count) for tier, count in zip(CACHE_TIER_LABELS, by_tier) if count > 0
+        }
+        return (
+            first_gen_tokens,
+            draft_tokens,
+            (int(prompt_tokens), int(cached_tokens)),
+            cached_tokens_details,
+        )

@@ -112,7 +112,11 @@ void initBindings(nb::module_& m)
         .def_rw("alloc_new_blocks", &tle::KvCacheStats::allocNewBlocks)
         .def_rw("reused_blocks", &tle::KvCacheStats::reusedBlocks)
         .def_rw("missed_blocks", &tle::KvCacheStats::missedBlocks)
-        .def_rw("cache_hit_rate", &tle::KvCacheStats::cacheHitRate);
+        .def_rw("cache_hit_rate", &tle::KvCacheStats::cacheHitRate)
+        .def_rw("reused_blocks_gpu", &tle::KvCacheStats::reusedBlocksGpu)
+        .def_rw("reused_blocks_host", &tle::KvCacheStats::reusedBlocksHost)
+        .def_rw("reused_blocks_disk", &tle::KvCacheStats::reusedBlocksDisk)
+        .def_rw("reused_blocks_remote", &tle::KvCacheStats::reusedBlocksRemote);
 
     nb::class_<tle::StaticBatchingStats>(m, "StaticBatchingStats")
         .def(nb::init<>())

@@ -62,6 +62,15 @@ from .tool_parser.tool_parser_factory import ToolParserFactory
 # yapf: enable
 
 
+def _prompt_tokens_details(rsp: GenerationResult) -> PromptTokensDetails:
+    """Usage details for one result: cached prompt tokens plus their storage-tier split when known."""
+    return PromptTokensDetails(
+        cached_tokens=rsp.cached_tokens,
+        cached_tokens_details=(dict(rsp.cached_tokens_by_tier)
+                               if rsp.cached_tokens_by_tier else None),
+    )
+
+
 def _ctx_usage_from_outputs(outputs: List[Any]) -> Optional[UsageInfo]:
     for output in outputs:
         disaggregated_params = getattr(output, "disaggregated_params", None)
@@ -345,8 +354,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 prompt_tokens=num_tokens,
                 total_tokens=num_tokens,
                 completion_tokens=0,
-                prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=rsp.cached_tokens),
+                prompt_tokens_details=_prompt_tokens_details(rsp),
             )
             rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_none=True)
@@ -522,11 +530,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                              id=stream_response_id,
                                              created=stream_created)
         if include_continuous_usage:
-            chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
-                                    completion_tokens=output.length,
-                                    total_tokens=output.length + prompt_tokens,
-                                    prompt_tokens_details=PromptTokensDetails(
-                                        cached_tokens=rsp.cached_tokens))
+            chunk.usage = UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=output.length,
+                total_tokens=output.length + prompt_tokens,
+                prompt_tokens_details=_prompt_tokens_details(rsp))
             rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_none=True)
         res.append(f"data: {data}\n\n")
@@ -537,8 +545,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=PromptTokensDetails(
-                cached_tokens=rsp.cached_tokens),
+            prompt_tokens_details=_prompt_tokens_details(rsp),
         )
         rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
@@ -691,8 +698,7 @@ def chat_response_post_processor(
         prompt_tokens=num_prompt_tokens,
         completion_tokens=num_generated_tokens,
         total_tokens=num_prompt_tokens + num_generated_tokens,
-        prompt_tokens_details=PromptTokensDetails(
-            cached_tokens=rsp.cached_tokens),
+        prompt_tokens_details=_prompt_tokens_details(rsp),
     )
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     response = ChatCompletionResponse(
@@ -807,11 +813,11 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                                          id=stream_response_id,
                                          created=stream_created)
         if include_continuous_usage:
-            chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
-                                    completion_tokens=output.length,
-                                    total_tokens=output.length + prompt_tokens,
-                                    prompt_tokens_details=PromptTokensDetails(
-                                        cached_tokens=rsp.cached_tokens))
+            chunk.usage = UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=output.length,
+                total_tokens=output.length + prompt_tokens,
+                prompt_tokens_details=_prompt_tokens_details(rsp))
             rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_unset=False)
         res.append(f"data: {data}\n\n")
@@ -822,8 +828,7 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=PromptTokensDetails(
-                cached_tokens=rsp.cached_tokens),
+            prompt_tokens_details=_prompt_tokens_details(rsp),
         )
         rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
@@ -876,8 +881,7 @@ def completion_response_post_processor(
     usage = UsageInfo(prompt_tokens=prompt_tokens,
                       completion_tokens=completion_tokens,
                       total_tokens=completion_tokens + prompt_tokens,
-                      prompt_tokens_details=PromptTokensDetails(
-                          cached_tokens=rsp.cached_tokens))
+                      prompt_tokens_details=_prompt_tokens_details(rsp))
     response = CompletionResponse(choices=choices,
                                   model=args.model,
                                   usage=usage)

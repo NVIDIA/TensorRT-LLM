@@ -76,6 +76,8 @@ def parse_and_display_metrics(metrics_data: str) -> None:
         f"{METRIC_PREFIX}request_queue_time_seconds": "Request queue time",
         f"{METRIC_PREFIX}kv_cache_hit_rate": "KV cache hit rate",
         f"{METRIC_PREFIX}kv_cache_reused_blocks_total": "KV cache reused blocks (cumulative)",
+        f"{METRIC_PREFIX}kv_cache_reused_blocks_by_tier_total": "KV cache reused blocks by storage tier",
+        f"{METRIC_PREFIX}prompt_cached_tokens_by_tier_total": "Cached prompt tokens by storage tier",
         f"{METRIC_PREFIX}kv_cache_missed_blocks_total": "KV cache missed blocks (cumulative)",
         f"{METRIC_PREFIX}kv_cache_utilization": "KV cache utilization",
     }

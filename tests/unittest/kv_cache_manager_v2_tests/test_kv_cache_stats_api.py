@@ -99,7 +99,8 @@ def test_cpp_stats_types_are_native() -> None:
     stats = KVCacheStatsDelta(alloc_total_blocks=1, reused_blocks=2)
     assert repr(stats) == (
         "KVCacheStatsDelta(alloc_total_blocks=1, alloc_new_blocks=0, "
-        "reused_blocks=2, missed_blocks=0)"
+        "reused_blocks=2, missed_blocks=0, reused_blocks_gpu=0, reused_blocks_host=0, "
+        "reused_blocks_disk=0, reused_blocks_remote=0)"
     )
     peak = PoolGroupPeakBlockStats(available=3, unavailable=4, evictable=5)
     assert peak == PoolGroupPeakBlockStats(3, 4, 5)

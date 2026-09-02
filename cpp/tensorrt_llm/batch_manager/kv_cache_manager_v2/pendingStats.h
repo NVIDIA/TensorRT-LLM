@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <vector>
 
@@ -88,27 +89,44 @@ public:
         return true;
     }
 
+    // `reusedBlocksByTier` holds the (gpu, host, disk, remote) split of the reused blocks decided at
+    // match time; every counted block has exactly one tier. Mirrors Python's record_reuse().
     bool recordReuse(LifeCycleId lifeCycle, int fullReusedBlocks, int partialReusedBlocks,
-        bool recordManagerStats = true, bool recordRequestStats = true)
+        std::array<int, 4> const& reusedBlocksByTier, bool recordManagerStats = true, bool recordRequestStats = true)
     {
         int const reusedBlocks = fullReusedBlocks + partialReusedBlocks;
         if (reusedBlocks == 0 || (!recordManagerStats && !recordRequestStats))
         {
             return false;
         }
+        auto const [gpu, host, disk, remote] = reusedBlocksByTier;
+        TLLM_CHECK_DEBUG_WITH_INFO(gpu + host + disk + remote == reusedBlocks,
+            "tier split (%d, %d, %d, %d) does not sum to %d reused blocks", gpu, host, disk, remote, reusedBlocks);
 
         PendingStatsDelta delta;
         if (recordManagerStats)
         {
             delta.globalStats.reusedBlocks = reusedBlocks;
+            delta.globalStats.reusedBlocksGpu = gpu;
+            delta.globalStats.reusedBlocksHost = host;
+            delta.globalStats.reusedBlocksDisk = disk;
+            delta.globalStats.reusedBlocksRemote = remote;
             delta.iterationStats.iterReusedBlocks = reusedBlocks;
             delta.iterationStats.iterFullReusedBlocks = fullReusedBlocks;
             delta.iterationStats.iterPartialReusedBlocks = partialReusedBlocks;
+            delta.iterationStats.iterReusedBlocksGpu = gpu;
+            delta.iterationStats.iterReusedBlocksHost = host;
+            delta.iterationStats.iterReusedBlocksDisk = disk;
+            delta.iterationStats.iterReusedBlocksRemote = remote;
             delta.lifeCycle = lifeCycle;
         }
         if (recordRequestStats)
         {
             delta.requestStats.reusedBlocks = reusedBlocks;
+            delta.requestStats.reusedBlocksGpu = gpu;
+            delta.requestStats.reusedBlocksHost = host;
+            delta.requestStats.reusedBlocksDisk = disk;
+            delta.requestStats.reusedBlocksRemote = remote;
         }
         return add(delta);
     }

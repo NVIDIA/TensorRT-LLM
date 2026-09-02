@@ -18,7 +18,7 @@ import math
 import time
 from typing import Dict, List, Optional, Union
 
-from .enums import MetricNames
+from .enums import CACHE_TIER_BLOCK_LABELS, CACHE_TIER_LABELS, MetricNames
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
@@ -45,6 +45,7 @@ class MetricsCollector:
             trtllm_prompt_tokens_total
             trtllm_generation_tokens_total
             trtllm_prompt_cached_tokens_total
+            trtllm_prompt_cached_tokens_by_tier_total
             trtllm_prompt_cached_tokens_per_request
             trtllm_spec_decode_drafted_tokens_total
             trtllm_spec_decode_accepted_tokens_total
@@ -60,6 +61,7 @@ class MetricsCollector:
             trtllm_kv_cache_reused_blocks_total
             trtllm_kv_cache_missed_blocks_total
             trtllm_kv_cache_iter_reused_blocks_total
+            trtllm_kv_cache_reused_blocks_by_tier_total
             trtllm_kv_cache_iter_full_reused_blocks_total
             trtllm_kv_cache_iter_partial_reused_blocks_total
             trtllm_kv_cache_iter_missed_blocks_total
@@ -267,6 +269,20 @@ class MetricsCollector:
             name=self.metric_prefix + "kv_cache_iter_reused_blocks",
             documentation="Total reused KV cache blocks (full + partial)",
             labelnames=self.labels.keys())
+        # Same reused blocks split by the storage tier that held the block when
+        # it was matched (gpu / host / disk / remote). Summed over cache_tier this
+        # equals kv_cache_iter_reused_blocks_total.
+        self.labelname_cache_tier = "cache_tier"
+        self.kv_cache_reused_blocks_by_tier = Counter(
+            name=self.metric_prefix + "kv_cache_reused_blocks_by_tier",
+            documentation=
+            "Total reused KV cache blocks by the storage tier that held the "
+            "block when it was matched",
+            labelnames=[*self.labels.keys(), self.labelname_cache_tier])
+        for tier in CACHE_TIER_BLOCK_LABELS:
+            # Pre-seed every tier so scrapers see a complete label set at 0.
+            self.kv_cache_reused_blocks_by_tier.labels(
+                **self._label_merge({self.labelname_cache_tier: tier}))
         self.kv_cache_iter_full_reused_blocks = Counter(
             name=self.metric_prefix + "kv_cache_iter_full_reused_blocks",
             documentation="Total fully reused KV cache blocks",
@@ -417,6 +433,18 @@ class MetricsCollector:
             name=self.metric_prefix + "prompt_cached_tokens_total",
             documentation="Total prompt tokens served from KV cache.",
             labelnames=self.labels.keys())
+        # Same cached prompt tokens split by storage tier. Summed over cache_tier
+        # this equals prompt_cached_tokens_total for every request that carried a
+        # tier breakdown; "none" marks tokens skipped by reuse without loading any
+        # KV (e.g. blocks outside every sliding attention window).
+        self.counter_tokens_cached_prompt_by_tier = Counter(
+            name=self.metric_prefix + "prompt_cached_tokens_by_tier",
+            documentation=
+            "Total prompt tokens served from KV cache by storage tier.",
+            labelnames=[*self.labels.keys(), self.labelname_cache_tier])
+        for tier in CACHE_TIER_LABELS:
+            self.counter_tokens_cached_prompt_by_tier.labels(
+                **self._label_merge({self.labelname_cache_tier: tier}))
         self.histogram_tokens_cached_prompt = Histogram(
             name=self.metric_prefix + "prompt_cached_tokens_per_request",
             documentation="Histogram of cached prompt tokens per request.",
@@ -618,6 +646,16 @@ class MetricsCollector:
                                       self.labels, cached_tokens)
                 self._log_histogram(self.histogram_tokens_cached_prompt,
                                     cached_tokens)
+                # Tier breakdown is only present when the KV cache manager
+                # attributed this request's reused prefix; never guess a tier.
+                cached_by_tier = metrics_dict.get(
+                    MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER)
+                if cached_by_tier:
+                    for tier, count in cached_by_tier.items():
+                        if count > 0:
+                            self._log_counter(
+                                self.counter_tokens_cached_prompt_by_tier,
+                                {self.labelname_cache_tier: tier}, count)
 
             per_pos_drafted = metrics_dict.get(
                 MetricNames.SPEC_DEC_DRAFTED_PER_POS)
@@ -829,6 +867,7 @@ class MetricsCollector:
             total_full_reused = 0
             total_partial_reused = 0
             total_missed = 0
+            total_reused_by_tier = {tier: 0 for tier in CACHE_TIER_BLOCK_LABELS}
             total_gen_alloc = 0
             total_onboard_bytes = 0
             total_offload_bytes = 0
@@ -839,6 +878,14 @@ class MetricsCollector:
                 total_full_reused += stats.get("iterFullReusedBlocks", 0)
                 total_partial_reused += stats.get("iterPartialReusedBlocks", 0)
                 total_missed += stats.get("iterMissedBlocks", 0)
+                total_reused_by_tier["gpu"] += stats.get(
+                    "iterReusedBlocksGpu", 0)
+                total_reused_by_tier["host"] += stats.get(
+                    "iterReusedBlocksHost", 0)
+                total_reused_by_tier["disk"] += stats.get(
+                    "iterReusedBlocksDisk", 0)
+                total_reused_by_tier["remote"] += stats.get(
+                    "iterReusedBlocksRemote", 0)
 
             for stats in secondary_stats.values():
                 total_secondary_max += stats.get("secondaryMaxNumBlocks", 0)
@@ -866,6 +913,10 @@ class MetricsCollector:
             if total_reused > 0:
                 self._log_counter(self.kv_cache_iter_reused_blocks, {},
                                   total_reused)
+            for tier, count in total_reused_by_tier.items():
+                if count > 0:
+                    self._log_counter(self.kv_cache_reused_blocks_by_tier,
+                                      {self.labelname_cache_tier: tier}, count)
             if total_full_reused > 0:
                 self._log_counter(self.kv_cache_iter_full_reused_blocks, {},
                                   total_full_reused)

@@ -1309,3 +1309,143 @@ class TestRequestErrorCounter:
         collector.log_request_error()
         labels = {**collector.labels, "http_code": ""}
         assert _counter_value_with_labels(collector.counter_request_error, labels) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for the cache_tier labelled counters (KV-cache hits by storage tier)
+# ---------------------------------------------------------------------------
+
+from tensorrt_llm.metrics.enums import CACHE_TIER_BLOCK_LABELS, CACHE_TIER_LABELS  # noqa: E402
+
+
+def _tier_value(collector: MetricsCollector, metric_name: str, tier: str) -> float:
+    metric = getattr(collector, metric_name)
+    return metric.labels(**collector.labels, cache_tier=tier)._value.get()
+
+
+class TestCacheTierMetrics:
+    """Counters labelled with cache_tier.
+
+    trtllm_prompt_cached_tokens_by_tier_total and
+    trtllm_kv_cache_reused_blocks_by_tier_total.
+    """
+
+    def test_tier_series_are_preseeded_to_zero(self, collector):
+        """Scrapers must see every tier at 0 before the first hit."""
+        for tier in CACHE_TIER_LABELS:
+            assert _tier_value(collector, "counter_tokens_cached_prompt_by_tier", tier) == 0
+        for tier in CACHE_TIER_BLOCK_LABELS:
+            assert _tier_value(collector, "kv_cache_reused_blocks_by_tier", tier) == 0
+
+    def test_request_tier_split_sums_to_aggregate(self, collector):
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "stop",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 96,
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER: {"gpu": 64, "host": 32},
+        }
+        collector.log_request_metrics_dict(metrics)
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 192
+        assert _tier_value(collector, "counter_tokens_cached_prompt_by_tier", "gpu") == 128
+        assert _tier_value(collector, "counter_tokens_cached_prompt_by_tier", "host") == 64
+        for tier in ("disk", "remote", "none"):
+            assert _tier_value(collector, "counter_tokens_cached_prompt_by_tier", tier) == 0
+        total = sum(
+            _tier_value(collector, "counter_tokens_cached_prompt_by_tier", tier)
+            for tier in CACHE_TIER_LABELS
+        )
+        assert total == _get_counter_value(collector, "counter_tokens_cached_prompt")
+
+    def test_request_without_tier_breakdown_leaves_tier_series_untouched(self, collector):
+        """A request the manager did not attribute must not be guessed into a tier."""
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "stop",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 50,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 50
+        for tier in CACHE_TIER_LABELS:
+            assert _tier_value(collector, "counter_tokens_cached_prompt_by_tier", tier) == 0
+
+    def test_request_tier_split_needs_finish_reason(self, collector):
+        metrics = {
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 50,
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER: {"host": 50},
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _tier_value(collector, "counter_tokens_cached_prompt_by_tier", "host") == 0
+
+    def test_request_none_tier_is_recorded(self, collector):
+        """Tokens skipped without loading KV land in the explicit 'none' tier.
+
+        Sliding-window models skip blocks outside the window without loading them;
+        those must not inflate gpu.
+        """
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "stop",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 40,
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER: {"none": 24, "gpu": 16},
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _tier_value(collector, "counter_tokens_cached_prompt_by_tier", "none") == 24
+        assert _tier_value(collector, "counter_tokens_cached_prompt_by_tier", "gpu") == 16
+
+    def test_iteration_block_tiers_v1_windows(self, collector):
+        """Legacy manager: per-window stats are summed across windows."""
+        stats = {
+            "kvCacheIterationStats": {
+                "16": {
+                    "iterReusedBlocks": 5,
+                    "iterReusedBlocksGpu": 3,
+                    "iterReusedBlocksHost": 2,
+                    "iterMissedBlocks": 1,
+                },
+                "4096": {
+                    "iterReusedBlocks": 4,
+                    "iterReusedBlocksGpu": 1,
+                    "iterReusedBlocksHost": 2,
+                    "iterReusedBlocksDisk": 1,
+                    "iterMissedBlocks": 0,
+                },
+            }
+        }
+        collector.log_iteration_stats(stats)
+        assert _get_counter_value(collector, "kv_cache_iter_reused_blocks") == 9
+        assert _tier_value(collector, "kv_cache_reused_blocks_by_tier", "gpu") == 4
+        assert _tier_value(collector, "kv_cache_reused_blocks_by_tier", "host") == 4
+        assert _tier_value(collector, "kv_cache_reused_blocks_by_tier", "disk") == 1
+        assert _tier_value(collector, "kv_cache_reused_blocks_by_tier", "remote") == 0
+        total = sum(
+            _tier_value(collector, "kv_cache_reused_blocks_by_tier", tier)
+            for tier in CACHE_TIER_BLOCK_LABELS
+        )
+        assert total == _get_counter_value(collector, "kv_cache_iter_reused_blocks")
+
+    def test_iteration_block_tiers_v2_lifecycles(self, collector):
+        """KVCacheManagerV2 reports reuse per attention life cycle; SSM entries are ignored."""
+        stats = {
+            "kvCacheIterationStatsByLifecycle": {
+                "0": {
+                    "kind": "attention",
+                    "iterReusedBlocks": 6,
+                    "iterReusedBlocksGpu": 4,
+                    "iterReusedBlocksHost": 2,
+                },
+                "1": {
+                    "kind": "ssm",
+                    "snapshotStats": {"iterSnapshotHits": 3},
+                },
+            },
+            "kvCacheIterationStatsByPoolGroup": {"0": {"iterOnboardBytes": 4096}},
+        }
+        collector.log_iteration_stats(stats)
+        assert _get_counter_value(collector, "kv_cache_iter_reused_blocks") == 6
+        assert _tier_value(collector, "kv_cache_reused_blocks_by_tier", "gpu") == 4
+        assert _tier_value(collector, "kv_cache_reused_blocks_by_tier", "host") == 2
+
+    def test_iteration_stats_without_tier_fields_do_not_error(self, collector):
+        stats = {"kvCacheIterationStats": {"16": {"iterReusedBlocks": 2, "iterMissedBlocks": 1}}}
+        collector.log_iteration_stats(stats)
+        assert _get_counter_value(collector, "kv_cache_iter_reused_blocks") == 2
+        for tier in CACHE_TIER_BLOCK_LABELS:
+            assert _tier_value(collector, "kv_cache_reused_blocks_by_tier", tier) == 0

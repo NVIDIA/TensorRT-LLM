@@ -610,7 +610,9 @@ static std::string statsDeltaRepr(kv::KVCacheStatsDelta const& stats)
     std::ostringstream stream;
     stream << "KVCacheStatsDelta(alloc_total_blocks=" << stats.allocTotalBlocks
            << ", alloc_new_blocks=" << stats.allocNewBlocks << ", reused_blocks=" << stats.reusedBlocks
-           << ", missed_blocks=" << stats.missedBlocks << ')';
+           << ", missed_blocks=" << stats.missedBlocks << ", reused_blocks_gpu=" << stats.reusedBlocksGpu
+           << ", reused_blocks_host=" << stats.reusedBlocksHost << ", reused_blocks_disk=" << stats.reusedBlocksDisk
+           << ", reused_blocks_remote=" << stats.reusedBlocksRemote << ')';
     return stream.str();
 }
 
@@ -623,6 +625,10 @@ static std::string iterationStatsDeltaRepr(kv::KVCacheIterationStatsDelta const&
            << ", iter_full_reused_blocks=" << stats.iterFullReusedBlocks
            << ", iter_partial_reused_blocks=" << stats.iterPartialReusedBlocks
            << ", iter_missed_blocks=" << stats.iterMissedBlocks
+           << ", iter_reused_blocks_gpu=" << stats.iterReusedBlocksGpu
+           << ", iter_reused_blocks_host=" << stats.iterReusedBlocksHost
+           << ", iter_reused_blocks_disk=" << stats.iterReusedBlocksDisk
+           << ", iter_reused_blocks_remote=" << stats.iterReusedBlocksRemote
            << ", iter_gen_alloc_blocks=" << stats.iterGenAllocBlocks
            << ", iter_onboard_blocks=" << stats.iterOnboardBlocks << ", iter_onboard_bytes=" << stats.iterOnboardBytes
            << ", iter_offload_blocks=" << stats.iterOffloadBlocks << ", iter_offload_bytes=" << stats.iterOffloadBytes
@@ -1149,20 +1155,30 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "__init__",
             [](kv::KVCacheStatsDelta* self, int64_t allocTotalBlocks, int64_t allocNewBlocks, int64_t reusedBlocks,
-                int64_t missedBlocks)
+                int64_t missedBlocks, int64_t reusedBlocksGpu, int64_t reusedBlocksHost, int64_t reusedBlocksDisk,
+                int64_t reusedBlocksRemote)
             {
                 new (self) kv::KVCacheStatsDelta{};
                 self->allocTotalBlocks = allocTotalBlocks;
                 self->allocNewBlocks = allocNewBlocks;
                 self->reusedBlocks = reusedBlocks;
                 self->missedBlocks = missedBlocks;
+                self->reusedBlocksGpu = reusedBlocksGpu;
+                self->reusedBlocksHost = reusedBlocksHost;
+                self->reusedBlocksDisk = reusedBlocksDisk;
+                self->reusedBlocksRemote = reusedBlocksRemote;
             },
             nb::arg("alloc_total_blocks") = 0, nb::arg("alloc_new_blocks") = 0, nb::arg("reused_blocks") = 0,
-            nb::arg("missed_blocks") = 0)
+            nb::arg("missed_blocks") = 0, nb::arg("reused_blocks_gpu") = 0, nb::arg("reused_blocks_host") = 0,
+            nb::arg("reused_blocks_disk") = 0, nb::arg("reused_blocks_remote") = 0)
         .def_rw("alloc_total_blocks", &kv::KVCacheStatsDelta::allocTotalBlocks)
         .def_rw("alloc_new_blocks", &kv::KVCacheStatsDelta::allocNewBlocks)
         .def_rw("reused_blocks", &kv::KVCacheStatsDelta::reusedBlocks)
         .def_rw("missed_blocks", &kv::KVCacheStatsDelta::missedBlocks)
+        .def_rw("reused_blocks_gpu", &kv::KVCacheStatsDelta::reusedBlocksGpu)
+        .def_rw("reused_blocks_host", &kv::KVCacheStatsDelta::reusedBlocksHost)
+        .def_rw("reused_blocks_disk", &kv::KVCacheStatsDelta::reusedBlocksDisk)
+        .def_rw("reused_blocks_remote", &kv::KVCacheStatsDelta::reusedBlocksRemote)
         .def("add", &kv::KVCacheStatsDelta::add, nb::arg("other"))
         .def("subtract", &kv::KVCacheStatsDelta::subtract, nb::arg("other"))
         .def("clear", &kv::KVCacheStatsDelta::clear)
@@ -1176,10 +1192,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__init__",
             [](kv::KVCacheIterationStatsDelta* self, int64_t iterAllocTotalBlocks, int64_t iterAllocNewBlocks,
                 int64_t iterReusedBlocks, int64_t iterFullReusedBlocks, int64_t iterPartialReusedBlocks,
-                int64_t iterMissedBlocks, int64_t iterGenAllocBlocks, int64_t iterOnboardBlocks,
-                int64_t iterOnboardBytes, int64_t iterOffloadBlocks, int64_t iterOffloadBytes,
-                int64_t iterIntraDeviceCopyBlocks, int64_t iterIntraDeviceCopyBytes, int64_t iterHostDroppedBlocks,
-                int64_t iterHostDroppedBytes)
+                int64_t iterMissedBlocks, int64_t iterReusedBlocksGpu, int64_t iterReusedBlocksHost,
+                int64_t iterReusedBlocksDisk, int64_t iterReusedBlocksRemote, int64_t iterGenAllocBlocks,
+                int64_t iterOnboardBlocks, int64_t iterOnboardBytes, int64_t iterOffloadBlocks,
+                int64_t iterOffloadBytes, int64_t iterIntraDeviceCopyBlocks, int64_t iterIntraDeviceCopyBytes,
+                int64_t iterHostDroppedBlocks, int64_t iterHostDroppedBytes)
             {
                 new (self) kv::KVCacheIterationStatsDelta{};
                 self->iterAllocTotalBlocks = iterAllocTotalBlocks;
@@ -1188,6 +1205,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 self->iterFullReusedBlocks = iterFullReusedBlocks;
                 self->iterPartialReusedBlocks = iterPartialReusedBlocks;
                 self->iterMissedBlocks = iterMissedBlocks;
+                self->iterReusedBlocksGpu = iterReusedBlocksGpu;
+                self->iterReusedBlocksHost = iterReusedBlocksHost;
+                self->iterReusedBlocksDisk = iterReusedBlocksDisk;
+                self->iterReusedBlocksRemote = iterReusedBlocksRemote;
                 self->iterGenAllocBlocks = iterGenAllocBlocks;
                 self->iterOnboardBlocks = iterOnboardBlocks;
                 self->iterOnboardBytes = iterOnboardBytes;
@@ -1201,6 +1222,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("iter_alloc_total_blocks") = 0, nb::arg("iter_alloc_new_blocks") = 0,
             nb::arg("iter_reused_blocks") = 0, nb::arg("iter_full_reused_blocks") = 0,
             nb::arg("iter_partial_reused_blocks") = 0, nb::arg("iter_missed_blocks") = 0,
+            nb::arg("iter_reused_blocks_gpu") = 0, nb::arg("iter_reused_blocks_host") = 0,
+            nb::arg("iter_reused_blocks_disk") = 0, nb::arg("iter_reused_blocks_remote") = 0,
             nb::arg("iter_gen_alloc_blocks") = 0, nb::arg("iter_onboard_blocks") = 0, nb::arg("iter_onboard_bytes") = 0,
             nb::arg("iter_offload_blocks") = 0, nb::arg("iter_offload_bytes") = 0,
             nb::arg("iter_intra_device_copy_blocks") = 0, nb::arg("iter_intra_device_copy_bytes") = 0,
@@ -1211,6 +1234,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("iter_full_reused_blocks", &kv::KVCacheIterationStatsDelta::iterFullReusedBlocks)
         .def_rw("iter_partial_reused_blocks", &kv::KVCacheIterationStatsDelta::iterPartialReusedBlocks)
         .def_rw("iter_missed_blocks", &kv::KVCacheIterationStatsDelta::iterMissedBlocks)
+        .def_rw("iter_reused_blocks_gpu", &kv::KVCacheIterationStatsDelta::iterReusedBlocksGpu)
+        .def_rw("iter_reused_blocks_host", &kv::KVCacheIterationStatsDelta::iterReusedBlocksHost)
+        .def_rw("iter_reused_blocks_disk", &kv::KVCacheIterationStatsDelta::iterReusedBlocksDisk)
+        .def_rw("iter_reused_blocks_remote", &kv::KVCacheIterationStatsDelta::iterReusedBlocksRemote)
         .def_rw("iter_gen_alloc_blocks", &kv::KVCacheIterationStatsDelta::iterGenAllocBlocks)
         .def_rw("iter_onboard_blocks", &kv::KVCacheIterationStatsDelta::iterOnboardBlocks)
         .def_rw("iter_onboard_bytes", &kv::KVCacheIterationStatsDelta::iterOnboardBytes)
@@ -1231,7 +1258,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     m.attr("KVCacheIterationStatsDelta").attr("_field_names") = nb::make_tuple("iter_alloc_total_blocks",
         "iter_alloc_new_blocks", "iter_reused_blocks", "iter_full_reused_blocks", "iter_partial_reused_blocks",
-        "iter_missed_blocks", "iter_gen_alloc_blocks", "iter_onboard_blocks", "iter_onboard_bytes",
+        "iter_missed_blocks", "iter_reused_blocks_gpu", "iter_reused_blocks_host", "iter_reused_blocks_disk",
+        "iter_reused_blocks_remote", "iter_gen_alloc_blocks", "iter_onboard_blocks", "iter_onboard_bytes",
         "iter_offload_blocks", "iter_offload_bytes", "iter_intra_device_copy_blocks", "iter_intra_device_copy_bytes",
         "iter_host_dropped_blocks", "iter_host_dropped_bytes");
 
@@ -1777,6 +1805,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
+        .def_prop_ro("reuse_tier_segments",
+            [](kv::KvCache const& self) -> nb::object
+            {
+                // Ordered (storage tier index, num tokens) runs over the reused prefix, None when the
+                // cache was not created from a reuse match. Mirrors the Python backend property.
+                auto const& segments = self.reuseTierSegments();
+                if (!segments.has_value())
+                {
+                    return nb::none();
+                }
+                nb::list result;
+                for (auto const& [tier, numTokens] : *segments)
+                {
+                    result.append(nb::make_tuple(static_cast<int>(tier), numTokens));
+                }
+                return result;
+            })
         .def("_get_num_tokens_before_hybrid_pruning", &kv::KvCache::numTokensBeforeHybridPruning)
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
             [](kv::KvCache& self, int hist) { self.setHistoryLength(hist); })

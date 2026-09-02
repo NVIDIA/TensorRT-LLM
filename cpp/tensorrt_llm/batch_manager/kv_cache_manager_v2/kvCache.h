@@ -27,9 +27,11 @@
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -292,6 +294,17 @@ public:
     std::vector<TokenIdExt> const& committedTokens() const noexcept
     {
         return mCommittedTokens;
+    }
+
+    // Ordered (storage tier index, num tokens) runs describing which storage tier served each token of
+    // the reused prefix when the reuse match was set up (tier indices follow
+    // tensorrt_llm.metrics.enums.CACHE_TIER_LABELS: 0 gpu, 1 host, 2 disk, 3 remote, 4 none), or nullopt
+    // when this cache was not created from a reuse match. Mirrors Python's _KVCache.reuse_tier_segments.
+    using ReuseTierSegments = std::vector<std::pair<std::int8_t, int>>;
+
+    std::optional<ReuseTierSegments> const& reuseTierSegments() const noexcept
+    {
+        return mReuseTierSegments;
     }
 
     ReuseScope const& reuseScope() const noexcept
@@ -596,6 +609,8 @@ private:
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 
     std::vector<TokenIdExt> mCommittedTokens;
+    // Storage-tier attribution of the reused prefix, see reuseTierSegments().
+    std::optional<ReuseTierSegments> mReuseTierSegments;
     // Resolved per-sequence text-only state after applying the manager default.
     bool mTextOnly = false;
     int mNumTokensBeforeHybridPruning;

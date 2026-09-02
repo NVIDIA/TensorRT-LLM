@@ -799,6 +799,12 @@ class PyExecutor:
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
             self.kv_cache_manager.snapshot_warmup_baseline()
+        # Drain the per-iteration KV cache deltas accumulated during warmup so the
+        # first reported iteration stats (and the Prometheus counters fed from
+        # them) only cover real traffic, matching the baselined cumulative counters.
+        if self.kv_cache_manager is not None and hasattr(
+                self.kv_cache_manager, 'get_iteration_stats'):
+            self.kv_cache_manager.get_iteration_stats()
 
         self.is_shutdown = False
         # Set at the executor loops' normal-exit `break` sites, and ONLY
@@ -1079,6 +1085,7 @@ class PyExecutor:
             response = request.create_response(False, self.dist.rank)
             if response:
                 response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens_by_tier = request.cached_tokens_by_tier
                 self._maybe_attach_ctx_usage(request, response)
                 # Buffer the response instead of enqueueing immediately.
                 # With ADP, _enqueue_responses does a tp_gather collective.
@@ -8365,6 +8372,7 @@ class PyExecutor:
             if response is None:
                 continue
             response.result.cached_tokens = request.cached_tokens
+            response.result.cached_tokens_by_tier = request.cached_tokens_by_tier
             self._maybe_attach_ctx_usage(request, response)
             if logits_snapshot is not None:
                 response.result.generation_logits = logits_snapshot
@@ -8465,6 +8473,7 @@ class PyExecutor:
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
+                    response.result.cached_tokens_by_tier = request.cached_tokens_by_tier
                     self._maybe_attach_ctx_usage(request, response)
                     response.result.per_pos_drafted = request.py_per_pos_drafted
                     response.result.per_pos_accepted = request.py_per_pos_accepted

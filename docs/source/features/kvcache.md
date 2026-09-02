@@ -221,3 +221,64 @@ Property ```use_uvm``` has been deprecated and will be removed in a future relea
 Property ```sink_token_length``` is deprecated and silently ignored on the PyTorch backend.
 The PyTorch attention kernels do not support StreamingLLM, so any non-``None`` value is
 dropped before reaching the executor.
+
+## Cache Hit Metrics by Storage Tier
+
+When host offloading (`host_cache_size`) or another cache tier is enabled, a prefix-cache hit can be
+served from several places: the block may still be resident in GPU memory, it may have to be copied
+back from host memory, read from disk, or fetched from an external KV store. The aggregate
+`trtllm_kv_cache_hit_rate`, `trtllm_kv_cache_iter_reused_blocks_total` and
+`trtllm_prompt_cached_tokens_total` do not distinguish these cases, and transfer volume
+(`trtllm_kv_cache_onboard_bytes_total`) cannot be used to reconstruct them because blocks are also
+moved for reasons other than a hit (request resume after preemption, prefetch). The KV cache manager
+therefore attributes every reused block to the tier it was served from **at the moment the block is
+matched, before any copy back to GPU**, and exports two additional Prometheus counters labeled with
+`cache_tier`:
+
+| Metric | Unit | Relationship to existing metrics |
+|---|---|---|
+| `trtllm_kv_cache_reused_blocks_by_tier_total{cache_tier}` | blocks, per iteration | summed over `cache_tier` equals `trtllm_kv_cache_iter_reused_blocks_total` |
+| `trtllm_prompt_cached_tokens_by_tier_total{cache_tier}` | tokens, per finished request | summed over `cache_tier` equals `trtllm_prompt_cached_tokens_total` for every request that carried an attribution |
+
+`cache_tier` takes the values below. Every reused block is attributed to exactly one tier.
+
+| `cache_tier` | Meaning | `KVCacheManager` (default) | `KVCacheManagerV2` |
+|---|---|---|---|
+| `gpu` | block resident in GPU memory when matched | primary pool | `GPU_MEM` tier |
+| `host` | block in the host (secondary) pool when matched, copied back to GPU for this request | secondary pool, transfer mode `DRAM` | `HOST_MEM` tier |
+| `disk` | block stored in a file when matched | secondary pool with `KvCacheTransferMode` `GDS` / `POSIX_DEBUG_FALLBACK` (executor API only) | `DISK` tier |
+| `remote` | whole blocks provided by the KV cache connector (external store) | connector-matched blocks | not yet supported (connector not available on V2) |
+| `none` | tokens skipped by prefix reuse whose KV was never loaded from any tier, i.e. blocks outside every sliding attention window of the model | SWA out-of-window anchors | stale sliding-window blocks |
+
+`none` only appears in the token counter: those tokens are counted in `prompt_cached_tokens_total`
+because the model does not recompute them, but no block is loaded, so they never appear in the block
+counter.
+
+The same split is also available per request in the OpenAI-compatible response as
+`usage.prompt_tokens_details.cached_tokens_details` (a `{tier: tokens}` map, omitted when the engine
+did not attribute the request) and in the `kvCacheStats` / `kvCacheIterationStats` sections of the
+iteration statistics (`reusedBlocksGpu`, `reusedBlocksHost`, `reusedBlocksDisk`, `reusedBlocksRemote`
+and their `iter*` counterparts).
+
+### Semantics
+
+- All `*_total` metrics are monotonic counters accumulated since process start and reset to zero only
+  when the server process restarts. Use `rate()` / `increase()` in PromQL.
+- Warmup requests are excluded: the cumulative counters subtract the values reached during warmup and
+  the per-iteration deltas accumulated during warmup are discarded, so the tier counters and the
+  aggregates they are compared against start from the same point.
+- Attribution is decided when the block is matched. If two requests in the same batch hit the same
+  host block, the first request is attributed to `host` (it triggers the copy) and the second to `gpu`
+  (the block is already back on the GPU when it is matched). Blocks that a disk prefetch moved to host
+  memory before the request was admitted are attributed to `host`.
+- The token split is derived from the request's `cached_tokens`, so the two request-level counters are
+  consistent even when the engine skips fewer tokens than the manager matched (block alignment, last
+  prompt token). With variable sliding-window attention the attribution follows the window that
+  determined the number of skipped tokens.
+- Disaggregated serving: prefix reuse happens on the context worker, so that is where the tier counters
+  move. The generation worker receives the prompt KV by transfer, which is neither a hit nor a miss;
+  its own counters do not change. The context worker's split travels with the request and is reported
+  in the final response's `usage.prompt_tokens_details.cached_tokens_details`.
+- `remote` also moves connector-provided whole blocks from the miss count to the reuse count of the
+  aggregate metrics, so `trtllm_kv_cache_hit_rate` reflects avoided recomputation when a connector is
+  used.

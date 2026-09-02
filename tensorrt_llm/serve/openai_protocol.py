@@ -156,6 +156,10 @@ class StreamOptions(OpenAIBaseModel):
 
 class PromptTokensDetails(OpenAIBaseModel):
     cached_tokens: int = 0
+    # cached_tokens split by the storage tier that served them
+    # (gpu / host / disk / remote / none, see tensorrt_llm.metrics.enums.CACHE_TIER_LABELS).
+    # Omitted when the engine did not attribute the reused prefix to tiers.
+    cached_tokens_details: Optional[Dict[str, int]] = None
 
 
 class UsageInfo(OpenAIBaseModel):

@@ -115,6 +115,10 @@ KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
     "iter_full_reused_blocks",
     "iter_partial_reused_blocks",
     "iter_missed_blocks",
+    "iter_reused_blocks_gpu",
+    "iter_reused_blocks_host",
+    "iter_reused_blocks_disk",
+    "iter_reused_blocks_remote",
 )
 KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
     field_name
@@ -2593,6 +2597,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.set_prepopulated_prompt_len(
                     kv_cache.num_committed_tokens, self.tokens_per_block
                 )
+                # Which storage tier served each reused token; LlmRequest turns this into
+                # cached_tokens_by_tier once cached_tokens is latched.
+                req.py_reuse_tier_segments = kv_cache.reuse_tier_segments
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
@@ -3292,6 +3299,10 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_stats.alloc_new_blocks = committed_stats.alloc_new_blocks
         kv_cache_stats.reused_blocks = committed_stats.reused_blocks
         kv_cache_stats.missed_blocks = committed_stats.missed_blocks
+        kv_cache_stats.reused_blocks_gpu = committed_stats.reused_blocks_gpu
+        kv_cache_stats.reused_blocks_host = committed_stats.reused_blocks_host
+        kv_cache_stats.reused_blocks_disk = committed_stats.reused_blocks_disk
+        kv_cache_stats.reused_blocks_remote = committed_stats.reused_blocks_remote
         total = kv_cache_stats.reused_blocks + kv_cache_stats.missed_blocks
         kv_cache_stats.cache_hit_rate = (
             0.0

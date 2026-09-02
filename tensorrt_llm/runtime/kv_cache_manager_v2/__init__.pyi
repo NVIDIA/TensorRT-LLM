@@ -74,6 +74,10 @@ class KVCacheStatsDelta:
     alloc_new_blocks: int = 0
     reused_blocks: int = 0
     missed_blocks: int = 0
+    reused_blocks_gpu: int = 0
+    reused_blocks_host: int = 0
+    reused_blocks_disk: int = 0
+    reused_blocks_remote: int = 0
 
 @dataclass(slots=True)
 class KVCacheIterationStatsDelta:
@@ -83,6 +87,10 @@ class KVCacheIterationStatsDelta:
     iter_full_reused_blocks: int = 0
     iter_partial_reused_blocks: int = 0
     iter_missed_blocks: int = 0
+    iter_reused_blocks_gpu: int = 0
+    iter_reused_blocks_host: int = 0
+    iter_reused_blocks_disk: int = 0
+    iter_reused_blocks_remote: int = 0
     iter_gen_alloc_blocks: int = 0
     iter_onboard_blocks: int = 0
     iter_onboard_bytes: int = 0
@@ -371,6 +379,8 @@ class _KVCache:
     ) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...
+    @property
+    def reuse_tier_segments(self) -> list[tuple[int, int]] | None: ...
     @property
     def committed_tokens(self) -> list[TokenIdExt]: ...
     @property

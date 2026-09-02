@@ -47,6 +47,13 @@ class KVCacheStatsDelta(_StatsDeltaMixin):
     alloc_new_blocks: int = 0
     reused_blocks: int = 0
     missed_blocks: int = 0
+    # Split of reused_blocks by the storage tier the page was on when matched
+    # (gpu + host + disk + remote == reused_blocks). remote stays 0 until the KV
+    # connector is supported on KVCacheManagerV2.
+    reused_blocks_gpu: int = 0
+    reused_blocks_host: int = 0
+    reused_blocks_disk: int = 0
+    reused_blocks_remote: int = 0
 
 
 @dataclass(slots=True)
@@ -57,6 +64,12 @@ class KVCacheIterationStatsDelta(_StatsDeltaMixin):
     iter_full_reused_blocks: int = 0
     iter_partial_reused_blocks: int = 0
     iter_missed_blocks: int = 0
+    # Split of iter_reused_blocks by storage tier at match time; the four sum to
+    # iter_reused_blocks.
+    iter_reused_blocks_gpu: int = 0
+    iter_reused_blocks_host: int = 0
+    iter_reused_blocks_disk: int = 0
+    iter_reused_blocks_remote: int = 0
     iter_gen_alloc_blocks: int = 0
     iter_onboard_blocks: int = 0
     iter_onboard_bytes: int = 0

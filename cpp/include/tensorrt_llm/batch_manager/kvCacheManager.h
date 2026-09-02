@@ -68,6 +68,18 @@ static constexpr SizeType32 kPrimaryLevel = 0;
 
 static constexpr SizeType32 kSecondaryLevel = 1;
 
+//! \brief Storage tier a reused block was served from, decided at claim time (before onboarding).
+//! The numeric values are shared with the Python side (tensorrt_llm/metrics/enums.py, CACHE_TIER_LABELS).
+enum class KvCacheTier : std::int8_t
+{
+    kGPU = 0,    //!< block resident in the primary (GPU) pool
+    kHOST = 1,   //!< block in the secondary pool backed by host memory (transfer mode DRAM)
+    kDISK = 2,   //!< block in the secondary pool backed by a file (transfer mode GDS / POSIX)
+    kREMOTE = 3, //!< tokens provided by the KV cache connector (external store)
+    kNONE = 4,   //!< tokens skipped by reuse but with no KV loaded from any tier (SWA out-of-window anchors)
+};
+static constexpr SizeType32 kNumKvCacheTiers = 5;
+
 // Extra block buffer allocated for SWA to be able to always keep "window size"
 // tokens held in the blocks.
 static constexpr SizeType32 kSWAExtraBlock = 1;
@@ -321,6 +333,12 @@ struct KvCacheStats
     SizeType32 missedBlocks;
     // Measuring the KV Cache reuse rate. cacheHitRate = reusedBlocks / (reusedBlocks + missedBlocks).
     float cacheHitRate;
+    // Breakdown of reusedBlocks by the storage tier the block was served from at claim time (see KvCacheTier).
+    // reusedBlocksGpu + reusedBlocksHost + reusedBlocksDisk + reusedBlocksRemote == reusedBlocks.
+    SizeType32 reusedBlocksGpu{0};
+    SizeType32 reusedBlocksHost{0};
+    SizeType32 reusedBlocksDisk{0};
+    SizeType32 reusedBlocksRemote{0};
     // Number of free blocks for every configured attention-window size.
     std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
     // GPU bytes allocated for KV-cache
@@ -363,6 +381,12 @@ struct KvCacheIterationStats
     SizeType32 iterPartialReusedBlocks{0}; // blocks partially matched in radix tree
     SizeType32 iterMissedBlocks{0};
     float iterCacheHitRate{0.0f};
+    // Breakdown of iterReusedBlocks by storage tier at claim time (see KvCacheTier); the four sum to
+    // iterReusedBlocks.
+    SizeType32 iterReusedBlocksGpu{0};
+    SizeType32 iterReusedBlocksHost{0};
+    SizeType32 iterReusedBlocksDisk{0};
+    SizeType32 iterReusedBlocksRemote{0};
     // Generation phase: block allocation
     SizeType32 iterGenAllocBlocks{0};
 
@@ -936,6 +960,10 @@ public:
         SizeType32 allocNewDelta{0};
         SizeType32 reusedDelta{0};
         SizeType32 missedDelta{0};
+        //! reusedDelta split by KvCacheTier (gpu, host, disk, remote).
+        std::array<SizeType32, 4> reusedByTierDelta{};
+        //! Ordered (tier, num tokens) runs over the reused prefix; the token counts sum to prepopulatedLen.
+        LlmRequest::ReuseTierSegments tierSegments;
     };
 
     //! \brief Result of Phase 1 (claim-only) of batch addSequence.
@@ -1090,6 +1118,12 @@ public:
     [[nodiscard]] SizeType32 getNumReusedBlocks() const noexcept
     {
         return mReusedBlocks;
+    }
+
+    //! \brief Number of reused blocks that were served from \p tier (gpu, host, disk or remote) when matched.
+    [[nodiscard]] SizeType32 getNumReusedBlocksByTier(KvCacheTier tier) const
+    {
+        return mReusedBlocksByTier.at(static_cast<size_t>(tier));
     }
 
     [[nodiscard]] SizeType32 getNumAllocatedBlocks() const
@@ -1353,9 +1387,11 @@ private:
         GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
 
     //! \brief Phase 2: Onboard claimed host blocks and allocate non-matching blocks.
-    //! \details Caller must hold mLookupTree->getMutex().
-    [[nodiscard]] SizeType32 onboardAndAllocateBlocks(
-        GenerationRequest& sequence, LlmRequest& llmRequest, ClaimResult& claimResult, bool isEnableBlockReuse);
+    //! \details Caller must hold mLookupTree->getMutex(). \p tierSegments receives the storage-tier
+    //!          attribution of the reused prefix (see LlmRequest::getReuseTierSegments), decided per block
+    //!          before it is onboarded.
+    [[nodiscard]] SizeType32 onboardAndAllocateBlocks(GenerationRequest& sequence, LlmRequest& llmRequest,
+        ClaimResult& claimResult, bool isEnableBlockReuse, LlmRequest::ReuseTierSegments& tierSegments);
 
     //! \brief Detach \p block and all its descendants from the lookup tree, and return
     //! unreferenced blocks to the eviction policy at min retention priority.
@@ -1449,6 +1485,9 @@ private:
     SizeType32 mPartialReusedBlocks;
     // Number of blocks that were reused (full + partial, context phase)
     SizeType32 mReusedBlocks;
+    // mReusedBlocks split by the storage tier the block was served from when matched, indexed by KvCacheTier
+    // (kGPU..kREMOTE); the four entries sum to mReusedBlocks.
+    std::array<SizeType32, 4> mReusedBlocksByTier{};
     // Number of unique blocks that were reused
     SizeType32 mReusedUniqueBlocks;
     // Number of blocks that were not reused (context phase)
@@ -1475,6 +1514,7 @@ private:
     SizeType32 mPrevAllocTotalBlocks{0};
     SizeType32 mPrevAllocNewBlocks{0};
     SizeType32 mPrevReusedBlocks{0};
+    std::array<SizeType32, 4> mPrevReusedBlocksByTier{};
     SizeType32 mPrevFullReusedBlocks{0};
     SizeType32 mPrevPartialReusedBlocks{0};
     SizeType32 mPrevMissedBlocks{0};
@@ -1723,6 +1763,11 @@ public:
     [[nodiscard]] SizeType32 getNumReusedBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumReusedBlocks(); });
+    }
+
+    [[nodiscard]] SizeType32 getNumReusedBlocksByTier(KvCacheTier tier) const
+    {
+        return sumWindows([tier](auto const& manager) { return manager.getNumReusedBlocksByTier(tier); });
     }
 
     [[nodiscard]] SizeType32 getNumMissedBlocks() const
@@ -2458,6 +2503,10 @@ public:
         kvCacheStats.allocNewBlocks = getNumAllocNewBlocks();
         kvCacheStats.reusedBlocks = getNumReusedBlocks();
         kvCacheStats.missedBlocks = getNumMissedBlocks();
+        kvCacheStats.reusedBlocksGpu = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kGPU);
+        kvCacheStats.reusedBlocksHost = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kHOST);
+        kvCacheStats.reusedBlocksDisk = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kDISK);
+        kvCacheStats.reusedBlocksRemote = mBlockManager.getNumReusedBlocksByTier(KvCacheTier::kREMOTE);
         kvCacheStats.cacheHitRate = kvCacheStats.reusedBlocks == 0 ? 0
                                                                    : static_cast<float>(kvCacheStats.reusedBlocks)
                 / static_cast<float>(kvCacheStats.reusedBlocks + kvCacheStats.missedBlocks);

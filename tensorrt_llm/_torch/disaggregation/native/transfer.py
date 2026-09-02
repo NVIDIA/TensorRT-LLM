@@ -2249,19 +2249,22 @@ class RxSession(RxSessionBase):
         """Read token data from the aux buffer slot into the given request."""
         assert self._aux_buffer is not None, "No aux_buffer set for this session"
         assert self.aux_slot is not None, "No aux_slot set for this session"
-        first_gen_tokens, draft_tokens, (prompt_tokens, cached_tokens) = (
+        first_gen_tokens, draft_tokens, (prompt_tokens, cached_tokens), cached_tokens_details = (
             self._aux_buffer.get_slot_data(self.aux_slot)
         )
         request.py_first_gen_tokens = first_gen_tokens  # type: ignore[attr-defined]
         request.py_draft_tokens = draft_tokens  # type: ignore[attr-defined]
         if request.py_disaggregated_params is not None:
+            prompt_tokens_details: dict = {"cached_tokens": cached_tokens}
+            if cached_tokens_details:
+                # Storage-tier split of the context worker's prefix reuse; the generation
+                # worker itself never sees those hits.
+                prompt_tokens_details["cached_tokens_details"] = cached_tokens_details
             request.py_disaggregated_params.ctx_usage = {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": 0,
                 "total_tokens": prompt_tokens,
-                "prompt_tokens_details": {
-                    "cached_tokens": cached_tokens,
-                },
+                "prompt_tokens_details": prompt_tokens_details,
             }
 
     def is_completed(self) -> bool:

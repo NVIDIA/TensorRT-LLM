@@ -2613,6 +2613,160 @@ TEST_F(KVCacheManagerTest, KVCacheManagerPerRequestStatsTest)
         static_cast<float>(numSharedBlocks) / static_cast<float>(numBlocks));
 }
 
+TEST_F(KVCacheManagerTest, KVCacheManagerReuseTierAttributionGpuTest)
+{
+    // Blocks that are still resident in the primary pool when matched are attributed to the gpu tier.
+    auto constexpr numLayers = 12;
+    auto constexpr numHeads = 6;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr maxSequenceLength = maxBlocksPerSeq * tokensPerBlock;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr blocksInPrimaryPool = 16;
+    auto constexpr blocksInSecondaryPool = 0;
+
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto constexpr beamWidth = 1;
+    SizeType32 constexpr maxNewTokens{8};
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const maxAttentionWindow = tokensPerBlock * maxBlocksPerSeq;
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        maxSequenceLength, maxSequenceLength, true);
+    kvCacheManager.allocatePools(false);
+
+    // 12 tokens -> blocks [0,1,2,3], [4,5,6,7], [8,9,10] are stored for reuse (last token is never reusable).
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+    auto const inputLength = static_cast<SizeType32>(inputTokens->size());
+    auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch({{{0, inputLength, beamWidth}}}, {std::ref(*llmRequest0)});
+    EXPECT_TRUE(llmRequest0->getReuseTierSegments().empty());
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
+    (void) kvCacheManager.removeSequence(0, llmRequest0);
+
+    // Same prompt again: two full blocks plus the partial [8,9,10] block, all still in primary memory.
+    auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch({{{1, inputLength, beamWidth}}}, {std::ref(*llmRequest1)});
+    EXPECT_EQ(llmRequest1->getPrepopulatedPromptLen(), 11);
+
+    auto const stats = kvCacheManager.getKvCacheStats();
+    EXPECT_EQ(stats.reusedBlocks, 3);
+    EXPECT_EQ(stats.reusedBlocksGpu, 3);
+    EXPECT_EQ(stats.reusedBlocksHost, 0);
+    EXPECT_EQ(stats.reusedBlocksDisk, 0);
+    EXPECT_EQ(stats.reusedBlocksRemote, 0);
+
+    auto const iterStats = kvCacheManager.getIterationStats().at(maxAttentionWindow);
+    EXPECT_EQ(iterStats.iterReusedBlocks, 3);
+    EXPECT_EQ(iterStats.iterReusedBlocksGpu, 3);
+    EXPECT_EQ(iterStats.iterReusedBlocksHost, 0);
+    EXPECT_EQ(iterStats.iterReusedBlocksDisk, 0);
+    EXPECT_EQ(iterStats.iterReusedBlocksRemote, 0);
+
+    // One run of 11 gpu tokens, matching the prepopulated length.
+    auto const& segments = llmRequest1->getReuseTierSegments();
+    ASSERT_EQ(segments.size(), 1U);
+    EXPECT_EQ(segments[0].first, static_cast<std::int8_t>(KvCacheTier::kGPU));
+    EXPECT_EQ(segments[0].second, llmRequest1->getPrepopulatedPromptLen());
+
+    // Deltas were consumed by the previous read.
+    auto const iterStatsAgain = kvCacheManager.getIterationStats().at(maxAttentionWindow);
+    EXPECT_EQ(iterStatsAgain.iterReusedBlocks, 0);
+    EXPECT_EQ(iterStatsAgain.iterReusedBlocksGpu, 0);
+}
+
+TEST_F(KVCacheManagerTest, KVCacheManagerReuseTierAttributionHostTest)
+{
+    // Blocks that were offloaded to the secondary pool before being matched are attributed to the host tier,
+    // decided before the onboard copy brings them back to the primary pool.
+    auto constexpr numLayers = 12;
+    auto constexpr numHeads = 6;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr maxSequenceLength = tokensPerBlock * maxBlocksPerSeq;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 4;
+
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto constexpr beamWidth = 1;
+    SizeType32 constexpr maxNewTokens = 8;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const maxAttentionWindow = tokensPerBlock * maxBlocksPerSeq;
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        maxSequenceLength, maxSequenceLength, true);
+    kvCacheManager.allocatePools(false);
+
+    // Same setup as KVCacheManagerSecondaryBlockPrimaryChildTest: request 0 stores [0,1,2,3], [4,5,6,7], [8,9,10]
+    // in blocks 0, 1, 2 ...
+    auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+    auto const inputLength0 = static_cast<SizeType32>(inputTokens0->size());
+    auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch({{{0, inputLength0, beamWidth}}}, {std::ref(*llmRequest0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
+    (void) kvCacheManager.removeSequence(0, llmRequest0);
+
+    // ... and request 1 matches nothing, takes the last free primary block and evicts blocks 2 and 1 to the
+    // secondary pool. Block 0 ([0,1,2,3]) stays primary, block 1 ([4,5,6,7]) is now in host memory.
+    auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+    auto const inputLength1 = static_cast<SizeType32>(inputTokens1->size());
+    auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch({{{1, inputLength1, beamWidth}}}, {std::ref(*llmRequest1)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest1);
+    (void) kvCacheManager.removeSequence(1, llmRequest1);
+    EXPECT_EQ(kvCacheManager.getKvCacheStats().reusedBlocks, 0);
+
+    // 9 tokens -> the first 8 are looked up: block 0 is a gpu hit, block 1 has to be onboarded from host.
+    auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
+    auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch({{{2, inputLength2, beamWidth}}}, {std::ref(*llmRequest2)});
+    EXPECT_EQ(llmRequest2->getPrepopulatedPromptLen(), 8);
+
+    auto const stats = kvCacheManager.getKvCacheStats();
+    EXPECT_EQ(stats.reusedBlocks, 2);
+    EXPECT_EQ(stats.reusedBlocksGpu, 1);
+    EXPECT_EQ(stats.reusedBlocksHost, 1);
+    EXPECT_EQ(stats.reusedBlocksDisk, 0);
+    EXPECT_EQ(stats.reusedBlocksRemote, 0);
+
+    auto const iterStats = kvCacheManager.getIterationStats().at(maxAttentionWindow);
+    EXPECT_EQ(iterStats.iterReusedBlocks, 2);
+    EXPECT_EQ(iterStats.iterReusedBlocksGpu, 1);
+    EXPECT_EQ(iterStats.iterReusedBlocksHost, 1);
+    EXPECT_EQ(iterStats.iterReusedBlocksDisk, 0);
+    EXPECT_EQ(iterStats.iterReusedBlocksRemote, 0);
+    // The host hit is the block that was onboarded.
+    EXPECT_EQ(iterStats.iterOnboardBlocks, 1);
+
+    // Segments follow prompt order: 4 gpu tokens, then 4 host tokens, summing to the prepopulated length.
+    auto const& segments = llmRequest2->getReuseTierSegments();
+    ASSERT_EQ(segments.size(), 2U);
+    EXPECT_EQ(segments[0].first, static_cast<std::int8_t>(KvCacheTier::kGPU));
+    EXPECT_EQ(segments[0].second, tokensPerBlock);
+    EXPECT_EQ(segments[1].first, static_cast<std::int8_t>(KvCacheTier::kHOST));
+    EXPECT_EQ(segments[1].second, tokensPerBlock);
+    SizeType32 numAttributedTokens = 0;
+    for (auto const& [tier, numTokens] : segments)
+    {
+        numAttributedTokens += numTokens;
+    }
+    EXPECT_EQ(numAttributedTokens, llmRequest2->getPrepopulatedPromptLen());
+}
+
 TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
 {
     auto constexpr numLayers = 12;

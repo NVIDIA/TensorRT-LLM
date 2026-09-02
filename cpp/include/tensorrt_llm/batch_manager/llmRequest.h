@@ -102,6 +102,7 @@ public:
     using SizeType32 = runtime::SizeType32;
     using TokenIdType = runtime::TokenIdType;
     using RequestIdType = std::uint64_t;
+    using ReuseTierSegments = std::vector<std::pair<std::int8_t, SizeType32>>;
     using LoraTaskIdType = runtime::LoraTaskIdType;
     using VecTokens = std::vector<TokenIdType>;
     using TokenExtraIdType = runtime::TokenExtraIdType;
@@ -962,6 +963,7 @@ public:
         mContextCurrentPositionDraft = 0;
         mPrepopulatedPromptLenTarget = 0;
         mPrepopulatedPromptLenDraft = 0;
+        mReuseTierSegments.clear();
         mContextChunkSizeTarget = mPromptLen;
         mContextChunkSizeDraft = mPromptLen;
         mEstimatedReusableTokens = 0;
@@ -1204,6 +1206,20 @@ public:
     [[nodiscard]] SizeType32 getPrepopulatedPromptLen() const
     {
         return mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
+    }
+
+    /// @brief Ordered (storage tier, num tokens) runs over the prompt prefix reused from the KV cache, recorded by
+    ///        the KV cache manager when the sequence is added. Tier values follow kv_cache_manager::KvCacheTier
+    ///        (0 gpu, 1 host, 2 disk, 3 remote, 4 none); the token counts sum to the manager-side prepopulated
+    ///        length. Empty when nothing was reused or block reuse is disabled.
+    [[nodiscard]] ReuseTierSegments const& getReuseTierSegments() const noexcept
+    {
+        return mReuseTierSegments;
+    }
+
+    void setReuseTierSegments(ReuseTierSegments segments)
+    {
+        mReuseTierSegments = std::move(segments);
     }
 
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
@@ -2132,6 +2148,8 @@ protected:
     // Up to inputLen - 1 tokens can be reused.
     SizeType32 mPrepopulatedPromptLenTarget{0};
     SizeType32 mPrepopulatedPromptLenDraft{0};
+    // Storage-tier attribution of the reused prefix, see getReuseTierSegments().
+    ReuseTierSegments mReuseTierSegments;
 
     // Estimated number of reusable tokens from the KV cache radix tree.
     // Set by the capacity scheduler (during getNeededBlocksOneStep /

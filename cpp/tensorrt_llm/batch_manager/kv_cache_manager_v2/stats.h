@@ -33,6 +33,12 @@ struct KVCacheStatsDelta
     int64_t allocNewBlocks = 0;
     int64_t reusedBlocks = 0;
     int64_t missedBlocks = 0;
+    // Split of reusedBlocks by the storage tier the page was on when matched
+    // (gpu + host + disk + remote == reusedBlocks). Mirrors Python's KVCacheStatsDelta.
+    int64_t reusedBlocksGpu = 0;
+    int64_t reusedBlocksHost = 0;
+    int64_t reusedBlocksDisk = 0;
+    int64_t reusedBlocksRemote = 0;
 
     void add(KVCacheStatsDelta const& other) noexcept
     {
@@ -40,6 +46,10 @@ struct KVCacheStatsDelta
         allocNewBlocks += other.allocNewBlocks;
         reusedBlocks += other.reusedBlocks;
         missedBlocks += other.missedBlocks;
+        reusedBlocksGpu += other.reusedBlocksGpu;
+        reusedBlocksHost += other.reusedBlocksHost;
+        reusedBlocksDisk += other.reusedBlocksDisk;
+        reusedBlocksRemote += other.reusedBlocksRemote;
     }
 
     void subtract(KVCacheStatsDelta const& other) noexcept
@@ -48,6 +58,10 @@ struct KVCacheStatsDelta
         allocNewBlocks -= other.allocNewBlocks;
         reusedBlocks -= other.reusedBlocks;
         missedBlocks -= other.missedBlocks;
+        reusedBlocksGpu -= other.reusedBlocksGpu;
+        reusedBlocksHost -= other.reusedBlocksHost;
+        reusedBlocksDisk -= other.reusedBlocksDisk;
+        reusedBlocksRemote -= other.reusedBlocksRemote;
     }
 
     void clear() noexcept
@@ -62,13 +76,16 @@ struct KVCacheStatsDelta
 
     [[nodiscard]] bool empty() const noexcept
     {
-        return allocTotalBlocks == 0 && allocNewBlocks == 0 && reusedBlocks == 0 && missedBlocks == 0;
+        return allocTotalBlocks == 0 && allocNewBlocks == 0 && reusedBlocks == 0 && missedBlocks == 0
+            && reusedBlocksGpu == 0 && reusedBlocksHost == 0 && reusedBlocksDisk == 0 && reusedBlocksRemote == 0;
     }
 
     [[nodiscard]] bool operator==(KVCacheStatsDelta const& other) const noexcept
     {
         return allocTotalBlocks == other.allocTotalBlocks && allocNewBlocks == other.allocNewBlocks
-            && reusedBlocks == other.reusedBlocks && missedBlocks == other.missedBlocks;
+            && reusedBlocks == other.reusedBlocks && missedBlocks == other.missedBlocks
+            && reusedBlocksGpu == other.reusedBlocksGpu && reusedBlocksHost == other.reusedBlocksHost
+            && reusedBlocksDisk == other.reusedBlocksDisk && reusedBlocksRemote == other.reusedBlocksRemote;
     }
 };
 
@@ -80,6 +97,11 @@ struct KVCacheIterationStatsDelta
     int64_t iterFullReusedBlocks = 0;
     int64_t iterPartialReusedBlocks = 0;
     int64_t iterMissedBlocks = 0;
+    // Split of iterReusedBlocks by storage tier at match time; the four sum to iterReusedBlocks.
+    int64_t iterReusedBlocksGpu = 0;
+    int64_t iterReusedBlocksHost = 0;
+    int64_t iterReusedBlocksDisk = 0;
+    int64_t iterReusedBlocksRemote = 0;
     int64_t iterGenAllocBlocks = 0;
     int64_t iterOnboardBlocks = 0;
     int64_t iterOnboardBytes = 0;
@@ -98,6 +120,10 @@ struct KVCacheIterationStatsDelta
         iterFullReusedBlocks += other.iterFullReusedBlocks;
         iterPartialReusedBlocks += other.iterPartialReusedBlocks;
         iterMissedBlocks += other.iterMissedBlocks;
+        iterReusedBlocksGpu += other.iterReusedBlocksGpu;
+        iterReusedBlocksHost += other.iterReusedBlocksHost;
+        iterReusedBlocksDisk += other.iterReusedBlocksDisk;
+        iterReusedBlocksRemote += other.iterReusedBlocksRemote;
         iterGenAllocBlocks += other.iterGenAllocBlocks;
         iterOnboardBlocks += other.iterOnboardBlocks;
         iterOnboardBytes += other.iterOnboardBytes;
@@ -117,6 +143,10 @@ struct KVCacheIterationStatsDelta
         iterFullReusedBlocks -= other.iterFullReusedBlocks;
         iterPartialReusedBlocks -= other.iterPartialReusedBlocks;
         iterMissedBlocks -= other.iterMissedBlocks;
+        iterReusedBlocksGpu -= other.iterReusedBlocksGpu;
+        iterReusedBlocksHost -= other.iterReusedBlocksHost;
+        iterReusedBlocksDisk -= other.iterReusedBlocksDisk;
+        iterReusedBlocksRemote -= other.iterReusedBlocksRemote;
         iterGenAllocBlocks -= other.iterGenAllocBlocks;
         iterOnboardBlocks -= other.iterOnboardBlocks;
         iterOnboardBytes -= other.iterOnboardBytes;
@@ -142,9 +172,10 @@ struct KVCacheIterationStatsDelta
     {
         return iterAllocTotalBlocks == 0 && iterAllocNewBlocks == 0 && iterReusedBlocks == 0
             && iterFullReusedBlocks == 0 && iterPartialReusedBlocks == 0 && iterMissedBlocks == 0
-            && iterGenAllocBlocks == 0 && iterOnboardBlocks == 0 && iterOnboardBytes == 0 && iterOffloadBlocks == 0
-            && iterOffloadBytes == 0 && iterIntraDeviceCopyBlocks == 0 && iterIntraDeviceCopyBytes == 0
-            && iterHostDroppedBlocks == 0 && iterHostDroppedBytes == 0;
+            && iterReusedBlocksGpu == 0 && iterReusedBlocksHost == 0 && iterReusedBlocksDisk == 0
+            && iterReusedBlocksRemote == 0 && iterGenAllocBlocks == 0 && iterOnboardBlocks == 0 && iterOnboardBytes == 0
+            && iterOffloadBlocks == 0 && iterOffloadBytes == 0 && iterIntraDeviceCopyBlocks == 0
+            && iterIntraDeviceCopyBytes == 0 && iterHostDroppedBlocks == 0 && iterHostDroppedBytes == 0;
     }
 
     [[nodiscard]] double iterCacheHitRate() const noexcept
@@ -162,9 +193,11 @@ struct KVCacheIterationStatsDelta
         return iterAllocTotalBlocks == other.iterAllocTotalBlocks && iterAllocNewBlocks == other.iterAllocNewBlocks
             && iterReusedBlocks == other.iterReusedBlocks && iterFullReusedBlocks == other.iterFullReusedBlocks
             && iterPartialReusedBlocks == other.iterPartialReusedBlocks && iterMissedBlocks == other.iterMissedBlocks
-            && iterGenAllocBlocks == other.iterGenAllocBlocks && iterOnboardBlocks == other.iterOnboardBlocks
-            && iterOnboardBytes == other.iterOnboardBytes && iterOffloadBlocks == other.iterOffloadBlocks
-            && iterOffloadBytes == other.iterOffloadBytes
+            && iterReusedBlocksGpu == other.iterReusedBlocksGpu && iterReusedBlocksHost == other.iterReusedBlocksHost
+            && iterReusedBlocksDisk == other.iterReusedBlocksDisk
+            && iterReusedBlocksRemote == other.iterReusedBlocksRemote && iterGenAllocBlocks == other.iterGenAllocBlocks
+            && iterOnboardBlocks == other.iterOnboardBlocks && iterOnboardBytes == other.iterOnboardBytes
+            && iterOffloadBlocks == other.iterOffloadBlocks && iterOffloadBytes == other.iterOffloadBytes
             && iterIntraDeviceCopyBlocks == other.iterIntraDeviceCopyBlocks
             && iterIntraDeviceCopyBytes == other.iterIntraDeviceCopyBytes
             && iterHostDroppedBlocks == other.iterHostDroppedBlocks

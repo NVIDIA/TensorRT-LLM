@@ -6,12 +6,14 @@ import itertools
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import (TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Union,
-                    cast)
+from typing import (TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Tuple,
+                    Union, cast)
 
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
+    split_cached_tokens_by_tier
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
@@ -827,6 +829,9 @@ class LlmResult:
         self._py_result = py_result
         self.is_final = is_final
         self.cached_tokens = 0
+        # cached_tokens split by storage tier (see tensorrt_llm.metrics.enums.CACHE_TIER_LABELS);
+        # empty when the KV cache manager reported no tier attribution for the request.
+        self.cached_tokens_by_tier: Dict[str, int] = {}
         # Cumulative (accepted, drafted) speculative-decoding draft-token
         # totals from the PyTorch executor; used to backfill
         # RequestPerfMetrics.speculative_decoding on the client side
@@ -1117,6 +1122,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self._cached_tokens = value
             self._cached_tokens_set = True
 
+    @property
+    def cached_tokens_by_tier(self) -> Dict[str, int]:
+        """``cached_tokens`` split by the storage tier that served them.
+
+        Keys follow ``tensorrt_llm.metrics.enums.CACHE_TIER_LABELS`` and the values sum to
+        ``cached_tokens``. Derived from the ``(tier, num tokens)`` segments the KV cache manager
+        recorded when the prefix was matched, so it is empty until the manager reports them
+        (e.g. requests whose KV arrives by disaggregated transfer, or managers without tier support).
+        """
+        return split_cached_tokens_by_tier(self.py_reuse_tier_segments,
+                                           self._cached_tokens)
+
     def _initialize_execution_state(self,
                                     *,
                                     seq_slot: Optional[int],
@@ -1169,6 +1186,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_ctx_pre_resize_cap = None
         self._cached_tokens = 0
         self._cached_tokens_set = False
+        # Set by the KV cache manager when the prefix is matched; see cached_tokens_by_tier.
+        self.py_reuse_tier_segments: Optional[List[Tuple[int, int]]] = None
 
     def reset_for_recompute(self, max_input_len: int) -> None:
         """Reset Python-side execution state so the request can replay prefill."""

@@ -14,7 +14,39 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Optional, Sequence
+
+from tensorrt_llm.metrics.enums import CACHE_TIER_LABELS
+
+
+def split_cached_tokens_by_tier(
+    segments: Optional[Sequence[tuple[int, int]]], num_tokens: int
+) -> dict[str, int]:
+    """Attribute the first ``num_tokens`` reused prompt tokens to storage tiers.
+
+    ``segments`` are the ordered ``(tier index, num tokens)`` runs a KV cache manager recorded when
+    the request's prefix was matched (indices follow ``CACHE_TIER_LABELS``). ``num_tokens`` is the
+    request's latched ``cached_tokens``, a prefix of the matched tokens, so the returned counts always
+    sum to ``num_tokens`` (the manager may have matched more than the engine ends up skipping). Returns
+    an empty dict when no attribution is available or nothing was cached.
+    """
+    if not segments or num_tokens <= 0:
+        return {}
+    by_tier: dict[str, int] = {}
+    remaining = num_tokens
+    for tier, tokens in segments:
+        if remaining <= 0:
+            break
+        take = min(tokens, remaining)
+        remaining -= take
+        label = CACHE_TIER_LABELS[tier]
+        by_tier[label] = by_tier.get(label, 0) + take
+    if remaining > 0:
+        # More tokens were skipped than the manager attributed (should not happen); keep the
+        # sum invariant and make the gap visible instead of guessing a tier.
+        by_tier["none"] = by_tier.get("none", 0) + remaining
+    return by_tier
+
 
 KV_CACHE_ITERATION_STATS_REUSE_KEYS = (
     "iterReusedBlocks",
@@ -22,6 +54,10 @@ KV_CACHE_ITERATION_STATS_REUSE_KEYS = (
     "iterPartialReusedBlocks",
     "iterMissedBlocks",
     "iterCacheHitRate",
+    "iterReusedBlocksGpu",
+    "iterReusedBlocksHost",
+    "iterReusedBlocksDisk",
+    "iterReusedBlocksRemote",
 )
 
 # Hot pool groups hold no cold blocks, and cold levels group lifecycles independently of the hot
@@ -144,6 +180,10 @@ def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = Non
         "iterPartialReusedBlocks": stats.iter_partial_reused_blocks,
         "iterMissedBlocks": stats.iter_missed_blocks,
         "iterCacheHitRate": stats.iter_cache_hit_rate,
+        "iterReusedBlocksGpu": stats.iter_reused_blocks_gpu,
+        "iterReusedBlocksHost": stats.iter_reused_blocks_host,
+        "iterReusedBlocksDisk": stats.iter_reused_blocks_disk,
+        "iterReusedBlocksRemote": stats.iter_reused_blocks_remote,
         "iterGenAllocBlocks": stats.iter_gen_alloc_blocks,
         "iterOnboardBlocks": stats.iter_onboard_blocks,
         "iterOnboardBytes": stats.iter_onboard_bytes,

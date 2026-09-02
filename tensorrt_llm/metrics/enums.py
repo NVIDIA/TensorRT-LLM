@@ -14,6 +14,21 @@
 # limitations under the License.
 from enum import Enum
 
+# Storage tier a reused KV cache block was served from, decided by the KV cache
+# manager when the block is matched (before any onboarding copy). The tuple index
+# is the wire value shared with the C++ ``KvCacheTier`` enum
+# (cpp/include/tensorrt_llm/batch_manager/kvCacheManager.h) and with the
+# ``(tier, num_tokens)`` segments the managers attach to requests.
+#   gpu    - block resident in GPU memory
+#   host   - block in the host (secondary) pool
+#   disk   - block in a file-backed secondary pool
+#   remote - tokens provided by the KV cache connector (external store)
+#   none   - tokens skipped by reuse but not loaded from any tier (e.g. blocks
+#            outside every sliding attention window); only used for token counts
+CACHE_TIER_LABELS = ("gpu", "host", "disk", "remote", "none")
+# Tiers that describe where a *block* physically came from (block counters).
+CACHE_TIER_BLOCK_LABELS = CACHE_TIER_LABELS[:4]
+
 
 class MetricNames(Enum):
     TTFT = "ttft"
@@ -27,6 +42,7 @@ class MetricNames(Enum):
     PROMPT_TOKENS = "prompt_tokens"
     GENERATION_TOKENS = "generation_tokens"
     PROMPT_CACHE_CACHED_TOKENS = "prompt_cache_cached_tokens"
+    PROMPT_CACHE_CACHED_TOKENS_BY_TIER = "prompt_cache_cached_tokens_by_tier"
     SPEC_DEC_ACCEPTED_PER_POS = "spec_dec_accepted_per_pos"
     SPEC_DEC_DRAFTED_PER_POS = "spec_dec_drafted_per_pos"
     PREFILL_PERPLEXITY = "prefill_perplexity"

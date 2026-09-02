@@ -175,21 +175,39 @@ class _PendingStats:
         *,
         full_reused_blocks: int,
         partial_reused_blocks: int,
+        reused_blocks_by_tier: tuple[int, int, int, int] = (0, 0, 0, 0),
         record_manager_stats: bool,
         record_request_stats: bool,
     ) -> bool:
         reused_blocks = full_reused_blocks + partial_reused_blocks
         if reused_blocks == 0 or not (record_manager_stats or record_request_stats):
             return False
+        # (gpu, host, disk, remote) block counts; every counted block has exactly one tier.
+        gpu, host, disk, remote = reused_blocks_by_tier
+        assert gpu + host + disk + remote == reused_blocks, (
+            f"tier split {reused_blocks_by_tier} does not sum to {reused_blocks} reused blocks"
+        )
         return self.add(
             _PendingStatsDelta(
                 global_stats=(
-                    KVCacheStatsDelta(reused_blocks=reused_blocks)
+                    KVCacheStatsDelta(
+                        reused_blocks=reused_blocks,
+                        reused_blocks_gpu=gpu,
+                        reused_blocks_host=host,
+                        reused_blocks_disk=disk,
+                        reused_blocks_remote=remote,
+                    )
                     if record_manager_stats
                     else KVCacheStatsDelta()
                 ),
                 request_stats=(
-                    KVCacheStatsDelta(reused_blocks=reused_blocks)
+                    KVCacheStatsDelta(
+                        reused_blocks=reused_blocks,
+                        reused_blocks_gpu=gpu,
+                        reused_blocks_host=host,
+                        reused_blocks_disk=disk,
+                        reused_blocks_remote=remote,
+                    )
                     if record_request_stats
                     else KVCacheStatsDelta()
                 ),
@@ -198,6 +216,10 @@ class _PendingStats:
                         iter_reused_blocks=reused_blocks,
                         iter_full_reused_blocks=full_reused_blocks,
                         iter_partial_reused_blocks=partial_reused_blocks,
+                        iter_reused_blocks_gpu=gpu,
+                        iter_reused_blocks_host=host,
+                        iter_reused_blocks_disk=disk,
+                        iter_reused_blocks_remote=remote,
                     )
                     if record_manager_stats
                     else KVCacheIterationStatsDelta()

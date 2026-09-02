@@ -716,6 +716,7 @@ class KVCacheManager(BaseResourceManager):
         # Warmup baseline for cumulative counters (set by snapshot_warmup_baseline)
         self._warmup_reused_blocks = 0
         self._warmup_missed_blocks = 0
+        self._warmup_reused_blocks_by_tier = (0, 0, 0, 0)
 
         self.impl.allocate_pools(False)
         self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
@@ -1106,6 +1107,11 @@ class KVCacheManager(BaseResourceManager):
                 self.impl.add_sequence_batch(batch_request_infos,
                                              batch_llm_requests)
                 for req in batch_llm_requests:
+                    # Storage tier of each reused prefix token, decided by the C++
+                    # manager while adding the sequence; LlmRequest.cached_tokens_by_tier
+                    # derives the per-tier split from it once cached_tokens is latched.
+                    req.py_reuse_tier_segments = list(
+                        req.reuse_tier_segments) or None
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
                     for _ in range(get_draft_token_length(req)):
@@ -1940,6 +1946,11 @@ class KVCacheManager(BaseResourceManager):
         # real inference traffic, not dummy requests from warmup.
         stats.reused_blocks -= self._warmup_reused_blocks
         stats.missed_blocks -= self._warmup_missed_blocks
+        gpu, host, disk, remote = self._warmup_reused_blocks_by_tier
+        stats.reused_blocks_gpu -= gpu
+        stats.reused_blocks_host -= host
+        stats.reused_blocks_disk -= disk
+        stats.reused_blocks_remote -= remote
         # Recompute cache hit rate from adjusted values.
         total = stats.reused_blocks + stats.missed_blocks
         stats.cache_hit_rate = (stats.reused_blocks /
@@ -1955,6 +1966,10 @@ class KVCacheManager(BaseResourceManager):
         raw = self.impl.get_kv_cache_stats()
         self._warmup_reused_blocks = raw.reused_blocks
         self._warmup_missed_blocks = raw.missed_blocks
+        self._warmup_reused_blocks_by_tier = (raw.reused_blocks_gpu,
+                                              raw.reused_blocks_host,
+                                              raw.reused_blocks_disk,
+                                              raw.reused_blocks_remote)
 
     def get_iteration_stats(self):
         """Get per-iteration KV cache stats keyed by window size. Resets deltas on each call."""

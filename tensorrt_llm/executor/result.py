@@ -186,6 +186,9 @@ class GenerationResultBase:
         self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
+        # cached_tokens split by storage tier (gpu/host/disk/remote/none); empty when
+        # the engine reported no attribution for this request.
+        self.cached_tokens_by_tier: dict[str, int] = {}
         self.per_pos_drafted = None
         self.per_pos_accepted = None
         # Cumulative (accepted, drafted) draft-token totals attached by the
@@ -576,6 +579,8 @@ class GenerationResultBase:
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
+            self.cached_tokens_by_tier = getattr(
+                response_result, 'cached_tokens_by_tier', None) or {}
             self.per_pos_drafted = getattr(response_result, 'per_pos_drafted',
                                            None)
             self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',
@@ -724,6 +729,9 @@ class GenerationResultBase:
         if output.finish_reason and sequence_index == 0:
             metrics_stats[MetricNames.PROMPT_CACHE_CACHED_TOKENS] = \
                 self.cached_tokens
+            if self.cached_tokens_by_tier:
+                metrics_stats[MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER] = \
+                    dict(self.cached_tokens_by_tier)
 
             spec_dec_logged = False
             if self.per_pos_drafted is not None and any(

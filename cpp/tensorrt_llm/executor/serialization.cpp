@@ -1925,9 +1925,14 @@ KvCacheStats Serialization::deserializeKvCacheStats(std::istream& is)
     auto reusedBlocks = su::deserialize<SizeType32>(is);
     auto missedBlocks = su::deserialize<SizeType32>(is);
     auto cacheHitRate = su::deserialize<float>(is);
+    auto reusedBlocksGpu = su::deserialize<SizeType32>(is);
+    auto reusedBlocksHost = su::deserialize<SizeType32>(is);
+    auto reusedBlocksDisk = su::deserialize<SizeType32>(is);
+    auto reusedBlocksRemote = su::deserialize<SizeType32>(is);
 
     return KvCacheStats{maxNumBlocks, freeNumBlocks, usedNumBlocks, tokensPerBlock, allocTotalBlocks, allocNewBlocks,
-        reusedBlocks, missedBlocks, cacheHitRate};
+        reusedBlocks, missedBlocks, cacheHitRate, reusedBlocksGpu, reusedBlocksHost, reusedBlocksDisk,
+        reusedBlocksRemote};
 }
 
 void Serialization::serialize(KvCacheStats const& kvCacheStats, std::ostream& os)
@@ -1941,6 +1946,10 @@ void Serialization::serialize(KvCacheStats const& kvCacheStats, std::ostream& os
     su::serialize(kvCacheStats.reusedBlocks, os);
     su::serialize(kvCacheStats.missedBlocks, os);
     su::serialize(kvCacheStats.cacheHitRate, os);
+    su::serialize(kvCacheStats.reusedBlocksGpu, os);
+    su::serialize(kvCacheStats.reusedBlocksHost, os);
+    su::serialize(kvCacheStats.reusedBlocksDisk, os);
+    su::serialize(kvCacheStats.reusedBlocksRemote, os);
 }
 
 size_t Serialization::serializedSize(KvCacheStats const& kvCacheStats)
@@ -1955,6 +1964,10 @@ size_t Serialization::serializedSize(KvCacheStats const& kvCacheStats)
     totalSize += su::serializedSize(kvCacheStats.reusedBlocks);
     totalSize += su::serializedSize(kvCacheStats.missedBlocks);
     totalSize += su::serializedSize(kvCacheStats.cacheHitRate);
+    totalSize += su::serializedSize(kvCacheStats.reusedBlocksGpu);
+    totalSize += su::serializedSize(kvCacheStats.reusedBlocksHost);
+    totalSize += su::serializedSize(kvCacheStats.reusedBlocksDisk);
+    totalSize += su::serializedSize(kvCacheStats.reusedBlocksRemote);
     return totalSize;
 }
 

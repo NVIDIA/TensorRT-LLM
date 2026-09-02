@@ -2438,12 +2438,18 @@ class OpenAIServer(_VideoRoutesMixin):
             all_choices: List[CompletionResponseChoice] = []
             all_prompt_token_ids: List[List[int]] = []
             num_prompt_tokens = num_gen_tokens = num_cached_tokens = 0
+            cached_tokens_details: dict[str, int] = {}
             for rsp in responses:
                 choices, usage = rsp.choices, rsp.usage
                 all_choices.extend(choices)
                 num_prompt_tokens += usage.prompt_tokens
                 num_gen_tokens += usage.completion_tokens
                 num_cached_tokens += usage.prompt_tokens_details.cached_tokens
+                for tier, count in (
+                        usage.prompt_tokens_details.cached_tokens_details
+                        or {}).items():
+                    cached_tokens_details[tier] = cached_tokens_details.get(
+                        tier, 0) + count
                 # Aggregate prompt token ids for context-only requests
                 if rsp.prompt_token_ids is not None:
                     all_prompt_token_ids.append(rsp.prompt_token_ids)
@@ -2453,7 +2459,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 completion_tokens=num_gen_tokens,
                 total_tokens=num_gen_tokens + num_prompt_tokens,
                 prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=num_cached_tokens, ),
+                    cached_tokens=num_cached_tokens,
+                    cached_tokens_details=cached_tokens_details or None),
             )
             merged_rsp = CompletionResponse(
                 model=self.model,

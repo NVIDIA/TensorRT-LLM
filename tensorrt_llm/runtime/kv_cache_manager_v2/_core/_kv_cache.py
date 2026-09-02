@@ -34,6 +34,7 @@ from .._common import (
     BlockOrdinal,
     BlockOrdinalT,
     CacheLevel,
+    CacheTier,
     CudaStream,
     PageIndex,
     PageIndexMode,
@@ -221,6 +222,46 @@ IndexSeq = array.array | memoryview
 # three lengths equal to the number of reused tokens.
 # TODO: in __del__, we should check if committed pages are usable for SWA cases. e.g. all pages are
 # dropped except the last one. The last one is not usable.
+# Wire values of tensorrt_llm.metrics.enums.CACHE_TIER_LABELS.
+_TIER_INDEX_BY_CACHE_TIER: dict[CacheTier, int] = {
+    CacheTier.GPU_MEM: 0,
+    CacheTier.HOST_MEM: 1,
+    CacheTier.DISK: 2,
+}
+_TIER_INDEX_NONE = 4
+
+
+def _cache_tier_index(tier: CacheTier) -> int:
+    return _TIER_INDEX_BY_CACHE_TIER[tier]
+
+
+def _build_reuse_tier_segments(
+    block_levels: list[int],
+    cache_tiers: Sequence[CacheTier],
+    num_tokens: int,
+    tokens_per_block: int,
+) -> list[tuple[int, int]]:
+    """Collapse per-block cache levels into ordered ``(tier index, num tokens)`` runs.
+
+    ``block_levels[i]`` is the cache level serving matched block ``i`` or -1 when no attention life
+    cycle loads it. The last block may be partial; its run only covers the matched tokens.
+    """
+    segments: list[tuple[int, int]] = []
+    remaining = num_tokens
+    for level in block_levels:
+        if remaining <= 0:
+            break
+        tokens = min(tokens_per_block, remaining)
+        remaining -= tokens
+        tier = _TIER_INDEX_NONE if level < 0 else _cache_tier_index(cache_tiers[level])
+        if segments and segments[-1][0] == tier:
+            segments[-1] = (tier, segments[-1][1] + tokens)
+        else:
+            segments.append((tier, tokens))
+    assert remaining == 0, f"{num_tokens} matched tokens exceed {len(block_levels)} matched blocks"
+    return segments
+
+
 class _KVCache:
     __slots__ = (
         "id",
@@ -251,6 +292,7 @@ class _KVCache:
         "_scratch_slots",
         "_enable_request_stats",
         "_pending_stats",
+        "_reuse_tier_segments",
         "__rawref__",
     )
 
@@ -302,6 +344,9 @@ class _KVCache:
     # only the additional needed slots are allocated. Freed on teardown/suspend.
     _scratch_slots: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
     _pending_stats: _PendingStats
+    # Ordered (storage tier index, num tokens) runs over the reused prefix, or None when this cache was
+    # not created from a reuse match. Tier indices follow tensorrt_llm.metrics.enums.CACHE_TIER_LABELS.
+    _reuse_tier_segments: list[tuple[int, int]] | None
 
     def __init__(
         self,
@@ -358,6 +403,7 @@ class _KVCache:
         )
         self._enable_request_stats = enable_request_stats
         self._pending_stats = _PendingStats()
+        self._reuse_tier_segments = None
         self._status = self.Status.SUSPENDED
         if reuse_match is not None:
             self._setup_for_reuse(reuse_match)
@@ -1109,6 +1155,13 @@ class _KVCache:
     @property
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
+
+    @property
+    def reuse_tier_segments(self) -> list[tuple[int, int]] | None:
+        """Ordered ``(tier index, num tokens)`` runs describing which storage tier served each
+        token of the reused prefix at match time (see tensorrt_llm.metrics.enums.CACHE_TIER_LABELS),
+        or None when this cache was not created from a reuse match."""
+        return self._reuse_tier_segments
 
     def _get_num_tokens_before_hybrid_pruning(self) -> int:
         """Return the pre-hybrid-pruning prefix for internal diagnostics."""
@@ -2128,6 +2181,14 @@ class _KVCache:
 
         beam_idx = DEFAULT_BEAM_INDEX
 
+        # Storage-tier attribution of the reused prefix, decided here, before any page is
+        # migrated back to GPU. Per matched block we keep the highest (slowest) cache level
+        # among the attention life cycles that actually load it; -1 marks a block that no
+        # attention life cycle loads (it is stale for every sliding window), whose tokens
+        # are still skipped by reuse but come from no tier.
+        cache_tiers = manager.cache_tier_list
+        block_levels = [-1] * len(matched)
+
         record_manager_stats = self._should_record_manager_stats()
         record_request_stats = self._should_record_request_stats()
         record_shared_stats = record_manager_stats or record_request_stats
@@ -2135,35 +2196,57 @@ class _KVCache:
             if lc_idx == ssm_lc_id:
                 continue  # SSM is handled separately below
             stale_start, stale_end = _KVCache._get_stale_range(tokens_per_block, num_tokens, lc)
+            is_attn = isinstance(lc, AttnLifeCycle)
             full_reused_blocks = 0
             partial_reused_blocks = 0
+            reused_by_tier = [0, 0, 0, 0]
             for ordinal in chain(
                 typed_range(stale_start), typed_range(stale_end, BlockOrdinal(len(matched)))
             ):
                 block = self._block(ordinal, beam_idx)
-                holder = unwrap_optional(matched[ordinal].get_page(lc_idx)).hold()
+                page = unwrap_optional(matched[ordinal].get_page(lc_idx))
+                holder = page.hold()
                 # For partial blocks (last block, not full), we defer the copy to first resume().
                 # Just store the holder of the original committed page for now.
                 block[lc_idx] = holder
-                if record_shared_stats and isinstance(lc, AttnLifeCycle):
+                if not is_attn:
+                    continue
+                level = int(page.cache_level)
+                if level > block_levels[ordinal]:
+                    block_levels[ordinal] = level
+                if record_shared_stats:
+                    counted = False
                     if ordinal < full_reused_end:
                         full_reused_blocks += 1
+                        counted = True
                     elif (
                         has_partial_match
                         and ordinal == full_reused_end
                         and self._has_reuse_source(holder)
                     ):
                         partial_reused_blocks = 1
-            if record_shared_stats and isinstance(lc, AttnLifeCycle):
+                        counted = True
+                    if counted:
+                        reused_by_tier[_cache_tier_index(cache_tiers[level])] += 1
+            if record_shared_stats and is_attn:
                 changed = self._pending_stats.record_reuse(
                     lc_idx,
                     full_reused_blocks=full_reused_blocks,
                     partial_reused_blocks=partial_reused_blocks,
+                    reused_blocks_by_tier=(
+                        reused_by_tier[0],
+                        reused_by_tier[1],
+                        reused_by_tier[2],
+                        reused_by_tier[3],
+                    ),
                     record_manager_stats=record_manager_stats,
                     record_request_stats=record_request_stats,
                 )
                 if changed:
                     self.manager.mark_stats_dirty(self.id)
+        self._reuse_tier_segments = _build_reuse_tier_segments(
+            block_levels, cache_tiers, num_tokens, tokens_per_block
+        )
         # SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().
         if ssm_lc_id is not None and matched:
             snapshot_block = matched[-1]

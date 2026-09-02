@@ -26,7 +26,8 @@ namespace tensorrt_llm::executor
 {
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(KvCacheStats, maxNumBlocks, freeNumBlocks, usedNumBlocks, tokensPerBlock,
-    allocTotalBlocks, allocNewBlocks, reusedBlocks, missedBlocks, cacheHitRate);
+    allocTotalBlocks, allocNewBlocks, reusedBlocks, missedBlocks, cacheHitRate, reusedBlocksGpu, reusedBlocksHost,
+    reusedBlocksDisk, reusedBlocksRemote);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     StaticBatchingStats, numScheduledRequests, numContextRequests, numCtxTokens, numGenTokens, emptyGenSlots);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InflightBatchingStats, numScheduledRequests, numContextRequests, numGenRequests,

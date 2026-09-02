@@ -25,6 +25,8 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -32,6 +34,21 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 namespace
 {
+
+// Wire values of tensorrt_llm.metrics.enums.CACHE_TIER_LABELS (0 gpu, 1 host, 2 disk, 3 remote, 4 none).
+constexpr std::int8_t kTierIndexNone = 4;
+
+int cacheTierIndex(CacheTier tier)
+{
+    switch (tier)
+    {
+    case CacheTier::GPU_MEM: return 0;
+    case CacheTier::HOST_MEM: return 1;
+    case CacheTier::DISK: return 2;
+    }
+    TLLM_CHECK_WITH_INFO(false, "Unknown cache tier %d", static_cast<int>(tier));
+    return kTierIndexNone;
+}
 
 int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleId lifeCycle)
 {
@@ -2080,6 +2097,13 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
 
     BeamIndex beamIdx = kDefaultBeamIndex;
 
+    // Storage-tier attribution of the reused prefix, decided here, before any page is migrated back to
+    // GPU. Per matched block keep the highest (slowest) cache level among the attention life cycles that
+    // actually load it; -1 marks a block no attention life cycle loads (it is stale for every sliding
+    // window), whose tokens are still skipped by reuse but come from no tier. Mirrors Python.
+    auto const cacheTiers = mManager->cacheTierList();
+    std::vector<int> blockLevels(static_cast<size_t>(numMatchedBlocks.value()), -1);
+
     for (LifeCycleId lcId{0}; lcId < numLc; ++lcId)
     {
         // SSM is handled separately below.
@@ -2092,6 +2116,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
         bool const isAttention = std::holds_alternative<AttnLifeCycle>(allLc[lcId]);
         int fullReusedBlocks = 0;
         int partialReusedBlocks = 0;
+        std::array<int, 4> reusedByTier{}; // gpu, host, disk, remote
 
         // Process a non-stale ordinal: hold the page.
         // For partial blocks (last block, not full), defer the copy to first resume().
@@ -2102,15 +2127,28 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
             TLLM_CHECK_DEBUG_WITH_INFO(page, "Expected page in non-stale block");
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
             bpSlot = page->hold();
-            if (shouldRecordStats && isAttention)
+            if (!isAttention)
             {
+                return;
+            }
+            auto& blockLevel = blockLevels[static_cast<size_t>(ordinal.value())];
+            blockLevel = std::max(blockLevel, page->cacheLevel.value());
+            if (shouldRecordStats)
+            {
+                bool counted = false;
                 if (ordinal < fullReusedEnd)
                 {
                     ++fullReusedBlocks;
+                    counted = true;
                 }
                 else if (hasPartialMatch && ordinal == fullReusedEnd && _hasReuseSource(bpSlot))
                 {
                     partialReusedBlocks = 1;
+                    counted = true;
+                }
+                if (counted)
+                {
+                    ++reusedByTier[static_cast<size_t>(cacheTierIndex(cacheTiers[page->cacheLevel]))];
                 }
             }
         };
@@ -2122,10 +2160,39 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
 
         if (shouldRecordStats && isAttention
             && mPendingStats.recordReuse(
-                lcId, fullReusedBlocks, partialReusedBlocks, recordManagerStats, recordRequestStats))
+                lcId, fullReusedBlocks, partialReusedBlocks, reusedByTier, recordManagerStats, recordRequestStats))
         {
             mManager->markStatsDirty(id);
         }
+    }
+
+    // Collapse the per-block levels into ordered (tier, num tokens) runs; the last block may be partial,
+    // so its run only covers the matched tokens. Mirrors Python's _build_reuse_tier_segments().
+    {
+        ReuseTierSegments segments;
+        int remaining = numTokens;
+        for (int const level : blockLevels)
+        {
+            if (remaining <= 0)
+            {
+                break;
+            }
+            int const tokens = std::min(mTokensPerBlock, remaining);
+            remaining -= tokens;
+            std::int8_t const tier
+                = level < 0 ? kTierIndexNone : static_cast<std::int8_t>(cacheTierIndex(cacheTiers[CacheLevel{level}]));
+            if (!segments.empty() && segments.back().first == tier)
+            {
+                segments.back().second += tokens;
+            }
+            else
+            {
+                segments.emplace_back(tier, tokens);
+            }
+        }
+        TLLM_CHECK_DEBUG_WITH_INFO(
+            remaining == 0, "%d matched tokens exceed %zu matched blocks", numTokens, blockLevels.size());
+        mReuseTierSegments = std::move(segments);
     }
 
     // SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().

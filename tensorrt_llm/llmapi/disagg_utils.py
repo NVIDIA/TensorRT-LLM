@@ -200,8 +200,13 @@ def rewrite_usage_info_from_ctx(usage: Optional[Any],
 
     usage.prompt_tokens = prompt_tokens
     usage.total_tokens = prompt_tokens + (usage.completion_tokens or 0)
+    # Keep the context worker's storage-tier split of its cached tokens, if any.
+    ctx_details = ctx_usage.prompt_tokens_details
     usage.prompt_tokens_details = PromptTokensDetails(
-        cached_tokens=cached_tokens)
+        cached_tokens=cached_tokens,
+        cached_tokens_details=(getattr(ctx_details, "cached_tokens_details",
+                                       None)
+                               if ctx_details is not None else None))
     return usage
 
 
