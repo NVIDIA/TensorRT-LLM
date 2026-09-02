@@ -139,20 +139,13 @@ def test_kimi_k3_mla_construction_fails_fast_for_fp8_kv_with_attention_dp(
         "num_contexts",
         "num_generations",
         "num_gen_tokens",
-        "num_heads",
         "expected_backend",
     ),
     [
-        ("cute-dsl", 0, 4, 4, 96, "cute-dsl"),
-        ("cute-dsl", 1, 3, 3, 12, "trtllm-gen"),
-        ("cute-dsl", 1, 3, 3, 96, "cute-dsl"),
-        # Generation-only multi-token (speculative verification): H=96 must
-        # stay on cute-dsl — trtllm-gen's decode gate rejects that head
-        # count, so falling back fails engine init. Smaller per-rank head
-        # counts (non-attention-DP shapes) keep the tuning fallback.
-        ("cute-dsl", 0, 4, 8, 96, "cute-dsl"),
-        ("cute-dsl", 0, 4, 8, 12, "trtllm-gen"),
-        ("trtllm-gen", 1, 3, 3, 96, "trtllm-gen"),
+        ("cute-dsl", 0, 4, 4, "cute-dsl"),
+        ("cute-dsl", 1, 3, 3, "trtllm-gen"),
+        ("cute-dsl", 0, 4, 8, "trtllm-gen"),
+        ("trtllm-gen", 1, 3, 3, "trtllm-gen"),
     ],
 )
 def test_kimi_k3_mla_decode_backend_policy_by_batch_shape(
@@ -160,10 +153,9 @@ def test_kimi_k3_mla_decode_backend_policy_by_batch_shape(
     num_contexts: int,
     num_generations: int,
     num_gen_tokens: int,
-    num_heads: int,
     expected_backend: str,
 ) -> None:
-    """K3 falls back outside plain decode except when H=96 breaks trtllm-gen."""
+    """K3 falls back to TRTLLM-Gen outside plain single-token decode."""
     assert (
         _kimi_k3_mla_decode_backend_policy(
             requested_backend,
@@ -172,7 +164,6 @@ def test_kimi_k3_mla_decode_backend_policy_by_batch_shape(
                 num_generations=num_generations,
             ),
             num_gen_tokens,
-            num_heads=num_heads,
         )
         == expected_backend
     )

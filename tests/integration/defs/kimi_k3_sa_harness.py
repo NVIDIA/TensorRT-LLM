@@ -183,9 +183,9 @@ def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             free_gpu_memory_fraction=float(os.environ.get("KIMI_K3_FREE_GPU_FRACTION", "0.25")),
-            # tokens_per_block=64 keeps the MLA (576, 512) generation path
-            # on the flashinfer trtllm-gen kernel (32 falls back to a C++
-            # path requiring num_heads % 64 == 0; K3 has 96 query heads).
+            # Retain the established K3 integration page size. H=96 is now
+            # declined by the FlashInfer TRTLLM-Gen wrapper independently of
+            # page size and runs through the legacy TRTLLM-Gen fallback.
             tokens_per_block=64,
         ),
     )
