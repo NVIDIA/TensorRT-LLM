@@ -877,6 +877,48 @@ class TestEdgeDefaults:
             }
         assert pipeline._mode_params("video") is COSMOS3_EDGE_VIDEO_PARAMS
 
+    @pytest.mark.parametrize(
+        "action_mode",
+        [
+            ACTION_MODE_POLICY,
+            ACTION_MODE_FORWARD_DYNAMICS,
+            ACTION_MODE_INVERSE_DYNAMICS,
+        ],
+    )
+    def test_default_negative_prompt_is_policy_specific(self, action_mode):
+        pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+        tokenized_prompts = []
+
+        def record_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
+            tokenized_prompts.append(text)
+            empty = torch.empty((1, 0), dtype=torch.long)
+            return empty, empty
+
+        pipeline._tokenize_prompt = record_prompt
+        request = SimpleNamespace(
+            action_mode=action_mode,
+            do_action=True,
+            is_t2i=False,
+            output_type="video",
+            max_sequence_length=128,
+            use_system_prompt=False,
+        )
+
+        pipeline._tokenize_request_prompts(
+            request,
+            ["move the robot"],
+            None,
+            use_duration_template=False,
+            use_resolution_template=False,
+        )
+
+        expected_negative_prompt = (
+            ""
+            if action_mode == ACTION_MODE_POLICY
+            else pipeline_module.default_negative_prompt("video")
+        )
+        assert tokenized_prompts == ["move the robot", expected_negative_prompt]
+
     def test_policy_manifest_sampling_does_not_cross_domain_override(self, monkeypatch):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
         pipeline.action_gen = True

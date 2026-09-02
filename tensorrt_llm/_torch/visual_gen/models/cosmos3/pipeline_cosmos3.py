@@ -1917,7 +1917,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         """Apply request metadata and tokenize the conditional pair."""
         if negative_prompt is None:
             negative_prompt = (
-                "" if request.do_action else default_negative_prompt(request.output_type)
+                ""
+                if request.action_mode == ACTION_MODE_POLICY
+                else default_negative_prompt(request.output_type)
             )
 
         if not request.do_action:
