@@ -3300,7 +3300,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
 
         self._branch_snapshot_points[req.py_request_id] = point
-        self._branch_snapshots_taken_total += 1
         self._apply_branch_snapshot_point(req)
 
     def prepare_expect_snapshot_points(self,
@@ -3993,6 +3992,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 end=commit_end,
             )
             kv_cache.commit(tokens)
+            if (self.local_num_mamba_layers > 0
+                    and self._branch_snapshot_points.get(
+                        request.py_request_id) == commit_end):
+                self._branch_snapshots_taken_total += 1
         if request.context_current_position >= commit_limit:
             self._mark_context_position_as_history(request, kv_cache)
         if request.context_remaining_length == 0:

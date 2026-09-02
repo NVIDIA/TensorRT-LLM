@@ -1899,6 +1899,9 @@ def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.enable_block_reuse = True
     mgr.is_draft = False
+    mgr.local_num_mamba_layers = 1
+    mgr._branch_snapshot_points = {}
+    mgr._branch_snapshots_taken_total = 0
     mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
     mgr._mark_context_position_as_history = MagicMock()
 
@@ -2830,7 +2833,7 @@ def test_branch_snapshot_uses_divergence_depth_not_page_pruned_depth():
 
     assert mgr._branch_snapshot_points == {1: 192}
     assert request.expect_snapshot_points == [192, 256]
-    assert mgr._branch_snapshots_taken_total == 1
+    assert mgr._branch_snapshots_taken_total == 0
     assert mgr._branch_snapshots_skipped_total == {}
 
 
@@ -2981,6 +2984,32 @@ def test_branch_snapshot_drops_the_point_once_prefill_passes_it():
     mgr.prepare_expect_snapshot_points([request])
 
     assert request.expect_snapshot_points == [256]
+    assert mgr._branch_snapshots_taken_total == 0
+
+
+def test_branch_snapshot_taken_counts_successful_commit_once():
+    mgr = _branch_snapshot_manager()
+    mgr.is_draft = False
+    mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
+    request = _fake_context_request(prompt_len=256, context_current_position=64)
+    request.context_remaining_length = 192
+    request.get_tokens = lambda beam_idx: list(range(256))
+    kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
+
+    def commit(tokens):
+        kv_cache.num_committed_tokens += len(tokens)
+
+    kv_cache.commit = MagicMock(side_effect=commit)
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    assert mgr._branch_snapshots_taken_total == 0
+
+    request.context_current_position = 192
+    request.context_remaining_length = 64
+    mgr.try_commit_blocks(request, kv_cache)
+    mgr.try_commit_blocks(request, kv_cache)
+
+    kv_cache.commit.assert_called_once_with(list(range(64, 192)))
+    assert mgr._branch_snapshots_taken_total == 1
 
 
 def test_branch_snapshot_always_keeps_the_prompt_end_as_the_maximum():
@@ -3048,7 +3077,7 @@ def test_branch_snapshot_counters_accumulate_across_requests():
             num_lookup_tokens=1023,
         )
 
-    assert mgr._branch_snapshots_taken_total == 3
+    assert mgr._branch_snapshots_taken_total == 0
     assert mgr._snapshot_pruned_tokens_total == 3 * (320 - 128)
     assert mgr._page_pruned_tokens_total == 3 * (512 - 320)
     assert mgr._branch_snapshot_points == {1: 512, 2: 512, 3: 512}
@@ -3121,6 +3150,9 @@ def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.enable_block_reuse = True
     mgr.is_draft = False
+    mgr.local_num_mamba_layers = 1
+    mgr._branch_snapshot_points = {}
+    mgr._branch_snapshots_taken_total = 0
     mgr.block_reuse_policy = BlockReusePolicy.PER_CONVERSATION
     events = []
     mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
