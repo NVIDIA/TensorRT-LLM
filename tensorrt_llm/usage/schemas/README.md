@@ -82,7 +82,7 @@ fails earlier can send a terminal report without an initial report.
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | `architectureClassName` | LongString | Exact model architecture class when it appears in the checked-in public Hugging Face architecture allowlist; otherwise empty. | `"MixtralForCausalLM"`, `"LlamaForCausalLM"`, `""` |
-| `architectureClassHash` | LongString | Deterministic, domain-separated SHA-256 digest for a non-empty architecture outside the public allowlist; otherwise empty. | `"sha256:76873a...ccd04"`, `""` |
+| `architectureClassHash` | LongString | Pseudonymous, deterministic SHA-256 grouping key for a non-empty architecture outside the public allowlist; otherwise empty. | `"sha256:76873a...ccd04"`, `""` |
 | `backend` | ShortString | Execution backend. | `"pytorch"`, `"tensorrt"` |
 | `dtype` | ShortString | Model data type. | `"float16"`, `"bfloat16"`, `"auto"` |
 | `quantizationAlgo` | ShortString | Quantization algorithm. Empty string if none. | `""`, `"fp8"`, `"w4a16_awq"` |
@@ -107,6 +107,13 @@ Plaintext is reported only for an exact match in
 represented by `sha256:` plus SHA-256 of
 `"trtllm-architecture-class-v1\0<UTF-8 name>"`, allowing repeated unknown names to
 be grouped without transmitting them.
+
+This hash provides pseudonymization, not confidentiality. Architecture names are
+often predictable, and the domain separator is public, so a telemetry recipient
+can hash candidate names offline and identify a match. The fixed domain also
+makes the same unknown architecture globally correlatable across deployments.
+The intended guarantee is only that the raw name is not transmitted while stable
+grouping remains possible; the hash must not be treated as anonymous or secret.
 
 Extraction uses the first Hugging Face `architectures` value and also supports
 legacy singular values and nested engine configs. Invalid or empty values leave
