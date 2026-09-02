@@ -1566,5 +1566,84 @@ def test_none_tokenizer_num_postprocess_workers():
         _logit_bias_to_embedding_bias({"0": 1.0}, vocab_size=None)
 
 
+# ===========================================================================
+# Fix 3  -  incomplete (never-closed) tool call guard (see #17437 / #16377)
+# ===========================================================================
+
+
+class TestIncompleteToolCallGuard:
+    """Verify the end-of-request guardrail for unclosed tool calls.
+
+    A tool call that was started but never closed (for example a
+    speculative-decode acceptance truncated a control prelude) must be
+    reported instead of silently dropped.
+    """
+
+    def _make_adapter_state(self):
+        from tensorrt_llm.serve.harmony_adapter import HarmonyAdapter
+
+        adapter = HarmonyAdapter(harmony_input=False, harmony_output=False)
+        request_id = "test-guard-tool"
+        state = adapter.create_stream_state(
+            request_id=request_id, available_tools=None, tool_choice=None
+        )
+        return adapter, request_id, state
+
+    def test_active_tool_call_reported(self):
+        adapter, request_id, state = self._make_adapter_state()
+        try:
+            state.tool_calls["call_1"] = {
+                "id": "call_1",
+                "name": "get_weather",
+                "arguments": '{"city":',
+                "index": 0,
+            }
+            assert state.active_tool_call_names() == ["get_weather"]
+        finally:
+            adapter.cleanup_stream_state(request_id)
+
+    def test_closed_tool_call_not_reported(self):
+        adapter, request_id, state = self._make_adapter_state()
+        try:
+            state.tool_calls["call_1"] = {
+                "id": "call_1",
+                "name": "get_weather",
+                "arguments": '{"city":"SF"}',
+                "index": 0,
+                "active": False,
+            }
+            assert state.active_tool_call_names() == []
+        finally:
+            adapter.cleanup_stream_state(request_id)
+
+    def test_cleanup_warns_on_incomplete_tool_call(self):
+        adapter, request_id, state = self._make_adapter_state()
+        state.tool_calls["call_1"] = {
+            "id": "call_1",
+            "name": "search",
+            "arguments": "",
+            "index": 0,
+        }
+        with patch("tensorrt_llm.serve.harmony_adapter.logger.warning") as mock_warn:
+            adapter.cleanup_stream_state(request_id)
+        assert mock_warn.call_count == 1
+        args = mock_warn.call_args.args
+        assert request_id in args[0]
+        assert "search" in args[1]
+
+    def test_cleanup_no_warning_when_complete(self):
+        adapter, request_id, state = self._make_adapter_state()
+        state.tool_calls["call_1"] = {
+            "id": "call_1",
+            "name": "get_weather",
+            "arguments": '{"city":"SF"}',
+            "index": 0,
+            "active": False,
+        }
+        with patch("tensorrt_llm.serve.harmony_adapter.logger.warning") as mock_warn:
+            adapter.cleanup_stream_state(request_id)
+        mock_warn.assert_not_called()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

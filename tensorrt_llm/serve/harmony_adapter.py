@@ -417,6 +417,18 @@ class HarmonyStreamState:
             self.should_filter_tools
         }
 
+    def active_tool_call_names(self) -> list[str]:
+        """Names of tool calls still 'active' at end-of-request.
+
+        A tool call that was started but never closed (a recipient or channel
+        transition did not occur) means the stream ended inside an incomplete
+        tool invocation, which would otherwise be returned to the caller as an
+        empty or truncated tool_calls (see #17437 / #16377)."""
+        return [
+            info["name"] for info in self.tool_calls.values()
+            if info.get("active", True)
+        ]
+
     def finalize_request(self) -> dict[str, Any] | None:
         """
         Finalize the request and return any remaining closing token delta.
@@ -1647,6 +1659,17 @@ class HarmonyAdapter:
         Call this when a request finishes to free memory.
         """
         if request_id in self._stream_states:
+            state = self._stream_states[request_id]
+            incomplete = state.active_tool_call_names()
+            if incomplete:
+                logger.warning(
+                    "Request %s finished with incomplete (never-closed) tool "
+                    "call(s): %s. Often caused by speculative-decode "
+                    "acceptance truncating a control-token prelude; the tool "
+                    "call was silently dropped (see #17437 / #16377).",
+                    request_id,
+                    incomplete,
+                )
             del self._stream_states[request_id]
             logger.debug(f"Cleaned up stream state for request {request_id}")
 
