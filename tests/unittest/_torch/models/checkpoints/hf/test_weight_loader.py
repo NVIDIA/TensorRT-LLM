@@ -493,29 +493,140 @@ def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
     assert len(progress_logs) >= 12
 
 
-def test_kimi_k3_lazy_load_records_the_checkpoint_dir(tmp_path):
+def test_lazy_load_records_the_checkpoint_dir(tmp_path):
     """A model that re-opens shards itself needs the directory back.
 
-    Kimi K3 streams its rank-local experts per shard file to avoid holding
-    the whole mapping open. A lazy slice does not carry its file, and
-    transformers 5.x no longer sets ``PretrainedConfig._name_or_path``, so
-    without this the model silently fell back to the shared mapping and the
-    step was OOM-killed.
+    Expert-parallel models stream their rank-local experts per shard file to
+    avoid holding the whole mapping open. A lazy slice does not carry its
+    file, and transformers 5.x no longer sets ``PretrainedConfig._name_or_path``,
+    so without this the model silently fell back to the shared mapping and the
+    step was OOM-killed. The lazy ``LoadFormat`` is selected here via the
+    ``load_lazily`` flag (what ``LoadFormat.LAZY_SAFETENSORS`` resolves to in
+    the model loader) -- no checkpoint model-name detection is involved.
     """
-    import json
-
     import safetensors.torch
     import torch
 
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "kimi_k3"}))
     safetensors.torch.save_file(
         {"w": torch.zeros(2, 2)}, tmp_path / "model-00001-of-00001.safetensors"
     )
 
     loader = HfWeightLoader()
+    # ``weights`` is bound before the try so a load_weights() failure surfaces
+    # as itself instead of an UnboundLocalError raised from the cleanup path.
+    weights = None
     try:
-        weights = loader.load_weights(str(tmp_path), Mapping())
+        weights = loader.load_weights(str(tmp_path), Mapping(), load_lazily=True)
         assert isinstance(weights, ConsumableWeightsDict)
         assert weights.checkpoint_dir == str(tmp_path)
     finally:
+        if weights is not None:
+            weights.clear()
+        loader.cleanup()
+
+
+def _materialize_lazy_slice(value):
+    """Realize a lazy safetensors slice the way a model's load_weights does.
+
+    Mirrors ``modeling_kimi_linear._materialize``: ``[:]`` realizes a normal
+    slice, but a 0-dim (scalar) entry needs ``[()]``.
+    """
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value
+    get_shape = getattr(value, "get_shape", None)
+    if get_shape is not None and len(get_shape()) == 0:
+        return value[()]
+    return value[:]
+
+
+def _write_multi_shard_fixture(checkpoint_dir):
+    """Write a small multi-shard safetensors fixture (no big checkpoint).
+
+    Two sharded files carry distinct keys; a consolidated file carries a
+    different key so which file set was selected is directly observable from
+    the loaded key set. Includes a quantized (fp8) weight and a companion
+    fp32 block-scale tensor so dtype and scale tensors are exercised.
+
+    Returns (sharded_keys, consolidated_keys).
+    """
+    import safetensors.torch
+    import torch
+
+    sharded_a = {
+        "layer.0.weight": torch.arange(16, dtype=torch.bfloat16).reshape(4, 4),
+        # FP8 block-scale companion (kept BF16-free on purpose: a real scale).
+        "layer.0.weight_scale_inv": torch.rand(2, 2, dtype=torch.float32),
+    }
+    sharded_b = {
+        # A genuinely quantized tensor: proves the fp8 dtype survives the
+        # lazy path byte-for-byte.
+        "layer.1.weight": torch.arange(16).reshape(4, 4).to(torch.float8_e4m3fn),
+    }
+    consolidated = {
+        "consolidated.only.weight": torch.ones(2, 2, dtype=torch.bfloat16),
+    }
+    safetensors.torch.save_file(sharded_a, str(checkpoint_dir / "model-00001-of-00002.safetensors"))
+    safetensors.torch.save_file(sharded_b, str(checkpoint_dir / "model-00002-of-00002.safetensors"))
+    safetensors.torch.save_file(consolidated, str(checkpoint_dir / "consolidated.safetensors"))
+    return (set(sharded_a) | set(sharded_b)), set(consolidated)
+
+
+@pytest.mark.parametrize("use_consolidated", [False, True])
+def test_lazy_format_load_matches_eager_load(tmp_path, use_consolidated):
+    """The lazy ``LoadFormat`` equals an eager load on the same fixture.
+
+    Covers criterion s1.g1: a general lazy format whose sharded-vs-consolidated
+    selection matches the eager path, whose materialized values/dtype/scale
+    tensors match the eager load exactly, and whose rank-local sliced reads do
+    not materialize the full tensor set. Runs on CPU, no 1.5 TB checkpoint.
+    """
+    import torch
+
+    checkpoint_dir = tmp_path / "ckpt"
+    checkpoint_dir.mkdir()
+    sharded_keys, consolidated_keys = _write_multi_shard_fixture(checkpoint_dir)
+    expected_keys = consolidated_keys if use_consolidated else sharded_keys
+
+    loader = HfWeightLoader()
+
+    # Eager reference load. Mock only the OS-cache prefetch; the real file
+    # selection and the real safetensors load both run.
+    with mock.patch.object(loader, "prefetch_files"):
+        eager = loader.load_weights(
+            str(checkpoint_dir), Mapping(), use_consolidated=use_consolidated
+        )
+    eager_values = {key: eager[key] for key in eager.keys()}
+
+    # Lazy-format load of the same fixture.
+    lazy = loader.load_weights(
+        str(checkpoint_dir), Mapping(), use_consolidated=use_consolidated, load_lazily=True
+    )
+    try:
+        # (1) use_consolidated selection matches the eager path: same key set.
+        assert set(eager.keys()) == expected_keys
+        assert set(lazy.keys()) == expected_keys
+
+        # (2) Lazy values are slice handles, not materialized tensors: merely
+        # opening the checkpoint never realizes the full tensor set.
+        for key in lazy.keys():
+            assert not isinstance(lazy[key], torch.Tensor), key
+
+        # (3) A rank-local sliced read materializes ONLY the requested bytes.
+        row_key = "consolidated.only.weight" if use_consolidated else "layer.0.weight"
+        partial = lazy[row_key][0:1]
+        assert isinstance(partial, torch.Tensor)
+        assert partial.shape[0] == 1  # only the requested row, not all rows
+
+        # (4) Materialized lazy values equal the eager values in dtype, shape,
+        # and bytes -- scale and fp8 tensors included.
+        for key in expected_keys:
+            lazy_val = _materialize_lazy_slice(lazy[key])
+            eager_val = eager_values[key]
+            assert lazy_val.dtype == eager_val.dtype, key
+            assert lazy_val.shape == eager_val.shape, key
+            assert torch.equal(lazy_val.to(torch.float32), eager_val.to(torch.float32)), key
+    finally:
+        lazy.clear()
         loader.cleanup()

@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
-import json
 import multiprocessing
 import os
 import threading
@@ -249,20 +248,6 @@ class HfWeightLoader(BaseWeightLoader):
             self._cache_loaded_weights(cache_key, weights)
         return weights
 
-    @staticmethod
-    def _is_kimi_k3_checkpoint(checkpoint_dir: str) -> bool:
-        """Kimi K3 checkpoints (~1.5 TB) must not be materialized in host RAM."""
-        config_path = os.path.join(checkpoint_dir, "config.json")
-        if not os.path.isfile(config_path):
-            return False
-        # Do not swallow read/parse failures: every rank must take the same
-        # branch here (the non-Kimi path enqueues collectives), so a
-        # rank-local transient error routing one rank differently would
-        # deadlock the job. Propagating fails fast on all ranks instead.
-        with open(config_path) as f:
-            model_type = json.load(f).get("model_type")
-        return model_type in ("kimi_k3", "kimi_linear")
-
     def _load_lazy_safetensors(
             self,
             checkpoint_dir: str,
@@ -272,7 +257,7 @@ class HfWeightLoader(BaseWeightLoader):
         Values are ``safetensors`` PySafeSlice objects: ``v[:]`` (or any
         indexing) materializes only the requested bytes from the mmapped
         file. This lets a model's ``load_weights`` stream a huge checkpoint
-        and read only its rank-local shard (e.g. Kimi K3 expert-parallel
+        and read only its rank-local shard (e.g. expert-parallel routed
         expert slices) without ever holding the full checkpoint in RAM.
         """
         weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
@@ -303,7 +288,7 @@ class HfWeightLoader(BaseWeightLoader):
         # transient source weights when ModelLoader.load() returns.
         lazy_weights = _LazySafetensorsWeights(weights, handles)
         # A lazy slice does not carry the file it came from, and a model that
-        # wants to re-open shards itself (Kimi K3 streams rank-local experts
+        # wants to re-open shards itself (e.g. streaming rank-local experts
         # per shard file, precisely to avoid holding this mapping open) has no
         # other reliable source: transformers no longer sets
         # ``PretrainedConfig._name_or_path``.
@@ -314,19 +299,25 @@ class HfWeightLoader(BaseWeightLoader):
                      checkpoint_dir: str,
                      mapping: Mapping,
                      use_consolidated: bool = False,
+                     load_lazily: bool = False,
                      **kwargs) -> dict[str, Any]:
         """Load model weights keyed by checkpoint tensor name.
 
-        Kimi K3 checkpoint is opened lazily as HF SafeTensors to avoid materializing any part of the checkpoint
-        in CPU memory.
-        Other models' checkpoints may be prefetched in parallel to warm up the OS file cache if
-        the CPU memory is large enough, before their tensors are loaded via mmap.
-        when `_WEIGHT_CACHE_ENV` is on, other models can also use a CPU weight cache to accelerate repeated
-        loading under the same process.
+        When ``load_lazily`` is set (selected via ``LoadFormat.LAZY_SAFETENSORS``
+        on the ``load_format`` surface, or a model's declared default), the
+        safetensors shards are opened lazily so only the rank-local slices each
+        model reads are materialized -- never the whole checkpoint in CPU
+        memory. This is required for checkpoints too large to fit in host RAM.
+
+        Otherwise the checkpoint is loaded eagerly: safetensors shards may be
+        prefetched in parallel to warm up the OS file cache if the CPU memory is
+        large enough, before their tensors are loaded via mmap. When
+        `_WEIGHT_CACHE_ENV` is on, eager loads can also use a CPU weight cache to
+        accelerate repeated loading under the same process.
 
         Returns a `ConsumableWeightsDict` mapping checkpoint tensor names to tensors.
         """
-        if self._is_kimi_k3_checkpoint(checkpoint_dir):
+        if load_lazily:
             return self._load_lazy_safetensors(checkpoint_dir, use_consolidated)
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
