@@ -2236,12 +2236,17 @@ class TestPyCapacitySchedulerStateGating:
         fitting, disagg, paused = scheduler.schedule_request([make_completed_request(0)])
         assert len(fitting) == 0
 
-    def test_generation_to_complete_scheduled(self):
-        """GENERATION_TO_COMPLETE is schedulable in PyCapacityScheduler.
-        PyCapacityScheduler uses no_schedule_after=GENERATION_COMPLETE (20),
-        so GENERATION_TO_COMPLETE (14) passes state gating. The real C++ binding's
-        is_generation_in_progress_state includes GENERATION_TO_COMPLETE, so the
-        MaxRequestsPolicy schedules it."""
+    def test_generation_to_complete_filtered(self):
+        """GENERATION_TO_COMPLETE is at no_schedule_after, filtered out (nvbug-6627795).
+
+        The state means "final token produced, teardown deferred by the overlap
+        scheduler". PyMicroBatchScheduler has always excluded it, so admitting it
+        here only burned a capacity slot -- the
+        ``len(scheduled_requests) >= max_num_requests`` break sits after the state
+        gate -- and shortened the real forward batch by one. Note the request is
+        still ``is_generation_in_progress_state`` (that predicate spans 13 and 14),
+        so only the state window keeps it out.
+        """
         scheduler = PyCapacityScheduler(
             max_num_requests=4,
             kv_cache_manager=None,
@@ -2250,8 +2255,27 @@ class TestPyCapacitySchedulerStateGating:
             request_id=0,
             state=LlmRequestState.GENERATION_TO_COMPLETE,
         )
+        assert req.is_generation_in_progress_state
         fitting, disagg, paused = scheduler.schedule_request([req])
-        assert len(fitting) == 1
+        assert len(fitting) == 0
+
+    def test_retiring_request_does_not_consume_capacity(self):
+        """A retiring request must not displace a schedulable one.
+
+        This is the nvbug-6627795 mechanism in miniature: with capacity 1, the
+        state-14 request used to be admitted first and the `break` then shut the
+        loop before the real generation request was ever considered.
+        """
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
+        scheduler = PyCapacityScheduler(
+            max_num_requests=1,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        )
+        retiring = _make_request(0, state=LlmRequestState.GENERATION_TO_COMPLETE)
+        runnable = _make_request(1, state=LlmRequestState.GENERATION_IN_PROGRESS)
+        fitting, _disagg, _paused = scheduler.schedule_request([retiring, runnable])
+        assert [r.request_id for r in fitting] == [1]
 
 
 # ############################################################################
@@ -2325,6 +2349,55 @@ class TestPyCapacitySchedulerLora:
         fitting, _disagg, _paused = scheduler.schedule_request([r0, r1, r2])
         # 2 tasks x 10 pages = 20 <= 25; 3rd task would push to 30 > 25
         assert len(fitting) == 2
+
+    @pytest.mark.parametrize(
+        "scheduler_policy",
+        [
+            CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+            CapacitySchedulerPolicy.MAX_UTILIZATION,
+            CapacitySchedulerPolicy.STATIC_BATCH,
+        ],
+    )
+    @pytest.mark.parametrize("reuse_retiring_adapter", [False, True])
+    def test_retiring_request_still_charges_its_lora_adapter(
+        self, scheduler_policy, reuse_retiring_adapter
+    ):
+        """nvbug-6627795: a retiring request leaves the window but keeps its adapter.
+
+        GENERATION_TO_COMPLETE is now outside no_schedule_after_state, so the policy
+        loops skip it before reaching their PEFT claim. The adapter is still resident
+        -- it is released by the teardown the overlap scheduler deferred, and the
+        cache can only evict tasks already marked done -- so it must still be
+        charged, or a request carrying a different adapter is admitted against a
+        budget that only looks free and then dies in ensure_batch.
+
+        Both directions are asserted: under-charging is the bug, but over-charging
+        would be a new one, so the same-adapter case must still be admitted free.
+        C++ ref: CapacitySchedulerTest.RetiringRequestStillChargesItsLoraAdapter.
+        """
+        # 10 pages per distinct adapter against 15 on device: one fits, two never can.
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
+        peft = MockPeftCacheManager(max_pages=15, pages_per_request=10)
+        scheduler = PyCapacityScheduler(
+            max_num_requests=4,
+            kv_cache_manager=kv,
+            peft_cache_manager=peft,
+            scheduler_policy=scheduler_policy,
+        )
+        retiring = _make_request(0, state=LlmRequestState.GENERATION_TO_COMPLETE, lora_task_id=1)
+        incoming = _make_request(1, lora_task_id=1 if reuse_retiring_adapter else 2)
+
+        fitting, _disagg, _paused = scheduler.schedule_request([retiring, incoming])
+
+        scheduled_ids = [r.request_id for r in fitting]
+        # Outside the window either way.
+        assert 0 not in scheduled_ids
+        if reuse_retiring_adapter:
+            # Needs no new pages, so the pre-claim must not lock it out.
+            assert scheduled_ids == [1]
+        else:
+            # 10 already charged + 10 needed > 15 available.
+            assert scheduled_ids == []
 
 
 # ############################################################################

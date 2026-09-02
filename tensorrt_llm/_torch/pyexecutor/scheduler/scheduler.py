@@ -1471,9 +1471,14 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
             reserved_cross_blocks = NoEvictScheduledBlocksManager(scheduler.cross_kv_cache_manager)
 
         # PEFT state - only used when has_peft
-        claimed_peft_pages = 0
         available_peft_pages = scheduler._get_max_peft_pages() if has_peft else 0
         uniq_task_ids: set[int] = set() if has_peft else None
+        # Retiring requests are outside the state window but still hold their
+        # adapters on device; charge them before the loop so the budget below is
+        # honest. See _pre_claim_peft_pages_for_retiring_requests.
+        claimed_peft_pages = scheduler._pre_claim_peft_pages_for_retiring_requests(
+            active_requests, uniq_task_ids
+        )
 
         pending_requests: RequestList = []
         pending_dis_gen_init_requests: RequestList = []
@@ -1639,8 +1644,12 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 scheduler.cross_kv_cache_manager, scheduler.two_step_lookahead
             )
 
-        num_scheduled_peft_pages = 0
         seen_task_ids: set[int] = set()
+        # Same reasoning as GuaranteedNoEvictPolicy: retiring requests are skipped
+        # by the state gate but their adapters are still resident.
+        num_scheduled_peft_pages = scheduler._pre_claim_peft_pages_for_retiring_requests(
+            active_requests, seen_task_ids
+        )
 
         newly_contributed_context_blocks, _ = scheduler._prefill_contributed_blocks(active_requests)
         # Summary cache populated lazily by _beneficial_to_skip; consumed by
@@ -1939,7 +1948,18 @@ class PyCapacityScheduler:
         cross_kv_cache_manager: object | None = None,
         two_step_lookahead: bool = False,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
-        no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_COMPLETE,
+        # Ends one state early, at GENERATION_TO_COMPLETE, matching
+        # BindCapacityScheduler and PyMicroBatchScheduler. That state means "final
+        # token produced, teardown deferred by the overlap scheduler": the
+        # micro-batch scheduler will never forward such a request, yet the
+        # ``len(scheduled_requests) >= scheduler.max_num_requests`` break in each
+        # policy sits after the state gate, so every one of them used to consume a
+        # capacity slot and shorten the real forward batch by one (nvbug-6627795).
+        # Keeping them in the window reserved nothing either: their
+        # get_remaining_blocks_to_completion is ~0, since they generate no further
+        # tokens. Their LoRA adapters *are* still resident, which is why the
+        # policies pre-claim PEFT pages for them separately.
+        no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
         enable_prefix_aware_scheduling: bool = True,
     ) -> None:
         """
@@ -1968,6 +1988,7 @@ class PyCapacityScheduler:
         # Cache state values to avoid repeated .value access (optimization)
         self._no_schedule_until_state_value = no_schedule_until_state.value
         self._no_schedule_after_state_value = no_schedule_after_state.value
+        self._gen_to_complete_state_value = LlmRequestState.GENERATION_TO_COMPLETE.value
 
         # Initialize the appropriate policy
         self._policy = self._create_policy()
@@ -2165,6 +2186,41 @@ class PyCapacityScheduler:
         is_new_task = lora_task_id is not None and lora_task_id not in seen_task_ids
         required_pages = self._get_peft_pages_for_request(req) if is_new_task else 0
         return lora_task_id, is_new_task, required_pages
+
+    def _pre_claim_peft_pages_for_retiring_requests(
+        self, active_requests: RequestList, seen_task_ids: Optional[set[int]]
+    ) -> int:
+        """Charge PEFT pages for requests the state window excludes but whose adapters are resident.
+
+        ``GENERATION_TO_COMPLETE`` requests sit outside ``no_schedule_after_state``,
+        so the policy loops skip them before reaching their PEFT claim. Their LoRA
+        adapters are still on device, though: the adapter is released by the
+        teardown the overlap scheduler has deferred, and the cache can only evict
+        tasks already marked done. Leaving them uncharged overstates the free
+        budget, so a pending request carrying a *different* adapter is admitted
+        against space that only looks free and then fails in ``ensure_batch``.
+
+        Charging without consuming a capacity slot or a token budget is the point:
+        a retiring request must count against adapter *residency* while staying out
+        of the forward batch. Mirrors ``preClaimPeftPagesForRetiringRequests`` in
+        capacityScheduler.cpp and ``KVCacheV2Scheduler``'s ``pre_claim_peft``.
+
+        Idempotent with respect to the policy loops: ``_get_peft_task_info`` dedupes
+        on ``seen_task_ids``, so a window that still admits
+        ``GENERATION_TO_COMPLETE`` charges the same total, and a pending request
+        reusing a retiring request's adapter is still charged zero new pages.
+        """
+        if self.peft_cache_manager is None or seen_task_ids is None:
+            return 0
+        claimed_pages = 0
+        for req in active_requests:
+            if req.state_value != self._gen_to_complete_state_value:
+                continue
+            lora_task_id, is_new_task, peft_pages = self._get_peft_task_info(req, seen_task_ids)
+            if is_new_task:
+                claimed_pages += peft_pages
+                seen_task_ids.add(lora_task_id)
+        return claimed_pages
 
     def _can_be_scheduled_with_disagg_exception(self, req: LlmRequest) -> bool:
         """
