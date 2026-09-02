@@ -263,7 +263,7 @@ public:
             return false;
         }
 #endif // TLLM_RUBIN_FEATURES
-        // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
+       // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
         if (isStaticTokenSparse(options.mSparseType) && !options.mIsMlaGen)
         {
             return true;
@@ -769,8 +769,7 @@ private:
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
             kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible, kernelMeta.mGroupsHeadsQ,
-            kernelMeta.mGroupsTokensHeadsQ, numInstsQ, numInstsKv, kernelMeta.mFp16Softmax,
-            kernelMeta.mUsesSpcompress);
+            kernelMeta.mGroupsTokensHeadsQ, numInstsQ, numInstsKv, kernelMeta.mFp16Softmax, kernelMeta.mUsesSpcompress);
     }
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
@@ -826,8 +825,7 @@ private:
                 static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
                 static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
                 static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible, options.mGroupsHeadsQ,
-                options.mGroupsTokensHeadsQ, options.mNumInstsQ, options.mNumInstsKv, fp16Softmax,
-                usesSpcompress),
+                options.mGroupsTokensHeadsQ, options.mNumInstsQ, options.mNumInstsKv, fp16Softmax, usesSpcompress),
             info);
     }
 
@@ -1388,8 +1386,8 @@ private:
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
                 selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
                 selectKernelParams.mSkipsSoftmaxWhenPossible, /* groupsHeadsQ */ false,
-                /* groupsTokensHeadsQ */ false, /* numInstsQ */ 1, /* numInstsKv */ 1,
-                selectKernelParams.mFp16Softmax, selectKernelParams.mUsesSpcompress),
+                /* groupsTokensHeadsQ */ false, /* numInstsQ */ 1, /* numInstsKv */ 1, selectKernelParams.mFp16Softmax,
+                selectKernelParams.mUsesSpcompress),
             info);
     }
 
