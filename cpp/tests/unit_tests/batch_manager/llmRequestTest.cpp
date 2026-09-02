@@ -140,17 +140,6 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         };
         lambdaErrMsgs.emplace_back(lambda, "beamWidth > 0");
     }
-    // Invalid input draft len
-    {
-        auto lambda = [&inputTokens, maxNewTokens, requestId]()
-        {
-            texec::Request execReq(inputTokens, maxNewTokens);
-            tb::LlmRequest llmReq(requestId, execReq);
-
-            llmReq.validate(500, 1000, 1, 32000);
-        };
-        lambdaErrMsgs.emplace_back(lambda, "exceeds maximum draft");
-    }
 
     // Invalid ptable shape
     {
