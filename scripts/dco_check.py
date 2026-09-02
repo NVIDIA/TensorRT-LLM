@@ -26,7 +26,7 @@ def main():
         sys.exit(1)
 
     # Read the commit message from the file passed as an argument by Git
-    with open(sys.argv[1], 'r') as file:
+    with open(sys.argv[1], 'r', encoding='utf-8') as file:
         message = file.read().strip()
 
     # Validate the commit message
