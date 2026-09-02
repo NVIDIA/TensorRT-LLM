@@ -4,9 +4,22 @@
 
 This deployment guide provides step-by-step instructions for running the GLM-5 model using TensorRT LLM with FP8 and NVFP4 quantization, optimized for NVIDIA Blackwell GPUs. It covers the complete setup required; from accessing model weights and preparing the software environment to configuring TensorRT LLM parameters, launching the server, and validating inference output.
 
-GLM-5 uses Multi-Latent Attention (MLA) with DeepSeek Sparse Attention (DSA). It shares the same architecture as DeepSeek V3.2 and reuses the `DeepseekV32ForCausalLM` code path in TensorRT LLM. GLM-5 natively supports Multi-Token Prediction (MTP) for speculative decoding.
+GLM-5 uses Multi-Latent Attention (MLA) with DeepSeek Sparse Attention (DSA). It shares the same architecture as DeepSeek V3.2 (with minor changes) and is served through the `GlmMoeDsaForCausalLM` model, which reuses the DeepSeek V3.2 code path in TensorRT LLM. GLM-5 natively supports Multi-Token Prediction (MTP) for speculative decoding.
+
+This guide applies to the GLM-5 family, including GLM-5.2 and GLM-5.3. GLM-5.3 is a weight update over GLM-5.2 with the same architecture and code path, so the server configurations and deployment steps below are identical across versions. Note that GLM-5.3 ships a revised chat template with different reasoning controls. Unlike GLM-5.2, there is no `enable_thinking` kwarg and thinking cannot be turned off; generation always begins with `<think>`. Reasoning depth is set with `reasoning_effort`, which accepts `low`, `high`, or `max` (default `max`). The separate `clear_thinking` kwarg controls whether reasoning from earlier turns is retained in multi-turn conversations; it does not disable thinking. Clients that controlled reasoning behavior via `chat_template_kwargs` on GLM-5.2 should update accordingly.
 
 The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA's accelerated stack.
+
+### Validated Features
+
+The following features have been tested with GLM-5 on TensorRT LLM:
+
+* CUDA Graph
+* Multi-Token Prediction (MTP)
+* Disaggregated serving
+* Disaggregated serving with MTP
+
+Because GLM-5 reuses the DeepSeek V3.2 code path, other features supported by `DeepseekV32ForCausalLM` are expected to work but have not been separately validated. See the [Model-Feature Support Matrix](../models/supported-models.md#model-feature-support-matrix-key-models) for the current per-feature status.
 
 ## Prerequisites
 
@@ -14,26 +27,28 @@ The guide is intended for developers and practitioners seeking high-throughput o
 * OS: Linux
 * Drivers: CUDA Driver 575 or later
 * Docker with NVIDIA Container Toolkit installed
-* Minimum TensorRT LLM version: 1.3.0rc8
+* Minimum TensorRT LLM version: 1.3.0rc25
 
 ## Models
 
 The following checkpoints are available:
 
-* FP8 model: [zai-org/GLM-5-FP8](https://huggingface.co/zai-org/GLM-5-FP8) — Official FP8 checkpoint
-* BF16 model: [zai-org/GLM-5](https://huggingface.co/zai-org/GLM-5) — Official BF16 checkpoint
-* NVFP4 model: [warnold-nv/GLM-5-nvfp4-v1](https://huggingface.co/warnold-nv/GLM-5-nvfp4-v1) — Unofficial NVFP4 checkpoint for experimentation only. *Quantized with ModelOpt by Will Arnold.*
+* FP8 model: [zai-org/GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) — Official FP8 checkpoint
+* BF16 model: [zai-org/GLM-5.3-BF16](https://huggingface.co/zai-org/GLM-5.3-BF16) — Official BF16 checkpoint
+* NVFP4 model: [warnold-nv/GLM-5-nvfp4-v1](https://huggingface.co/warnold-nv/GLM-5-nvfp4-v1) — Unofficial NVFP4 checkpoint of GLM-5 for experimentation only. *Quantized with ModelOpt by Will Arnold.*
+
+> **Note on checkpoint naming:** For GLM-5.3 the base repository (`zai-org/GLM-5.3`) contains the FP8 weights and the BF16 weights live in the `-BF16` repository. This is the reverse of GLM-5 and GLM-5.2, where the base repositories ([zai-org/GLM-5](https://huggingface.co/zai-org/GLM-5), [zai-org/GLM-5.2](https://huggingface.co/zai-org/GLM-5.2)) are BF16 and the FP8 weights live in the `-FP8` repositories ([zai-org/GLM-5-FP8](https://huggingface.co/zai-org/GLM-5-FP8), [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8)). Check the `quantization_config` in the checkpoint's `config.json` if in doubt.
 
 Pick a host directory for the checkpoints and make sure your user can write to it. Use
 this same directory for the `-v <host_models_dir>:/models` mount in the `docker run`
-step below, so that the checkpoint appears at `/models/GLM-5-FP8` inside the container.
+step below, so that the checkpoint appears at `/models/GLM-5.3` inside the container.
 
 ```bash
 export HOST_MODELS_DIR=/path/to/your/models
 mkdir -p "$HOST_MODELS_DIR"
 
 git lfs install
-git clone https://huggingface.co/zai-org/GLM-5-FP8 "$HOST_MODELS_DIR/GLM-5-FP8"
+git clone https://huggingface.co/zai-org/GLM-5.3 "$HOST_MODELS_DIR/GLM-5.3"
 ```
 
 ## MoE Backend Support Matrix
@@ -60,7 +75,7 @@ docker run --rm -it \
     -p 8000:8000 \
     -v "$HOST_MODELS_DIR":/models \
     --name tensorrt_llm \
-    nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc8 \
+    nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc25 \
     /bin/bash
 ```
 
@@ -140,7 +155,8 @@ Below is an example command to launch the TensorRT LLM server with GLM-5 from wi
 
 ```bash
 trtllm-serve \
-  /models/GLM-5-FP8 \
+  /models/GLM-5.3 \
+  --served_model_name zai-org/GLM-5.3 \
   --host 0.0.0.0 \
   --port 8000 \
   --max_batch_size 128 \
@@ -156,6 +172,40 @@ trtllm-serve \
 > - Lower `kv_cache_config.free_gpu_memory_fraction` (e.g., `0.6`).
 > - Reduce `--max_num_tokens` to `3072` for max-throughput configs.
 > - Reduce `--max_batch_size` and `cuda_graph_config.max_batch_size` to `32` or `16` for min-latency configs.
+
+### Disaggregated Serving
+
+GLM-5 supports disaggregated serving, which separates the prefill (context) and decode (generation) phases onto different workers so each can be scaled and tuned independently. This can be combined with MTP.
+
+Launch one or more context (prefill) servers and one or more generation (decode) servers with `trtllm-serve`, then start a `trtllm-serve disaggregated` orchestrator that routes client requests between them. Both context and generation workers must carry the same `cache_transceiver_config` to exchange the KV cache. Add the following to the config file used by each worker:
+
+```yaml
+cache_transceiver_config:
+  backend: NIXL
+```
+
+Reuse the FP8 config (or the FP8-with-MTP config for Disagg + MTP) from [Recommended Performance Settings](#recommended-performance-settings) for the workers, adding the `cache_transceiver_config` block above. The context workers should also set `disable_overlap_scheduler: true`.
+
+The orchestrator is launched with a disaggregated config that lists the context and generation worker URLs:
+
+```bash
+trtllm-serve disaggregated -c disagg_config.yaml
+```
+
+```yaml
+hostname: localhost
+port: 8000
+context_servers:
+  num_instances: 1
+  urls:
+    - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  urls:
+    - "localhost:8002"
+```
+
+Clients then send OpenAI-compatible requests to the orchestrator (`localhost:8000`). For the full walkthrough, per-worker GPU placement, and multi-node/SLURM launch, see the [Disaggregated Serving guide](../features/disagg-serving.md).
 
 ### LLM API Options (YAML Configuration)
 
@@ -216,7 +266,7 @@ After the TensorRT LLM server is set up and shows *Application startup complete*
 curl http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
-      "model": "zai-org/GLM-5-FP8",
+      "model": "zai-org/GLM-5.3",
       "prompt": "What is the capital of France?",
       "max_tokens": 16,
       "temperature": 0
@@ -229,7 +279,7 @@ Example response:
 {
   "id": "cmpl-...",
   "object": "text_completion",
-  "model": "zai-org/GLM-5-FP8",
+  "model": "zai-org/GLM-5.3",
   "choices": [
     {
       "index": 0,
@@ -271,7 +321,7 @@ result_dir=/tmp/glm5_output
 for concurrency in ${concurrency_list}; do
     num_prompts=$((concurrency * multi_round))
     python -m tensorrt_llm.serve.scripts.benchmark_serving \
-        --model zai-org/GLM-5-FP8 \
+        --model zai-org/GLM-5.3 \
         --backend openai \
         --dataset-name "random" \
         --random-input-len ${isl} \

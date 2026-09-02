@@ -49,7 +49,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
-from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -202,6 +202,7 @@ def _make_async_encoder_executor(future):
 
 
 def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8):
+    """Build a PyExecutor stub wired for token-path encoder batch-wait admission."""
     executor = object.__new__(PyExecutor)
     executor.max_batch_size = 32
     batch_sizes = batch_sizes or [1, 2, 4, 8]
@@ -214,17 +215,51 @@ def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8
         ),
         encoder_max_batch_size=encoder_max_batch_size,
     )
+    executor.model_engine = types.SimpleNamespace(
+        encoder_cuda_graph_runner=types.SimpleNamespace(
+            feature_mode=False, enabled=True, supported_batch_sizes=batch_sizes
+        )
+    )
+    executor.batch_wait_timeout_iters = 48
+    executor.encoder_batch_wait_iters_count = 0
+    return executor
+
+
+def _make_feature_encoder_batch_wait_executor(
+    runner_batch_sizes, encoder_max_batch_size=8, runner_enabled=True
+):
+    """Batch-wait executor whose encoder graph config is the feature variant.
+
+    A feature encoder leaves `num_tokens` / `seq_lens` unset and may have had
+    its `batch_sizes` derived rather than configured, so the resolved sizes come
+    from the engine's encoder graph runner rather than the config.
+    """
+    executor = object.__new__(PyExecutor)
+    executor.max_batch_size = 32
+    executor.llm_args = types.SimpleNamespace(
+        encoder_cuda_graph_config=EncodeCudaGraphConfig(enable_padding=True),
+        encoder_max_batch_size=encoder_max_batch_size,
+    )
+    executor.model_engine = types.SimpleNamespace(
+        encoder_cuda_graph_runner=types.SimpleNamespace(
+            supported_batch_sizes=runner_batch_sizes,
+            enabled=runner_enabled,
+            feature_mode=True,
+        )
+    )
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor
 
 
 def _make_encoder_fallback_batch_wait_executor():
+    """Build a PyExecutor stub with no encoder graph config, for the fallback path."""
     executor = object.__new__(PyExecutor)
     executor.llm_args = types.SimpleNamespace(
         encoder_cuda_graph_config=None,
         encoder_max_batch_size=None,
     )
+    executor.model_engine = types.SimpleNamespace(encoder_cuda_graph_runner=None)
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     executor.batch_wait_max_tokens_ratio = 0.5
@@ -261,6 +296,72 @@ def test_encoder_graph_warmup_uses_runtime_encoder_stream():
     executor.model_engine._warmup_encoder_cuda_graphs_enc_dec.assert_called_once_with(
         executor.resource_manager
     )
+
+
+@pytest.mark.parametrize(
+    "runner_batch_sizes,config_batch_sizes,num_requests,expected",
+    [
+        # A feature encoder leaves num_tokens / seq_lens unset, so gating this
+        # path on them would skip microbatch admission entirely.
+        ([1, 2, 4, 8], None, 12, 8),
+        # The runner's list is authoritative: the engine filters the configured
+        # sizes by the scheduler's encoder-batch bound, so the config alone can
+        # name sizes that were never captured.
+        ([1, 2, 3, 4], [1, 2, 3, 4, 8], 6, 4),
+    ],
+)
+def test_encoder_microbatch_admission_uses_resolved_feature_batch_sizes(
+    runner_batch_sizes, config_batch_sizes, num_requests, expected
+):
+    """Feature admission targets the runner's resolved sizes, not the configured ones."""
+    executor = _make_feature_encoder_batch_wait_executor(runner_batch_sizes)
+    if config_batch_sizes is not None:
+        executor.llm_args.encoder_cuda_graph_config.batch_sizes = config_batch_sizes
+    encoder_requests = [object() for _ in range(num_requests)]
+
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [object()] * 20,
+    )
+
+    assert scheduled == encoder_requests[:expected]
+    assert executor.encoder_batch_wait_iters_count == 0
+
+
+def test_encoder_microbatch_admission_skips_uncaptured_padded_size():
+    """Feature admission never targets a batch size the runner did not capture."""
+    # An `encoder_max_batch_size` above `max_batch_size` leaves a captured
+    # bucket beyond the admission limit. Padding admission up to the limit
+    # itself is a token-path move: a feature batch of 8 would have to pad to
+    # the captured 16, which `pad_batch` refuses, so it must target 4 instead.
+    executor = _make_feature_encoder_batch_wait_executor([1, 2, 4, 16], encoder_max_batch_size=16)
+    executor.max_batch_size = 8
+    encoder_requests = [object() for _ in range(12)]
+
+    scheduled = executor._waiting_encoder_requests(encoder_requests, [], [object()] * 2)
+
+    assert scheduled == encoder_requests[:4]
+    assert executor.encoder_batch_wait_iters_count == 0
+
+
+def test_encoder_microbatch_admission_ignores_disabled_feature_runner():
+    """A runner that declined capture must not make admission wait on unreplayable shapes."""
+    # supported_batch_sizes stays populated from the config even when capture
+    # was declined (TP > 1, or no bucket fits), so waiting on those shapes
+    # would stall a batch that can only ever run eager. With no decoder work
+    # the request must be released immediately instead.
+    executor = _make_feature_encoder_batch_wait_executor([1, 2, 4, 8], runner_enabled=False)
+    executor.batch_wait_max_tokens_ratio = 0.5
+    executor.max_num_tokens = 32
+    executor.active_requests = []
+    executor.inflight_req_ids = _InflightRequestIds()
+    encoder_requests = [_make_encoder_request(0)]
+
+    scheduled = executor._waiting_encoder_requests(encoder_requests, [], [])
+
+    assert scheduled == encoder_requests
+    assert executor.encoder_batch_wait_iters_count == 0
 
 
 def test_encoder_microbatch_graph_admission_boundaries():
@@ -2088,20 +2189,39 @@ def test_pad_dummy_allocation_failure_skips_padding():
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
 
 
-def test_adp_pad_dummy_checks_full_context_capacity():
+def test_adp_pad_dummy_checks_minimal_context_capacity():
     stub = _StubADPExecutor(
         max_num_tokens=4096,
         peer_forward_intent=_ADPForwardIntent.CONTEXT,
     )
-    stub.kv_cache_manager.get_num_available_tokens.return_value = 1024
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 0
 
     _run_pad(stub)
 
     stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
-        token_num_upper_bound=4096, max_num_draft_tokens=0
+        token_num_upper_bound=1, max_num_draft_tokens=0
     )
     stub.kv_cache_manager.add_dummy_requests.assert_not_called()
     assert stub._pending_adp_dummy_request is None
+
+
+def test_adp_pad_dummy_ctx_preserves_helix_two_token_minimum():
+    stub = _StubADPExecutor(
+        max_num_tokens=4096,
+        peer_forward_intent=_ADPForwardIntent.CONTEXT,
+    )
+    stub.kv_cache_manager.mapping.has_cp_helix.return_value = True
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 2
+
+    _run_pad(stub)
+
+    stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=2, max_num_draft_tokens=0
+    )
+    assert len(stub.add_dummy_calls) == 1
+    # add_dummy_requests applies the same Helix minimum when constructing the
+    # request; keep the caller's generic context minimum at one token.
+    assert stub.add_dummy_calls[0]["token_nums"] == [1]
 
 
 def test_adp_pad_dummy_checks_full_generation_capacity():
@@ -2232,9 +2352,25 @@ def test_pad_dummy_skips_when_active_request_present():
     assert len(stub.active_requests) == 1
 
 
-def test_pad_dummy_ctx_pads_to_max_num_tokens():
+@pytest.mark.parametrize(
+    ("max_num_tokens", "model_max_seq_len", "manager_max_seq_len"),
+    [
+        (4096, 8232, 8233),
+        (16384, 8232, 8233),
+        (16384, 16384, 8192),
+    ],
+)
+def test_pad_dummy_ctx_uses_minimal_prompt_independent_of_configured_limits(
+    max_num_tokens,
+    model_max_seq_len,
+    manager_max_seq_len,
+):
+    # max_num_tokens is a batch-wide scheduling limit, not a target length for
+    # the single synthetic context request.
     stub = _StubADPExecutor(
-        max_num_tokens=4096,
+        max_num_tokens=max_num_tokens,
+        max_seq_len=model_max_seq_len,
+        kv_manager_max_seq_len=manager_max_seq_len,
         peer_forward_intent=_ADPForwardIntent.CONTEXT,
     )
     stub.expected_num_active_requests = 1
@@ -2243,7 +2379,7 @@ def test_pad_dummy_ctx_pads_to_max_num_tokens():
 
     assert len(stub.add_dummy_calls) == 1
     call = stub.add_dummy_calls[0]
-    assert call["token_nums"] == [4096]
+    assert call["token_nums"] == [1]
     assert call["is_gen"] is False
     assert stub.active_requests[-1].state == LlmRequestState.CONTEXT_INIT
 
@@ -2274,12 +2410,12 @@ def test_overlap_adp_preserves_legacy_role_without_forward_intent_collective():
     _run_pad(stub)
 
     assert len(stub.add_dummy_calls) == 1
-    assert stub.add_dummy_calls[0]["token_nums"] == [4096]
+    assert stub.add_dummy_calls[0]["token_nums"] == [1]
     assert stub.add_dummy_calls[0]["is_gen"] is False
     stub.dist.tp_allreduce.assert_not_called()
 
 
-def test_pad_dummy_ctx_skips_padding_when_max_num_tokens_missing():
+def test_pad_dummy_ctx_uses_minimal_prompt_when_max_num_tokens_missing():
     stub = _StubADPExecutor(
         max_num_tokens=None,
         peer_forward_intent=_ADPForwardIntent.CONTEXT,
@@ -2289,7 +2425,7 @@ def test_pad_dummy_ctx_skips_padding_when_max_num_tokens_missing():
     _run_pad(stub)
 
     assert len(stub.add_dummy_calls) == 1
-    assert stub.add_dummy_calls[0]["token_nums"] is None
+    assert stub.add_dummy_calls[0]["token_nums"] == [1]
 
 
 def test_pad_dummy_not_added_when_all_ranks_only_await_kv_transfer():
@@ -2319,8 +2455,38 @@ def test_pad_dummy_context_role_re_evaluated_while_local_rank_drains():
     _run_pad(stub)
 
     assert len(stub.add_dummy_calls) == 1
-    assert stub.add_dummy_calls[0]["token_nums"] == [4096]
+    assert stub.add_dummy_calls[0]["token_nums"] == [1]
     assert stub.add_dummy_calls[0]["is_gen"] is False
+
+
+def test_compute_adp_dummy_tokens_splits_context_and_generation_work():
+    scheduled_requests = types.SimpleNamespace(
+        context_requests=[
+            types.SimpleNamespace(
+                is_attention_dp_dummy=True,
+                context_chunk_size=1,
+            ),
+            types.SimpleNamespace(
+                is_attention_dp_dummy=False,
+                context_chunk_size=2048,
+            ),
+        ],
+        generation_requests=[
+            types.SimpleNamespace(
+                is_attention_dp_dummy=True,
+                py_draft_tokens=[1, 1, 1],
+            ),
+            types.SimpleNamespace(
+                is_attention_dp_dummy=False,
+                py_draft_tokens=[1, 1],
+            ),
+        ],
+    )
+
+    ctx_tokens, gen_tokens = PyExecutor._compute_adp_dummy_tokens(scheduled_requests)
+
+    assert ctx_tokens == 1
+    assert gen_tokens == 4
 
 
 def test_pad_dummy_no_op_when_attention_dp_disabled():
