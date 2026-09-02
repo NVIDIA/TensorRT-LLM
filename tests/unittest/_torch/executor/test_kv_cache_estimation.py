@@ -25,7 +25,12 @@ from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_wind
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    KvCacheConfig,
+    MTPDecodingConfig,
+    MultimodalConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -730,6 +735,80 @@ def test_v2_static_cache_size_preserves_window_pattern_phase_across_pp() -> None
     # Global layer 3 selects the full-attention entry, so its 64-byte layer
     # cost is entirely per-token with no fixed SWA allocation.
     assert cache_cost == CacheCost(slope=64, intercept=0)
+
+
+def test_v2_cache_size_per_token_charges_reuse_window_lookahead():
+    class FakeModelConfig:
+        quant_config = None
+        pretrained_config = SimpleNamespace(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+
+        def get_num_attention_layers(self):
+            return 1
+
+    class UnsupportedKVCacheManagerV2(KVCacheManagerV2):
+        _supports_reuse_match_backoff = False
+
+    mapping = Mock(enable_attention_dp=False, tp_size=1)
+    mapping.pp_layers.return_value = [0]
+    spec_config = MTPDecodingConfig(max_draft_len=1, use_mtp_vanilla=True)
+    kwargs = dict(
+        tokens_per_block=64,
+        max_seq_len=4096,
+        max_batch_size=3,
+        kv_cache_config=KvCacheConfig(max_attention_window=[64]),
+        spec_config=spec_config,
+    )
+
+    no_draft = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            FakeModelConfig(), mapping, **(kwargs | {"spec_config": None})
+        )
+    )
+    single_kvcm = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(FakeModelConfig(), mapping, **kwargs)
+    )
+    target = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            FakeModelConfig(),
+            mapping,
+            use_separate_draft_kv_cache=True,
+            **kwargs,
+        )
+    )
+    draft = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            FakeModelConfig(), mapping, is_draft=True, **kwargs
+        )
+    )
+    unsupported = CacheCost.from_raw(
+        UnsupportedKVCacheManagerV2.get_cache_size_per_token(FakeModelConfig(), mapping, **kwargs)
+    )
+    block_reuse_disabled = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            FakeModelConfig(),
+            mapping,
+            **(
+                kwargs
+                | {
+                    "kv_cache_config": KvCacheConfig(
+                        enable_block_reuse=False,
+                        max_attention_window=[64],
+                    )
+                }
+            ),
+        )
+    )
+
+    # W=64 occupies one page; one-model draft reuse retains W+D=65 and
+    # therefore charges two pages in single and separate KVCM layouts.
+    assert no_draft == CacheCost(slope=0, intercept=3 * 64 * 64)
+    assert unsupported == no_draft
+    assert block_reuse_disabled == no_draft
+    assert single_kvcm == target == draft == CacheCost(slope=0, intercept=3 * 128 * 64)
 
 
 def test_creator_uses_v2_affine_cache_cost():

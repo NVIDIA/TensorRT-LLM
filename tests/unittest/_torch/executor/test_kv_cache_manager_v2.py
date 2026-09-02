@@ -26,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as kv_cache_v2_mo
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
+    _extend_swa_windows_for_reuse,
     _KVCacheManagerInitStatus,
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
@@ -34,7 +35,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestSta
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
@@ -416,9 +417,13 @@ def test_propagates_partial_reuse_config(enable_partial_reuse: bool) -> None:
 
 
 @pytest.mark.parametrize(
-    ("joint_reuse", "expected_core_backoff"),
-    [(False, 1), (True, 1)],
-    ids=["single_pool_trims_in_core", "paired_pools_trim_in_core"],
+    ("joint_reuse", "is_draft", "expected_windows"),
+    [
+        (False, False, [6, None, None]),
+        (True, False, [6, None, None]),
+        (True, True, [6, None, None]),
+    ],
+    ids=["single_kvcm", "joint_target", "joint_draft"],
 )
 @pytest.mark.parametrize(
     "spec_config",
@@ -434,18 +439,20 @@ def test_propagates_partial_reuse_config(enable_partial_reuse: bool) -> None:
 def test_one_model_prompt_lookahead_configures_reuse_backoff(
     spec_config: Eagle3DecodingConfig | MTPDecodingConfig,
     joint_reuse: bool,
-    expected_core_backoff: int,
+    is_draft: bool,
+    expected_windows: list[int | None],
 ) -> None:
     """Keep #18295's shift-by-one input aligned with both reuse protocols."""
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         max_gpu_total_bytes=16 << 20,
+        max_attention_window=[5, MAX_SEQ_LEN, MAX_SEQ_LEN - 1],
     )
     manager, _ = _make_manager_for_cache_tier_test(
         kv_cache_config,
         [Mock()],
         spec_config=spec_config,
-        is_draft=joint_reuse,
+        is_draft=is_draft,
         joint_reuse=joint_reuse,
     )
 
@@ -465,12 +472,19 @@ def test_one_model_prompt_lookahead_configures_reuse_backoff(
     assert list(manager._context_reuse_tokens(request, reuse_limit=63)) == prompt[:64]
 
     # Both protocols bind the lookahead evidence and backoff in one core match.
+    assert manager.max_attention_window_vec == expected_windows
+    assert kv_cache_config.max_attention_window == [
+        5,
+        MAX_SEQ_LEN,
+        MAX_SEQ_LEN - 1,
+    ]
     core_config = manager._build_base_config(
         kv_cache_config,
         tokens_per_block=TOKENS_PER_BLOCK,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
     )
-    assert core_config.reuse_match_backoff == expected_core_backoff
+    assert core_config.layers[0].sliding_window_size == expected_windows[0]
+    assert core_config.reuse_match_backoff == 1
     assert replace(core_config, commit_min_snapshot=True).reuse_match_backoff == 1
 
 
@@ -516,6 +530,16 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
         manager._context_reuse_tokens.assert_called_once_with(request, 2)
     else:
         manager._context_reuse_tokens.assert_not_called()
+
+
+def test_extend_swa_windows_for_reuse_preserves_non_attention_windows() -> None:
+    recurrent_states = LinearCacheType.RECURRENT_STATES.value
+
+    assert _extend_swa_windows_for_reuse(
+        [None, 0, recurrent_states, 5, MAX_SEQ_LEN - 1],
+        reuse_match_backoff=1,
+        max_seq_len=MAX_SEQ_LEN,
+    ) == [None, 0, recurrent_states, 6, None]
 
 
 def test_pool_ratio_overrides_constraints() -> None:

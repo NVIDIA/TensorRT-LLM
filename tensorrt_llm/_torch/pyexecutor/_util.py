@@ -1524,7 +1524,7 @@ class KvCacheCreator:
         if not self._is_kv_cache_manager_v2:
             return False
         if not getattr(self._kv_cache_manager_cls,
-                       "_supports_joint_kv_cache_reuse", False):
+                       "_supports_reuse_match_backoff", False):
             return False
         return draft_prompt_lookahead(self._speculative_config) is not None
 

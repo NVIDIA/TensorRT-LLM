@@ -398,6 +398,30 @@ def _resolve_v2_max_attention_window_vec(
     return [None if window == max_seq_len else window for window in local_windows]
 
 
+def _extend_swa_windows_for_reuse(
+    attention_windows: Sequence[Optional[int]],
+    reuse_match_backoff: int,
+    max_seq_len: Optional[int],
+) -> List[Optional[int]]:
+    """Extend physical SWA retention to cover a backed-off reuse match."""
+    if reuse_match_backoff <= 0:
+        return list(attention_windows)
+
+    retention_windows: List[Optional[int]] = []
+    for window_size in attention_windows:
+        if window_size is None or window_size <= 0:
+            retention_windows.append(window_size)
+            continue
+
+        retention_window = int(window_size) + reuse_match_backoff
+        retention_windows.append(
+            None
+            if max_seq_len is not None and retention_window >= int(max_seq_len)
+            else retention_window
+        )
+    return retention_windows
+
+
 def _get_static_cache_size_layer_components(
     model_config: ModelConfigPython,
     mapping: Mapping,
@@ -874,8 +898,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
     # Read by KvCacheCreator: a subclass that overrides the context
-    # commit/history protocol opts out and never gets a pairing.
-    _supports_joint_kv_cache_reuse = True
+    # commit/history protocol opts out of generic reuse-match backoff.
+    _supports_reuse_match_backoff = True
 
     def __init__(
         self,
@@ -999,7 +1023,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._can_publish_block_reuse = joint_kv_cache_reuse or not self.is_draft
         # Unsupported adapters keep their main-like reuse endpoint.
         self.reuse_match_backoff = draft_prompt_lookahead(spec_config) or 0
-        if not self._supports_joint_kv_cache_reuse:
+        if not self._supports_reuse_match_backoff:
             self.reuse_match_backoff = 0
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens = self.max_total_draft_tokens
@@ -1031,6 +1055,15 @@ class KVCacheManagerV2(BaseResourceManager):
             self.pp_layers,
         )
         assert len(self.max_attention_window_vec) == self.num_local_layers
+
+        # A D-token match backoff needs D more physical SWA history at the
+        # committed endpoint so commit_min_snapshot still covers the rewind.
+        if kv_cache_config.enable_block_reuse and self.reuse_match_backoff:
+            self.max_attention_window_vec = _extend_swa_windows_for_reuse(
+                self.max_attention_window_vec,
+                self.reuse_match_backoff,
+                max_seq_len,
+            )
 
         event_window_size = max(
             self.max_seq_len if window_size is None else int(window_size)
@@ -4091,8 +4124,9 @@ class KVCacheManagerV2(BaseResourceManager):
         return 0
 
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic
-    @staticmethod
+    @classmethod
     def get_cache_size_per_token(
+        cls,
         model_config: ModelConfigPython,
         mapping: Mapping,
         num_layers: Optional[int] = None,
@@ -4113,6 +4147,21 @@ class KVCacheManagerV2(BaseResourceManager):
             max_seq_len=max_seq_len,
             kv_cache_config=kv_cache_config,
         )
+        reuse_backoff_enabled = (
+            kv_cache_config is not None
+            and kv_cache_config.enable_block_reuse
+            and cls._supports_reuse_match_backoff
+        )
+        if reuse_backoff_enabled:
+            from ..speculative import draft_prompt_lookahead
+
+            # Mirror the runtime W+D retention window before page rounding.
+            backoff = draft_prompt_lookahead(spec_config) or 0
+            attention_windows = _extend_swa_windows_for_reuse(
+                attention_windows,
+                backoff,
+                max_seq_len,
+            )
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows
         )
