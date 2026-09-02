@@ -76,7 +76,20 @@ class FallbackFmha(Fmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        del q, k, v, phase
+        del k, v, phase
+        # A verify group may straddle a page boundary onto two CP ranks, so
+        # its KV ownership is per-token. The fused thop path cannot express
+        # that: its spec-dec mask and the per-sequence helix_is_inactive_rank
+        # gate both assume the new KV entries are the trailing slots of one
+        # rank's kv_len. Reject rather than run it silently wrong; being last
+        # in the library list, this makes dispatch raise.
+        if (
+            metadata.helix_position_offsets is not None
+            and metadata._helix_spec_tokens_valid
+            and metadata.num_generations > 0
+            and q.shape[0] > metadata.num_seqs
+        ):
+            return False
         return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
             forward_args.update_kv_cache or metadata.is_cross
         )

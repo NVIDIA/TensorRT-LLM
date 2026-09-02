@@ -372,6 +372,11 @@ def _vision_requires_replication(model_config: ModelConfig, num_heads: int) -> b
     mapping = model_config.mapping
     if mapping.enable_attention_dp:
         return True
+    # Helix carries its parallelism in cp with tp_size=1, so a tp-only test
+    # never trips; the tower has no context-parallel form, so any cp > 1
+    # must replicate.
+    if mapping.cp_size > 1:
+        return True
     return (num_heads % mapping.tp_size) != 0
 
 
@@ -379,12 +384,17 @@ def _get_vision_tp_mapping(model_config: ModelConfig, num_heads: int) -> Mapping
     if not _vision_requires_replication(model_config, num_heads):
         return model_config.mapping
 
+    # Fold every parallel dimension (incl. helix cp) into pp so each rank
+    # runs the tower replicated; without cp the world size collapses below
+    # the rank range under helix.
+    attn_ranks = (model_config.mapping.pp_size * model_config.mapping.tp_size
+                  * model_config.mapping.cp_size)
     return Mapping(
-        world_size=model_config.mapping.pp_size * model_config.mapping.tp_size,
+        world_size=attn_ranks,
         rank=model_config.mapping.rank,
         gpus_per_node=model_config.mapping.gpus_per_node,
         tp_size=1,
-        pp_size=model_config.mapping.pp_size * model_config.mapping.tp_size,
+        pp_size=attn_ranks,
     )
 
 

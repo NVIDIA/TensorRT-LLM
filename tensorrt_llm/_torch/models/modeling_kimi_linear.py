@@ -2054,11 +2054,33 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 "per-request locality of KDA recurrent state."
             )
         if spec_config is not None:
-            raise ValueError(
-                "Kimi K3 helix phase 1 does not support speculative "
-                "decoding (round-robin KV bookkeeping assumes one token "
-                "per decode step)."
-            )
+            # Helix supports only the standalone DSpark drafter (verified on
+            # the V2 superblock ledger); reject everything else loudly rather
+            # than let an unsupported spec mode run silently wrong.
+            if not spec_config.spec_dec_mode.is_dspark():
+                raise ValueError(
+                    "Kimi K3 helix supports speculative decoding only with "
+                    f"DSpark (standalone drafter); got "
+                    f"{spec_config.decoding_type!r}."
+                )
+            # The SpeculationGate acceptance-rate trip permanently disables
+            # speculation mid-flight while enable_spec_decode stays True;
+            # in-flight helix requests then fall into the plain generation
+            # loop whose position math (total_input_len_cp +
+            # py_decoding_iter - 1) is stale once any draft token was
+            # accepted -> silently wrong RoPE positions and KV slots. Reject
+            # the trip wires until that loop is helix-group aware.
+            if (
+                spec_config.acceptance_rate_window_size is not None
+                or spec_config.acceptance_rate_threshold is not None
+            ):
+                raise ValueError(
+                    "Kimi K3 helix does not support the speculation "
+                    "acceptance-rate gate (acceptance_rate_window_size / "
+                    "acceptance_rate_threshold): dynamically disabling "
+                    "speculation mid-flight leaves helix requests on a "
+                    "single-token position formula."
+                )
         cp = model_config.mapping.cp_size
         repurposed_tp = model_config.mapping.tp_size * cp
         if cfg.num_attention_heads % repurposed_tp != 0:

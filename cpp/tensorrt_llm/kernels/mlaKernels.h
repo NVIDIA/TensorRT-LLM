@@ -153,6 +153,13 @@ struct MlaParams
     // for Helix parallelism: whether the current rank is inactive, shape [b]
     // (the current query tokens are not appended to this rank's KV cache)
     bool const* helix_is_inactive_rank{nullptr};
+
+    // for Helix parallelism with speculative verify groups: per-token
+    // rank-local KV write slot, shape [num_tokens]; -1 means another CP rank
+    // owns the token's global position. Non-null supersedes the per-sequence
+    // helix_is_inactive_rank gate (a 1 + draft_len group can straddle a
+    // ledger-page boundary, splitting ownership between two ranks).
+    int32_t const* helix_local_slots{nullptr};
 };
 
 template <typename T, typename KVCacheBuffer>

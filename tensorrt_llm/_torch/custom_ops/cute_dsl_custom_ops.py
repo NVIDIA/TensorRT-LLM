@@ -9694,7 +9694,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     tensor of shape (H, S_q, B) remains in the workspace.
             """
             (q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-             workspace, softmax_stats) = inputs
+             workspace, softmax_stats) = inputs[:9]
+            # inputs[9] (optional): helix per-token attention bounds of shape
+            # (B * S_q,), int32 — speculative verify groups only.
+            kv_bounds = inputs[9] if len(inputs) > 9 else None
             softmax_scale = float(kwargs.get("softmax_scale", 1.0))
             output_scale = float(kwargs.get("output_scale", 1.0))
 
@@ -9767,12 +9770,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
             split_workspace = workspace_bytes[split_kv_offset:split_kv_offset +
                                               split_kv_size]
 
+            if kv_bounds is not None and AutoTuner.get().is_tuning_mode:
+                # Profiling rebuilds cache_seqs at bucketed sizes but input 9
+                # has no dynamic-dim spec, so kv_bounds arrives at the old
+                # size. Bound values only affect masking depth, not the
+                # tactic space, so any size-consistent dummy will do.
+                if kv_bounds.numel() != batch_size * seq_len_q:
+                    kv_bounds = cache_seqs.repeat_interleave(
+                        seq_len_q).contiguous()
+            if kv_bounds is not None:
+                expected_bounds_shape = (batch_size * seq_len_q, )
+                if (kv_bounds.shape != expected_bounds_shape
+                        or kv_bounds.dtype != torch.int32
+                        or kv_bounds.device != o.device
+                        or not kv_bounds.is_contiguous()):
+                    raise RuntimeError(
+                        "CuteDSLNVMlaDecodeBlackwellRunner requires contiguous "
+                        "int32 kv_bounds on the output device with shape "
+                        f"{expected_bounds_shape}, got shape="
+                        f"{tuple(kv_bounds.shape)}, dtype={kv_bounds.dtype}.")
+
             cache_key = self.unique_id() + (
                 out_dtype,
                 mma_qk_tiler_mn,
                 mma_pv_tiler_mn,
                 split_kv,
                 is_persistent,
+                kv_bounds is not None,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
@@ -9840,6 +9864,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 if use_workspace else None)
                 cache_seqs_ct = cute.runtime.from_dlpack(
                     cache_seqs, assumed_align=16).mark_layout_dynamic()
+                kv_bounds_ct = (cute.runtime.from_dlpack(
+                    kv_bounds, assumed_align=4).mark_layout_dynamic()
+                                if kv_bounds is not None else None)
                 # Variable split-KV (block_split_kvs) is not used on this path:
                 block_split_kvs_ct = None
 
@@ -9860,6 +9887,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     workspace_ct,
                     split_kv,
                     cache_seqs_ct,
+                    kv_bounds_ct,
                     block_split_kvs_ct,
                     cutlass.Float32(softmax_scale),
                     cutlass.Float32(output_scale),
@@ -9890,6 +9918,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (split_kv > 1 and split_workspace.numel() > 0) else None,
                 split_kv,
                 cache_seqs,
+                kv_bounds,
                 None,  # block_split_kvs: var-split path unused (is_var_split_kv False)
                 softmax_scale,
                 output_scale,
@@ -9917,14 +9946,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
-        # Keep the last two arguments required in the custom-op schema. PyTorch
+        # Keep the trailing arguments required in the custom-op schema. PyTorch
         # elides trailing default-valued arguments before its mutation fallback,
         # while mutates_args retains their positional indices.
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
         """
+        if kv_bounds is not None:
+            raise ValueError(
+                "trtllm::cute_dsl_mla_decode_fp8_blackwell does not support "
+                "helix per-token kv_bounds (bf16/fp16 kernel only).")
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
                 f"trtllm::cute_dsl_mla_decode_fp8_blackwell requires SM 100 or "
@@ -9980,6 +10014,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_scale: float,
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         return None
 
@@ -10005,8 +10040,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # See the FP8 op above: these must remain required schema arguments.
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
+
+        kv_bounds: helix speculative verify groups — per-token rank-local
+        attention bounds of shape (B * seq_len_q,), int32.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
@@ -10042,7 +10081,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-            workspace, softmax_stats
+            workspace, softmax_stats, kv_bounds
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
@@ -10080,5 +10119,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_scale: float,
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         return None

@@ -309,8 +309,15 @@ class CuteDslMlaFmha(PhasedFmha):
         seq_len_q = q.shape[0] // meta.num_generations
         batch_size = meta.num_generations
         if meta.helix_position_offsets is not None:
-            if seq_len_q != 1:
+            if seq_len_q != 1 and not meta._helix_spec_tokens_valid:
+                # Multi-token decode under helix needs the per-token bound /
+                # write-slot buffers of the speculative verify-group path.
                 return False, "CuTe DSL MLA FMHA only supports single-token decode with Helix."
+            if seq_len_q != 1 and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn:
+                return False, (
+                    "CuTe DSL MLA FMHA helix verify groups require a bf16/fp16 "
+                    "KV cache (the fp8 kernel has no per-token bounds)."
+                )
             softmax_stats = fwd.softmax_stats_tensor
             if softmax_stats is None:
                 return False, "CuTe DSL MLA FMHA requires softmax_stats_tensor with Helix."
@@ -513,6 +520,17 @@ class CuteDslMlaFmha(PhasedFmha):
             # Max batch size for the AutoTuner to profile.
             int(meta.max_num_requests),
             params.fwd.softmax_stats_tensor,
+            # Per-token rank-local bounds, filled by
+            # recompute_helix_spec_buffers. None everywhere else.
+            (
+                meta.helix_kv_bounds[:num_tokens]
+                if (
+                    meta.helix_position_offsets is not None
+                    and meta._helix_spec_tokens_valid
+                    and kernel_dtype != torch.float8_e4m3fn
+                )
+                else None
+            ),
         )
 
     def run_mla_generation(
