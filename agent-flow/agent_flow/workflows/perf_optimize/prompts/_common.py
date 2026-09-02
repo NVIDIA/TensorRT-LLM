@@ -187,15 +187,18 @@ reverts rejected attempts with `git reset --hard` + `git clean -fd`:
   say itself — the non-obvious constraint, the why of a chosen value —
   in the repo's own terms; the provenance story belongs in
   `optimization_summary.md`, not in the source.
-- **Before ANY source edit, verify the checkout is the installed
-  package** (verify before asserting):
+- **Before any source edit or server launch, identify the active runtime
+  checkout from the turn instructions.** Inside the same Slurm container
+  and shell that will launch `trtllm-serve`, prepend that exact checkout
+  to `PYTHONPATH`, then verify:
   ```bash
   python -c "import tensorrt_llm, os; print(os.path.realpath(tensorrt_llm.__file__))"
   ```
-  The printed path must resolve **under `trtllm_repo_path`** (an editable
-  install). On a mismatch, source edits will not take effect in the
-  served process — record that as a blocker in your output file and do
-  not pretend the change was applied.
+  The printed path must resolve under the active runtime checkout. If it
+  does not, stop and record a blocker; do not benchmark or claim that the
+  change was exercised. `task.yaml`'s `trtllm_repo_path` is the campaign
+  checkout. It may differ from the active runtime checkout when an item
+  or integration worktree is in use.
 - The review basis for an attempt is
   `git -C <trtllm_repo_path> diff` (plus `--stat`) — uncommitted changes
   on the optimization branch. New files the attempt added show up with
@@ -487,23 +490,24 @@ worst point −0.40% ≥ −1.0% ✓ → the perf axis passes.
 # --------------------------------------------------------------------------- #
 
 TUNING_CONFIG_NOTE = """\
-## The live tuning config (supersedes the `extra_llm_api_options` guidance above)
+## The active tuning config (supersedes the `extra_llm_api_options` guidance above)
 
 In this workflow the server tuning is **owned by the workspace**, not by
-`task.yaml`: `trtllm-serve` **always** passes
-`--extra_llm_api_options <workspace>/tuning/extra_llm_api_options.yaml` —
-the live working copy ( `{}` when no tuning applies, which is valid).
+`task.yaml`. The turn instructions name the exact **active tuning config**;
+that path supersedes shorthand references to
+`tuning/extra_llm_api_options.yaml` elsewhere in the prompt.
+`trtllm-serve` **always** passes `--extra_llm_api_options` with that exact
+path (whose content is `{}` when no tuning applies, which is valid).
 Ignore the earlier instruction to pass the flag only when `task.yaml`
-sets the key: here the flag is always present and always points at the
-tuning file, so config optimizations take effect by editing that one
-file and relaunching.
+sets the key: here the flag is always present, so config optimizations
+take effect by editing the active tuning config and relaunching.
 
-- Only the **optimizer** edits `tuning/extra_llm_api_options.yaml`; every
-  other role treats it as read-only and serves with it as-is.
-- `tuning/extra_llm_api_options.accepted.yaml` is the
-  orchestrator-managed snapshot of the last accepted config — never edit
-  it; the orchestrator restores the live file from it when an attempt is
-  rejected.
+- Only the **optimizer** edits the active tuning config; every other role
+  treats it as read-only and serves with it as-is.
+- The turn instructions also name the orchestrator-managed accepted
+  config snapshot when the role needs it. Never edit that snapshot; the
+  orchestrator restores the active tuning config from it when an attempt
+  is rejected.
 """
 
 
@@ -531,7 +535,7 @@ runs it for you, with the same flags.
 - **harness config** (`task.yaml`'s `disagg.config`) — cluster,
   environment, measurement conditions. Read-only.
 - **`task.yaml`** — the campaign knobs (`optimize`). Read-only.
-- **`<workspace>/tuning/extra_llm_api_options.yaml`** — the harness
+- **active tuning config named in the turn instructions** — the harness
   config's `worker_config`, i.e. `{ctx: {...}, gen: {...}}`. Only the
   **optimizer** edits it, under the rules above.
 

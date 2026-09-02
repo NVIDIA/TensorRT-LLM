@@ -178,6 +178,10 @@ def test_mutating_roles_carry_git_discipline():
     assert "Never run `git commit`" in block
     assert "orchestrator owns all git state" in block
     assert "only the current roadmap item's changes" in block
+    assert "active runtime checkout from the turn instructions" in block
+    assert "prepend that exact checkout to `PYTHONPATH`" in block
+    assert "may differ from the active runtime checkout" in block
+    assert "an editable install" not in block
 
 
 def test_code_edits_never_reference_run_internals():
@@ -389,12 +393,15 @@ def test_server_roles_carry_the_tuning_config_supersede_note():
     note = _norm(TUNING_CONFIG_NOTE)
     assert "supersedes" in note
     assert "**always** passes" in note
+    assert "turn instructions name the exact **active tuning config**" in note
+    assert "supersedes shorthand references" in note
+    assert "<workspace>/tuning/extra_llm_api_options.yaml" not in note
     for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "qa"):
-        assert "The live tuning config" in _ALL_PROMPTS[role], role
+        assert "The active tuning config" in _ALL_PROMPTS[role], role
     # Only the optimizer may edit the live file; the snapshot is
     # orchestrator-managed.
-    assert "extra_llm_api_options.accepted.yaml" in note
-    assert "never edit" in note
+    assert "accepted config snapshot" in note
+    assert "Never edit" in note
 
 
 # ------------------------------------------------------------------------- qa

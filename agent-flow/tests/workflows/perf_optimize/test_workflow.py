@@ -419,8 +419,10 @@ def test_integrator_verdict_is_not_recomputed_by_python(tmp_path, fake_git):
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
     _stub_agents(workflow)
+    integrator_prompts: list[str] = []
 
     def authoritative_integrator(prompt):
+        integrator_prompts.append(prompt)
         state = state_module.load_state(workflow.state_path)
         integration_dir = workflow._round_dir(state) / "integration"
         (integration_dir / "integration.md").write_text("# authoritative\n", encoding="utf-8")
@@ -451,6 +453,11 @@ def test_integrator_verdict_is_not_recomputed_by_python(tmp_path, fake_git):
     roadmap = roadmap_schema.load_roadmap(workflow.roadmap_path)
     assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "accepted"
     assert roadmap["current_best"]["value"] == 50.0
+    active_repo = str(ws / "worktrees" / "round_1" / "integration")
+    assert f"Active runtime checkout: `{active_repo}`" in integrator_prompts[0]
+    assert (
+        f'export PYTHONPATH="{active_repo}${{PYTHONPATH:+:$PYTHONPATH}}"' in integrator_prompts[0]
+    )
 
 
 def test_relative_workspace_resolves_reference_result_dir(tmp_path, fake_git, monkeypatch):
@@ -2931,6 +2938,8 @@ def _capture_driving_prompts(
         current_item_id="opt-001",
         campaign_git_branch="perf-optimize/test-branch",
         campaign_git_base_commit="a" * 40,
+        item_worktree_path=str(ws / "worktrees" / "round_1" / "item_1_opt-001"),
+        item_branch="perf-optimize/test-branch-round-1-item-1-opt-001",
         stage=state_module.STAGE_OPTIMIZER,
     )
 
@@ -2972,10 +2981,18 @@ def test_driving_prompts_reinforce_casebook_for_serving_analysis_roles(tmp_path)
 def test_optimizer_prompt_names_item_branch_and_attempt_dir(tmp_path):
     captured = _capture_driving_prompts(tmp_path)
     prompt = captured["optimizer"]
+    active_repo = str(tmp_path / "ws" / "worktrees" / "round_1" / "item_1_opt-001")
+    tuning_dir = tmp_path / "ws" / "rounds" / "round_1" / "item_1_opt-001" / "tuning"
+    active_tuning = str(tuning_dir / "extra_llm_api_options.yaml")
+    accepted_tuning = str(tuning_dir / "extra_llm_api_options.accepted.yaml")
     assert "opt-001" in prompt
     assert "perf-optimize/test-branch" in prompt
     assert "attempt_1" in prompt
     assert "never commit" in prompt
+    assert f"Active runtime checkout: `{active_repo}`" in prompt
+    assert f'export PYTHONPATH="{active_repo}${{PYTHONPATH:+:$PYTHONPATH}}"' in prompt
+    assert active_tuning in prompt
+    assert accepted_tuning not in prompt
 
 
 def test_evaluator_prompt_carries_the_gate_knobs(tmp_path):
@@ -2983,6 +3000,10 @@ def test_evaluator_prompt_carries_the_gate_knobs(tmp_path):
         tmp_path, {"optimize": {"accept_fraction": 0.7, "noise_floor_pct": 2.0}}
     )
     prompt = captured["evaluator"]
+    active_repo = str(tmp_path / "ws" / "worktrees" / "round_1" / "item_1_opt-001")
+    tuning_dir = tmp_path / "ws" / "rounds" / "round_1" / "item_1_opt-001" / "tuning"
+    active_tuning = str(tuning_dir / "extra_llm_api_options.yaml")
+    accepted_tuning = str(tuning_dir / "extra_llm_api_options.accepted.yaml")
     assert "accept_fraction=0.7" in prompt
     assert "noise_floor_pct=2.0" in prompt
     assert "current_best" in prompt
@@ -2990,6 +3011,10 @@ def test_evaluator_prompt_carries_the_gate_knobs(tmp_path):
     # The three-way decision vocabulary and the full-metric diff reference.
     assert "APPROVE|REJECT|PUSH_BACK" in prompt
     assert "full-metric diff" in prompt
+    assert f"Active runtime checkout: `{active_repo}`" in prompt
+    assert f'export PYTHONPATH="{active_repo}${{PYTHONPATH:+:$PYTHONPATH}}"' in prompt
+    assert f"Active tuning config: `{active_tuning}`" in prompt
+    assert f"Accepted tuning config snapshot: `{accepted_tuning}`" in prompt
 
 
 def test_qa_prompt_conditions_accuracy_on_task_block(tmp_path):
