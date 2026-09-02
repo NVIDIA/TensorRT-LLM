@@ -90,8 +90,12 @@ def test_sessionless_rank_striped_load_uses_native_io(
     native_weights = {"native": object()}
     native_load = mock.Mock(return_value=native_weights)
     reader_start = mock.Mock(side_effect=AssertionError("must not start"))
+    open_weight_session = mock.Mock(side_effect=AssertionError("must not open a session"))
+    warning = mock.Mock(side_effect=AssertionError("must not warn"))
     monkeypatch.setattr(loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(loader, "open_weight_session", open_weight_session)
     monkeypatch.setattr(read_ahead.RankStripedReadAheadSession, "start", reader_start)
+    monkeypatch.setattr(weight_loader_module.logger, "warning", warning)
     mapping = Mapping()
 
     weights = loader.load_weights("/unused", mapping=mapping)
@@ -104,7 +108,25 @@ def test_sessionless_rank_striped_load_uses_native_io(
     assert status.activated is False
     assert status.effective == "native"
     assert "open_weight_session" in status.fallback_reason
+    open_weight_session.assert_not_called()
     reader_start.assert_not_called()
+    warning.assert_not_called()
+
+
+def test_checkpoint_io_status_log_escapes_multiline_fallback_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _rank_striped_loader()
+    loader._last_checkpoint_io_status.fallback_reason = "first line\r\nsecond line"
+    log_info = mock.Mock()
+    monkeypatch.setattr(weight_loader_module.logger, "info", log_info)
+
+    loader._log_checkpoint_io_status()
+
+    message = log_info.call_args.args[0]
+    assert "\r" not in message
+    assert "\n" not in message
+    assert r"fallback_reason=first line\r\nsecond line." in message
 
 
 def test_extent_plan_is_complete_disjoint_and_fair(tmp_path, monkeypatch):
