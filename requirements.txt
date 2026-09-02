@@ -34,7 +34,7 @@ nvidia-nccl-cu13>=2.29.7,<=2.30.4
 # NcclEP uses nccl4py's nccl.ep package without changing the NCCL wheel constraint.
 nccl4py>=0.3.1,<0.4
 nvidia-cuda-nvrtc
-transformers==5.5.4
+transformers==5.10.1
 prometheus_client
 # 8.x is the first series to allow starlette>=1.0.0; 7.1.0 pins starlette<1.0.0
 # and can no longer resolve against the starlette floor below.
