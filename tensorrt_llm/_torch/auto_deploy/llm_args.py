@@ -122,6 +122,12 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         if spec_config is None:
             return self
 
+        if spec_config.moe_backend is not None:
+            raise ValueError(
+                "AutoDeploy does not support speculative_config.moe_backend. "
+                "This draft-model override is available only with the PyTorch backend."
+            )
+
         if isinstance(spec_config, MTPDecodingConfig):
             if not spec_config.mtp_eagle_one_model or spec_config.use_mtp_vanilla:
                 raise ValueError(
