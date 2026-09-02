@@ -520,12 +520,10 @@ def action_video_client(tmp_path):
 @pytest.fixture()
 def checkpoint_policy_video_client(tmp_path):
     """Video client modeling a checkpoint that selects Policy internally."""
-    from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+    from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
 
-    specs = {
-        "action": ExtraParamSchema(type="list", default=None),
-        "action_mode": ExtraParamSchema(type="str", default="policy", requires_tensor_output=True),
-    }
+    specs = dict(COSMOS3_EXTRA_SPECS)
+    specs["action_mode"] = specs["action_mode"].model_copy(update={"default": "policy"})
     gen = MockVisualGen(
         video_output=_make_dummy_video_tensor(),
         action_output=torch.zeros((32, 8), dtype=torch.float32),
@@ -1936,6 +1934,24 @@ class TestVideoGenerationAsync:
         data = resp.json()
         assert data["status"] == "queued"
         assert data["id"].startswith("video_")
+
+    def test_async_video_accepts_deprecated_cosmos3_view_point(
+        self, checkpoint_policy_video_client
+    ):
+        resp = checkpoint_policy_video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Pick up the block",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "extra_params": {"view_point": "ego_view"},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        assert resp.status_code == 202
+        assert resp.json()["status"] == "queued"
 
 
 # =========================================================================
