@@ -157,7 +157,7 @@ TEST(RequestTest, serializeDeserialize)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 1, 10)}, 10), "Processor",
         std::nullopt, std::nullopt, 1234, false, 0.5, RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, 1, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, 1, std::nullopt,
         GuidedDecodingParams(GuidedDecodingParams::GuideType::kREGEX, "\\d+"));
 
     auto serializedSize = Serialization::serializedSize(request);

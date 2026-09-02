@@ -1394,9 +1394,7 @@ class TestLogsprobsInBatchedSampling:
                             returned_topk_logprobs.pop(sampled_token)
 
                         # validate ranks and suppress masked tokens
-                        req_top_k = None
-                        if (req_top_ks := req.sampling_config.top_k) is not None:
-                            req_top_k = req_top_ks[0]
+                        req_top_k = req.sampling_config.top_k
                         returned_ranks = set()
                         for token, logprob in returned_topk_logprobs.items():
                             assert logprob.rank not in returned_ranks
