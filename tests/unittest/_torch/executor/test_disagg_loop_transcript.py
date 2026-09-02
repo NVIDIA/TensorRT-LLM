@@ -116,7 +116,6 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.enable_iter_perf_stats = False
     executor.enable_attention_dp = False
     executor.is_benchmark_disagg = False
-    executor.is_warmup = False
     executor.iter_counter = 0
     executor._resource_governor_enabled = False
     executor._is_kv_manager_v2 = False
