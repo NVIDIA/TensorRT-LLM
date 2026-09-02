@@ -1183,166 +1183,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                           extra_acc_spec="beam_width=2")
 
 
-class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.2-3B"
-    MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-3B"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_hopper
-    def test_fp8_prequantized(self):
-        model_path = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-3B-Instruct-FP8"
-        with LLM(model_path) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-@pytest.mark.timeout(7200)
-@pytest.mark.skip_less_device_memory(80000)
-class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
-
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_auto_dtype_tp8(self):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
-        with LLM(model_path, tensor_parallel_size=8) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-    @pytest.mark.skip_less_mpi_world_size(2)
-    def test_auto_dtype_tp2(self):
-        _run_multinode_accuracy(
-            f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct",
-            self.MODEL_NAME,
-            benchmarks=["mmlu"])
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @parametrize_with_ids("torch_compile", [False, True])
-    @parametrize_with_ids("eagle3_one_model", [True, False])
-    def test_fp8_eagle3_tp8(self, eagle3_one_model, torch_compile):
-        model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
-        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-        spec_config = Eagle3DecodingConfig(max_draft_len=3,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=eagle3_one_model)
-        torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        pytorch_config = dict(
-            disable_overlap_scheduler=not eagle3_one_model,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=1),
-            torch_compile_config=torch_compile_config)
-        with LLM(model_path,
-                 max_batch_size=16,
-                 tensor_parallel_size=8,
-                 speculative_config=spec_config,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device(4)
-    @skip_pre_hopper
-    @parametrize_with_ids("torch_compile", [False, True])
-    def test_fp8_tp4(self, torch_compile):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
-        torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        with LLM(model_path,
-                 tensor_parallel_size=4,
-                 max_seq_len=8192,
-                 max_batch_size=32,
-                 kv_cache_config=kv_cache_config,
-                 torch_compile_config=torch_compile_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            sampling_params = SamplingParams(
-                max_tokens=256,
-                temperature=0.0,
-                add_special_tokens=False,
-            )
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-    @pytest.mark.skip_less_device(4)
-    @skip_pre_blackwell
-    @parametrize_with_ids("torch_compile", [False, True])
-    def test_nvfp4_tp4(self, torch_compile):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
-        torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        with LLM(model_path,
-                 tensor_parallel_size=4,
-                 max_batch_size=32,
-                 kv_cache_config=kv_cache_config,
-                 torch_compile_config=torch_compile_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            sampling_params = SamplingParams(
-                max_tokens=256,
-                temperature=0.0,
-                add_special_tokens=False,
-            )
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-    @pytest.mark.skip_less_device(4)
-    @skip_pre_blackwell
-    @parametrize_with_ids("enable_gemm_allreduce_fusion", [False, True])
-    @parametrize_with_ids("torch_compile", [False, True])
-    def test_fp4_tp2pp2(self, enable_gemm_allreduce_fusion, torch_compile):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
-        torch_compile_config = _get_default_torch_compile_config(torch_compile)
-
-        with (mock.patch.dict(
-                os.environ, {
-                    "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED":
-                    str(int(enable_gemm_allreduce_fusion))
-                }),
-              LLM(model_path,
-                  tensor_parallel_size=2,
-                  pipeline_parallel_size=2,
-                  max_batch_size=32,
-                  kv_cache_config=kv_cache_config,
-                  torch_compile_config=torch_compile_config) as llm):
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            sampling_params = SamplingParams(
-                max_tokens=256,
-                temperature=0.0,
-                add_special_tokens=False,
-            )
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-
 class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Ministral-8B-Instruct-2410"
     MODEL_PATH = f"{llm_models_root()}/Ministral-8B-Instruct-2410"
@@ -2768,6 +2608,46 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skipif(get_sm_version() != 107,
+                        reason="fine-grained sync requires SM107")
+    @parametrize_with_ids("torch_compile", [False])
+    @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
+                          [(False, False, False, False),
+                           (True, False, True, True), (True, True, True, True)])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("moe_backend", ["TRTLLM"])
+    @parametrize_with_ids("enable_autotuner", [False, True])
+    def test_nvfp4_fine_grained_sync(self, fp8kv: bool, attention_dp: bool,
+                                     cuda_graph: bool, overlap_scheduler: bool,
+                                     torch_compile: bool, mtp_nextn: int,
+                                     moe_backend: str,
+                                     enable_autotuner: bool) -> None:
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        torch_compile_config = _get_default_torch_compile_config(torch_compile)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            torch_compile_config=torch_compile_config,
+            moe_config=MoeConfig(backend=moe_backend))
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 enable_autotuner=enable_autotuner,
+                 use_fine_grained_sync=True,
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @parametrize_with_ids(
         "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
         [(False, False, False, False),
@@ -3596,7 +3476,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
-            moe_config = MoeConfig()
+            # Chunk MoE so its workspace fits alongside the KV cache, which is sized
+            # from a profile taken before that workspace is allocated (NVBug 6633931).
+            moe_config = MoeConfig(max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
             # Cap max_seq_len based on the evaluation task (NVBug 6476233).
@@ -5378,6 +5260,62 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skipif(get_sm_version() != 107,
+                        reason="fine-grained sync requires SM107")
+    @pytest.mark.parametrize("enable_autotuner", [False, True],
+                             ids=["no_autotuner", "autotuner"])
+    @pytest.mark.parametrize("activation_dtype", ["mxfp8"], ids=["mxfp8"])
+    @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
+        (False, False),
+        (True, True),
+    ])
+    def test_w4a8_mxfp4_fine_grained_sync(self, enable_autotuner: bool,
+                                          activation_dtype: str,
+                                          cuda_graph: bool,
+                                          overlap_scheduler: bool) -> None:
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend="TRTLLM"))
+
+        with LLM(
+                f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-30B-A3B_w4a8_mxfp4_{activation_dtype}_kv_none_hf_moeonly",
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                moe_expert_parallel_size=1,
+                **pytorch_config,
+                enable_autotuner=enable_autotuner,
+                use_fine_grained_sync=True) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skipif(get_sm_version() != 107,
+                        reason="fine-grained sync requires SM107")
+    @pytest.mark.parametrize("enable_autotuner", [False, True],
+                             ids=["no_autotuner", "autotuner"])
+    @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
+        (False, False),
+        (True, True),
+    ])
+    def test_w4a16_mxfp4_fine_grained_sync(self, enable_autotuner: bool,
+                                           cuda_graph: bool,
+                                           overlap_scheduler: bool) -> None:
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend="TRTLLM"))
+
+        with LLM(
+                f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-30B-A3B_w4a16_mxfp4_kv_none_hf_moeonly",
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                moe_expert_parallel_size=1,
+                **pytorch_config,
+                enable_autotuner=enable_autotuner,
+                use_fine_grained_sync=True) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-235B-A22B"
@@ -5752,6 +5690,265 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             task = GSM8K("GPT-OSS/20B-MXFP4")
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+    def test_w4_1gpu_suspend_resume(self) -> None:
+        # Suspend / resume correctness for an ACTIVE request -- the
+        # V2-only preemption round-trip, distinct from idle committed-block reuse.
+        # Under capacity pressure the scheduler preempts an in-flight request:
+        # live pages go ACTIVE -> SUSPENDED (LOCKED->HELD), are lazily offloaded
+        # to host when a competing request needs the slots, and on resume are
+        # onboarded with their host page-index buffers RECONNECTED
+        kv_cache_config = KvCacheConfig(
+            # Sized so the four concurrent requests contend: each alone fits, but
+            # the pool cannot hold all four at their decode peak, so the scheduler
+            # must preempt (ACTIVE->SUSPENDED, pages LOCKED->HELD) and resume.
+            #
+            # NOTE: max_tokens is NOT the resulting pool size. The V2 manager
+            # converts it to a byte quota and then inflates it by
+            # 1 / max_util_for_resume -- see the _get_quota_from_max_tokens call
+            # in tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py and the
+            # note in _util.py::_configure_helix_kv_cache_capacity. With 0.7
+            # below, the pool is sized for roughly 512/0.7 tokens. GPT-OSS is
+            # also a SWA model, so the token->byte rate is not uniform across
+            # layers. Whether any given pair of requests can co-reside is
+            # therefore NOT derivable from this knob -- read `pool_tokens` in the
+            # [I-10 sizing] diagnostic below instead.
+            max_tokens=512,
+            free_gpu_memory_fraction=0.5,
+            # Refuse resume() once the hot tier is above this utilization, so a
+            # suspended request genuinely defers before being recalled (V2-only).
+            # Also doubles as the pool-inflation factor described above.
+            max_util_for_resume=0.7,
+            enable_block_reuse=False,
+            host_cache_size=4 * (1 << 30),
+            use_kv_cache_manager_v2=True)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=8,
+                  max_seq_len=1024,
+                  disable_overlap_scheduler=True,
+                  enable_iter_perf_stats=True,
+                  moe_config=MoeConfig(backend="CUTLASS"))
+
+        # Several distinct long prompts. Each alone fits the pool; together they
+        # cannot all stay resident at their decode peak, which is what forces
+        # suspend/resume. The contention comes from context + 128 decode across
+        # four requests plus the max_util_for_resume gate -- not from two bare
+        # contexts failing to co-reside (see the sizing note above).
+        base = (
+            "In large language model inference, the key-value cache stores the "
+            "attention keys and values computed for each token so they are not "
+            "recomputed on later decoding steps. ")
+        # One distinct needle per prompt, planted at the very start of the
+        # context -- i.e. in the first KV pages, exactly the ones that go
+        # LOCKED->HELD on suspend and are reconnected on resume. Recalling it
+        # after a round trip is the KV-integrity signal (assertion (3) below).
+        # The needles also keep the four prompts genuinely distinct: a bare
+        # "Alpha:"/"Beta:" prefix is ignored by the model, which made two
+        # contended completions come back byte-identical.
+        needles = ("BANANA", "TRUMPET", "GLACIER", "VIOLIN")
+        prompts = [
+            f"Remember this code word: {n}. {base * 8}"
+            f"Question: what was the code word? Answer in one word."
+            for n in needles
+        ]
+        # Long generation so each suspend/resume round trip spans many decode
+        # steps and the suspended requests are held across a long active run of
+        # the request that owns the pool
+        sampling = SamplingParams(max_tokens=128, temperature=0.0)
+
+        def _drain_stats() -> tuple[int, int, int, int, int]:
+            # Single drain: llm.get_stats() consumes the per-iteration records,
+            # so suspend/resume counts AND offload/onboard bytes must be summed
+            # in one pass. iterSuspendedRequests/iterResumedRequests are manager-
+            # level (top-level of each record); offload/onboard are per pool
+            # group. Both are V2-only.
+            suspended = resumed = offload = onboard = pool_tokens = 0
+            for s in llm.get_stats(timeout=10):
+                suspended += s.get("iterSuspendedRequests", 0)
+                resumed += s.get("iterResumedRequests", 0)
+                # Measured pool size, for the [I-10 sizing] diagnostic. This is
+                # the allocated GPU pool the manager actually built; do NOT
+                # re-derive it from max_tokens (see the sizing note on
+                # kv_cache_config above). kvCacheStats is emitted for every
+                # backend, so this needs no V2-only key.
+                kvs = s.get("kvCacheStats") or {}
+                pool_tokens = max(
+                    pool_tokens,
+                    kvs.get("maxNumBlocks", 0) * kvs.get("tokensPerBlock", 0))
+                pgs = s.get("kvCacheIterationStatsByPoolGroup")
+                if not pgs:
+                    continue
+                for pg in pgs.values():
+                    offload += pg.get("iterOffloadBytes", 0)
+                    onboard += pg.get("iterOnboardBytes", 0)
+            return suspended, resumed, offload, onboard, pool_tokens
+
+        def _common_prefix_len(a: list[int], b: list[int]) -> int:
+            # Diagnostic only -- do NOT turn this into an assertion. Contended
+            # and uncontended runs use different batch compositions, which is
+            # enough to change MoE routing and GEMM tiling, so greedy decoding
+            # may legitimately diverge at any index including 0. See (3) below.
+            n = 0
+            for x, y in zip(a, b):
+                if x != y:
+                    break
+                n += 1
+            return n
+
+        with llm:
+            # Uncontended references: each prompt alone fits the tight pool, so
+            # no suspend occurs (the deterministic single-request path).
+            ref_ids = []
+            ref_txt = []
+            for p in prompts:
+                r = llm.generate([p], sampling)
+                ref_ids.append(list(r[0].outputs[0].token_ids))
+                ref_txt.append(r[0].outputs[0].text)
+            _, _, _, _, pool_tokens = _drain_stats()  # discard ref-run stats
+            # Sizing ground truth, printed before the contended phase so it is
+            # visible even if that phase fails. `pool_tokens` is measured, not
+            # derived from max_tokens -- see the sizing note on kv_cache_config.
+            ctx_lens = [len(llm.tokenizer.encode(p)) for p in prompts]
+            peak_per_request = min(ctx_lens) + sampling.max_tokens
+            concurrent_peak = len(prompts) * peak_per_request
+            print(f"[I-10 sizing] pool_tokens={pool_tokens} "
+                  f"ctx_lens={ctx_lens} decode={sampling.max_tokens} "
+                  f"peak_per_request={peak_per_request} "
+                  f"concurrent_peak={concurrent_peak}")
+            # Workload precondition: the pool cannot hold all four requests at
+            # their decode peak, which is what forces the scheduler to preempt.
+            # Checked against the *measured* pool, never against max_tokens --
+            # the manager inflates that knob by 1 / max_util_for_resume, so a
+            # config-derived bound is wrong by ~1.43x (see the sizing note on
+            # kv_cache_config). Observed on B200/H100 at 1588 vs 736, a ~2.2x
+            # margin; the deliberately weaker two-request form (794 vs 736) is
+            # only ~8% and too tight to gate CI on. Failing here means the
+            # workload stopped being contended, NOT that the KV path broke.
+            assert concurrent_peak > pool_tokens, (
+                f"workload precondition failed: the pool ({pool_tokens} tokens) "
+                f"can hold all {len(prompts)} requests at their decode peak "
+                f"({concurrent_peak} tokens), so nothing forces preemption -- "
+                f"retune max_tokens / prompt length; this is not a KV-path "
+                f"failure")
+            # Contended: all prompts in flight against a ~1-request pool, so the
+            # scheduler must suspend/resume (and may offload/onboard) to serve them.
+            # Bounded wait: a V2 scheduler deadlock (all requests suspended, none
+            # resumable) would otherwise hang the test until the CI stage timeout,
+            # with no diagnostics. TimeoutError here IS the deadlock signal.
+            futures = [llm.generate_async(p, sampling) for p in prompts]
+            contended = [f.result(timeout=600) for f in futures]
+            suspended, resumed, offload, onboard, _ = _drain_stats()
+
+        con_ids = [list(r.outputs[0].token_ids) for r in contended]
+        con_txt = [r.outputs[0].text for r in contended]
+        prefixes = [
+            _common_prefix_len(ref_ids[i], con_ids[i])
+            for i in range(len(prompts))
+        ]
+        # Diagnostics FIRST, so the round-trip evidence and the ref/contended
+        # comparison are always visible even when an assertion fails.
+        print(f"[I-10 suspend/resume] suspended={suspended} resumed={resumed} "
+              f"offload_bytes={offload} onboard_bytes={onboard} "
+              f"common_prefix_tokens={prefixes}")
+        for i in range(len(prompts)):
+            print(f"[I-10 out {i}] needle={needles[i]} "
+                  f"ref_recall={needles[i] in ref_txt[i].upper()} "
+                  f"con_recall={needles[i] in con_txt[i].upper()} "
+                  f"ref={ref_txt[i]!r} con={con_txt[i]!r}")
+
+        # (1) No crash / no deadlock: every request completed within the bounded
+        # wait above and produced a non-empty completion (a KV-corrupting bad
+        # page-index reconnect would instead illegal-memory-access crash here).
+        assert len(contended) == len(prompts)
+        assert all(len(ids) > 0 for ids in con_ids), (
+            "a request produced no tokens under suspend/resume contention "
+            "(possible V2 scheduler deadlock or illegal-memory-access crash)")
+        # (2) The ACTIVE<->SUSPENDED state machine genuinely fired (not mere
+        # queuing): an in-flight request was suspended under pressure and later
+        # recovered. These per-iteration manager counters are the direct signal;
+        # offload/onboard bytes may legitimately be 0 (suspend keeps HELD pages
+        # on GPU and offloads only lazily), so they are not gated -- only printed
+        # above. iterResumedRequests counts preemption recovery only: a request's
+        # initial admission also drives a SUSPENDED->ACTIVE transition internally
+        # but is excluded, so a non-zero value here cannot come from mere arrivals.
+        assert suspended > 0 and resumed > 0, (
+            "expected an active-request suspend->resume round trip "
+            "(iterSuspendedRequests>0 and iterResumedRequests>0); "
+            f"suspended={suspended} resumed={resumed} -- if 0, the pool was not "
+            "tight enough to force preemption of an in-flight request; "
+            "retune max_tokens")
+        # Not asserted: `resumed <= suspended` holds globally but not necessarily
+        # within one drain window -- a request suspended just before a drain and
+        # recovered just after straddles the boundary. The deterministic guard
+        # against the counter regressing to admission-counting is the model-free
+        # unit test test_admission_is_not_counted_as_a_resume; the ratio is only
+        # printed above.
+        # (3) KV integrity: the needle planted in each prompt's first KV pages
+        # survives the suspend/resume round trip. A bad page-index reconnect
+        # loses the prompt content and the recall fails; benign numerical drift
+        # does not touch it.
+        #
+        # Token-level equality against the uncontended reference is deliberately
+        # NOT asserted: batch composition changes MoE routing and GEMM tiling,
+        # so greedy decoding is not required to match a batch-of-1 reference at
+        # any index -- not even index 0. `prefixes` is a diagnostic only.
+        #
+        # The contended check is gated on the reference recalling the needle
+        # first, so a model-capability miss fails loudly as a workload
+        # precondition instead of masquerading as KV corruption.
+        missing_ref = [
+            n for n, t in zip(needles, ref_txt) if n not in t.upper()
+        ]
+        assert not missing_ref, (
+            "workload precondition failed: the uncontended reference run did "
+            f"not recall {missing_ref} -- retune the prompt; this is not a "
+            "KV-path failure")
+        missing_con = [
+            n for n, t in zip(needles, con_txt) if n not in t.upper()
+        ]
+        assert not missing_con, (
+            "a preempted request lost prompt content that it recalls "
+            f"uncontended: {missing_con} -- possible KV corruption across "
+            f"suspend/resume; common_prefix_tokens={prefixes}")
+
+    @pytest.mark.skipif(get_sm_version() != 107,
+                        reason="fine-grained sync requires SM107")
+    @pytest.mark.parametrize("enable_autotuner", [False, True],
+                             ids=["no_autotuner", "autotuner"])
+    @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
+        (False, False),
+        (True, True),
+    ])
+    def test_w4_1gpu_fine_grained_sync(self, enable_autotuner: bool,
+                                       cuda_graph: bool,
+                                       overlap_scheduler: bool, mocker) -> None:
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend="TRTLLM"))
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=1,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=720,
+                 **pytorch_config,
+                 enable_autotuner=enable_autotuner,
+                 use_fine_grained_sync=True) as llm:
+            model_name = "GPT-OSS/20B-MXFP4"
+            task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
@@ -7291,7 +7488,7 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
                    moe_backend, max_draft_len, mocker):
         model_path = f"{llm_models_root()}/Inferact-Qwen3.8-2.4T-A95B-NVFP4"
         if not os.path.exists(model_path):
-            pytest.skip(f"Model directory {model_path} does not exist")
+            pytest.fail(f"Model directory {model_path} does not exist")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False,

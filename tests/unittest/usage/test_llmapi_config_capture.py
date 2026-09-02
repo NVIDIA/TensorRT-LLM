@@ -762,8 +762,12 @@ def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
     assert _walk_captured_keys(SkipSoftmaxAttentionConfig()) >= {"algorithm"}
 
 
-def test_background_reporter_keeps_initial_report_when_config_capture_fails(monkeypatch):
+def test_background_reporter_keeps_initial_report_when_config_capture_fails(
+    monkeypatch, enable_telemetry
+):
     sent_payloads = []
+
+    assert usage_lib.apply_usage_session_config()
 
     monkeypatch.setattr(usage_lib, "_MAX_HEARTBEATS", 0)
     monkeypatch.setattr(usage_lib, "_get_trtllm_version", lambda: "0.0.0-test")
