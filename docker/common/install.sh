@@ -73,21 +73,6 @@ if [ $base -eq 1 ]; then
     # Clean up the pip constraint file from the base NGC PyTorch image.
     [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true
 
-    # [TEMP] Disabled while the 26.08 MPI_Comm_spawn failure is being bisected.
-    #
-    # This was meant to pin Open MPI 5 as the only candidate on the linker search
-    # path, but comparing the two devel images on a dlcluster node shows it has
-    # almost nothing left to do:
-    #   * /usr/local/mpi -> /opt/hpcx/ompi5 is already set up by the base image
-    #     (ln -sf /opt/hpcx/ompi${OPENMPI_VERSION_MAJOR}, OPENMPI_VERSION=5.0.10)
-    #   * /opt/hpcx/ompi -> ompi5 already ships inside the HPC-X tarball
-    # The only real change left is dropping /opt/hpcx/ompi4/lib from
-    # ld.so.conf.d -- and the internal rubin image, whose CI does not hit the
-    # spawn failure, keeps that entry. So this prunes something a known-good
-    # configuration keeps.
-    #
-    # bash $SCRIPT_DIR/switch_to_ompi5.sh
-
     echo "Using Python version: $PYTHON_VERSION"
     GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_base.sh $PYTHON_VERSION
 fi
