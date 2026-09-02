@@ -4135,10 +4135,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[int]:
-            if (sm_version := get_sm_version()) not in (100, 103):
+            if not is_sm_100f():
                 logger.debug(
-                    f"CuteDSL: SM version {sm_version} is not supported. "
-                    f"CuteDSL FP8 GEMM only supports SM100 and SM103. Skipping all tactics."
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    f"CuteDSL FP8 GEMM only supports SM 100 family. Skipping all tactics."
                 )
                 return []
 
@@ -4382,10 +4382,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(
                 f"CuteDSL FP8 GEMM only supports bfloat16 output, got {output_dtype}"
             )
-        if (sm_version := get_sm_version()) not in (100, 103):
+        if not is_sm_100f():
             raise ValueError(
-                f"CuteDSL: SM version {sm_version} is not supported. "
-                f"CuteDSL FP8 GEMM only supports SM100 and SM103. Skipping all tactics."
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL FP8 GEMM only supports SM 100 family. Skipping all tactics."
             )
         tuner = AutoTuner.get()
 
@@ -4453,10 +4453,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> List[int]:
 
-            if (sm_version := get_sm_version()) not in (100, 103, 107):
+            if not is_sm_100f():
                 logger.debug(
-                    f"CuteDSL: SM version {sm_version} is not supported. "
-                    f"CuteDSL FP8 BMM only supports SM100 and SM103. Skipping all tactics."
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    f"CuteDSL FP8 BMM only supports SM 100 family. Skipping all tactics."
                 )
                 return []
             # [b, m, k]
@@ -4702,10 +4702,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(
                 f"CuteDSL FP8 BMM only supports bfloat16 output, got {output_dtype}"
             )
-        if (sm_version := get_sm_version()) not in (100, 103, 107):
+        if not is_sm_100f():
             raise ValueError(
-                f"CuteDSL: SM version {sm_version} is not supported. "
-                f"CuteDSL FP8 BMM only supports SM100 and SM103. Skipping all tactics."
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL FP8 BMM only supports SM 100 family. Skipping all tactics."
             )
 
         tuner = AutoTuner.get()
