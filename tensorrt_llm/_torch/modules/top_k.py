@@ -59,6 +59,13 @@ class TopK(nn.Module):
             decode_implementation or TopKImplementation.CUDA_RADIX
         )
         self.compress_ratio = compress_ratio
+        # emission-assisted GVR (opt-in via prepare_gvr_emission): the
+        # module owns the closed-loop emission state; the caller passes
+        # the returned kwargs to the scoring op, and the consume side is
+        # injected into the GVR Top-K call while the step stays armed
+        self._gvr_emission_state = None
+        self._gvr_emission_route = None
+        self._gvr_emission_armed = False
 
     def forward(
         self,
@@ -334,6 +341,16 @@ class TopK(nn.Module):
             )
         else:
             assert max_seq_len is not None
+            emission_kwargs: dict = {}
+            if self._gvr_emission_armed:
+                state = self._gvr_emission_state
+                num_rows = scores.shape[0]
+                emission_kwargs = state.topk_ext_kwargs(
+                    self._gvr_emission_route,
+                    num_rows,
+                    state.block_max[:num_rows] if state.block_max is not None else None,
+                )
+                self._gvr_emission_armed = False
             torch.ops.trtllm.cute_dsl_gvr_topk_decode(
                 scores,
                 gvr_prior_indices,
@@ -344,8 +361,70 @@ class TopK(nn.Module):
                 compress_ratio=self.compress_ratio,
                 max_seq_len=max_seq_len,
                 order_row=gvr_row_order,
+                **emission_kwargs,
             )
         return output_indices
+
+    def prepare_gvr_emission(
+        self,
+        batch: int,
+        n_comp: int,
+        num_sms: int,
+        gvr_prior_indices: torch.Tensor,
+    ) -> dict:
+        """Plan the emission-assisted GVR tier for this decode step.
+
+        Returns the emission kwargs for the paged-MQA scoring op (empty
+        when the planner declines this step); the matching consume-side
+        kwargs are injected into the next GVR Top-K call automatically.
+        Host arithmetic on engine-static shapes plus capturable device
+        ops, so a captured graph bakes the tier and replays refresh the
+        state buffers in place.
+
+        Args:
+            batch: Number of decode requests this step.
+            n_comp: Engine-static compressed maximum sequence length.
+            num_sms: Device SM count.
+            gvr_prior_indices: Caller-owned previous-selection state;
+                defines the emission state's row capacity and device.
+        """
+        # the emission/xstate writes are undeclared mutations (see the op's
+        # schema note), so the tier is eager / CUDA-graph only
+        if torch.compiler.is_dynamo_compiling():
+            return {}
+        from ..cute_dsl_kernels.blackwell.top_k.gvr_emission import (
+            LIST_EMIT_MIN_N,
+            GvrEmissionState,
+        )
+
+        if self._gvr_emission_state is None:
+            self._gvr_emission_state = GvrEmissionState(
+                max_rows=gvr_prior_indices.shape[0],
+                top_k=self.top_k,
+                device=gvr_prior_indices.device,
+                enable_list_tier=n_comp >= LIST_EMIT_MIN_N,
+                own_prior=False,
+            )
+        state = self._gvr_emission_state
+        emit_tier, self._gvr_emission_route = state.plan(
+            batch, n_comp, num_sms, compress_ratio=max(self.compress_ratio, 1)
+        )
+        self._gvr_emission_armed = self._gvr_emission_route.tier != "none"
+        if emit_tier in ("counts", "list", "rungs"):
+            state.update_seed_rows(batch, emit_tier)
+        kwargs: dict = {}
+        if emit_tier in ("counts", "list"):
+            kwargs = state.indexer_emit_kwargs(emit_tier, batch)
+        if self._gvr_emission_route.attach_block_max or emit_tier in ("counts", "list"):
+            kwargs["block_max_out"] = state.ensure_block_max(n_comp)[:batch]
+        return kwargs
+
+    def reset_gvr_emission_rows(self, rows: slice) -> None:
+        """Cold-start the emission closed-loop state for reused request
+        slots (prefill-to-decode handoff): a zeroed xstate reads as
+        invalid and routes those rows to the stock path in-kernel."""
+        if self._gvr_emission_state is not None:
+            self._gvr_emission_state.xstate[rows].zero_()
 
     def update_gvr_prior_from_prefill(
         self,

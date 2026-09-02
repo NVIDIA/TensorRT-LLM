@@ -6067,8 +6067,10 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
                         (slurmScoped && FailureClassifier.isDeferrableInfra(e, InfraFailure.SLURM))) {
                     def scopeTag = slurmScoped ? "SLURM/K8s" : "K8s"
                     deferred.add([stage: stageName])
-                    echo "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
-                         "siblings continue instead of fail-fast. ${e.toString()}"
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        error "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
+                              "siblings continue instead of fail-fast. ${e.toString()}"
+                    }
                     return
                 }
                 throw e
@@ -6079,8 +6081,8 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
     parallel wrapped
     if (deferred) {
         echo "[INFRA-DEFER] ${deferred.size()} stage(s) infra-incomplete " +
-             "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
-             "(coverage incomplete, no genuine test failure)."
+             "(${deferred.collect { it.stage }.join(', ')}); result already marked UNSTABLE " +
+             "per branch above (coverage incomplete, no genuine test failure)."
         // Distinguish a per-branch infra blip from a cluster-wide outage: when EVERY
         // branch in the group infra-aborted, the shared infra (a SLURM frontend / a
         // whole cluster) is the likely culprit. Flag it loudly so a re-run isn't
@@ -6094,7 +6096,6 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
             echo "[INFRA-DEFER] ALL ${jobs.size()} branch(es) infra-aborted; " +
                  "suspected cluster-wide / shared-frontend outage rather than isolated blips."
         }
-        currentBuild.result = 'UNSTABLE'
     }
 }
 
