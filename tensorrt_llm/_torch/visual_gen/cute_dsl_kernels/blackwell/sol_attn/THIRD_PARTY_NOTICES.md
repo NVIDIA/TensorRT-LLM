@@ -29,14 +29,15 @@ Only the pieces needed for the architectures TensorRT-LLM ships are carried:
 |---|---|
 | `interface.py`, `preprocess.py`, `common/` | `sm89/`, `sm90/` (incl. `sm90/_compat/`) |
 | `sm100/` (B200 / GB200) | `triton_ref/` Triton reference attention |
-| `sm120/` (RTX Blackwell) | `_vendor/flash_attn/` (see below) |
+| | `sm120/` (RTX Blackwell) |
+| | `_vendor/flash_attn/` (see below) |
 
 The upstream package vendored a copy of FlashAttention's CuTe DSL helpers
 under `sol_attn/_vendor/flash_attn/cute/`. That copy is **not** carried here:
 TensorRT-LLM already depends on
 [`flash-attn-4`](https://github.com/Dao-AILab/flash-attention) (pinned in
 `requirements.txt`), which provides the same `flash_attn.cute` modules, and
-the SM100/SM120 kernels import them from that dependency directly. This was
+the SM100 kernels import them from that dependency directly. This was
 verified on B200 to produce bit-identical output to the vendored copy across a
 shape/tau sweep. FlashAttention's BSD-3-Clause license is retained at
 `sol_attn/sm100/LICENSE.flash-attention` because portions of the SM100 design
@@ -88,9 +89,10 @@ The runtime also depends on NVIDIA CUTLASS / CuTe DSL, cuda-python, and
 PyTorch. Those dependencies are not redistributed by this repository and
 remain subject to their respective licenses.
 
-The SM120 warp-MMA/TMA execution skeleton and online-softmax helpers are
-adapted from
-[NVIDIA cuDNN Frontend's block-sparse-attention reference](https://github.com/NVIDIA/cudnn-frontend/tree/74785165de2da954a2c879a5e3e6f95411c2292d)
-at commit `74785165de2da954a2c879a5e3e6f95411c2292d`. That source is
-licensed under the Apache License 2.0; adapted files retain the
-corresponding SPDX header.
+SM120 (RTX Blackwell) was carried in an earlier revision of this port and has
+been dropped: it had kernel-level evidence only, no end-to-end validation, and
+no `cute_dsl_fmha_fwd` exists for that architecture, so Sol-Attn's dense
+fallback could not match its own backend there. With SM100 alone, Sol-Attn's
+architecture set is a subset of the dense CuTe DSL FMHA kernel's. The
+cuDNN-frontend attribution that covered the SM120 execution skeleton was
+removed with it.

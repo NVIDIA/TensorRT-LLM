@@ -14,7 +14,6 @@ import torch
 BLOCK_SIZE = 64
 _CUTE_BACKENDS = {
     (10, 0): "cute_sm100",  # B200 / GB200
-    (12, 0): "cute_sm120",  # RTX Pro Blackwell / GeForce Blackwell
 }
 _compiled = {}
 
@@ -106,7 +105,7 @@ def get_sol_attn_backend(device: torch.device | str | int | None = None) -> str:
 def _validate_cute(arch, tokens, kv_splits):
     if kv_splits != 1:
         raise ValueError(
-            "kv_splits=2/4 was an SM90-only path; this build ships SM100/SM120 "
+            "kv_splits=2/4 was an SM90-only path; this build ships SM100 "
             "kernels only, so kv_splits must be 1."
         )
     route_groups = ((tokens + 63) // 64 + 63) // 64
@@ -163,33 +162,6 @@ def _compile_sm100(
     return compiled, args
 
 
-def _compile_sm120(
-    key,
-    tensors,
-    scale,
-    sink_start_block,
-    sink_end_block,
-    stream,
-):
-    import cutlass.cute as cute
-
-    from .sm120 import make_kernel
-
-    operator = make_kernel()
-    args = _to_cute_tensors(tensors)
-    compiled = cute.compile(
-        operator,
-        *args,
-        scale,
-        sink_start_block,
-        sink_end_block,
-        stream=stream,
-        options="--enable-tvm-ffi",
-    )
-    _compiled[key] = compiled
-    return compiled, args
-
-
 def _sol_attn_cute(
     q,
     k,
@@ -225,58 +197,36 @@ def _sol_attn_cute(
         stream = _stream(q.device)
         key = (q.device.index, arch, batch, tokens, heads, kv_splits)
 
-        if arch == (10, 0):
-            sink_start_block, sink_end_block = _sink_block_range(
-                tokens,
-                sink_start,
-                sink_tokens,
-            )
-            tensors = [q, k, v, output, kc, vc, threshold, lse]
-            compiled = _compiled.get(key)
-            if compiled is None:
-                compiled, args = _compile_sm100(
-                    key,
-                    tensors,
-                    scale,
-                    sink_start_block,
-                    sink_end_block,
-                    stream,
-                )
-            else:
-                args = _to_cute_tensors(tensors)
-            compiled(
-                *args,
+        if arch != (10, 0):
+            # Unreachable via sol_attn(): _backend_for_arch raises first. Kept
+            # explicit because the alternative on a missed guard is returning
+            # the uninitialised `output` buffer, i.e. silently wrong results.
+            raise ValueError(f"no Sol-Attn CuTe kernel for SM{arch[0]}{arch[1]}")
+        sink_start_block, sink_end_block = _sink_block_range(
+            tokens,
+            sink_start,
+            sink_tokens,
+        )
+        tensors = [q, k, v, output, kc, vc, threshold, lse]
+        compiled = _compiled.get(key)
+        if compiled is None:
+            compiled, args = _compile_sm100(
+                key,
+                tensors,
                 scale,
                 sink_start_block,
                 sink_end_block,
-                stream=stream,
+                stream,
             )
         else:
-            sink_start_block, sink_end_block = _sink_block_range(
-                tokens,
-                sink_start,
-                sink_tokens,
-            )
-            tensors = [q, k, v, output, kc, vc, threshold, lse]
-            compiled = _compiled.get(key)
-            if compiled is None:
-                compiled, args = _compile_sm120(
-                    key,
-                    tensors,
-                    scale,
-                    sink_start_block,
-                    sink_end_block,
-                    stream,
-                )
-            else:
-                args = _to_cute_tensors(tensors)
-            compiled(
-                *args,
-                scale,
-                sink_start_block,
-                sink_end_block,
-                stream=stream,
-            )
+            args = _to_cute_tensors(tensors)
+        compiled(
+            *args,
+            scale,
+            sink_start_block,
+            sink_end_block,
+            stream=stream,
+        )
     return output
 
 
@@ -310,7 +260,7 @@ def sol_attn(
     if kv_splits != 1:
         raise ValueError(
             "kv_splits must be 1; the 2/4 path was SM90-only and this build "
-            "ships SM100/SM120 kernels only."
+            "ships SM100 kernels only."
         )
     _backend_for_arch(arch)  # raises on an architecture with no kernel
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
