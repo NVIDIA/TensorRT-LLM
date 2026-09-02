@@ -52,7 +52,8 @@ from ...logger import logger
 from ...mapping import Mapping
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
+from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest,
+                          LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
 
@@ -2674,10 +2675,14 @@ class SlotManager:
 
     def add_slot(self, request_id: int):
         if request_id in self.slot_mapping:
-            # CUDA graph dummy request could be added for different batches,
-            # but we only need to reserve slot for it once.
+            # Dummy requests can be added for different batches, but we only
+            # need to reserve the slot once. The attention-DP pad dummy hits
+            # this on a disagg context server: it is registered up front by
+            # spec_resource_manager.add_dummy_requests() and then scheduled as
+            # a context request, whose prepare_resources() adds it again.
             from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-            assert request_id == CUDA_GRAPH_DUMMY_REQUEST_ID
+            assert request_id in (CUDA_GRAPH_DUMMY_REQUEST_ID,
+                                  ATTENTION_DP_DUMMY_REQUEST_ID)
             return self.slot_mapping[request_id]
 
         if len(self.free_slots) == 0:
