@@ -151,7 +151,6 @@ full:DGX_H100/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy SKIP (https://nvbugs/6276923)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt SKIP (https://nvbugs/6276923)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap SKIP (https://nvbugs/6276923)
-full:GB200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_online_eplb[mtp_nextn=2-moe_backend=TRTLLM] SKIP (https://nvbugs/6690084)
 full:GB200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_gemm[cuda_graph=True] SKIP (https://nvbugs/6525897)
 full:GB200/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=True] SKIP (https://nvbugs/5929339)
 full:GB200/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill] SKIP (https://nvbugs/6597570)
