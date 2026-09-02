@@ -568,15 +568,6 @@ TEST(SerializeUtilsTest, DecodingConfig)
         EXPECT_EQ(specDecodingConfig.getDecodingMode(), specDecodingConfig2.getDecodingMode());
         EXPECT_EQ(specDecodingConfig.getLookaheadDecodingConfig(), specDecodingConfig2.getLookaheadDecodingConfig());
     }
-
-    {
-        texec::DecodingMode decodingMode{texec::DecodingMode::Medusa()};
-        texec::MedusaChoices medusaChoices{{{0, 1, 2}}};
-        auto specDecodingConfig = texec::DecodingConfig(decodingMode, std::nullopt, medusaChoices);
-        auto specDecodingConfig2 = serializeDeserialize(specDecodingConfig);
-        EXPECT_EQ(specDecodingConfig.getDecodingMode(), specDecodingConfig2.getDecodingMode());
-        EXPECT_EQ(specDecodingConfig.getMedusaChoices(), specDecodingConfig2.getMedusaChoices());
-    }
 }
 
 TEST(SerializeUtilsTest, KvCacheStats)

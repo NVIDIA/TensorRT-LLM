@@ -291,10 +291,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.max_total_draft_tokens` | `Optional[int]` | `value` |  |  |
 | `speculative_config.max_verification_set_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.max_window_size` | `<class 'int'>` | `value` |  |  |
-| `speculative_config.medusa_choices` | `Optional[List[List[int]]]` | `value` |  |  |
 | `speculative_config.mtp_eagle_one_model` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.num_eagle_layers` | `Optional[int]` | `value` |  |  |
-| `speculative_config.num_medusa_heads` | `Optional[int]` | `value` |  |  |
 | `speculative_config.num_nextn_predict_layers` | `Optional[int]` | `value` |  |  |
 | `speculative_config.posterior_threshold` | `Optional[float]` | `value` |  |  |
 | `speculative_config.relaxed_delta` | `<class 'float'>` | `value` |  |  |

@@ -2168,29 +2168,6 @@ class LayerwiseBenchmarksConfig(StrictBaseModel):
         return self
 
 
-class MedusaDecodingConfig(DecodingBaseConfig):
-    decoding_type: Literal["Medusa"] = Field(default="Medusa")
-    medusa_choices: Optional[List[List[int]]] = Field(
-        default=None,
-        description=
-        "Tree structure for Medusa draft token generation. Each sublist represents a path in the tree where elements are token indices at each level. "
-        "For example, [[0], [0, 0], [1], [0, 1]] defines multiple branches.")
-    num_medusa_heads: Optional[int] = Field(
-        default=None,
-        description=
-        "Number of Medusa prediction heads to use. Each head predicts a draft token at a different position in parallel. "
-        "If not specified, defaults to the 'medusa_num_heads' value from the Medusa model's config.json."
-    )
-
-    @model_validator(mode="after")
-    def set_max_total_draft_tokens(self):
-        self.max_total_draft_tokens = self.max_draft_len  # Current Medusa only supports linear tree
-        return self
-
-    def supports_backend(self, backend: str) -> bool:
-        return backend not in ("pytorch", "_autodeploy")
-
-
 class EagleDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Eagle"] = Field(default="Eagle")
     eagle_choices: Optional[List[List[int]]] = Field(
@@ -3753,7 +3730,6 @@ SpeculativeConfig: TypeAlias = Annotated[
         Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
         EagleDecodingConfig,
         LookaheadDecodingConfig,
-        MedusaDecodingConfig,
         MTPDecodingConfig,
         NGramDecodingConfig,
         SADecodingConfig,

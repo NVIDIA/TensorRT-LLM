@@ -65,7 +65,6 @@ using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcess
 using LogitsPostProcessorBatched = std::function<void(std::vector<IdType> const&, std::vector<Tensor>&,
     std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&,
     std::vector<std::optional<IdType>> const&)>;
-using MedusaChoices = std::vector<std::vector<SizeType32>>;
 using EagleChoices = std::vector<std::vector<SizeType32>>;
 using PriorityType = float;
 using BufferView = std::basic_string_view<uint8_t>;

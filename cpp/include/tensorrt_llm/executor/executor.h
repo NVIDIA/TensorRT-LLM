@@ -1190,8 +1190,7 @@ class DecodingConfig
 {
 public:
     explicit DecodingConfig(std::optional<DecodingMode> decodingMode = std::nullopt,
-        std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig = std::nullopt,
-        std::optional<MedusaChoices> medusaChoices = std::nullopt);
+        std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig = std::nullopt);
 
     bool operator==(DecodingConfig const& other) const;
 
@@ -1207,14 +1206,6 @@ public:
     [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadDecodingConfig() const;
     [[nodiscard]] SizeType32 getLookaheadDecodingMaxNumRequest() const;
 
-    // Medusa methods.
-    /// @brief Sets medusa mode and config.
-    void setMedusaChoices(MedusaChoices const&);
-    [[nodiscard]] std::optional<MedusaChoices> getMedusaChoices() const;
-
-    // EAGLE methods.
-    /// @brief Sets eagle mode and config.
-
 private:
     friend class Serialization;
 
@@ -1222,9 +1213,6 @@ private:
     std::optional<DecodingMode> mDecodingMode;
     // Lookahead params.
     std::optional<LookaheadDecodingConfig> mLookaheadDecodingConfig;
-    // Medusa params.
-    std::optional<MedusaChoices> mMedusaChoices;
-    // Eagle config.
     // The max number of requests that can support running with lookahead decoding
     static constexpr SizeType32 mLookaheadDecodingMaxNumRequest = 8;
 };

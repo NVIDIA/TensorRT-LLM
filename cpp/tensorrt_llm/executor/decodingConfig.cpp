@@ -100,11 +100,10 @@ bool LookaheadDecodingConfig::isLE(LookaheadDecodingConfig const& that) const
         && mVerificationSetSize <= that.mVerificationSetSize;
 }
 
-DecodingConfig::DecodingConfig(std::optional<DecodingMode> decodingMode,
-    std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig, std::optional<MedusaChoices> medusaChoices)
+DecodingConfig::DecodingConfig(
+    std::optional<DecodingMode> decodingMode, std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig)
     : mDecodingMode{decodingMode}
     , mLookaheadDecodingConfig{lookaheadDecodingConfig}
-    , mMedusaChoices{std::move(medusaChoices)}
 {
     if (mLookaheadDecodingConfig)
     {
@@ -112,18 +111,11 @@ DecodingConfig::DecodingConfig(std::optional<DecodingMode> decodingMode,
         TLLM_CHECK_WITH_INFO(mDecodingMode.value().isLookahead(),
             "LookaheadDecodingConfig is set, but DecodingMode is not set to Lookahead");
     }
-    if (mMedusaChoices)
-    {
-        TLLM_CHECK_WITH_INFO(mDecodingMode, "MedusaChoices are set, but DecodingMode is not set");
-        TLLM_CHECK_WITH_INFO(
-            mDecodingMode.value().isMedusa(), "MedusaChoices are set, but DecodingMode is not set to Medusa");
-    }
 }
 
 bool DecodingConfig::operator==(DecodingConfig const& other) const
 {
-    return mDecodingMode == other.mDecodingMode && mLookaheadDecodingConfig == other.mLookaheadDecodingConfig
-        && mMedusaChoices == other.mMedusaChoices;
+    return mDecodingMode == other.mDecodingMode && mLookaheadDecodingConfig == other.mLookaheadDecodingConfig;
 }
 
 std::optional<DecodingMode> DecodingConfig::getDecodingMode() const
@@ -165,17 +157,6 @@ void DecodingConfig::enableSeamlessLookaheadDecoding()
     {
         mLookaheadDecodingConfig = executor::LookaheadDecodingConfig();
     }
-}
-
-std::optional<MedusaChoices> DecodingConfig::getMedusaChoices() const
-{
-    return mMedusaChoices;
-}
-
-void DecodingConfig::setMedusaChoices(MedusaChoices const& medusaChoices)
-{
-    mMedusaChoices = medusaChoices;
-    mDecodingMode = DecodingMode::Medusa();
 }
 
 } // namespace tensorrt_llm::executor

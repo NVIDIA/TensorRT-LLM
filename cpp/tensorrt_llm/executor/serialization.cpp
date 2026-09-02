@@ -1595,16 +1595,14 @@ DecodingConfig Serialization::deserializeDecodingConfig(std::istream& is)
 {
     auto decodingMode = su::deserialize<std::optional<DecodingMode>>(is);
     auto lookaheadDecodingConfig = su::deserialize<std::optional<LookaheadDecodingConfig>>(is);
-    auto medusaChoices = su::deserialize<std::optional<MedusaChoices>>(is);
 
-    return DecodingConfig{decodingMode, lookaheadDecodingConfig, medusaChoices};
+    return DecodingConfig{decodingMode, lookaheadDecodingConfig};
 }
 
 void Serialization::serialize(DecodingConfig const& decodingConfig, std::ostream& os)
 {
     su::serialize(decodingConfig.getDecodingMode(), os);
     su::serialize(decodingConfig.getLookaheadDecodingConfig(), os);
-    su::serialize(decodingConfig.getMedusaChoices(), os);
 }
 
 size_t Serialization::serializedSize(DecodingConfig const& decodingConfig)
@@ -1612,7 +1610,6 @@ size_t Serialization::serializedSize(DecodingConfig const& decodingConfig)
     size_t totalSize = 0;
     totalSize += su::serializedSize(decodingConfig.getDecodingMode());
     totalSize += su::serializedSize(decodingConfig.getLookaheadDecodingConfig());
-    totalSize += su::serializedSize(decodingConfig.getMedusaChoices());
     return totalSize;
 }
 

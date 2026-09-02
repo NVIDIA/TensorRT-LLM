@@ -1759,7 +1759,7 @@ public:
 
     /// @brief Get the beam width of the current decoding step.
     /// @details Return `mSamplingConfig.getBeamWidth()` in decoding modes beside Variable-Beam-Width-Search (VBWS).
-    /// Or returns a scalar value from `mSamplingConfig.getBeamWidth()Array` indexing by `mDecodingIter` in VBWS.
+    /// Or returns a scalar value from `mSamplingConfig.getBeamWidthArray()` indexing by `mDecodingIter` in VBWS.
     ///
     /// Calling in context phase, it returns the beam width of the first generation step, which is used for copying
     /// logits (function `copyGenerationLogits` as example).
@@ -2189,8 +2189,6 @@ protected:
     std::optional<std::shared_ptr<VecUniqueTokens>> mEncoderUniqueTokens{std::nullopt};
 
     SizeType32 mNumReturnSequences{1};
-
-    // Config for Eagle speculative decoding.
 
     SizeType32 mSequenceIndex{0};
 

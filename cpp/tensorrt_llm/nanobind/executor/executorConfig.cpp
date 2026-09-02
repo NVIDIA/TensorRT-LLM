@@ -216,26 +216,22 @@ void initConfigBindings(nb::module_& m)
         .def("__setstate__", peftCacheConfigSetstate);
 
     auto decodingConfigGetstate = [](tle::DecodingConfig const& self)
-    { return nb::make_tuple(self.getDecodingMode(), self.getLookaheadDecodingConfig(), self.getMedusaChoices()); };
+    { return nb::make_tuple(self.getDecodingMode(), self.getLookaheadDecodingConfig()); };
     auto decodingConfigSetstate = [](tle::DecodingConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 2)
         {
             throw std::runtime_error("Invalid state!");
         }
         new (&self) tle::DecodingConfig(nb::cast<std::optional<tle::DecodingMode>>(state[0]), // DecodingMode
-            nb::cast<std::optional<tle::LookaheadDecodingConfig>>(state[1]),                  // LookaheadDecodingConfig
-            nb::cast<std::optional<tle::MedusaChoices>>(state[2]));                           // MedusaChoices
+            nb::cast<std::optional<tle::LookaheadDecodingConfig>>(state[1]));                 // LookaheadDecodingConfig
     };
     nb::class_<tle::DecodingConfig>(m, "DecodingConfig")
-        .def(nb::init<std::optional<tle::DecodingMode>, std::optional<tle::LookaheadDecodingConfig>,
-                 std::optional<tle::MedusaChoices>>(),
-            nb::arg("decoding_mode") = nb::none(), nb::arg("lookahead_decoding_config") = nb::none(),
-            nb::arg("medusa_choices") = nb::none())
+        .def(nb::init<std::optional<tle::DecodingMode>, std::optional<tle::LookaheadDecodingConfig>>(),
+            nb::arg("decoding_mode") = nb::none(), nb::arg("lookahead_decoding_config") = nb::none())
         .def_prop_rw("decoding_mode", &tle::DecodingConfig::getDecodingMode, &tle::DecodingConfig::setDecodingMode)
         .def_prop_rw("lookahead_decoding_config", &tle::DecodingConfig::getLookaheadDecodingConfig,
             &tle::DecodingConfig::setLookaheadDecodingConfig)
-        .def_prop_rw("medusa_choices", &tle::DecodingConfig::getMedusaChoices, &tle::DecodingConfig::setMedusaChoices)
         .def("__getstate__", decodingConfigGetstate)
         .def("__setstate__", decodingConfigSetstate);
 

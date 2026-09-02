@@ -836,8 +836,7 @@ env TRTLLM_ENABLE_PDL=1 \
   trtllm-bench --model meta-llama/Meta-Llama-3-70B \
   latency \
   --dataset $DATASET_PATH \
-  --engine_dir /tmp/meta-llama/Meta-Llama-3-70B/medusa/engine \
-  --medusa_choices medusa.yml
+  --engine_dir /tmp/meta-llama/Meta-Llama-3-70B/medusa/engine
 ```
 
 ## Summary
@@ -851,7 +850,6 @@ The following table summarizes the commands needed for running benchmarks:
 | Throughput | Benchmark | `trtllm-bench --model $HF_MODEL throughput --dataset $DATASET_PATH --engine_dir $ENGINE_DIR` |
 | Latency | Build | See [section about building low latency engines](#low-latency-tensorrt-llm-engine-for-llama-3-70b) |
 | Non-Medusa Latency | Benchmark | `trtllm-bench --model $HF_MODEL latency --dataset $DATASET_PATH --engine_dir $ENGINE_DIR` |
-| Medusa Latency | Benchmark | `trtllm-bench --model $HF_MODEL latency --dataset $DATASET_PATH --engine_dir $ENGINE_DIR --medusa_choices $MEDUSA_CHOICES` |
 
 where,
 
@@ -866,6 +864,3 @@ where,
 
 `$ENGINE_DIR`
 : The engine directory as printed by `trtllm-bench build`.
-
-`$MEDUSA_CHOICES`
-: A YAML config representing the Medusa tree for the benchmark.

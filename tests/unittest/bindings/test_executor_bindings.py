@@ -730,13 +730,11 @@ def test_decoding_config():
     config = trtllm.DecodingConfig()
     assert config.decoding_mode is None
     assert config.lookahead_decoding_config is None
-    assert config.medusa_choices is None
 
     config = trtllm.DecodingConfig()
     config.decoding_mode = trtllm.DecodingMode.TopKTopP()
     assert config.decoding_mode.isTopKandTopP()
     assert config.lookahead_decoding_config is None
-    assert config.medusa_choices is None
 
     config = trtllm.DecodingConfig()
     la_decoding_config = trtllm.LookaheadDecodingConfig(3, 5, 7)
@@ -746,14 +744,6 @@ def test_decoding_config():
     assert config.lookahead_decoding_config.max_ngram_size == la_decoding_config.max_ngram_size
     assert config.lookahead_decoding_config.max_window_size == la_decoding_config.max_window_size
     assert config.lookahead_decoding_config.max_verification_set_size == la_decoding_config.max_verification_set_size
-    assert config.medusa_choices is None
-
-    config = trtllm.DecodingConfig()
-    config.medusa_choices = [[0, 0], [0, 1]]
-
-    assert config.decoding_mode.isMedusa()
-    assert config.lookahead_decoding_config is None
-    assert config.medusa_choices == [[0, 0], [0, 1]]
 
 
 @pytest.mark.cpu_only
@@ -991,7 +981,6 @@ def test_decoding_config_pickle():
     config_copy = pickle.loads(pickle.dumps(config))
     assert config_copy.decoding_mode.isBeamSearch
     assert config.lookahead_decoding_config == config_copy.lookahead_decoding_config
-    assert config.medusa_choices == config_copy.medusa_choices
 
 
 @pytest.mark.cpu_only
