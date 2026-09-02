@@ -182,14 +182,23 @@ class WeightManifest:
         version = payload["manifest_format_version"]
         if not isinstance(version, int) or isinstance(version, bool):
             raise ValueError(f"Weight manifest format version must be an int, got {version!r}")
+        entries = tuple(WeightManifestEntry.from_dict(item) for item in payload["entries"])
+        stored_digest = str(payload["manifest_sha256"])
+        recomputed_digest = _entries_digest(entries)
+        if stored_digest != recomputed_digest:
+            raise ValueError(
+                "Weight manifest has a stale manifest_sha256 (stored "
+                f"{stored_digest[:12]}..., recomputed {recomputed_digest[:12]}...); the entries "
+                "were modified after the manifest was written"
+            )
         return cls(
             manifest_format_version=version,
-            entries=tuple(WeightManifestEntry.from_dict(item) for item in payload["entries"]),
+            entries=entries,
             skipped=tuple(SkippedTensor.from_dict(item) for item in payload.get("skipped", [])),
             alias_groups=tuple(
                 tuple(str(name) for name in group) for group in payload.get("alias_groups", [])
             ),
-            manifest_sha256=str(payload["manifest_sha256"]),
+            manifest_sha256=stored_digest,
             context=dict(payload.get("context", {})),
         )
 
@@ -351,6 +360,11 @@ def _canonical_json_digest(obj: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _entries_digest(entries: Iterable[WeightManifestEntry]) -> str:
+    """Whole-manifest digest: SHA-256 of the canonical JSON of the sorted entries."""
+    return _canonical_json_digest([entry.to_dict() for entry in entries])
+
+
 def _tensor_digest(tensor: torch.Tensor) -> tuple[str, int]:
     """Return `(sha256_hex, nbytes)` over the canonical bytes of `tensor`."""
     raw = canonical_tensor_bytes(tensor)
@@ -428,7 +442,7 @@ def build_weight_manifest(
     alias_groups = tuple(
         tuple(sorted(members)) for members in alias_members.values() if len(members) >= 2
     )
-    manifest_sha256 = _canonical_json_digest([entry.to_dict() for entry in entries])
+    manifest_sha256 = _entries_digest(entries)
 
     merged_context: dict[str, Any] = dict(context or {})
     merged_context.update(
@@ -554,9 +568,13 @@ def compare_weight_manifests(
     )
 
     full_scope = set(kinds) == set(WEIGHT_MANIFEST_KINDS)
+    # The fast path only applies when both stored digests are consistent with
+    # their own entries; a stale digest falls through to the full comparison.
     if (
         full_scope
         and expected.manifest_sha256 == actual.manifest_sha256
+        and expected.manifest_sha256 == _entries_digest(expected.entries)
+        and actual.manifest_sha256 == _entries_digest(actual.entries)
         and expected_skipped == actual_skipped
         and expected_alias == actual_alias
     ):

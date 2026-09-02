@@ -59,7 +59,14 @@ DONOR_PROCESS_FAILURE_OVERLAP = max(len(marker) for marker in DONOR_PROCESS_FAIL
 
 @dataclass(frozen=True)
 class RankTransferSummary:
-    """What one receiver rank log says about the transfer."""
+    """What one receiver rank log says about the transfer.
+
+    Attributes:
+        rank: Tensor-parallel rank the log belongs to.
+        matched_summaries: Every `Matched m/n params` occurrence as `(m, n)`.
+        transfer_summaries: Every `Rank r: transferred k params` occurrence as `(r, k)`.
+        failure_markers: Failure markers found in the log, lower-cased.
+    """
 
     rank: int
     matched_summaries: tuple[tuple[int, int], ...]
@@ -76,16 +83,30 @@ class RankTransferSummary:
 
 
 def find_failure_markers(text: str) -> tuple[str, ...]:
-    """Return the failure markers present in `text` (case-insensitive)."""
+    """Return the failure markers present in `text`.
+
+    Args:
+        text: Log text to scan; matching is case-insensitive.
+
+    Returns:
+        The markers from `RECEIVER_FAILURE_MARKERS` found in `text`, in list order.
+    """
     lowered = text.lower()
     return tuple(marker for marker in RECEIVER_FAILURE_MARKERS if marker in lowered)
 
 
 def transfer_logs_by_rank(transfer_log_dir: Path) -> dict[int, str]:
-    """Map rank -> log text for the non-empty `rank<N>.log` files in a directory.
+    """Map rank to log text for the non-empty `rank<N>.log` files in a directory.
 
-    Raises `ValueError` when no non-empty log exists, when a file does not
-    follow the `rank<N>.log` naming, or when a rank appears twice.
+    Args:
+        transfer_log_dir: The receiver's `MX_TRANSFER_LOG_DIR`.
+
+    Returns:
+        A dict from rank to the log text of that rank.
+
+    Raises:
+        ValueError: No non-empty log exists, a file does not follow the
+            `rank<N>.log` naming, or a rank appears twice.
     """
     log_files = tuple(path for path in Path(transfer_log_dir).rglob("*") if path.is_file())
     logs = tuple(path for path in log_files if path.stat().st_size > 0)
@@ -114,7 +135,15 @@ def transfer_logs_by_rank(transfer_log_dir: Path) -> dict[int, str]:
 
 
 def summarize_rank_log(rank: int, text: str) -> RankTransferSummary:
-    """Extract the matched/transferred summaries and failure markers of one rank log."""
+    """Extract the matched/transferred summaries and failure markers of one rank log.
+
+    Args:
+        rank: Rank the log belongs to.
+        text: Full text of that rank's log.
+
+    Returns:
+        The `RankTransferSummary` for the log.
+    """
     matched = tuple(
         (int(found), int(total)) for found, total in MATCHED_PARAMS_PATTERN.findall(text)
     )
@@ -131,7 +160,17 @@ def summarize_rank_log(rank: int, text: str) -> RankTransferSummary:
 
 
 def summarize_transfer_logs(transfer_log_dir: Path) -> dict[int, RankTransferSummary]:
-    """Summarize every rank log in `transfer_log_dir`."""
+    """Summarize every rank log in `transfer_log_dir`.
+
+    Args:
+        transfer_log_dir: The receiver's `MX_TRANSFER_LOG_DIR`.
+
+    Returns:
+        A dict from rank to its `RankTransferSummary`.
+
+    Raises:
+        ValueError: Propagated from `transfer_logs_by_rank`.
+    """
     return {
         rank: summarize_rank_log(rank, text)
         for rank, text in transfer_logs_by_rank(transfer_log_dir).items()
@@ -141,13 +180,22 @@ def summarize_transfer_logs(transfer_log_dir: Path) -> dict[int, RankTransferSum
 def check_receiver_transfer_logs(
     rank_logs: Mapping[int, str], tp_size: int, extra_text: str = ""
 ) -> list[str]:
-    """Return the list of problems with a receiver's transfer evidence (empty = pass).
+    """Return the problems with a receiver's transfer evidence (empty means pass).
 
     Rules: exactly ranks `0..tp_size-1` are present; neither the rank logs nor
-    `extra_text` (typically the receiver's stdout) contains a failure marker;
-    each rank log has exactly one `Matched m/n params` summary with `m == n > 0`
-    and exactly one `Rank r: transferred k params` summary with `r == rank` and
-    `k == m`.
+    `extra_text` contains a failure marker; each rank log has exactly one
+    `Matched m/n params` summary with `m == n > 0` and exactly one
+    `Rank r: transferred k params` summary with `r == rank` and `k == m`.
+
+    Args:
+        rank_logs: Rank to log text, as returned by `transfer_logs_by_rank`.
+        tp_size: Expected number of ranks.
+        extra_text: Additional text to scan for failure markers, typically the
+            receiver's stdout.
+
+    Returns:
+        Human-readable problem descriptions; an empty list means the evidence
+        is complete.
     """
     problems: list[str] = []
     expected_ranks = set(range(tp_size))
