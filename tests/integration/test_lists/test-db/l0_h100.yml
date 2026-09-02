@@ -117,6 +117,7 @@ l0_h100:
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py
+  - unittest/llmapi/test_return_routed_experts.py
   - unittest/scaffolding
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py

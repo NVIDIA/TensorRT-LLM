@@ -41,6 +41,7 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
+  - unittest/_torch/test_route_capture.py
   - unittest/_torch/test_utils.py
   - unittest/_torch/thop/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py

@@ -25,6 +25,7 @@ import torch
 
 from tensorrt_llm._torch.route_capture import RouteCapture, assert_capturable
 
+pytestmark = pytest.mark.cpu_only
 _L, _K = 4, 2  # small MoE-layer count / top-k for tests
 
 
