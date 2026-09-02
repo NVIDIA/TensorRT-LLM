@@ -128,9 +128,12 @@ class KVCacheV2IterationStatsReport:
     # Logical prompt tokens successfully scheduled for disk-to-host prefetch
     # during this iteration.
     disk_prefetch_tokens: int = 0
-    # Initial current-residency cached-token attribution, by source tier
-    # (gpu/host/disk/remote), for requests admitted during this iteration.
-    cached_tokens_by_tier: dict = field(default_factory=dict)
+    # Initial current-residency cached-token attribution for requests admitted during this
+    # iteration, indexed by cache level so entry i is the i-th configured tier.
+    cached_tokens_by_level: list[int] = field(default_factory=list)
+    # Readable tier name per cache level, in level order. Lets consumers label the level-indexed
+    # counters above without hard-coding a gpu/host/disk split.
+    cache_level_tiers: list[str] = field(default_factory=list)
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -223,7 +226,9 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
     stats_dict["iterSuspendedRequests"] = kv_iter_stats.suspended_requests
     stats_dict["iterResumedRequests"] = kv_iter_stats.resumed_requests
     stats_dict["iterDiskPrefetchTokens"] = kv_iter_stats.disk_prefetch_tokens
-    stats_dict["iterCachedTokensByTier"] = dict(kv_iter_stats.cached_tokens_by_tier)
+    stats_dict["iterCachedTokensByLevel"] = list(kv_iter_stats.cached_tokens_by_level)
+    if kv_iter_stats.cache_level_tiers:
+        stats_dict["kvCacheLevelTiers"] = list(kv_iter_stats.cache_level_tiers)
 
     stats_dict["kvCacheIterationStatsByPoolGroup"] = {
         str(pool_group_id): {

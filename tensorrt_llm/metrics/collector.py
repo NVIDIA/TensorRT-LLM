@@ -20,8 +20,6 @@ from typing import Dict, List, Optional, Union
 
 from .enums import MetricNames
 
-_PROMPT_CACHE_TIERS = ("gpu", "host", "disk", "remote")
-
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
 class MetricsCollector:
@@ -106,6 +104,7 @@ class MetricsCollector:
             trtllm_kv_cache_config_info
     """
     labelname_finish_reason = "finished_reason"
+    labelname_cache_level = "cache_level"
     labelname_cache_tier = "cache_tier"
 
     def __init__(
@@ -433,28 +432,25 @@ class MetricsCollector:
                 "KV cache is flushed or evicted."),
             labelnames=self.labels.keys())
         self.counter_tokens_cached_prompt.labels(**self.labels)
-        self.labels_with_cache_tier = {
-            **self.labels, self.labelname_cache_tier: ""
+        self.labels_with_cache_level = {
+            **self.labels,
+            self.labelname_cache_level: "",
+            self.labelname_cache_tier: "",
         }
         self.counter_tokens_cached_prompt_by_tier = Counter(
             name=self.metric_prefix + "prompt_cache_hit_tokens_total",
             documentation=(
                 "Process-lifetime total prompt tokens served from each KV "
-                "cache tier. Resets only when the serving process restarts, "
-                "not when the KV cache is flushed or evicted. Requests from "
-                "older peers without tier provenance update only the existing "
-                "aggregate counter; no unknown tier is emitted. Prompt KV "
-                "supplied across a disaggregated context/generation boundary "
-                "is attributed to the remote tier. Pages already prefetched "
-                "from disk to host are attributed to host."),
-            labelnames=self.labels_with_cache_tier.keys())
-        # Create all fixed-label children at startup so zero-valued tiers are
-        # visible before their first cache hit.
-        for cache_tier in _PROMPT_CACHE_TIERS:
-            self.counter_tokens_cached_prompt_by_tier.labels(
-                **{
-                    **self.labels, self.labelname_cache_tier: cache_tier
-                })
+                "cache level. Resets only when the serving process restarts, "
+                "not when the KV cache is flushed or evicted. cache_level is "
+                "the index into the configured tier list and cache_tier names "
+                "the memory backing it, so a deployment with a hot and a cold "
+                "GPU level reports them as two series sharing the gpu name. "
+                "Pages already prefetched from disk to host count as host."),
+            labelnames=self.labels_with_cache_level.keys())
+        # The configured levels are only known once stats arrive; children are created then so
+        # that zero-valued levels are still visible before their first cache hit.
+        self._registered_cache_levels = False
         self.histogram_tokens_cached_prompt = Histogram(
             name=self.metric_prefix + "prompt_cached_tokens_per_request",
             documentation="Histogram of cached prompt tokens per request.",
@@ -572,6 +568,36 @@ class MetricsCollector:
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         # Convenience function for logging to histogram.
         histogram.labels(**self.labels).observe(data)
+
+    def _cache_level_labels(self, level: int,
+                            level_tiers: Optional[List[str]]) -> Dict[str, str]:
+        tier = level_tiers[level] if level_tiers and level < len(
+            level_tiers) else ""
+        return {
+            self.labelname_cache_level: str(level),
+            self.labelname_cache_tier: tier,
+        }
+
+    def _log_cached_tokens_by_level(self, counts: Optional[List[int]],
+                                    level_tiers: Optional[List[str]]) -> None:
+        """Log cached prompt tokens for each configured cache level.
+
+        The level count comes from the engine's tier list, so the series are created on the
+        first stats report rather than at construction time.
+        """
+        if not counts:
+            return
+        if not self._registered_cache_levels:
+            for level in range(len(counts)):
+                self.counter_tokens_cached_prompt_by_tier.labels(
+                    **self.labels,
+                    **self._cache_level_labels(level, level_tiers))
+            self._registered_cache_levels = True
+        for level, count in enumerate(counts):
+            if count > 0:
+                self._log_counter(self.counter_tokens_cached_prompt_by_tier,
+                                  self._cache_level_labels(level, level_tiers),
+                                  count)
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
@@ -845,14 +871,9 @@ class MetricsCollector:
             self._log_counter(self.kv_cache_disk_prefetch_tokens_total, {},
                               disk_prefetch_tokens)
 
-        cached_tokens_by_tier = iteration_stats.get("iterCachedTokensByTier")
-        if cached_tokens_by_tier:
-            for cache_tier in _PROMPT_CACHE_TIERS:
-                count = cached_tokens_by_tier.get(cache_tier, 0)
-                if count > 0:
-                    self._log_counter(self.counter_tokens_cached_prompt_by_tier,
-                                      {self.labelname_cache_tier: cache_tier},
-                                      count)
+        self._log_cached_tokens_by_level(
+            iteration_stats.get("iterCachedTokensByLevel"),
+            iteration_stats.get("kvCacheLevelTiers"))
 
         kv_iter = iteration_stats.get("kvCacheIterationStats")
         kv_iter_by_lifecycle = iteration_stats.get(

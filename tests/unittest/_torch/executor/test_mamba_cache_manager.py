@@ -916,10 +916,8 @@ def test_v2_disagg_mamba_cache_tiers_are_remote():
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.tokens_per_block = 4
     manager.local_num_mamba_layers = 1
-    local_counts = manager._get_disagg_generation_preserved_cached_tokens_by_tier(
-        {"gpu": 4, "host": 2, "disk": 0, "remote": 0}, 6, 1
-    )
-    assert local_counts == dict.fromkeys(("gpu", "host", "disk", "remote"), 0)
+    local_counts = manager._get_disagg_generation_preserved_cached_tokens_by_level([4, 2, 0], 6, 1)
+    assert local_counts == [0, 0, 0]
 
 
 def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():

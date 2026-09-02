@@ -2885,18 +2885,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     _supports_additional_snapshot_offsets = True
 
-    def _get_disagg_generation_preserved_cached_tokens_by_tier(
+    def _get_disagg_generation_preserved_cached_tokens_by_level(
         self,
-        counts: Dict[str, int],
+        counts: List[int],
         num_cached_tokens: int,
-        last_cached_token_tier: Optional[int],
-    ) -> Dict[str, int]:
+        last_cached_token_level: Optional[int],
+    ) -> List[int]:
         if self.local_num_mamba_layers > 0:
-            # The incoming recurrent state overwrites the whole local slot and
-            # summarizes the complete prefix, so all of those tokens are remote.
-            return {tier: 0 for tier in counts}
-        return super()._get_disagg_generation_preserved_cached_tokens_by_tier(
-            counts, num_cached_tokens, last_cached_token_tier)
+            # The incoming recurrent state overwrites the whole local slot and summarizes the
+            # complete prefix, so none of those tokens count as a local cache hit.
+            return [0] * len(counts)
+        return super()._get_disagg_generation_preserved_cached_tokens_by_level(
+            counts, num_cached_tokens, last_cached_token_level)
 
     def __init__(
         self,

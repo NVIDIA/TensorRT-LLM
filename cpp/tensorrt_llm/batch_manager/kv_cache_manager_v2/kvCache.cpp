@@ -522,7 +522,17 @@ bool KvCache::prefetch(CacheLevel target)
     }
     if (hasDiskSource)
     {
-        mManager->recordDiskPrefetchTokens(mCachedTokensByTier.disk);
+        // The metric counts disk-to-host movement, so fold together every level the config maps
+        // to the disk tier rather than assuming a single disk level.
+        int64_t diskTokens = 0;
+        for (CacheLevel level{0}; level < mCachedTokensByLevel.size(); ++level)
+        {
+            if (storageMgr.cacheTier(level) == CacheTier::DISK)
+            {
+                diskTokens += mCachedTokensByLevel.at(level);
+            }
+        }
+        mManager->recordDiskPrefetchTokens(diskTokens);
     }
     return true;
 }
@@ -2056,58 +2066,43 @@ void KvCache::_onStopCommitting()
 }
 
 // ---------------------------------------------------------------------------
-// colderTier: the tier a token must be fetched from when several pages back it.
-// CacheTier is ordered from hottest to coldest, so the larger value wins.
+// _finalizeCachedTokensByLevel: turn the per-block cache levels collected while
+// holding the matched pages into logical token counts.
+//
+// Cache levels are ordered hottest first, so the coldest level backing a block
+// is simply the largest one. Working at level granularity (rather than at the
+// coarser GPU/host/disk tier) keeps a hot and a cold GPU level distinct.
 // ---------------------------------------------------------------------------
 
-namespace
+void KvCache::_finalizeCachedTokensByLevel(
+    int numTokens, TypedVec<BlockOrdinal, CacheLevel> const& attentionLevels, std::optional<CacheLevel> ssmLevel)
 {
-CacheTier colderTier(CacheTier lhs, CacheTier rhs) noexcept
-{
-    return static_cast<int>(lhs) < static_cast<int>(rhs) ? rhs : lhs;
-}
-} // namespace
-
-// ---------------------------------------------------------------------------
-// _finalizeCachedTokensByTier: turn the per-block attention tiers collected
-// while holding the matched pages into logical token counts.
-// ---------------------------------------------------------------------------
-
-void KvCache::_finalizeCachedTokensByTier(
-    int numTokens, std::vector<CacheTier> const& attentionTiers, std::optional<CacheTier> ssmTier)
-{
-    mCachedTokensByTier = CachedTokensByTier{};
-    mLastCachedTokenTier.reset();
+    mCachedTokensByLevel = CountsByLevel(mManager->storage().numCacheLevels(), 0);
+    mLastCachedTokenLevel.reset();
     if (numTokens == 0)
     {
         return;
     }
 
-    for (size_t ordinal = 0; ordinal < attentionTiers.size(); ++ordinal)
+    for (BlockOrdinal ordinal{0}; ordinal < attentionLevels.size(); ++ordinal)
     {
-        int const blockStart = static_cast<int>(ordinal) * mTokensPerBlock;
+        int const blockStart = ordinal.value() * mTokensPerBlock;
         int const blockEnd = std::min(numTokens, blockStart + mTokensPerBlock);
         if (blockStart >= blockEnd)
         {
             break;
         }
-        CacheTier sourceTier = attentionTiers[ordinal];
-        if (ssmTier.has_value())
+        CacheLevel sourceLevel = attentionLevels.at(ordinal);
+        if (ssmLevel.has_value() && *ssmLevel > sourceLevel)
         {
-            sourceTier = colderTier(sourceTier, *ssmTier);
+            sourceLevel = *ssmLevel;
         }
-        mLastCachedTokenTier = sourceTier;
-        int const blockLength = blockEnd - blockStart;
-        switch (sourceTier)
-        {
-        case CacheTier::GPU_MEM: mCachedTokensByTier.gpu += blockLength; break;
-        case CacheTier::HOST_MEM: mCachedTokensByTier.host += blockLength; break;
-        case CacheTier::DISK: mCachedTokensByTier.disk += blockLength; break;
-        }
+        mLastCachedTokenLevel = sourceLevel;
+        mCachedTokensByLevel.at(sourceLevel) += blockEnd - blockStart;
     }
 
-    TLLM_CHECK_DEBUG(mCachedTokensByTier.total() == numTokens);
-    TLLM_CHECK_DEBUG(mLastCachedTokenTier.has_value());
+    TLLM_CHECK_DEBUG(countsByLevelTotal(mCachedTokensByLevel) == numTokens);
+    TLLM_CHECK_DEBUG(mLastCachedTokenLevel.has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -2146,13 +2141,13 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
     BeamIndex beamIdx = kDefaultBeamIndex;
 
     auto& storageMgr = mManager->storage();
-    auto const numCacheLevels = static_cast<size_t>(storageMgr.numCacheLevels().value());
+    CacheLevel const numCacheLevels = storageMgr.numCacheLevels();
 
-    // Source-tier attribution for the reused tokens, merged across attention life cycles at block
+    // Source-level attribution for the reused tokens, merged across attention life cycles at block
     // granularity. It is observed in this same walk rather than in a separate pre-pass: hold() only
     // takes a PageHolder and unschedules eviction, it never migrates data, so a page still reports
-    // the level it was matched on.
-    std::vector<CacheTier> attentionTiers(matched.stdSize(), CacheTier::GPU_MEM);
+    // the level it was matched on. Levels are ordered hottest first, so merging takes the max.
+    TypedVec<BlockOrdinal, CacheLevel> attentionLevels(numMatchedBlocks, CacheLevel{0});
 
     for (LifeCycleId lcId{0}; lcId < numLc; ++lcId)
     {
@@ -2171,13 +2166,13 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
         ReusedBlocksByLevel reusedByLevel;
         if (shouldRecordStats && isAttention)
         {
-            reusedByLevel.full.assign(numCacheLevels, 0);
-            reusedByLevel.partial.assign(numCacheLevels, 0);
+            reusedByLevel.full = CountsByLevel(numCacheLevels, 0);
+            reusedByLevel.partial = CountsByLevel(numCacheLevels, 0);
         }
-        std::vector<std::optional<CacheLevel>> lifeCycleLevels;
+        TypedVec<BlockOrdinal, std::optional<CacheLevel>> lifeCycleLevels;
         if (isAttention)
         {
-            lifeCycleLevels.resize(matched.stdSize());
+            lifeCycleLevels.resize(numMatchedBlocks);
         }
 
         // Process a non-stale ordinal: hold the page.
@@ -2194,18 +2189,18 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
             {
                 return;
             }
-            lifeCycleLevels.at(ordinal.value()) = level;
+            lifeCycleLevels.at(ordinal) = level;
             if (shouldRecordStats)
             {
                 if (ordinal < fullReusedEnd)
                 {
                     ++fullReusedBlocks;
-                    ++reusedByLevel.full.at(static_cast<size_t>(level.value()));
+                    ++reusedByLevel.full.at(level);
                 }
                 else if (hasPartialMatch && ordinal == fullReusedEnd && _hasReuseSource(bpSlot))
                 {
                     partialReusedBlocks = 1;
-                    ++reusedByLevel.partial.at(static_cast<size_t>(level.value()));
+                    ++reusedByLevel.partial.at(level);
                 }
             }
         };
@@ -2216,28 +2211,26 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
             processOrdinal(ord);
 
         // For SWA, only sink and live-window pages at the matched endpoint are materialized. Stale
-        // spans inherit the next live page's tier, because that later anchor is what enables those
+        // spans inherit the next live page's level, because that later anchor is what enables those
         // logical tokens to be skipped.
         if (isAttention)
         {
-            std::optional<CacheTier> nextAnchorTier;
-            for (int ordinal = numMatchedBlocks.value() - 1; ordinal >= 0; --ordinal)
+            std::optional<CacheLevel> nextAnchorLevel;
+            for (int i = numMatchedBlocks.value() - 1; i >= 0; --i)
             {
-                auto const& level = lifeCycleLevels.at(static_cast<size_t>(ordinal));
-                std::optional<CacheTier> tier;
+                BlockOrdinal const ordinal{i};
+                auto level = lifeCycleLevels.at(ordinal);
                 if (level.has_value())
                 {
-                    tier = storageMgr.cacheTier(*level);
-                    nextAnchorTier = tier;
+                    nextAnchorLevel = level;
                 }
                 else
                 {
-                    tier = nextAnchorTier;
+                    level = nextAnchorLevel;
                 }
-                if (tier.has_value())
+                if (level.has_value() && *level > attentionLevels.at(ordinal))
                 {
-                    attentionTiers.at(static_cast<size_t>(ordinal))
-                        = colderTier(attentionTiers.at(static_cast<size_t>(ordinal)), *tier);
+                    attentionLevels.at(ordinal) = *level;
                 }
             }
         }
@@ -2254,17 +2247,17 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
     // Reuse onboards only this final recurrent checkpoint, and it summarizes the entire matched
     // prefix, so its source tier applies to every logical reused token; older checkpoints are
     // traversal history, not inputs.
-    std::optional<CacheTier> ssmTier;
+    std::optional<CacheLevel> ssmLevel;
     if (ssmLcId.has_value() && !matched.empty())
     {
         auto& snapshotBlock = *matched.back();
         auto* snapshotPage = snapshotBlock.storage[*ssmLcId];
         TLLM_CHECK_DEBUG_WITH_INFO(snapshotPage, "Last matched block must have SSM snapshot after truncation");
-        ssmTier = storageMgr.cacheTier(snapshotPage->cacheLevel);
+        ssmLevel = snapshotPage->cacheLevel;
         mSsmBlocks[kDefaultBeamIndex][*ssmLcId] = snapshotPage->hold();
     }
 
-    _finalizeCachedTokensByTier(numTokens, attentionTiers, ssmTier);
+    _finalizeCachedTokensByLevel(numTokens, attentionLevels, ssmLevel);
     // Record one SSM snapshot lookup for this reuse-match onboarding (a miss when
     // nothing matched). Mirrors Python's record_ssm_snapshot_lookup call.
     if (_shouldRecordManagerStats() && ssmLcId.has_value())

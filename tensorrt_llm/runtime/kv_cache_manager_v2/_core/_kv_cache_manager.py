@@ -26,6 +26,7 @@ from .._block_radix_tree import BlockRadixTree, ReuseMatch, ReuseScope
 from .._common import (
     BAD_PAGE_INDEX,
     GPU_LEVEL,
+    NDEBUG,
     PRIORITY_DEFAULT,
     BlockOrdinal,
     CacheLevel,
@@ -42,10 +43,12 @@ from .._exceptions import LogicError
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
 from .._stats import (
+    CountsByLevel,
     KVCacheIterationStatsDelta,
     KVCacheStatsDelta,
     ReusedBlocksByLevel,
     SsmSnapshotIterationStatsDelta,
+    add_counts_by_level,
 )
 from .._storage._config import BufferId, SlotDesc, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
@@ -199,9 +202,6 @@ class PoolGroupPeakBlockStats:
     evictable: int
 
 
-_CACHED_TOKEN_TIERS = ("gpu", "host", "disk", "remote")
-
-
 class KVCacheManager:
     __slots__ = (
         "_init_config",
@@ -229,7 +229,7 @@ class KVCacheManager:
         "_iter_suspended_requests",
         "_iter_resumed_requests",
         "_iter_disk_prefetch_tokens",
-        "_iter_cached_tokens_by_tier",
+        "_iter_cached_tokens_by_level",
         "_iter_reused_blocks_by_level",
     )
     _init_config: KVCacheManagerConfig
@@ -315,7 +315,7 @@ class KVCacheManager:
         self._iter_suspended_requests = 0
         self._iter_resumed_requests = 0
         self._iter_disk_prefetch_tokens = 0
-        self._iter_cached_tokens_by_tier = dict.fromkeys(_CACHED_TOKEN_TIERS, 0)
+        self._iter_cached_tokens_by_level = []
         self._iter_reused_blocks_by_level = {}
 
     def __del__(self) -> None:
@@ -709,16 +709,19 @@ class KVCacheManager:
         self._iter_disk_prefetch_tokens = 0
         return num_tokens
 
-    def record_cached_tokens_by_tier(self, counts: dict[str, int]) -> None:
-        """Accumulate a request's initial cached-token tier attribution into this iteration."""
+    def record_cached_tokens_by_level(self, counts: CountsByLevel) -> None:
+        """Accumulate a request's initial cached-token attribution, by cache level, into this
+        iteration."""
+        assert NDEBUG or all(count >= 0 for count in counts)
         if self._stats_enabled:
-            for tier in _CACHED_TOKEN_TIERS:
-                self._iter_cached_tokens_by_tier[tier] += counts[tier]
+            self._iter_cached_tokens_by_level = add_counts_by_level(
+                self._iter_cached_tokens_by_level, counts
+            )
 
-    def get_and_reset_iteration_cached_tokens_by_tier(self) -> dict[str, int]:
-        """Return {gpu, host, disk, remote} cached-token counts since the last drain and reset them."""
-        counts = self._iter_cached_tokens_by_tier
-        self._iter_cached_tokens_by_tier = dict.fromkeys(_CACHED_TOKEN_TIERS, 0)
+    def get_and_reset_iteration_cached_tokens_by_level(self) -> CountsByLevel:
+        """Return the per-cache-level cached-token counts since the last drain and reset them."""
+        counts = self._iter_cached_tokens_by_level
+        self._iter_cached_tokens_by_level = []
         return counts
 
     def get_and_reset_iteration_peak_block_stats(

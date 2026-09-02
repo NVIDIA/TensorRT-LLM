@@ -249,12 +249,12 @@ public:
     void recordDiskPrefetchTokens(int64_t numTokens);
     // Return the number of disk-prefetched tokens since the last drain and reset it.
     int64_t getAndResetIterationDiskPrefetchTokens();
-    // Accumulate a request's initial current-residency cached-token tier attribution into the
-    // current iteration window.
-    void recordCachedTokensByTier(CachedTokensByTier const& counts);
-    // Return {gpu, host, disk, remote} cached-token counts accumulated since the last drain and
-    // reset them.
-    CachedTokensByTier getAndResetIterationCachedTokensByTier();
+    // Accumulate a request's initial current-residency cached-token attribution, indexed by cache
+    // level, into the current iteration window.
+    void recordCachedTokensByLevel(CountsByLevel const& counts);
+    // Return the per-cache-level cached-token counts accumulated since the last drain and reset
+    // them.
+    CountsByLevel getAndResetIterationCachedTokensByLevel();
     // Return {suspended, resumed} counts since the last drain and reset them.
     // Both counters track the same population, so the running
     // (suspended - resumed) total is the number of requests still parked in
@@ -382,7 +382,7 @@ private:
     int64_t mIterSuspendedRequests{0};
     int64_t mIterResumedRequests{0};
     int64_t mIterDiskPrefetchTokens{0};
-    CachedTokensByTier mIterCachedTokensByTier;
+    CountsByLevel mIterCachedTokensByLevel;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

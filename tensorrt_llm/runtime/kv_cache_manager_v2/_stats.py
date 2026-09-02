@@ -16,6 +16,9 @@
 import dataclasses
 from dataclasses import dataclass, fields
 
+from ._common import CacheLevel
+from ._utils import TypedIndexList
+
 
 class _StatsDeltaMixin:
     __slots__ = ()
@@ -79,35 +82,42 @@ class KVCacheIterationStatsDelta(_StatsDeltaMixin):
         return self.iter_reused_blocks / total
 
 
+CountsByLevel = TypedIndexList[CacheLevel, int]
+"""Counters indexed by CacheLevel: entry ``i`` belongs to the i-th configured cache tier.
+
+The length follows the configured tier list instead of a hard-coded gpu/host/disk split, which
+is what lets a deployment with a hot and a cold GPU level report them as two distinct entries.
+"""
+
+
+def add_counts_by_level(dst: CountsByLevel, src: CountsByLevel) -> CountsByLevel:
+    """Element-wise accumulate, widening ``dst`` when ``src`` covers more levels."""
+    if len(dst) < len(src):
+        dst = list(dst) + [0] * (len(src) - len(dst))
+    for level, value in enumerate(src):
+        dst[level] += value
+    return dst
+
+
 @dataclass(slots=True)
 class ReusedBlocksByLevel:
     """Reuse block counts split by the cache level the reused pages were resident on.
 
-    Kept outside ``KVCacheIterationStatsDelta`` on purpose: the number of cache levels is a
-    runtime, config-driven quantity (a deployment may configure two GPU levels, a hot and a
-    cold one), while that dataclass is a fixed-field record whose field-wise add/subtract
-    helpers assume scalar members. Indices are ``CacheLevel`` values, so entry ``i`` always
-    refers to the i-th configured tier rather than to a hard-coded gpu/host/disk bucket.
+    Kept outside ``KVCacheIterationStatsDelta`` on purpose: the level count is a runtime
+    quantity, while that dataclass is a fixed-field record whose field-wise add/subtract
+    helpers assume scalar members.
     """
 
-    full: list[int] = dataclasses.field(default_factory=list)
-    partial: list[int] = dataclasses.field(default_factory=list)
+    full: CountsByLevel = dataclasses.field(default_factory=list)
+    partial: CountsByLevel = dataclasses.field(default_factory=list)
 
     def add(self, other: "ReusedBlocksByLevel") -> None:
-        self.full = _add_into(self.full, other.full)
-        self.partial = _add_into(self.partial, other.partial)
+        self.full = add_counts_by_level(self.full, other.full)
+        self.partial = add_counts_by_level(self.partial, other.partial)
 
     @property
     def empty(self) -> bool:
         return not any(self.full) and not any(self.partial)
-
-
-def _add_into(dst: list[int], src: list[int]) -> list[int]:
-    if len(dst) < len(src):
-        dst = dst + [0] * (len(src) - len(dst))
-    for i, value in enumerate(src):
-        dst[i] += value
-    return dst
 
 
 @dataclass(slots=True)

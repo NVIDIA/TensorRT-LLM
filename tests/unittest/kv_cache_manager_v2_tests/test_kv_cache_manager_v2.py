@@ -5037,11 +5037,9 @@ class TestCachedTokensByTier(TestKVCacheManagerV2):
         with self._tiered_prefix() as (tokens, _):
             cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
             try:
-                self.assertEqual(
-                    cache.cached_tokens_by_tier,
-                    {"gpu": 4, "host": 4, "disk": 3, "remote": 0},
-                )
-                self.assertEqual(cache._get_last_cached_token_tier(), 2)
+                # Levels 0/1/2 are gpu/host/disk in this fixture's configured tier list.
+                self.assertEqual(list(cache.cached_tokens_by_level), [4, 4, 3])
+                self.assertEqual(cache._get_last_cached_token_level(), 2)
             finally:
                 cache.close()
 
@@ -5066,17 +5064,13 @@ class TestCachedTokensByTier(TestKVCacheManagerV2):
 
     def test_iteration_accumulation(self) -> None:
         self.prepare(16 << 20, 16 << 20, 16 << 20, 2, 16, 0, tokens_per_block=4)
-        self.manager.record_cached_tokens_by_tier({"gpu": 3, "host": 1, "disk": 0, "remote": 0})
-        self.manager.record_cached_tokens_by_tier({"gpu": 2, "host": 0, "disk": 4, "remote": 0})
+        self.manager.record_cached_tokens_by_level([3, 1, 0])
+        self.manager.record_cached_tokens_by_level([2, 0, 4])
         self.assertEqual(
-            self.manager.get_and_reset_iteration_cached_tokens_by_tier(),
-            {"gpu": 5, "host": 1, "disk": 4, "remote": 0},
+            list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [5, 1, 4]
         )
         # Draining resets the accumulator.
-        self.assertEqual(
-            self.manager.get_and_reset_iteration_cached_tokens_by_tier(),
-            {"gpu": 0, "host": 0, "disk": 0, "remote": 0},
-        )
+        self.assertEqual(list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [])
 
 
 @pytest.mark.cpu_only

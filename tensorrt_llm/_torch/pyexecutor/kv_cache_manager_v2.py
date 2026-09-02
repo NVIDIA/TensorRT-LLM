@@ -51,6 +51,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BufferConfig,
     CacheLevel,
+    CacheTier,
     CacheTierConfig,
     CuError,
     DataRole,
@@ -122,7 +123,14 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
     if field_name not in KV_CACHE_ITERATION_STATS_REUSE_FIELDS
 )
 
-_CACHED_TOKEN_TIERS = ("gpu", "host", "disk", "remote")
+# Readable name per CacheTier, used only to label level-indexed counters. The levels themselves
+# come from the configured tier list, so several levels may share a name. Keyed by the enum
+# member because the C++ backend binds CacheTier as a plain nanobind enum, not an IntEnum.
+_CACHE_TIER_NAMES = {
+    CacheTier.GPU_MEM: "gpu",
+    CacheTier.HOST_MEM: "host",
+    CacheTier.DISK: "disk",
+}
 
 
 class Role:
@@ -2653,29 +2661,25 @@ class KVCacheManagerV2(BaseResourceManager):
                 and not req.is_dummy_request
                 and not self.is_estimating_kv_cache
             ):
-                counts = dict(kv_cache.cached_tokens_by_tier)
-                if set(counts) != set(_CACHED_TOKEN_TIERS) or any(
-                    type(counts[tier]) is not int or counts[tier] < 0
-                    for tier in _CACHED_TOKEN_TIERS
-                ):
-                    raise RuntimeError(f"Invalid cached-token tier attribution: {counts!r}")
-                if sum(counts.values()) != kv_cache.num_committed_tokens:
+                counts = list(kv_cache.cached_tokens_by_level)
+                if any(type(count) is not int or count < 0 for count in counts):
+                    raise RuntimeError(f"Invalid cached-token level attribution: {counts!r}")
+                if sum(counts) != kv_cache.num_committed_tokens:
                     raise RuntimeError(
-                        "Cached-token tier attribution does not match the "
+                        "Cached-token level attribution does not match the "
                         f"reused-token count: {counts!r} vs "
                         f"{kv_cache.num_committed_tokens}"
                     )
-                counts = {tier: counts[tier] for tier in _CACHED_TOKEN_TIERS}
                 if req.is_disagg_generation_init_state:
-                    counts = self._get_disagg_generation_preserved_cached_tokens_by_tier(
+                    counts = self._get_disagg_generation_preserved_cached_tokens_by_level(
                         counts,
                         kv_cache.num_committed_tokens,
-                        kv_cache._get_last_cached_token_tier(),
+                        kv_cache._get_last_cached_token_level(),
                     )
                     if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
                         counts = None
                 if counts is not None:
-                    self.impl.record_cached_tokens_by_tier(counts)
+                    self.impl.record_cached_tokens_by_level(counts)
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
@@ -2692,21 +2696,20 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return self._resume_and_restore(req.py_request_id, kv_cache)
 
-    def _get_disagg_generation_preserved_cached_tokens_by_tier(
+    def _get_disagg_generation_preserved_cached_tokens_by_level(
         self,
-        counts: Dict[str, int],
+        counts: List[int],
         num_cached_tokens: int,
-        last_cached_token_tier: Optional[int],
-    ) -> Dict[str, int]:
+        last_cached_token_level: Optional[int],
+    ) -> List[int]:
         """Keep only complete local blocks not overwritten by P/D transfer."""
-        result = dict(counts)
+        result = list(counts)
         partial_tokens = num_cached_tokens % self.tokens_per_block
         if partial_tokens:
-            if last_cached_token_tier not in range(3):
-                raise RuntimeError("Partial cached prefix is missing its final cache tier")
-            tier = _CACHED_TOKEN_TIERS[last_cached_token_tier]
-            result[tier] -= partial_tokens
-            if result[tier] < 0:
+            if last_cached_token_level is None or not 0 <= last_cached_token_level < len(result):
+                raise RuntimeError("Partial cached prefix is missing its final cache level")
+            result[last_cached_token_level] -= partial_tokens
+            if result[last_cached_token_level] < 0:
                 raise RuntimeError("Invalid partial cached-prefix attribution")
         return result
 
@@ -3009,6 +3012,15 @@ class KVCacheManagerV2(BaseResourceManager):
         if slot_sizes is None:
             slot_sizes = getattr(pool_group_stats, "slot_size")
         return tuple(slot_sizes)
+
+    def _stats_cache_level_tier_names(self) -> List[str]:
+        """Name the tier backing each configured cache level, in level order.
+
+        Consumers pair these with the level-indexed counters so a metric can carry both the
+        level and a readable tier name. Two GPU levels stay distinct entries that happen to
+        share the name.
+        """
+        return [_CACHE_TIER_NAMES.get(tier, str(tier)) for tier in self.impl.cache_tier_list]
 
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
         # life cycle (== layer group) -> pool group is static structure exposed by
@@ -3430,7 +3442,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
 
         disk_prefetch_tokens = self.impl.get_and_reset_iteration_disk_prefetch_tokens()
-        cached_tokens_by_tier = self.impl.get_and_reset_iteration_cached_tokens_by_tier()
+        cached_tokens_by_level = self.impl.get_and_reset_iteration_cached_tokens_by_level()
         reused_blocks_by_level = self.impl.get_and_reset_iteration_reused_blocks_by_level()
 
         life_cycle_metadata = self._stats_life_cycle_metadata()
@@ -3530,7 +3542,8 @@ class KVCacheManagerV2(BaseResourceManager):
             suspended_requests=suspended_requests,
             resumed_requests=resumed_requests,
             disk_prefetch_tokens=disk_prefetch_tokens,
-            cached_tokens_by_tier=cached_tokens_by_tier,
+            cached_tokens_by_level=list(cached_tokens_by_level),
+            cache_level_tiers=self._stats_cache_level_tier_names(),
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
