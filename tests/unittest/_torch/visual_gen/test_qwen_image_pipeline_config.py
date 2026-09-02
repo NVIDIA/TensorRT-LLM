@@ -283,7 +283,7 @@ def test_qwen_joint_attention_wraps_separate_qkv_self_attention(
 
 
 @pytest.mark.parametrize("backend", ["TRTLLM", "FA4", "CUTEDSL"])
-def test_qwen_joint_attention_keeps_requested_self_attention_backend(backend):
+def test_qwen_joint_attention_keeps_requested_self_attention_backend(backend) -> None:
     attention = QwenJointAttention(
         dim=16,
         num_attention_heads=2,
@@ -713,7 +713,7 @@ def test_qwen_sequence_sharding_rejects_padding_without_key_mask_support():
 
 
 @pytest.mark.parametrize("backend", ["TRTLLM", "FA4", "CUTEDSL"])
-def test_qwen_transformer_rejects_non_vanilla_ulysses_attention_backend(backend):
+def test_qwen_transformer_rejects_non_vanilla_ulysses_attention_backend(backend) -> None:
     with pytest.raises(ValueError, match="requires attention_config.backend='VANILLA'"):
         QwenImageTransformer2DModel(
             model_config=DiffusionModelConfig(
