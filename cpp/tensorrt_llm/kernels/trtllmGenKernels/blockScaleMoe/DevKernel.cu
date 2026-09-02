@@ -1054,7 +1054,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
     int64_t const hiddenBlockIdx = blockIdx.y;
     int64_t const tokenIdx = blockIdx.x;
     int64_t const startOffset = threadIdx.x + hiddenBlockIdx * params.hiddenDimPerBlock / FINALIZE_ELEM_PER_THREAD;
-    int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+    int64_t const stride = blockDim.x;
     int64_t const numElemsInPaddedCol = params.hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
     int64_t const numElemsInColPerBlock = (hiddenBlockIdx + 1) * params.hiddenDimPerBlock / FINALIZE_ELEM_PER_THREAD;
 
@@ -1203,7 +1203,14 @@ void run(Data const& data, void* stream)
         // Capped at rather arbitrary 8192 to avoid gridDim exceeding 65535 specified by CUDA.
         int const numBlocksY = std::min(8192, data.numTokens);
 
-        if (numBlocksX * numBlocksY < 1184)
+        int const dtypeBits = tg::dtypeGetNumBits(data.mDtypeElt);
+        // The vector kernel casts every row to 128-bit loads. Keep irregular
+        // layouts on the scalar kernel instead of relying on allocator luck.
+        bool const vectorLayoutEligible = data.hiddenDim > 0
+            && static_cast<int64_t>(data.hiddenDim) * dtypeBits % 128 == 0
+            && static_cast<int64_t>(data.hiddenDimPadded) * dtypeBits % 128 == 0
+            && isAlignedTo(data.inPtr, alignof(float4)) && isAlignedTo(data.outPtr, alignof(float4));
+        if (numBlocksX * numBlocksY < 1184 || !vectorLayoutEligible)
         {
             // The number 1184 comes from 148 * 8, where 148 is the number of SMs (Streaming Multiprocessors) in the
             // Blackwell architecture,
@@ -1215,8 +1222,23 @@ void run(Data const& data, void* stream)
         }
         else
         {
-            LAUNCH_EXPW(data, finalizeKernelVecLoad, true, /*numBlocks=*/data.numTokens,
-                /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
+            // A row is this many 128-bit vectors. One thread per vector removes
+            // the trailing iteration that runs with most lanes idle. Past 1.5x the
+            // default block the wider block gives up more occupancy than that tail
+            // costs.
+            int const vecPerRow = static_cast<int>(static_cast<int64_t>(data.hiddenDim) * dtypeBits / 128);
+            bool const useSinglePass
+                = vecPerRow > FINALIZE_THREADS_PER_BLOCK && vecPerRow <= 3 * FINALIZE_THREADS_PER_BLOCK / 2;
+            if (useSinglePass)
+            {
+                LAUNCH_EXPW(data, finalizeKernelVecLoad, false, /*numBlocks=*/data.numTokens,
+                    /*numThreads=*/vecPerRow, 0, stream);
+            }
+            else
+            {
+                LAUNCH_EXPW(data, finalizeKernelVecLoad, true, /*numBlocks=*/data.numTokens,
+                    /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
+            }
         }
     }
 }
