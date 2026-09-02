@@ -88,6 +88,19 @@ def _require_edge_checkpoint() -> str:
     return path
 
 
+def _require_edge_policy_droid_checkpoint() -> str:
+    """Resolve the released Policy-DROID checkpoint for gated component tests."""
+    path = os.environ.get("DIFFUSION_MODEL_PATH_COSMOS3_EDGE_POLICY_DROID")
+    if not path:
+        root = Path(os.environ.get("LLM_MODELS_ROOT", "/home/scratch.trt_llm_data_ci/llm-models/"))
+        if not root.exists():
+            root = Path("/scratch/trt_llm_data/llm-models/")
+        path = str(root / "Cosmos3-Edge-Policy-DROID")
+    if not os.path.isdir(path):
+        pytest.skip(f"Checkpoint not found: {path}")
+    return path
+
+
 def _reduced_edge_config() -> SimpleNamespace:
     # Key set mirrors the Edge checkpoint's transformer/config.json verbatim
     # (including the missing rope_type in rope_scaling); only sizes shrink.
@@ -1285,6 +1298,54 @@ class TestDiffusersParity:
         # bf16 accumulation band across 28 layers with differing attention
         # backends; observed 0.007 / 0.016 on B200.
         assert all(rel < 0.05 for rel in rels), result.stdout
+
+    def test_policy_droid_joint_transformer_parity(self):
+        """L2: DROID state-conditioned joint DiT vs the exported reference.
+
+        The emitted tensors are one-step BF16 video and action velocities. The
+        reference is the Diffusers transformer with cosmos-framework's DROID
+        state-row layout. The relaxed T1 band covers reduction reordering from
+        the two frameworks' different attention backends.
+        """
+        import json
+        import subprocess
+        import sys
+
+        diffusers_main = os.environ.get("DIFFUSERS_MAIN_PATH")
+        if not diffusers_main:
+            pytest.skip("Set DIFFUSERS_MAIN_PATH to Diffusers with Edge and action support")
+        checkpoint = _require_edge_policy_droid_checkpoint()
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        script = Path(__file__).parent / "cosmos3_edge_policy_component_parity.py"
+        result = subprocess.run(
+            [sys.executable, str(script), checkpoint],
+            env={**os.environ},
+            capture_output=True,
+            text=True,
+            timeout=1200,
+        )
+        assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-4000:]
+        prefix = "POLICY_DROID_COMPONENT_PARITY="
+        reports = [line for line in result.stdout.splitlines() if line.startswith(prefix)]
+        assert len(reports) == 1, result.stdout
+        report = json.loads(reports[0][len(prefix) :])
+
+        # B300 calibration against Diffusers 2919c5096 with BF16 SDPA:
+        # video/action relative-L2 0.01184/0.00410 and cosine
+        # 0.999932/0.999992. The 0.025 band leaves roughly 2x headroom for
+        # backend accumulation order.
+        for modality in ("video", "action"):
+            stats = report[modality]
+            assert stats["relative_l2"] < 0.025, report
+            assert stats["cosine"] > 0.9998, report
+            assert stats["max_abs"] < 0.025 * stats["reference_max_abs"] + 1e-3, report
+            assert stats["p99_abs"] < 0.025 * stats["reference_max_abs"] + 1e-3, report
+        # Feature-active assertion: removing the clean state row must change
+        # the predicted DROID action chunk by more than BF16 rounding noise.
+        assert report["state_effect_relative_l2"] > 0.01, report
+        assert report["state_effect_max_abs"] > 0.01, report
 
 
 # Recorded from diffusers main 2919c5096 (`Cosmos3OmniPipeline.tokenize_prompt`
