@@ -104,12 +104,10 @@
 /cpp/include/tensorrt_llm/batch_manager @NVIDIA/trt-llm-runtime-devs
 /cpp/include/tensorrt_llm/common @NVIDIA/trt-llm-runtime-devs
 /cpp/include/tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
-/cpp/include/tensorrt_llm/layers @NVIDIA/trt-llm-runtime-devs
 /cpp/include/tensorrt_llm/runtime @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/batch_manager @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/common @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
-/cpp/tensorrt_llm/layers @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/nanobind @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/runtime @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/testing @NVIDIA/trt-llm-runtime-devs

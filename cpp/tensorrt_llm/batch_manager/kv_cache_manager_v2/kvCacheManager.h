@@ -28,11 +28,13 @@
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storageManager.h"
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <set>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -231,6 +233,19 @@ public:
     void commitSsmSnapshotIterationStats(SsmSnapshotIterationStatsByLifeCycle const& statsByLifeCycle);
     SsmSnapshotIterationStatsByLifeCycle getAndResetSsmSnapshotIterationStats();
 
+    // Count one ACTIVE->SUSPENDED transition for the current iteration window.
+    void recordRequestSuspended();
+    // Count one preemption recovery for the current iteration window. Only a
+    // previously-ACTIVE cache that was suspended and then successfully resumed
+    // counts; a freshly-created cache is activated by its first resume(), but
+    // that is an admission, not a recovery, and is not counted.
+    void recordRequestResumed();
+    // Return {suspended, resumed} counts since the last drain and reset them.
+    // Both counters track the same population, so the running
+    // (suspended - resumed) total is the number of requests still parked in
+    // the SUSPENDED state.
+    std::pair<int64_t, int64_t> getAndResetIterationSuspendResumeStats();
+
     void markStatsDirty(std::optional<RequestIdType> kvCacheId);
     void clearStatsDirty(std::optional<RequestIdType> kvCacheId);
     std::unordered_set<RequestIdType> getDirtyStatsKvCacheIds() const;
@@ -348,6 +363,8 @@ private:
     PeakBlockStatsByCacheLevel mIterationPeakNumBlocksByCacheLevel;
     std::unordered_set<RequestIdType> mDirtyStatsKvCacheIds;
     std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;
+    int64_t mIterSuspendedRequests{0};
+    int64_t mIterResumedRequests{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

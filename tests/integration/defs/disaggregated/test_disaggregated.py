@@ -80,22 +80,7 @@ def get_ucx_tls():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
-    if sm == 90:
-        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
-        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
-        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
-        return "^gdr_copy"
     return "^ib,gdr_copy"
-
-
-# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
-# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
-# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
-# address handles to cross-rail peers and time out, hanging the workers.
-# Drop it at import time so worker environments (copied from os.environ)
-# fall back to standard GID-based address resolution; no-op when absent.
-if get_sm_version() == 90:
-    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 
 def cleanup_output_files():
@@ -2104,9 +2089,18 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     # documented off switch.
     gen_env = None
     assert_gen_log_contains = None
+    # Default readiness budget. On Blackwell (SM100/103) the CuTe DSL MLA decode
+    # JIT and autotuner warmup deterministically push cold-start readiness to
+    # ~370s: every observed B200/B300 run overran the 300s default, so raise it
+    # to the 1200s budget other disagg tests already use (a real hang still
+    # fails at 1200s). H100 registers in ~138s and its 300s-mark failures are
+    # dominated by a separate UCX/NIXL issue, not slow warmup, so keep 300s
+    # there rather than delaying those failures.
+    server_start_timeout = 300
     if get_sm_version() in (100, 103):
         gen_env = {"TLLM_LOG_LEVEL": "INFO"}
         assert_gen_log_contains = "CuteDSL MLA decode: compiling kernel variant"
+        server_start_timeout = 1200
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
@@ -2114,7 +2108,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
                            gen_env=gen_env,
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory(),
-                           assert_gen_log_contains=assert_gen_log_contains)
+                           assert_gen_log_contains=assert_gen_log_contains,
+                           server_start_timeout=server_start_timeout)
 
 
 @skip_no_hopper
@@ -4156,6 +4151,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
