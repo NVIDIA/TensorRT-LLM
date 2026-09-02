@@ -643,37 +643,6 @@ class KimiKDALinearAttention(nn.Module):
         hd = self.head_dim
         H = self.num_heads
         B = x2d.shape[0]
-        W = self.conv_size
-
-        # Allocated once at the pool slot count and never reallocated:
-        # captured CUDA graphs retain this pointer.
-        buf = self._cs_dense
-        if buf is None:
-            if torch.cuda.is_current_stream_capturing():
-                return self.forward_decode_fallback(
-                    x2d,
-                    conv_pool,
-                    ssm_pool,
-                    slot_indices,
-                    layer_cache,
-                    ssm_state_indices,
-                    output,
-                )
-            buf = torch.empty(
-                3,
-                max(conv_pool.shape[0], B),
-                d,
-                W - 1,
-                dtype=torch.bfloat16,
-                device=x2d.device,
-            )
-            self._cs_dense = buf
-        else:
-            assert buf.shape[1] >= B, (
-                f"KDA decode staging buffer holds {buf.shape[1]} rows but the "
-                f"decode batch is {B}; reallocating would corrupt previously "
-                f"captured CUDA graphs"
-            )
 
         # kda_decode is inplace-only. BCG supplies its graph-owned core buffer;
         # eager decode uses a persistent buffer whose pointer remains stable
