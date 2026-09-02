@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -142,6 +142,131 @@ TEST_F(PeftCacheManagerTest, addRequestPeftMissingTask)
 
     mPeftManager->addRequestPeft(llmRequest);
 }
+
+TEST_F(PeftCacheManagerTest, unsupportedAdapterDataTypeDoesNotConfigureCache)
+{
+    SamplingConfig samplingConfig;
+    auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
+    TensorPtr int8Weights = mManager->cpu(loraWeightsTp2->getShape(), tensorrt_llm::DataType::kINT8);
+    auto int8Request = std::make_shared<LlmRequest>(0, 4, tokens, samplingConfig, false);
+    int8Request->setLoraTaskId(1234);
+    int8Request->setLoraWeights(int8Weights);
+    int8Request->setLoraConfig(loraConfigTp2);
+
+    EXPECT_THAT([&]() { mPeftManager->addRequestPeft(int8Request); },
+        testing::Throws<std::runtime_error>(testing::Property(
+            &std::runtime_error::what, testing::HasSubstr("Unsupported LoRA weights dtype int8 for PEFT cache"))));
+
+    auto floatRequest = std::make_shared<LlmRequest>(1, 4, tokens, samplingConfig, false);
+    floatRequest->setLoraTaskId(5678);
+    floatRequest->setLoraWeights(loraWeightsTp2);
+    floatRequest->setLoraConfig(loraConfigTp2);
+    EXPECT_NO_THROW(mPeftManager->addRequestPeft(floatRequest));
+    EXPECT_EQ(mPeftManager->getDataType(), tensorrt_llm::DataType::kFLOAT);
+}
+
+#if defined(ENABLE_FP8)
+TEST_F(PeftCacheManagerTest, invalidAdapterDoesNotConfigureCacheDataType)
+{
+    SamplingConfig samplingConfig;
+    auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
+    TensorPtr fp8Weights = mManager->cpu(loraWeightsTp2->getShape(), tensorrt_llm::DataType::kFP8);
+    auto invalidRequest = std::make_shared<LlmRequest>(0, 4, tokens, samplingConfig, false);
+    invalidRequest->setLoraTaskId(1234);
+    invalidRequest->setLoraWeights(fp8Weights);
+
+    EXPECT_THAT([&]() { mPeftManager->addRequestPeft(invalidRequest); },
+        testing::Throws<std::runtime_error>(testing::Property(
+            &std::runtime_error::what, testing::HasSubstr("must have both lora_weights and lora_keys"))));
+
+    auto floatRequest = std::make_shared<LlmRequest>(1, 4, tokens, samplingConfig, false);
+    floatRequest->setLoraTaskId(5678);
+    floatRequest->setLoraWeights(loraWeightsTp2);
+    floatRequest->setLoraConfig(loraConfigTp2);
+    EXPECT_NO_THROW(mPeftManager->addRequestPeft(floatRequest));
+    EXPECT_EQ(mPeftManager->getDataType(), tensorrt_llm::DataType::kFLOAT);
+}
+
+TEST_F(PeftCacheManagerTest, adapterSelectsHomogeneousCacheDataType)
+{
+    SamplingConfig samplingConfig;
+    auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
+    TensorPtr fp8Weights = mManager->cpu(loraWeightsTp2->getShape(), tensorrt_llm::DataType::kFP8);
+    auto fp8Request = std::make_shared<LlmRequest>(0, 4, tokens, samplingConfig, false);
+    fp8Request->setLoraTaskId(1234);
+    fp8Request->setLoraWeights(fp8Weights);
+    fp8Request->setLoraConfig(loraConfigTp2);
+
+    mPeftManager->addRequestPeft(fp8Request);
+    EXPECT_EQ(mPeftManager->getDataType(), tensorrt_llm::DataType::kFP8);
+
+    auto floatRequest = std::make_shared<LlmRequest>(1, 4, tokens, samplingConfig, false);
+    floatRequest->setLoraTaskId(5678);
+    floatRequest->setLoraWeights(loraWeightsTp2);
+    floatRequest->setLoraConfig(loraConfigTp2);
+    EXPECT_THAT([&]() { mPeftManager->addRequestPeft(floatRequest); },
+        testing::Throws<std::runtime_error>(testing::Property(
+            &std::runtime_error::what, testing::HasSubstr("PEFT cache supports one homogeneous LoRA dtype"))));
+}
+
+TEST_F(PeftCacheManagerTest, adapterDataTypeRecalculatesHostByteBudgetPageCapacity)
+{
+    ModelConfig bf16ModelConfig(0, 2, 2, 0, 1, 16, tensorrt_llm::DataType::kBF16);
+    bf16ModelConfig.setMlpHiddenSize(mModelConfig->getMlpHiddenSize());
+    bf16ModelConfig.setLoraModules(mModelConfig->getLoraModules());
+    bf16ModelConfig.setMaxLoraRank(mModelConfig->getMaxLoraRank());
+
+    SizeType32 constexpr kDeviceModuleLayerCount = 2 * 8 * 92;
+    size_t constexpr kHostCacheByteBudget = 100'000'000; // 100 MB
+    PeftCacheManagerConfig config(0, kDeviceModuleLayerCount, 8, 64, 1, 1);
+    config.hostCacheSize = kHostCacheByteBudget;
+    auto const [initialHostConfig, initialDeviceConfig]
+        = PeftCacheManager::getPageManagerConfig(config, bf16ModelConfig, *mWorldConfig, *mManager);
+    auto peftManager = std::make_unique<PeftCacheManager>(config, bf16ModelConfig, *mWorldConfig, *mManager);
+
+    auto const pageWidth = static_cast<uint64_t>(initialHostConfig.getPageWidth());
+    auto const slotsPerPage = static_cast<uint64_t>(initialHostConfig.getSlotsPerPage());
+    auto const fp8PageSlotBytes
+        = pageWidth * static_cast<uint64_t>(runtime::BufferDataType(tensorrt_llm::DataType::kFP8).getSize());
+    auto const fp8HostSlots = static_cast<uint64_t>(kHostCacheByteBudget) / fp8PageSlotBytes;
+    auto const expectedFp8HostPages = (fp8HostSlots + slotsPerPage - 1) / slotsPerPage;
+
+    EXPECT_EQ(tensorrt_llm::DataType::kBF16, initialHostConfig.getDataType());
+    EXPECT_EQ(peftManager->getMaxHostPages(), initialHostConfig.getTotalNumPages());
+    EXPECT_EQ(peftManager->getMaxDevicePages(), initialDeviceConfig.getTotalNumPages());
+
+    peftManager->configureDataType(tensorrt_llm::DataType::kFP8);
+
+    EXPECT_EQ(peftManager->getMaxHostPages(), expectedFp8HostPages);
+    EXPECT_GT(peftManager->getMaxHostPages(), initialHostConfig.getTotalNumPages());
+    EXPECT_EQ(peftManager->getMaxDevicePages(), initialDeviceConfig.getTotalNumPages());
+}
+
+TEST_F(PeftCacheManagerTest, adapterDataTypeRecalculatesDeviceByteBudgetPageCapacity)
+{
+    ModelConfig bf16ModelConfig(0, 2, 2, 0, 1, 16, tensorrt_llm::DataType::kBF16);
+    bf16ModelConfig.setMlpHiddenSize(mModelConfig->getMlpHiddenSize());
+    bf16ModelConfig.setLoraModules(mModelConfig->getLoraModules());
+    bf16ModelConfig.setMaxLoraRank(mModelConfig->getMaxLoraRank());
+
+    SizeType32 constexpr kHostModuleLayerCount = 2 * 8 * 128;
+    SizeType32 constexpr kFp8ToBf16CapacityRatio = 2;
+    float constexpr kDeviceCachePercent = 0.0001F;
+    PeftCacheManagerConfig config(kHostModuleLayerCount, 0, 8, 64, 1, 1);
+    config.deviceCachePercent = kDeviceCachePercent;
+    auto peftManager = std::make_unique<PeftCacheManager>(config, bf16ModelConfig, *mWorldConfig, *mManager);
+    auto const initialDevicePages = peftManager->getMaxDevicePages();
+
+    peftManager->configureDataType(tensorrt_llm::DataType::kFP8);
+
+    auto const fp8DevicePages = peftManager->getMaxDevicePages();
+    // Reusing one byte budget gives FP8 twice the BF16 slots; page rounding can
+    // shift the doubled page count by one.
+    EXPECT_GT(fp8DevicePages, initialDevicePages);
+    EXPECT_GE(fp8DevicePages, kFp8ToBf16CapacityRatio * initialDevicePages - 1);
+    EXPECT_LE(fp8DevicePages, kFp8ToBf16CapacityRatio * initialDevicePages + 1);
+}
+#endif
 
 TEST_F(PeftCacheManagerTest, putGet)
 {

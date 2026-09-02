@@ -34,6 +34,8 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
+    MAMBA_CONV_ROLE,
+    MAMBA_SSM_ROLE,
     AttentionLayerGroup,
     KVCachePageTable,
     LocalLayer,
@@ -47,8 +49,16 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 pytestmark = pytest.mark.cpu_only
 
 
-def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None):
-    """Create a KVCachePageTable for testing."""
+def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mamba_tp=2):
+    """Create a KVCachePageTable for testing.
+
+    ``mamba_tp`` is the TP degree the synthetic recurrent-state group is
+    sharded for: per-rank sizes are the ``mamba_tp`` shard of a fixed global
+    state, so page tables built for different TP degrees stay
+    peer-compatible under MambaPolicy's global (TP-aggregated) size check.
+    Pass the rank's effective mamba TP (``make_rankinfo`` defaults to
+    ``tp_size=2``).
+    """
     if pool_ptrs is None:
         pool_ptrs = [1234]
     if block_bytes is None:
@@ -84,15 +94,46 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None):
         local_layers=local_layers,
         pool_views=pool_views,
     )
+    conv_slot_bytes = 4096 // mamba_tp
+    ssm_slot_bytes = 8192 // mamba_tp
+    sorted_lids = [0, 1]
+    mamba_local_layers = [
+        LocalLayer(local_layer_id=0, global_layer_id=100),
+        LocalLayer(local_layer_id=1, global_layer_id=101),
+    ]
+    mamba_pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=conv_slot_bytes,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=ssm_slot_bytes,
+        ),
+    ]
     mamba_lg = MambaLayerGroup(
         pool_group_idx=1,
-        mamba_layer_offsets={100: 0, 101: 1},
-        conv_states=PhysicalPool(base_address=0xA000, slot_bytes=2048, num_slots=128),
-        ssm_states=PhysicalPool(base_address=0xB000, slot_bytes=4096, num_slots=128),
-        conv_section_bytes=[512, 256, 256],
+        local_layers=mamba_local_layers,
+        pool_views=mamba_pool_views,
+        conv_section_bytes=[1024 // mamba_tp, 512 // mamba_tp, 512 // mamba_tp],
         ssm_bytes_per_head=64,
     )
-    pool_groups = [PhysicalPoolGroup(pools=physical_pools)]
+    conv_pool = PhysicalPool(base_address=0xA000, slot_bytes=conv_slot_bytes, num_slots=128)
+    ssm_pool = PhysicalPool(base_address=0xB000, slot_bytes=ssm_slot_bytes, num_slots=128)
+    pool_groups = [
+        PhysicalPoolGroup(pools=physical_pools),
+        PhysicalPoolGroup(pools=[conv_pool, ssm_pool]),
+    ]
 
     return KVCachePageTable(
         tokens_per_block=16,
@@ -558,7 +599,7 @@ def test_peer_registrar_get_kv_map_head_mismatch():
         tokens_per_block=16,
         dims_per_head=8,
         layer_num_per_pp=[2],
-        page_table=make_page_table(block_bytes=[2048]),
+        page_table=make_page_table(block_bytes=[2048], mamba_tp=1),
     )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
@@ -1026,7 +1067,7 @@ def test_peer_registrar_allows_byte_aligned_subbyte_head_mismatch():
         element_bytes=0.5,
         kv_heads_per_rank=4,
         tp_size=1,
-        page_table=make_page_table(block_bytes=[2048]),
+        page_table=make_page_table(block_bytes=[2048], mamba_tp=1),
     )
     reg = _make_peer_registrar(self_ri)
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
@@ -1056,7 +1097,7 @@ def test_peer_registrar_rejects_misaligned_subbyte_head_mismatch():
         tokens_per_block=1,
         dims_per_head=1,
         tp_size=1,
-        page_table=make_page_table(block_bytes=[2048]),
+        page_table=make_page_table(block_bytes=[2048], mamba_tp=1),
     )
     reg = _make_peer_registrar(self_ri)
 
@@ -1066,7 +1107,7 @@ def test_peer_registrar_rejects_misaligned_subbyte_head_mismatch():
 
 def test_peer_registrar_dispatches_nhd_mapper():
     self_pt = make_page_table()
-    peer_pt = make_page_table(block_bytes=[2048])
+    peer_pt = make_page_table(block_bytes=[2048], mamba_tp=1)
     self_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
     peer_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
     self_ri = make_rankinfo(
@@ -1090,7 +1131,7 @@ def test_peer_registrar_dispatches_nhd_mapper():
 
 def test_peer_registrar_warns_for_nhd_head_mismatch(monkeypatch):
     self_pt = make_page_table()
-    peer_pt = make_page_table(block_bytes=[2048])
+    peer_pt = make_page_table(block_bytes=[2048], mamba_tp=1)
     self_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
     peer_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
     self_ri = make_rankinfo(kv_heads_per_rank=2, tp_size=2, page_table=self_pt)

@@ -43,11 +43,11 @@ from ..distributed import AllReduce
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import DeepSeekV3MoeRoutingMethod, create_moe
-from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
 from ..modules.gated_mlp import GatedMLP
 from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import DeepSeekV3MoeRoutingMethod, create_moe
+from ..moe.fused_moe.routing import Deepseekv3RoutingImpl
 from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 

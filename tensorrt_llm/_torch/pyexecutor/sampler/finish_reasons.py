@@ -260,9 +260,25 @@ class FinishReasonsHandler:
         """
 
         self._temp_data.max_lens.append(
-            min(self._max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
+            min(self._max_seq_len, request.py_orig_prompt_len + request.py_max_new_tokens)
         )
-        self._temp_data.end_ids.append(end_id if (end_id := request.py_end_id) is not None else -1)
+        # Beam-search context-only (disaggregated prefill) requests hand off
+        # after their single step, so their end id is masked to the "no end
+        # token" sentinel (< 0). Two things depend on it: an end candidate is
+        # not pooled by the CBA op, so it stays in its beam slot and travels to
+        # the generation server as first_gen_tokens; and the request is not
+        # marked finished here, so it still reaches the disagg-transmission
+        # state that builds ContextPhaseParams (llmRequest.cpp) -- an END_ID
+        # finish leaves it in GENERATION_COMPLETE, which is neither
+        # isContextFinished() nor finished-due-to-length, so the handoff is
+        # never started and no tokens are produced at all. The generation
+        # server sees the end id itself and pools the beam there
+        # (TRTLLM-14792). Scoped to beam search: single-beam disaggregation
+        # keeps its current end-id behaviour.
+        end_id = request.py_end_id
+        if end_id is None or (request.is_context_only_request and request.py_beam_width > 1):
+            end_id = -1
+        self._temp_data.end_ids.append(end_id)
 
         if (stop_words_list := request.py_stop_words_list) is not None:
             assert (seq_slot := request.py_seq_slot) is not None
@@ -528,6 +544,7 @@ class FinishReasonsHandler:
         seq_lens_cuda: torch.Tensor,
         new_tokens_cuda: torch.Tensor,
         first_finish_reasons_cuda: torch.Tensor | None = None,
+        pending_harvest_cuda: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Calculates the finish reasons for each request and returns the finish reasons tensor.
 
@@ -567,6 +584,7 @@ class FinishReasonsHandler:
             stop_word_indices=stop_word_indices_cuda,
             single_token_stop_words_only=single_token_stop_words_only,
             first_finish_reasons=first_finish_reasons_cuda,
+            pending_harvest=pending_harvest_cuda,
         )
         return self.store.finish_reasons_cuda
 
@@ -638,6 +656,7 @@ class FinishReasonsHandler:
         stop_word_indices: torch.Tensor | None = None,
         single_token_stop_words_only: bool = False,
         first_finish_reasons: torch.Tensor | None = None,
+        pending_harvest: torch.Tensor | None = None,
     ) -> None:
         """Writes the finish reasons to the finish_reasons tensor.
 
@@ -712,11 +731,20 @@ class FinishReasonsHandler:
         if first_finish_reasons is not None:
             # store the first stop reason for each beam of a seq_slot.
             batched_first_finish_reasons = first_finish_reasons[seq_slots]
+            newly_finished = (batched_first_finish_reasons == FinishReason.NOT_FINISHED.value) & (
+                batched_finish_reasons != FinishReason.NOT_FINISHED.value
+            )
             first_finish_reasons[seq_slots, ...] = torch.where(
                 batched_first_finish_reasons == FinishReason.NOT_FINISHED.value,
                 batched_finish_reasons,
                 batched_first_finish_reasons,
             )
+            if pending_harvest is not None:
+                # Raise the beam-search harvest latch for beams that finished on
+                # *this* step. The CBA step lowers it once it has pooled them;
+                # first_finish_reasons itself cannot serve as the latch because
+                # it must outlive the harvest to be reported to the caller.
+                pending_harvest[seq_slots, ...] |= newly_finished.any(dim=0)
 
     def _are_end_id(self, end_ids_cuda: torch.Tensor, tokens_cuda: torch.Tensor) -> torch.Tensor:
         """Checks if the tokens are the end id

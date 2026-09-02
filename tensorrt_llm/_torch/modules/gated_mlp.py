@@ -12,7 +12,8 @@ from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
-from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from .linear import (Linear, TensorParallelMode, WeightMode,
+                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
 from .swiglu import swiglu
 
 
@@ -219,7 +220,8 @@ class GatedMLP(nn.Module):
         - gate_up_proj has no bias (bias not supported in fused kernel)
         """
         return (self.use_cute_dsl_blockscaling_mm and self.activation == F.silu
-                and self._is_plain_swiglu() and self.gate_up_proj.has_nvfp4
+                and self._is_plain_swiglu()
+                and self.gate_up_proj.has_nvfp4_activation_quantization
                 and not self.gate_up_proj.has_bias)
 
     def _can_fuse_gate_up_swiglu_fp4out(self):
@@ -232,13 +234,7 @@ class GatedMLP(nn.Module):
         """
         if not self._can_fuse_gate_up_swiglu():
             return False
-        if not self.down_proj.has_nvfp4:
-            return False
-        if self.down_proj.force_dynamic_quantization:
-            return False
-        if self.down_proj.input_scale is None:
-            return False
-        return True
+        return is_static_nvfp4_input_eligible(self.down_proj)
 
     def _fused_gate_up_swiglu(self, x, fp4_out=False):
         """Fused FC1 GEMM + SwiGLU using CuteDSL dense kernel.
@@ -357,16 +353,13 @@ class GatedMLP(nn.Module):
                 "LoRA is not supported with uneven TP for GatedMLP "
                 "(intermediate_size not divisible by tp_size).")
 
-        h1 = self.gate_up_proj(x)
-
-        h1_lora = self.splitted_gate_up_lora(x, lora_params, self.layer_idx)
-
-        if h1_lora is not None:
-            h1 = h1 + h1_lora
-
-        h1_lora = self.fused_gate_up_lora(x, lora_params, self.layer_idx)
-        if h1_lora is not None:
-            h1 = h1 + h1_lora
+        h1 = LoraLayer.forward_with_base(
+            lambda: self.gate_up_proj(x),
+            (self.splitted_gate_up_lora, self.fused_gate_up_lora),
+            x,
+            lora_params,
+            self.layer_idx,
+        )
 
         h2 = self._apply_activation(h1, has_lora=True)
         output = self.down_proj(h2,

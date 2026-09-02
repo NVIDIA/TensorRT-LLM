@@ -13,14 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-
-if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
@@ -33,9 +30,9 @@ from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..modules.linear import Linear, TensorParallelMode, copy_weight, load_weight_shard
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
@@ -403,9 +400,11 @@ class MiniMaxM2Model(DecoderModel):
 @register_auto_model("MiniMaxM2ForCausalLM")
 class MiniMaxM2ForCausalLM(DecoderModelForCausalLM[MiniMaxM2Model, PretrainedConfig]):
     @classmethod
-    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
-        """Use KV cache manager V2 by default."""
-        return {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+    def get_preferred_kv_cache_manager_version(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for MiniMax M2."""
+        return "V2"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(

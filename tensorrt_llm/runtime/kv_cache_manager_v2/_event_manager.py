@@ -560,12 +560,12 @@ class KVCacheEventManager:
 
     @staticmethod
     def _life_cycle_ids_from_radix_block(block: Any) -> set[int]:
-        life_cycle_ids = set[int]()
-        for life_cycle_id in range(len(block.storage)):
-            page = block.get_page(life_cycle_id)
-            if page is not None and page.num_tokens_in_block >= len(block.tokens):
-                life_cycle_ids.add(life_cycle_id)
-        return life_cycle_ids
+        return {
+            life_cycle_id
+            for life_cycle_id in range(len(block.storage))
+            if (page := block.get_page(life_cycle_id)) is not None
+            and page.num_tokens_in_block >= len(block.tokens)
+        }
 
     def _parent_hash_from_radix_block(self, block: Any) -> EventBlockHash | None:
         parent = block.prev

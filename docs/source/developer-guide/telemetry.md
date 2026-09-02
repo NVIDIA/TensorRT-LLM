@@ -28,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-270 captured fields.
+294 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -45,7 +45,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `attention_dp_config.kv_cache_routing_max_sessions` | `<class 'int'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_new_conv_placement` | `Literal['round_robin', 'least_queued']` | `categorical` |  | `round_robin`, `least_queued` |
 | `attention_dp_config.timeout_iters` | `<class 'int'>` | `value` |  |  |
-| `attn_backend` | `<class 'str'>` | `categorical` | allowlist | `VANILLA`, `TRTLLM`, `FLASHINFER`, `FLASHINFER_STAR_ATTENTION` |
+| `attn_backend` | `<class 'str'>` | `categorical` | allowlist | `VANILLA`, `TRTLLM`, `FLASHINFER` |
 | `backend` | `Literal['pytorch']` | `categorical` |  | `pytorch` |
 | `batch_wait_max_tokens_ratio` | `<class 'float'>` | `value` |  |  |
 | `batch_wait_timeout_iters` | `<class 'int'>` | `value` |  |  |
@@ -58,9 +58,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cache_transceiver_config.max_tokens_in_buffer` | `Optional[int]` | `value` |  |  |
 | `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON', 'auto']]` | `categorical` |  | `CPP`, `PYTHON`, `auto` |
 | `context_parallel_size` | `<class 'int'>` | `value` |  |  |
-| `cp_config.block_size` | `Optional[int]` | `value` |  |  |
-| `cp_config.cp_anchor_size` | `Optional[int]` | `value` |  |  |
-| `cp_config.cp_type` | `<enum 'CpType'>` | `categorical` |  | `ULYSSES`, `STAR`, `RING`, `HELIX` |
+| `cp_config.cp_type` | `<enum 'CpType'>` | `categorical` |  | `ULYSSES`, `RING`, `HELIX` |
 | `cp_config.fifo_version` | `Optional[int]` | `value` |  |  |
 | `cp_config.tokens_per_block` | `Optional[int]` | `value` |  |  |
 | `cp_config.use_nccl_for_alltoall` | `Optional[bool]` | `value` |  |  |
@@ -84,6 +82,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `enable_autotuner` | `<class 'bool'>` | `value` |  |  |
 | `enable_chunked_prefill` | `<class 'bool'>` | `value` |  |  |
 | `enable_early_first_token_response` | `<class 'bool'>` | `value` |  |  |
+| `enable_encoder_decoder_mixed_cuda_graph` | `<class 'bool'>` | `value` |  |  |
 | `enable_energy_metrics` | `<class 'bool'>` | `value` |  |  |
 | `enable_iter_perf_stats` | `<class 'bool'>` | `value` |  |  |
 | `enable_iter_req_stats` | `<class 'bool'>` | `value` |  |  |
@@ -95,17 +94,32 @@ unset or when the safety sanitizer rejects the runtime value.
 | `enable_resource_governor` | `<class 'bool'>` | `value` |  |  |
 | `enable_speculative_beam_history_d2h` | `<class 'bool'>` | `value` |  |  |
 | `encode_only` | `<class 'bool'>` | `value` |  |  |
+| `encoder_cuda_graph_config.batch_sizes` | `Optional[List[int]]` | `value` |  |  |
+| `encoder_cuda_graph_config.enable_padding` | `<class 'bool'>` | `value` |  |  |
+| `encoder_cuda_graph_config.max_batch_size` | `<class 'int'>` | `value` |  |  |
+| `encoder_cuda_graph_config.max_num_token` | `<class 'int'>` | `value` |  |  |
+| `encoder_cuda_graph_config.max_seq_len` | `<class 'int'>` | `value` |  |  |
+| `encoder_cuda_graph_config.mode` | `Literal['encode']` | `categorical` |  | `encode` |
+| `encoder_cuda_graph_config.num_tokens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |
+| `encoder_cuda_graph_config.seq_lens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |
 | `encoder_max_batch_size` | `Optional[int]` | `value` |  |  |
 | `encoder_max_num_tokens` | `Optional[int]` | `value` |  |  |
 | `force_dynamic_quantization` | `<class 'bool'>` | `value` |  |  |
 | `garbage_collection_gen0_threshold` | `<class 'int'>` | `value` |  |  |
 | `gather_generation_logits` | `<class 'bool'>` | `value` |  |  |
+| `generation_config` | `Literal['auto', 'trtllm']` | `categorical` |  | `auto`, `trtllm` |
 | `gms_config.mode` | `Literal['auto', 'rw', 'ro']` | `categorical` |  | `auto`, `rw`, `ro` |
 | `gpus_per_node` | `Optional[int]` | `value` |  |  |
 | `guided_decoding_backend` | `Optional[Literal['xgrammar', 'llguidance']]` | `categorical` |  | `xgrammar`, `llguidance` |
 | `iter_stats_max_iterations` | `Optional[int]` | `value` |  |  |
+| `kv_cache_compression_config.algorithm` | `Literal['triattention']` | `categorical` |  | `triattention` |
+| `kv_cache_compression_config.beta` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_compression_config.budget` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_compression_config.eviction_mode` | `Literal['union', 'per_head', 'per_layer_perhead']` | `categorical` |  | `union`, `per_head`, `per_layer_perhead` |
+| `kv_cache_compression_config.normalize_scores` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.avg_seq_len` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
+| `kv_cache_config.block_reuse_config.max_num_turns` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.block_reuse_config.policy` | `Literal['all_reusable', 'per_request', 'per_conversation']` | `categorical` |  | `all_reusable`, `per_request`, `per_conversation` |
 | `kv_cache_config.copy_on_partial_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `Optional[float]` | `value` |  |  |
@@ -117,6 +131,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.enable_partial_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.enable_swa_scratch_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.event_buffer_max_size` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.fp8_context_mla_kv_len_cap` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.free_gpu_memory_fraction` | `Optional[float]` | `value` |  |  |
 | `kv_cache_config.host_cache_size` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.iteration_stats_interval` | `<class 'int'>` | `value` |  |  |
@@ -152,13 +167,14 @@ unset or when the safety sanitizer rejects the runtime value.
 | `max_stats_len` | `<class 'int'>` | `value` |  |  |
 | `mm_encoder_only` | `<class 'bool'>` | `value` |  |  |
 | `moe_cluster_parallel_size` | `Optional[int]` | `value` |  |  |
-| `moe_config.backend` | `Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM']` | `categorical` |  | `AUTO`, `CUTLASS`, `CUTEDSL`, `WIDEEP`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM` |
+| `moe_config.backend` | `Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']` | `categorical` |  | `AUTO`, `CUTLASS`, `CUTEDSL`, `WIDEEP`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM`, `MEGAMOE_CUTEDSL` |
 | `moe_config.disable_finalize_fusion` | `<class 'bool'>` | `value` |  |  |
 | `moe_config.max_num_tokens` | `Optional[int]` | `value` |  |  |
 | `moe_config.use_low_precision_moe_combine` | `<class 'bool'>` | `value` |  |  |
 | `moe_expert_parallel_size` | `Optional[int]` | `value` |  |  |
 | `moe_tensor_parallel_size` | `Optional[int]` | `value` |  |  |
 | `multimodal_config.encoder_cache_max_bytes` | `<class 'int'>` | `value` |  |  |
+| `multimodal_config.encoder_scheduling_policy` | `<enum 'MultimodalEncoderSchedulingPolicy'>` | `categorical` |  | `DISABLED`, `DEFAULT`, `EAGER` |
 | `multimodal_config.encoder_side_stream_max_ahead` | `<class 'int'>` | `value` |  |  |
 | `multimodal_config.video_pruning_rate` | `Optional[float]` | `value` |  |  |
 | `mx_config.preshard_strategy` | `<class 'str'>` | `categorical` | allowlist | `per_module` |
@@ -181,6 +197,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `perf_metrics_max_requests` | `<class 'int'>` | `value` |  |  |
 | `pipeline_parallel_size` | `<class 'int'>` | `value` |  |  |
 | `pp_partition` | `Optional[List[int]]` | `value` |  |  |
+| `prefill_capture_num_tokens` | `Optional[List[int]]` | `value` |  |  |
+| `prefill_cuda_graph_backend` | `<enum 'PrefillCudaGraphBackend'>` | `categorical` | allowlist | `disabled`, `piecewise`, `breakable` |
 | `print_iter_log` | `<class 'bool'>` | `value` |  |  |
 | `prometheus_metrics_config.e2e_request_latency_buckets` | `Optional[List[float]]` | `value` |  |  |
 | `prometheus_metrics_config.request_decode_time_buckets` | `Optional[List[float]]` | `value` |  |  |
@@ -192,14 +210,13 @@ unset or when the safety sanitizer rejects the runtime value.
 | `ray_placement_config.defer_workers_init` | `<class 'bool'>` | `value` |  |  |
 | `ray_placement_config.per_worker_gpu_share` | `Optional[float]` | `value` |  |  |
 | `ray_placement_config.placement_bundle_indices` | `Optional[List[List[int]]]` | `value` |  |  |
-| `reasoning_parser` | `Optional[str]` | `categorical` | allowlist | `auto`, `deepseek-r1`, `laguna`, `qwen3`, `qwen3_5`, `minimax_m2`, `minimax_m2_append_think`, `nano-v3`, `gemma4`, `kimi_k2`, `kimi_k25` |
+| `reasoning_parser` | `Optional[str]` | `categorical` | allowlist | `auto`, `deepseek-r1`, `poolside_v1`, `laguna`, `qwen3`, `qwen3_5`, `minimax_m2`, `minimax_m2_append_think`, `nano-v3`, `gemma4`, `kimi_k2`, `kimi_k25` |
 | `reorder_policy_config.policy_args.agent_inflight_seq_num` | `<class 'int'>` | `value` |  |  |
 | `reorder_policy_config.policy_args.agent_percentage` | `<class 'float'>` | `value` |  |  |
 | `reorder_policy_config.policy_name` | `Optional[Literal['AgentTree']]` | `categorical` |  | `AgentTree` |
 | `request_stats_max_iterations` | `Optional[int]` | `value` |  |  |
 | `return_perf_metrics` | `<class 'bool'>` | `value` |  |  |
 | `sampler_force_async_worker` | `<class 'bool'>` | `value` |  |  |
-| `sampler_type` | `Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]` | `categorical` | allowlist | `TRTLLMSampler`, `TorchSampler`, `auto` |
 | `scheduler_config.capacity_scheduler_policy` | `<enum 'CapacitySchedulerPolicy'>` | `categorical` |  | `MAX_UTILIZATION`, `GUARANTEED_NO_EVICT`, `STATIC_BATCH` |
 | `scheduler_config.context_chunking_policy` | `Optional[tensorrt_llm.llmapi.llm_args.ContextChunkingPolicy]` | `categorical` |  | `FIRST_COME_FIRST_SERVED`, `EQUAL_PROGRESS`, `FORCE_CHUNK` |
 | `scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window` | `<class 'int'>` | `value` |  |  |
@@ -215,8 +232,10 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.implementation` | `Literal['triton', 'msa']` | `categorical` |  | `triton`, `msa` |
 | `sparse_attention_config.index_head_dim` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.index_n_heads` | `Optional[int]` | `value` |  |  |
+| `sparse_attention_config.index_share_for_mtp_iteration` | `Optional[bool]` | `value` |  |  |
 | `sparse_attention_config.index_topk` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.indexer_k_dtype` | `Literal['fp8', 'fp4']` | `categorical` |  | `fp8`, `fp4` |
+| `sparse_attention_config.indexer_kv_dtype` | `Literal['bf16', 'fp8']` | `categorical` |  | `bf16`, `fp8` |
 | `sparse_attention_config.indexer_max_chunk_size` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.indexer_rope_interleave` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.kernel_size` | `Optional[int]` | `value` |  |  |
@@ -243,7 +262,9 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.window_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.acceptance_rate_threshold` | `Optional[float]` | `value` |  |  |
 | `speculative_config.acceptance_rate_window_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
+| `speculative_config.advanced_sampling_mode` | `<enum 'AdvancedSamplingMode'>` | `categorical` |  | `full`, `no_topk`, `no_topp`, `no_topk_no_topp` |
 | `speculative_config.allow_advanced_sampling` | `<class 'bool'>` | `value` |  |  |
+| `speculative_config.attention_backend` | `Literal['VANILLA', 'TRTLLM']` | `categorical` |  | `VANILLA`, `TRTLLM` |
 | `speculative_config.begin_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.block_size` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `Lookahead`, `MTP`, `Medusa`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
@@ -288,7 +309,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.write_interval` | `<class 'int'>` | `value` |  |  |
 | `stream_interval` | `<class 'int'>` | `value` |  |  |
 | `telemetry_config.disabled` | `<class 'bool'>` | `value` |  |  |
-| `telemetry_config.usage_context` | `<enum 'UsageContext'>` | `categorical` |  | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval` |
+| `telemetry_config.usage_context` | `<enum 'UsageContext'>` | `categorical` |  | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval`, `disaggregated` |
 | `tensor_parallel_size` | `<class 'int'>` | `value` |  |  |
 | `tokenizer_mode` | `Literal['auto', 'slow']` | `categorical` |  | `auto`, `slow` |
 | `torch_compile_config.capture_num_tokens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |

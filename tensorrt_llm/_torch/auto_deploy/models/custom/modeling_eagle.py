@@ -775,7 +775,7 @@ class EagleDrafterForCausalLM(PreTrainedModel):
 
 @dataclass
 class EagleWrapperOutput(ModelOutput):
-    """Output format compatible with Eagle3OneModelSampler/MTPSampler.
+    """Output format compatible with SpecSampler.
 
     This output format allows the one-model speculative decoding flow to bypass
     logits-based sampling in the sampler. The EagleWrapper performs all sampling

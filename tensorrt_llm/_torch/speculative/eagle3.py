@@ -18,10 +18,10 @@ from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, SpecWorkerBase
-from .mtp import MTPSampler, _select_mtp_position_ids
+from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
+                        SpecWorkerBase)
+from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 
@@ -414,6 +414,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_parent_token: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        if self.spec_dec_mode.is_mtp_eagle_one_model():
+            self.allocate_context_prompt_lookahead()
         if self.layers_to_capture is None:
             if self.spec_dec_mode.is_mtp_eagle_one_model():
                 # MTP Eagle one-model feeds the target model's hidden_states
@@ -599,22 +601,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                    i * self.hidden_size,
                                    (i + 1) * self.hidden_size)
                 break
-
-
-class Eagle3OneModelSampler(MTPSampler):
-    """Sampler for one-model EAGLE3 (linear and dynamic tree modes)."""
-
-    def __init__(self, args: TorchSampler.Args, spec_config=None):
-        self._spec_config = spec_config
-        super().__init__(args, nextn=args.max_total_draft_tokens)
-
-    def _get_max_new_tokens(self, args: TorchSampler.Args,
-                            draft_len: int) -> int:
-        """Dynamic tree: accepted path depth <= max_draft_len + 1."""
-        if (self._spec_config is not None
-                and getattr(self._spec_config, 'use_dynamic_tree', False)):
-            return self._spec_config.max_draft_len + 1
-        return self._get_max_tokens(args, draft_len)
 
 
 class Eagle3OneModelWorker(SpecWorkerBase):
@@ -872,6 +858,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             sequence_lengths=attn_metadata.seq_lens_cuda[:batch_size],
             num_contexts=num_contexts,
             batch_indices=spec_metadata.batch_indices_cuda[:batch_size],
+            prompt_lookahead_tokens=(
+                spec_metadata.context_prompt_lookahead_tokens),
         )
 
         draft_metadata = attn_metadata.get_draft_metadata()
@@ -939,6 +927,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                    num_accepted_tokens,
                                    original_all_rank_num_tokens):
         """Linear draft loop, unified for Eagle3 and MTP Eagle."""
+        from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
+                                                    is_dsa_cache_manager)
+
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
         next_draft_tokens = []
@@ -946,9 +937,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         position_ids = inputs["position_ids"]
 
-        reuse_mtp_topk = (self.is_mtp_eagle
-                          and hasattr(attn_metadata, "set_skip_topk"))
-        if reuse_mtp_topk:
+        uses_dsa_mtp_metadata = self.is_mtp_eagle and isinstance(
+            attn_metadata, DSAtrtllmAttentionMetadata)
+        if uses_dsa_mtp_metadata:
             attn_metadata.set_in_mtp_draft_loop(True)
             # Accepted counts let the indexer stash each gen's last-accepted row.
             attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
@@ -957,8 +948,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 attn_metadata, draft_kv_cache_manager) as draft_attn_metadata:
             attn_metadata = draft_attn_metadata
             inputs["attn_metadata"] = draft_attn_metadata
+            if uses_dsa_mtp_metadata and is_dsa_cache_manager(
+                    draft_kv_cache_manager):
+                # Overlap scheduling corrects kv_lens_cuda from the runtime
+                # accepted-token counts inside the captured graph. The target
+                # forward refreshes target slot mappings during that correction;
+                # refresh once more after rebinding so the first draft forward
+                # writes the separate DSA indexer cache at the same positions.
+                attn_metadata.on_update_kv_lens()
             for i in range(runtime_draft_len):
-                if reuse_mtp_topk:
+                if uses_dsa_mtp_metadata:
                     attn_metadata.set_skip_topk(i > 0)
                 # Run draft model (mode-specific via helper). The helper
                 # passes ``all_rank_num_tokens`` as a kwarg so the draft model
@@ -1156,7 +1155,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
-        if reuse_mtp_topk:
+        if uses_dsa_mtp_metadata:
             attn_metadata.set_skip_topk(False)
             attn_metadata.set_in_mtp_draft_loop(False)
             attn_metadata.set_mtp_num_accepted(None)
@@ -1362,8 +1361,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # context
         input_ids_ctx = self._prepare_context_input_ids(
-            input_ids, attn_metadata.num_ctx_tokens, spec_metadata.gather_ids,
-            accepted_tokens, num_contexts)
+            input_ids,
+            attn_metadata.num_ctx_tokens,
+            spec_metadata.gather_ids,
+            accepted_tokens,
+            num_contexts,
+            prompt_lookahead_tokens=(
+                spec_metadata.context_prompt_lookahead_tokens),
+        )
 
         # generation
         input_ids_gen = accepted_tokens[
@@ -1390,8 +1395,29 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         sequence_lengths: torch.Tensor,
         num_contexts: int,
         batch_indices: torch.Tensor,
+        prompt_lookahead_tokens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Select the accepted token, hidden row, and fixed draft position."""
+        """Select the next token, recurrent hidden row, and draft position.
+
+        Args:
+            accepted_tokens: Accepted target tokens with shape
+                ``[batch_size, max_draft_len + 1]``.
+            num_accepted_tokens: Accepted-token count for each request with
+                shape ``[batch_size]``.
+            hidden_states: Target hidden states for the current input tokens.
+            position_ids: Position IDs corresponding to ``hidden_states``.
+            sequence_lengths: Current input length for each request with shape
+                ``[batch_size]``.
+            num_contexts: Number of context requests at the front of the batch.
+            batch_indices: Request row indices with shape ``[batch_size]``.
+            prompt_lookahead_tokens: Immediate prompt token following each
+                context chunk with shape ``[max_num_requests]``. Entries equal
+                to ``INVALID_PROMPT_LOOKAHEAD_TOKEN`` have no valid lookahead.
+
+        Returns:
+            The draft input IDs, recurrent hidden states, and draft position
+            IDs for the current batch.
+        """
         sequence_starts = torch.cumsum(
             sequence_lengths, dim=0, dtype=torch.long) - sequence_lengths
         recurrent_indices = sequence_starts + sequence_lengths - 1
@@ -1400,6 +1426,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             num_accepted_tokens[num_contexts:] - 1)
         draft_input_ids = accepted_tokens[batch_indices,
                                           num_accepted_tokens - 1]
+        context_lookahead = prompt_lookahead_tokens[:num_contexts]
+        draft_input_ids[:num_contexts] = torch.where(
+            context_lookahead != INVALID_PROMPT_LOOKAHEAD_TOKEN,
+            context_lookahead,
+            draft_input_ids[:num_contexts],
+        )
         recurrent_hidden_states = hidden_states[recurrent_indices]
         draft_position_ids = (
             _select_mtp_position_ids(position_ids, recurrent_indices) + 1)

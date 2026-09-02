@@ -23,13 +23,14 @@ read (V1/V2 layout-independent), and the non-MLA no-op gate.
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor import _util
+from tensorrt_llm._torch.attention_backend import trtllm as trtllm_backend
+from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
 from tensorrt_llm._torch.pyexecutor._util import (
-    get_mla_context_workspace_bytes_per_token,
+    get_attention_workspace_bytes_per_token,
     get_mla_context_workspace_kv_len_cap,
     get_mla_context_workspace_reserve,
 )
@@ -171,9 +172,25 @@ def test_kv_len_cap_none_when_reuse_cannot_grow_workspace(
 
 
 def test_workspace_bytes_zero_for_non_mla_model():
-    # No kv_lora_rank on the config -> not MLA -> 0 (early return, no binding call needed).
-    model_config = SimpleNamespace(pretrained_config=SimpleNamespace(), quant_config=None)
-    assert get_mla_context_workspace_bytes_per_token(model_config, Mock()) == 0
+    # No kv_lora_rank on the config -> the TRTLLM backend declares no reservation -> 0 (early return, no
+    # binding call needed). Exercises the full resolve-backend path, not just the TRTLLM classmethod.
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(), quant_config=None, attn_backend="TRTLLM"
+    )
+    assert get_attention_workspace_bytes_per_token(model_config, Mock()) == 0
+
+
+def test_workspace_bytes_zero_for_backend_without_declaration():
+    # A backend that stages no runtime-scaled workspace inherits the default 0 from AttentionBackend, so
+    # the estimator reserves nothing and the scheduler applies no admission cap for it -- even for an MLA
+    # model that the TRTLLM backend would charge for. VANILLA is used because it always resolves (FLASHINFER
+    # silently falls back to TRTLLM when flashinfer is not installed).
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        quant_config=None,
+        attn_backend="VANILLA",
+    )
+    assert get_attention_workspace_bytes_per_token(model_config, Mock()) == 0
 
 
 def _fp8_mla_model_config(sparse_algorithm):
@@ -191,6 +208,7 @@ def _fp8_mla_model_config(sparse_algorithm):
         ),
         quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp8_kv_cache=lambda: True)),
         sparse_attention_config=sparse_cfg,
+        attn_backend="TRTLLM",
     )
 
 
@@ -216,9 +234,9 @@ def test_workspace_bytes_zero_only_for_absorption_mode_sparse_mla(
 ):
     # Reporting w == 0 for a config that still stages the fp8 K/V buffers reserves nothing and installs no
     # admission cap -- exactly the mid-forward OOM this reservation exists to prevent.
-    monkeypatch.setattr(_util, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: sm)
     monkeypatch.setenv("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", short_seq_mha)
-    w = get_mla_context_workspace_bytes_per_token(
+    w = get_attention_workspace_bytes_per_token(
         _fp8_mla_model_config(sparse_algorithm),
         SimpleNamespace(enable_attention_dp=False, tp_size=8),
     )
@@ -264,14 +282,16 @@ def test_workspace_reserve_zero_for_bad_inputs(budget, k, w, kv_len_cap):
 # ---- carried admission-cap read (executor side, V1/V2) ----
 
 
-def _executor_with_manager(manager, is_warmup=False):
-    # Bypass __init__; the cap getter only reads is_warmup and the cap carried on kv_cache_manager. The
-    # estimator is the single decision point -- the scheduler never re-derives w or the pool layout.
+def _executor_with_manager(manager, is_warmup=False, max_seq_len=4096):
+    # Bypass __init__; the cap getter reads is_warmup, the cap carried on kv_cache_manager, and max_seq_len
+    # (only to decide whether the resolved cap is too tight to batch on -- see the degenerate-cap warning).
+    # The estimator is the single decision point -- the scheduler never re-derives w or the pool layout.
     # Set the _is_warmup backing field directly -- the is_warmup property setter also propagates into
     # model_engine, which this bare (no-__init__) executor doesn't have.
     exe = object.__new__(PyExecutor)
     exe._is_warmup = is_warmup
     exe.kv_cache_manager = manager
+    exe.max_seq_len = max_seq_len
     return exe
 
 
@@ -307,6 +327,53 @@ def test_ctx_cap_none_when_no_reservation(manager):
     # A carried None (or absent) cap means no headroom to enforce -> admission disabled, no crash.
     exe = _executor_with_manager(manager)
     assert exe._get_ctx_mla_kv_len_cap() is None
+
+
+def test_ctx_cap_zero_is_a_cap_not_no_cap():
+    # A budget so tight the reserve covers under one token carries 0. Collapsing that into None would
+    # disable admission control for exactly the case it is most needed -- it must stay a real cap.
+    exe = _executor_with_manager(SimpleNamespace(fp8_ctx_mla_kv_len_cap=0))
+    assert exe._get_ctx_mla_kv_len_cap() == 0
+    # Enforced as a cap: everything past the first request (the forward-progress guard) is deferred.
+    reqs = [_ctx_req(0, True, 0, 50, 50) for _ in range(3)]
+    assert len(exe._cap_context_by_total_kv_len(reqs)) == 1
+
+
+@pytest.mark.parametrize(
+    "cap,max_seq_len,should_warn",
+    [
+        # Reserve covers under one token: one context request per step, forever.
+        (0, 4096, True),
+        # Below max_seq_len: a single max-length request already exceeds the cap, so requests near that
+        # length serialize. Only the memory budget can produce this -- the user override is floored at
+        # max_seq_len -- so the warning must fire here too, not just at 0.
+        (4095, 4096, True),
+        # Exactly max_seq_len: one max-length request still fits; batching degrades gracefully.
+        (4096, 4096, False),
+        (262144, 4096, False),
+        # No reservation at all -- admission disabled, nothing to warn about.
+        (None, 4096, False),
+        # max_seq_len unknown: only the unambiguous 0 case warns, and comparing against None must not raise.
+        (4095, None, False),
+        (0, None, True),
+    ],
+)
+def test_ctx_cap_degenerate_warns_once(cap, max_seq_len, should_warn):
+    # A cap this tight collapses context batching, and the per-iteration deferral log is debug-level, so
+    # the resolution point must say so once at warning level or the throughput loss is invisible.
+    exe = _executor_with_manager(
+        SimpleNamespace(fp8_ctx_mla_kv_len_cap=cap), max_seq_len=max_seq_len
+    )
+    with patch.object(py_executor_module, "logger") as mock_logger:
+        assert exe._get_ctx_mla_kv_len_cap() == cap
+        # Resolution is cached, so re-reading must not re-warn.
+        exe._get_ctx_mla_kv_len_cap()
+    assert mock_logger.warning.call_count == (1 if should_warn else 0)
+    if should_warn:
+        # Name the budget as the lever; the override is floored at max_seq_len and cannot fix this.
+        message = mock_logger.warning.call_args[0][0]
+        assert "free_gpu_memory_fraction" in message
+        assert str(cap) in message
 
 
 def test_ctx_cap_no_cap_during_warmup():

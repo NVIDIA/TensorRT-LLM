@@ -38,13 +38,24 @@ global_kvcache_config_prompt_logprobs = KvCacheConfig(
 )
 
 
+@pytest.fixture(autouse=True)
+def _dynamo_recompile_headroom():
+    """Recompile headroom for the fullgraph=True beam-search step.
+
+    The beam-search cases here build a fresh engine per parametrization in one
+    process, and Dynamo counts recompiles per code object across the process,
+    so the default limit (8) is exhausted partway through and the rest hard-fail
+    under fullgraph. The limit guards against runaway recompilation and is not a
+    correctness property; a served model has a fixed set of shapes.
+    """
+    import torch._dynamo
+
+    with torch._dynamo.config.patch(recompile_limit=128):
+        yield
+
+
 @pytest.fixture(scope="module", params=[False, True])
 def disable_overlap_scheduler_fixture(request) -> bool:
-    return request.param
-
-
-@pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
-def sampler_type_fixture(request) -> str:
     return request.param
 
 
@@ -76,11 +87,9 @@ class CacheSalter:
 
 @pytest.fixture(scope="module")
 def llm(
-    sampler_type_fixture: str,
     disable_overlap_scheduler_fixture: bool,
     enable_early_first_token_response_fixture: bool,
 ):
-    sampler_type = sampler_type_fixture
     disable_overlap_scheduler = disable_overlap_scheduler_fixture
     enable_early_first_token_response = enable_early_first_token_response_fixture
 
@@ -93,7 +102,6 @@ def llm(
         model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
-        sampler_type=sampler_type,
         disable_overlap_scheduler=disable_overlap_scheduler,
         enable_early_first_token_response=enable_early_first_token_response,
     )
@@ -1362,7 +1370,7 @@ class TestLogsprobsInBatchedSampling:
                             #   There are two factors. First, "rank" is not clearly specified for beam search
                             #   (could be logprob rank within beam or across all beams) and therefore
                             #   'rank=1' is returned for all finished beams
-                            #   via _finalize_beam and convert_logprobs_tensor_to_list. Second,
+                            #   via finalize_beam and convert_logprobs_tensor_to_list. Second,
                             #   during decoding (unfinished beam, in general this is the case in this test),
                             #   request logprobs are set via handle_logprobs and store_logprobs_list_to_request,
                             #   which inspects uninitialized elements of log_probs_store.sampled_log_prob_ranks.

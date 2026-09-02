@@ -105,7 +105,6 @@ myst_enable_extensions = [
     "substitution",
     "dollarmath",
     "amsmath",
-    "html_inline",
 ]
 
 myst_substitutions = {
@@ -186,11 +185,25 @@ def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
 def setup(app):
     from helper import generate_examples, generate_llmapi, update_version
 
+    # `import tensorrt_llm` pulls in the compiled bindings, which link against
+    # libcuda.so.1. On a driverless (CPU) doc-build node that resolves only if
+    # the CUDA driver stub is on LD_LIBRARY_PATH (see
+    # scripts/cuda_driver_stub.py, exported before `make html`). A failed import
+    # yields incomplete API docs, so in CI (TRTLLM_DOCS_REQUIRE_IMPORT=1) treat
+    # it as a hard failure instead of a silent warning; a local doc-only build
+    # without the wheel still degrades gracefully.
+    require_import = os.environ.get("TRTLLM_DOCS_REQUIRE_IMPORT") == "1"
     try:
         from tensorrt_llm.llmapi.utils import tag_llm_params
         tag_llm_params()
-    except ImportError:
-        print("Warning: tensorrt_llm not available, skipping tag_llm_params")
+        print("tensorrt_llm imported successfully; applied tag_llm_params")
+    except ImportError as e:
+        msg = f"tensorrt_llm not importable, API docs would be incomplete: {e}"
+        if require_import:
+            raise RuntimeError(
+                "tensorrt_llm not importable, API docs would be incomplete"
+            ) from e
+        print(f"Warning: {msg}; skipping tag_llm_params")
 
     app.add_role('tag', tag_role)
 

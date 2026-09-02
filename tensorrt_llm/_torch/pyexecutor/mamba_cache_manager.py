@@ -27,6 +27,7 @@ import triton.language as tl
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+    from tensorrt_llm.sampling_params import SamplingParams
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy, KVCacheManagerV2, Role)
@@ -124,6 +125,19 @@ class MambaRole:
 
     SSM_STATE = DataRole("ssm_state")
     CONV_STATE = DataRole("conv_state")
+
+
+def _mamba_effective_tp_size(mapping: Mapping) -> int:
+    """TP degree for sizing per-rank mamba/KDA state pools.
+
+    Attention-DP replicates the state and takes precedence; helix
+    repurposes CP ranks as plain TP for recurrent-state layers.
+    """
+    if mapping.enable_attention_dp:
+        return 1
+    if mapping.has_cp_helix():
+        return mapping.tp_size * mapping.cp_size
+    return mapping.tp_size
 
 
 def get_tensor_size_bytes(tensor):
@@ -339,6 +353,13 @@ class PythonMambaCacheManager(BaseResourceManager):
                     kwargs[k] = v[layer]
             return type(self)(**kwargs)
 
+        @property
+        def has_kda_replay_caches(self) -> bool:
+            """Whether the Kimi K3 KDA fused-verify replay caches are
+            allocated. The base (non-speculative) state never has them; the
+            speculative state overrides this."""
+            return False
+
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
         """Speculative state with intermediate states for draft tokens.
@@ -396,6 +417,26 @@ class PythonMambaCacheManager(BaseResourceManager):
         old_dt: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
         old_dA_cumsum: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
 
+        @property
+        def has_kda_replay_caches(self) -> bool:
+            """True when the KDA fused-verify replay caches were allocated
+            (the fused ``trtllm::kda_mtp_decode`` verify path)."""
+            return self.kda_qkg_cache is not None
+
+        def commit_conv_window(self, slot_indices: torch.Tensor,
+                               conv_pool: torch.Tensor) -> None:
+            """Seed the KDA replay caches from the live ``W - 1`` conv pool."""
+            from ..modules.kimi_kda._kda_kernels import \
+                copy_kda_replay_conv_window
+
+            copy_kda_replay_conv_window(
+                conv_pool,
+                self.kda_conv_q,
+                self.kda_conv_k,
+                self.kda_conv_v,
+                slot_indices,
+            )
+
     def __init__(
         self,
         d_state: int,
@@ -449,7 +490,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._seed_request_counter = 0
 
         # get tp size
-        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        tp_size = _mamba_effective_tp_size(mapping)
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
@@ -553,10 +594,9 @@ class PythonMambaCacheManager(BaseResourceManager):
                     "KDA replay caches expect the [q | k | v] conv-state "
                     "sectioning (3 equal sections)")
                 section_dim = conv_dim // 3
-                # d_conv is short_conv_kernel_size + 1 for kimi_linear (the
-                # pool trick that stores the full FLA window); the kernel's
-                # conv width is the FLA window size.
-                w_kernel = d_conv - 1
+                # d_conv is KDA's convolution width; the live pool stores
+                # its W - 1 committed input columns.
+                w_kernel = d_conv
                 extended_s = w_kernel - 1 + M
 
                 def _dim_contiguous_conv_cache():
@@ -789,9 +829,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         the recurrent state from the first verify step onward. Call this
         after the state transfer completes, before the first generation
         forward. Mirrors ``_sync_kda_replay_conv_window``: the conv pool row
-        stores the full FLA window (width W); its last ``W - 1`` columns are
-        the committed window of the replay caches. Pending-draft scratch is
-        cleared (no drafts are pending for a freshly transferred request).
+        stores the committed ``W - 1`` raw inputs directly. Pending-draft
+        scratch is cleared (no drafts are pending for a freshly transferred
+        request).
         """
         if not (self._use_kda_replay_update
                 and isinstance(self.mamba_cache, self.SpeculativeState)):
@@ -802,12 +842,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         ]
         if not blocks:
             return
-        conv = self.mamba_cache.conv  # [L, slots, 3D, W]
+        conv = self.mamba_cache.conv  # [L, slots, 3D, W - 1]
         idx = torch.tensor(sorted(set(blocks)),
                            dtype=torch.long,
                            device=conv.device)
         d = conv.shape[2] // 3
-        committed = conv.shape[3] - 1  # W - 1
+        committed = conv.shape[3]
         cs = conv.index_select(1, idx)
         for cache, section in (
             (self.mamba_cache.kda_conv_q, cs[:, :, :d]),
@@ -820,7 +860,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 (cache.shape[0], idx.numel()) + cache.shape[2:],
                 dtype=cache.dtype,
                 device=cache.device)
-            seeded[:, :, :, :committed] = section[:, :, :, 1:].to(cache.dtype)
+            seeded[:, :, :, :committed] = section.to(cache.dtype)
             cache.index_copy_(1, idx, seeded)
         for buf in (self.mamba_cache.kda_qkg_cache,
                     self.mamba_cache.kda_v_cache,
@@ -1578,6 +1618,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         max_seq_len: int,
         max_batch_size: int,
         mapping: Mapping,
+        max_num_tokens: int = 8192,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_estimating_kv_cache: bool = False,
@@ -1642,6 +1683,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
@@ -2189,6 +2231,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 layer_mask=full_attention_layer_mask,
                 is_estimating_kv_cache=is_estimating_kv_cache,
                 is_draft=is_draft,
+                **kwargs,
             )
             # PP ranks replay the same scheduling decisions, so a rank without
             # local Mamba layers must still publish the configured boundaries.
@@ -2200,7 +2243,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        tp_size = _mamba_effective_tp_size(mapping)
         d_inner = mamba_head_dim * mamba_num_heads
         conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
         nheads = mamba_num_heads
@@ -2485,12 +2528,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        # For capturable drafting loops. During normal inference, the draft model always
-        # has enough KV cache space to fit all of our draft tokens. During warmup, however,
-        # we need to make the KV cache manager aware that multiple autoregressive steps will
-        # occur.
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
+        capture_sampling_params: Optional["SamplingParams"] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -2502,8 +2541,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
-            num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params,
         )
         if requests:
             self.requests.extend(requests)
@@ -2749,9 +2788,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
         is_dummy = [req.is_dummy for req in requests]
-        self._refresh_dummy_request_mask(
-            is_dummy if requests is
-            self.requests else [req.is_dummy for req in self.requests])
+        self._refresh_dummy_request_mask(is_dummy)
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
@@ -2870,6 +2907,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if conv_state_layout not in ("x_b_c", "q_k_v"):
             raise ValueError(
                 f"Unsupported convolution state layout: {conv_state_layout!r}")
+        if "model_type" in kwargs:
+            # The V1 managers select the conv-state layout by model_type; this
+            # class takes it explicitly. Silently absorbing model_type here
+            # means a caller's layout request would be dropped on the floor.
+            raise TypeError(
+                "MambaHybridCacheManagerV2 does not accept 'model_type' "
+                f"(got {kwargs['model_type']!r}); pass "
+                "conv_state_layout='x_b_c' or 'q_k_v' instead")
         total_layers = len(mamba_layer_mask)
         if layer_mask is None:
             full_attention_layer_mask = [False] * total_layers
@@ -2927,7 +2972,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and self.local_num_mamba_layers > 0)
 
         if self.local_num_mamba_layers > 0:
-            tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+            tp_size = _mamba_effective_tp_size(mapping)
             d_inner = mamba_head_dim * mamba_num_heads
             grouped_state_dim = mamba_n_groups * mamba_d_state
             conv_dim = d_inner + 2 * grouped_state_dim
@@ -3542,8 +3587,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
+        capture_sampling_params: Optional["SamplingParams"] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -3555,8 +3600,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
-            num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params,
         )
         if requests and prepare_resource:
             self._setup_state_indices(requests)

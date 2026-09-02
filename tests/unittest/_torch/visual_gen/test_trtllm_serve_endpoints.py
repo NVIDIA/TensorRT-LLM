@@ -5,7 +5,7 @@ in OpenAIServer.register_visual_gen_routes():
 
     POST /v1/images/generations
     POST /v1/images/edits
-    POST /v1/videos/generations   (sync)
+    POST /v1/videos/sync          (sync)
     POST /v1/videos               (async)
     GET  /v1/videos               (list)
     GET  /v1/videos/{video_id}    (metadata)
@@ -15,13 +15,18 @@ in OpenAIServer.register_visual_gen_routes():
 
 import asyncio
 import base64
+import json
 import os
+import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
 
+import httpx
 import pytest
+import pytest_asyncio
 import torch
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -31,6 +36,9 @@ from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -112,6 +120,47 @@ def _assert_visual_gen_server_timing(headers) -> None:
     assert "denoise;dur=750.000000" in server_timing
 
 
+def _server_timing_ms(headers, name: str) -> float:
+    """Parse the ``dur`` (ms) of one metric out of the Server-Timing header."""
+    server_timing = headers[SERVER_TIMING_HEADER]
+    for part in server_timing.split(","):
+        part = part.strip()
+        if part.startswith(f"{name};dur="):
+            return float(part[len(f"{name};dur=") :])
+    raise AssertionError(f"{name!r} not in Server-Timing: {server_timing!r}")
+
+
+def _drive_job_to_completion(client, video_id, timeout: float = 5.0):
+    """Poll ``GET /v1/videos/{id}`` until the job reaches a terminal state.
+
+    Returns the terminal status (``"completed"``/``"failed"``) or ``None`` on
+    timeout. Shared by the async-video tests so the polling deadline lives in
+    one place.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = client.get(f"/v1/videos/{video_id}").json().get("status")
+        if status in ("completed", "failed"):
+            return status
+        time.sleep(0.05)
+    return None
+
+
+async def _adrive_job_to_completion(client, video_id, timeout: float = 10.0):
+    """Async counterpart of :func:`_drive_job_to_completion` for the httpx
+    ``AsyncClient`` — awaits polls on the live loop so the background task's
+    offloaded encode can progress to a terminal state.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = await client.get(f"/v1/videos/{video_id}")
+        status = resp.json().get("status")
+        if status in ("completed", "failed"):
+            return status
+        await asyncio.sleep(0.05)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Mock VisualGen
 # ---------------------------------------------------------------------------
@@ -135,8 +184,13 @@ class MockVisualGen:
         batch_aware: bool = True,
         validation_error: Optional[ValueError] = None,
         generate_error: Optional[BaseException] = None,
+        extra_param_specs: Optional[dict] = None,
+        model: str = "test-model",
+        supports_image_edit: bool = False,
     ):
         from types import SimpleNamespace
+
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 
         self._image = image_output
         self._video = video_output
@@ -147,6 +201,8 @@ class MockVisualGen:
         # Raised out of generate(): models an engine-side failure class,
         # where validation_error models a coordinator preflight rejection.
         self._generate_error = generate_error
+        self._extra_param_specs = extra_param_specs or {}
+        self._model = model
         self._healthy = True
         self._req_counter = 0
         # Captured arguments of the most recent generate / generate_async call,
@@ -161,8 +217,6 @@ class MockVisualGen:
         # reject legitimate width/height/num_frames/... requests;
         # ``extra_param_specs`` lists a single known key so tests can
         # exercise both the accept-known and reject-unknown paths.
-        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
-
         self.executor = SimpleNamespace(
             default_generation_params={
                 "height": 64,
@@ -173,9 +227,9 @@ class MockVisualGen:
                 "num_frames": 8,
                 "frame_rate": 8.0,
             },
-            extra_param_specs={
-                "stg_scale": ExtraParamSchema(type="float", default=1.0),
-            },
+            extra_param_specs=extra_param_specs
+            or {"stg_scale": ExtraParamSchema(type="float", default=1.0)},
+            supports_image_edit=supports_image_edit,
         )
 
     def _maybe_batch(self, tensor, n):
@@ -229,7 +283,7 @@ class MockVisualGen:
         seeds request params from this, so it must return a fresh instance."""
         from tensorrt_llm.visual_gen import VisualGenParams
 
-        return VisualGenParams()
+        return VisualGenParams(**self.executor.default_generation_params)
 
     @property
     def extra_param_specs(self):
@@ -237,12 +291,12 @@ class MockVisualGen:
         every request ``extra_params`` key reaches the executor as
         ``unknown_extra_param`` (matches a pipeline with no model-specific
         knobs declared, like Flux or Wan 2.1)."""
-        return {}
+        return self._extra_param_specs
 
     @property
     def model(self):
         """Stand-in for VisualGen.model — used by warn-on-set logic."""
-        return "test-model"
+        return self._model
 
     def _check_health(self) -> bool:
         return self._healthy
@@ -307,16 +361,46 @@ class MockVisualGenResult:
 # ---------------------------------------------------------------------------
 
 
-def _create_server(generator: MockVisualGen, model_name: str = "test-model") -> TestClient:
+class _ThreadSettlingTestClient(TestClient):
+    """TestClient that outwaits starlette's FileResponse reader thread.
+
+    pytest-threadleak samples running threads at the end of a test's call
+    phase. ``FileResponse`` reads the download on an anyio pool thread
+    ("AnyIO worker thread") that is told to stop when the request's portal
+    closes but exits a few milliseconds later -- inside the sampling window,
+    so any file-shipping test in this module can fail as a phantom leak
+    (pipeline #52355 did). Joining here, still in the call phase, waits out
+    those milliseconds deterministically; stop is already queued, so the
+    deadline is a guard, not an expected wait.
+    """
+
+    def request(self, *args, **kwargs):
+        response = super().request(*args, **kwargs)
+        deadline = time.monotonic() + 10.0
+        for thread in threading.enumerate():
+            if thread.name == "AnyIO worker thread":
+                thread.join(max(0.0, deadline - time.monotonic()))
+        return response
+
+
+def _create_server(
+    generator: MockVisualGen,
+    model_name: str = "test-model",
+) -> TestClient:
     """Instantiate an OpenAIServer for VISUAL_GEN with a mocked generator.
 
-    We patch the ``VisualGen`` name inside the ``openai_server`` module so that
-    ``isinstance(generator, VisualGen)`` returns True for our mock.
+    The server detects VisualGen generators via ``_is_visual_gen_instance``
+    (a sys.modules probe, so plain LLM serving never imports visual_gen) and
+    caches the result in ``__init__``; patching the probe during construction
+    makes it recognize our mock.
     """
     from tensorrt_llm.llmapi.disagg_utils import ServerRole
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
-    with patch("tensorrt_llm.serve.openai_server.VisualGen", MockVisualGen):
+    with patch(
+        "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+        return_value=True,
+    ):
         server = OpenAIServer(
             generator=generator,
             model=model_name,
@@ -324,10 +408,38 @@ def _create_server(generator: MockVisualGen, model_name: str = "test-model") -> 
             server_role=ServerRole.VISUAL_GEN,
             metadata_server_cfg=None,
         )
-    client = TestClient(server.app)
+    client = _ThreadSettlingTestClient(server.app)
     # Expose the mock so tests can assert captured generate() arguments.
     client.mock_gen = generator
     return client
+
+
+def _create_async_client(generator: MockVisualGen, model_name: str = "test-model"):
+    """Build the VISUAL_GEN server and return an ``httpx.AsyncClient`` over its
+    ASGI app.
+
+    The sync ``TestClient`` drives each request through a portal and does not run
+    the event loop between requests, so a detached ``/v1/videos`` background task
+    (and its offloaded encode) never progresses. Exercising the app on the
+    caller's live loop lets the background task run to completion.
+    """
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    with patch(
+        "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+        return_value=True,
+    ):
+        server = OpenAIServer(
+            generator=generator,
+            model=model_name,
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+        )
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server.app), base_url="http://testserver"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +465,43 @@ def video_client(tmp_path):
     client = _create_server(gen)
     yield client
     os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+@pytest_asyncio.fixture()
+async def async_video_client(tmp_path):
+    """Async httpx client over the video server — drives the async
+    ``/v1/videos`` background task (incl. its offloaded encode) on a live loop.
+    """
+    gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+    os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+    client = _create_async_client(gen)
+    try:
+        yield client
+    finally:
+        await client.aclose()
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+@pytest.fixture()
+def action_video_client(tmp_path):
+    """Video client whose pipeline declares a tensor-only extra param.
+
+    Stands in for Cosmos3 action: the route must learn "this result needs a
+    tensor payload" from the spec, never from the parameter's name.
+    """
+    from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+
+    gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+    specs = {
+        "action_mode": ExtraParamSchema(type="str", default=None, requires_tensor_output=True),
+    }
+    gen.executor.extra_param_specs = specs
+    type(gen).extra_param_specs = property(lambda self: specs)
+    os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+    client = _create_server(gen)
+    yield client
+    os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+    del type(gen).extra_param_specs
 
 
 @pytest.fixture()
@@ -406,6 +555,49 @@ def _mock_video_encoding():
         patch("tensorrt_llm.media.encoding._check_ffmpeg_available", return_value=True),
     ):
         yield
+
+
+@pytest.mark.parametrize(
+    "endpoint,payload",
+    [
+        ("/v1/images/generations", {"prompt": "cat", "response_format": "path"}),
+        (
+            "/v1/videos/sync",
+            {
+                "prompt": "cat",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "response_format": "path",
+            },
+        ),
+        (
+            "/v1/videos",
+            {
+                "prompt": "cat",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "response_format": "path",
+            },
+        ),
+    ],
+)
+def test_response_format_path_rejected_when_disabled(tmp_path, monkeypatch, endpoint, payload):
+    """With ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``, ``response_format='path'``
+    is rejected with 400 on the image and video (sync + async) endpoints."""
+    monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+    gen = MockVisualGen(
+        image_output=_make_dummy_image_tensor(),
+        video_output=_make_dummy_video_tensor(),
+    )
+    client = _create_server(gen)
+    resp = client.post(endpoint, json=payload, headers={"content-type": "application/json"})
+    assert resp.status_code == 400
+    body = resp.json()
+    _assert_llm_envelope(body, code=400)
+    assert "path" in body["message"] and "disabled" in body["message"]
 
 
 # =========================================================================
@@ -529,6 +721,47 @@ class TestImageGeneration:
         assert content.status_code == 200
         assert content.headers["content-type"] == "application/octet-stream"
         loaded = torch.load(BytesIO(content.content), weights_only=True)
+        assert "image" in loaded
+
+    def test_image_generation_path_returns_output_path(self, image_client):
+        """``response_format='path'`` writes each image to media storage and
+        surfaces its on-disk path per ``data[]`` item; ``n>1`` fans out to one
+        object per image (distinct path); ``url``/``b64_json`` stay unset."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "A dog",
+                "response_format": "path",
+                "n": 2,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert len(data) == 2
+        assert len({obj["path"] for obj in data}) == 2  # one distinct path per image
+        for obj in data:
+            assert obj["url"] is None and obj["b64_json"] is None
+            assert obj["path"] is not None and os.path.exists(obj["path"])
+        with open(data[0]["path"], "rb") as fh:
+            assert fh.read().startswith(b"\x89PNG\r\n\x1a\n")
+
+    def test_image_generation_pt_path(self, image_client):
+        """Tensor formats under ``response_format='path'`` persist each
+        per-item payload and return its on-disk path."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Tensor dog",
+                "response_format": "path",
+                "format": "pt",
+            },
+        )
+        assert resp.status_code == 200
+        obj = resp.json()["data"][0]
+        assert obj["path"] is not None and obj["url"] is None and obj["b64_json"] is None
+        assert os.path.exists(obj["path"])
+        with open(obj["path"], "rb") as fh:
+            loaded = torch.load(BytesIO(fh.read()), weights_only=True)
         assert "image" in loaded
 
     def test_image_generation_auto_size(self, image_client):
@@ -692,38 +925,397 @@ class TestImageGeneration:
 
 
 class TestImageEdit:
-    """``/v1/images/edits`` returns 501 NotImplemented in the current release.
+    """``/v1/images/edits`` support is gated by the loaded visual model."""
 
-    No in-tree pipeline implements image editing: Flux/Flux2 are
-    text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
-    video, not edited images. Restore the full happy-path coverage when an
-    edit-capable pipeline lands.
-    """
+    def _client(
+        self,
+        tmp_path,
+        monkeypatch,
+        *,
+        image_output: Optional[torch.Tensor] = None,
+        extra_param_specs: Optional[dict] = None,
+        model: str = "Qwen/Qwen-Image-Layered",
+        should_fail: bool = False,
+        supports_image_edit: bool = True,
+    ):
+        gen = MockVisualGen(
+            image_output=image_output if image_output is not None else _make_dummy_image_tensor(),
+            extra_param_specs=extra_param_specs,
+            model=model,
+            should_fail=should_fail,
+            supports_image_edit=supports_image_edit,
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        return _create_server(gen, model_name=model), gen
 
-    def test_image_edit_returns_not_implemented(self, image_client):
-        """Valid request body short-circuits to 501 NotImplemented."""
-        b64_img = _b64_white_png_1x1()
-        resp = image_client.post(
+    @pytest.mark.parametrize(
+        ("model", "supports_image_edit", "expected_status"),
+        [
+            ("not-a-canonical-edit-model-id", True, 200),
+            ("Qwen/Qwen-Image-Layered", False, 501),
+        ],
+    )
+    def test_image_edit_support_uses_loaded_pipeline_capability(
+        self, tmp_path, monkeypatch, model, supports_image_edit, expected_status
+    ):
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
+            model=model,
+            supports_image_edit=supports_image_edit,
+        )
+
+        resp = client.post(
             "/v1/images/edits",
             json={
-                "image": b64_img,
-                "prompt": "Make it blue",
-                "num_inference_steps": 10,
+                "prompt": "Make it red",
+                "image": _b64_white_png_1x1(),
+                "response_format": "b64_json",
             },
         )
-        assert resp.status_code == 501
-        body = resp.json()
-        assert body.get("type") == "NotImplementedError"
-        assert "not supported" in body.get("message", "").lower()
 
-    def test_image_edit_no_body_returns_not_implemented(self, image_client):
-        """The route doesn't parse a typed body; any incoming request still
-        gets 501, including ones that would have failed schema validation
-        before. Restore typed-body coverage when an edit pipeline lands."""
-        resp = image_client.post("/v1/images/edits", json={"prompt": "Edit without image"})
-        assert resp.status_code == 501
+        assert resp.status_code == expected_status
+        if expected_status == 501:
+            assert gen.last_params is None
+
+    def test_image_edit_accepts_json_base64_image(self, tmp_path, monkeypatch):
+        """JSON edit requests materialize inputs and map OpenAI-shaped fields."""
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
+            image_output=_make_dummy_image_tensor(4, 4),
+        )
+
+        resp = client.post(
+            "/v1/images/edits",
+            content=json.dumps(
+                {
+                    "prompt": "split layers",
+                    "image": _b64_white_png_1x1(),
+                    "n": 2,
+                    "output_format": "webp",
+                    "response_format": "b64_json",
+                }
+            ),
+            headers={"content-type": "Application/JSON"},
+        )
+
+        assert resp.status_code == 200
+        assert str(gen.last_params.image).startswith(str(tmp_path))
+        assert not os.path.exists(gen.last_params.image)
+        assert gen.last_params.num_images_per_prompt == 2
         body = resp.json()
-        assert body.get("type") == "NotImplementedError"
+        assert body["output_format"] == "webp"
+        assert body["size"] == "4x4"
+        assert len(body["data"]) == 2
+
+    @pytest.mark.parametrize(
+        ("size", "expected_dimensions"),
+        [
+            ("auto", (None, None)),
+            ("32x48", (32, 48)),
+        ],
+    )
+    def test_image_edit_auto_size_allows_reference_size_derivation(
+        self, tmp_path, monkeypatch, size, expected_dimensions
+    ):
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "use reference dimensions",
+                "image": _b64_white_png_1x1(),
+                "size": size,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert (gen.last_params.width, gen.last_params.height) == expected_dimensions
+
+    @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+    def test_image_edit_default_url_returns_fetchable_output(self, tmp_path, monkeypatch):
+        """The default edit response writes a fetchable image content URL."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+            },
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        url = body["data"][0]["url"]
+        assert "/v1/images/" in url and "/content" in url
+        assert str(gen.last_params.image).startswith(str(tmp_path))
+        assert not os.path.exists(gen.last_params.image)
+
+        path = url.split("//", 1)[-1].split("/", 1)[1]
+        content = client.get("/" + path)
+        assert content.status_code == 200
+        assert content.content.startswith(b"\x89PNG\r\n\x1a\n")
+        assert content.headers["content-type"] == "image/png"
+
+    def test_image_edit_rejects_json_array_body(self, tmp_path, monkeypatch):
+        """Non-object JSON bodies are client errors, not server errors."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            content=json.dumps(
+                [
+                    {
+                        "prompt": "split layers",
+                        "image": _b64_white_png_1x1(),
+                    }
+                ]
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+        assert resp.status_code == 400
+        assert "must be an object" in resp.json()["message"]
+        assert gen.last_params is None
+
+    def test_image_edit_rejects_file_extra_params(self, tmp_path, monkeypatch):
+        """Multipart extra_params must be a JSON string field."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        image_bytes = BytesIO(base64.b64decode(_b64_white_png_1x1()))
+        resp = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "split layers",
+                "response_format": "b64_json",
+            },
+            files={
+                "image": ("input.png", image_bytes, "image/png"),
+                "extra_params": ("extra.json", b"{}", "application/json"),
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "extra_params" in resp.json()["message"]
+        assert gen.last_params is None
+
+    def test_image_edit_rejects_empty_image_list(self, tmp_path, monkeypatch):
+        """Empty image lists fail request validation before pipeline dispatch."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": [],
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="image")
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_non_image_base64_input(self, tmp_path, monkeypatch):
+        """Decoded image-edit bytes must be a supported image before disk write."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": base64.b64encode(b"not an image").decode("utf-8"),
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        _assert_llm_envelope(
+            resp.json(),
+            code=400,
+            message_contains="image edit input is not a PNG/JPEG image",
+        )
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_non_image_upload_input(self, tmp_path, monkeypatch):
+        """Multipart image-edit bytes are sniffed before materialization."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "split layers",
+                "response_format": "b64_json",
+            },
+            files={"image": ("input.png", BytesIO(b"not an image"), "image/png")},
+        )
+
+        assert resp.status_code == 400
+        _assert_llm_envelope(
+            resp.json(),
+            code=400,
+            message_contains="image edit input is not a PNG/JPEG image",
+        )
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_mask_with_clear_error(self, tmp_path, monkeypatch):
+        """Mask is OpenAI-shaped but not implemented by TRTLLM image edit yet."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+                "mask": _b64_white_png_1x1(),
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "mask input is not supported" in resp.json()["message"]
+        assert gen.last_params is None
+
+    def test_image_edit_rejects_too_many_input_images(self, tmp_path, monkeypatch):
+        """Input image count is capped before files are materialized."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": [_b64_white_png_1x1()] * 17,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "at most 16 input images" in resp.json()["message"]
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_allows_max_input_images_without_output_fanout(self, tmp_path, monkeypatch):
+        """Multiple edit inputs are joint conditioning, not output fan-out."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": [_b64_white_png_1x1()] * 16,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert len(gen.last_params.image) == 16
+        assert len(resp.json()["data"]) == 1
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_excessive_output_fanout(self, tmp_path, monkeypatch):
+        """Layered output fan-out is capped before files are materialized."""
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
+            extra_param_specs={
+                "layers": ExtraParamSchema(type="int", default=4, range=(1, 16)),
+            },
+        )
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+                "n": 5,
+                "extra_params": {"layers": 16},
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "at most 64 output images" in resp.json()["message"]
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_oversized_base64_image_before_decode(self, tmp_path, monkeypatch):
+        """Base64 image size is capped before allocating decoded bytes."""
+        from tensorrt_llm.serve import visual_gen_utils
+
+        client, gen = self._client(tmp_path, monkeypatch)
+        monkeypatch.setattr(visual_gen_utils, "IMAGE_EDIT_MAX_IMAGE_BYTES", 8)
+        monkeypatch.setattr(
+            visual_gen_utils.base64,
+            "b64decode",
+            lambda *args, **kwargs: pytest.fail("oversized payload was decoded"),
+        )
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": "A" * 13,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "per-image byte limit" in resp.json()["message"]
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_cleans_inputs_when_generation_fails(self, tmp_path, monkeypatch):
+        """Temporary edit inputs are removed even when generation raises."""
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
+            should_fail=True,
+        )
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert gen.last_params is not None
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "image_value",
+        [
+            "/tmp/server-local-image.png",
+            "file:///tmp/server-local-image.png",
+            "https://example.com/server-local-image.png",
+        ],
+    )
+    def test_image_edit_rejects_json_path_or_url_image(self, tmp_path, monkeypatch, image_value):
+        """Serving image-edit input strings must be base64, not server paths or URLs."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": image_value,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert gen.last_params is None
 
 
 # =========================================================================
@@ -757,13 +1349,51 @@ class TestNormalizeImageOutput:
 
 
 # =========================================================================
-# POST /v1/videos/generations  (synchronous)
+# POST /v1/videos/sync  (synchronous)
 # =========================================================================
 
 
 @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
 class TestVideoGenerationSync:
     def test_basic_sync_video_generation(self, video_client):
+        resp = video_client.post(
+            "/v1/videos/sync",
+            json={
+                "prompt": "A rocket launching",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "video/mp4"
+        _assert_visual_gen_server_timing(resp.headers)
+
+    def test_sync_video_server_timing_has_total(self, video_client):
+        """The sync Server-Timing header carries generation, denoise, and the
+        new ``total`` (full server time; real wall-clock, so only checked > 0)."""
+        resp = video_client.post(
+            "/v1/videos/sync",
+            json={
+                "prompt": "timing",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "avi",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        assert _server_timing_ms(resp.headers, "generation") == 1250.0
+        assert _server_timing_ms(resp.headers, "denoise") == 750.0
+        assert _server_timing_ms(resp.headers, "total") > 0
+        assert len(resp.content) > 0
+
+    def test_deprecated_generations_alias_routes_to_sync(self, video_client):
+        """The pre-rename /v1/videos/generations route is kept as a deprecated
+        alias of /v1/videos/sync (upstream back-compat) — same handler, so it
+        returns the video bytes rather than 404/405."""
         resp = video_client.post(
             "/v1/videos/generations",
             json={
@@ -776,12 +1406,32 @@ class TestVideoGenerationSync:
         )
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "video/mp4"
-        _assert_visual_gen_server_timing(resp.headers)
         assert len(resp.content) > 0
+
+    @pytest.mark.parametrize("removed", ["url", "b64_json"])
+    def test_removed_response_format_names_replacement(self, video_client, removed):
+        """Legacy video response_format values (url/b64_json) are rejected with
+        a 422 whose message names the replacement, not the generic
+        "Input should be 'file' or 'path'"."""
+        resp = video_client.post(
+            "/v1/videos/sync",
+            json={
+                "prompt": "x",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "response_format": removed,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        _assert_llm_envelope(body, code=422, message_contains=removed)
+        assert "removed" in body["message"] and "file" in body["message"], body["message"]
 
     def test_sync_video_generation_with_params(self, video_client):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "Ocean waves",
                 "size": "64x64",
@@ -814,7 +1464,7 @@ class TestVideoGenerationSync:
         Image.new("RGB", (4, 4), (64, 64, 64)).save(str(ref_path))
         with open(ref_path, "rb") as f:
             resp = video_client.post(
-                "/v1/videos/generations",
+                "/v1/videos/sync",
                 data={
                     "prompt": "Mountain sunrise",
                     "size": "64x64",
@@ -833,7 +1483,7 @@ class TestVideoGenerationSync:
 
         with open(ref_path, "rb") as f:
             resp = video_client.post(
-                "/v1/videos/generations",
+                "/v1/videos/sync",
                 data={
                     "prompt": "Animate this image",
                     "size": "64x64",
@@ -863,7 +1513,7 @@ class TestVideoGenerationSync:
         payload = _V2V_FIXTURE_MP4.read_bytes()
         with open(_V2V_FIXTURE_MP4, "rb") as f:
             resp = video_client.post(
-                "/v1/videos/generations",
+                "/v1/videos/sync",
                 data={
                     "prompt": "Continue the same scene",
                     "size": "64x64",
@@ -886,7 +1536,7 @@ class TestVideoGenerationSync:
         """Content matching no image or video container signature is rejected
         at the boundary."""
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             data={"prompt": "x"},
             files={"input_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
         )
@@ -895,7 +1545,7 @@ class TestVideoGenerationSync:
 
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "Should fail",
                 "size": "64x64",
@@ -912,7 +1562,7 @@ class TestVideoGenerationSync:
         os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
         client = _create_server(gen)
         resp = client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={"prompt": "null video", "size": "64x64", "seconds": 1.0, "fps": 8},
             headers={"content-type": "application/json"},
         )
@@ -932,7 +1582,7 @@ class TestVideoGenerationSync:
         monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
         client = _create_server(gen)
         resp = client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={"prompt": "big", "size": "64x64", "seconds": 1.0, "fps": 8},
             headers={"content-type": "application/json"},
         )
@@ -949,7 +1599,7 @@ class TestVideoGenerationSync:
         monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
         client = _create_server(gen)
         resp = client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={"prompt": "bad ref", "size": "64x64", "seconds": 1.0, "fps": 8},
             headers={"content-type": "application/json"},
         )
@@ -958,7 +1608,7 @@ class TestVideoGenerationSync:
 
     def test_sync_video_unsupported_content_type(self, video_client):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             content=b"some raw bytes",
             headers={"content-type": "text/plain"},
         )
@@ -967,7 +1617,7 @@ class TestVideoGenerationSync:
     def test_sync_video_missing_prompt_json(self, video_client):
         """Missing required ``prompt`` surfaces the visual-gen 422 envelope."""
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={"size": "64x64"},
             headers={"content-type": "application/json"},
         )
@@ -979,7 +1629,7 @@ class TestVideoGenerationSync:
         same LLM envelope as JSON so the wire contract is identical."""
         dummy_file = BytesIO(b"")
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             data={"size": "64x64"},
             files={"_dummy": ("dummy", dummy_file, "application/octet-stream")},
         )
@@ -992,7 +1642,7 @@ class TestVideoGenerationSync:
         the JSON path."""
         dummy_file = BytesIO(b"")
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             data={
                 "prompt": "Strict multipart",
                 "size": "64x64",
@@ -1008,7 +1658,7 @@ class TestVideoGenerationSync:
     def test_sync_video_rejects_top_level_n(self, video_client):
         """Sync video has no top-level ``n``; it's rejected with 422."""
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "Batch rockets",
                 "size": "64x64",
@@ -1062,6 +1712,83 @@ class TestVideoGenerationAsync:
         assert data["duration"] == 2.0
         assert data["fps"] == 12
         assert data["size"] == "64x64"
+
+    @pytest.mark.threadleak(enabled=False)  # offloaded encode uses a worker thread
+    @pytest.mark.asyncio
+    async def test_async_video_status_transitions_generating_then_postprocessing(
+        self, async_video_client, monkeypatch
+    ):
+        """queued -> generating -> postprocessing -> completed, in order, so
+        clients can detect when generation finishes before postprocessing."""
+        seen = []
+        original_upsert = VIDEO_STORE.upsert
+
+        async def _spy_upsert(video_id, job):
+            seen.append(job.status)
+            return await original_upsert(video_id, job)
+
+        monkeypatch.setattr(VIDEO_STORE, "upsert", _spy_upsert)
+
+        resp = await async_video_client.post(
+            "/v1/videos",
+            json={"prompt": "lifecycle", "size": "32x32", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+
+        status = await _adrive_job_to_completion(async_video_client, video_id)
+        assert status == "completed"
+
+        assert "generating" in seen and "postprocessing" in seen
+        assert seen.index("generating") < seen.index("postprocessing") < seen.index("completed")
+
+    @pytest.mark.threadleak(enabled=False)  # offloaded encode uses a worker thread
+    @pytest.mark.asyncio
+    async def test_async_postprocessing_state_observable_during_encode(
+        self, async_video_client, monkeypatch
+    ):
+        """The encode is offloaded to a thread, so the event loop stays
+        responsive and a poll observes ``postprocessing`` while the file is
+        written — not just ``generating`` then ``completed``."""
+        import threading
+
+        release = threading.Event()
+        original_save = VisualGenOutput.save
+
+        def _blocking_save(self, *args, **kwargs):
+            # Runs in the executor thread; hold until the test sees the state.
+            release.wait(timeout=5)
+            return original_save(self, *args, **kwargs)
+
+        monkeypatch.setattr(VisualGenOutput, "save", _blocking_save)
+
+        resp = await async_video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "observe postprocessing",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "auto",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+
+        observed = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            poll = await async_video_client.get(f"/v1/videos/{video_id}")
+            observed = poll.json().get("status")
+            if observed in ("postprocessing", "completed", "failed"):
+                break
+            await asyncio.sleep(0.02)
+        release.set()  # never leave the encoder blocked
+        assert observed == "postprocessing", (
+            f"GET never observed 'postprocessing' (saw {observed!r})"
+        )
 
     def test_async_video_multipart(self, video_client, tmp_path):
         """Multipart async request with a real ``input_reference`` file."""
@@ -1207,6 +1934,9 @@ class TestListVideos:
         assert resp.status_code == 200
         data = resp.json()
         assert len(data["data"]) == 2
+        # Status-only listing: the internal path fields never appear on the wire.
+        for item in data["data"]:
+            assert "output_path" not in item and "output_paths" not in item
 
 
 # =========================================================================
@@ -1215,20 +1945,29 @@ class TestListVideos:
 
 
 class TestGetVideoMetadata:
-    def test_get_video_metadata_success(self, video_client):
-        create_resp = video_client.post(
+    @pytest.mark.threadleak(enabled=False)  # offloaded encode uses a worker thread
+    @pytest.mark.asyncio
+    async def test_get_video_metadata_success(self, async_video_client):
+        create_resp = await async_video_client.post(
             "/v1/videos",
             json={"prompt": "Space walk", "size": "64x64", "seconds": 1.0, "fps": 8},
             headers={"content-type": "application/json"},
         )
         video_id = create_resp.json()["id"]
 
-        resp = video_client.get(f"/v1/videos/{video_id}")
+        # Drive to completion so output_path/output_paths are populated on the
+        # job, then confirm the status endpoint returns status only (no leak).
+        await _adrive_job_to_completion(async_video_client, video_id)
+
+        resp = await async_video_client.get(f"/v1/videos/{video_id}")
         assert resp.status_code == 200
         data = resp.json()
         assert data["id"] == video_id
         assert data["object"] == "video"
         assert data["prompt"] == "Space walk"
+        assert data["status"] == "completed"
+        # Status-only: the internal server path(s) are not leaked here.
+        assert "output_path" not in data and "output_paths" not in data
 
     def test_get_video_metadata_not_found(self, video_client):
         resp = video_client.get("/v1/videos/video_nonexistent")
@@ -1243,10 +1982,8 @@ class TestGetVideoMetadata:
 @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
 class TestGetVideoContent:
     def _insert_video_job(self, video_id: str, status: str = "queued"):
-        import time as _time
-
         job = VideoJob(
-            created_at=int(_time.time()),
+            created_at=int(time.time()),
             id=video_id,
             model="test-model",
             prompt="test prompt",
@@ -1284,6 +2021,20 @@ class TestGetVideoContent:
 
         video_id = "video_notready"
         self._insert_video_job(video_id, status="queued")
+
+        resp = client.get(f"/v1/videos/{video_id}/content")
+        assert resp.status_code == 400
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    @pytest.mark.parametrize("status", ["generating", "postprocessing"])
+    def test_get_video_content_not_ready_in_flight(self, tmp_path, status):
+        """A generating/postprocessing job is not downloadable yet → 400."""
+        gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen)
+
+        video_id = f"video_{status}"
+        self._insert_video_job(video_id, status=status)
 
         resp = client.get(f"/v1/videos/{video_id}/content")
         assert resp.status_code == 400
@@ -1466,7 +2217,7 @@ class TestRouteEngineValidationError:
             )
             client = _create_server(gen)
             resp = client.post(
-                "/v1/videos/generations",
+                "/v1/videos/sync",
                 json={
                     "prompt": "trigger validation error",
                     "size": "64x64",
@@ -1644,14 +2395,14 @@ class TestNonVisualGenValidationResponse:
 @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
 class TestVideoTensorResponse:
     """The sync route emits tensor payloads as a single file under
-    ``response_format='url'`` and as base64-encoded bytes under
-    ``response_format='b64_json'``. The async route persists the
+    ``response_format='file'`` and as a server-side path JSON under
+    ``response_format='path'``. The async route persists the
     payload to media storage; ``GET /v1/videos/{id}/content`` serves
     the file with ``application/octet-stream``."""
 
     def _post_sync(self, video_client, fmt: str, response_format: str):
         return video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": f"tensor video {fmt}",
                 "size": "32x32",
@@ -1664,8 +2415,8 @@ class TestVideoTensorResponse:
         )
 
     @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
-    def test_sync_tensor_url_returns_file_with_correct_suffix(self, video_audio_client, fmt):
-        resp = self._post_sync(video_audio_client, fmt, "url")
+    def test_sync_tensor_file_returns_file_with_correct_suffix(self, video_audio_client, fmt):
+        resp = self._post_sync(video_audio_client, fmt, "file")
         assert resp.status_code == 200
         ext = f".{fmt}"
         # The content-disposition header carries the on-disk filename.
@@ -1681,13 +2432,17 @@ class TestVideoTensorResponse:
         assert "video" in loaded
 
     @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
-    def test_sync_tensor_b64_returns_decodable_payload(self, video_audio_client, fmt):
-        resp = self._post_sync(video_audio_client, fmt, "b64_json")
+    def test_sync_tensor_path_returns_readable_output_path(self, video_audio_client, fmt):
+        resp = self._post_sync(video_audio_client, fmt, "path")
         assert resp.status_code == 200
+        # path responses carry the Server-Timing metrics too.
+        _assert_visual_gen_server_timing(resp.headers)
         data = resp.json()
-        assert data["format"] == fmt
-        assert "b64_json" in data
-        raw = base64.b64decode(data["b64_json"])
+        assert set(data) >= {"id", "output_path"}
+        # Co-located client reads the returned server-side path directly.
+        assert os.path.exists(data["output_path"])
+        with open(data["output_path"], "rb") as fh:
+            raw = fh.read()
         if fmt == "safetensors":
             from safetensors.torch import load as load_safetensors
 
@@ -1698,8 +2453,6 @@ class TestVideoTensorResponse:
 
     @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
     def test_async_tensor_persists_and_serves(self, video_audio_client, fmt, tmp_path):
-        import time as _time
-
         client = video_audio_client
         resp = client.post(
             "/v1/videos",
@@ -1716,12 +2469,7 @@ class TestVideoTensorResponse:
         video_id = resp.json()["id"]
 
         # Drive the background task to completion via polling.
-        deadline = _time.time() + 5
-        while _time.time() < deadline:
-            status = client.get(f"/v1/videos/{video_id}").json().get("status")
-            if status in ("completed", "failed"):
-                break
-            _time.sleep(0.05)
+        _drive_job_to_completion(client, video_id)
 
         content = client.get(f"/v1/videos/{video_id}/content")
         assert content.status_code == 200
@@ -1737,44 +2485,44 @@ class TestVideoTensorResponse:
 
 
 @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
-class TestVideoEncoderB64Response:
+class TestVideoEncoderResponse:
     """The sync video route's encoder branch (``mp4``/``avi``/``auto``)
-    honors ``response_format='b64_json'`` by base64-encoding the
-    encoded video bytes; ``response_format='url'`` keeps the
+    honors ``response_format='path'`` by returning the server-side output
+    path(s) as JSON; ``response_format='file'`` keeps the
     ``FileResponse`` download."""
 
-    def test_sync_encoder_b64_json_returns_base64_payload(self, video_client):
+    def test_sync_encoder_path_returns_output_path(self, video_client):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
-                "prompt": "encoded b64",
+                "prompt": "encoded path",
                 "size": "32x32",
                 "seconds": 1.0,
                 "fps": 8,
                 "format": "avi",
-                "response_format": "b64_json",
+                "response_format": "path",
             },
             headers={"content-type": "application/json"},
         )
         assert resp.status_code == 200
+        # path responses carry the Server-Timing metrics too.
+        _assert_visual_gen_server_timing(resp.headers)
         body = resp.json()
-        assert body["format"] in {"mp4", "avi"}
-        assert "b64_json" in body
-        raw = base64.b64decode(body["b64_json"])
-        # Non-empty encoded bytes — exact format verification is the
-        # encoder layer's domain.
-        assert len(raw) > 0
+        assert set(body) >= {"id", "output_path"}
+        # The returned server-side path points at non-empty encoded bytes.
+        assert os.path.exists(body["output_path"])
+        assert os.path.getsize(body["output_path"]) > 0
 
-    def test_sync_encoder_url_keeps_file_response(self, video_client):
+    def test_sync_encoder_file_keeps_file_response(self, video_client):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
-                "prompt": "encoded url",
+                "prompt": "encoded file",
                 "size": "32x32",
                 "seconds": 1.0,
                 "fps": 8,
                 "format": "avi",
-                "response_format": "url",
+                "response_format": "file",
             },
             headers={"content-type": "application/json"},
         )
@@ -1801,7 +2549,7 @@ class TestVideoTimingValidation:
     )
     def test_non_positive_timing_field_rejected(self, video_client, field, value):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "bad timing",
                 "size": "32x32",
@@ -1844,7 +2592,7 @@ class TestVideoZeroFrameDerivationRejected:
 
     def test_subsecond_seconds_below_one_frame_returns_400(self, video_client):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "way too short",
                 "size": "32x32",
@@ -1866,8 +2614,9 @@ class TestVideoZeroFrameDerivationRejected:
         declares a ``frame_rate``: the parser must reject the request with
         HTTP 400 instead of silently dropping the duration and returning the
         pipeline's default ``num_frames``."""
+        video_client.mock_gen.executor.default_generation_params.pop("frame_rate", None)
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "duration without fps",
                 "size": "32x32",
@@ -1886,7 +2635,7 @@ class TestVideoZeroFrameDerivationRejected:
         """The caller can bypass the derivation by passing ``num_frames``
         directly; the request must succeed."""
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "explicit single frame",
                 "size": "32x32",
@@ -1963,7 +2712,7 @@ class TestVideoFrameBudgetCap:
             payload.update({"seconds": 1.0, "fps": 8})
         payload[field] = value
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json=payload,
             headers={"content-type": "application/json"},
         )
@@ -2070,7 +2819,7 @@ class TestVideoEncoderFailsFast:
         # locks in the fail-fast contract.
         video_client.mock_gen.last_inputs = None
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "mp4 without ffmpeg",
                 "size": "32x32",
@@ -2116,7 +2865,7 @@ class TestVideoEncoderFailsFast:
 
         monkeypatch.setattr(routes, "resolve_video_format", _raise_value_error)
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "tensor unaffected",
                 "size": "32x32",
@@ -2130,75 +2879,173 @@ class TestVideoEncoderFailsFast:
 
 
 @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
-class TestAsyncVideoB64JsonTransport:
+class TestAsyncVideoTransport:
     """``POST /v1/videos`` persists the requested ``response_format`` on
     the queued job. ``GET /v1/videos/{id}/content`` honors it:
-    ``url`` (or unset) returns a ``FileResponse`` download;
-    ``b64_json`` returns a JSON envelope with the encoded bytes
-    base64-inlined."""
+    ``file`` (or unset) returns a ``FileResponse`` download;
+    ``path`` returns a JSON envelope with the server-side output path(s)."""
 
-    def _drive_job_to_completion(self, client, video_id):
-        import time as _time
-
-        deadline = _time.time() + 5
-        while _time.time() < deadline:
-            status = client.get(f"/v1/videos/{video_id}").json().get("status")
-            if status in ("completed", "failed"):
-                return status
-            _time.sleep(0.05)
-        return None
-
-    def test_async_b64_json_returned_at_get_content(self, video_client):
-        resp = video_client.post(
+    @pytest.mark.asyncio
+    async def test_async_path_returned_at_get_content(self, async_video_client):
+        resp = await async_video_client.post(
             "/v1/videos",
             json={
-                "prompt": "async base64",
+                "prompt": "async path",
                 "size": "32x32",
                 "seconds": 1.0,
                 "fps": 8,
                 "format": "avi",
-                "response_format": "b64_json",
+                "response_format": "path",
             },
             headers={"content-type": "application/json"},
         )
         assert resp.status_code == 202
         job = resp.json()
-        assert job["response_format"] == "b64_json"
+        assert job["response_format"] == "path"
 
-        status = self._drive_job_to_completion(video_client, job["id"])
+        status = await _adrive_job_to_completion(async_video_client, job["id"])
         assert status == "completed"
 
-        content = video_client.get(f"/v1/videos/{job['id']}/content")
+        content = await async_video_client.get(f"/v1/videos/{job['id']}/content")
         assert content.status_code == 200
         body = content.json()
-        assert set(body) >= {"id", "format", "b64_json"}
+        assert set(body) >= {"id", "output_path"}
         assert body["id"] == job["id"]
-        # The encoded payload decodes to non-empty bytes.
-        raw = base64.b64decode(body["b64_json"])
-        assert len(raw) > 0
+        # The returned server-side path points at non-empty bytes.
+        assert os.path.exists(body["output_path"])
+        assert os.path.getsize(body["output_path"]) > 0
 
-    def test_async_url_still_returns_file_response(self, video_client):
-        """Default and explicit ``response_format='url'`` keep the
-        existing ``FileResponse`` behavior."""
-        resp = video_client.post(
+    @pytest.mark.asyncio
+    async def test_async_content_server_timing_has_total(self, async_video_client):
+        """`/content` carries the same Server-Timing header as the sync route,
+        rebuilt from the timings the background task stored on the job."""
+        resp = await async_video_client.post(
             "/v1/videos",
             json={
-                "prompt": "async url",
+                "prompt": "timing",
                 "size": "32x32",
                 "seconds": 1.0,
                 "fps": 8,
                 "format": "avi",
-                "response_format": "url",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+        assert await _adrive_job_to_completion(async_video_client, video_id) == "completed"
+
+        content = await async_video_client.get(f"/v1/videos/{video_id}/content")
+        assert content.status_code == 200
+        assert _server_timing_ms(content.headers, "generation") == 1250.0
+        assert _server_timing_ms(content.headers, "denoise") == 750.0
+        assert _server_timing_ms(content.headers, "total") > 0
+
+    @pytest.mark.asyncio
+    async def test_async_file_still_returns_file_response(self, async_video_client):
+        """Default and explicit ``response_format='file'`` keep the
+        existing ``FileResponse`` behavior."""
+        resp = await async_video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "async file",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "avi",
+                "response_format": "file",
             },
             headers={"content-type": "application/json"},
         )
         assert resp.status_code == 202
         job = resp.json()
-        assert job["response_format"] == "url"
+        assert job["response_format"] == "file"
 
-        self._drive_job_to_completion(video_client, job["id"])
-        content = video_client.get(f"/v1/videos/{job['id']}/content")
+        await _adrive_job_to_completion(async_video_client, job["id"])
+        content = await async_video_client.get(f"/v1/videos/{job['id']}/content")
         assert content.status_code == 200
-        # AVI FileResponse carries ``video/x-msvideo``; the b64_json
+        # AVI FileResponse carries ``video/x-msvideo``; the path
         # branch would have set ``application/json``.
         assert content.headers["content-type"] == "video/x-msvideo"
+
+
+class TestTensorOnlyFormatResolution:
+    """A request whose result an encoder cannot carry must not be served as video."""
+
+    @staticmethod
+    def _post(client, **body):
+        return client.post(
+            "/v1/videos/generations",
+            json={"prompt": "pick up the block", "size": "64x64", "seconds": 1.0, "fps": 8, **body},
+            headers={"content-type": "application/json"},
+        )
+
+    def test_auto_resolves_to_tensor_payload(self, action_video_client):
+        resp = self._post(action_video_client, extra_params={"action_mode": "policy"})
+        assert resp.status_code == 200
+        # 'auto' would otherwise have produced an encoded video, silently
+        # dropping the modality the request was made for.
+        assert resp.headers["content-type"] == "application/octet-stream"
+        assert resp.headers["content-disposition"].endswith('.safetensors"')
+
+    def test_explicit_tensor_format_passes_through(self, action_video_client):
+        resp = self._post(action_video_client, format="pt", extra_params={"action_mode": "policy"})
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].endswith('.pt"')
+
+    @pytest.mark.parametrize("fmt", ["mp4", "avi"])
+    def test_explicit_encoder_format_is_rejected(self, action_video_client, fmt):
+        """The caller stated two incompatible things; guessing either way is wrong."""
+        resp = self._post(action_video_client, format=fmt, extra_params={"action_mode": "policy"})
+        assert resp.status_code == 400
+        body = resp.json()
+        _assert_llm_envelope(body, code=400, message_contains="action_mode")
+        # The message must name the way out, not just the refusal.
+        assert "safetensors" in body["message"]
+
+    def test_untriggered_request_keeps_encoder_default(self, action_video_client):
+        """No tensor-only param set -> ordinary video request, unchanged."""
+        resp = self._post(action_video_client)
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("video/")
+
+
+class TestTensorOnlyFormatRule:
+    """Unit coverage of the resolution rule itself, without a server."""
+
+    @staticmethod
+    def _specs(**flags):
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+
+        return {
+            name: ExtraParamSchema(type="str", default=None, requires_tensor_output=flag)
+            for name, flag in flags.items()
+        }
+
+    def test_no_specs_is_a_noop(self):
+        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+
+        assert _resolve_tensor_only_format("auto", {"action_mode": "policy"}, None) == "auto"
+        assert _resolve_tensor_only_format("auto", None, self._specs(a=True)) == "auto"
+
+    def test_only_a_declared_param_triggers(self):
+        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+
+        specs = self._specs(action_mode=True, stg_scale=False)
+        # a non-declaring param must not force a tensor payload
+        assert _resolve_tensor_only_format("auto", {"stg_scale": 2.0}, specs) == "auto"
+        assert (
+            _resolve_tensor_only_format("auto", {"action_mode": "policy"}, specs) == "safetensors"
+        )
+
+    def test_null_value_does_not_trigger(self):
+        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+
+        specs = self._specs(action_mode=True)
+        assert _resolve_tensor_only_format("auto", {"action_mode": None}, specs) == "auto"
+
+    def test_encoder_format_raises_naming_the_parameter(self):
+        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+
+        specs = self._specs(action_mode=True)
+        with pytest.raises(ValueError, match="action_mode"):
+            _resolve_tensor_only_format("mp4", {"action_mode": "policy"}, specs)

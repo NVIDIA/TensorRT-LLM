@@ -13,6 +13,7 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
+    from ..model_config import ModelConfig
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -444,7 +445,6 @@ class AttentionMetadata:
             is_spec_dec_dynamic_tree,
             max_draft_len,
             max_total_draft_tokens,
-            model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
             spec_tree_manager: Optional['SpecTreeManager'] = None,
             num_contexts: int = 0):
@@ -941,6 +941,12 @@ class AttentionForwardArgs:
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
     enable_dsv4_epilogue_fusion: bool = False
 
+    # Fused kv_a_layernorm, DSv4 sparse context path. When set, `latent_cache` is the
+    # RAW kv_a_proj output and the context RoPE kernel norms it before RoPE + quant +
+    # paged write, so the caller drops its own RMSNorm and concat.
+    kv_norm_weight: Optional[torch.Tensor] = None
+    kv_norm_eps: float = 1e-6
+
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
@@ -1069,6 +1075,21 @@ class AttentionBackend(Generic[TMetadata]):
     @classmethod
     def support_multi_item_scoring(cls) -> bool:
         return False
+
+    @classmethod
+    def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",
+                                          mapping: Mapping) -> int:
+        """Per-token bytes to reserve for a workspace this backend stages whose size scales with a
+        runtime quantity the KV-cache estimator does not drive to its serving maximum while profiling
+        (e.g. ``total_kv_len``, inflated by KV-cache reuse). Default ``0`` -- correct for every backend
+        except fp8 context-MLA today.
+
+        A non-zero rate is reserved from the KV budget by the estimator, and the scheduler caps the
+        driving sum at what that reserve covers, so the declared buffer stays within its reservation
+        (buffers the backend does not declare are still unaccounted for). Keep the rate identical to the
+        runtime allocation's per-token cost. See ``ATTENTION_DEVELOPER_GUIDE.md`` §2.3.
+        """
+        return 0
 
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
         """

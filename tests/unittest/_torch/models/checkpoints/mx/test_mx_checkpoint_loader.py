@@ -14,6 +14,7 @@ assertion is about our dependency handling, not the upstream API.
 """
 
 import json
+import logging
 import os
 import sys
 from contextlib import ExitStack
@@ -153,6 +154,25 @@ class TestConstruction:
 
         loader._source_identity_compatible_for_last_load = True
         assert loader.is_post_transform_weights_preloaded() is True
+
+    @pytest.mark.parametrize(
+        ("effective_level", "expected_level"),
+        ((logging.WARNING, logging.INFO), (logging.DEBUG, None)),
+    )
+    def test_transfer_log_dir_enables_info_records(
+        self, monkeypatch, effective_level, expected_level
+    ):
+        monkeypatch.setenv("MX_TRANSFER_LOG_DIR", "/tmp/mx-transfer-logs")
+        mx_logger = MagicMock()
+        mx_logger.getEffectiveLevel.return_value = effective_level
+
+        with patch.object(mx_checkpoint_loader.logging, "getLogger", return_value=mx_logger):
+            mx_checkpoint_loader._enable_mx_transfer_logging()
+
+        if expected_level is None:
+            mx_logger.setLevel.assert_not_called()
+        else:
+            mx_logger.setLevel.assert_called_once_with(expected_level)
 
 
 # ---------------------------------------------------------------------------
@@ -1015,6 +1035,35 @@ class TestMxSourceQueryTimeoutDefault:
         mx_loader.load_weights.assert_called_once()
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
+    def test_zero_timeout_falls_back_before_receiver_preparation(self):
+        identity = _identity()
+        disk_weights = {"disk.weight": MagicMock()}
+        prepare_receiver = MagicMock()
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001", query_timeout_s=0)
+        fake_mx = _build_fake_modelexpress()
+
+        with (
+            _install_fake_modelexpress(fake_mx),
+            patch.object(
+                HfCheckpointLoader, "load_weights", return_value=disk_weights
+            ) as mock_super_load,
+        ):
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+                allow_post_transform_weights=True,
+                prepare_post_transform_receiver=prepare_receiver,
+            )
+
+        assert result is disk_weights
+        assert loader.is_weights_preloaded() is False
+        assert loader.is_post_transform_weights_preloaded() is False
+        prepare_receiver.assert_not_called()
+        fake_mx.trtllm_live_transfer.MxLiveWeightLoader.assert_not_called()
+        mock_super_load.assert_called_once()
+
     def test_existing_source_keeps_upstream_default_when_unset(self):
         identity = _identity()
 
@@ -1099,8 +1148,8 @@ class TestModelNameConstructor:
         assert loader.model_name is None
 
     def test_model_name_stored_as_string(self):
-        loader = MXCheckpointLoader(model_name="Qwen/Qwen2.5-72B-Instruct")
-        assert loader.model_name == "Qwen/Qwen2.5-72B-Instruct"
+        loader = MXCheckpointLoader(model_name="Qwen/Qwen3-8B")
+        assert loader.model_name == "Qwen/Qwen3-8B"
 
     def test_model_name_path_coerced_to_string(self, tmp_path):
         # Constructor accepts Path (e.g. llm_args.model resolved as Path)
@@ -1120,7 +1169,7 @@ class TestNormalizeModelIdentity:
         [
             # Hub IDs and bare names pass through unchanged.
             ("bare_name", "llama-3-70b", "llama-3-70b"),
-            ("hub_id", "Qwen/Qwen2.5-72B-Instruct", "Qwen/Qwen2.5-72B-Instruct"),
+            ("hub_id", "Qwen/Qwen3-8B", "Qwen/Qwen3-8B"),
             ("nested_hub_id", "meta-llama/Llama-3-70B", "meta-llama/Llama-3-70B"),
             # Absolute paths get reduced to basenames.
             ("abs_path_simple", "/scratch/local-model", "local-model"),
@@ -1148,10 +1197,8 @@ class TestNormalizeModelIdentity:
     def test_hf_snapshot_unmangling(self):
         # HF cache layout: ".../models--<org>--<name>/snapshots/<sha>/"
         # to "<org>/<name>" instead of the commit sha.
-        snapshot = (
-            "/cache/huggingface/hub/models--Qwen--Qwen2.5-72B-Instruct/snapshots/abc123def456789"
-        )
-        assert _normalize_model_identity(snapshot) == "Qwen/Qwen2.5-72B-Instruct"
+        snapshot = "/cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/abc123def456789"
+        assert _normalize_model_identity(snapshot) == "Qwen/Qwen3-8B"
 
     def test_hf_snapshot_unmangling_nested_org(self):
         # Multi-component HF org names use "--" as the separator.
@@ -1179,8 +1226,8 @@ class TestResolveMxModelName:
         assert _resolve_mx_model_name(None, "/scratch/local-model") == "local-model"
 
     def test_snapshot_fallback_when_arg_and_env_missing(self):
-        snapshot = "/cache/huggingface/hub/models--Qwen--Qwen2.5-72B-Instruct/snapshots/abc123"
-        assert _resolve_mx_model_name(None, snapshot) == "Qwen/Qwen2.5-72B-Instruct"
+        snapshot = "/cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/abc123"
+        assert _resolve_mx_model_name(None, snapshot) == "Qwen/Qwen3-8B"
 
     def test_unknown_when_all_missing(self):
         assert _resolve_mx_model_name(None, None) == "unknown"
@@ -1199,12 +1246,12 @@ class TestLoadWeightsModelName:
         snapshot = "/cache/hub/models--Other--Model/snapshots/abc123"
 
         def _assert_model_name(*args, **kwargs):
-            assert os.environ.get("MODEL_NAME") == "Qwen/Qwen2.5-72B-Instruct"
+            assert os.environ.get("MODEL_NAME") == "Qwen/Qwen3-8B"
             return {}
 
         loader = MXCheckpointLoader(
             mx_server_url="http://mx:8001",
-            model_name="Qwen/Qwen2.5-72B-Instruct",
+            model_name="Qwen/Qwen3-8B",
         )
         fake_mx = _build_fake_modelexpress(
             load_weights_side_effect=_assert_model_name,
@@ -1221,7 +1268,7 @@ class TestLoadWeightsModelName:
 
         assert os.environ.get("MODEL_NAME") == "prior-model"
         fake_mx.trtllm_live_transfer._build_trtllm_identity.assert_called_with(
-            model_name="Qwen/Qwen2.5-72B-Instruct"
+            model_name="Qwen/Qwen3-8B"
         )
 
 
@@ -1241,7 +1288,7 @@ class TestPublishAsSourceModelName:
     def test_uses_explicit_constructor_model_name(self):
         loader = MXCheckpointLoader(
             mx_server_url="http://mx:8001",
-            model_name="Qwen/Qwen2.5-72B-Instruct",
+            model_name="Qwen/Qwen3-8B",
         )
         captured = {}
 
@@ -1253,7 +1300,7 @@ class TestPublishAsSourceModelName:
         with _install_fake_modelexpress(fake_mx):
             loader.publish_as_source(MagicMock(), source_identity=_identity())
 
-        assert captured["MODEL_NAME"] == "Qwen/Qwen2.5-72B-Instruct"
+        assert captured["MODEL_NAME"] == "Qwen/Qwen3-8B"
         assert captured["MODEL_EXPRESS_URL"] == "http://mx:8001"
         # Both env vars restored to the (unset) prior state.
         assert "MODEL_NAME" not in os.environ
@@ -1279,9 +1326,7 @@ class TestPublishAsSourceModelName:
 
     def test_unmangles_hf_snapshot_path(self):
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        snapshot = (
-            "/cache/huggingface/hub/models--Qwen--Qwen2.5-72B-Instruct/snapshots/abc123def456"
-        )
+        snapshot = "/cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/abc123def456"
         captured = {}
 
         def _capture(model, **_kwargs):
@@ -1296,7 +1341,7 @@ class TestPublishAsSourceModelName:
             )
 
         # Critical: NOT the commit hash, the human-readable Hub-ID form.
-        assert captured["MODEL_NAME"] == "Qwen/Qwen2.5-72B-Instruct"
+        assert captured["MODEL_NAME"] == "Qwen/Qwen3-8B"
         assert captured["MODEL_NAME"] != "abc123def456"
 
     def test_constructor_model_name_takes_priority_over_env(self, monkeypatch):

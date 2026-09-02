@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from typing import Mapping as TMapping
 
 import torch
@@ -51,7 +51,6 @@ from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMax
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
@@ -63,6 +62,8 @@ from ..modules.linear import (
 )
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..utils import (
     ActivationType,
     AuxStreamType,
@@ -84,6 +85,7 @@ from .modeling_utils import (
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
 # and flash SDPA does not accept attn_mask.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
 
 # ---------------------------------------------------------------------------
 # Config normalization helpers
@@ -160,6 +162,25 @@ def get_text_model_config(
     return cfg
 
 
+def _validate_sparse_attention_runtime_config(
+    model_config: "ModelConfig[PretrainedConfig]",
+) -> None:
+    """Require the runtime backend that owns M3's metadata and index cache.
+
+    Both dense and sparse M3 layers use that cache manager, independent of
+    checkpoint precision or GPU architecture. Backend-specific constraints,
+    such as MSA requiring SM100, are validated by the backend itself.
+    """
+    sparse_config = model_config.sparse_attention_config
+    if sparse_config is None or sparse_config.algorithm != "minimax_m3":
+        raise ValueError(
+            "MiniMax-M3 requires sparse_attention_config.algorithm='minimax_m3' "
+            "to create its KV-cache manager and prepare attn_metadata.minimax_m3. "
+            "Set the following in the LLM API configuration:\n"
+            "sparse_attention_config:\n  algorithm: minimax_m3"
+        )
+
+
 def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
     """Return ``(dense_layer_ids, sparse_layer_ids)`` for the M3 text model."""
     sparse_cfg = getattr(text_config, "sparse_attention_config", None)
@@ -180,7 +201,9 @@ def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List
     return dense, sparse
 
 
-def get_sparse_disable_index_value_layer_ids(text_config: PretrainedConfig) -> List[int]:
+def get_sparse_disable_index_value_layer_ids(
+    text_config: PretrainedConfig,
+) -> List[int]:
     """Return layer ids where the sparse index-value branch is disabled."""
     sparse_cfg = getattr(text_config, "sparse_attention_config", None)
     if sparse_cfg is None:
@@ -661,6 +684,9 @@ def minimax_m3_attn_custom_op_inplace(
     )
 
 
+maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(minimax_m3_attn_custom_op_inplace)
+
+
 class MiniMaxM3Attention(Attention):
     """M3 attention: dense (layers 0-2) or sparse (layers 3-59).
 
@@ -718,6 +744,14 @@ class MiniMaxM3Attention(Attention):
         # Dtype of the q/k/v activations fed into norm and RoPE. KV-cache
         # quantization changes cache storage only, so this stays the compute dtype.
         self.attn_activation_dtype = config.torch_dtype
+
+        # Whether the main K/V cache is stored as FP8 E4M3.
+        quant_config = getattr(model_config, "quant_config", None)
+        self.main_kv_is_fp8 = bool(
+            quant_config is not None
+            and quant_config.quant_mode is not None
+            and quant_config.quant_mode.has_fp8_kv_cache()
+        )
 
         # Per-head Gemma RMSNorm — one set of weights shared across heads.
         self.q_norm = RMSNorm(
@@ -869,6 +903,7 @@ class MiniMaxM3Attention(Attention):
         head_dim: int,
         q_norm: RMSNorm,
         k_norm: RMSNorm,
+        out_fp8: bool = False,
     ) -> Optional[torch.Tensor]:
         """Fuse per-head Gemma RMSNorm and partial RoPE into one kernel.
 
@@ -878,6 +913,10 @@ class MiniMaxM3Attention(Attention):
         norms the full head_dim and rotates only the leading rotary_dim
         channels, matching M3's whole-head norm with front partial RoPE, and
         leaves the V heads untouched.
+
+        When out_fp8 is True, an out-of-place variant runs instead and returns a
+        fresh FP8 E4M3 tensor with Q/K normed and roped and V copy-cast, leaving
+        qkv untouched.
 
         Returns None with qkv unmodified when the kernel does not apply, so the
         caller runs norm and RoPE separately: non-bf16 activations (the kernel
@@ -896,6 +935,31 @@ class MiniMaxM3Attention(Attention):
         rotary_dim = int(self.pos_embd_params.rope.dim)
         # The kernel assumes a contiguous [num_tokens, total_heads * head_dim].
         qkv = qkv.contiguous()
+        position_ids_i32 = position_ids.reshape(-1).contiguous().to(torch.int32)
+        if out_fp8:
+            return torch.ops.trtllm.fused_qk_norm_rope_to_fp8(
+                qkv,
+                num_heads_q,
+                num_heads_k,
+                num_heads_v,
+                head_dim,
+                rotary_dim,
+                q_norm.variance_epsilon,
+                q_norm.weight,
+                k_norm.weight,
+                self.pos_embd_params.rope.theta,
+                self.pos_embd_params.is_neox,
+                position_ids_i32,
+                1.0,  # factor: no YARN (M3 has no rope_scaling)
+                0.0,  # low
+                0.0,  # high
+                1.0,  # attention_factor
+                True,  # is_qk_norm
+                self.use_gemma_norm,  # use_gemma
+                False,  # use_mrope
+                0,  # mrope_section1
+                0,  # mrope_section2
+            )
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv,
             num_heads_q,
@@ -908,7 +972,7 @@ class MiniMaxM3Attention(Attention):
             k_norm.weight,
             self.pos_embd_params.rope.theta,
             self.pos_embd_params.is_neox,
-            position_ids.reshape(-1).contiguous().to(torch.int32),
+            position_ids_i32,
             1.0,  # factor: no YARN (M3 has no rope_scaling)
             0.0,  # low
             0.0,  # high
@@ -921,6 +985,66 @@ class MiniMaxM3Attention(Attention):
         )
         return qkv
 
+    def _fused_fp8_index_qk_norm_rope(
+        self,
+        idx_qk: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> Optional[torch.Tensor]:
+        """Produce raw-E4M3 index-Q and insert index-K in one M3-only kernel.
+
+        This path is deliberately narrower than the general fused QK kernel:
+        it is enabled only for the MSA FP8-indexer configuration and the exact
+        M3 Gemma-RMSNorm + NeoX partial-RoPE geometry. The kernel rounds the
+        normalized/RoPE values through BF16 before E4M3 conversion, matching
+        the former fused-BF16-kernel followed by ``Tensor.to(E4M3)`` contract.
+        """
+        if not isinstance(self.attn, MiniMaxM3MsaSparseAttention):
+            return None
+        if self.attn.indexer_kv_dtype != "fp8":
+            return None
+        if position_ids is None or idx_qk.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "MiniMax-M3 fused FP8 indexer requires BF16 activations and position_ids."
+            )
+        if (
+            self.rotary_emb is None
+            or self.pos_embd_params is None
+            or self.pos_embd_params.rope is None
+        ):
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires partial RoPE.")
+        if not self.pos_embd_params.is_neox:
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires NeoX RoPE.")
+        if not self.use_gemma_norm:
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires Gemma RMSNorm.")
+        if self.index_q_norm.variance_epsilon != self.index_k_norm.variance_epsilon:
+            raise ValueError(
+                "MiniMax-M3 fused FP8 indexer requires identical index Q/K "
+                "RMSNorm epsilon values because the kernel accepts one epsilon."
+            )
+
+        rotary_dim = int(self.pos_embd_params.rope.dim)
+        index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+        if index_k_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "MiniMax-M3 fused FP8 indexer requires an E4M3 index-K cache, "
+                f"got {index_k_cache.dtype}."
+            )
+        num_tokens = int(idx_qk.shape[0])
+        return torch.ops.trtllm.minimax_m3_fp8_indexer_qk_norm_rope(
+            idx_qk.contiguous(),
+            index_k_cache,
+            attn_metadata.msa_out_cache_loc[:num_tokens],
+            self.sparse_num_index_heads,
+            self.sparse_index_dim,
+            rotary_dim,
+            self.index_q_norm.variance_epsilon,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+            self.pos_embd_params.rope.theta,
+            position_ids.reshape(-1).contiguous().to(torch.int32),
+        ).flatten(1)
+
     def _expect_fused_qk_norm_rope(self, position_ids: Optional[torch.Tensor]) -> bool:
         """Whether the fused kernel is expected to run instead of the fallback.
 
@@ -929,6 +1053,43 @@ class MiniMaxM3Attention(Attention):
         The forward paths assert on this.
         """
         return self.attn_activation_dtype == torch.bfloat16 and position_ids is not None
+
+    def _msa_backend_active(self) -> bool:
+        """Whether the MSA fmha_sm100 backend handles this layer's attention."""
+        return isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+
+    def _emit_fp8_main_qkv(self) -> bool:
+        """Whether the main-branch fused QK-norm+RoPE should emit FP8 q/k/v.
+
+        Only the MSA backend consumes an FP8 paged K/V cache directly; the
+        Triton/SDPA reference paths and the index branch stay bf16.
+        """
+        return self.main_kv_is_fp8 and self._msa_backend_active()
+
+    def _split_main_qkv(
+        self, fused_qkv: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split the fused [q|k|v] buffer into per-tensor q/k/v.
+
+        The MSA kernels read q with its real strides and scatter k/v into the
+        paged cache with an indexed copy, so the split column-views can be
+        handed over as-is. Other backends keep the previous contiguity.
+        """
+        q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self._msa_backend_active():
+            return q, k, v
+        return q.contiguous(), k.contiguous(), v
+
+    def _split_index_qk(self, fused_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split the fused [idx_q|idx_k] buffer into per-tensor idx_q/idx_k.
+
+        The index analogue of _split_main_qkv; the index cache is bf16, so there
+        is no FP8 variant here.
+        """
+        idx_q, idx_k = fused_idx.split([self.index_q_size, self.index_k_size], dim=-1)
+        if self._msa_backend_active():
+            return idx_q, idx_k
+        return idx_q.contiguous(), idx_k.contiguous()
 
     def forward(
         self,
@@ -1030,11 +1191,10 @@ class MiniMaxM3Attention(Attention):
             head_dim=self.head_dim,
             q_norm=self.q_norm,
             k_norm=self.k_norm,
+            out_fp8=self._emit_fp8_main_qkv(),
         )
         if fused_qkv is not None:
-            q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            # Match the contiguity of the separate path; V stays a column-slice view.
-            q, k = q.contiguous(), k.contiguous()
+            q, k, v = self._split_main_qkv(fused_qkv)
         else:
             assert not self._expect_fused_qk_norm_rope(position_ids), (
                 f"MiniMax-M3 dense attention (layer {self.layer_idx}) expected the "
@@ -1242,9 +1402,14 @@ class MiniMaxM3Attention(Attention):
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        output = q.new_empty((q.shape[0], self.num_heads * self.head_dim))
-        if self.register_to_config and is_torch_compiling():
-            minimax_m3_attn_custom_op_inplace(
+        # q may be FP8 on the MSA FP8-KV path, so pin the output to the compute
+        # dtype rather than inheriting it from q.
+        output = q.new_empty(
+            (q.shape[0], self.num_heads * self.head_dim),
+            dtype=self.attn_activation_dtype,
+        )
+        if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
+            maybe_bcg_minimax_m3_attn_custom_op_inplace(
                 q,
                 k,
                 v,
@@ -1302,7 +1467,7 @@ class MiniMaxM3Attention(Attention):
         builds the forward_args the FMHA reads.
         """
         if self.is_sparse_attention_layer:
-            assert idx_q is not None and idx_k is not None
+            assert idx_q is not None
             # Publish the selected blocks so the FMHA runs the sparse path.
             kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
             forward_args = AttentionForwardArgs(
@@ -1378,10 +1543,10 @@ class MiniMaxM3Attention(Attention):
                 head_dim=self.head_dim,
                 q_norm=self.q_norm,
                 k_norm=self.k_norm,
+                out_fp8=self._emit_fp8_main_qkv(),
             )
             if fused_qkv is not None:
-                q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-                return q.contiguous(), k.contiguous(), v
+                return self._split_main_qkv(fused_qkv)
             assert not self._expect_fused_qk_norm_rope(position_ids), (
                 f"MiniMax-M3 sparse attention (layer {self.layer_idx}) expected the "
                 f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
@@ -1396,6 +1561,10 @@ class MiniMaxM3Attention(Attention):
 
         def _index_norm_rope():
             idx_qk = self.index_qk_proj(hidden_states)
+            fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
+            if fp8_idx_q is not None:
+                # Index-K was inserted directly into the paged side cache.
+                return fp8_idx_q, None
             fused_idx = self._fused_qk_norm_rope(
                 idx_qk,
                 position_ids,
@@ -1407,8 +1576,7 @@ class MiniMaxM3Attention(Attention):
                 k_norm=self.index_k_norm,
             )
             if fused_idx is not None:
-                idx_q, idx_k = fused_idx.split([self.index_q_size, self.index_k_size], dim=-1)
-                return idx_q.contiguous(), idx_k.contiguous()
+                return self._split_index_qk(fused_idx)
             assert not self._expect_fused_qk_norm_rope(position_ids), (
                 f"MiniMax-M3 sparse index branch (layer {self.layer_idx}) expected the "
                 f"fused QK-norm+RoPE kernel (bf16 activations, index_dim="
@@ -1779,6 +1947,7 @@ class MiniMaxM3Model(DecoderModel):
     """M3 text decoder model."""
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
+        _validate_sparse_attention_runtime_config(model_config)
         super().__init__(model_config)
         quant_config = model_config.quant_config
         if quant_config is None or (
@@ -1810,6 +1979,10 @@ class MiniMaxM3Model(DecoderModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
+        # The executor owns the authoritative CUDA-graph configuration. Mark
+        # this model as eligible here and let the executor enable the automatic
+        # FlashInfer MXFP8 path only when its decode graph runner is active.
+        self._use_flashinfer_mxfp8_decode_graph_default = True
         # Final norm is a plain (non-Gemma) RMSNorm for the same reason as the
         # layer-boundary norms (see MiniMaxM3DecoderLayer.__init__): it doubles
         # as the last layer's next_layer_layernorm, so the last MoE/MLP output
@@ -1926,6 +2099,27 @@ def _fold_gemma_boundary_norm_weights(weights):
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for MiniMax-M3.
+
+        Sparse attention already routes M3 to a V2-core manager
+        unconditionally; declaring the preference keeps
+        ``kv_cache_config.use_kv_cache_manager_v2`` consistent with the
+        manager actually in use.
+        """
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config: Any = None) -> Literal["PYTHON"]:
+        """Prefer the Python transceiver in disaggregated serving.
+
+        M3 runs a V2-core cache manager, which the C++ transceiver cannot
+        drive; the KV-transfer unit test exercises the Python transceiver
+        directly. This routes the fully-'auto' path to that combination.
+        """
+        return "PYTHON"
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         raw_pretrained = model_config.pretrained_config

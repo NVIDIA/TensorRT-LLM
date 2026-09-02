@@ -39,15 +39,27 @@ _MEM_FRACTION_50 = 0.5
 _MEM_FRACTION_80 = 0.8
 _MEM_FRACTION_95 = 0.95
 
+_MINIMAX_M3_EVAL_CONFIG = {
+    # This is required for minimax M3.
+    "sparse_attention_config": {
+        "algorithm": "minimax_m3",
+    },
+    # The below are to prevent OOMs in CI - the model's 1M context length is too large.
+    "kv_cache_config": {
+        "enable_block_reuse": False,
+    },
+    "max_seq_len": 4096,
+}
+
 
 @pytest.mark.parametrize("model_name,model_path", [
-    ("DeepSeek-R1-Distill-Qwen-1.5B", "DeepSeek-R1-Distill-Qwen-1.5B"),
+    ("Qwen3/Qwen3-0.6B", "Qwen3/Qwen3-0.6B"),
 ])
 def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv):
     """RCCA: https://nvbugs/5238105 - none of n>1 sequences may be empty."""
     from tensorrt_llm import LLM, SamplingParams
 
-    prompt = r"<｜begin▁of▁sentence｜><｜User｜>The operation $\otimes$ is defined for all nonzero numbers by $a \otimes b = \frac{a^{2}}{b}$. Determine $[(1 \otimes 2) \otimes 3] - [1 \otimes (2 \otimes 3)]$. Let's think step by step and output the final answer within \boxed{}.<｜Assistant｜>"
+    prompt = r"The operation $\otimes$ is defined for all nonzero numbers by $a \otimes b = \frac{a^{2}}{b}$. Determine $[(1 \otimes 2) \otimes 3] - [1 \otimes (2 \otimes 3)]$. Let's think step by step."
 
     sampling_params = SamplingParams(
         max_tokens=1024,
@@ -60,6 +72,14 @@ def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv):
     with LLM(model=f"{llm_models_root()}/{model_path}",
              max_batch_size=8,
              max_seq_len=4224) as llm:
+        prompt = llm.tokenizer.apply_chat_template(
+            [{
+                "role": "user",
+                "content": prompt
+            }],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
         outputs = llm.generate([prompt], sampling_params=sampling_params)
 
     completions = outputs[0].outputs
@@ -673,21 +693,20 @@ def test_openai_post_processor(llm_root, llm_venv):
          str(test_root / "_test_openai_post_processor.py")])
 
 
-@pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
-def test_openai_completions_with_logit_bias(llm_root, llm_venv, sampler: str):
+def test_openai_completions_with_logit_bias(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
         "-m", "pytest",
-        str(test_root / "_test_openai_completions.py"), "-k", sampler
+        str(test_root / "_test_openai_completions.py"), "-k",
+        "logit_bias_effect"
     ])
 
 
-@pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
-def test_openai_chat_with_logit_bias(llm_root, llm_venv, sampler: str):
+def test_openai_chat_with_logit_bias(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
         "-m", "pytest",
-        str(test_root / "_test_openai_chat.py"), "-k", sampler
+        str(test_root / "_test_openai_chat.py"), "-k", "logit_bias_effect"
     ])
 
 
@@ -872,7 +891,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
     ("Llama3.1-8B-BF16", "llama-3.1-model/Meta-Llama-3.1-8B"),
     ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
-    ("Nemotron-H-8B", "Nemotron-H-8B-Base-8K"),
     pytest.param('Llama3.1-8B-NVFP4',
                  'nvfp4-quantized/Meta-Llama-3.1-8B',
                  marks=skip_pre_blackwell),
@@ -885,12 +903,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Nemotron-Super-49B-v1-FP8',
                  'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8',
                  marks=skip_pre_hopper),
-    pytest.param('Mixtral-8x7B-NVFP4',
-                 'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
-                 marks=skip_pre_blackwell),
-    pytest.param('Mixtral-8x7B-FP8',
-                 'Mixtral-8x7B-Instruct-v0.1-fp8',
-                 marks=skip_pre_blackwell),
     pytest.param('Qwen3-30B-A3B',
                  'Qwen3/Qwen3-30B-A3B',
                  marks=pytest.mark.skip_less_device_memory(80000)),
@@ -911,15 +923,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
                  marks=skip_pre_blackwell),
     pytest.param('Nemotron-Super-49B-v1-BF16',
                  'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1',
-                 marks=skip_pre_blackwell),
-    pytest.param('Mixtral-8x7B-BF16',
-                 'Mixtral-8x7B-Instruct-v0.1',
-                 marks=skip_pre_blackwell),
-    pytest.param('Mistral-Nemo-12b-Base',
-                 'Mistral-Nemo-Base-2407',
-                 marks=skip_pre_blackwell),
-    pytest.param('DeepSeek-R1-Distill-Qwen-32B',
-                 'DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B',
                  marks=skip_pre_blackwell),
     pytest.param('GPT-OSS-20B', 'gpt_oss/gpt-oss-20b',
                  marks=skip_pre_blackwell),
@@ -945,13 +948,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
                  'Qwen3/nvidia-Qwen3-32B-NVFP4',
                  marks=skip_pre_blackwell),
     ("Qwen3-32B-bf16", "Qwen3/Qwen3-32B"),
-    pytest.param('Phi4-Reasoning-Plus-fp8',
-                 'nvidia-Phi-4-reasoning-plus-FP8',
-                 marks=skip_pre_hopper),
-    pytest.param('Phi4-Reasoning-Plus-nvfp4',
-                 'nvidia-Phi-4-reasoning-plus-NVFP4',
-                 marks=skip_pre_blackwell),
-    ("Phi-4-reasoning-plus-bf16", "Phi-4-reasoning-plus"),
     pytest.param('Nemotron-Super-49B-v1.5-FP8',
                  'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1_5-FP8',
                  marks=skip_pre_hopper),
@@ -965,7 +961,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    if model_name in ("Nemotron-H-8B", "Nemotron-Nano-9B-v2-nvfp4"):
+    if model_name == "Nemotron-Nano-9B-v2-nvfp4":
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--disable_kv_cache_reuse",
@@ -988,8 +984,10 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
         ]
         if "Qwen3" in model_name:
             cmds.append("--kv_cache_fraction=0.6")
-        if "Llama3.1-70B" in model_name or "Llama3.3-70B" in model_name:
+        if "Llama3.3-70B" in model_name:
             cmds.append("--max_num_tokens=1024")
+        if "Llama-4" in model_name:
+            cmds.append("--max_seq_len=8192")
         llm_venv.run_cmd(cmds)
 
 
@@ -1058,7 +1056,7 @@ def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
 
 
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 @skip_pre_hopper
 @pytest.mark.parametrize("model_path", [
     pytest.param('DeepSeek-V3', marks=skip_post_blackwell),
@@ -1230,7 +1228,7 @@ def test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance(
 
 @skip_post_blackwell
 @pytest.mark.skip_less_device_memory(110000)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 @pytest.mark.parametrize("model_name,model_path", [
     pytest.param(
         'DeepSeek-R1', 'DeepSeek-R1/DeepSeek-R1', marks=skip_pre_hopper),
@@ -1259,7 +1257,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
 
 
 @pytest.mark.skip_less_device_memory(110000)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 @pytest.mark.parametrize("model_name,model_path", [
     pytest.param(
         'DeepSeek-R1', 'DeepSeek-R1/DeepSeek-R1', marks=skip_pre_hopper),
@@ -1298,7 +1296,7 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
 @skip_pre_ada
 @skip_post_blackwell
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 @pytest.mark.parametrize("model_name,model_path", [
     pytest.param('DeepSeek-R1-W4AFP8',
                  'DeepSeek-R1/DeepSeek-R1-W4AFP8',
@@ -1324,7 +1322,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(140000)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
     """Test DeepSeek-R1 FP4 with MTP speculative decoding using BenchRunner.
 
@@ -1409,11 +1407,6 @@ def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path,gpu_count", [
-    ("Mixtral-8x7B-BF16", "Mixtral-8x7B-v0.1", 8),
-    pytest.param('Mixtral-8x7B-NVFP4',
-                 'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
-                 8,
-                 marks=skip_pre_blackwell),
     pytest.param('Nemotron-Ultra-253B',
                  'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
                  8,
@@ -1432,10 +1425,8 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     mapping = {
         "Llama3.1-70B-BF16": 24.6,
-        "Mixtral-8x7B-BF16": 16.5,
         "Llama3.1-70B-FP8": 58.5,
         "Llama3.1-405B-FP8": 63.2,
-        "Mixtral-8x7B-NVFP4": 9.9,
         "Nemotron-Ultra-253B": 72.3,
         "DeepSeek-V3-671B-FP8": 83.8
     }
@@ -1454,7 +1445,7 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
 @pytest.mark.parametrize("cuda_graph", [False, True])
 @pytest.mark.parametrize("tp_size, pp_size", [
     pytest.param(2, 2, marks=pytest.mark.skip_less_device(4)),
-    pytest.param(2, 4, marks=pytest.mark.skip_less_device(8)),
+    pytest.param(2, 4, marks=pytest.mark.skip_less_mpi_world_size(8)),
 ])
 @pytest.mark.parametrize("model_name,model_path", [
     pytest.param('Llama3.3-70B-FP8',
@@ -1485,7 +1476,7 @@ def test_ptp_quickstart_advanced_pp_enabled(llm_root, llm_venv, model_name,
 
 
 @skip_pre_hopper
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 @pytest.mark.parametrize("cuda_graph", [False, True])
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama-4-Maverick-17B-128E-Instruct-FP8",
@@ -1526,7 +1517,6 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
 @pytest.mark.parametrize("model_name,model_path", [
     ('Nemotron-Super-49B-v1-BF16',
      'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1'),
-    ("Mixtral-8x7B-BF16", "Mixtral-8x7B-Instruct-v0.1"),
 ])
 def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
                                              model_path):
@@ -1646,78 +1636,6 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
     print("All answers are correct!")
 
 
-@pytest.mark.parametrize("modality", ["image", "audio", "image_audio"])
-@pytest.mark.parametrize("model_name,model_path", [
-    ("phi4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
-    pytest.param("phi4-multimodal-instruct-fp4",
-                 "multimodals/Phi-4-multimodal-instruct-FP4",
-                 marks=skip_pre_blackwell),
-    pytest.param("phi4-multimodal-instruct-fp8",
-                 "multimodals/Phi-4-multimodal-instruct-FP8",
-                 marks=skip_pre_hopper),
-])
-def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, model_name,
-                                          model_path, modality):
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    test_data_root = Path(
-        os.path.join(llm_models_root(), "multimodals", "test_data"))
-    audio_data_root = Path(
-        os.path.join(llm_models_root(), "multimodals",
-                     "Phi-4-multimodal-instruct", "examples"))
-    print(f"Accuracy test {model_name} {modality} mode with example inputs.")
-    accuracy_inputs = {
-        "image": {
-            "prompt": [
-                "Describe the object and the weather condition in the image.",
-                "Describe the traffic condition on the road in the image.",
-            ],
-            "media": [
-                str(test_data_root / "inpaint.png"),
-                str(test_data_root / "61.jpg"),
-            ],
-        },
-        "audio": {
-            "prompt": [
-                "Transcribe the audio clip into text, please don't add other text.",
-                "Transcribe the audio clip into text, please don't add other text.",
-            ],
-            "media": [
-                str(audio_data_root /
-                    "what_is_the_traffic_sign_in_the_image.wav"),
-                str(audio_data_root / "what_is_shown_in_this_image.wav"),
-            ],
-        },
-        "image_audio": {
-            "prompt": [
-                "",
-            ],
-            "media": [
-                str(test_data_root / "inpaint.png"),
-                str(audio_data_root / "what_is_shown_in_this_image.wav"),
-            ],
-        }
-    }
-    cmd = [
-        str(example_root / "quickstart_multimodal.py"),
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        "--modality",
-        modality,
-        "--prompt",
-        *accuracy_inputs[modality]["prompt"],
-        "--media",
-        *accuracy_inputs[modality]["media"],
-        # Set max_seq_len to 4096 to use short rope factor.
-        "--max_seq_len=4096",
-        "--load_lora",
-        "--auto_model_name",
-        "Phi4MMForCausalLM",
-    ]
-    output = llm_venv.run_cmd(cmd, caller=check_output)
-
-    print("Sanity check passed!")
-
-
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
@@ -1777,10 +1695,7 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
     output = llm_venv.run_cmd(cmd, caller=check_output)
     print("output:", output)
 
-    # Set match ratio based on model
     match_ratio = 4.0 / 5
-    if model_name.startswith("Phi-4-multimodal-instruct"):
-        match_ratio = 0.6
 
     # Check output accuracy
     parsed_outputs = parse_output(output)
@@ -1854,39 +1769,39 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     print("Success: HF model logits match TRTLLM logits!")
 
 
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("model_name,model_path", [
-    ("DeepSeek-R1-Distill-Qwen-7B", "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"),
-])
-def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
-    print(f"Testing scaffolding {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "scaffolding"))
-    input_file = Path(os.path.join(example_root, "test.jsonl"))
-    llm_venv.run_cmd([
-        str(example_root / "run_majority_vote_aime24.py"),
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        f"--jsonl_file={input_file}",
-        "--threshold=0.5",
-    ])
-
-
 @pytest.mark.timeout(5400)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("eval_task", ["mmlu"])
 @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 16), (8, 2, 8)],
                          ids=["tp16", "tp8pp2"])
-@pytest.mark.parametrize("model_path", [
-    pytest.param('Qwen3/Qwen3-235B-A22B', marks=skip_pre_hopper),
+@pytest.mark.parametrize("model_path,llm_api_config", [
+    pytest.param('Qwen3/Qwen3-235B-A22B',
+                 None,
+                 marks=skip_pre_hopper,
+                 id='Qwen3/Qwen3-235B-A22B'),
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
-                 marks=skip_pre_blackwell),
-    pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
-    pytest.param('Kimi-K2-Thinking-NVFP4', marks=skip_pre_blackwell),
-    pytest.param('MiniMax-M3', marks=skip_pre_blackwell),
+                 None,
+                 marks=skip_pre_blackwell,
+                 id='Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf'),
+    pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4',
+                 None,
+                 marks=skip_pre_blackwell,
+                 id='DeepSeek-R1/DeepSeek-R1-0528-FP4'),
+    pytest.param('Kimi-K2-Thinking-NVFP4',
+                 None,
+                 marks=skip_pre_blackwell,
+                 id='Kimi-K2-Thinking-NVFP4'),
+    pytest.param('MiniMax-M3',
+                 _MINIMAX_M3_EVAL_CONFIG,
+                 marks=skip_pre_blackwell,
+                 id='MiniMax-M3'),
 ])
-def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
-                          mmlu_dataset_root):
+def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
+                                                                         Any]],
+                          tp_size: int, pp_size: int, ep_size: int,
+                          eval_task: str, tmp_path: Path,
+                          mmlu_dataset_root: str) -> None:
     mmlu_threshold = 81.5
     model_dir = f"{llm_models_root()}/{model_path}"
     run_cmd = [
@@ -1904,6 +1819,11 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
         run_cmd.append("--trust_remote_code")
     else:
         run_cmd.append(f"--tokenizer={model_dir}")
+
+    if llm_api_config is not None:
+        config_path = tmp_path / "llm_api_config.yaml"
+        config_path.write_text(yaml.safe_dump(llm_api_config))
+        run_cmd.append(f"--config={config_path}")
 
     run_cmd.extend([eval_task, f"--dataset_path={mmlu_dataset_root}"])
 
@@ -1933,8 +1853,6 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
                  marks=skip_pre_hopper),
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
                  marks=skip_pre_blackwell),
-    pytest.param('DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B',
-                 marks=skip_pre_hopper),
     pytest.param('llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8',
                  marks=skip_pre_hopper),
     pytest.param('llama4-models/Llama-4-Scout-17B-16E-Instruct',
@@ -1960,6 +1878,7 @@ def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
             backend='pytorch',
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
+            max_seq_len=8192 if "Llama-4" in model_path else None,
             max_num_tokens=4096,
             max_batch_size=1,
             cuda_graph_config=CudaGraphConfig(),
@@ -2028,8 +1947,23 @@ def test_eagle3_output_repetition_4gpus(model_dir: str, draft_model_dir: str):
         CudaGraphConfig(),
     }
 
-    # Test prompt
-    prompt = "Who are you?"
+    # Test prompt. It has to go through the chat template: a bare string makes
+    # the model continue arbitrary text instead of answering a turn, so it
+    # never emits <|im_end|> and keeps generating until it hits max_tokens --
+    # by which point it is looping over whatever it last said. That
+    # degeneration comes from the prompt, not from Eagle3, and it is what made
+    # this test flaky (nvbugs/6627979).
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(target_model_dir)
+    prompt = tokenizer.apply_chat_template(
+        [{
+            "role": "user",
+            "content": "Who are you?"
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
     sampling_params = SamplingParams(max_tokens=1024, temperature=0)
 
     # Run with Eagle3

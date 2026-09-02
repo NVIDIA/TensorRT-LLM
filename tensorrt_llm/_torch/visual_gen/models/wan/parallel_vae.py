@@ -80,13 +80,64 @@ def _native_decode_chunk_size(
 class WanCausalConvHalo(HaloExchangeConv):
     """HaloExchangeConv for WanCausalConv3d, which takes an extra cache_x arg."""
 
-    def forward(self, x, cache_x=None, *args, **kwargs):
+    def __init__(
+        self,
+        module: nn.Module,
+        chunk_dim: int,
+        adj_groups: list[torch.distributed.ProcessGroup | None],
+        rank: int,
+        world_size: int,
+    ) -> None:
+        super().__init__(module, chunk_dim, adj_groups, rank, world_size)
+        self._local_output_spatial_padding = self._get_local_output_spatial_padding()
+
+    def _get_local_output_spatial_padding(self) -> tuple[int, int] | None:
+        """Return spatial padding that avoids computing halo outputs.
+
+        After exchanging ``p`` samples on both sides, a centered ``2p + 1``
+        stride-1 convolution emits the original local extent when padding on
+        the split axis is zero. Other geometries retain pad-then-strip.
+        """
+        if not isinstance(self.module, wan_vae.WanCausalConv3d):
+            return None
+
+        # ``chunk_dim`` indexes NCTHW, while ``spatial_padding`` indexes HW.
+        conv_axis = self.chunk_dim - 2
+        spatial_axis = self.chunk_dim - 3
+        if (
+            self.module.stride[conv_axis] != 1
+            or self.module.dilation[conv_axis] != 1
+            or self.module.kernel_size[conv_axis] % 2 != 1
+            or self.module.padding[conv_axis] != self.halo_left
+            or self.module.padding[conv_axis] != self.halo_right
+        ):
+            return None
+
+        spatial_padding = list(self.module.padding[1:])
+        spatial_padding[spatial_axis] = 0
+        return (spatial_padding[0], spatial_padding[1])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache_x: torch.Tensor | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
         if self.halo_left == 0 and self.halo_right == 0:
             return self.module(x, cache_x, *args, **kwargs)
 
         x = self._exchange_halos(x)
         if cache_x is not None:
             cache_x = self._exchange_halos(cache_x)
+        if self._local_output_spatial_padding is not None:
+            return self.module(
+                x,
+                cache_x,
+                *args,
+                spatial_padding=self._local_output_spatial_padding,
+                **kwargs,
+            )
         result = self.module(x, cache_x, *args, **kwargs)
         return self._strip_halo(result)
 
@@ -244,10 +295,9 @@ class ParallelVAE_Wan(ParallelVAEBase):
 
 
 # Two parallel-VAE wrappers, one per VAE *class* (not a temporary transition):
-#   ParallelVAE_Wan       wraps the diffusers AutoencoderKLWan -- used by Cosmos3
-#                         (models/cosmos3) and the Wan TRTLLM_USE_DIFFUSER_VAE
-#                         debug fallback.
-#   ParallelVAE_TrtllmWan wraps the native WanVAE -- the default for Wan2.1/2.2.
+#   ParallelVAE_Wan       wraps the diffusers AutoencoderKLWan -- used by the
+#                         TRTLLM_USE_DIFFUSER_VAE debug fallback for Wan and Cosmos3.
+#   ParallelVAE_TrtllmWan wraps the native WanVAE -- the default for Wan and Cosmos3.
 # They share all splitting logic via the base class; only the conv3d/attention
 # module classes differ. ParallelVAE_Wan stays as long as any model uses the
 # diffusers AutoencoderKLWan.

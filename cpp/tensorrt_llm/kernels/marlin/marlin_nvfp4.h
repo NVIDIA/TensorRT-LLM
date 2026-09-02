@@ -30,6 +30,11 @@ inline bool isMarlinNvfp4SmSupported(int sm)
     return sm >= 89 && sm < 100;
 }
 
+inline bool isMarlinNvfp4DenseSmSupported(int sm)
+{
+    return isMarlinNvfp4SmSupported(sm) || sm == 120 || sm == 121;
+}
+
 void dequantFp4Activations(
     void const* act_fp4, void const* act_sf, float const* alpha, void* act_bf16, int m, int k, cudaStream_t stream);
 

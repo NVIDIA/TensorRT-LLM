@@ -11,6 +11,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
     gen_multimodal_cache_key_tokens,
 )
 
+pytestmark = pytest.mark.cpu_only
+
+
 _HASH_INTS = (1, 2, 3, 4, 5, 6, 7, 8)
 _OTHER_HASH_INTS = (8, 7, 6, 5, 4, 3, 2, 1)
 

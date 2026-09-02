@@ -28,6 +28,8 @@ from typing import Any, Dict, List
 
 import yaml
 
+DEFAULT_SERVER_HEALTH_TIMEOUT = 1800
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -54,6 +56,17 @@ def parse_args():
 def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
+
+
+def get_server_health_timeout(env_config: Dict[str, Any]) -> int:
+    """Return the configured server health timeout in seconds."""
+    timeout = env_config.get('server_health_timeout',
+                             DEFAULT_SERVER_HEALTH_TIMEOUT)
+    if isinstance(timeout,
+                  bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise ValueError(
+            "environment.server_health_timeout must be a positive integer")
+    return timeout
 
 
 def save_worker_config(worker_config, output_path):
@@ -291,15 +304,17 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         upsert_env_config(env_config, 'worker_env_var',
                           'TRTLLM_DISAGG_BENCHMARK_GEN_ONLY',
                           'TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1')
-    if benchmark_mode == "gen_only":
-        upsert_env_config(env_config, 'worker_env_var',
+    if benchmark_mode == "gen_only" and role == "GEN":
+        # GEN worker only: skipping transfer-state polling helps the generation
+        # worker, but the same flag on the CTX worker has been seen to hang
+        # gen_only runs with KV blocks never released.
+        upsert_env_config(env_config, 'gen_worker_env_var',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1')
-        if role == "GEN":
-            concurrency = _parse_positive_concurrency(concurrency)
-            upsert_env_config(env_config, 'gen_worker_env_var',
-                              'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
-                              f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
+        concurrency = _parse_positive_concurrency(concurrency)
+        upsert_env_config(env_config, 'gen_worker_env_var',
+                          'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
+                          f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
 
     # 2. Add profiling env vars to env_config (conditional)
     if nsys_on:
@@ -734,12 +749,17 @@ def submit_job(config, log_dir, dry_run):
     )
 
     # Generate wait server command (use script_dir for wait_server.sh)
+    server_health_timeout = get_server_health_timeout(env_config)
+    wait_server_script = os.path.join(script_dir, 'wait_server.sh')
+    wait_server_command = (
+        f"bash {wait_server_script} {disagg_server_hostname} "
+        f"{disagg_server_port} {server_health_timeout}")
     cmd = [
         "srun -l",
         f"--container-name={container_name}",
         f"--container-mounts={container_mount_str}",
         f"--mpi=pmix --overlap -N 1 -n 1",
-        f"bash {os.path.join(script_dir, 'wait_server.sh')} {disagg_server_hostname} {disagg_server_port}",
+        wait_server_command,
         f"&> {log_dir}/5_wait_server.log",
     ]
     start_server_cmds.append(" ".join(cmd))

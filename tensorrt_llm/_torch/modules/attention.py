@@ -23,9 +23,12 @@ from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..pyexecutor.breakable_cuda_graph import (eager_on_graph,
+                                               is_in_breakable_cuda_graph)
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_enabled, is_torch_compiling)
-from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+                     is_torch_compiling)
+from .linear import (Linear, TensorParallelMode, WeightMode,
+                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
@@ -114,6 +117,9 @@ def attn_custom_op_inplace(
         relative_attention_bias=relative_attention_bias,
         relative_attention_max_distance=relative_attention_max_distance,
     )
+
+
+maybe_bcg_attn_custom_op_inplace = eager_on_graph(attn_custom_op_inplace)
 
 
 def _helix_zero_kv_mask(
@@ -609,7 +615,7 @@ class Attention(nn.Module):
         attn_cls = get_attention_backend(self.attn_backend,
                                          sparse_params=sparse_params)
 
-        self.is_marlin_enabled: bool = is_nvfp4_marlin_enabled()
+        self.is_marlin_enabled = False
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -698,7 +704,9 @@ class Attention(nn.Module):
         self.attn.update_quant_config(self.quant_config)
 
         self.o_proj.create_weights()
-        self.has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
+        self.is_marlin_enabled = self.o_proj.uses_marlin_nvfp4
+        self.has_quant_scale = (self.o_proj.has_fp8_qdq
+                                or self.o_proj.has_nvfp4_activation_quantization
                                 or self.o_proj.has_fp8_block_scales
                                 or self.o_proj.has_fp8_rowwise
                                 or self.o_proj.has_w4a8_nvfp4_fp8)
@@ -761,6 +769,12 @@ class Attention(nn.Module):
         # If o_proj does dynamic activation quantization, it computes its own scales
         # at runtime from a BF16 input — attention must NOT pre-quantize output
         if self.o_proj.force_dynamic_quantization:
+            return False
+
+        # Producing FP4 output requires a calibrated activation scale on the
+        # consumer. Weight-only W4A16 has NVFP4 weights but consumes BF16/FP16.
+        if (self.o_proj.has_nvfp4
+                and not is_static_nvfp4_input_eligible(self.o_proj)):
             return False
 
         # If no quant is applied, no need to quantize the output
@@ -954,20 +968,19 @@ class Attention(nn.Module):
             if "mrope_position_deltas" in mrope_config:
                 mrope_position_deltas = mrope_config["mrope_position_deltas"]
 
-        # Currently only TRTLLM and FLASHINFER are torch compile compatible backends.
-        # Only enable custom inplace op when torch compiling.
-        use_custom_inplace_op = (self.register_to_config
-                                 and (self.attn_backend == "TRTLLM"
-                                      or self.attn_backend == "FLASHINFER")
-                                 and is_torch_compiling()
-                                 and not self.is_marlin_enabled)
+        # Currently only TRTLLM and FLASHINFER support the custom inplace op.
+        use_custom_inplace_op = (
+            self.register_to_config and
+            (self.attn_backend == "TRTLLM" or self.attn_backend == "FLASHINFER")
+            and (is_torch_compiling() or is_in_breakable_cuda_graph())
+            and not self.is_marlin_enabled)
 
         if use_custom_inplace_op:
             outputs = create_attn_outputs(q, attention_mask, self.layer_idx_str)
             assert len(outputs) == 1 or len(outputs) == 2
             output = outputs[0]
             output_sf = outputs[1] if len(outputs) == 2 else None
-            attn_custom_op_inplace(
+            maybe_bcg_attn_custom_op_inplace(
                 q,
                 k,
                 v,
@@ -1039,18 +1052,16 @@ class Attention(nn.Module):
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)
 
-        qkv = self.qkv_proj(hidden_states)
-
         if bool(lora_params):
-            qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
-                                              self.layer_idx)
-            if qkv_lora is not None:
-                qkv = qkv + qkv_lora
-
-            qkv_lora = self.fused_qkv_lora(hidden_states, lora_params,
-                                           self.layer_idx)
-            if qkv_lora is not None:
-                qkv = qkv + qkv_lora
+            qkv = LoraLayer.forward_with_base(
+                lambda: self.qkv_proj(hidden_states),
+                (self.splitted_qkv_lora, self.fused_qkv_lora),
+                hidden_states,
+                lora_params,
+                self.layer_idx,
+            )
+        else:
+            qkv = self.qkv_proj(hidden_states)
 
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).

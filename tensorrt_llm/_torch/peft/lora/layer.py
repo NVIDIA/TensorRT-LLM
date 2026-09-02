@@ -1,10 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Dict, List, Optional
 
 import torch
 
+from ...modules.multi_stream_utils import (do_multi_stream,
+                                           maybe_execute_in_parallel)
 from .cuda_graph_lora_params import CudaGraphLoraParams
+
+_FP8_LORA_TMA_ALIGNMENT = 16
+
+
+def _validate_fp8_lora_cuda_graph_alignment(slot_ranks_host: torch.Tensor,
+                                            hidden_size: int,
+                                            output_hidden_sizes: List[int],
+                                            max_rank: int) -> int:
+    if max_rank < _FP8_LORA_TMA_ALIGNMENT or max_rank % _FP8_LORA_TMA_ALIGNMENT != 0:
+        raise ValueError(
+            f"FP8 LoRA CUDA graph mode requires max LoRA rank to be a "
+            f"multiple of {_FP8_LORA_TMA_ALIGNMENT} and at least "
+            f"{_FP8_LORA_TMA_ALIGNMENT}. Got max rank {max_rank}.")
+
+    active_ranks = slot_ranks_host[slot_ranks_host > 0]
+    if active_ranks.numel() > 0:
+        min_active_rank = int(active_ranks.min().item())
+        has_misaligned_rank = bool(
+            torch.any(active_ranks % _FP8_LORA_TMA_ALIGNMENT != 0).item())
+        if min_active_rank < _FP8_LORA_TMA_ALIGNMENT or has_misaligned_rank:
+            raise ValueError(
+                f"FP8 LoRA CUDA graph mode requires active LoRA ranks "
+                f"to be multiples of {_FP8_LORA_TMA_ALIGNMENT} and at "
+                f"least {_FP8_LORA_TMA_ALIGNMENT}. Got active ranks "
+                f"{active_ranks.tolist()}.")
+    else:
+        min_active_rank = max_rank
+
+    fp8_dims = [hidden_size, *output_hidden_sizes]
+    misaligned_dims = [
+        dim for dim in fp8_dims if dim % _FP8_LORA_TMA_ALIGNMENT != 0
+    ]
+    if misaligned_dims:
+        raise ValueError(
+            f"FP8 LoRA CUDA graph mode requires hidden and output sizes "
+            f"to be multiples of {_FP8_LORA_TMA_ALIGNMENT}. Got "
+            f"{fp8_dims}.")
+
+    return min(hidden_size, min_active_rank)
 
 
 @dataclass
@@ -157,6 +214,13 @@ MOE_LORA_MODULE_TO_KERNEL_SLOT = {
 }
 
 
+def add_lora_result(output: torch.Tensor,
+                    lora_result: Optional[torch.Tensor]) -> torch.Tensor:
+    if lora_result is not None:
+        output.add_(lora_result.to(output.dtype))
+    return output
+
+
 class LoraLayer(torch.nn.Module):
 
     def __init__(self, lora_module_types: List[LoraModuleType],
@@ -167,6 +231,79 @@ class LoraLayer(torch.nn.Module):
         self.output_hidden_sizes = output_hidden_sizes
         assert len(lora_module_types) == len(output_hidden_sizes)
 
+        self._par_events: List[torch.cuda.Event] | None = None
+
+    @staticmethod
+    def forward_with_base(
+        base_forward: Callable[[], torch.Tensor],
+        lora_layers: tuple["LoraLayer", ...],
+        x: torch.Tensor,
+        lora_params: dict,
+        layer_idx: int | None,
+    ) -> torch.Tensor:
+        """
+        Run the base and LoRA branches and merge their outputs.
+
+        Args:
+            base_forward: Forward call for base model projection
+            lora_layers: Tuple of LoRA layers to be called
+            x: Input tensor
+            lora_params: CUDA Graph compatible LoRA parameters
+            layer_idx: Current layer index
+
+        Returns:
+            LoRA + base model output tensor
+
+        Note that lora_layers needs to be a tuple in order to
+        handle fused/unfused modules (e.g., QKV), where both
+        variants are invoked but only one runs through.
+        """
+        cuda_graph_params = lora_params.get('cuda_graph_params')
+        has_lora_layer = bool(cuda_graph_params) and any(
+            CudaGraphLoraParams.LoraLayerKey(
+                layer_idx=layer_idx,
+                module_ids=tuple(layer.lora_module_types),
+            ) in cuda_graph_params.layer_info for layer in lora_layers)
+
+        lora_aux_stream = lora_params.get("lora_aux_stream")
+        execute_in_parallel = (has_lora_layer and lora_aux_stream is not None
+                               and do_multi_stream()
+                               and not torch.compiler.is_compiling())
+
+        # Pack all LoRA forwards (e.g., fused/unfused) in a single tuple
+        def lora_forward() -> tuple[torch.Tensor | None, ...]:
+            return tuple(
+                lora_layer(x, lora_params, layer_idx)
+                for lora_layer in lora_layers)
+
+        if execute_in_parallel:
+            assert lora_aux_stream is not None
+            # Lazy allocation of parallel events
+            if lora_layers[0]._par_events is None:
+                lora_layers[0]._par_events = [
+                    torch.cuda.Event(), torch.cuda.Event()
+                ]
+
+            base_output, lora_outputs = maybe_execute_in_parallel(
+                base_forward,
+                lora_forward,
+                lora_layers[0]._par_events[0],
+                lora_layers[0]._par_events[1],
+                lora_aux_stream,
+                disable_on_compile=True,
+            )
+        else:
+            base_output, lora_outputs = base_forward(), lora_forward()
+
+        for lora_output in lora_outputs:
+            if not isinstance(lora_output, torch.Tensor):
+                continue
+            if execute_in_parallel:
+                lora_output.record_stream(torch.cuda.current_stream())
+            base_output = add_lora_result(base_output, lora_output)
+
+        return base_output
+
     def forward(
         self,
         x,
@@ -174,16 +311,30 @@ class LoraLayer(torch.nn.Module):
         layer_idx: int,
     ) -> Optional[torch.Tensor]:
 
-        if bool(lora_params):
-            # Check if we're using CUDA Graph mode
-            use_cuda_graph_mode = lora_params.get('use_cuda_graph_mode', False)
-
-            if use_cuda_graph_mode:
-                return self._forward_cuda_graph_mode(x, lora_params, layer_idx)
-            else:
-                return self._forward_eager_mode(x, lora_params, layer_idx)
-        else:
+        if not bool(lora_params):
             return None
+
+        input_dtype = x.dtype
+        data_type = lora_params.get("data_type")
+        if data_type is not None and input_dtype != data_type:
+            if data_type == torch.float8_e4m3fn and input_dtype in (
+                    torch.float16, torch.bfloat16, torch.float32):
+                fp8_max = torch.finfo(data_type).max
+                x = x.clamp(min=-fp8_max, max=fp8_max).to(data_type)
+            else:
+                raise TypeError(
+                    f"LoRA input dtype {input_dtype} must match PEFT cache dtype "
+                    f"{data_type}.")
+
+        use_cuda_graph_mode = lora_params.get("use_cuda_graph_mode", False)
+        if use_cuda_graph_mode:
+            result = self._forward_cuda_graph_mode(x, lora_params, layer_idx)
+        else:
+            result = self._forward_eager_mode(x, lora_params, layer_idx)
+
+        if isinstance(result, torch.Tensor) and result.dtype != input_dtype:
+            result = result.to(input_dtype)
+        return result
 
     def prepare_grouped_gemm_buffers(self, input: GroupedGemmParamsInput):
         device = input.x.device
@@ -429,15 +580,20 @@ class LoraLayer(torch.nn.Module):
 
         # Skip layers that don't have LoRA modules
         if layer_params is None:
-            return 0  # Pass-through for layers without LoRA modules
+            return None  # Pass-through for layers without LoRA modules
 
         batch_size, hidden_size = x.shape[0], x.shape[-1]
         num_layer_modules = len(self.lora_module_types)
         max_rank = cuda_graph_params.max_rank
         total_output_size = sum(self.output_hidden_sizes)
-        min_kn = min(
-            hidden_size, 8, max_rank
-        )  # TODO: hardcode to 8 for now, for alignments in kernels, might have alignment error if rank is less than 8!
+        if x.dtype == torch.float8_e4m3fn:
+            min_kn = _validate_fp8_lora_cuda_graph_alignment(
+                cuda_graph_params.slot_ranks_host, hidden_size,
+                self.output_hidden_sizes, max_rank)
+        else:
+            min_kn = min(
+                hidden_size, 8, max_rank
+            )  # TODO: hardcode to 8 for now, for alignments in kernels, might have alignment error if rank is less than 8!
 
         output_buffer = torch.empty(batch_size,
                                     total_output_size,
@@ -482,8 +638,13 @@ class LoraLayer(torch.nn.Module):
             host_max_out_sizes, grouped_gemm_params.splitk_offsets,
             grouped_gemm_params.reordered_input.dtype, min_kn)
 
+        # PyTorch does not implement index_copy_ for FP8 tensors.
+        if output_buffer.dtype == torch.float8_e4m3fn:
+            output_buffer = output_buffer.to(torch.bfloat16)
+
         # TODO: move to kernel
-        restored_output = torch.zeros_like(output_buffer)
+        # sorted_ids is a permutation, so index_copy_ initializes every row.
+        restored_output = torch.empty_like(output_buffer)
         restored_output.index_copy_(0,
                                     cuda_graph_params.sorted_ids[:batch_size],
                                     output_buffer)

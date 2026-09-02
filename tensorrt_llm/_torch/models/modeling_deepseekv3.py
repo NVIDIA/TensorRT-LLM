@@ -60,13 +60,12 @@ from ..modules.attention import (maybe_allgather_for_helix_cp,
                                  maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
-                                 MoEWeightLoadingMode, create_moe)
-from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.mla import MLA
+from ..moe.fused_moe import (DeepSeekV3MoeRoutingMethod, MoEWeightLoadingMode,
+                             create_moe, is_moe_weight_owner)
 
 # isort: off
-from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
+from ..moe.fused_moe.routing import Deepseekv3RoutingImpl
 # isort: on
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightsLoadingConfig,
@@ -604,7 +603,7 @@ class DeepseekV3WeightLoader:
                     # Mark consumed experts weights
                     if mark_consumed:
                         weights.mark_consumed(name)
-                elif names[-1] == "backend" and isinstance(module, MoE):
+                elif names[-1] == "backend" and is_moe_weight_owner(module):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
                     # After MoE refactoring, ConfigurableMoE now has a backend submodule,
@@ -1150,9 +1149,6 @@ class Deepseekv3MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
-            **({
-                "alltoall_result_do_sum": False
-            } if isinstance(self.experts, WideEPMoE) else {}),
         )
 
         return routed_output
@@ -1901,36 +1897,31 @@ class DeepseekV3Model(DecoderModel):
         return hidden_states
 
 
-@register_auto_model("GlmMoeDsaForCausalLM")
 @register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 
     @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for this model implementation."""
+        return "V2"
+
+    @classmethod
     def get_preferred_transceiver_runtime(
             cls,
             pretrained_config: Any = None
     ) -> Optional[Literal["CPP", "PYTHON"]]:
-        """Preferred KV-cache transceiver runtime, differentiated per checkpoint.
+        """Preferred KV-cache transceiver runtime.
 
-        ``DeepseekV3ForCausalLM`` / ``DeepseekV32ForCausalLM`` use MLA attention, which transfers
-        a large latent KV that the Python (v2) transceiver handles better in disaggregated
-        serving, so they prefer the Python transceiver. GLM 5.2 (``GlmMoeDsaForCausalLM`` /
-        ``glm_moe_dsa``) uses a per-layer masked DSA indexer k-cache pool (cross-layer indexer
-        sharing) that the Python transceiver does not support, so GLM checkpoints must use the
-        C++ transceiver, which handles both the masked pool and dense indexer layouts. Applied
-        only when ``cache_transceiver_config.transceiver_runtime`` is 'auto'; an explicit runtime
+        ``DeepseekV3ForCausalLM`` and ``DeepseekV32ForCausalLM`` use MLA
+        attention, which transfers a large latent KV that the Python (v2)
+        transceiver handles better in disaggregated serving. Applied only when
+        ``cache_transceiver_config.transceiver_runtime`` is 'auto'; an explicit runtime
         is always respected.
         """
-        if pretrained_config is not None:
-            architectures = getattr(pretrained_config, 'architectures',
-                                    None) or []
-            # model_type is checked as a fallback: it is 'glm_moe_dsa' on GLM
-            # checkpoints until __init__ rewrites it to 'deepseek_v32'.
-            if ("GlmMoeDsaForCausalLM" in architectures or getattr(
-                    pretrained_config, 'model_type', None) == 'glm_moe_dsa'):
-                return "CPP"
         return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
@@ -2096,3 +2087,16 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                         layer.mlp.experts.fuse_shared_expert(
                             layer.mlp.shared_experts)
                         layer.mlp.shared_experts = None
+
+
+@register_auto_model("GlmMoeDsaForCausalLM")
+class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
+    """GLM 5.2 model flavor with an independent transceiver preference."""
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer Python for GLM 5.2's masked DSA indexer K-cache transfer."""
+        return "PYTHON"

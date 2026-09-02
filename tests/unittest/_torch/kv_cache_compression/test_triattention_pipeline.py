@@ -30,6 +30,7 @@ from conftest import make_bare_staging as _make_bare_staging
 from conftest import make_fake_v2 as _make_fake_v2
 from conftest import make_request as _make_request
 from conftest import make_staging_manager as _make_staging_manager
+from conftest import make_test_pretrained_config as _make_test_pretrained_config
 from conftest import make_tri_config as _make_tri_config
 from conftest import make_triattention as _make_triattention
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
@@ -68,16 +69,24 @@ def _make_hf_config(**values):
     return SimpleNamespace(get_text_config=lambda: text_config)
 
 
+def _factory_model_engine(pretrained_config: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        mapping=SimpleNamespace(has_cp_helix=lambda: False),
+        spec_config=None,
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                pretrained_config=pretrained_config,
+                quant_config=None,
+            )
+        ),
+    )
+
+
 class TestConfigAndFactory:
-    def test_factory_allows_block_reuse_and_propagates_config_fields(self):
+    def test_factory_allows_block_reuse_and_propagates_config_fields(self) -> None:
         # The factory contract is independent of GPU-owned persistent buffers.
         fake_v2 = _make_fake_v2(enable_block_reuse=True)
         cfg = _make_tri_config(budget=32, beta=16, eviction_mode="per_head")
-        validate_kv_cache_compression_compatibility(
-            cfg,
-            SimpleNamespace(enable_block_reuse=True),
-            None,
-        )
         with (
             mock.patch(
                 "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
@@ -87,7 +96,12 @@ class TestConfigAndFactory:
                 TriAttentionCompressionManager, "_initialize_eviction_state"
             ) as initialize,
         ):
-            mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)
+            mgr = create_kv_cache_compression_manager(
+                cfg,
+                model_engine=_factory_model_engine(_make_test_pretrained_config()),
+                kv_cache_config=SimpleNamespace(enable_block_reuse=True),
+            )
+            mgr.bind_kv_cache_managers(fake_v2)
         assert isinstance(mgr, TriAttentionCompressionManager)
         assert mgr.budget == 32
         assert mgr.beta == 16
@@ -104,7 +118,7 @@ class TestTriAttentionCompressionManager:
     def test_loads_flat_pt(self, flat_calibration_pt):
         mgr = _make_triattention()
         mgr.calibration_path = flat_calibration_pt
-        mgr.model_path = None
+        mgr.pretrained_config = None
         mgr._load_calibration()
 
         assert torch.equal(mgr._omega, torch.arange(4, dtype=torch.float32))
@@ -208,7 +222,9 @@ class TestTriAttentionCompressionManager:
         )
         mgr.calibration_path = str(calibration_path)
 
-        mgr.model_path = plain
+        from transformers import AutoConfig
+
+        mgr.pretrained_config = AutoConfig.from_pretrained(plain)
         mgr._load_calibration()
         omega = mgr._omega
         freq_scale_sq = mgr._freq_scale_sq
@@ -216,7 +232,17 @@ class TestTriAttentionCompressionManager:
         torch.testing.assert_close(omega, (1.0 / (1000000.0 ** (idx / 64)))[:freq_count])
         assert torch.equal(freq_scale_sq, torch.ones(freq_count))
 
-        mgr.model_path = yarn
+        # The executor's config loader clears rope_parameters for default
+        # (unscaled) RoPE and keeps the canonical value on config.rope_theta.
+        engine_cfg = AutoConfig.from_pretrained(plain)
+        engine_cfg.rope_parameters = None
+        engine_cfg.rope_theta = 1000000.0
+        mgr.pretrained_config = engine_cfg
+        mgr._load_calibration()
+        torch.testing.assert_close(mgr._omega, omega)
+        assert torch.equal(mgr._freq_scale_sq, torch.ones(freq_count))
+
+        mgr.pretrained_config = AutoConfig.from_pretrained(yarn)
         mgr._load_calibration()
         omega_yarn = mgr._omega
         freq_scale_sq_yarn = mgr._freq_scale_sq
@@ -269,7 +295,7 @@ class TestEvictionLifecycle:
     @staticmethod
     def _make_due_decode_request(seq_len, *, num_extra_kv_tokens=0, kv_reserve_draft_tokens=0):
         # The growth and protected-tail capacity constants snapshot the
-        # manager at construction, so the reserve widths are set up front.
+        # manager at binding, so the reserve widths are set up front.
         request = _make_request(
             7,
             py_prompt_len=1024,
@@ -280,7 +306,11 @@ class TestEvictionLifecycle:
         fake_v2.num_extra_kv_tokens = num_extra_kv_tokens
         fake_v2._kv_reserve_draft_tokens = kv_reserve_draft_tokens
         with mock.patch.object(TriAttentionCompressionManager, "_initialize_eviction_state"):
-            mgr = TriAttentionCompressionManager(_make_tri_config(budget=8), fake_v2)
+            mgr = TriAttentionCompressionManager(
+                _make_tri_config(budget=8),
+                pretrained_config=_make_test_pretrained_config(),
+            )
+            mgr.bind_kv_cache_managers(fake_v2)
         cache = SimpleNamespace(
             capacity=seq_len,
             history_length=1024,
@@ -420,13 +450,12 @@ class TestEvictionLifecycle:
     def test_one_model_draft_co_compression_is_accepted(self, spec_mode):
         draft_manager = _make_fake_v2(is_draft=True)
         with mock.patch.object(TriAttentionCompressionManager, "_initialize_eviction_state"):
-            TriAttentionCompressionManager(
+            manager = TriAttentionCompressionManager(
                 _make_tri_config(budget=8),
-                _make_fake_v2(),
-                draft_kv_cache_manager=draft_manager,
+                pretrained_config=_make_test_pretrained_config(),
             )
+            manager.bind_kv_cache_managers(_make_fake_v2(), draft_manager)
 
-        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_compatibility
         from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
 
         spec_config = (
@@ -439,11 +468,15 @@ class TestEvictionLifecycle:
             )
         )
 
-        validate_kv_cache_compression_compatibility(
-            _make_tri_config(budget=8),
-            SimpleNamespace(enable_block_reuse=False),
-            spec_config,
-        )
+        with mock.patch(
+            "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
+            return_value=True,
+        ):
+            validate_kv_cache_compression_compatibility(
+                _make_tri_config(budget=8),
+                SimpleNamespace(enable_block_reuse=False),
+                spec_config,
+            )
 
 
 class TestFixedScoreMetadata:
@@ -532,7 +565,6 @@ class TestKernelMaskedSwa:
     @pytest.mark.parametrize("budget,fits_window", [(128, True), (127, False)])
     def test_attention_layers_use_local_config_and_validate_window(self, budget, fits_window):
         mgr = _make_triattention()
-        mgr.model_path = "/models/gpt-oss"
         mgr.budget = budget
         mgr._global_layers = [0, 1, 2, 3]
         config = _make_hf_config(
@@ -545,17 +577,15 @@ class TestKernelMaskedSwa:
             sliding_window=128,
         )
 
-        with mock.patch("transformers.AutoConfig.from_pretrained", return_value=config) as load:
-            if not fits_window:
-                # The decode budget must cover the kernel-masked SWA window.
-                with pytest.raises(ValueError, match="budget=127"):
-                    mgr._resolve_attention_layers()
-                return
-            dense, sliding, window = mgr._resolve_attention_layers()
+        mgr.pretrained_config = config
 
-        load.assert_called_once_with(
-            "/models/gpt-oss", trust_remote_code=True, local_files_only=True
-        )
+        if not fits_window:
+            # The decode budget must cover the kernel-masked SWA window.
+            with pytest.raises(ValueError, match="budget=127"):
+                mgr._resolve_attention_layers()
+            return
+        dense, sliding, window = mgr._resolve_attention_layers()
+
         assert dense == [1, 3]
         assert sliding == [0, 2]
         assert window == 128

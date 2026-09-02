@@ -15,7 +15,9 @@
 """Unit tests for DSA C++ custom ops:
 
 - ``torch.ops.trtllm.indexer_k_cache_gather_op``
+- ``torch.ops.trtllm.indexer_k_cache_scatter_op``
 - ``torch.ops.trtllm.convert_req_index_to_global``
+- ``torch.ops.trtllm.convert_req_index_to_global_grouped``
 - ``torch.ops.trtllm.fused_cat_fp4``
 - ``torch.ops.trtllm.cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell``
 """
@@ -486,6 +488,220 @@ def test_convert_req_index_to_global_block_table_padding():
     )
 
     assert (out == -1).all(), "All outputs should be -1 when block_table is all padding"
+
+
+# ===================================================================
+# Test 2b: convert_req_index_to_global_grouped (cross-layer fan-out)
+# ===================================================================
+#
+# The grouped op emits ``[group_size, num_tokens, num_topk]`` in one launch;
+# slice ``[g]`` must be bit-identical to the single-layer op called with
+# ``layer_id = layer_ids[g]`` (same req_id / block_table / token_indices, only
+# the additive ``layer_id * block_size`` term differs per member). These tests
+# pin that equivalence directly against the shipped single-layer op (and the
+# Python reference), so no runtime shadow check is needed in the model path.
+
+
+def _reference_convert_req_index_to_global_grouped(
+    req_id: torch.Tensor,
+    block_table: torch.Tensor,
+    token_indices: torch.Tensor,
+    block_size: int,
+    stride_factor: int,
+    layer_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Reference for the grouped op: stack the single-layer reference over
+    ``layer_ids`` (all members share ``stride_factor``)."""
+    slices = [
+        _reference_convert_req_index_to_global(
+            req_id, block_table, token_indices, block_size, stride_factor, int(lid)
+        )
+        for lid in layer_ids.cpu().tolist()
+    ]
+    return torch.stack(slices, dim=0)
+
+
+def _make_convert_inputs(num_tokens, num_requests, num_topk, block_size, device, seed=42):
+    """Build (req_id, block_table, token_indices) with a mix of valid tokens,
+    invalid (-1) tokens, and block-table padding -- mirrors the single-op test."""
+    torch.manual_seed(seed)
+    max_kv_len = 4096
+    max_blocks_per_req = (max_kv_len + block_size - 1) // block_size
+
+    req_id = torch.randint(0, num_requests, (num_tokens,), dtype=torch.int32, device=device)
+
+    block_table = torch.randint(
+        0, 1000, (num_requests, max_blocks_per_req), dtype=torch.int32, device=device
+    )
+    # Padding (-1) in later blocks.
+    block_table[:, max_blocks_per_req // 2 :] = -1
+
+    max_valid_token = (max_blocks_per_req // 2) * block_size - 1
+    token_indices = torch.randint(
+        0, max(max_valid_token, 1), (num_tokens, num_topk), dtype=torch.int32, device=device
+    )
+    # Sprinkle -1s for invalid tokens (~20%).
+    invalid_mask = torch.rand(num_tokens, num_topk, device=device) < 0.2
+    token_indices[invalid_mask] = -1
+    return req_id, block_table, token_indices
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_requests,num_topk,block_size,stride_factor,layer_ids",
+    [
+        # group_size 1 (degenerate -- must still equal the single op).
+        (4, 2, 128, 64, 64, [0]),
+        # group_size 2, contiguous pool (stride_factor == block_size).
+        (4, 2, 128, 64, 64, [0, 1]),
+        # group_size 4, arbitrary / non-monotonic layer offsets, interleaved pool.
+        (8, 4, 256, 64, 192, [3, 0, 7, 1]),
+        # group_size 5 -- a typical MTP verification-window fan-out.
+        (16, 8, 256, 64, 320, [0, 1, 2, 3, 4]),
+        # top-k widths straddling the 256-thread block boundary.
+        (4, 2, 1, 64, 64, [0, 2]),
+        (4, 2, 255, 64, 64, [1, 0]),
+        (4, 2, 256, 64, 64, [0, 1]),
+        (4, 2, 257, 64, 64, [2, 5]),
+        (4, 2, 513, 64, 192, [0, 3, 1]),
+        (4, 2, 2048, 64, 192, [0, 1, 2, 3]),
+        # small block_size.
+        (8, 4, 128, 16, 16, [0, 1, 2]),
+        # single token, large layer offsets.
+        (1, 1, 128, 64, 64, [0, 4]),
+    ],
+)
+def test_convert_req_index_to_global_grouped(
+    num_tokens,
+    num_requests,
+    num_topk,
+    block_size,
+    stride_factor,
+    layer_ids,
+):
+    """Grouped op vs (1) the shipped single-layer op per member and (2) the
+    Python reference."""
+    device = torch.device("cuda")
+    req_id, block_table, token_indices = _make_convert_inputs(
+        num_tokens, num_requests, num_topk, block_size, device
+    )
+    layer_ids_t = torch.tensor(layer_ids, dtype=torch.int32, device=device)
+
+    grouped = torch.ops.trtllm.convert_req_index_to_global_grouped(
+        req_id, block_table, token_indices, block_size, num_topk, stride_factor, layer_ids_t
+    )
+    assert grouped.shape == (len(layer_ids), num_tokens, num_topk)
+
+    # (1) Each slice must be bit-identical to the shipped single-layer op.
+    for g, lid in enumerate(layer_ids):
+        single = torch.ops.trtllm.convert_req_index_to_global(
+            req_id, block_table, token_indices, block_size, num_topk, stride_factor, int(lid)
+        )
+        assert torch.equal(grouped[g], single), (
+            f"grouped slice {g} (layer_id={lid}) differs from the single-layer op"
+        )
+
+    # (2) And match the independent Python reference.
+    ref = _reference_convert_req_index_to_global_grouped(
+        req_id, block_table, token_indices, block_size, stride_factor, layer_ids_t
+    )
+    assert torch.equal(grouped, ref)
+
+
+def test_convert_req_index_to_global_grouped_noncontiguous():
+    """Non-contiguous inputs must produce the same result as the single op."""
+    device = torch.device("cuda")
+    num_tokens, num_requests, num_topk, block_size, stride_factor = 8, 4, 128, 64, 192
+    layer_ids = [2, 0, 1]
+    req_id, block_table, token_indices = _make_convert_inputs(
+        num_tokens, num_requests, num_topk, block_size, device
+    )
+    # Make token_indices and block_table non-contiguous via a stride-swapped view.
+    token_indices_nc = torch.as_strided(
+        token_indices, token_indices.shape, (1, token_indices.shape[0])
+    )
+    assert not token_indices_nc.is_contiguous()
+    block_table_nc = torch.as_strided(block_table, block_table.shape, (1, block_table.shape[0]))
+    assert not block_table_nc.is_contiguous()
+    layer_ids_t = torch.tensor(layer_ids, dtype=torch.int32, device=device)
+
+    grouped = torch.ops.trtllm.convert_req_index_to_global_grouped(
+        req_id, block_table_nc, token_indices_nc, block_size, num_topk, stride_factor, layer_ids_t
+    )
+    for g, lid in enumerate(layer_ids):
+        single = torch.ops.trtllm.convert_req_index_to_global(
+            req_id, block_table_nc, token_indices_nc, block_size, num_topk, stride_factor, int(lid)
+        )
+        assert torch.equal(grouped[g], single)
+
+
+def test_convert_req_index_to_global_grouped_oob_block_id():
+    """token indices whose block_id exceeds the block-table extent -> -1."""
+    device = torch.device("cuda")
+    num_tokens, num_topk, block_size, max_blocks_per_req = 2, 64, 16, 8
+    req_id = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    block_table = torch.full((1, max_blocks_per_req), 100, dtype=torch.int32, device=device)
+    # Every token maps to a block_id >= max_blocks_per_req.
+    token_indices = torch.full(
+        (num_tokens, num_topk),
+        max_blocks_per_req * block_size + 5,
+        dtype=torch.int32,
+        device=device,
+    )
+    layer_ids = torch.tensor([0, 1, 3], dtype=torch.int32, device=device)
+
+    out = torch.ops.trtllm.convert_req_index_to_global_grouped(
+        req_id, block_table, token_indices, block_size, num_topk, block_size, layer_ids
+    )
+    assert out.shape == (3, num_tokens, num_topk)
+    assert (out == -1).all(), "OOB block ids should map to -1 for all members"
+
+
+def test_convert_req_index_to_global_grouped_cuda_graph():
+    """The grouped op must be CUDA-graph-safe: capture once, then replay with
+    changed input contents and stay bit-exact vs eager."""
+    device = torch.device("cuda")
+    num_tokens, num_requests, num_topk, block_size, stride_factor = 8, 4, 256, 64, 192
+    layer_ids = [3, 0, 1, 2]
+    max_blocks_per_req = (4096 + block_size - 1) // block_size
+
+    # Static input buffers (graph capture pins these addresses).
+    req_id = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    block_table = torch.zeros(num_requests, max_blocks_per_req, dtype=torch.int32, device=device)
+    token_indices = torch.zeros(num_tokens, num_topk, dtype=torch.int32, device=device)
+    layer_ids_t = torch.tensor(layer_ids, dtype=torch.int32, device=device)
+
+    def fill(seed):
+        r, bt, ti = _make_convert_inputs(
+            num_tokens, num_requests, num_topk, block_size, device, seed=seed
+        )
+        req_id.copy_(r)
+        block_table.copy_(bt)
+        token_indices.copy_(ti)
+
+    fill(seed=1)
+    # Warmup on a side stream before capture.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        torch.ops.trtllm.convert_req_index_to_global_grouped(
+            req_id, block_table, token_indices, block_size, num_topk, stride_factor, layer_ids_t
+        )
+    torch.cuda.current_stream().wait_stream(s)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = torch.ops.trtllm.convert_req_index_to_global_grouped(
+            req_id, block_table, token_indices, block_size, num_topk, stride_factor, layer_ids_t
+        )
+
+    for seed in (2, 3):
+        fill(seed=seed)
+        graph.replay()
+        torch.cuda.synchronize()
+        ref = _reference_convert_req_index_to_global_grouped(
+            req_id, block_table, token_indices, block_size, stride_factor, layer_ids_t
+        )
+        assert torch.equal(out, ref), f"grouped op diverged on graph replay (seed={seed})"
 
 
 # ===================================================================

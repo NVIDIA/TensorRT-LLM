@@ -34,7 +34,7 @@ The PyTorch backend provides LoRA support, allowing you to:
 
 ```python
 from tensorrt_llm import LLM
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -118,6 +118,22 @@ llm = LLM(
 )
 ```
 
+#### Native FP8 adapter support
+
+The base model's quantization and the LoRA adapter's data type are independent. Dense LoRA modules can keep
+FP8 E4M3 adapter weights and execute them with native FP8 grouped GEMM kernels on the following architectures:
+
+| GPU architecture | Native FP8 adapter support |
+|---|---|
+| Hopper (SM90) | Yes |
+| Blackwell B200 (SM100) | Yes |
+| Blackwell (SM103/SM107) | No |
+| Blackwell (SM120/SM121) | No |
+
+If native FP8 LoRA kernels are unavailable for the current device or were excluded from the TensorRT-LLM build,
+the adapter weights are converted to the model compute data type. Native FP8 adapter weights are not supported
+for routed-expert MoE LoRA modules; see [Routed-Expert MoE LoRA](#routed-expert-moe-lora).
+
 ### NeMo LoRA Format
 
 ```python
@@ -159,7 +175,7 @@ LoRA can be applied to the routed-expert projections of a Mixture-of-Experts (Mo
 
 ```python
 from tensorrt_llm import LLM
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 
 lora_config = LoraConfig(
     lora_target_modules=[

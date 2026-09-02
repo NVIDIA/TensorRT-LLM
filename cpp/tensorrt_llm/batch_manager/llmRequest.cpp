@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
-#include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 namespace tensorrt_llm::batch_manager
 {
@@ -37,13 +36,16 @@ runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool
 {
     runtime::SizeType32 beamWidth = mSamplingConfig.beamWidth; // For non-Variable-Beam-Width-Search
     auto const& beamWidthArray = mSamplingConfig.beamWidthArray;
-    if (beamWidthArray.has_value())
+    if (beamWidthArray.has_value() && !beamWidthArray.value().empty() && !beamWidthArray.value()[0].empty())
     {
+        auto const& requestBeamWidthArray = beamWidthArray.value()[0];
         auto const iter = mDecodingIter + (forNextIteration ? 1 : 0);
-        // Clamped `decodingIter` into [0,kMaxBeamWidthArrayLength-1] as index
-        int const index
-            = std::max(std::min(iter, static_cast<int>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength)) - 1, 0);
-        beamWidth = beamWidthArray.value()[0][index];
+        // Clamp `decodingIter` with the actual array length, so that decoding
+        // longer than the array holds the last width instead of reading past
+        // the end. kMaxBeamWidthArrayLength is only the capacity limit; the
+        // user array is not padded up to it.
+        int const index = std::max(std::min(iter, static_cast<int>(requestBeamWidthArray.size())) - 1, 0);
+        beamWidth = requestBeamWidthArray[index];
     }
     return beamWidth;
 }

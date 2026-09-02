@@ -6,6 +6,7 @@ The following is a table of supported models for the PyTorch backend:
 | Architecture                         | Model                              | HuggingFace Example                          |
 | ------------------------------------ | ---------------------------------- | -------------------------------------------- |
 | `AfmoeForCausalLM`                   | Arcee Foundation MoE (Trinity)     | `arcee-ai/Trinity-Mini`                      |
+| `BartForConditionalGeneration`       | BART                               | `facebook/bart-large-cnn`                    |
 | `BertForSequenceClassification`      | BERT-based                         | `textattack/bert-base-uncased-yelp-polarity` |
 | `Cohere2ForCausalLM`                 | Command A                          | `CohereLabs/c4ai-command-a-03-2025`          |
 | `DeciLMForCausalLM`                  | Nemotron                           | `nvidia/Llama-3_1-Nemotron-51B-Instruct`     |
@@ -23,7 +24,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Gemma4AssistantForCausalLM`         | Gemma 4 MTP assistant              | `google/gemma-4-E2B-it-assistant`, `google/gemma-4-E4B-it-assistant`, `google/gemma-4-26B-A4B-it-assistant`, `google/gemma-4-31B-it-assistant` |
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
 | `Glm4MoeLiteForCausalLM` [^5]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
-| `GlmMoeDsaForCausalLM`               | GLM-5                              | `zai-org/GLM-5`                              |
+| `GlmMoeDsaForCausalLM`               | GLM-5, GLM-5.2, GLM-5.3            | `zai-org/GLM-5.3`                            |
 | `GraniteForCausalLM` [^5]            | Granite 3, Granite Guardian 3      | `ibm-granite/granite-3.1-8b-instruct`, `ibm-granite/granite-3.3-8b-instruct`, `ibm-granite/granite-guardian-3.2-5b` |
 | `GraniteMoeHybridForCausalLM` [^5]   | Granite 4.0 Hybrid MoE             | `ibm-granite/granite-4.0-h-small`            |
 | `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
@@ -31,9 +32,12 @@ The following is a table of supported models for the PyTorch backend:
 | `HunYuanMoEForCausalLM` [^5]         | Hunyuan MoE                        | `tencent/Hunyuan-A13B-Instruct`              |
 | `InternLM3ForCausalLM` [^5]          | InternLM3                          | `internlm/internlm3-8b-instruct`             |
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
+| `KimiK3ForConditionalGeneration` [^15]| Kimi-K3                            | `moonshotai/Kimi-K3`                         |
+| `KimiLinearForCausalLM` [^15]        | Kimi-K3 (text decoder)             | `moonshotai/Kimi-K3`                         |
 | `LagunaForCausalLM`                  | Laguna-XS                          | `poolside/laguna-XS.2`                       |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
+| `MBartForConditionalGeneration`      | mBART                              | `facebook/mbart-large-50-many-to-one-mmt`    |
 | `MiniCPMV4_6ForConditionalGeneration` [^14]| MiniCPM-V 4.6                    | `openbmb/MiniCPM-V-4.6`                      |
 | `MiniMaxM2ForCausalLM` [^5]          | MiniMax M2/M2.1/M2.7              | `MiniMaxAI/MiniMax-M2.7`                    |
 | `MiniMaxM3SparseForConditionalGeneration` [^12]| MiniMax-M3                       | `MiniMaxAI/MiniMax-M3`                      |
@@ -53,11 +57,13 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen3ForTextEmbedding`              | Qwen3-Embedding                    | `Qwen/Qwen3-Embedding-8B`                    |
 | `Qwen3MoeForCausalLM`                | Qwen3MoE                           | `Qwen/Qwen3-30B-A3B`                         |
 | `Qwen3NextForCausalLM`               | Qwen3Next                          | `Qwen/Qwen3-Next-80B-A3B-Thinking`           |
-| `Qwen3_5MoeForCausalLM`              | Qwen3.5-MoE                        | `Qwen/Qwen3.5-397B-A17B`                     |
+| `Qwen3_5MoeForCausalLM`              | Qwen3.8-MoE, Qwen3.5-MoE           | `Qwen/Qwen3.8-2.4T-A95B`, `Qwen/Qwen3.5-397B-A17B` |
 | `SeedOssForCausalLM` [^5]            | Seed OSS, Seed-Coder               | `ByteDance-Seed/Seed-OSS-36B-Instruct`       |
 | `SkyworkR1V2ForConditionalGeneration` [^5] | Skywork R1V2, Skywork SWE    | `Skywork/Skywork-R1V2-38B`                   |
 | `SmolLM3ForCausalLM` [^5]            | SmolLM3                            | `HuggingFaceTB/SmolLM3-3B`                   |
 | `Step3p7ForConditionalGeneration` [^8]| Step-3.7-Flash                    | `stepfun-ai/Step-3.7-Flash`                  |
+| `T5ForConditionalGeneration`         | T5, Flan-T5, ByT5                  | `google/flan-t5-small`                       |
+| `WhisperForConditionalGeneration`    | Whisper                            | `openai/whisper-large-v3`                    |
 
 
 ## Model-Feature Support Matrix (Key Models)
@@ -68,6 +74,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | -------------------------------- | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | --- | ---------------- | ----------------- | ------ | ------------- | ---------------- | -------------- | ------------------------ | --------------------- | --------------- |
 | `DeepseekV3ForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes [^1]        | Yes | No               | No                | No     | Yes           | Yes              | Yes [^2]       | N/A                      | Yes                   | Yes             |
 | `DeepseekV32ForCausalLM`         | Yes               | Yes        | Yes                        | Yes                   | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
+| `GlmMoeDsaForCausalLM`           | Yes               | Yes        | Untested                   | Yes                   | Yes             | Yes | No               | No                | No     | Yes           | Untested         | Untested       | N/A                      | Untested              | Untested        |
 | `DeepseekV4ForCausalLM` [^11]    | Yes               | Yes        | Yes                        | Untested              | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Untested       | Yes                      | Untested              | Untested        |
 | `Glm4MoeForCausalLM`             | Yes               | Yes        | Yes                        | Untested              | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
 | `Qwen3MoeForCausalLM`            | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes              | Yes               | No     | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
@@ -95,6 +102,25 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^12]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.
 [^13]: The Cosmos 3 family also supports visual generation through the VisualGen API. See [Visual Generation Models](#visual-generation-models).
 [^14]: Requires `transformers>=5.7.0`: MiniCPM-V 4.6 was upstreamed into transformers as a native model type (`minicpmv4_6`) and the checkpoint ships no remote code (`auto_map`) to fall back on. The Qwen3.5-hybrid text tower runs in BF16. Image, video, and text inputs are supported in this release (video reuses the same NaViT-packed vision path as image via `MiniCPMV4_6InputProcessor`).
+[^15]: Kimi K3 is only supported on NVIDIA Blackwell GPUs (`SM100` family); see the [Kimi K3 deployment guide](../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.md). Which recipes fit is set by the attention layout rather than by the GPU count: DEP16 (`enable_attention_dp: true`) replicates the BF16 non-expert weights on every rank (114 GB) on top of the MXFP4 routed experts at 16-way expert parallelism (90 GB), needing 210 GB per rank, so it requires GB300-class per-GPU memory. TEP16 (`enable_attention_dp: false`) shards those non-expert weights instead and needs 115 GB per rank; it is validated end-to-end on GB200 (`SM100`) at 16 GPUs. On B200 (`SM100`), kernel and module support is functional and covered by CI. Note that the FP8 weight-read path (TRTLLM-14765) does not relax the DEP16 requirement: the conversion runs after the weights are already resident in BF16, so it lowers the steady-state footprint but not the load-time peak.
+
+# Encoder-Decoder Feature Support Matrix (PyTorch Backend)
+
+The following capabilities apply to the supported encoder-decoder architectures. For configuration guidance and
+limitations, see [Use encoder-decoder models with the PyTorch backend](./encoder-decoder.md).
+
+| Model Architecture/Feature | Overlap Scheduler | Decoder CUDA Graph | Encoder CUDA Graph | KV Cache Manager V1 | KV Cache Manager V2 | Beam Search | Tensor Parallelism | Pipeline Parallelism | Chunked Prefill |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `BartForConditionalGeneration` | Yes | Yes (except FP32) | Yes | Yes | Yes (single beam) | Yes (V1 only) | Yes | No | No (encoder phase) |
+| `MBartForConditionalGeneration` | Yes | Yes (except FP32) | Yes | Yes | Yes (single beam) | Yes (V1 only) | Yes | No | No (encoder phase) |
+| `T5ForConditionalGeneration` | Yes | Yes (except FP32) | Yes | Yes | Yes (single beam) | Yes (V1 only) | Yes | No | No (encoder phase) |
+| `WhisperForConditionalGeneration` | Yes | Yes (except FP32) | No (feature inputs) | Yes | Yes (single beam) | Yes (V1 only) | Yes | No | No (encoder phase) |
+
+Decoder CUDA graphs support greedy and beam-search decoding with KV cache manager V1 and single-beam decoding with
+V2. Encoder CUDA graphs support the token-input BART, mBART, and T5 families; Whisper's feature-driven audio encoder
+runs eagerly. Use the `TRTLLM` attention backend for encoder-decoder models; tensor parallelism also requires attention
+head counts divisible by the tensor parallel size. Chunked prefill is not supported for the encoder phase, so the
+complete encoder input must fit in the iteration token budget.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 
@@ -154,8 +180,12 @@ The following optimizations are available to models that implement
   Set `multimodal_config.encoder_cache_max_bytes` to its capacity (for example, `"512MiB"`), or
   `0` to disable it. Entries are cached per multimodal item, but a request reuses cached embeddings
   only when all of its items hit the cache. At present, only single-modality requests are cacheable;
-  mixed-modality requests bypass the cache. When combined with side-stream prefetch, peak memory is
-  the cache capacity plus any in-flight prefetched encoder inputs and outputs.
+  mixed-modality requests bypass the cache. For models with item-level encoder scheduling, the
+  cache also composes with the item path: cached items skip encoder execution after selection but
+  still count against the per-iteration item and token budgets, partially cached requests re-compute
+  only the missing items, and items encoded through the item path populate the cache for later
+  requests. When combined with side-stream prefetch, peak memory is the cache capacity plus any
+  in-flight prefetched encoder inputs and outputs.
 
 # Visual Generation Models
 
@@ -184,20 +214,21 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super-Text2Image-4Step` | Text-to-Image (DMD2-distilled, fixed 4-step schedule) |
 | `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
+| `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
 
 ### Feature Matrix
 
 | Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
 |---|---|---|---|---|---|---|---|---|---|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **FLUX.1** | Yes | Yes | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **FLUX.2** | Yes | Yes | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image-Layered** [^3] | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
-| **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Layered** [^vg2] | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | Yes | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 
 [^vg1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
-[^3]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition. FP8 blockwise, NVFP4, `trtllm-serve` image-edit routing, and attention-parallel backends are not enabled yet.
+[^vg2]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition through `trtllm-serve` image-edit routing. By default it returns one RGBA image per generated layer; set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable image grid. FP8 blockwise, NVFP4, and attention-parallel backends are not enabled yet.

@@ -21,13 +21,15 @@ import traceback
 import uuid
 import weakref
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.peft.lora.manager import LoraManager
+from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
@@ -37,8 +39,6 @@ from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
-from ..lora_manager import LoraManager
-from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
@@ -429,8 +429,6 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params._decoder_output_token_prefix)
             if max_tokens is not None:
                 max_tokens -= output_prefix_len
-            query_token_len = len(
-                request.query_token_ids) if request.query_token_ids else 0
 
             cp_size = 1
             max_seq_len = None
@@ -461,14 +459,13 @@ class BaseWorker(GenerationExecutor):
                     len(prompt_token_ids) <= executor_config.max_seq_len
                 ), f"`prompt_token_ids` length ({len(prompt_token_ids)}) is greater than `max_seq_len` ({executor_config.max_seq_len})"
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
-            default_max_tokens = max_seq_len - splited_prompt_len - query_token_len
+            default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
                 # Raise error on `default_max_tokens` not enough, since max_tokens should be less than `default_max_tokens``
                 raise ValueError(
                     f"`default_max_tokens` ({default_max_tokens}) must be greater than 0, "
                     f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({max_seq_len})"
-                    f" - `splited_prompt_len` ({splited_prompt_len}) - `query_token_len` ({query_token_len})"
-                )
+                    f" - `splited_prompt_len` ({splited_prompt_len})")
 
             # default_max_tokens is the biggest available value
             if max_tokens is None:
@@ -567,23 +564,11 @@ class BaseWorker(GenerationExecutor):
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
 
-            if request.query_token_ids is not None:
-                # pytorch star attention workflow
-                # a workaround to avoid public interface update
-                if self._is_pytorch_backend and result_wait_queue is not None:
-                    req_id = self.engine.enqueue_request(
-                        executor_request,
-                        request.query_token_ids,
-                        result_wait_queue=result_wait_queue)
-                else:
-                    req_id = self.engine.enqueue_request(
-                        executor_request, request.query_token_ids)
+            if self._is_pytorch_backend and result_wait_queue is not None:
+                req_id = self.engine.enqueue_request(
+                    executor_request, result_wait_queue=result_wait_queue)
             else:
-                if self._is_pytorch_backend and result_wait_queue is not None:
-                    req_id = self.engine.enqueue_request(
-                        executor_request, result_wait_queue=result_wait_queue)
-                else:
-                    req_id = self.engine.enqueue_request(executor_request)
+                req_id = self.engine.enqueue_request(executor_request)
             return req_id
         except Exception as e:
             raise RequestError(str(e)) from e
@@ -983,6 +968,25 @@ class BaseWorker(GenerationExecutor):
             return b""
         return self.engine.kv_cache_transceiver.get_data_transceiver_state()
 
+    def get_startup_metrics(self) -> dict:
+        """Return rank-local startup metrics for the PyTorch backend."""
+        if not self._is_pytorch_backend or self.engine is None:
+            return {}
+
+        startup_metrics = {}
+        model_engine = getattr(self.engine, "model_engine", None)
+        model_loader = getattr(model_engine, "model_loader", None)
+        if model_loader is not None:
+            startup_metrics["model_loader"] = dict(model_loader.metrics)
+
+        draft_model_engine = getattr(self.engine, "draft_model_engine", None)
+        draft_model_loader = getattr(draft_model_engine, "model_loader", None)
+        if draft_model_loader is not None:
+            startup_metrics["draft_model_loader"] = dict(
+                draft_model_loader.metrics)
+
+        return startup_metrics
+
     @staticmethod
     def _stats_serializer(stats) -> str:
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
@@ -1087,7 +1091,14 @@ class AwaitResponseHelper:
         # The error responses when submit request failed will be put here
         self.temp_error_responses = Queue()
 
-    def responses_handler(self, responses: List[tllm.Response]):
+    def _resolve_handler_kind(self) -> "AwaitResponseHelper.HandlerKind":
+        """Determine (and memoise) which side of the IPC boundary we are on.
+
+        Split out of ``responses_handler`` so the error path can ask the same
+        question without having handled a response batch first — a crash
+        during the very first ``await_responses`` leaves ``handler_kind``
+        ``unknown`` otherwise.
+        """
         HandlerKind = AwaitResponseHelper.HandlerKind
 
         if self.handler_kind is HandlerKind.unknown:
@@ -1105,6 +1116,12 @@ class AwaitResponseHelper:
                 logger_debug(f"creating await_response helper for IPC\n",
                              color="yellow")
                 self.handler_kind = HandlerKind.ipc_batched
+        return self.handler_kind
+
+    def responses_handler(self, responses: List[tllm.Response]):
+        HandlerKind = AwaitResponseHelper.HandlerKind
+
+        self._resolve_handler_kind()
 
         match self.handler_kind:
             case HandlerKind.single_process_worker:
@@ -1113,6 +1130,35 @@ class AwaitResponseHelper:
                 return self.handle_for_ipc_batched(responses)
             case _:
                 raise NotImplementedError
+
+    def process_responses(
+            self, responses: List[tllm.Response]) -> List[tllm.Response]:
+        """Apply engine callbacks and append deferred submission errors."""
+        responses = list(
+            filter(
+                lambda _: _,
+                [self.worker._engine_response_callback(r) for r in responses]))
+
+        # Drain with get_nowait(): this may run concurrently from the
+        # ManagedThread and RPC fetch_responses(), and empty()+get() can
+        # block forever if another consumer wins the race.
+        while True:
+            try:
+                responses.append(self.temp_error_responses.get_nowait())
+            except Empty:
+                break
+
+        return responses
+
+    def process_and_handle_responses(
+            self, responses: List[tllm.Response]) -> List[tllm.Response]:
+        """Process engine responses and dispatch the client-visible results."""
+        responses = self.process_responses(responses)
+        with nvtx_range_debug(f"await_response-{len(responses)}",
+                              color="red",
+                              category="Worker"):
+            self.responses_handler(responses)
+        return responses
 
     def __call__(self, timeout: Optional[float] = None) -> bool:
         ''' This method should be called by a ManagedThread. '''
@@ -1130,20 +1176,7 @@ class AwaitResponseHelper:
             # _await_any_response) is also a clear signal to broadcast
             # and stop the thread.
             return self._broadcast_event_loop_error(e)
-        # filter since The _engine_response_callback may return None
-        responses = list(
-            filter(
-                lambda _: _,
-                [self.worker._engine_response_callback(r) for r in responses]))
-
-        # append the error responses to the temp_error_responses
-        while not self.temp_error_responses.empty():
-            responses.append(self.temp_error_responses.get())
-
-        with nvtx_range_debug(f"await_response-{len(responses)}",
-                              color="red",
-                              category="Worker"):
-            self.responses_handler(responses)
+        self.process_and_handle_responses(responses)
 
         # Even when await_responses returned normally (e.g. via
         # _await_any_response, whose predicate already includes
@@ -1152,6 +1185,8 @@ class AwaitResponseHelper:
         # thread in that case too — see nvbug 6038228.
         error = getattr(self.worker.engine, "_event_loop_error", None)
         if error is not None:
+            # _broadcast_event_loop_error owns the delivery gate: it is the
+            # only place that knows whether a client was actually woken.
             return self._broadcast_event_loop_error(error)
         return True
 
@@ -1172,8 +1207,21 @@ class AwaitResponseHelper:
         results on a different side of the boundary and would need a
         separate poison-pill on ``self.worker.result_queue``; that is left
         as a follow-up consistent with the PyExecutor-side fix.
+
+        Because of that scope, this method also owns the rank-crash kill's
+        delivery gate. The gate may only be set when a client verifiably
+        woke: on ``ipc_batched`` the queues written below have no reader
+        (responses travel via ``handle_for_ipc_batched``), so setting it
+        there would stand the kill down while the peer ranks are still
+        stranded — the case the kill exists for, in the default spawned-
+        worker deployment. When delivery cannot be proven the gate stays
+        clear and the kill fires, which is the safe direction: a spurious
+        world-kill costs a traceback, a missed one costs the job.
         """
         error_msg = f"Event loop terminated with error: {error}"
+        can_reach_client = (
+            self._resolve_handler_kind()
+            is AwaitResponseHelper.HandlerKind.single_process_worker)
         pending_client_ids = list(self.worker._results.keys())
         if not pending_client_ids:
             logger.error(
@@ -1186,6 +1234,9 @@ class AwaitResponseHelper:
 
         event_loop = None
         async_queues: List[_SyncQueue] = []
+        # Counts queues a caller can actually read from. A _SyncQueue is only
+        # readable once notify_many() has run, so those are counted there.
+        woken = 0
         for client_id in pending_client_ids:
             try:
                 queue = self.worker.return_queue(client_id)
@@ -1203,6 +1254,7 @@ class AwaitResponseHelper:
                     event_loop = event_loop or queue.loop
                 else:
                     queue.put(err_resp)
+                    woken += 1
             except Exception as put_error:
                 logger.error(f"Failed to push ErrorResponse for client_id="
                              f"{client_id}: {put_error}")
@@ -1212,10 +1264,27 @@ class AwaitResponseHelper:
         if async_queues:
             try:
                 _SyncQueue.notify_many(event_loop, async_queues)
+                woken += len(async_queues)
             except Exception as notify_error:
                 logger.error(
                     f"Failed to notify async queues on event-loop error: "
                     f"{notify_error}")
+
+        if woken and can_reach_client:
+            # A client is now holding the real error, so the crash is
+            # reportable without killing the world: a symmetric crash (every
+            # rank raised the same deterministic error, nobody stranded) ends
+            # in N tracebacks rather than in MPI_Abort replacing them with a
+            # bare exit 137.
+            delivered = getattr(self.worker.engine,
+                                "_event_loop_error_delivered", None)
+            if delivered is not None:
+                delivered.set()
+        elif not can_reach_client:
+            logger.error(
+                "Event-loop error broadcast cannot reach the client on the "
+                "IPC/proxy path; leaving the rank-crash hard kill armed so "
+                "peer ranks are not stranded.")
 
         return False
 

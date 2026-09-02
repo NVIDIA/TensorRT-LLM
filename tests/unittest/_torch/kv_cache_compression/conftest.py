@@ -328,11 +328,17 @@ def make_tri_config(**overrides):
 
     options = {
         "budget": 8,
-        "model_path": make_test_model_dir(),
         "calibration_path": make_test_calibration_pt(),
     }
     options.update(overrides)
     return TriAttentionKvCacheCompressionConfig(**options)
+
+
+def make_test_pretrained_config():
+    """The test model's config, as the executor would hand it to the factory."""
+    from transformers import AutoConfig
+
+    return AutoConfig.from_pretrained(make_test_model_dir())
 
 
 def make_triattention(**overrides):
@@ -342,7 +348,12 @@ def make_triattention(**overrides):
     )
 
     with mock.patch.object(TriAttentionCompressionManager, "_initialize_eviction_state"):
-        return TriAttentionCompressionManager(make_tri_config(**overrides), make_fake_v2())
+        manager = TriAttentionCompressionManager(
+            make_tri_config(**overrides),
+            pretrained_config=make_test_pretrained_config(),
+        )
+        manager.bind_kv_cache_managers(make_fake_v2())
+        return manager
 
 
 def make_eviction_request(

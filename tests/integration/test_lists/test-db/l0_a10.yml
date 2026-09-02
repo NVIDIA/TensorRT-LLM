@@ -18,6 +18,7 @@ l0_a10:
   - unittest/_torch/sampler/test_penalties.py
   - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_torch_multi_arange.py
+  - unittest/_torch/test_fused_relu2.py
   - unittest/utils/test_util.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
@@ -26,40 +27,47 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_radio.py
   - unittest/_torch/modeling/test_modeling_minicpmv4_6.py
   - unittest/_torch/modeling/test_multimodal_encoder_mixin.py
-  - unittest/_torch/sampler/test_trtllm_sampler.py
   - unittest/_torch/sampler/test_token_ban.py
-  - unittest/_torch/executor/test_kv_cache_estimation.py
-  - unittest/_torch/executor/test_kv_cache_budget_split.py
-  - unittest/_torch/executor/test_kv_pool_rebalance.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
   - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_error_classification.py
-  - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
-  - unittest/_torch/modules/moe/test_communication_factory.py
+  - unittest/_torch/executor/test_resource_manager.py
+  - unittest/_torch/moe/test_communication_factory.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints
   - unittest/_torch/models/test_qwen3_next_moe_quant.py
+  - unittest/_torch/models/test_qwen3_next_eager_fusion.py
   - unittest/_torch/weight_sharing
   - unittest/inputs/test_multimodal_input_processor.py
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cache_transceiver_precheck_run.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_tracing.py
+  - unittest/grpc/test_grpc_optional.py
+  - unittest/grpc/smg/test_smg.py
   - unittest/disaggregated/test_coordinator_e2e.py
   - unittest/disaggregated/test_coordinator_worker.py
   - unittest/disaggregated/test_agent_multi_backends.py
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_bounce.py
   - unittest/disaggregated/test_mamba_transfer.py
-  - unittest/tools
-  - unittest/usage/test_collectors.py
-  - unittest/usage/test_config.py
-  - unittest/usage/test_llmapi_config_telemetry_docs.py
-  - unittest/usage/test_opt_out.py
-  - unittest/usage/test_reporter.py
-  - unittest/usage/test_schema.py
+  # unittest/tools is listed per file rather than as a directory. The directory
+  # form swept test_layer_wise_benchmarks.py onto A10, whose DeepSeek FP4 cases
+  # pin SM100+ checkpoints -- that is https://nvbugs/6337228.
+  #
+  # Only files with at least one non-cpu_only test belong here: this stage runs
+  # unittests with `-m not cpu_only`, and one pytest invocation is made per
+  # entry, so a file whose tests are all cpu_only collects nothing and errors.
+  # The fully-cpu_only ones (test_config_database_sync, test_periodic_junit,
+  # test_prepare_dataset, test_test_to_stage_mapping) are covered by
+  # l0_cpu.yml, which lists unittest/tools as a directory.
+  - unittest/tools/test_host_profiler.py
+  - unittest/tools/test_infra_dry_run_pipeline.py
+  - unittest/tools/test_infra_dry_run_pytest.py
+  - unittest/tools/test_perf_sanity_matching.py
+  - unittest/tools/test_unittest_culprits.py
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
@@ -73,6 +81,7 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_sa[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
@@ -104,19 +113,17 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
   # visual_gen
   - unittest/_torch/visual_gen/test_profiler.py
-  - unittest/_torch/visual_gen/test_visual_gen_params.py
-  - unittest/visual_gen/test_output.py
   - unittest/visual_gen/test_iteration_stats.py
   - unittest/visual_gen/test_media_encoding.py
-  - unittest/_torch/visual_gen/test_tensor_payload.py
-  - unittest/_torch/visual_gen/test_flux_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
   # llmapi
   - unittest/llmapi/test_rlhf_utils.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   # executor
+  - unittest/executor/test_spec_dec_stats_pairing.py
   - unittest/executor/test_postprocessor_hook.py
   - unittest/executor/test_proxy_postproc_terminate.py
   - unittest/executor/test_proxy_fast_death.py
@@ -151,7 +158,6 @@ l0_a10:
   # helper-script unit tests (CPU-only, ~3s)
   - unittest/scripts
   - unittest/kv_cache_manager_v2_tests # 4 min
-  - unittest/dynamo
   - unittest/api_stability
   - unittest/bindings
 - condition:
@@ -171,7 +177,7 @@ l0_a10:
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_examples.py::test_llmapi_server_example
-  - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen2-0.5B]
+  - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen3/Qwen3-0.6B]
   - test_e2e.py::test_openai_health
   - test_e2e.py::test_trtllm_serve_example
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit

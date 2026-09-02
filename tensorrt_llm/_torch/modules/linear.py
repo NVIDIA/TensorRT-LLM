@@ -4,6 +4,9 @@ import enum
 import math
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, Optional, Union
 
@@ -31,8 +34,19 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_enabled,
                      replace_parameter_and_save_metadata, unswizzle_sf)
+from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
+from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
+
+
+def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
+    """Fast pre-filter: check the global enable flag and M upper bound only."""
+    if not LOW_M_GEMM_ACTIVE:
+        return False
+    if input.ndim < 1:
+        return False
+    k = int(input.shape[-1])
+    return k > 0 and input.numel() <= _LOW_M_GEMM_MAX_M * k
 
 
 class WeightMode(str, enum.Enum):
@@ -97,6 +111,24 @@ class TensorParallelMode(str, enum.Enum):
     @classmethod
     def flip(cls, mode):
         return cls.ROW if mode == cls.COLUMN else cls.COLUMN
+
+
+def quant_config_has_nvfp4_activation_quantization(
+        quant_config: Optional[QuantConfig]) -> bool:
+    """Whether the quantization algorithm converts activations to NVFP4."""
+    return (quant_config is not None
+            and quant_config.layer_quant_mode.has_nvfp4()
+            and quant_config.quant_algo != QuantAlgo.W4A16_NVFP4)
+
+
+def _uses_marlin_nvfp4_backend(module) -> bool:
+    """Whether a regular NVFP4 linear explicitly selects Marlin."""
+    allowed_backends = getattr(module, "nvfp4_allowed_backends", ())
+    return ("marlin" in allowed_backends and 89 <= get_sm_version() < 100
+            and getattr(module, "dtype", None) == torch.bfloat16
+            and not getattr(module, "use_fused_gemm_allreduce", False)
+            and hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
+            and hasattr(torch.ops.trtllm, "gptq_marlin_repack"))
 
 
 def load_weight_shard(
@@ -354,6 +386,7 @@ class LinearMethodBase(ABC):
     # window buffer. apply() reads this ClassVar to derive output_buffer_kind
     # internally; callers do not pass output_buffer_kind as a parameter.
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
+    quantizes_nvfp4_activations: ClassVar[bool] = False
 
     @abstractmethod
     def create_weights(self, module: Linear, in_features: int,
@@ -398,6 +431,9 @@ class LinearMethodBase(ABC):
             self.process_weights_after_loading(module)
 
     def transform_weights(self, module: Linear) -> None:
+        return None
+
+    def cache_derived_state(self, module: Linear) -> None:
         return None
 
     def post_load_weights(self, module: Linear) -> None:
@@ -494,6 +530,25 @@ class LinearMethodBase(ABC):
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
+    """Linear method for unquantized (BF16 / FP16 / FP32) weights.
+
+    BF16 GEMM dispatch (priority order, Blackwell SM100/SM103)
+    ----------------------------------------------------------
+    1. **low-m GEMM** (``TRTLLM_LOW_M_GEMM_BACKEND=auto``, M ≤ 32)
+       CuTe-DSL low-m GEMM kernel for small-M decode batches on Blackwell.
+       Orthogonal to ``use_cute_dsl_bf16_gemm`` — must be enabled
+       independently via the env var.
+
+    2. **persistent GEMM** (``Linear(use_cute_dsl_bf16_gemm=True)``)
+       ``trtllm::cute_dsl_bf16_gemm_blackwell`` persistent CuTe-DSL kernel.
+
+    3. **cublas_mm** (``Linear(use_custom_cublas_mm=True)``)
+       ``trtllm::cublas_mm``; use when TP AllReduce fuse via NCCL
+       symmetric-memory window is needed (``output_buffer_kind=NCCL_WINDOW``).
+
+    4. **F.linear** (default)
+       PyTorch cuBLASLt; general-purpose fallback for all other cases.
+    """
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
@@ -521,6 +576,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
+        # kernel and returns None to fall through to the normal GEMM path.
+        # Skip when use_custom_cublas_mm is set: that path may allocate output
+        # in an NCCL symmetric-memory window for TP all-reduce fusion, which
+        # the low-M dispatcher does not support.
+        if _should_apply_low_m_gemm(input) and not getattr(
+                module, "use_custom_cublas_mm", False):
+            output = apply_low_m_gemm(module, input, module.weight, bias)
+            if output is not None:
+                return output
         # CuTe DSL BF16 GEMM path for Blackwell
         if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
                 and module.weight.dtype == torch.bfloat16):
@@ -836,11 +901,14 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         """
         weight_mode = module.weights_loading_config.weight_mode
         shard_key_to_index = weight_mode.shard_key_to_index
+        compute_device = module.weight.device
+        if compute_device.type == "cpu" and torch.cuda.is_available():
+            compute_device = torch.device("cuda")
 
         # Handle input_scale
         if hasattr(module, "has_static_input_scale"):
             # Compute max and replace input_scale with a new parameter
-            max_input_scale = module.tmp_input_scales.max()
+            max_input_scale = module.tmp_input_scales.to(compute_device).max()
             module.input_scale.data.copy_(max_input_scale)
             # Also update inv_input_scale for static quantization
             if hasattr(
@@ -854,13 +922,13 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 module.inv_input_scale = None
 
         # Compute max weight_scale
-        max_weight_scale = module.tmp_weight_scales.max()
+        max_weight_scale = module.tmp_weight_scales.to(compute_device).max()
         module.weight_scale.data.copy_(max_weight_scale)
 
         # Rescale each weight shard: (weight * original_scale) / max_scale
         for shard_key in weight_mode.shard_keys:
             idx = shard_key_to_index[shard_key]
-            original_scale = module.tmp_weight_scales[idx]
+            original_scale = module.tmp_weight_scales[idx].to(compute_device)
 
             # Get shard position from mapping
             shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
@@ -869,12 +937,14 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             # Rescale: FP8 -> BF16 -> multiply by original_scale -> divide by max_scale -> FP8
             weight_shard = module.weight.data[shard_offset:shard_offset +
                                               shard_size]
-            rescaled_weight = weight_shard.to(module.dtype).mul_(original_scale)
+            rescaled_weight = weight_shard.to(compute_device).to(
+                module.dtype).mul_(original_scale)
             rescaled_weight = rescaled_weight.div_(
                 max_weight_scale.to(rescaled_weight.device)).to(
                     torch.float8_e4m3fn)
             module.weight.data[shard_offset:shard_offset +
-                               shard_size] = rescaled_weight
+                               shard_size] = rescaled_weight.to(
+                                   module.weight.device)
 
         delattr(module, "tmp_input_scales")
         delattr(module, "tmp_weight_scales")
@@ -1335,6 +1405,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 class NVFP4LinearMethod(LinearMethodBase):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
+    quantizes_nvfp4_activations: ClassVar[bool] = True
 
     # Temporary workaround which will be resolved by TRTLLM-11958
     # When True, use tunable_fp4_quantize (AutoTuner selects TRTLLM vs
@@ -1486,7 +1557,9 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
-        allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
+        use_marlin = _uses_marlin_nvfp4_backend(module)
+        allowed_backends_str = ('marlin' if use_marlin else ','.join(
+            module.nvfp4_allowed_backends))
         output_buffer_kind = (
             int(BufferKind.NCCL_WINDOW)
             if self.supports_nccl_symmetric_memory_window_output
@@ -1498,7 +1571,7 @@ class NVFP4LinearMethod(LinearMethodBase):
                  and module.mapping is not None else None)
         # Fuse bias inside the GEMM op when N is unpadded and the output is a
         # plain buffer; otherwise fall back to post-op `out + bias` below.
-        fuse_bias_in_gemm = (bias is not None
+        fuse_bias_in_gemm = (bias is not None and not use_marlin
                              and output_buffer_kind == int(BufferKind.DEFAULT)
                              and module.weight.shape[0] == module.out_features)
         output = torch.ops.trtllm.nvfp4_gemm(
@@ -1665,12 +1738,16 @@ class NVFP4LinearMethod(LinearMethodBase):
     def process_weights_after_loading_vanilla(self, module: Linear):
         input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
 
-        # For dynamic activation quantization, input_scale and alpha are computed at runtime
-        if input_scale is not None:
+        # For dynamic activation quantization, input_scale and alpha are computed at runtime.
+        # The destination checks cover weight-only subclasses (W4A16 / Marlin), which leave
+        # input_scale / inv_input_scale / alpha as None in create_weights: a checkpoint may
+        # still carry activation scales, but they are meaningless for a high-precision
+        # activation path, so drop them instead of copying into a missing Parameter.
+        if input_scale is not None and module.input_scale is not None:
             copy_weight(module.input_scale, input_scale)
             E2M1_MAX = 6.0
             module.inv_input_scale.data = module.input_scale / E2M1_MAX
-        if alpha is not None:
+        if alpha is not None and module.alpha is not None:
             copy_weight(module.alpha, alpha)
             module.scalar_alpha = alpha.item()
         if weight_scale_2 is not None:
@@ -1761,11 +1838,13 @@ class NVFP4LinearMethod(LinearMethodBase):
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
-        # Finalize input_scale, weight_scale_2, alpha
+        # Finalize input_scale, weight_scale_2, alpha. The destination checks skip
+        # scales this linear method never allocated (see the weight-only note in
+        # process_weights_after_loading_vanilla).
         input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
-        if input_scale is not None:
+        if input_scale is not None and module.input_scale is not None:
             copy_weight(module.input_scale, input_scale)
-        if alpha is not None:
+        if alpha is not None and module.alpha is not None:
             copy_weight(module.alpha, alpha)
             module.scalar_alpha = alpha.item()
         if weight_scale_2 is not None:
@@ -1847,11 +1926,13 @@ class NVFP4LinearMethod(LinearMethodBase):
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
-        # Finalize input_scale, weight_scale_2, alpha
+        # Finalize input_scale, weight_scale_2, alpha. The destination checks skip
+        # scales this linear method never allocated (see the weight-only note in
+        # process_weights_after_loading_vanilla).
         input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
-        if input_scale is not None:
+        if input_scale is not None and module.input_scale is not None:
             copy_weight(module.input_scale, input_scale)
-        if alpha is not None:
+        if alpha is not None and module.alpha is not None:
             copy_weight(module.alpha, alpha)
             module.scalar_alpha = alpha.item()
         if weight_scale_2 is not None:
@@ -1969,70 +2050,103 @@ class NVFP4LinearMethod(LinearMethodBase):
 
 
 class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
-    """W4A16 dequant fallback for NVFP4 on SM<100. Only used by
-    modeling_nemotron_h.  ``apply_linear_allreduce`` is inherited unchanged:
-    its fused path is SM>=100-gated upstream.
-    """
+    """W4A16 NVFP4 linear using on-the-fly weight dequantization."""
+
+    quantizes_nvfp4_activations: ClassVar[bool] = False
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        super().create_weights(module, in_features, out_features, bias, dtype)
+
+        # W4A16 consumes high-precision activations, so there is no calibrated
+        # activation scale. These must be None from create_weights onwards (not
+        # merely left uninitialized): eligibility checks such as
+        # ``is_static_nvfp4_input_eligible`` run right after create_weights,
+        # before any weights are loaded, and read ``input_scale is not None``.
+        # The parent's process_weights_after_loading_* skip scales whose
+        # destination is None, so checkpoint-provided values are dropped here.
+        module.input_scale = None
+        module.inv_input_scale = None
+        module.alpha = None
 
     def transform_weights(self, module: Linear) -> None:
-        # Skip parent's 32x16 weight padding (apply() accepts [N, K/2] as-is)
-        # and un-swizzle per-block scale once at load.
+        # Materialize the smaller linear scale view once for Triton dequantization.
         LinearMethodBase.transform_weights(self, module)
+        self.cache_derived_state(module)
+
+    def cache_derived_state(self, module: Linear) -> None:
         pad_rows = fp4_utils.pad_up(module.out_features, 128)
         pad_cols = fp4_utils.pad_up(
             module.in_features // module.scaling_vector_size, 4)
         scale_swizzled = module.weight_scale.data.view(
             fp4_utils.float4_sf_dtype).reshape(pad_rows, pad_cols)
         scale_linear = torch.ops.trtllm.block_scale_interleave_reverse(
-            scale_swizzled)
-        module.weight_scale.data.view(fp4_utils.float4_sf_dtype).copy_(
-            scale_linear.reshape(-1))
+            scale_swizzled).reshape(-1)
+        buffer_name = "_w4a16_weight_scale_linear"
+        if buffer_name in module._buffers:
+            module._buffers[buffer_name] = scale_linear
+        else:
+            module.register_buffer(buffer_name, scale_linear, persistent=False)
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    @staticmethod
+    def _prepare_input(module: Linear, input: torch.Tensor):
         if isinstance(input, (Fp4QuantizedTensor, tuple)):
             raise RuntimeError(
-                "W4A16NVFP4LinearMethod: hp input required; disable upstream "
-                "FP4 fusion (e.g. TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0)")
+                "W4A16NVFP4LinearMethod requires a high-precision input; "
+                "disable upstream FP4 fusion")
 
-        ## FP8 input from upstream FMHA pre-quant: invert by / module.inv_input_scale.
+        # create_weights leaves inv_input_scale None on this path, so an FP8
+        # activation has no scale to dequantize it with. Reject it up front the
+        # same way as a pre-quantized FP4 input.
         if input.dtype == torch.float8_e4m3fn:
-            assert module.inv_input_scale is not None, \
-                "W4A16NVFP4LinearMethod: FP8 input requires static inv_input_scale"
-            input = (input.to(module.dtype) / module.inv_input_scale).to(
-                module.dtype)
+            raise RuntimeError(
+                "W4A16NVFP4LinearMethod requires a high-precision input; "
+                "disable upstream FP8 attention output")
 
         original_shape = None
         if input.dim() > 2:
             original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
 
-        # NVFP4_AWQ pre_quant_scale (mirrors parent's _input_prepare branch).
         if module.pre_quant_scale is not None:
-            assert input.dtype == module.pre_quant_scale.dtype, (
-                "Input dtype and pre_quant_scale dtype must match")
+            assert input.dtype == module.pre_quant_scale.dtype, \
+                "Input dtype and pre_quant_scale dtype must match"
             input = input * module.pre_quant_scale
+        return input, original_shape
 
-        from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import \
+    @staticmethod
+    def _restore_output(output: torch.Tensor, original_shape,
+                        bias: Optional[torch.Tensor]):
+        if original_shape is not None:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        input, original_shape = self._prepare_input(module, input)
+        from tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4 import \
             dequant_nvfp4_2d_triton
         weight_deq = dequant_nvfp4_2d_triton(
             module.weight.view(torch.uint8),
-            module.weight_scale,
+            module._w4a16_weight_scale_linear,
             module.weight_scale_2,
             target_dtype=module.dtype,
             sf_vec_size=module.scaling_vector_size,
         )
 
-        if module.use_custom_cublas_mm:
+        if getattr(module, "use_custom_cublas_mm", False):
             output_buffer_kind = (
                 int(BufferKind.NCCL_WINDOW)
                 if self.supports_nccl_symmetric_memory_window_output
-                and module.all_reduce is not None
+                and getattr(module, "all_reduce", None) is not None
                 and module.all_reduce.uses_nccl_symmetric_memory_window() else
                 int(BufferKind.DEFAULT))
-            group = (module.mapping.tp_group
+            mapping = getattr(module, "mapping", None)
+            group = (mapping.tp_group
                      if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
-                     and module.mapping is not None else None)
+                     and mapping is not None else None)
             output = torch.ops.trtllm.cublas_mm(
                 input,
                 weight_deq.t(),
@@ -2043,10 +2157,148 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
             )
         else:
             output = F.linear(input, weight_deq, bias)
+        return self._restore_output(output, original_shape, bias=None)
 
-        if original_shape is not None:
-            output = output.reshape(*original_shape[:-1], output.shape[-1])
-        return output
+
+class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
+    """W4A16 NVFP4 linear backed by Marlin."""
+
+    # ``apply`` always allocates a plain output buffer (the Marlin GEMM has no
+    # NCCL-window output path) and ``apply_linear_allreduce`` is unsupported, so
+    # this must not inherit the True from NVFP4LinearMethod: Linear.forward reads
+    # this ClassVar to take a zero-copy branch that assumes the GEMM wrote into
+    # the symmetric-memory window.
+    supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
+
+    def get_tp_alignment(self,
+                         tp_mode: Optional[TensorParallelMode],
+                         quant_config: Optional[QuantConfig] = None) -> int:
+        # Same 32-element alignment as the parent NVFP4 path. The Marlin kernel
+        # itself wants K%64 and N%128, but ``transform_weights`` pads the weight
+        # and scales up to those bounds (and ``apply`` slices the N padding back
+        # off), so the sharding constraint stays unchanged.
+        return 32
+
+    @staticmethod
+    def is_supported(module: Linear) -> bool:
+        sm_version = get_sm_version()
+        return ((89 <= sm_version < 100 or sm_version in (120, 121))
+                and getattr(module, "dtype", None) == torch.bfloat16
+                and not getattr(module, "use_fused_gemm_allreduce", False)
+                and hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
+                and hasattr(torch.ops.trtllm, "gptq_marlin_repack"))
+
+    @classmethod
+    def is_enabled(cls, module: Linear) -> bool:
+        """Apply the architecture policy on top of kernel capability."""
+        if not cls.is_supported(module):
+            return False
+        sm_version = get_sm_version()
+        return (sm_version in (120, 121)
+                or "marlin" in getattr(module, "nvfp4_allowed_backends", ()))
+
+    def transform_weights(self, module: Linear) -> None:
+        from tensorrt_llm.quantization.utils import marlin_utils
+
+        weight = module.weight.data
+        weight_scale = module.weight_scale.data
+        size_n = module.out_features
+        size_k = module.in_features
+        group_size = module.scaling_vector_size
+
+        assert size_k % group_size == 0, (
+            f"size_k {size_k} must be divisible by group_size {group_size}")
+
+        size_k_pad = fp4_utils.pad_up(size_k, 64)
+        size_n_pad = fp4_utils.pad_up(size_n, 128)
+        num_groups = size_k // group_size
+        scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+            weight_scale.view(size_n_pad, -1))
+        scale_2d = scale_unswizzled[:size_n, :num_groups]
+
+        if size_k_pad != size_k or size_n_pad != size_n:
+            num_groups_pad = size_k_pad // group_size
+            weight = F.pad(weight,
+                           (0,
+                            (size_k_pad - size_k) // 2, 0, size_n_pad - size_n))
+            # Marlin's S0E5M3 fast dequantization requires a non-zero scale for
+            # zero-weight K padding. 0x08 is the smallest normal E4M3 value.
+            scale_2d = F.pad(scale_2d, (0, num_groups_pad - num_groups),
+                             value=0x08)
+            scale_2d = F.pad(scale_2d, (0, 0, 0, size_n_pad - size_n), value=0)
+
+        qweight_int32 = weight.view(torch.int32).T.contiguous()
+        perm = torch.empty(0, dtype=torch.int32, device=weight.device)
+        marlin_weight = torch.ops.trtllm.gptq_marlin_repack(
+            b_q_weight=qweight_int32,
+            perm=perm,
+            size_k=size_k_pad,
+            size_n=size_n_pad,
+            num_bits=4,
+            is_a_8bit=False,
+        )
+
+        scale_2d = scale_2d.view(torch.float8_e4m3fn).T.contiguous()
+        marlin_scale = marlin_utils.marlin_permute_scales(scale_2d.to(
+            torch.half),
+                                                          size_k_pad,
+                                                          size_n_pad,
+                                                          group_size=group_size)
+        marlin_scale = marlin_utils.nvfp4_marlin_process_scales(marlin_scale)
+
+        weight_scale_2 = module.weight_scale_2.data
+        if (weight_scale_2.numel() == 0
+                or not torch.isfinite(weight_scale_2).all()
+                or weight_scale_2.item() == 0):
+            weight_scale_2 = torch.tensor([1.0],
+                                          dtype=torch.float32,
+                                          device=weight.device)
+        weight_global_scale = marlin_utils.nvfp4_marlin_process_global_scale(
+            weight_scale_2.to(torch.bfloat16))
+
+        module.weight = Parameter(marlin_weight, requires_grad=False)
+        module.weight_scale = Parameter(marlin_scale, requires_grad=False)
+        module.weight_global_scale = Parameter(weight_global_scale,
+                                               requires_grad=False)
+        self.cache_derived_state(module)
+
+    def cache_derived_state(self, module: Linear) -> None:
+        module._marlin_size_k = fp4_utils.pad_up(module.in_features, 64)
+        module._marlin_size_n = fp4_utils.pad_up(module.out_features, 128)
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        input, original_shape = self._prepare_input(module, input)
+        size_k = module.in_features
+        size_n = module.out_features
+        size_k_pad = getattr(module, "_marlin_size_k", size_k)
+        size_n_pad = getattr(module, "_marlin_size_n", size_n)
+
+        input_bf16 = input.bfloat16()
+        if size_k_pad != size_k:
+            input_bf16 = F.pad(input_bf16, (0, size_k_pad - size_k))
+        output = torch.ops.trtllm.marlin_nvfp4_gemm(
+            input_bf16,
+            module.weight,
+            scale_a=None,
+            scale_b=module.weight_scale,
+            alpha=None,
+            weight_global_scale=module.weight_global_scale,
+            bias=None,
+            out_dtype=module.dtype,
+            size_n=size_n_pad,
+            size_k=size_k_pad,
+            output_buffer_kind=int(BufferKind.DEFAULT),
+        )
+        if size_n_pad != size_n:
+            output = output[..., :size_n].contiguous()
+        return self._restore_output(output, original_shape, bias)
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int]):
+        raise RuntimeError(
+            "MarlinNVFP4LinearMethod does not support apply_linear_allreduce")
 
 
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
@@ -2903,124 +3155,6 @@ class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
         return output
 
 
-class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
-    """NVFP4 Linear method backed by the Marlin W4A16 kernel (SM89/SM90)."""
-
-    def transform_weights(self, module: Linear) -> None:
-        from tensorrt_llm.quantization.utils import marlin_utils
-
-        weight = module.weight.data
-        weight_scale = module.weight_scale.data
-        size_n = module.out_features
-        size_k = module.in_features
-        group_size = module.scaling_vector_size  # 16
-
-        assert size_k % group_size == 0, (
-            f"size_k {size_k} must be divisible by group_size {group_size}")
-
-        size_k_pad = fp4_utils.pad_up(size_k, 64)
-        size_n_pad = fp4_utils.pad_up(size_n, 128)
-
-        num_groups = size_k // group_size
-        n_padded = size_n_pad
-        scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-            weight_scale.view(n_padded, -1))
-        # [size_n, num_groups] block scales; uint8 storage (reverse interleave),
-        # reinterpreted as E4M3 after any padding. Pad in uint8 since F.pad does
-        # not support float8.
-        scale_2d = scale_unswizzled[:size_n, :num_groups]
-
-        if size_k_pad != size_k or size_n_pad != size_n:
-            num_groups_pad = size_k_pad // group_size
-            # weight: [N, K/2] uint8 -> [N_pad, K_pad/2] (FP4 zero == 0.0)
-            weight = F.pad(weight,
-                           (0,
-                            (size_k_pad - size_k) // 2, 0, size_n_pad - size_n))
-            # scales: [N, num_groups] -> [N_pad, num_groups_pad].
-            # The Marlin S0E5M3 fast-dequant is NOT zero-safe: a zero scale on
-            # a (zero-weight) padded K-group still corrupts that tile's output.
-            # Since K is the contraction dim, one bad group-scale poisons every
-            # output row, so padded K-groups must carry a valid non-zero fp8
-            # scale -- use the smallest-normal e4m3 value (0x08), matching the
-            # quantizer's own zero-block scale. N-row padding is sliced off in
-            # ``apply`` and can stay zero.
-            scale_2d = F.pad(scale_2d, (0, num_groups_pad - num_groups),
-                             value=0x08)
-            scale_2d = F.pad(scale_2d, (0, 0, 0, size_n_pad - size_n), value=0)
-
-        qweight_int32 = weight.view(
-            torch.int32).T.contiguous()  # [K_pad/4, N_pad]
-        perm = torch.empty(0, dtype=torch.int32, device=weight.device)
-        marlin_weight = torch.ops.trtllm.gptq_marlin_repack(
-            b_q_weight=qweight_int32,
-            perm=perm,
-            size_k=size_k_pad,
-            size_n=size_n_pad,
-            num_bits=4,
-            is_a_8bit=False,
-        )
-
-        scale_2d = scale_2d.view(
-            torch.float8_e4m3fn).T.contiguous()  # [num_groups_pad, N_pad]
-        marlin_scale = marlin_utils.marlin_permute_scales(scale_2d.to(
-            torch.half),
-                                                          size_k_pad,
-                                                          size_n_pad,
-                                                          group_size=group_size)
-        marlin_scale = marlin_utils.nvfp4_marlin_process_scales(marlin_scale)
-
-        ws2 = module.weight_scale_2.data
-        if ws2.numel() == 0 or not torch.isfinite(ws2).all() or ws2.item() == 0:
-            ws2 = torch.tensor([1.0], dtype=torch.float32, device=weight.device)
-        weight_global_scale = marlin_utils.nvfp4_marlin_process_global_scale(
-            ws2.to(torch.bfloat16))
-
-        module.weight = Parameter(marlin_weight, requires_grad=False)
-        module.weight_scale = Parameter(marlin_scale, requires_grad=False)
-        module.weight_global_scale = Parameter(weight_global_scale,
-                                               requires_grad=False)
-        # Padded GEMM dims consumed by ``apply``; default to the real sizes.
-        module._marlin_size_k = size_k_pad
-        module._marlin_size_n = size_n_pad
-
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
-        assert is_nvfp4_marlin_enabled()
-        size_k = module.in_features
-        size_n = module.out_features
-        # Set by transform_weights; equal to size_k/size_n when 64-aligned.
-        size_k_pad = getattr(module, "_marlin_size_k", size_k)
-        size_n_pad = getattr(module, "_marlin_size_n", size_n)
-
-        x = input.bfloat16()
-        if size_k_pad != size_k:
-            x = F.pad(x, (0, size_k_pad - size_k))
-        output = torch.ops.trtllm.marlin_nvfp4_gemm(
-            x,
-            module.weight,
-            scale_a=None,
-            scale_b=module.weight_scale,
-            alpha=None,
-            weight_global_scale=module.weight_global_scale,
-            bias=None,
-            out_dtype=module.dtype,
-            size_n=size_n_pad,
-            size_k=size_k_pad,
-            output_buffer_kind=int(BufferKind.DEFAULT),
-        )
-        if size_n_pad != size_n:
-            output = output[..., :size_n].contiguous()
-        if bias is not None:
-            output = output + bias
-        return output
-
-    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
-                               bias: Optional[torch.Tensor], tp_rank: int,
-                               tp_group: List[int]):
-        raise RuntimeError(
-            "MarlinNVFP4LinearMethod does not support apply_linear_allreduce")
-
-
 def _mxfp8_cutlass_op_available() -> bool:
     """Cached check for whether the CUTLASS MXFP8xMXFP8 GEMM op is compiled in.
 
@@ -3033,28 +3167,146 @@ def _mxfp8_cutlass_op_available() -> bool:
                    ) and torch.cuda.get_device_capability()[0] >= 10
 
 
+_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
+    "flashinfer_mxfp8_autotune_active", default=False)
+_FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
+    "flashinfer_mxfp8_decode_graph_capture_active", default=False)
+
+
+@contextmanager
+def flashinfer_mxfp8_autotune() -> Iterator[None]:
+    """Tune FlashInfer MXFP8 tactics while enabling auto-dispatched calls."""
+    from flashinfer import autotune
+
+    token = _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.set(True)
+    try:
+        with autotune():
+            yield
+    finally:
+        _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.reset(token)
+
+
+@contextmanager
+def flashinfer_mxfp8_decode_graph_capture() -> Iterator[None]:
+    """Enable auto-dispatched FlashInfer calls only for decode graph capture."""
+    token = _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(token)
+
+
 class MXFP8LinearMethod(LinearMethodBase):
     """MXFP8 weights (e4m3 + UE8M0 1x32) x dynamic MXFP8 activations (W8A8).
 
-    Two execution paths share a common loader:
+    Three execution paths share a common loader:
       - Reference (no CUTLASS op compiled): dequantize the weight to compute
         dtype and run F.linear. Slow but correct -- used to seed M1 tests and
         as a portable fallback.
       - CUTLASS (Blackwell sm100/103 + mxfp8_mxfp8_gemm op present): dynamic
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
+      - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
+        with ``mm_mxfp8``. MiniMax-M3 enables this path automatically only
+        while tuning or capturing decode CUDA graphs; eager execution remains
+        on the native TensorRT-LLM op.
 
-    The path is selected at create_weights time via _mxfp8_cutlass_op_available;
-    the weight_scale tensor's layout matches the chosen path (2D [O,K/32] for
-    the reference, 1D padded swizzled for CUTLASS) so apply() stays branchless.
+    ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
+    ``flashinfer``, or ``auto``. The reference layout is 2D [O,K/32]; both
+    compiled backends consume the same 1D padded swizzled scale layout.
+    When the TensorRT-LLM autotuner is enabled, the native backend profiles
+    its compiled tactics during startup. Learned tactics are registered in
+    the native op so serving avoids the Python autotuner lookup; the generic
+    CUTLASS configuration remains the cache-miss fallback.
     """
     BLOCK_SIZE = 32
     # Swizzled-SF layout padding (matches W4A8MXFP4FP8: rows->128, cols/SFblock->4).
     _SF_ROW_PAD = 128
     _SF_COL_PAD = 4
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.use_cutlass = _mxfp8_cutlass_op_available()
+        self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+        # Only PyTorchModelEngine owns the startup tuning lifecycle. Keep
+        # standalone modules and engine paths that skip warmup (for example,
+        # Helix CP) on the direct native op instead of leaving Python
+        # AutoTuner dispatch armed indefinitely.
+        self.use_native_autotuner = False
+        self._native_autotuned = False
+        if self.backend not in ("trtllm", "flashinfer", "auto"):
+            raise ValueError("TRTLLM_MXFP8_GEMM_BACKEND must be 'trtllm', "
+                             f"'flashinfer', or 'auto', got {self.backend!r}")
+        self._flashinfer_mxfp8 = None
+        self._flashinfer_autotuned = False
+        if self.backend == "flashinfer":
+            self._load_flashinfer(required=True)
+        elif self.backend == "auto" and not self._load_flashinfer(
+                required=False):
+            self.backend = "trtllm"
+
+    @property
+    def uses_flashinfer(self) -> bool:
+        return self.backend in ("flashinfer", "auto")
+
+    @property
+    def needs_flashinfer_autotune(self) -> bool:
+        return self.uses_flashinfer and self._flashinfer_mxfp8 is not None
+
+    @property
+    def needs_native_autotune(self) -> bool:
+        return (self.use_native_autotuner and not self._native_autotuned
+                and self.use_cutlass)
+
+    def _load_flashinfer(self, *, required: bool) -> bool:
+        if not self.use_cutlass:
+            if required:
+                raise RuntimeError(
+                    "FlashInfer MXFP8 GEMM requires the TensorRT-LLM MXFP8 "
+                    "quantization ops on Blackwell")
+            return False
+        try:
+            from flashinfer import autotune, mm_mxfp8
+            if not callable(autotune):
+                raise ImportError("flashinfer.autotune is unavailable")
+        except ImportError as error:
+            if required:
+                raise RuntimeError(
+                    "TRTLLM_MXFP8_GEMM_BACKEND=flashinfer requires the "
+                    "pinned flashinfer-python package") from error
+            logger.warning_once(
+                "FlashInfer MXFP8 is unavailable; using the native "
+                "TensorRT-LLM GEMM backend.",
+                key="flashinfer_mxfp8_unavailable")
+            return False
+        self._flashinfer_mxfp8 = mm_mxfp8
+        return True
+
+    def enable_flashinfer_auto(self) -> bool:
+        """Enable graph-only FlashInfer dispatch unless the user overrode it."""
+        if "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
+            return self.backend == "auto"
+        if not self._load_flashinfer(required=False):
+            return False
+        self.backend = "auto"
+        return True
+
+    def mark_flashinfer_autotuned(self) -> None:
+        self._flashinfer_autotuned = True
+
+    def mark_native_autotuned(self) -> None:
+        self._native_autotuned = True
+
+    def enable_native_autotune(self) -> None:
+        self.use_native_autotuner = True
+
+    def disable_native_autotune(self) -> None:
+        self.use_native_autotuner = False
+        self._native_autotuned = False
+
+    def disable_flashinfer_auto(self) -> None:
+        if self.backend == "auto":
+            self.backend = "trtllm"
+            self._flashinfer_autotuned = False
 
     @classmethod
     def _swizzled_scale_size(cls, out_features: int, in_features: int) -> int:
@@ -3100,15 +3352,39 @@ class MXFP8LinearMethod(LinearMethodBase):
             # the CUTLASS block-scaled e4m3xe4m3 GEMM.
             act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
                 input.contiguous(), True)
-            # globalScale is the alpha multiplier; pure MXFP8xMXFP8 uses 1.0.
-            global_scale = torch.ones([1],
-                                      dtype=torch.float32,
-                                      device=input.device)
-            output = torch.ops.trtllm.mxfp8_mxfp8_gemm(act_e4m3, act_sf,
-                                                       module.weight,
-                                                       module.weight_scale,
-                                                       global_scale,
-                                                       module.dtype)
+            use_flashinfer = self.backend == "flashinfer" or (
+                self.backend == "auto" and
+                (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
+                 (self._flashinfer_autotuned
+                  and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
+            if use_flashinfer:
+                flashinfer_mxfp8 = self._flashinfer_mxfp8
+                assert flashinfer_mxfp8 is not None
+                output = flashinfer_mxfp8(
+                    act_e4m3,
+                    module.weight.t(),
+                    act_sf,
+                    module.weight_scale,
+                    out_dtype=module.dtype,
+                    use_8x4_sf_layout=False,
+                    backend="cutlass",
+                )
+            else:
+                # globalScale is the alpha multiplier; pure MXFP8xMXFP8 uses 1.0.
+                global_scale = torch.ones([1],
+                                          dtype=torch.float32,
+                                          device=input.device)
+                gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
+                        if self.needs_native_autotune else
+                        torch.ops.trtllm.mxfp8_mxfp8_gemm)
+                output = gemm(
+                    act_e4m3,
+                    act_sf,
+                    module.weight,
+                    module.weight_scale,
+                    global_scale,
+                    module.dtype,
+                )
             if bias is not None:
                 output = output + bias
         else:
@@ -3214,13 +3490,12 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
         return FP8RowwiseLinearMethod()
     if quant_config.layer_quant_mode.has_fp8_block_scales():
         return FP8BlockScalesLinearMethod()
+    if quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+        return W4A16NVFP4LinearMethod()
     if quant_config.layer_quant_mode.has_nvfp4():
         if quant_config.quant_algo == QuantAlgo.NVFP4_ARC:
             return NVFP4ARCLinearMethod()
-        elif is_nvfp4_marlin_enabled():
-            return MarlinNVFP4LinearMethod()
-        else:
-            return NVFP4LinearMethod()
+        return NVFP4LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
         return W4A8NVFP4FP8LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
@@ -3275,7 +3550,9 @@ class Linear(nn.Module):
             nvfp4_allowed_backends: List of backends to consider for NVFP4 GEMM auto-selection.
                 Default (via config): ['cutlass', 'cublaslt', 'cuda_core'] - excludes cutedsl for faster build.
                 Add 'cutedsl' for extreme performance at the cost of longer build time.
-                Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.
+                Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'.
+                Marlin is opt-in on SM89-99. W4A16 BF16 linear layers use
+                Marlin by default on SM120/121.
                 Configure via nvfp4_gemm_config.allowed_backends in extra_llm_api_options.yaml.
         """
         from ..distributed import AllReduce
@@ -3389,8 +3666,8 @@ class Linear(nn.Module):
         in_features_aligned = self.in_features % 128 == 0
         out_features_aligned = self.out_features % 64 == 0
         tp_valid = self.tp_mode is not None and self.tp_mode == TensorParallelMode.ROW and self.tp_size > 1
-        quant_valid = self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
-        )
+        quant_valid = quant_config_has_nvfp4_activation_quantization(
+            self.quant_config)
 
         device_supported = get_sm_version() >= 100
         enable_gemm_allreduce_fusion_env = (os.environ.get(
@@ -3416,7 +3693,21 @@ class Linear(nn.Module):
             self.create_weights()
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
-        return get_quant_method(quant_config)
+        quant_method = get_quant_method(quant_config)
+        method_type = type(quant_method)
+        if method_type is W4A16NVFP4LinearMethod:
+            # Marlin by default on SM120/121, explicit opt-in elsewhere.
+            if MarlinNVFP4LinearMethod.is_enabled(self):
+                return MarlinNVFP4LinearMethod()
+        elif method_type is NVFP4LinearMethod:
+            # The Marlin kernel is W4A16, so an explicit opt-in on a W4A4
+            # checkpoint runs the weight-only method, which pads N/K to the
+            # tile sizes the kernel requires. Reuse the same predicate the
+            # ``uses_marlin_nvfp4`` property reads, so the method chosen here
+            # and that property can never disagree on the SM.
+            if _uses_marlin_nvfp4_backend(self):
+                return MarlinNVFP4LinearMethod()
+        return quant_method
 
     @staticmethod
     def _calc_shard(total, tp_size, rank):
@@ -3582,6 +3873,12 @@ class Linear(nn.Module):
         if self._weights_created:
             return
 
+        # Mixed-precision loading may replace quant_config after __init__.
+        # Weight-only W4A16 must not retain the activation-quantized fused path.
+        if not quant_config_has_nvfp4_activation_quantization(
+                self.quant_config):
+            self.use_fused_gemm_allreduce = False
+
         self.rebuild_tensor_metadata = {}
 
         self.quant_method = self.get_quant_method(self.quant_config)
@@ -3621,6 +3918,18 @@ class Linear(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
         )
+
+    @property
+    def has_nvfp4_activation_quantization(self):
+        assert self._weights_created
+        return self.quant_method.quantizes_nvfp4_activations
+
+    @property
+    def uses_marlin_nvfp4(self):
+        assert self._weights_created
+        return (isinstance(self.quant_method, MarlinNVFP4LinearMethod)
+                or (type(self.quant_method) is NVFP4LinearMethod
+                    and _uses_marlin_nvfp4_backend(self)))
 
     @property
     def has_weight_only_quant(self):
@@ -3663,11 +3972,16 @@ class Linear(nn.Module):
                      bias,
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
-        output = self.quant_method.apply(self, input, bias)
         if self.lora is not None and bool(lora_params):
-            lora_result = self.lora(input, lora_params, layer_idx)
-            if lora_result is not None:
-                output = output + lora_result
+            output = LoraLayer.forward_with_base(
+                lambda: self.quant_method.apply(self, input, bias),
+                (self.lora, ),
+                input,
+                lora_params,
+                layer_idx,
+            )
+        else:
+            output = self.quant_method.apply(self, input, bias)
         return output
 
     def apply_linear_allreduce(self,
@@ -3777,6 +4091,7 @@ class Linear(nn.Module):
         self._weights_transformed = True
 
     def cache_derived_state(self) -> None:
+        self.quant_method.cache_derived_state(self)
         self._weights_transformed = True
 
     def post_load_weights(self) -> None:
@@ -3793,16 +4108,16 @@ def is_static_nvfp4_input_eligible(linear) -> bool:
     """Whether `linear` consumes a static (calibrated) NVFP4 input, making it
     eligible to have its input-quantize folded into a producing RMSNorm.
 
-    Eligible iff the Linear has NVFP4 weights, a calibrated (static)
-    `input_scale`, no AWQ `pre_quant_scale`, and is not forced to dynamic
-    quantization. This is the single canonical definition shared by every
-    NVFP4-fold site (the layer-boundary / dense folds in modeling_deepseekv3.py
-    and the q_a_layernorm -> q_b_proj fold in attention.py's MLA) so the gate
-    cannot drift between them.
+    Eligible iff the Linear quantizes activations to NVFP4, has a calibrated
+    (static) `input_scale`, has no AWQ `pre_quant_scale`, and is not forced to
+    dynamic quantization. This is the single canonical definition shared by
+    every NVFP4-fold site (the layer-boundary / dense folds in
+    modeling_deepseekv3.py and the q_a_layernorm -> q_b_proj fold in
+    attention.py's MLA) so the gate cannot drift between them.
     """
     if linear is None:
         return False
-    return (getattr(linear, "has_nvfp4", False)
+    return (getattr(linear, "has_nvfp4_activation_quantization", False)
             and not getattr(linear, "force_dynamic_quantization", False)
             and getattr(linear, "input_scale", None) is not None
             and getattr(linear, "pre_quant_scale", None) is None)
