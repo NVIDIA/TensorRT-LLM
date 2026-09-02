@@ -352,7 +352,8 @@ class CUDAGraphRunner:
         # Sampling tier this graph must contain. Only meaningful when the fast
         # sampler is enabled; otherwise it stays FULL so every batch shares one
         # graph and sampling runs eagerly after the forward, as before.
-        sample_type = self._resolve_sample_type(batch)
+        sample_type = self._resolve_sample_type(batch,
+                                                promoted_context_request_ids)
 
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
@@ -414,7 +415,11 @@ class CUDAGraphRunner:
         """Register how a runtime batch maps to its sampling tier."""
         self._sample_type_resolver = resolver
 
-    def _resolve_sample_type(self, batch: ScheduledRequests) -> SampleType:
+    def _resolve_sample_type(
+        self,
+        batch: ScheduledRequests,
+        promoted_context_request_ids: frozenset[int] = frozenset()
+    ) -> SampleType:
         """Sampling tier the graph for this batch must contain.
 
         FULL when the fast sampler is off, so the key -- and the graphs it
@@ -426,6 +431,12 @@ class CUDAGraphRunner:
         which graph is replayed.
         """
         if not self.config.enable_fast_sampler or self._sample_type_resolver is None:
+            return SampleType.FULL
+        # A promoted final-context row is a generation request in the execution
+        # view but not in the batch the sampler is handed, so those steps are
+        # staged FULL and sampled eagerly. Resolve FULL too, or the key would
+        # ask for a FAST graph whose sampling kernels then never run.
+        if promoted_context_request_ids:
             return SampleType.FULL
         # During a capture pass the tier is pinned, so the graph records that
         # tier's kernels rather than the one the all-dummy warmup batch would
