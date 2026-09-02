@@ -90,8 +90,8 @@ def _launch_fallback_tactic(
 class FP4ConvTunableRunner(TunableRunner):
     """Tune precompiled CuTe Conv3d launch tactics for one runtime shape."""
 
-    # The launch closures bind live tensor and layout objects.
-    tuning_config = TuningConfig(use_cuda_graph=False)
+    # Graph replay removes host-launch gaps from sub-millisecond tactic timings.
+    tuning_config = TuningConfig(use_cuda_graph=True)
 
     def __init__(
         self,
