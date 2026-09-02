@@ -99,21 +99,12 @@ def _dense_kv_inputs(
     q: torch.Tensor,
     kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
     layer_idx: int,
-    *,
-    sm_scale: float,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    int,
-    float,
-    float,
-]:
-    """Resolve direct TRTLLM-gen inputs for one M3 dense layer."""
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Resolve the query, flat K/V pool and slot stride for one M3 dense layer."""
     kv_pool, subpages_per_slot = kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
     if kv_pool.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
         q = q.to(torch.float8_e4m3fn)
-
-    return q, kv_pool, int(subpages_per_slot), sm_scale, 1.0
+    return q, kv_pool, int(subpages_per_slot)
 
 
 def subpage_block_table(
@@ -226,18 +217,7 @@ def minimax_m3_trtllm_gen_dense_decode(
         decode_query_len,
     )
 
-    (
-        q,
-        kv_pool,
-        subpages_per_slot,
-        bmm1_scale,
-        bmm2_scale,
-    ) = _dense_kv_inputs(
-        q,
-        kv_cache_manager,
-        layer_idx,
-        sm_scale=sm_scale,
-    )
+    q, kv_pool, subpages_per_slot = _dense_kv_inputs(q, kv_cache_manager, layer_idx)
     num_heads = int(q.shape[1])
 
     reserve = torch.cuda.is_current_stream_capturing()
@@ -260,8 +240,8 @@ def minimax_m3_trtllm_gen_dense_decode(
         staged_subpage_table,  # block_tables
         seq_lens,  # seq_lens
         max_seq_len,  # max_seq_len
-        bmm1_scale,  # bmm1_scale
-        bmm2_scale,  # bmm2_scale
+        sm_scale,  # bmm1_scale
+        1.0,  # bmm2_scale
         -1,  # window_left: M3 dense layers are fully causal
         output,  # out
         None,  # sinks

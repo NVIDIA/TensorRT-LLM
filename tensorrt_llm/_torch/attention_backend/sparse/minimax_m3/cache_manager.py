@@ -182,14 +182,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         layers (0 for a separate drafter or when speculation is disabled).
     """
 
-    # One-model speculative draft layers share this manager, so reuse,
-    # eviction, and disaggregated transfer cover the drafter natively.
-    supports_shared_draft_layers = True
-
-    # The separately allocated Eagle layer cannot inherit an NVFP4 target
-    # cache: the shipped TRTLLM-Gen set has no matching M3 NVFP4 decode cubin.
-    # Keep that compatibility path on FP8/P128 as well.
-    draft_manager_kv_cache_dtype = "fp8"
     _main_kv_layout = "NHD"
 
     def __init__(
@@ -898,17 +890,17 @@ class MiniMaxM3DraftKVCacheView:
         self._manager = manager
         if len(draft_layer_ids) != 1:
             raise ValueError(
-                "MiniMax-M3's unified draft KV view supports exactly one "
+                "MiniMax-M3's native P128 draft view supports exactly one "
                 f"draft layer, got {len(draft_layer_ids)}"
             )
         if manager.tokens_per_block != 128:
             raise ValueError(
-                "MiniMax-M3's unified draft KV view requires tokens_per_block=128, "
+                "MiniMax-M3's native P128 draft view requires tokens_per_block=128, "
                 f"got {manager.tokens_per_block}"
             )
         if manager.enable_swa_scratch_reuse:
             raise ValueError(
-                "MiniMax-M3's unified draft KV view does not support SWA scratch reuse"
+                "MiniMax-M3's native P128 draft view does not support SWA scratch reuse"
             )
 
         layer_id = draft_layer_ids[0]
@@ -970,6 +962,10 @@ class MiniMaxM3DraftKVCacheView:
         num_seqs: int,
         max_blocks: Optional[int] = None,
     ) -> None:
+        # Call the V2 implementation unbound so it reads this view's
+        # ``index_scales``, ``kv_offset`` and ``host_kv_cache_block_offsets``
+        # rather than the shared manager's; ``__getattr__`` would bind the
+        # manager's own copy otherwise.
         KVCacheManagerV2.copy_batch_block_offsets(
             self,
             dst_tensor,
@@ -979,11 +975,6 @@ class MiniMaxM3DraftKVCacheView:
             num_seqs,
             max_blocks=max_blocks,
         )
-        # The V2 copy maps padding to K=0,V=0. Keep the rooted view's padding
-        # on the safe slot-0 K/V pair because speculative substeps can cross
-        # the host KV-length snapshot at a page edge.
-        with torch.cuda.stream(self._manager._stream):
-            dst_tensor[0, :num_seqs, 1].clamp_min_(1)
 
 
 def get_minimax_m3_kv_cache_manager_cls():

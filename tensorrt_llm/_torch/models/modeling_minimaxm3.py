@@ -2848,9 +2848,9 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             model_config = get_text_model_config(model_config)
         if model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4:
             # M3's 57 sparse target layers have an MSA NVFP4 consumer, but the
-            # one-model Eagle layer has no matching NVFP4 decode cubin.
-            # Keep its modules and separate cache on their established FP8
-            # representation while the target remains NVFP4.
+            # one-model Eagle layer has no matching NVFP4 decode cubin. Keep its
+            # modules and its shared draft KV layer on FP8 while the target
+            # remains NVFP4.
             model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
 

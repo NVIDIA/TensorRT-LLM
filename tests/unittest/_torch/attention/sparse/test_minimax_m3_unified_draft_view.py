@@ -14,8 +14,6 @@
 # limitations under the License.
 """Pure-logic tests for MiniMaxM3DraftKVCacheView."""
 
-from contextlib import nullcontext
-
 import pytest
 import torch
 
@@ -121,7 +119,6 @@ def test_block_table_uses_native_p128_copy(monkeypatch):
             dst_tensor[0, 0, 1, block_idx] = slot * SCALE + 1
 
     monkeypatch.setattr(KVCacheManagerV2, "copy_batch_block_offsets", fake_copy)
-    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
     dst = torch.full((1, 1, 2, view.max_blocks_per_seq), -7, dtype=torch.int32)
 
     view.copy_batch_block_offsets(
@@ -136,7 +133,7 @@ def test_block_table_uses_native_p128_copy(monkeypatch):
     assert dst[0, 0, 0, :2].tolist() == [5 * SCALE, 7 * SCALE]
     assert dst[0, 0, 1, :2].tolist() == [5 * SCALE + 1, 7 * SCALE + 1]
     assert dst[0, 0, 0, 2:].tolist() == [0] * 14
-    assert dst[0, 0, 1, 2:].tolist() == [1] * 14
+    assert dst[0, 0, 1, 2:].tolist() == [0] * 14
     assert calls == [([123], 1, 1, 1, 9)]
 
 
