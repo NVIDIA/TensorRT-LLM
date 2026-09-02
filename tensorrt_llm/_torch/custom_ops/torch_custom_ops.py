@@ -2702,17 +2702,6 @@ def get_event(event_idx: int):
     return extra_attrs["events"]()[event_idx]
 
 
-def get_eagle_hidden_states_event() -> torch.cuda.Event:
-    from ..utils import get_model_extra_attrs
-    extra_attrs = get_model_extra_attrs()
-    assert extra_attrs is not None, "Missing model extra attributes"
-    spec_metadata = extra_attrs.get("spec_metadata")
-    assert spec_metadata is not None, "Missing speculative metadata"
-    event = spec_metadata.hidden_states_ready_event
-    assert event is not None, "Missing Eagle hidden-state event"
-    return event
-
-
 def get_stream(stream_id: int):
     from ..utils import get_model_extra_attrs
     extra_attrs = get_model_extra_attrs()
@@ -2754,22 +2743,6 @@ def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
     stream = get_stream(stream_id)
     assert stream is not None
     tensor.record_stream(stream)
-
-
-@torch.library.custom_op("trtllm::eagle_hidden_states_copy",
-                         mutates_args=("dest", ))
-def eagle_hidden_states_copy(dest: torch.Tensor, src: torch.Tensor,
-                             dim1_start: int, dim1_end: int) -> None:
-    """Copy and publish the final disaggregated Eagle hidden-state slice."""
-    torch.ops.trtllm.inplace_slice_copy(dest, src, dim1_start, dim1_end)
-    if do_multi_stream():
-        get_eagle_hidden_states_event().record()
-
-
-@torch.library.register_fake("trtllm::eagle_hidden_states_copy")
-def _eagle_hidden_states_copy_fake(dest: torch.Tensor, src: torch.Tensor,
-                                   dim1_start: int, dim1_end: int) -> None:
-    pass
 
 
 class Fp4GemmAllreduceRunner(TunableRunner):

@@ -190,8 +190,6 @@ class MultiStreamDAG:
                     args_new.append(arg)
             return args_new
 
-        publication_sink = None
-
         # Pop all the placeholders from gm
         # We know that the node is already in topological order
         for node in gm.graph.nodes:
@@ -215,9 +213,6 @@ class MultiStreamDAG:
                 in_edges[None] = self.entry_node
 
             vertex = MultiStreamNode(node, in_edges)
-            if (node.op == "call_function" and node.target
-                    == torch.ops.trtllm.eagle_hidden_states_copy.default):
-                publication_sink = vertex
             if node.op == "output":
                 self.exit_node = vertex
                 vertex.distance = 0
@@ -235,19 +230,7 @@ class MultiStreamDAG:
 
             for edge in in_edges.values():
                 edge.out_edges.append(vertex)
-
-        # An externally consumed write has no natural path to the graph output.
-        # Give it output-path scheduling priority, but remove the synthetic edge
-        # before stream assignment so it does not become a graph-exit barrier.
-        if publication_sink is not None:
-            edge_key = ("external_publication_priority",
-                        self.node_to_id[publication_sink.node])
-            publication_sink.out_edges.append(self.exit_node)
-            self.exit_node.in_edges[edge_key] = publication_sink
         self.compute_distance()
-        if publication_sink is not None:
-            publication_sink.out_edges.remove(self.exit_node)
-            del self.exit_node.in_edges[edge_key]
 
     def compute_distance(self) -> None:
         """
