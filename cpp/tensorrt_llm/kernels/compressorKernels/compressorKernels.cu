@@ -234,10 +234,15 @@ enum class CacheScaleType
 // (state_dim = 2*head_dim), Phase 1 iterates over 2 column halves.
 //
 // Memory layout:
-//   kv_score:   [total_tokens, 2 * state_dim] — interleaved KV and score
-//   projections paged_kv:   paged cache for compressor KV state paged_score:
-//   paged cache for compressor score state (with APE bias) output:
-//   [total_comp_tokens, head_dim] — compressed output tokens
+//
+//   kv_score: [total_tokens, 2 * state_dim] — interleaved KV and score
+//             projections.
+//
+//   paged_kv: Paged cache for compressor KV state.
+//
+//   paged_score: Paged cache for compressor score state (with APE bias).
+//
+//   output: [total_comp_tokens, head_dim] — compressed output tokens.
 // ============================================================================
 
 // Helper: vectorized online softmax step reading from paged KV/score state.
@@ -316,11 +321,16 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     using StateVecT = typename VecType<VEC * STATE_ELEM_BYTES>::type;
     static_assert(VEC >= 4, "VEC must be >= 4 for float4 ape loads");
 
-    // HEAD_BLOCKS: split head_dim across blockIdx.y for better SM utilisation.
-    // For HD=512 and max elem size 2: NTHRD_BASE=64 → HEAD_BLOCKS=2,
-    // NTHRD_INNER=32. For HD=128 and max elem size 2/4: NTHRD_BASE=32 →
-    // HEAD_BLOCKS=1, NTHRD_INNER=32. For HD=512 and max elem size 4:
-    // NTHRD_BASE=128 → HEAD_BLOCKS=4, NTHRD_INNER=32.
+    // HEAD_BLOCKS splits head_dim across blockIdx.y for better SM utilisation.
+    //
+    //   HD=512, max element size 2: NTHRD_BASE=64, HEAD_BLOCKS=2,
+    //   NTHRD_INNER=32.
+    //
+    //   HD=128, max element size 2 or 4: NTHRD_BASE=32, HEAD_BLOCKS=1,
+    //   NTHRD_INNER=32.
+    //
+    //   HD=512, max element size 4: NTHRD_BASE=128, HEAD_BLOCKS=4,
+    //   NTHRD_INNER=32.
     constexpr int NTHRD_BASE = HEAD_DIM / VEC;
     constexpr int HEAD_BLOCKS = (NTHRD_BASE > 32) ? (NTHRD_BASE / 32) : 1;
     constexpr int NTHRD_INNER = NTHRD_BASE / HEAD_BLOCKS; // always <= 32
@@ -795,10 +805,15 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 // All full chunks are also written to paged kv/score caches for block reuse.
 //
 // Memory layout:
-//   kv_score:    [total_tokens, 2*state_dim] — interleaved KV and score from
-//   linear projection paged_kv:    paged cache for compressor state (remainder)
-//   paged_score: paged cache for compressor score state (remainder, with APE)
-//   output:      [total_comp_tokens, head_dim] — compressed output tokens
+//
+//   kv_score: [total_tokens, 2*state_dim] — interleaved KV and score from the
+//             linear projection.
+//
+//   paged_kv: Paged cache for compressor state (remainder).
+//
+//   paged_score: Paged cache for compressor score state (remainder, with APE).
+//
+//   output: [total_comp_tokens, head_dim] — compressed output tokens.
 // ============================================================================
 
 // Per-element online softmax step on VEC elements via 128-bit vectorized loads.
@@ -1068,9 +1083,11 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     // [range_start + new_start, range_start
     // + COMPRESS_RATIO) are new tokens read from kv_score with live APE addition.
     // Two branch-free loops avoid a per-iteration if/else on pos < sp.
-    //   kv_col_off  — column offset into kv_score / paged state (0 or HEAD_DIM
-    //   for overlap) ape_col_off — column offset into APE table for the score
-    //   column (same as kv_col_off)
+    //   kv_col_off: Column offset into kv_score / paged state (0 or HEAD_DIM
+    //   for overlap).
+    //
+    //   ape_col_off: Column offset into the APE table for the score column
+    //   (same as kv_col_off).
     auto reduce_window = [&](int range_start, int kv_col_off, int ape_col_off, bool skipNewTokens)
     {
         // Precompute split once for the whole window.
