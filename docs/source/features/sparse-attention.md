@@ -1,11 +1,14 @@
 # Sparse Attention
 
 - [Overview](#overview)
+- [Supported Sparse Attentions](#supported-sparse-attentions)
+  - [Sparse MLA](#sparse-mla)
+  - [Sparse MQA/GQA](#sparse-mqagqa)
+  - [Sparse MHA](#sparse-mha)
 - [Supported Algorithms](#supported-algorithms)
-- [Sparse MHA Kernel Support](#sparse-mha-kernel-support)
-- [Sparse MQA/GQA Kernel Support](#sparse-mqagqa-kernel-support)
-- [Configure Sparse Attention](#configure-sparse-attention)
-- [Algorithm Details](#algorithm-details)
+  - [Capability Comparison](#capability-comparison)
+  - [Algorithm Details](#algorithm-details)
+- [Usage with trtllm-bench and trtllm-serve](#usage-with-trtllm-bench-and-trtllm-serve)
 - [Further Reading](#further-reading)
 
 ## Overview
@@ -29,42 +32,91 @@ class selected by its `algorithm` field. Model-native algorithms usually read
 their geometry from the checkpoint; avoid overriding those values unless the
 model-specific guide says they are tunable.
 
-## Supported Algorithms
+## Supported Sparse Attentions
 
-| `algorithm` | Config class | Sparse mechanism | Attention implementation | Typical use |
-|---|---|---|---|---|
-| `rocket` | `RocketSparseAttentionConfig` | Prompt KV eviction, then page-level Top-K selection during decode | TRTLLM or Vanilla | Training-free sparsity for MHA/MQA/GQA models |
-| `dsa` | `DeepSeekSparseAttentionConfig` | Learned token-level indexer followed by sparse MLA | TRTLLM | DeepSeek V3.2 and compatible model-native DSA architectures |
-| `deepseek_v4` | `DeepSeekV4SparseAttentionConfig` | Sliding-window attention plus compressed sparse or compressed dense history | TRTLLM | DeepSeek-V4 hybrid attention |
-| `minimax_m3` | `MiniMaxM3SparseAttentionConfig` | Learned block selection followed by sparse GQA | Dedicated Triton or MSA implementation | MiniMax-M3 sparse layers |
-| `skip_softmax` | `SkipSoftmaxAttentionConfig` | Dynamically skips eligible softmax work inside the FMHA kernel | TRTLLM | Existing full-attention models with calibrated or direct thresholds |
+TensorRT LLM supports sparse computation for MLA, MQA/GQA, and MHA. This
+section describes the attention and kernel contracts independently of the
+algorithm that produces the sparse pattern. The public algorithms that connect
+selectors, cache management, and these attention implementations are listed in
+[Supported Algorithms](#supported-algorithms).
 
-All five configs select the PyTorch execution backend. The "attention
-implementation" column refers to the attention kernel/backend used inside that
-execution backend.
+### Sparse MLA
 
-### Capability Comparison
+Sparse MLA consumes token-level selections against a latent KV cache. It is
+used by model-native algorithms such as DeepSeek Sparse Attention and
+DeepSeek-V4 hybrid attention. Both prefill and generation are supported,
+including mixed batches.
 
-| Capability | RocketKV | DSA | DeepSeek-V4 | MiniMax-M3 | Skip Softmax |
-|---|---:|---:|---:|---:|---:|
-| Sparse prefill computation | No | Yes | Yes | Yes | Yes |
-| Sparse decode computation | Yes | Yes | Yes | Yes | Yes |
-| Reduces retained main KV history | Yes | No | Yes, through model-native compression | No | No |
-| Requires a model-trained selector | No | Yes | Yes | Yes | No |
-| Selection granularity | Token eviction and pages | Tokens | Compressed entries | Blocks | Kernel tiles |
+| Parameter | Support |
+|---|---|
+| GPU architecture | SM90, SM100, SM103, SM120, and SM121 through architecture-specific sparse MLA implementations |
+| Sparse compute phase | Packed prefill, generation, and mixed context/generation batches |
+| Attention type | MLA with a shared latent KV representation |
+| Model geometry | Checkpoint-native geometry; tests cover DeepSeek-V3.2 (`qk_head_dim=192`, `v_head_dim=128`) and DeepSeek-V4 (`qk_head_dim=512`, `v_head_dim=512`) |
+| Model input dtype | BF16 |
+| KV-cache dtype | BF16 and the FP8 modes supported by the selected model and GPU architecture |
+| Sparse indices | `int32` token indices; one selection per query token |
+| Attention semantics | Causal self-attention |
 
-"No" for RocketKV prefill means that prompt attention is still computed
-densely. RocketKV selects which prompt KV entries to retain, so it reduces cache
-size and later decode work.
+[`test_sparse_mla_forward.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py)
+covers pure prefill, pure generation, mixed batches, BF16/FP8 KV-cache modes,
+and the direct FlashMLA sparse-forward contract.
 
-## Sparse MHA Kernel Support
+### Sparse MQA/GQA
 
-RocketKV uses the shared page-sparse MHA path after its selector produces block
-indices and per-request offsets. Prefill attention remains dense: RocketKV can
-compact the retained KV cache after prefill, but sparse attention computation
-starts during generation.
+TensorRT LLM provides two sparse MQA/GQA compute paths. The token-sparse path
+accepts a precomputed token list for each KV head and query token. Query heads
+in the same KV group share the KV head's list. The block-sparse path accepts
+request-local selections of 128-token KV blocks from a paged HND cache.
 
-### Support Matrix
+These are attention capabilities, not standalone public
+`SparseAttentionConfig` algorithms. A user-facing algorithm must also provide
+the selector, metadata, cache management, and backend integration.
+
+| Parameter | Token-sparse | Block-sparse |
+|---|---|---|
+| Sparse block size | 1 token | 128 tokens |
+| GPU architecture | SM100 and SM103 | SM100 and SM103 |
+| Sparse compute phase | Packed prefill, single-token generation, and linear draft-token generation; query lengths `1` and `4` are tested | Packed prefill, single-token generation, linear multi-query compute, and mixed batches |
+| Attention type | MQA and GQA; Q heads must be divisible by KV heads | MQA and GQA; Q heads must be divisible by KV heads |
+| Query heads per KV head | At most 32; tests cover `2`, `3`, `4`, `8`, `16`, `24`, `31`, and `32` | `2`, `4`, `8`, or `16`; all are tested |
+| Q/KV head counts | No additional discrete kernel limit; tests cover Q heads `{6, 8, 16, 32, 48, 62, 64}` and KV heads `{1, 2, 4, 8}` | No additional discrete kernel limit; tests cover Q heads `{4, 8, 16, 32}` and KV heads `{1, 2}` |
+| Model Q/K/V input dtype | BF16 or FP16 | BF16 or E4M3 FP8 |
+| Model Q/K/V input layout | Fused QKV | Q `[tokens, q_heads, 128]`; paged K/V `[pages, kv_heads, 128, 128]` |
+| Output dtype | BF16 or FP16 for every supported head dimension; E4M3 FP8 for head dimensions `64`, `128`, and `256` | BF16 |
+| KV-cache dtype | BF16 or FP16 for every supported head dimension; E4M3 FP8 for head dimensions `64`, `128`, and `256` | BF16 or E4M3 FP8 |
+| Q/K/V head dimension | Equal dimensions of `64`, `80`, `128`, or `256` | Equal dimension of `128` |
+| KV-cache layout | Paged cache; page size is a power of two and at least 8 tokens; tests cover `8`, `16`, `32`, `64`, `128`, `256`, and `512` | Paged HND cache with page size `128`; shuffled physical pages and strided outer-page storage are tested |
+| Sparse indices | `int32` physical token indices per KV head and query token | `int32` request-local block indices per KV head and query token; per-token lists, `-1` padding, and physical remapping are tested |
+| Sparse Top-K | Positive multiple of 4; tests cover `4`, `32`, `64`, and `128` | `4`, `8`, `16`, or `32` selected blocks; all are tested |
+| Attention semantics | Causal self-attention | Causal self-attention with bottom-right or explicit per-request query offsets |
+
+The token-sparse path is JIT-compiled with NVRTC. Its support is defined by the
+current source checks rather than by the precompiled cubins that were present
+when the feature was introduced. Linear draft-token generation is verified
+with one target token and three draft tokens. Each query has its own causal
+sparse list, including K/V written earlier in the same speculative forward.
+Tree-shaped speculative masks are not applied by this path.
+
+For an FP8 KV cache, token-sparse Q is quantized to E4M3 during QKV
+preprocessing while the model input remains BF16 or FP16. Tests cover both
+BF16 output with an FP8 KV cache and the E4M3 FP8-output kernel. The shared
+kernel validator also admits head dimension `512`, but the sparse path aborts
+before launch for that configuration, so it is excluded from this matrix.
+
+Backend developers can use
+[`test_sparse_mqa_gqa.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mqa_gqa.py)
+as an integration example. Its static selectors isolate index/cache layout and
+attention computation without presenting a public application API.
+
+### Sparse MHA
+
+The shared page-sparse MHA path consumes block indices and per-request offsets
+produced by a sparse selector. Sparse MHA computation starts during generation;
+prefill attention computation remains dense. An algorithm can still compact
+the retained KV cache after prefill to reduce cache size and later decode work.
+
+#### Support Matrix
 
 | Parameter | Support |
 |---|---|
@@ -91,109 +143,40 @@ selections, invokes `TrtllmAttention.forward`, and compares the result with an
 equivalent token-level PyTorch reference. RocketKV selector, metadata, and KT
 cache tests remain under the `rocketkv/` subdirectory.
 
-## Sparse MQA/GQA Kernel Support
+## Supported Algorithms
 
-TensorRT LLM contains an internal TRTLLM-Gen kernel for token-sparse
-multi-query attention (MQA) and grouped-query attention (GQA). It accepts a
-precomputed token-index list for each KV head and query token. Query heads in
-the same KV group share the KV head's index list.
+The public `sparse_attention_config` API connects a sparse algorithm to its
+selector, runtime metadata, cache management, and attention implementation.
 
-This is a kernel capability, not a public `SparseAttentionConfig` algorithm.
-There is no supported `algorithm: mqa_gqa` value for `LLM` or YAML. A sparse
-algorithm must provide the selector, metadata, cache management, and attention
-backend integration before applications can use this kernel through the public
-API.
+| `algorithm` | Config class | Sparse mechanism | Attention implementation | Typical use |
+|---|---|---|---|---|
+| `rocket` | `RocketSparseAttentionConfig` | Prompt KV eviction, then page-level Top-K selection during decode | TRTLLM or Vanilla | Training-free sparsity for MHA/MQA/GQA models |
+| `dsa` | `DeepSeekSparseAttentionConfig` | Learned token-level indexer followed by sparse MLA | TRTLLM | DeepSeek-V3.2 and compatible model-native DSA architectures |
+| `deepseek_v4` | `DeepSeekV4SparseAttentionConfig` | Sliding-window attention plus compressed sparse or compressed dense history | TRTLLM | DeepSeek-V4 hybrid attention |
+| `minimax_m3` | `MiniMaxM3SparseAttentionConfig` | Learned block selection followed by sparse GQA | Dedicated Triton or packaged block-sparse implementation | MiniMax-M3 sparse layers |
+| `skip_softmax` | `SkipSoftmaxAttentionConfig` | Dynamically skips eligible softmax work inside the FMHA kernel | TRTLLM | Existing full-attention models with calibrated or direct thresholds |
 
-### Support Matrix
+All five configs select the PyTorch execution backend. The "attention
+implementation" column refers to the attention kernel/backend used inside that
+execution backend.
 
-| Parameter | Supported | Not currently supported or not established |
-|---|---|---|
-| GPU architecture | SM100 and SM103 | Pre-Blackwell GPUs; SM120 and SM121 |
-| Attention type | MQA (`num_kv_heads == 1`) and GQA | Arbitrary head mappings |
-| Head relationship | `num_q_heads % num_kv_heads == 0`; at most 32 query heads per KV head; tests cover group sizes `2`, `3`, `4`, `8`, `16`, `24`, `31`, and `32` | Non-divisible Q/KV head counts and groups larger than 32 |
-| Q/K/V dimensions | Equal QK and V head dimensions | Unequal QK/V dimensions (MLA uses a separate sparse path) |
-| Head dimension | `64`, `80`, `128`, or `256` | `512` and other head dimensions |
-| Model Q/K/V input dtype | BF16 or FP16 | FP8 model-input tensors are not wired through this XQA fixed-parameter path |
-| Output dtype | BF16, FP16, or E4M3 FP8 | Other output dtypes |
-| KV-cache dtype and layout | BF16, FP16, or E4M3 FP8 paged KV cache; page size is a power of two and at least 8 tokens | Contiguous cache, non-power-of-two pages, and pages smaller than 8 tokens |
-| Sparse indices | `int32`, token-granular, one list per KV head and query token | A public built-in selector for generic MQA/GQA |
-| Sparse Top-K | Positive multiple of 4; shorter sequences may pad unused entries with `-1` | Top-K values not divisible by 4 |
-| Inference phase | Packed prefill, single-token generation, and linear draft-token generation (`qSeqLen=4` is tested) | Tree-shaped speculative masks are ignored by this static sparse kernel; mixed context/generation batches are not covered |
-| Beam width | `1` | Beam search |
-| Attention mask/window | Causal self-attention with a fixed cache window | ALiBi, arbitrary custom masks, StreamingLLM/sink tokens, and variable cyclic windows |
+### Capability Comparison
 
-The current main branch JIT-compiles this path with NVRTC. Its support is
-therefore defined by the current TRTLLM-Gen source checks, not by the set of
-precompiled cubins that was present when the feature was introduced.
+| Capability | RocketKV | DSA | DeepSeek-V4 | MiniMax-M3 | Skip Softmax |
+|---|---:|---:|---:|---:|---:|
+| Sparse prefill computation | No | Yes | Yes | Yes | Yes |
+| Sparse decode computation | Yes | Yes | Yes | Yes | Yes |
+| Reduces retained main KV history | Yes | No | Yes, through model-native compression | No | No |
+| Requires a model-trained selector | No | Yes | Yes | Yes | No |
+| Selection granularity | Token eviction and pages | Tokens | Compressed entries | Blocks | Kernel tiles |
 
-Linear draft-token generation is verified with four query tokens per request:
-one target token plus three draft tokens. Each query has its own causal sparse
-index list, including indices for K/V written earlier in the same speculative
-forward. A separate branched-tree probe showed that the static sparse kernel
-matches the unmasked reference rather than the tree-filtered reference, so
-tree-shaped speculative masks are not supported.
+"No" for RocketKV prefill means that prompt attention is still computed
+densely. RocketKV selects which prompt KV entries to retain, so it reduces cache
+size and later decode work.
 
-For FP8 KV cache, Q is quantized to E4M3 during QKV preprocessing and the XQA
-runner selects E4M3 KV/math types while retaining BF16 or FP16 model input.
-Tests cover both BF16 output with an FP8 KV cache and an E4M3 FP8-output kernel.
+### Algorithm Details
 
-The regression tests cover:
-
-- MQA and GQA group sizes `2`, `3`, `4`, `8`, `16`, `24`, `31`, and `32`;
-- variable batch and sequence lengths;
-- context KV compaction, context sparse computation, and decode sparse
-  computation;
-- Top-K values `4`, `64`, and `128`, including Top-K larger than a request's
-  current KV length;
-- backing KV-cache page sizes `32` and `64`;
-- all supported equal head dimensions in both BF16 and FP16;
-- linear generation with three draft tokens;
-- E4M3 FP8 KV cache and FP8 output with BF16 model input.
-
-The shared TRTLLM-Gen option validator also admits head dimension `512`, but
-the sparse MQA/GQA path aborts before launch for that configuration on current
-main. It is therefore intentionally excluded from the supported matrix and
-regression tests.
-
-Backend developers can use
-[`test_sparse_mqa_gqa.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mqa_gqa.py)
-as a minimal integration example. `_SparseMqaGqaParams` and
-`_StaticSparseMqaGqaAttention` deliberately supply fixed sparse predictions so
-that the test isolates the cache/index layout and kernel computation. They are
-not public application APIs.
-
-## Configure Sparse Attention
-
-Pass a config object to `LLM` in Python, or use the equivalent discriminated
-YAML object with `trtllm-serve`, `trtllm-bench`, or `trtllm-eval`.
-
-```python
-from tensorrt_llm import LLM
-from tensorrt_llm.llmapi import RocketSparseAttentionConfig
-
-llm = LLM(
-    model="<path_or_hf_id>",
-    sparse_attention_config=RocketSparseAttentionConfig(),
-)
-```
-
-```yaml
-sparse_attention_config:
-  algorithm: rocket
-```
-
-For example:
-
-```bash
-trtllm-serve <path_or_hf_id> --config config.yaml
-trtllm-bench --model <path_or_hf_id> throughput --dataset <dataset> --config config.yaml
-```
-
-The following sections list algorithm-specific settings and constraints.
-
-## Algorithm Details
-
-### RocketKV
+#### RocketKV
 
 [RocketKV](https://arxiv.org/pdf/2502.14051) is a training-free, two-stage
 algorithm for MHA, MQA, and GQA architectures. During prefill, it computes dense
@@ -237,7 +220,7 @@ enable_chunked_prefill: false
 The TRTLLM and Vanilla attention implementations support RocketKV. The
 Vanilla implementation requires a BF16 KT cache.
 
-### DeepSeek Sparse Attention
+#### DeepSeek Sparse Attention
 
 DeepSeek Sparse Attention (DSA) is a model-native mechanism introduced by
 DeepSeek V3.2. A learned MQA indexer scores the KV history, Top-K selects token
@@ -278,7 +261,7 @@ See the
 for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
 and disaggregated-serving support.
 
-### DeepSeek-V4 Hybrid Sparse Attention
+#### DeepSeek-V4 Hybrid Sparse Attention
 
 DeepSeek-V4 interleaves three model-native attention modes:
 
@@ -304,7 +287,7 @@ See the
 [DeepSeek-V4 example](../../../examples/models/core/deepseek_v4/README.md) for
 checkpoint-derived configuration and deployment constraints.
 
-### MiniMax-M3 Block-Sparse GQA
+#### MiniMax-M3 Block-Sparse GQA
 
 MiniMax-M3 uses model-native block-sparse GQA in its sparse layers. An index
 branch scores main KV-cache blocks, forces configured initial/local blocks into
@@ -334,7 +317,7 @@ reuse or MTP. See the
 [MiniMax-M3 deployment guide](../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md)
 for supported checkpoints and parallel deployment settings.
 
-### Skip Softmax Attention
+#### Skip Softmax Attention
 
 Skip Softmax Attention, also known as BLASST, dynamically skips eligible work
 inside a FlashAttention-style kernel. It does not select tokens, alter the
@@ -408,6 +391,62 @@ fnmatch layer patterns. At most one checkpoint config group may use the
 
 Skip Softmax Attention requires the TRTLLM attention backend. Other attention
 backends do not apply it.
+
+## Usage with trtllm-bench and trtllm-serve
+
+Sparse attention is configured through `sparse_attention_config` on the
+PyTorch backend. DeepSeek-V3.2 provides a mature end-to-end example: its
+checkpoint defines the DSA indexer geometry and Top-K, so the minimal YAML only
+needs to select the `dsa` algorithm.
+
+```yaml
+# config.yml
+sparse_attention_config:
+  algorithm: dsa
+```
+
+Start an OpenAI-compatible server with the same config file used for other
+PyTorch backend options:
+
+```bash
+trtllm-serve deepseek-ai/DeepSeek-V3.2 \
+  --backend pytorch \
+  --tp_size 8 \
+  --ep_size 8 \
+  --custom_tokenizer deepseek_v32 \
+  --config ./config.yml
+```
+
+For a throughput benchmark, first prepare or supply a tokenized dataset, then
+pass the same config to `trtllm-bench`:
+
+```bash
+trtllm-bench --model deepseek-ai/DeepSeek-V3.2 \
+  prepare-dataset \
+  --output ./deepseek-v3.2-dataset.json \
+  token-norm-dist \
+  --input-mean 4096 \
+  --output-mean 512 \
+  --input-stdev 0 \
+  --output-stdev 0 \
+  --num-requests 16
+
+trtllm-bench --model deepseek-ai/DeepSeek-V3.2 throughput \
+  --backend pytorch \
+  --tp 8 \
+  --ep 8 \
+  --dataset ./deepseek-v3.2-dataset.json \
+  --max_batch_size 16 \
+  --max_num_tokens 8192 \
+  --config ./config.yml
+```
+
+Use a local checkpoint path in place of the Hugging Face model ID when needed.
+Other sparse algorithms use the same YAML entry point with their own
+`algorithm` discriminator and settings. See the
+[DeepSeek V3/V3.2 example](../../../examples/models/core/deepseek_v3/README.md)
+for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
+and disaggregated-serving configurations.
 
 ## Further Reading
 

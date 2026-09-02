@@ -33,7 +33,7 @@ TensorRT LLM's sparse attention algorithms fall into two categories.
 - **Framework-level**: the algorithm runs a *prediction* step that emits
   sparse indices, which are then consumed by a shared `AttentionOp` to
   produce sparse KV cache updates and/or sparse attention computation.
-  Examples: **RocketKV** (page-level, MQA/GQA), **DSA** (token-level,
+  Examples: **RocketKV** (page-level, MHA/MQA/GQA), **DSA** (token-level,
   MLA).
 - **Kernel-level**: sparsity is implemented entirely inside the
   attention kernel — there is no external prediction or gather step.
@@ -125,11 +125,11 @@ The current capability matrix is:
 
 | Attention type | Context phase | Generation phase |
 |---|---|---|
-| MQA / MHA / GQA | sparse KV cache | sparse computation (page-level) |
+| MQA / GQA | sparse KV cache and sparse computation (token-level) | sparse computation (token- or page-level) |
+| MHA | sparse KV cache | sparse computation (page-level) |
 | MLA | sparse computation (token-level) | sparse computation (token-level) |
 
-Context-phase sparse computation for MQA/GQA and dynamic generation-phase
-KV eviction are tracked as future work.
+Dynamic generation-phase KV eviction is tracked as future work.
 
 ### Prediction hooks
 
@@ -171,13 +171,17 @@ Algorithm implementations live under
 </div>
 <p align="center"><sub><em>Figure 2: Sparse attention operator workflow in TensorRT LLM.</em></sub></p>
 
-For MQA/GQA, the op runs `gatherKvPageOffsetsKernel` before the
-generation-phase attention kernel. It takes the (potentially unordered
-or finer-grained) sparse indices and maps them to ordered, page-aligned
-KV cache offsets, also producing an updated per-head effective KV
-length. The downstream attention kernel reads only those pages. Today
-MQA/GQA sparse computation is supported at **block (page) granularity**
-in the generation phase only.
+For page-sparse MHA/MQA/GQA, the op runs `gatherKvPageOffsetsKernel`
+before the generation-phase attention kernel. It takes the (potentially
+unordered or finer-grained) sparse indices and maps them to ordered,
+page-aligned KV cache offsets, also producing an updated per-head
+effective KV length. The downstream attention kernel reads only those
+pages.
+
+Token-sparse MQA/GQA uses physical KV-cache token indices directly. It
+supports packed context and generation computation, including a linear
+sequence of draft tokens. Query heads in the same KV group share the KV
+head's per-query token list.
 
 After context attention, `updateSparseKvCacheAfterFmha` post-processes
 the KV cache: it selects the important KV tokens and rewrites the
@@ -261,14 +265,16 @@ prediction methods.
 - **Behavior**: return the sparse indices used by the generation-phase
   attention computation.
 - **Outputs**:
-  - `sparse_attn_indices`: shape `(nHeads, nBlocks)` — block indices on
-    the KV sequence dimension. Block size is set by the algorithm via
-    `sparse_attn_indices_block_size` (arbitrary value supported).
+  - `sparse_attn_indices`: sparse token or block indices on the KV
+    sequence dimension. Token-sparse MQA/GQA supplies one physical-token
+    list per KV head and query token. Page-sparse attention supplies
+    request-local block lists; block size is set by the algorithm via
+    `sparse_attn_indices_block_size`.
   - `sparse_attn_offsets`: shape `(nBatch + 1)` — same semantics as
     above.
-- **Constraint**: today only **page-level** granularity is supported
-  for MQA/GQA sparse computation, and the generation-phase path uses
-  TRTLLM-GEN kernels (NVIDIA Blackwell SM 100+).
+- **Constraint**: token-sparse MQA/GQA and page-sparse MHA/MQA/GQA use
+  different index layouts. Match the selected kernel contract; do not
+  pass request-local block indices to the physical-token path.
 
 Prediction is on the critical path and can dominate latency in
 low-latency scenarios. Plan for custom kernels (Triton or CUDA) rather
@@ -326,8 +332,6 @@ for the kernel-side specifics.
 
 ## Roadmap
 
-- **Sparse computation in context phase for MQA/MHA/GQA** — extend
-  framework coverage to context-phase sparse compute.
 - **Dynamic eviction in generation phase** — exploring block-level
   eviction as a compromise that keeps KV cache flexibility manageable.
 - **Unified auxiliary memory management** — let custom auxiliary pools
