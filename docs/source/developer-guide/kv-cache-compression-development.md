@@ -299,30 +299,42 @@ the storage ABI, see the
 [PR #18091](https://github.com/NVIDIA/TensorRT-LLM/pull/18091) for a concrete
 NVFP4 layout and provider implementation.
 
-### Common base contract and required overrides
+### General storage-bound provider contract
+
+A storage-bound method can subclass `KVCacheCompressionManager` directly and
+provide its own cold-page codec. This is the general path for storage formats
+that do not use the token-wise quantization helper.
+
+| Member | `KVCacheCompressionManager` behavior | Storage-bound subclass responsibility |
+|---|---|---|
+| `__init__()` | Stores the configuration and initializes target/draft KVCM references | Normally inherit; call `super().__init__()` when adding manager-lifetime state |
+| `uses_iteration_lifecycle` | Defaults to `True` | Set to `False` |
+| `provides_cold_page_codec` | Defaults to `False` | Set to `True` |
+| `create_cold_page_codec()` | Returns `None` | Required: return an independent owning native `IKvCacheColdPageCodec` for each call |
+| `encode_cold_pages()`, `decode_cold_pages()` | Raise `NotImplementedError` | Implement when the returned codec delegates format transforms back to the Python provider; a self-contained native codec may own these operations directly |
+
+The returned codec must satisfy the same ownership, lifetime, stream, and
+migration contracts regardless of where its implementation lives. A different
+storage format is not a reason to add an algorithm-specific path to KVCM.
+
+### Token-wise cold-page quantization helper
 
 For token-wise cold-page quantization, subclass
-`ColdPageQuantizationCompression`. It implements the common registration and
-Python/native bridge; the format subclass supplies only its state, layout, and
-batched transform.
+`ColdPageQuantizationCompression`. It supplies the common registration and
+Python/native bridge, so the format subclass defines only its state, layout,
+and batched transform.
 
-| Member | Common base behavior | Format subclass responsibility |
+| Member | `ColdPageQuantizationCompression` behavior | Quantization format responsibility |
 |---|---|---|
-| `__init__()` | Stores the compression configuration and KVCM bindings | Override only to load immutable format metadata, and call `super().__init__()` |
-| `uses_iteration_lifecycle`, `provides_cold_page_codec` | Selects storage-bound execution | Inherit `False` and `True`, respectively |
-| `create_cold_page_codec()` | Builds independent codec state and returns an owning native `IKvCacheColdPageCodec` wrapper | Normally inherit |
-| `configure()` | Builds and retains metadata for every provider-owned lifecycle, reports one fixed cold Page size per lifecycle, and selects host-resident `PageIndexPair` arrays | Normally inherit when this index contract fits |
+| `__init__()` | Inherits compression configuration and KVCM state from the general base | Override only to load immutable format metadata, and call `super().__init__()` |
+| `uses_iteration_lifecycle`, `provides_cold_page_codec` | Selects storage-bound execution with `False` and `True` | Inherit |
+| `create_cold_page_codec()` | Builds independent codec state and returns an owning native wrapper | Inherit |
+| `configure()` | Builds and retains metadata for each provider-owned lifecycle, reports one fixed cold Page size per lifecycle, and selects host-resident `PageIndexPair` arrays | Inherit when this index contract fits |
 | `build_codec_state()` | Raises `NotImplementedError` | Required: define codec-lifetime format state and provider-owned layers |
 | `build_lifecycle_metadata()` | Raises `NotImplementedError` | Required: resolve and validate one lifecycle's physical layout and launch metadata |
-| `encode_cold_pages()`, `decode_cold_pages()` | Raise `NotImplementedError` in `KVCacheCompressionManager` | Required: dispatch the batched format-specific transforms |
+| `encode_cold_pages()`, `decode_cold_pages()` | Inherit the general base placeholders | Required: dispatch the batched format-specific transforms |
 
-A storage format that does not fit the token-wise quantization helper should
-subclass `KVCacheCompressionManager` directly and implement
-`create_cold_page_codec()`. It must provide the same ownership, lifetime, and
-migration contract; needing a different transform is not a reason to add an
-algorithm-specific path to KVCM.
-
-### Required codec state
+### Required helper method: codec state
 
 KVCM supplies the cache configuration, runtime KV dtype, PP-local layer
 mapping, per-layer KV-head count, per-layer head dimension, and whether the
@@ -340,7 +352,7 @@ them to determine which KVCM lifecycles the provider owns. Each
 wrapper retains that state for the codec lifetime. Do not keep mutable
 lifecycle metadata only on the shared compression-manager object.
 
-### Required lifecycle layout
+### Required helper method: lifecycle layout
 
 The native adapter converts KVCM's authoritative hot pool descriptors into
 resolved lifecycles before it calls `configure()`. The common implementation
@@ -365,7 +377,7 @@ lossless.[^mixed-lifecycle-host-limit]
     lossless codec cannot split its batched copies at those registration
     boundaries.
 
-### Required batched transforms
+### Required helper methods: batched transforms
 
 `encode_cold_pages()` and `decode_cold_pages()` receive the codec state,
 provider-lifecycle index, cold allocation base address, `PageIndexPair` array,
