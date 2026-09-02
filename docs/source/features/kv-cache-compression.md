@@ -182,32 +182,36 @@ rules, see the [KV Cache Compression Development Guide](../developer-guide/kv-ca
 
 ## Support
 
-The following table summarizes the cache structures handled by NVFP4 cold-page
-quantization.
+The two methods share the compression framework but support different cache
+structures.
 
-| Cache structure | Compression support |
-| --- | --- |
-| MHA/GQA Attention KV | Supported |
-| MLA Attention KV | Supported |
-| GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly |
-| DSA and other Attention side buffers | Preserved losslessly |
-| DeepSeek-V4 specialized sparse cache | Not supported |
+| Cache structure | NVFP4 cold-page quantization | TriAttention |
+| --- | --- | --- |
+| MHA/GQA Attention KV | Supported | Supported for full-Attention KV |
+| MLA Attention KV | Supported | Not supported |
+| GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
+| DSA and other Attention side buffers | Preserved losslessly | Not supported |
+| DeepSeek-V4 specialized sparse cache | Not supported | Not supported |
 
-Cold-page NVFP4 currently requires the PyTorch backend, the native C++ KV cache
-manager V2, and an SM100-family GPU. Algorithm-specific requirements can differ;
-refer to the corresponding example before enabling a method.
+\* Both methods currently require the PyTorch backend, KVCM V2, and an
+SM100-family GPU (SM100 or SM103). NVFP4 cold-page quantization additionally
+requires the native C++ KVCM V2 backend and a nonzero Host or Disk cache.
+TriAttention requires a model-specific offline calibration file. See each
+method's detailed example for its remaining requirements and validated modes.
 
 ### Tested Models
 
-Cold-page quantization has been tested with the following model families:
+NVFP4 cold-page quantization has been tested with the following model families:
 
 - Qwen3 family
 - Qwen3.5 family
 - GLM family, including GLM-5.2
 - DeepSeek-R1 family
 
-This is a tested-model list, not an exhaustive support list. Other models that
-use a supported KV-cache structure are expected to work.
+TriAttention has been tested with Qwen3-8B. These are tested-model lists, not
+exhaustive support lists. Other models that use a supported KV-cache structure
+are expected to work; consult the method example for method-specific
+restrictions.
 
 ## Verification
 
