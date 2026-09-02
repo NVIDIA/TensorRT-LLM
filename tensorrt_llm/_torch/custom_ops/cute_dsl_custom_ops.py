@@ -8054,6 +8054,83 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.paged_mqa_logits import (
         FP4MQALogitsKernel, FP8MQALogitsKernel)
 
+    def _emission_block_max(B, next_n, nb_pad, block_max_out, device):
+        """Allocate/validate the [rows, nb_pad*4] fp32 warp-partial buffer
+        (4 records per 128-token block)."""
+        nrec = nb_pad * 4
+        if block_max_out is None:
+            block_max_out = torch.empty((B * next_n, nrec),
+                                        device=device,
+                                        dtype=torch.float32)
+        assert (block_max_out.shape == (B * next_n, nrec)
+                and block_max_out.is_contiguous())
+        return block_max_out
+
+    def _emission_seed_buffers(B, next_n, emit_block_meta, seed_thr,
+                               seed_counts_out):
+        """Validate the seed contract shared by the FP4/FP8 scoring runners.
+
+        Packed (seed_counts_out is None): seed_thr IS the [rows, 8] fp32
+        seed row - lines at cols 0..2, counts accumulate as fp32 at cols
+        3..5; the caller zeroes cols 3..7 and writes lines each step.
+        Split: seed_thr [rows, 3] fp32 + caller-zeroed seed_counts_out
+        [rows, 3] int32. Returns (seed_packed, seed_counts_out).
+        """
+        assert emit_block_meta, "emit_seed_counts requires emit_block_meta"
+        if seed_counts_out is None:
+            assert (
+                seed_thr is not None and seed_thr.dtype == torch.float32
+                and seed_thr.is_cuda and seed_thr.is_contiguous()
+                and seed_thr.shape == (B * next_n, 8)
+            ), (f"packed emit_seed_counts requires seed_thr fp32 "
+                f"[{B * next_n}, 8]; got "
+                f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
+                )
+            return True, seed_thr
+        assert (
+            seed_thr is not None and seed_thr.dtype == torch.float32
+            and seed_thr.is_cuda and seed_thr.is_contiguous()
+            and seed_thr.shape == (B * next_n, 3)
+        ), (f"emit_seed_counts requires seed_thr fp32 "
+            f"[{B * next_n}, 3]; got "
+            f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
+            )
+        assert (seed_counts_out.dtype == torch.int32 and seed_counts_out.is_cuda
+                and seed_counts_out.is_contiguous()
+                and seed_counts_out.shape == (B * next_n, 3)), (
+                    "emit_seed_counts requires a caller-zeroed "
+                    "seed_counts_out int32 [B*next_n, 3]")
+        return False, seed_counts_out
+
+    def _emission_bucketed_cand(B, next_n, accept_cap, cand_out, cand_idx_out,
+                                cand_ctl_out, cand_cur_out):
+        """Validate the bucketed SoA contract: cand_out fp32 VALUES
+        [rows, 2*segA+capC], cand_idx_out int32 positions (same width),
+        cand_ctl_out int32 [rows, 4] {n0, void, n1, n2} (caller-zeroed),
+        cand_cur_out int32 [rows, 4] cursors (caller-zeroed).
+        Returns cand_cap = W - 2*accept_cap."""
+        assert cand_out is not None, ("emit_cand_bucketed requires cand_out")
+        W = cand_out.shape[1]
+        assert (cand_out.dtype == torch.float32 and cand_out.is_cuda
+                and cand_out.is_contiguous() and cand_out.dim() == 2
+                and cand_out.shape[0] == B * next_n and W > 2 * accept_cap), (
+                    "bucketed requires cand_out fp32 [rows, 2*segA+capC]")
+        assert (cand_idx_out is not None and cand_idx_out.dtype == torch.int32
+                and cand_idx_out.is_cuda and cand_idx_out.is_contiguous()
+                and cand_idx_out.shape == cand_out.shape), (
+                    "bucketed requires cand_idx_out int32, same shape")
+        assert (cand_ctl_out is not None and cand_ctl_out.dtype == torch.int32
+                and cand_ctl_out.is_cuda and cand_ctl_out.is_contiguous()
+                and cand_ctl_out.shape == (B * next_n, 4)), (
+                    "bucketed requires caller-zeroed cand_ctl_out "
+                    "int32 [rows, 4]")
+        assert (cand_cur_out is not None and cand_cur_out.dtype == torch.int32
+                and cand_cur_out.is_cuda and cand_cur_out.is_contiguous()
+                and cand_cur_out.shape == (B * next_n, 4)), (
+                    "bucketed requires caller-zeroed cand_cur_out "
+                    "int32 [rows, 4]")
+        return W - 2 * accept_cap
+
     class CuteDSLPagedMQALogitsRunner:
         """Runner for CuTe DSL FP8 Paged MQA Logits kernel (Blackwell SM100).
 
@@ -8274,8 +8351,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 epi_dtype: epilogue compute dtype
                 acc_dtype: MMA accumulator dtype
                 output_dtype: output logits dtype
+                emit_block_meta: also emit per-128-block metadata for the
+                    fused GVR top-k. ``block_max_out``
+                    [B*next_n, nb_pad*4] fp32 (4 warp-partial records per
+                    block) is allocated when not supplied.
+                emit_seed_counts: with ``seed_counts_out`` None, packed
+                    contract: ``seed_thr`` IS the [B*next_n, 8] fp32 seed
+                    row (lines at cols 0..2, counts at 3..5); otherwise
+                    split contract: ``seed_thr`` [B*next_n, 3] fp32 +
+                    caller-zeroed ``seed_counts_out`` [B*next_n, 3] int32.
+                emit_cand_bucketed: bucketed A/B/C candidate list into
+                    ``cand_out`` / ``cand_idx_out`` [B*next_n,
+                    2*accept_cap + cand_cap] + ``cand_ctl_out``
+                    [B*next_n, 4] + ``cand_cur_out`` [B*next_n, 4].
             Returns:
-                logits: [B*next_n, max_context_len] output_dtype
+                logits [B*next_n, max_context_len]; with emit_block_meta,
+                the tuple (logits, block_max_out).
+
+            The optional emission tensors are written by the kernel but
+            cannot be declared in ``mutates_args`` (see the FP4 runner
+            note); emission is eager / CUDA-graph only.
             """
             B, next_n, H, D = q.shape
             N = next_n * H
@@ -8312,53 +8407,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             logits = logits[:, :max_context_len]
 
-            # Emission buffers (same contracts as the FP4 runner; the
-            # optional tensors are written by the kernel but stay out of
-            # mutates_args - see the FP4 op note). nb_pad mirrors the
+            # Emission buffers: written by the kernel but out of
+            # mutates_args (see the docstring note). nb_pad mirrors the
             # logits padding so WG1's odd-num_kv OOB tile lands in padding.
             if emit_block_meta:
                 nb_pad = aligned_max_ctx // compute_block_kv
-                nrec = nb_pad * 4
-                if block_max_out is None:
-                    block_max_out = torch.empty((B * next_n, nrec),
-                                                device=q.device,
-                                                dtype=torch.float32)
-                assert (block_max_out.shape == (B * next_n, nrec)
-                        and block_max_out.is_contiguous())
+                block_max_out = _emission_block_max(B, next_n, nb_pad,
+                                                    block_max_out, q.device)
             seed_packed = False
             if emit_seed_counts:
-                assert emit_block_meta, (
-                    "emit_seed_counts requires emit_block_meta")
-                if seed_counts_out is None:
-                    # Packed contract: seed_thr IS the [rows, 8] fp32 seed
-                    # row; lines at cols 0..2, counts accumulate as fp32 at
-                    # cols 3..5. Caller zeroes cols 3..7 and writes lines
-                    # each step.
-                    seed_packed = True
-                    assert (
-                        seed_thr is not None and seed_thr.dtype == torch.float32
-                        and seed_thr.is_cuda and seed_thr.is_contiguous()
-                        and seed_thr.shape == (B * next_n, 8)
-                    ), (f"packed emit_seed_counts requires seed_thr fp32 "
-                        f"[{B * next_n}, 8]; got "
-                        f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
-                        )
-                    seed_counts_out = seed_thr
-                else:
-                    assert (
-                        seed_thr is not None and seed_thr.dtype == torch.float32
-                        and seed_thr.is_cuda and seed_thr.is_contiguous()
-                        and seed_thr.shape == (B * next_n, 3)
-                    ), (f"emit_seed_counts requires seed_thr fp32 "
-                        f"[{B * next_n}, 3]; got "
-                        f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
-                        )
-                    assert (seed_counts_out.dtype == torch.int32
-                            and seed_counts_out.is_cuda
-                            and seed_counts_out.is_contiguous()
-                            and seed_counts_out.shape == (B * next_n, 3)), (
-                                "emit_seed_counts requires a caller-zeroed "
-                                "seed_counts_out int32 [B*next_n, 3]")
+                seed_packed, seed_counts_out = _emission_seed_buffers(
+                    B, next_n, emit_block_meta, seed_thr, seed_counts_out)
             else:
                 seed_thr = None
                 seed_counts_out = None
@@ -8366,36 +8425,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if emit_cand_bucketed:
                 assert emit_seed_counts, (
                     "emit_cand_bucketed requires emit_seed_counts")
-                assert cand_out is not None, (
-                    "emit_cand_bucketed requires cand_out")
-                W = cand_out.shape[1]
-                assert (
-                    cand_out.dtype == torch.float32 and cand_out.is_cuda
-                    and cand_out.is_contiguous() and cand_out.dim() == 2
-                    and cand_out.shape[0] == B * next_n
-                    and W > 2 * accept_cap), (
-                        "bucketed requires cand_out fp32 [rows, 2*segA+capC]")
-                assert (cand_idx_out is not None
-                        and cand_idx_out.dtype == torch.int32
-                        and cand_idx_out.is_cuda
-                        and cand_idx_out.is_contiguous()
-                        and cand_idx_out.shape == cand_out.shape), (
-                            "bucketed requires cand_idx_out int32, same shape")
-                assert (cand_ctl_out is not None
-                        and cand_ctl_out.dtype == torch.int32
-                        and cand_ctl_out.is_cuda
-                        and cand_ctl_out.is_contiguous()
-                        and cand_ctl_out.shape == (B * next_n, 4)), (
-                            "bucketed requires caller-zeroed cand_ctl_out "
-                            "int32 [rows, 4]")
-                assert (cand_cur_out is not None
-                        and cand_cur_out.dtype == torch.int32
-                        and cand_cur_out.is_cuda
-                        and cand_cur_out.is_contiguous()
-                        and cand_cur_out.shape == (B * next_n, 4)), (
-                            "bucketed requires caller-zeroed cand_cur_out "
-                            "int32 [rows, 4]")
-                cand_cap = W - 2 * accept_cap
+                cand_cap = _emission_bucketed_cand(B, next_n, accept_cap,
+                                                   cand_out, cand_idx_out,
+                                                   cand_ctl_out, cand_cur_out)
             else:
                 cand_out = None
                 cand_idx_out = None
@@ -9651,7 +9683,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if emit_block_meta:
                 nb_pad = aligned_max_ctx // compute_block_kv
                 # 4 warp-partial records per block (see FP4MQALogitsKernel).
-                nrec = nb_pad * 4
+                nb_pad * 4
                 if emit_hit_stats:
                     assert (
                         hit_bitmap is not None
@@ -9675,50 +9707,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else:
                     hit_bitmap = None
                     hit_stats_out = None
-                if block_max_out is None:
-                    block_max_out = torch.empty((B * next_n, nrec),
-                                                device=q.device,
-                                                dtype=torch.float32)
-                assert (block_max_out.shape == (B * next_n, nrec)
-                        and block_max_out.is_contiguous())
+                block_max_out = _emission_block_max(B, next_n, nb_pad,
+                                                    block_max_out, q.device)
 
             seed_packed = False
             if emit_seed_counts:
-                assert emit_block_meta, (
-                    "emit_seed_counts requires emit_block_meta")
-                if seed_counts_out is None:
-                    # Packed contract: seed_thr IS the [rows, 8] fp32 seed
-                    # row; lines at cols 0..2, counts accumulate as fp32 at
-                    # cols 3..5. Caller zeroes cols 3..7 and writes lines
-                    # each step.
-                    seed_packed = True
-                    assert (
-                        seed_thr is not None and seed_thr.dtype == torch.float32
-                        and seed_thr.is_cuda and seed_thr.is_contiguous()
-                        and seed_thr.shape == (B * next_n, 8)
-                    ), (f"packed emit_seed_counts requires seed_thr fp32 "
-                        f"[{B * next_n}, 8]; got "
-                        f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
-                        )
-                    seed_counts_out = seed_thr
-                else:
-                    # Legacy split contract: 3 thresholds per row (fp32),
-                    # counts accumulated with red.global.add.s32 into a
-                    # caller-zeroed int32 [rows, 3].
-                    assert (
-                        seed_thr is not None and seed_thr.dtype == torch.float32
-                        and seed_thr.is_cuda and seed_thr.is_contiguous()
-                        and seed_thr.shape == (B * next_n, 3)
-                    ), (f"emit_seed_counts requires seed_thr fp32 "
-                        f"[{B * next_n}, 3]; got "
-                        f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
-                        )
-                    assert (seed_counts_out.dtype == torch.int32
-                            and seed_counts_out.is_cuda
-                            and seed_counts_out.is_contiguous()
-                            and seed_counts_out.shape == (B * next_n, 3)), (
-                                "emit_seed_counts requires a caller-zeroed "
-                                "seed_counts_out int32 [B*next_n, 3]")
+                seed_packed, seed_counts_out = _emission_seed_buffers(
+                    B, next_n, emit_block_meta, seed_thr, seed_counts_out)
             else:
                 seed_thr = None
                 seed_counts_out = None
@@ -9747,40 +9742,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             elif emit_cand_bucketed:
                 assert emit_seed_counts, (
                     "emit_cand_bucketed requires emit_seed_counts")
-                # SoA contract: cand_out = fp32 VALUES [rows, 2*segA+capC],
-                # cand_idx_out = int32 positions (same width), cand_cur_out =
-                # int32 [rows, 4] cursors (caller-zeroed), cand_ctl_out =
-                # int32 [rows, 4] {n0, void, n1, n2} (caller-zeroed)
-                assert cand_out is not None, (
-                    "emit_cand_bucketed requires cand_out")
-                W = cand_out.shape[1]
-                assert (
-                    cand_out.dtype == torch.float32 and cand_out.is_cuda
-                    and cand_out.is_contiguous() and cand_out.dim() == 2
-                    and cand_out.shape[0] == B * next_n
-                    and W > 2 * accept_cap), (
-                        "bucketed requires cand_out fp32 [rows, 2*segA+capC]")
-                assert (cand_idx_out is not None
-                        and cand_idx_out.dtype == torch.int32
-                        and cand_idx_out.is_cuda
-                        and cand_idx_out.is_contiguous()
-                        and cand_idx_out.shape == cand_out.shape), (
-                            "bucketed requires cand_idx_out int32, same shape")
-                assert (cand_ctl_out is not None
-                        and cand_ctl_out.dtype == torch.int32
-                        and cand_ctl_out.is_cuda
-                        and cand_ctl_out.is_contiguous()
-                        and cand_ctl_out.shape == (B * next_n, 4)), (
-                            "bucketed requires caller-zeroed cand_ctl_out "
-                            "int32 [rows, 4]")
-                assert (cand_cur_out is not None
-                        and cand_cur_out.dtype == torch.int32
-                        and cand_cur_out.is_cuda
-                        and cand_cur_out.is_contiguous()
-                        and cand_cur_out.shape == (B * next_n, 4)), (
-                            "bucketed requires caller-zeroed cand_cur_out "
-                            "int32 [rows, 4]")
-                cand_cap = W - 2 * accept_cap
+                cand_cap = _emission_bucketed_cand(B, next_n, accept_cap,
+                                                   cand_out, cand_idx_out,
+                                                   cand_ctl_out, cand_cur_out)
             else:
                 cand_out = None
                 cand_ctl_out = None

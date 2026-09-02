@@ -1243,6 +1243,83 @@ def benchmark_fp8_paged_mqa_logits(
             print()
 
 
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("avg_ctx", [4096, 4224])
+def test_cute_dsl_fp8_paged_mqa_logits_op_emission_surface(batch_size, avg_ctx):
+    """The op-level emission seam: kwargs produced by GvrEmissionState (the
+    production wiring) feed torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits.
+    The op must accept the kwarg names as-is, unwrap the runner tuple, and
+    produce the deterministic emission outputs (logits, block_max, packed
+    seed row, ctl counts, cursor totals) bit-identical to the runner path."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLPagedMQALogitsRunner
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_emission import GvrEmissionState
+
+    device = "cuda"
+    next_n, phys_block_kv = 1, 64
+    (
+        q_fp8,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+    ) = _emission_test_data(batch_size, next_n, avg_ctx, phys_block_kv, False, seed=11)
+    num_rows = batch_size * next_n
+
+    def run(op_path: bool):
+        state = GvrEmissionState(
+            max_rows=num_rows, top_k=2048, device=torch.device(device), own_prior=False
+        )
+        state.update_seed_rows(num_rows, "list")
+        kwargs = state.indexer_emit_kwargs("list", num_rows)
+        kwargs["block_max_out"] = state.ensure_block_max(max_model_len)[:num_rows]
+        if op_path:
+            logits = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+                q_fp8,
+                kv_fused,
+                weights,
+                context_lens,
+                block_table,
+                schedule_meta,
+                max_model_len,
+                **kwargs,
+            )
+            assert isinstance(logits, torch.Tensor), "op must unwrap the runner tuple"
+        else:
+            logits, _ = CuteDSLPagedMQALogitsRunner.forward(
+                q_fp8,
+                kv_fused,
+                weights,
+                context_lens,
+                block_table,
+                schedule_meta,
+                max_model_len,
+                emit_block_meta=True,
+                emit_seed_counts=True,
+                emit_cand_bucketed=True,
+                seed_thr=kwargs["seed_thr"],
+                accept_cap=kwargs["accept_cap"],
+                cand_out=kwargs["cand_out"],
+                cand_idx_out=kwargs["cand_idx_out"],
+                cand_ctl_out=kwargs["cand_ctl_out"],
+                cand_cur_out=kwargs["cand_cur_out"],
+                block_max_out=kwargs["block_max_out"],
+                **_EMISSION_COMMON,
+            )
+        torch.cuda.synchronize()
+        return logits, state
+
+    logits_op, st_op = run(op_path=True)
+    logits_rn, st_rn = run(op_path=False)
+    torch.testing.assert_close(logits_op.float(), logits_rn.float(), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(st_op.block_max, st_rn.block_max, atol=0.0, rtol=0.0, equal_nan=True)
+    torch.testing.assert_close(st_op.seed_row, st_rn.seed_row, atol=0.0, rtol=0.0)
+    assert torch.equal(st_op.cand_ctl[:num_rows], st_rn.cand_ctl[:num_rows])
+    assert torch.equal(st_op.cand_cur[:num_rows], st_rn.cand_cur[:num_rows])
+
+
 if __name__ == "__main__":
     import argparse
     import os
