@@ -190,8 +190,11 @@ def test_take_wrong_size_in_flight_waits_before_miss(prefetcher, monkeypatch):
     assert result == [None]  # wrong-size pool was drained, then rejected
 
 
-def test_shadow_wait_budget_tracks_identity_timeout(monkeypatch):
-    fake_mpi_session = types.SimpleNamespace(_identity_barrier_timeout=lambda: 125.0)
+def test_shadow_wait_budget_tracks_identity_gate_budget(monkeypatch):
+    # The gate budget covers bootstrap AND the barrier phase; the prefetcher
+    # must take the whole thing, not just the bootstrap half, or it abandons a
+    # build the library still considers healthy.
+    fake_mpi_session = types.SimpleNamespace(identity_gate_budget=lambda: 125.0)
     monkeypatch.setitem(sys.modules, "tensorrt_llm.llmapi.mpi_session", fake_mpi_session)
     assert (
         session_prefetcher._shadow_build_wait_timeout()
@@ -204,8 +207,18 @@ def test_shadow_wait_budget_handles_partially_loaded_mpi_module(monkeypatch):
     monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT", "625")
     assert (
         session_prefetcher._shadow_build_wait_timeout()
-        == 625 + session_prefetcher._SHADOW_BUILD_FINISH_GRACE
+        == 625
+        + session_prefetcher._FALLBACK_BARRIER_TIMEOUT
+        + session_prefetcher._SHADOW_BUILD_FINISH_GRACE
     )
+
+
+def test_shadow_wait_budget_never_undercuts_the_real_gate():
+    """The fallback constants must not drift below the library's own budget."""
+    mpi_session = pytest.importorskip("tensorrt_llm.llmapi.mpi_session")
+
+    assert session_prefetcher._FALLBACK_BARRIER_TIMEOUT == mpi_session._IDENTITY_BARRIER_TIMEOUT
+    assert session_prefetcher._shadow_build_wait_timeout() >= mpi_session.identity_gate_budget()
 
 
 def test_take_timeout_is_terminal_until_build_exits(prefetcher, monkeypatch):
