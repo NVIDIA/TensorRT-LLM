@@ -62,7 +62,12 @@ _DEFAULT_MODELS = {
 }
 
 
-def _generate(model: str, kv_cache_config: KvCacheConfig, compression_config) -> None:
+def _generate(
+    model: str,
+    kv_cache_config: KvCacheConfig,
+    compression_config: ColdPageQuantizationCompressionConfig
+    | TriAttentionKvCacheCompressionConfig,
+) -> None:
     with LLM(
         model=model,
         backend="pytorch",
@@ -110,7 +115,7 @@ def run_triattention(model: str, calibration_path: str) -> None:
     )
 
 
-def parse_arguments():
+def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--compression-method",

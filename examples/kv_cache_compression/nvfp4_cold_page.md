@@ -67,8 +67,8 @@ C++ KVCacheManagerV2
   `-- cold -> hot: fused transfer + decode to the runtime KV type
                        |
                        v
-KVCM publishes the destination Page after completion
-  `-- Attention consumes only the normal GPU hot-page layout
+KVCM publishes the destination mapping with its normal completion ordering
+  `-- Attention consumes the normal GPU hot-page layout
 ```
 
 KVCacheManagerV2 remains the storage and lifecycle owner. The compression
@@ -89,9 +89,9 @@ Host cold Page (NVFP4 Attention data + block scales;
     |  fused Host-to-GPU transfer + decode
     v
 GPU hot Page (original runtime KV type)
-    |  completion event
+    |  KVCM publishes the restored Page
     v
-KVCM publishes the new cache level and Slot mapping
+Attention consumes the Page in its normal runtime layout
 ```
 
 ## Feature Behavior
@@ -115,10 +115,16 @@ every group of 16 values. A compatible ModelOpt NVFP4 checkpoint can optionally
 supply per-layer K/V global-scale metadata; see
 [Optional ModelOpt Global Scales](#optional-modelopt-global-scales).
 
-This is different from an active NVFP4 KV cache. Do not set
+This is different from an active NVFP4 KV cache.[^active-nvfp4] Do not set
 `kv_cache_config.dtype: nvfp4` for this feature. Cold-page compression does not
 change Page identity, token count, block reuse, scheduling, or the
 Attention-visible GPU layout.
+
+[^active-nvfp4]: If the loaded model configuration already declares an active
+    NVFP4 KV cache, TensorRT-LLM skips cold-page NVFP4 conversion and migrates
+    that representation losslessly. A checkpoint with NVFP4 weights can still
+    use this feature when its active KV type is FP16, BF16, or FP8; weight
+    quantization and KV-cache quantization are separate settings.
 
 ## Supported Cache Types
 
@@ -142,9 +148,9 @@ Set `kv_cache_config.use_kv_cache_manager_v2: true` explicitly, and do not set
 required for Pages to cross a compression boundary.
 
 On Linux 6.11 through 6.13, mixed models that need both NVFP4 Attention
-lifecycles and lossless SSM/GDN fallback lifecycles are currently rejected.
-Those kernels require chunked pinned-memory registration, which the embedded
-lossless fallback cannot yet split safely at registration boundaries.
+lifecycles and lossless SSM/GDN fallback lifecycles are not supported. See the
+[KV Cache Compression Development Guide](../../docs/source/developer-guide/kv-cache-compression-development.md)
+for the current storage-path limitation.
 
 ### Tested Models
 
@@ -216,10 +222,10 @@ kv_cache_compression_config:
 trtllm-serve Qwen/Qwen3.5-4B --config qwen3.5-cold-nvfp4.yaml
 ```
 
-This minimal smoke disables block reuse to keep the example small. For an
-agentic prefix-reuse workload, enable block reuse and supply enough reusable
-long-context traffic to create real GPU KV pressure. Compression preserves the
-Page identity used by block reuse.
+This smoke test disables block reuse and covers basic inference and
+configuration. For a prefix-reuse workload, enable block reuse and supply
+enough reusable long-context traffic to create real GPU KV pressure.
+Compression preserves the Page identity used by block reuse.
 
 ## GLM-5.2 Disaggregated Serving
 
@@ -284,7 +290,7 @@ kv_cache_compression_config:
 
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 128
+  max_batch_size: 32
 moe_config:
   backend: CUTEDSL
 cache_transceiver_config:
@@ -299,7 +305,7 @@ Start the context and generation workers in separate shells on one 8-GPU node:
 CUDA_VISIBLE_DEVICES=0,1,2,3 trtllm-serve nvidia/GLM-5.2-NVFP4 \
   --backend pytorch --served_model_name nvidia/GLM-5.2-NVFP4 \
   --host 0.0.0.0 --port 8001 \
-  --max_batch_size 128 --max_num_tokens 16640 --max_seq_len 8232 \
+  --max_batch_size 32 --max_num_tokens 4096 --max_seq_len 8192 \
   --tp_size 4 --ep_size 4 --pp_size 1 \
   --config context.yaml
 
@@ -307,7 +313,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 trtllm-serve nvidia/GLM-5.2-NVFP4 \
 CUDA_VISIBLE_DEVICES=4,5,6,7 trtllm-serve nvidia/GLM-5.2-NVFP4 \
   --backend pytorch --served_model_name nvidia/GLM-5.2-NVFP4 \
   --host 0.0.0.0 --port 8002 \
-  --max_batch_size 128 --max_num_tokens 10240 --max_seq_len 10240 \
+  --max_batch_size 32 --max_num_tokens 4096 --max_seq_len 8192 \
   --tp_size 4 --ep_size 4 --pp_size 1 \
   --config generation.yaml
 ```
@@ -346,10 +352,9 @@ curl http://localhost:8000/v1/completions \
 The orchestrator does not own a KV cache. Put `kv_cache_config` and
 `kv_cache_compression_config` on each worker that uses a local Host or Disk
 tier. A successful NIXL context-to-generation transfer alone does not prove
-that the worker migrated a Page to its cold tier. This configuration is a
-functional disaggregated-serving example, not an Agentic block-reuse
-benchmark; enable block reuse and use a reuse-bearing workload when measuring
-the capacity and hit-rate benefit.
+that the worker migrated a Page to its cold tier. This configuration
+demonstrates disaggregated serving. Enable block reuse and use a workload with
+reusable prefixes when measuring cache-capacity and hit-rate benefits.
 
 ## Verify Activation
 
@@ -362,9 +367,15 @@ nonzero when the workload offloads and later reuses cold Pages:
 * `trtllm_kv_cache_offload_bytes_total`
 * `trtllm_kv_cache_onboard_bytes_total`
 
-Also verify the resolved worker configuration. In disaggregated serving, each
-context or generation worker owns its own local KVCM and cold-tier quota; the
-front-end orchestrator does not.
+These counters prove that Pages moved.[^migration-counters] Also verify the
+resolved worker configuration. In disaggregated serving, each context or
+generation worker owns its own local KVCM and cold-tier quota; the front-end
+orchestrator does not.
+
+[^migration-counters]: The counters cover all KVCM migrations, including
+    lifecycles that use the lossless fallback. A profiler trace can distinguish
+    the NVFP4 codec route from lossless migration when route-level evidence is
+    required.
 
 ## Optional ModelOpt Global Scales
 

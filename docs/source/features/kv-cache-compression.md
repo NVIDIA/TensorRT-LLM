@@ -52,10 +52,9 @@ Continue inference through the existing KVCM and Attention interfaces
 Depending on the method, this design can reduce KV-cache storage, transfer
 bytes, Attention work, or a combination of them without adding
 compression-specific code to the model or Attention kernel. A method can use
-its own scoring or transform kernels. Each method is designed to preserve useful
-KV information while minimizing its impact on accuracy and output quality. The
-exact trade-off depends on the method, its settings, and the workload, and
-should be validated before deployment.
+its own scoring or transform kernels. Compression can affect accuracy and output
+quality; the exact trade-off depends on the method, its settings, and the
+workload, and must be validated before deployment.
 
 `KvCacheConfig` continues to control cache capacity, levels, reuse, offloading,
 and Page lifetime. `KvCacheCompressionConfig` selects how KV is compressed at
@@ -160,7 +159,7 @@ For calibration, configuration parameters, and current requirements, see the
 Compression methods use one of two execution models. Iteration-driven methods
 run from PyExecutor's request and iteration lifecycle. Storage-bound methods
 run only when KVCM migrates a Page across a hot/cold representation boundary.
-A method implements only the model and stages it needs.
+A method implements only the execution model and stages it needs.
 
 ### Iteration-Driven Methods
 
@@ -172,8 +171,8 @@ periodic, budget-triggered token eviction.
 | --- | --- | --- |
 | A request enters its first prefill chunk | `on_request_init()` | Initialize request-local compression state |
 | A request finishes its final prefill chunk | `on_context_step_end()` | Run optional context-bound compression |
-| Before a generation forward step | `on_generation_step_begin()` | Prepare generation-step state when required |
-| After a generation forward step | `on_generation_step_end()` | Run periodic or budget-triggered compression, such as TriAttention |
+| Before each scheduled forward iteration | `on_generation_step_begin()` | Inspect or prepare the generation cohort when required |
+| After each scheduled forward iteration and the native KVCM update | `on_generation_step_end()` | Process the generation cohort, such as periodic TriAttention eviction |
 | A request finishes or aborts | `on_request_finish()` | Release request-local compression state |
 
 ### Storage-Bound Methods
@@ -187,29 +186,33 @@ operations and does not register for per-iteration callbacks.
 | A hot Page moves to a cold tier | `encode_cold_pages()` | Encode and transfer a batch of Pages to cold storage |
 | A cold Page returns to the GPU | `decode_cold_pages()` | Transfer and restore a batch of Pages to the runtime layout |
 
-KVCM still decides when Pages migrate and owns their Slots, streams, events,
-rollback, and mapping publication. It publishes the new cache level only after
-the codec operation is safely enqueued. For method signatures and ownership
-rules, see the [KV Cache Compression Development Guide](../developer-guide/kv-cache-compression-development.md).
+KVCM still decides when Pages migrate and owns their Slots, streams, completion
+ordering, rollback, and mapping publication. For method signatures and
+ownership rules, see the
+[KV Cache Compression Development Guide](../developer-guide/kv-cache-compression-development.md).
 
 ## Support
 
 The two methods share the compression framework but support different cache
-structures.
+structures. Platform and method requirements are noted below.[^support-requirements]
 
 | Cache structure | NVFP4 cold-page quantization | TriAttention |
 | --- | --- | --- |
-| MHA/GQA Attention KV | Supported | Supported for full-Attention KV |
+| MHA Attention KV | Supported | Not supported |
+| GQA Attention KV | Supported | Restricted; see the TriAttention example |
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
 | DeepSeek-V4 specialized sparse cache | Not supported | Not supported |
 
-\* Both methods currently require the PyTorch backend, KVCM V2, and an
-SM100-family GPU (SM100 or SM103). NVFP4 cold-page quantization additionally
-requires the native C++ KVCM V2 backend and a nonzero Host or Disk cache.
-TriAttention requires a model-specific offline calibration file. See each
-method's detailed example for its remaining requirements and validated modes.
+[^support-requirements]: Both methods currently require the PyTorch backend,
+    KVCM V2, and an NVIDIA GPU with compute capability SM100 or SM103. NVFP4
+    cold-page quantization additionally requires the native C++ KVCM V2 backend
+    and a nonzero Host or Disk cache. TriAttention requires a model-specific
+    offline calibration file and currently supports only BF16 GQA pools with
+    group size 4 or 8 and the score geometry listed in its detailed example.
+    See each method's example for its remaining requirements and validated
+    modes.
 
 ### Tested Models
 

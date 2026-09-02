@@ -20,15 +20,17 @@ TriAttention is integrated into TensorRT-LLM as a KV-cache compression manager o
 
 ## Support Matrix
 
-* NVIDIA B200 (SM100; the current validated target)
+* NVIDIA SM100- or SM103-family GPU
 * Paged KV Cache (`KVCacheManagerV2`)
 * PyTorch backend
+* BF16 GQA KV pools with group size 4 or 8
+* Head size 64 or 128, Page size 32 or 128, and uniform scored-layer geometry
 
 **Notes:**
 1. TriAttention supports KV-cache block reuse. V2 reuses the committed prompt prefix, while TriAttention preserves that prefix and compacts only the generation suffix.
 2. TriAttention requires the V2 KV-cache manager (`use_kv_cache_manager_v2=True`).
 3. TriAttention does not compute calibration. Bring the official tool's calibration `.pt`; see [Calibration](#calibration).
-4. The current SWA path covers models such as GPT-OSS whose V2 pools remain full length and whose attention kernel applies the window. Native sliding-eviction layouts such as Gemma 4, SSM/hybrid pools, and MLA caches are not supported.
+4. MHA, MLA, SSM/hybrid pools, and native sliding-eviction layouts such as Gemma 4 are not supported. The current SWA path covers models such as GPT-OSS whose V2 pools remain full length and whose attention kernel applies the window.
 5. Speculative decoding is supported for one-model MTP and EAGLE3 with `eviction_mode="union"`. Tensor parallelism beyond TP1, attention DP, and disaggregated serving have not yet been validated end to end.
 
 ## Calibration
