@@ -460,14 +460,14 @@ def generate_llmapi():
         search_content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
         search_content += "    :no-index:\n\n"
         search_content += (
-            f":doc:`View the full {cls_name} reference <reference/{cls_name}>`\n\n"
+            f"    :doc:`View the full {cls_name} reference <reference/{cls_name}>`\n\n"
         )
 
     content += "\n" + underline("Search the full LLM API", "~") + "\n\n"
     content += (
-        "Use your browser's find command to search API names and parameters "
-        "on this page. Follow the link after each entry for complete member "
-        "and inheritance documentation.\n\n")
+        "This page provides a searchable index of API names and parameters. "
+        "Open an entry's full reference for complete member and inheritance "
+        "documentation.\n\n")
     content += search_content
 
     with open(doc_path, "w+") as f:
