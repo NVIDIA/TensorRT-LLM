@@ -109,6 +109,20 @@ acceptance gate, so it must be defensible:
   and cannot carry an item by itself. When ncu's `bound` class and the
   utilization pass's `bounding_resource` disagree for the same kernel,
   say so in `evidence` and name which one you planned on.
+- **An imbalance item is categorized by the work, not by where it
+  surfaces.** When the rank-jitter step (Step 9) or a jitter-wait-heavy
+  collective says the job waits on a slow rank, the fix is the
+  distribution of work or the health of that machine — so the item's
+  `category` is that of the imbalanced work `imbalance_operator` names
+  (an uneven expert load is `compute`, an uneven KV footprint is
+  `kv-capacity`), **not** `communication`. Categorizing it
+  `communication` aims the next round at bucketing, overlap and
+  interconnect levers, none of which can recover a wait another rank's
+  lateness created. The two verdicts also produce different items:
+  `pinned` is one machine or one rank's fixed share and is often not
+  fixable in-campaign — say so rather than proposing a lever; `rotating`
+  is the work distribution and is. Cite the verdict in `evidence`, and
+  bound `expected_gain_pct` by `pct_of_iter`, never by the whole spread.
 - **Cover the nsys opportunity list.** The timeline analysis writes
   `nsys_analysis/items.json` — the opportunities it found, each with a
   `magnitudeMs`. Account for **every** id in a top-level `nsys_items`

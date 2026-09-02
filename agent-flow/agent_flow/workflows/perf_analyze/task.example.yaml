@@ -44,6 +44,18 @@ benchmark:
 profile:
   methods: [nsys, ncu]
   nsys_iter_range: "100-150"
+  # Which ranks nsys captures. Default [0] — the historical single-wrap
+  # behaviour, and all a bare `trtllm-serve` can give: at world size > 1 it
+  # creates its workers with MPI.COMM_SELF.Spawn and nsys does not follow
+  # spawned processes. Several ranks need one wrap per rank inside the
+  # launcher (the Slurm `trtllm-llmapi-launch` shape), and buy the skill's
+  # rank-jitter step: mean jitter wait per iteration, the busy spread, the
+  # imbalance operator, and the pinned-vs-rotating straggler verdict — the
+  # only evidence that says the job waits on a slow rank rather than on the
+  # network. Wrap only the ranks you list: a rank slowed by its own profiler
+  # shows up as jitter the others wait on. One representative per part of
+  # the parallelism is enough; capturing all 8 costs 8 exports.
+  # profile_ranks: [0, 4]
 
 # Optional: include this section only when the server + benchmark must run
 # through Slurm (otherwise everything runs locally on the current node).

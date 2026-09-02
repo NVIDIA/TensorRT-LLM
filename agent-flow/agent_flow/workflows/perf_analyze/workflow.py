@@ -25,6 +25,7 @@ from .progress import (
     read_progress,
 )
 from .prompts import DEFAULT_PROMPTS, PromptBundle
+from .prompts._common import profile_ranks_note
 from .sol_methodology import SolMethodology, output_instruction, projector_instruction
 from .state import (
     STAGE_ANALYZER,
@@ -41,6 +42,7 @@ from .task_schema import (
     dump_task_yaml,
     is_curve_mode,
     load_and_validate_task_yaml,
+    profile_ranks,
     sol_enabled,
 )
 
@@ -567,7 +569,8 @@ class PerfAnalyzeWorkflow:
             f"`nsys profile` command in your system prompt** (don't improvise "
             f"nsys flags): it keeps `--capture-range-end=stop` so the window "
             f"lands in steady-state load without tearing the engine down, and "
-            f"the replayed benchmark keeps `--no-test-input`. Then "
+            f"the replayed benchmark keeps `--no-test-input`. "
+            f"{profile_ranks_note(self._profile_ranks())} Then "
             f"**decompose that timeline with the "
             f"`perf-nsight-system-analysis` skill** (via the `Skill` tool; "
             f"fully-qualified "
@@ -701,6 +704,10 @@ class PerfAnalyzeWorkflow:
         On by default — only ``sol.enabled: false`` turns it off.
         """
         return sol_enabled(self._task_data())
+
+    def _profile_ranks(self) -> tuple[int, ...]:
+        """The rank ids nsys must capture, from the resolved spec."""
+        return profile_ranks(self._task_data())
 
     def _curve_mode(self) -> bool:
         """Whether the resolved task spec runs in Pareto-curve mode."""

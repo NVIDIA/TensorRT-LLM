@@ -145,6 +145,22 @@ workspace/perf-analyze/<name>/
   kernels of the nsys timeline decomposition) rather than improvising
   per run; only
   the paths and the `benchmark` / `profile` values are filled in.
+- **Multi-rank capture (`profile.profile_ranks`, default `[0]`).** Where
+  the nsys wrap goes decides whether a multi-GPU run yields any model
+  kernels: a bare `trtllm-serve` above world size 1 creates its workers
+  with `MPI.COMM_SELF.Spawn`, which nsys does not follow, so only the
+  parent — holding no model rank — is traced. Listing several ranks puts
+  one wrap per rank inside the launcher step (the Slurm
+  `trtllm-llmapi-launch` shape the repo's own
+  `examples/disaggregated/slurm/benchmark/start_worker.sh` uses) and
+  unlocks the skill's **rank-jitter step**: mean jitter wait per
+  iteration, the non-communication busy spread, the imbalance operator,
+  and the `pinned`-vs-`rotating` straggler verdict — the only evidence
+  that distinguishes "the job waits on a slow rank" from "the job waits
+  on the network", which need opposite fixes. Only the listed ranks are
+  wrapped, because a rank slowed by its own profiler registers as jitter
+  the others wait on. Representatives and parts come from the survey's
+  measured fingerprint groups rather than an assumed rank layout.
 - **nsys timeline analysis (Run A).** `nsys stats` gives a kernel-sum
   table; the Analyzer additionally exports the trace to `.sqlite` and
   runs the **`perf-nsight-system-analysis` skill**'s pipeline into

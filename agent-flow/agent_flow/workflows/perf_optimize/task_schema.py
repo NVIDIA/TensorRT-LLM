@@ -68,6 +68,7 @@ from agent_flow.workflows.perf_analyze.task_schema import (
     has_slurm_environment,
     is_curve_mode,
     num_prompts_per_point,
+    profile_ranks,
     remote_run_root,
     sol_enabled,
 )
@@ -549,6 +550,7 @@ __all__ = [
     "load_and_validate_task_yaml",
     "max_regression_pct",
     "num_prompts_per_point",
+    "profile_ranks",
     "remote_run_root",
     "sol_enabled",
 ]

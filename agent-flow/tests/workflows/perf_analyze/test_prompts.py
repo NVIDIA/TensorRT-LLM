@@ -29,6 +29,7 @@ from agent_flow.workflows.perf_analyze.prompts._common import (
     SOL_METHODOLOGY_FALLBACK,
     SOL_REPORTER_GUIDANCE,
     TRTLLM_TAXONOMY_PATH,
+    profile_ranks_note,
 )
 
 
@@ -1013,3 +1014,91 @@ def test_findings_contract_owes_the_classification_and_the_step5_mode():
     assert "which Step 5 mode ran" in contract
     # Both reconciliations are reported as pass/fail, not assumed.
     assert "stated as pass/fail" in contract
+
+
+# --------------------------------------------------------------------------- #
+# Multi-rank capture and the rank-jitter step. Where the nsys wrap goes decides
+# whether a multi-GPU run yields any model kernels at all, and several ranks
+# are what buy the straggler verdict.
+# --------------------------------------------------------------------------- #
+
+
+def test_multi_gpu_names_the_spawn_limit_rather_than_the_wrong_env_var():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The real constraint: a bare trtllm-serve spawns its workers, and nsys
+    # does not follow spawned processes.
+    assert "MPI.COMM_SELF.Spawn" in prompt
+    assert "does not follow them" in prompt
+    # TLLM_PROFILE_LOG_RANKS selects which ranks print the step log; it is
+    # not a capture knob, and treating it as one wastes an allocation.
+    assert "selects which ranks print the step log line" in prompt
+    # The window needs no per-rank handling — every rank arms on the same
+    # iteration counter.
+    assert "arms `cudaProfilerStart/Stop` on the same iteration" in prompt
+
+
+def test_per_rank_wrap_goes_inside_the_launcher_and_only_on_listed_ranks():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "the wrap goes **inside** the step, once per task" in prompt
+    assert "SLURM_PROCID" in prompt
+    assert "trtllm-llmapi-launch" in prompt
+    # Wrapping every rank makes the straggler verdict describe nsys.
+    assert "makes the straggler verdict describe nsys rather than the model" in prompt
+
+
+def test_several_ranks_take_a_survey_pass_then_a_representative_pass():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The skill refuses to pick representatives; exit 2 on the first pass is
+    # the expected outcome, not a failure to retry around.
+    assert "no `--representative`" in prompt
+    assert "stops with exit 2, which is the expected outcome" in prompt
+    assert "--representative 0 --representative 4" in prompt
+    assert "--part stage-0=0,1,2,3" in prompt
+    # Parts come from measured fingerprint groups, not an assumed layout.
+    assert "group index shared by ranks with identical kernel fingerprints" in prompt
+    assert "rather than from a rank-layout convention you assumed" in prompt
+    # Rank ids are the pairing key.
+    assert "never renumbered" in prompt
+
+
+def test_jitter_step_is_read_with_its_verdict():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "part-<name>/jitter.json" in prompt
+    assert "mean_jitter_wait_ms_per_iter" in prompt
+    assert "imbalance_operator" in prompt
+    # The spread alone is not actionable — pinned and rotating need
+    # opposite fixes.
+    assert "always with `straggler.verdict` beside the spread, never without" in prompt
+    assert "need opposite fixes" in prompt
+    # Lateness needs a shared clock; a one-rank part has no jitter at all.
+    assert "only with its `floor_ms` beside it" in prompt
+    assert "A part holding one rank has a `null` `jitter_cost`" in prompt
+
+
+def test_jitter_wait_dominant_comm_is_read_as_imbalance():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "is imbalance, not the network" in prompt
+    assert "where the cost *appears*, not where it is *caused*" in prompt
+
+
+def test_findings_contract_owes_the_straggler_verdict():
+    contract = _norm(PROFILE_FINDINGS_CONTRACT)
+    assert "Rank jitter" in contract
+    assert "straggler verdict" in contract
+    assert "the spread is never reported without it" in contract
+    # One captured rank makes no imbalance claim at all.
+    assert "make no imbalance claim" in contract
+
+
+def test_profile_ranks_note_states_the_duty_for_each_shape():
+    single = _norm(profile_ranks_note([0]))
+    assert "rank 0 only" in single
+    assert "rank-jitter step does not apply" in single
+
+    several = _norm(profile_ranks_note([0, 4]))
+    assert "ranks 0, 4" in several
+    assert "one trace per rank" in several
+    assert "only these ranks are wrapped" in several
+    # Degrades where the topology cannot deliver per-rank traces.
+    assert "spawn-launched `trtllm-serve` cannot" in several
+    assert "make no imbalance claim" in several

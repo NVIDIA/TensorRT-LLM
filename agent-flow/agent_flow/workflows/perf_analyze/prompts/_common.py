@@ -41,6 +41,7 @@ machinery, and its prompts compose these same fragments.
 """
 
 from pathlib import Path
+from typing import Sequence
 
 # The starting taxonomy the nsys-timeline pipeline classifies kernels with.
 # The skill ships a generic template shaped for *training* frameworks
@@ -518,11 +519,39 @@ time nsys runs, without waiting to be asked.
    - **One captured rank means the skill's rank survey has nothing to
      decide**: a single `--profile` with no `--representative` runs
      straight through, and the skill's "ask the user which ranks are
-     representative" step does not apply. If you did capture several
-     ranks, read the printed survey table, pick the representative
-     yourself (one per part of the parallelism), and name that choice
-     and its basis in your findings — this campaign has no user to ask,
-     and stopping to ask one costs the whole round.
+     representative" step does not apply.
+   - **Several captured ranks take two invocations.** The skill refuses
+     to choose representatives for you, and a campaign has no user to
+     ask — so make the choice yourself, from its own survey, and record
+     it. First pass, every rank and no `--representative`: this prints
+     the Step 0 survey and stops with exit 2, which is the expected
+     outcome, not a failure.
+     ```bash
+     python <skill_dir>/scripts/run_all.py \\
+         --profile 0=<workspace>/server_nsys_rank0.sqlite \\
+         --profile 4=<workspace>/server_nsys_rank4.sqlite \\
+         --taxonomy <workspace>/taxonomy.json --out <workspace>/nsys_analysis
+     ```
+     The survey gives each rank a **group index shared by ranks with
+     identical kernel fingerprints**. Those groups are the parts of the
+     parallelism as measured, so build `--part` from them rather than
+     from a rank-layout convention you assumed — then cross-check the
+     count against the tuning config (`tensor_parallel_size` ×
+     `pipeline_parallel_size`; `moe_expert_parallel_size` reuses the TP
+     ranks and does not multiply it) and report any disagreement instead
+     of resolving it silently. Declare one representative per part.
+     Second pass, with the choice made:
+     ```bash
+     python <skill_dir>/scripts/run_all.py \\
+         --profile 0=... --profile 4=... \\
+         --representative 0 --representative 4 \\
+         --part stage-0=0,1,2,3 --part stage-1=4,5,6,7 \\
+         --taxonomy <workspace>/taxonomy.json --out <workspace>/nsys_analysis
+     ```
+     Rank ids are the pairing key across parts and variants: pass each
+     one verbatim as the rank it actually is, never renumbered to match
+     the order you captured them in. Name in your findings who chose the
+     representatives (you) and on what basis (the survey's groups).
    - Anchor detection can exit listing candidates rather than picking
      one. Re-run with `--anchor <pattern>` on the densest recurring
      decode kernel from `nsys_stats.txt` and record which anchor you
@@ -559,6 +588,29 @@ time nsys runs, without waiting to be asked.
      `scope`-labelled window, every scope it touches with each
      `share_pct`. This is the section that names *what to optimize*;
      the busy rungs only say how much there is to win.
+   - **Read `part-<name>/jitter.json` when you declared parts** — the
+     rank-imbalance step, and the only one that can tell you the job is
+     waiting on a slow rank rather than on the network. Report
+     `jitter_cost.mean_jitter_wait_ms_per_iter` with its `pct_of_iter`,
+     the `non_comm_busy_spread` (`spread_pct`, `slowest_rank`,
+     `fastest_rank`), and `operator_spread`'s `imbalance_operator` — and
+     **always with `straggler.verdict` beside the spread, never
+     without**: `pinned` (one rank straggles in ≥ `threshold_pct` of
+     iterations → that machine or that rank's share of the work) and
+     `rotating` (the identity moves → how the work is distributed) need
+     opposite fixes, so a spread reported without the verdict is not
+     actionable. Quote `arrival_lateness` only with its `floor_ms`
+     beside it, and not at all when `alignment` failed to establish —
+     report `lost_claims` instead. A part holding one rank has a `null`
+     `jitter_cost`: report the absence and its reason, and make no
+     jitter claim.
+   - **A comm figure whose jitter-wait share dominates is imbalance, not
+     the network.** Step 6 splits each collective into transfer time and
+     jitter wait, and Step 3's blocking-on-comm inherits that split.
+     Where jitter wait dominates, the collective is where the cost
+     *appears*, not where it is *caused* — pursue the straggler rank.
+     Bucketing, overlap and interconnect changes cannot recover a wait
+     that another rank's lateness created.
    - **Author `<workspace>/nsys_analysis/items.json`** per the skill's
      *Output* section once the numbers are in: one entry per performance
      opportunity the analysis found, each with `id`, `title`, `claim`,
@@ -590,11 +642,53 @@ time nsys runs, without waiting to be asked.
      on. Never hand-derive a busy/idle rung or a compute-absent split
      the pipeline did not produce.
 
-For multi-GPU runs (tensor/pipeline/expert parallelism set in
-`extra_llm_api_options`), nsys wrapping only traces the launcher rank;
-consult the repo's profiling guidance (e.g. `TLLM_PROFILE_LOG_RANKS`,
-`examples/.../nsys` patterns) and at minimum profile rank 0, noting the
-limitation.
+### Multi-GPU: where the nsys wrap has to go
+
+At world size 1 the wrap above is the whole story. Above it, **where you
+put `nsys profile` decides whether you get any model kernels at all**,
+and the two launch shapes differ:
+
+- **Bare `trtllm-serve`** (no `mpirun`, no `srun`): the LLM API creates
+  its workers with `MPI.COMM_SELF.Spawn`
+  (`tensorrt_llm/llmapi/mpi_session.py`, `MpiPoolSession`). Spawned
+  processes are **not** fork-before-exec children, so
+  `--trace-fork-before-exec=true` does not follow them and nsys traces
+  only the parent — which holds no model rank. Expect a trace with no
+  model kernels in it, and treat that as the topology telling you so,
+  not as a failed capture. `profile.profile_ranks` beyond `[0]` cannot
+  be honored here; say so in *Caveats*.
+- **One task per rank** (`srun --ntasks-per-node=<world_size> ...
+  trtllm-llmapi-launch trtllm-serve ...`, per *Running under Slurm*
+  below): every rank is its own process, so the wrap goes **inside** the
+  step, once per task, with the rank id in `-o`. This is the shape the
+  repo's own multi-rank profiling uses
+  (`examples/disaggregated/slurm/benchmark/start_worker.sh`):
+
+  ```bash
+  # inside the srun step; every task runs this, ${{SLURM_PROCID}} is its rank
+  if echo ",<profile.profile_ranks, comma-separated>," \\
+       | grep -q ",${{SLURM_PROCID}},"; then
+      wrap="nsys profile -o <workspace>/server_nsys_rank${{SLURM_PROCID}} \\
+            ...the same flags as the single-rank command above..."
+  else
+      wrap=""     # this rank runs unwrapped
+  fi
+  ${{wrap}} trtllm-llmapi-launch trtllm-serve <ckpt> ...same trtllm-serve flags...
+  ```
+
+  Wrap **only** the ranks `profile.profile_ranks` names — every wrapped
+  rank pays the tracing overhead, and a rank slowed by its own profiler
+  shows up as jitter the other ranks wait on, which is the exact
+  quantity Step 9 measures. Wrapping all of them makes the straggler
+  verdict describe nsys rather than the model.
+
+`TLLM_PROFILE_START_STOP` needs no per-rank handling: every rank runs
+the executor loop and arms `cudaProfilerStart/Stop` on the same iteration
+counter. (`TLLM_PROFILE_LOG_RANKS` is **not** related — it selects which
+ranks print the step log line, and setting it changes no capture.)
+
+Name in *Caveats* which ranks you captured and which you could not, and
+never present a single-rank capture as a picture of the whole job.
 
 ## Run A2 — Nsight Systems utilization + call-stack passes
 
@@ -897,6 +991,13 @@ instructions, using this structure. Section headers must match.
   sites, or only the eager prologue and host loop. When the pass did not
   run, keep the bullet with one line — `call stacks unavailable:
   <reason>` — and never guess an owner for a kernel.
+- Rank jitter (only when several ranks were captured and parts
+  declared): mean jitter wait per iteration and its % of the iteration,
+  the non-communication busy spread, the imbalance operator, and the
+  **straggler verdict** (`pinned` / `rotating`) — the spread is never
+  reported without it. Name which ranks were captured, who chose the
+  representatives and on what basis. When only one rank was captured,
+  say so in one line and make no imbalance claim
 - Per-request prefill vs decode split (from perf_metrics, if available)
 - When the skill's pipeline did not run (skill missing, export or
   pipeline error): keep the section with the `nsys stats` numbers plus
@@ -1544,3 +1645,39 @@ EVIDENCE_DISCIPLINE = """\
   reproduce your run from the commands you wrote down.
 - **No conversational filler.** Jump straight into the work.
 """
+
+
+def profile_ranks_note(ranks: Sequence[int]) -> str:
+    """The per-run sentence naming which ranks nsys must capture.
+
+    Interpolated into the analyzer's driving instructions by both
+    workflows, so the stateless agent does not have to re-derive
+    ``profile.profile_ranks`` from the spec — and so the multi-rank case
+    is stated as a duty rather than left as an option the agent may or
+    may not notice it has.
+    """
+    if len(ranks) <= 1:
+        only = ranks[0] if ranks else 0
+        return (
+            f"Capture nsys on **rank {only} only** (`profile.profile_ranks`). "
+            f"A single `--profile {only}=<sqlite>` runs the skill's pipeline "
+            f"straight through with no representative to choose, and the "
+            f"rank-jitter step does not apply — say so in one line rather "
+            f"than reporting an imbalance you did not measure."
+        )
+    listed = ", ".join(str(rank) for rank in ranks)
+    return (
+        f"Capture nsys on **ranks {listed}** (`profile.profile_ranks`), one "
+        f"trace per rank, per the *Multi-GPU* section of your system prompt: "
+        f"the wrap goes inside the per-rank launcher step, and only these "
+        f"ranks are wrapped — a rank slowed by its own profiler becomes "
+        f"jitter the others wait on, which is the very quantity the "
+        f"rank-jitter step measures. Then run the skill twice as that "
+        f"section shows: once with every `--profile` and no "
+        f"`--representative` to print the Step 0 survey, then again with "
+        f"the representatives and `--part`s you derive from the survey's "
+        f"fingerprint groups. Report the straggler verdict with the spread, "
+        f"always. If the launch topology cannot give you per-rank traces "
+        f"(a spawn-launched `trtllm-serve` cannot), capture what you can, "
+        f"record the reason under *Caveats*, and make no imbalance claim."
+    )

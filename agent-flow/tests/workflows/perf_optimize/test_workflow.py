@@ -4301,3 +4301,31 @@ def test_no_items_json_means_no_coverage_owed(tmp_path, fake_git):
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
     assert state.done is True
     assert not list((ws / "rounds").glob("*/analysis/nsys_analysis/items.json"))
+
+
+# --------------------------------------------------------------------------- #
+# profile.profile_ranks reaches the analyzer's driving instruction: the
+# stateless agent should not have to re-derive which ranks to capture, and the
+# multi-rank case has to arrive as a duty rather than an option.
+# --------------------------------------------------------------------------- #
+
+
+def test_default_driving_prompt_asks_for_rank_zero_only(tmp_path):
+    analyzer = _capture_driving_prompts(tmp_path)["analyzer"]
+    assert "rank 0 only" in analyzer
+    # And says plainly that the imbalance step does not apply, rather than
+    # leaving the agent to report a spread it could not measure.
+    assert "rank-jitter step does not apply" in analyzer
+
+
+def test_multi_rank_driving_prompt_names_the_ranks_and_the_two_passes(tmp_path):
+    analyzer = _capture_driving_prompts(
+        tmp_path, {"profile": {"methods": ["nsys", "ncu"], "profile_ranks": [0, 4]}}
+    )["analyzer"]
+    assert "ranks 0, 4" in analyzer
+    assert "one trace per rank" in analyzer
+    # Only the listed ranks are wrapped — a profiler-slowed rank would
+    # otherwise register as jitter the others wait on.
+    assert "only these ranks are wrapped" in analyzer
+    assert "Step 0 survey" in analyzer
+    assert "straggler verdict" in analyzer

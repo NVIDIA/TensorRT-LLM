@@ -23,6 +23,7 @@ from agent_flow import (
 )
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
+from agent_flow.workflows.perf_analyze.prompts._common import profile_ranks_note
 from agent_flow.workflows.perf_analyze.sol_methodology import (
     SolMethodology,
     output_instruction,
@@ -70,6 +71,7 @@ from .task_schema import (
     kernel_coverage,
     load_and_validate_task_yaml,
     max_regression_pct,
+    profile_ranks,
     sol_enabled,
 )
 
@@ -1817,6 +1819,10 @@ class PerfOptimizeWorkflow:
         block = self._task_data().get("accuracy")
         return block if isinstance(block, dict) else None
 
+    def _profile_ranks(self) -> tuple[int, ...]:
+        """The rank ids nsys must capture, from the resolved spec."""
+        return profile_ranks(self._task_data())
+
     def _profile_methods(self) -> tuple[str, ...]:
         """``profile.methods`` from the resolved spec, defensively defaulted.
 
@@ -2420,7 +2426,8 @@ class PerfOptimizeWorkflow:
             )
             + f", and drive "
             f"nsys from the **canonical `nsys profile` command in your system "
-            f"prompt** (don't improvise nsys flags). Then **decompose that "
+            f"prompt** (don't improvise nsys flags). "
+            f"{profile_ranks_note(self._profile_ranks())} Then **decompose that "
             f"timeline with the `perf-nsight-system-analysis` skill** (via "
             f"the `Skill` tool; fully-qualified "
             f"`trtllm-agent-toolkit:perf-nsight-system-analysis` if the bare "

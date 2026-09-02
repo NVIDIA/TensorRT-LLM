@@ -529,6 +529,18 @@ running the CLI.
   and
   interpreted with the `perf-nsight-compute-analysis` skill; both
   degrade gracefully when the tool or the skill is unavailable.
+- **Multi-rank capture (`profile.profile_ranks`, default `[0]`).**
+  Listing several ranks wraps each of them separately inside the
+  launcher step and unlocks the skill's rank-jitter step, whose
+  `pinned`-vs-`rotating` straggler verdict is the only evidence that
+  separates "waiting on a slow rank" from "waiting on the network".
+  Above world size 1 a bare `trtllm-serve` cannot deliver it — its
+  workers are `MPI.COMM_SELF.Spawn`ed and nsys does not follow them — so
+  per-rank traces need the Slurm `trtllm-llmapi-launch` shape. An
+  imbalance item is filed under the category of the imbalanced *work*
+  (`compute` for uneven expert load, and so on), never `communication`:
+  the jitter wait shows up inside a collective but bucketing, overlap
+  and interconnect levers cannot recover another rank's lateness.
 - **Per-kernel coverage contract (optional).** A
   `profile.kernel_coverage` block in `task.yaml` (empty mapping =
   defaults: `min_share_pct: 0.5`, `coverage_target_pct: 95`) upgrades

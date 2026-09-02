@@ -1288,3 +1288,19 @@ def test_roadmap_spec_documents_the_nsys_items_block():
     assert "omitted entirely when it does not" in spec
     # The block is rewritten each round, so a dropped row is a violation.
     assert "a dropped row reads as an unaccounted opportunity" in spec
+
+
+def test_analyzer_categorizes_imbalance_by_the_work_not_the_collective():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # Jitter wait surfaces inside a collective but is caused elsewhere;
+    # filing it as `communication` aims the next round at bucketing and
+    # overlap levers that cannot recover another rank's lateness.
+    assert "categorized by the work, not by where it surfaces" in prompt
+    assert "not** `communication`" in prompt
+    assert "imbalance_operator" in prompt
+    # The two verdicts produce different items, and one of them often has
+    # no in-campaign lever at all.
+    assert "`pinned` is one machine" in prompt
+    assert "often not fixable in-campaign" in prompt
+    # Bounded by the measured share, not the raw spread.
+    assert "bound `expected_gain_pct` by `pct_of_iter`, never by the whole spread" in prompt
