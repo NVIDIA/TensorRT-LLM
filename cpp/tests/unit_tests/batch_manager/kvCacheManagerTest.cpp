@@ -2360,8 +2360,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt, false,
         std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
-        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt, false,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt); // No cache_salt
 
     GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -2403,9 +2403,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt, false,
         std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
-        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt,
+        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt, false,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt,
         cacheSalt1); // With cache_salt = "tenant-A"
 
     GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -2441,9 +2441,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt, false,
         std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
-        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt,
+        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt, false,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt,
         cacheSalt1); // Same cache_salt = "tenant-A"
 
     GenerationRequest seq2{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -2480,9 +2480,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt, false,
         std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
-        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt,
+        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt, false,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt,
         cacheSalt2); // Different cache_salt = "tenant-B"
 
     GenerationRequest seq3{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -2512,8 +2512,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt, false,
         std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
-        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt, false,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt); // No cache_salt
 
     GenerationRequest seq4{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};

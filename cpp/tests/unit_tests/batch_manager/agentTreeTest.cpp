@@ -63,8 +63,8 @@ protected:
             std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt,
             false, std::nullopt, false, std::nullopt, false, std::nullopt,
             tensorrt_llm::executor::Request::kDefaultPriority, std::nullopt, std::nullopt, std::nullopt,
-            tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, 1, std::nullopt, std::nullopt,
-            false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, agentHierarchy);
+            tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, 1, std::nullopt, false,
+            std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, agentHierarchy);
     }
 
     LlmRequestPtr createAgentDeepResearchRequest(SizeType32 nodeId, SizeType32 requestId)
