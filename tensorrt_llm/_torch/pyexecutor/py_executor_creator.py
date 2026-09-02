@@ -42,6 +42,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     validate_feature_combination)
 from .config_utils import is_hybrid_linear, is_minimax_m3
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .connectors.registry import uses_connector
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
@@ -380,6 +381,19 @@ def create_py_executor(
     if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
         # Disable KV cache reuse for deterministic mode
         kv_cache_config.enable_block_reuse = False
+        kv_cache_config.enable_partial_reuse = False
+
+    # Must happen before the KV cache manager is built below, since the manager
+    # reads enable_partial_reuse to construct its block pools.
+    if (kv_cache_config.enable_partial_reuse
+            and uses_connector(kv_connector_config, "mooncake-store")):
+        logger.warning(
+            "Disabling partial reuse: it is not usable with the mooncake-store "
+            "connector. The store is addressed by whole blocks, so a partial "
+            "device match leaves the matched length off a block boundary and "
+            "the connector declines the lookup rather than resume a block from "
+            "the middle. Partial reuse therefore trades part of one block for "
+            "every stored block of the remaining prefix.")
         kv_cache_config.enable_partial_reuse = False
 
     decoding_config = llm_args.decoding_config

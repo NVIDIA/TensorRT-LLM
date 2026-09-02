@@ -66,6 +66,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.validation import 
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.registry import uses_connector
+from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 TOKENS_PER_BLOCK = 4
@@ -428,6 +430,38 @@ def test_validate_layout_rejects_sliding_window():
     with pytest.raises(NotImplementedError, match="sliding-window"):
         validate_layout(make_layout(window_size=1024))
     validate_layout(make_layout())
+
+
+# ---- connector identification ----
+#
+# py_executor_creator turns partial reuse off for this connector, and finds it
+# through uses_connector. Missing the config would silently cost the reuse the
+# store exists to provide, so the recognition itself is worth pinning down.
+
+
+def test_uses_connector_recognizes_the_preset():
+    config = KvCacheConnectorConfig(connector="mooncake-store")
+    assert uses_connector(config, "mooncake-store")
+
+
+def test_uses_connector_recognizes_a_hand_written_module():
+    config = KvCacheConnectorConfig(
+        connector_module="tensorrt_llm._torch.pyexecutor.connectors.mooncake_store",
+        connector_scheduler_class="MooncakeStoreConnectorScheduler",
+        connector_worker_class="MooncakeStoreConnectorWorker",
+    )
+    assert uses_connector(config, "mooncake-store")
+
+
+def test_uses_connector_separates_connectors_and_tolerates_none():
+    assert not uses_connector(KvCacheConnectorConfig(connector="kvbm"), "mooncake-store")
+    assert not uses_connector(None, "mooncake-store")
+
+
+def test_uses_connector_rejects_an_unknown_preset():
+    config = KvCacheConnectorConfig(connector="mooncake-store")
+    with pytest.raises(ValueError, match="Unknown connector preset"):
+        uses_connector(config, "mooncake-stroe")
 
 
 # ---- worker ----

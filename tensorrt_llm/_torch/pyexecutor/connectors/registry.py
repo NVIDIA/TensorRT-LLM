@@ -19,6 +19,11 @@ by KvCacheConnectorConfig. The connector module is NOT imported here —
 it is resolved at runtime via importlib in py_executor_creator.py.
 """
 
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+
 CONNECTOR_REGISTRY: dict[str, dict[str, str]] = {
     "lmcache": {
         "connector_module": "lmcache.integration.tensorrt_llm.tensorrt_adapter",
@@ -41,3 +46,20 @@ CONNECTOR_REGISTRY: dict[str, dict[str, str]] = {
         "connector_worker_class": "MooncakeStoreConnectorWorker",
     },
 }
+
+
+def uses_connector(kv_connector_config: Optional["KvCacheConnectorConfig"], name: str) -> bool:
+    """Report whether a connector config resolves to the named preset.
+
+    Compares the resolved module rather than the ``connector`` field, so a
+    config that names the module explicitly instead of using the preset is
+    still recognized. Accepts ``None`` to save every caller a null check.
+    """
+    if kv_connector_config is None:
+        return False
+    preset = CONNECTOR_REGISTRY.get(name)
+    if preset is None:
+        raise ValueError(
+            f"Unknown connector preset: {name!r}. Known presets: {list(CONNECTOR_REGISTRY)}"
+        )
+    return kv_connector_config.connector_module == preset["connector_module"]

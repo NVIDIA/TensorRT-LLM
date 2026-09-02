@@ -136,6 +136,12 @@ Two further settings are TensorRT-LLM's rather than Mooncake's, and are read fro
 
 In a disaggregated deployment, run context servers as `both` and leave generation servers unconfigured. Generated tokens are rarely a reused prefix, so writing them costs bandwidth for no hit rate.
 
+#### Partial block reuse is forced off
+
+`kv_cache_config.enable_partial_reuse` is set to `false` when this connector is configured, with a warning, whether or not it was requested explicitly. It defaults to `true`, so most deployments will see that warning.
+
+The store is addressed by whole blocks. The connector is handed the device match as `num_computed_tokens` and offers only blocks beyond it, but it can only resume from a block boundary -- so when the device match ends mid-block, it declines the lookup and the store is not consulted at all. Partial reuse is precisely what puts the match off a boundary, which means it trades part of one block of device reuse for every stored block of the remaining prefix. Measured on MiniMax-M3, leaving it enabled declined 97.2% of lookups and left actual prompt cache read at 35% against a 96% ceiling; forcing it off raised that to 94% and roughly doubled throughput.
+
 #### How it keys pages
 
 `KVCacheManagerV2` reports `RequestData.block_hashes` empty, so the connector derives block identity itself: a blake2b chain where each block's hash covers its own tokens *and* every token before it, seeded by the request's `cache_salt`. A key is `<prefix>/<model>/w<world size>r<rank>/lg<layer group>/t<tokens per block>b<bytes per page>/<block hash>`. The namespace pins down everything that would make the stored bytes mean something different, so a mismatched shard count, layer group or page geometry reads as a cache miss rather than as garbage.
