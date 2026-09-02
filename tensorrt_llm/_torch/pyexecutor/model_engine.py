@@ -582,6 +582,11 @@ class PyTorchModelEngine(ModelEngine):
             _mm_scheduling_policy != MultimodalEncoderSchedulingPolicy.DISABLED)
         _validate_mm_encoder_scheduling_compatibility(
             self.llm_args, self.mm_encoder_item_scheduling_enabled)
+        # Set by PyExecutor when the V1 MAX_UTILIZATION scheduler may pause
+        # started requests: pause replays the whole prompt as a fresh prefill,
+        # so multimodal payloads must survive generation admission instead of
+        # being stripped on the first decode step.
+        self._retain_mm_data_for_pause_replay = False
         self.mm_encoder_attention_metadata_capacity: Optional[Dict[str,
                                                                    int]] = None
         self.mm_encoder_output_budget_bytes: Optional[int] = None
@@ -6326,7 +6331,8 @@ class PyTorchModelEngine(ModelEngine):
                 # first so non-multimodal models pay one LOAD_FAST per request
                 # instead of LOAD_ATTR(py_multimodal_data) + LOAD_ATTR(py_batch_idx).
                 if (_has_any_multimodal_request and request.py_multimodal_data
-                        and request.py_batch_idx is None):
+                        and request.py_batch_idx is None
+                        and not self._retain_mm_data_for_pause_replay):
                     strip_mm_data_for_generation(request.py_multimodal_data)
 
                 request.py_batch_idx = request.py_seq_slot

@@ -6,6 +6,7 @@ from __future__ import annotations
 import types
 from unittest.mock import Mock
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import _UNBOUNDED_PAUSE_MAX_INPUT_LEN, PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
@@ -24,6 +25,7 @@ def _make_executor(handler: Mock | None) -> PyExecutor:
     executor = object.__new__(PyExecutor)
     executor._disagg_pp_termination_handler = handler
     executor._pending_recompute_pause_ids = set()
+    executor._pending_pause_replay_ids = set()
     executor.inflight_req_ids = ReqIdsSet()
     executor.resource_manager = Mock()
     executor._prefetched_request_ids = set()
@@ -108,3 +110,100 @@ def test_terminal_request_does_not_recompute_after_pp_consensus() -> None:
     assert request.py_request_id not in executor._pending_recompute_pause_ids
     assert request.py_request_id not in executor.inflight_req_ids
     assert request.py_request_id not in executor.result_wait_queues
+
+
+def _make_multimodal_request(request_id: int = 7) -> _StubRequest:
+    request = _StubRequest(request_id)
+    request.py_multimodal_data = {
+        "modality_type": "image",
+        "image": {"pixel_values": object()},
+    }
+    request.py_mm_encoder_state = object()
+    return request
+
+
+def test_pause_terminate_keeps_multimodal_payload_for_replay() -> None:
+    executor = _make_executor(None)
+    request = _make_multimodal_request()
+
+    executor._terminate_requests([request], for_pause=True)
+
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    assert request.py_multimodal_data["modality_type"] == "image"
+    assert "image" in request.py_multimodal_data
+    assert request.py_mm_encoder_state is not None
+
+
+def test_deferred_pause_terminate_keeps_multimodal_payload() -> None:
+    handler = Mock()
+    executor = _make_executor(handler)
+    request = _make_multimodal_request()
+    executor.active_requests = [request]
+
+    executor._terminate_requests([request], for_pause=True)
+
+    handler.terminate.assert_called_once_with(request)
+    assert request.py_request_id in executor._pending_pause_replay_ids
+    assert request.py_multimodal_data["modality_type"] == "image"
+
+    executor._on_disagg_pp_termination(request)
+
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    assert request.py_request_id not in executor._pending_pause_replay_ids
+    assert request.py_multimodal_data["modality_type"] == "image"
+    assert "image" in request.py_multimodal_data
+    assert request.py_mm_encoder_state is not None
+
+
+def test_plain_terminate_still_strips_multimodal_payload() -> None:
+    executor = _make_executor(None)
+    request = _make_multimodal_request()
+
+    executor._terminate_requests([request])
+
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    assert request.py_multimodal_data == {}
+    assert request.py_mm_encoder_state is None
+
+
+def _make_final_chunk_context_request(request_id: int = 7) -> _StubRequest:
+    request = _make_multimodal_request(request_id)
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_current_position = 0
+    request.context_chunk_size = 4
+    request.context_remaining_length = 0
+    request.move_to_next_context_chunk = Mock()
+    return request
+
+
+def _run_update_request_states_tp(executor: PyExecutor, request: _StubRequest) -> None:
+    executor.disable_overlap_scheduler = True
+    scheduled_batch = ScheduledRequests()
+    # `context_requests` is a read-only property over the chunking /
+    # last-chunk backing lists; a final-chunk request belongs to the latter.
+    scheduled_batch.context_requests_last_chunk = [request]
+    executor._update_request_states_tp(scheduled_batch)
+
+
+def test_post_prefill_strip_skipped_when_pause_replay_possible() -> None:
+    executor = _make_executor(None)
+    executor._retain_mm_data_for_pause_replay = True
+    request = _make_final_chunk_context_request()
+
+    _run_update_request_states_tp(executor, request)
+
+    assert request.state == LlmRequestState.GENERATION_IN_PROGRESS
+    assert request.py_multimodal_data["modality_type"] == "image"
+    assert request.py_mm_encoder_state is not None
+
+
+def test_post_prefill_strip_runs_when_pause_replay_impossible() -> None:
+    executor = _make_executor(None)
+    executor._retain_mm_data_for_pause_replay = False
+    request = _make_final_chunk_context_request()
+
+    _run_update_request_states_tp(executor, request)
+
+    assert request.state == LlmRequestState.GENERATION_IN_PROGRESS
+    assert request.py_multimodal_data == {}
+    assert request.py_mm_encoder_state is None

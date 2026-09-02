@@ -43,7 +43,8 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          PeftCacheConfig, WaitingQueuePolicy)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
@@ -597,6 +598,27 @@ class PyExecutor:
         # a request.
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
+        # Under MAX_UTILIZATION the V1 capacity scheduler may pause any started
+        # request; pause() replays the whole prompt as a fresh prefill, and for
+        # multimodal requests that replay re-runs the encoder from
+        # `py_multimodal_data`. The post-prefill release would make the replay
+        # impossible (KeyError on 'modality_type' in the resumed context
+        # forward), so the payload is retained for the request lifetime
+        # instead. V2 keeps releasing: its scheduler refuses to
+        # recompute-pause a request whose multimodal data is already gone.
+        scheduler_config = getattr(self.llm_args, "scheduler_config", None)
+        self._retain_mm_data_for_pause_replay = (
+            not self._is_kv_manager_v2 and scheduler_config is not None
+            and scheduler_config.capacity_scheduler_policy
+            == CapacitySchedulerPolicy.MAX_UTILIZATION)
+        # The generation-admission strip in `_prepare_tp_inputs` mutates the
+        # same shared `py_multimodal_data`, so every engine that prepares
+        # inputs for these requests has to honor the retention decision.
+        self.model_engine._retain_mm_data_for_pause_replay = (
+            self._retain_mm_data_for_pause_replay)
+        if self.draft_model_engine is not None:
+            self.draft_model_engine._retain_mm_data_for_pause_replay = (
+                self._retain_mm_data_for_pause_replay)
         self._prefetched_request_ids: set[int] = set()
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
@@ -733,6 +755,11 @@ class PyExecutor:
         # these requests until their prior execution state is safe to reuse.
         self.inflight_req_ids = ReqIdsSet()
         self._pending_recompute_pause_ids: set[int] = set()
+        # Request ids whose pause-for-replay terminate was deferred to the
+        # disagg PP termination handler. Consumed by `_do_terminate_request`
+        # after PP consensus so the deferred release also keeps the multimodal
+        # replay payload.
+        self._pending_pause_replay_ids: set[int] = set()
 
         # Encoder-decoder models execute the encoder and decoder in separate
         # iterations in both executor loops. PP usage is very rare for these
@@ -4244,7 +4271,8 @@ class PyExecutor:
                     self._terminate_recompute_paused_requests(scheduled_batch)
                     self._pause_recompute_paused_requests(scheduled_batch)
                 else:
-                    self._terminate_requests(scheduled_batch.paused_requests)
+                    self._terminate_requests(scheduled_batch.paused_requests,
+                                             for_pause=True)
                     self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
@@ -5070,7 +5098,8 @@ class PyExecutor:
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
                 else:
-                    self._terminate_requests(scheduled_batch.paused_requests)
+                    self._terminate_requests(scheduled_batch.paused_requests,
+                                             for_pause=True)
 
                 gpu_forward_events_from_perf_pool = False
                 can_queue, can_queue_this_rank = self._can_queue(
@@ -7827,8 +7856,11 @@ class PyExecutor:
                 # (multimodal_embedding) and raw pre-encoder tensors that multimodal models stashed
                 # on `py_multimodal_data`. Without this, encoder inputs and outputs for multi-modal
                 # requests stay pinned on GPU through the full decode lifetime and can lead to OOMs
-                # at high concurrency.
-                _strip_py_multimodal_data_post_prefill(request)
+                # at high concurrency. Skipped when the V1 MAX_UTILIZATION
+                # scheduler may still pause this request: pause replays the
+                # prompt as a fresh prefill that needs this data again.
+                if not self._retain_mm_data_for_pause_replay:
+                    _strip_py_multimodal_data_post_prefill(request)
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
                     request.set_exclude_last_generation_logits(False)
@@ -8137,16 +8169,21 @@ class PyExecutor:
                 # tears down every rank together via is_shutdown.
                 raise self._fatal_error
 
-    def _terminate_request(self, request: LlmRequest) -> None:
+    def _terminate_request(self,
+                           request: LlmRequest,
+                           *,
+                           for_pause: bool = False) -> None:
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,
         # but the dummy ID is reused every iteration).
         if (self._disagg_pp_termination_handler is not None
                 and not request.is_dummy_request):
+            if for_pause:
+                self._pending_pause_replay_ids.add(request.py_request_id)
             self._disagg_pp_termination_handler.terminate(request)
         else:
-            self._do_terminate_request(request)
+            self._do_terminate_request(request, for_pause=for_pause)
 
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
@@ -8155,11 +8192,23 @@ class PyExecutor:
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
 
-    def _do_terminate_request(self, request: LlmRequest) -> None:
+    def _do_terminate_request(self,
+                              request: LlmRequest,
+                              *,
+                              for_pause: bool = False) -> None:
+        if request.py_request_id in self._pending_pause_replay_ids:
+            # This terminate resolves a pause-for-replay that was deferred to
+            # the disagg PP termination handler.
+            self._pending_pause_replay_ids.discard(request.py_request_id)
+            for_pause = True
         self._free_request_resources(request)
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
-        _strip_py_multimodal_data_post_prefill(request)
+        # A pause-for-replay terminate must keep the multimodal payload: the
+        # paused request re-enters as a context request and replays prefill
+        # from `py_multimodal_data`.
+        if not for_pause:
+            _strip_py_multimodal_data_post_prefill(request)
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
 
@@ -8576,12 +8625,14 @@ class PyExecutor:
             # defend against anyway.
             return []
 
-    def _terminate_requests(
-            self, requests_to_terminate: Iterable[LlmRequest]) -> None:
+    def _terminate_requests(self,
+                            requests_to_terminate: Iterable[LlmRequest],
+                            *,
+                            for_pause: bool = False) -> None:
         # todo: support work with self.inflight_req_ids.
         #       Currently, self.inflight_req_ids is not updated.
         for req in requests_to_terminate:
-            self._terminate_request(req)
+            self._terminate_request(req, for_pause=for_pause)
 
     def _pause_requests(self, requests_to_pause: Iterable[LlmRequest]) -> None:
         for req in requests_to_pause:
