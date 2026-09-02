@@ -39,3 +39,22 @@ l0_model_express:
   - model_express/test_model_express.py::test_mx_donor_receiver[llama-bf16-tp2]
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen2-bf16-tp2]
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-bf16-tp2]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+        lte: 2
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
+  - model_express/test_model_express_accuracy.py::test_mx_receiver_accuracy[llama3-8b-instruct-mmlu-tp1]
+  - model_express/test_model_express_accuracy.py::test_mx_receiver_accuracy[qwen2.5-7b-instruct-mmlu-tp1]
+  - model_express/test_model_express_accuracy.py::test_mx_receiver_accuracy[qwen3-8b-gsm8k-tp1]
