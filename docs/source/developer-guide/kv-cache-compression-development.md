@@ -259,6 +259,43 @@ KVCM hot/cold migration
   -> native algorithm launcher on the supplied CUDA stream
 ```
 
+### Cold-page storage foundation and format layout
+
+KVCM V2's cold-page mechanism is the algorithm-neutral storage foundation for
+storage-bound compression; it is not itself a compression method. KVCM treats
+each cold Page as one fixed-size opaque byte record. It allocates and releases
+cold Slots, routes Pages across cache levels, stages Disk I/O, tracks completion
+events, publishes the completed mapping, and rolls back failed migrations. It
+does not interpret the compression format inside the record.
+
+A storage-bound compression method supplies that missing format contract
+through the existing cold-page codec interface. For every provider-owned
+lifecycle or layer group, define:
+
+- which hot buffers are encoded and which are preserved losslessly;
+- the order, byte offsets, alignment, and padding of records in the cold Page;
+- the packed data, scale, and auxiliary-buffer representation;
+- one fixed cold Page byte size; and
+- the matching batched encode and decode operations.
+
+The native adapter derives resolved hot lifecycle and buffer descriptors from
+KVCM's `PoolGroupDesc`. The provider can build and validate its layout in Python
+from those resolved descriptors, then pass immutable layout metadata to its
+native launcher. The layout belongs to the compression method and codec; do not
+add a format-specific branch to KVCM. Once the codec reports the fixed Page size
+and implements the transform, the existing cold-page mechanism manages the
+compressed Slots and their lifecycle without compression-specific Page
+management changes.
+
+Iteration-driven methods that do not introduce a separate storage
+representation do not need a cold-page layout. Storage-bound methods that store
+a different cold-tier representation, for example in Host or Disk memory,
+should use this interface rather than building a second Page/Slot manager. For
+the storage ABI, see the
+[KVCM V2 Cold-Page Codec Design](kv-cache-cold-page-codec.md). See
+[PR #18091](https://github.com/NVIDIA/TensorRT-LLM/pull/18091) for a concrete
+NVFP4 layout and provider implementation.
+
 ### `create_cold_page_codec()`
 
 KVCM supplies the resolved cache configuration, runtime KV dtype, PP-local
@@ -411,14 +448,18 @@ add algorithm selection to KVCM C++.
 
 1. Set `uses_iteration_lifecycle = False` and
    `provides_cold_page_codec = True`.
-2. Implement `create_cold_page_codec()` directly, or reuse
+2. Define the method's fixed cold-page layout: encoded and lossless buffers,
+   record order, offsets, alignment, padding, auxiliary metadata, and total Page
+   bytes. Follow the
+   [cold-page layout contract](#cold-page-storage-foundation-and-format-layout).
+3. Implement `create_cold_page_codec()` directly, or reuse
    `ColdPageQuantizationCompression` and implement `build_codec_state()` plus
    `build_lifecycle_metadata()`.
-3. Define the provider-owned layer set and a lossless policy for unowned
+4. Define the provider-owned layer set and a lossless policy for unowned
    lifecycles.
-4. Implement batched `encode_cold_pages()` and `decode_cold_pages()` using the
+5. Implement batched `encode_cold_pages()` and `decode_cold_pages()` using the
    supplied stream.
-5. Keep fixed cold-page size, Page-index location, pointer lifetime, and
+6. Keep fixed cold-page size, Page-index location, pointer lifetime, and
    asynchronous failure behavior consistent with the native codec contract.
 
 The native `IKvCacheColdPageCodec` interface and Python/native adapter already
