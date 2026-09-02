@@ -82,7 +82,8 @@ struct Sum2
     float y;
 };
 
-__device__ __forceinline__ float bf16_load(__nv_bfloat16 const* ptr, int index)
+template <typename Index>
+__device__ __forceinline__ float bf16_load(__nv_bfloat16 const* ptr, Index index)
 {
     return __bfloat162float(ptr[index]);
 }
@@ -237,7 +238,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     float const* __restrict__ dt_bias, __nv_bfloat16 const* __restrict__ beta,
     __nv_bfloat16 const* __restrict__ onorm_g, float const* __restrict__ onorm_weight,
     int const* __restrict__ ssm_state_indices, float* __restrict__ state, int64_t state_slot_stride,
-    __nv_bfloat16* __restrict__ out, float lower_bound, float scale, float onorm_epsilon)
+    __nv_bfloat16* __restrict__ out, float lower_bound, float scale, float onorm_epsilon, KdaDecodeIoLayout layout)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
     __trap();
@@ -332,13 +333,15 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
             q_accumulator += bf16_load(cs_q, cache_index) * bf16_load(w_q_t, width * kFlat + head_column);
             k_accumulator += bf16_load(cs_k, cache_index) * bf16_load(w_k_t, width * kFlat + head_column);
         }
-        int const token_index = (batch_index * kHeads + head) * kDim + column;
-        q_accumulator += bf16_load(x_q, token_index) * bf16_load(w_q_t, (kKernelWidth - 1) * kFlat + head_column);
-        k_accumulator += bf16_load(x_k, token_index) * bf16_load(w_k_t, (kKernelWidth - 1) * kFlat + head_column);
+        int64_t const q_index = static_cast<int64_t>(batch_index) * layout.xQRowStride + head_column;
+        int64_t const k_index = static_cast<int64_t>(batch_index) * layout.xKRowStride + head_column;
+        q_accumulator += bf16_load(x_q, q_index) * bf16_load(w_q_t, (kKernelWidth - 1) * kFlat + head_column);
+        k_accumulator += bf16_load(x_k, k_index) * bf16_load(w_k_t, (kKernelWidth - 1) * kFlat + head_column);
         shared_q[column] = silu_fast(q_accumulator);
         shared_k[column] = silu_fast(k_accumulator);
 
-        float const gate = bf16_load(g, token_index) + dt_bias[head_column];
+        int64_t const gate_index = static_cast<int64_t>(batch_index) * layout.gateRowStride + head_column;
+        float const gate = bf16_load(g, gate_index) + dt_bias[head_column];
         shared_decay[column] = __expf(lower_bound * sigmoid_fast(exp_a * gate));
     }
 
@@ -355,20 +358,22 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
             int const cache_index = cache_base + width;
             v_accumulator += bf16_load(cs_v, cache_index) * bf16_load(w_v_t, width * kFlat + head_row);
         }
-        int const token_index = (batch_index * kHeads + head) * kDim + row;
-        v_accumulator += bf16_load(x_v, token_index) * bf16_load(w_v_t, (kKernelWidth - 1) * kFlat + head_row);
+        int64_t const v_index = static_cast<int64_t>(batch_index) * layout.xVRowStride + head_row;
+        v_accumulator += bf16_load(x_v, v_index) * bf16_load(w_v_t, (kKernelWidth - 1) * kFlat + head_row);
         shared_v[row] = silu_fast(v_accumulator);
 
         if constexpr (!kUseCluster)
         {
-            preloaded_gate = sigmoid_fast(bf16_load(onorm_g, token_index));
+            int64_t const onorm_gate_index
+                = static_cast<int64_t>(batch_index) * layout.outputNormGateRowStride + head_row;
+            preloaded_gate = sigmoid_fast(bf16_load(onorm_g, onorm_gate_index));
             preloaded_weight = onorm_weight[row];
         }
     }
 
     if (tid == 0)
     {
-        shared_beta = sigmoid_fast(bf16_load(beta, batch_index * kHeads + head));
+        shared_beta = sigmoid_fast(bf16_load(beta, static_cast<int64_t>(batch_index) * layout.betaRowStride + head));
     }
     __syncthreads();
 
@@ -563,9 +568,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
             int const local_row = tid - kVThreadBase;
             int const row = cluster_rank * kLocalVThreads + local_row;
             int const output_index = (batch_index * kHeads + head) * kDim + row;
+            int64_t const onorm_gate_index
+                = static_cast<int64_t>(batch_index) * layout.outputNormGateRowStride + head_offset + row;
             float const inverse_rms = rsqrtf(normalization_sum_square / static_cast<float>(kDim) + onorm_epsilon);
-            float const output_value
-                = shared_output[row] * inverse_rms * onorm_weight[row] * sigmoid_fast(bf16_load(onorm_g, output_index));
+            float const output_value = shared_output[row] * inverse_rms * onorm_weight[row]
+                * sigmoid_fast(bf16_load(onorm_g, onorm_gate_index));
             out[output_index] = bf16_store(output_value);
         }
         // Rank zero's shared total must remain live until every peer consumes it.
@@ -632,7 +639,8 @@ cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t str
         params.logA, static_cast<__nv_bfloat16 const*>(params.gate), params.dtBias,
         static_cast<__nv_bfloat16 const*>(params.beta), static_cast<__nv_bfloat16 const*>(params.outputNormGate),
         params.outputNormWeight, params.ssmStateIndices, params.state, params.stateSlotStride,
-        static_cast<__nv_bfloat16*>(params.output), params.lowerBound, params.scale, params.outputNormEps);
+        static_cast<__nv_bfloat16*>(params.output), params.lowerBound, params.scale, params.outputNormEps,
+        params.layout);
     if (launchStatus != cudaSuccess)
     {
         return launchStatus;
