@@ -173,11 +173,13 @@ class HfWeightLoader(BaseWeightLoader):
 
     def _log_checkpoint_io_status(self) -> None:
         status = self._last_checkpoint_io_status
+        fallback_reason = (status.fallback_reason
+                           or "none").replace("\r", "\\r").replace("\n", "\\n")
         logger.info(
             f"Checkpoint I/O policy: requested={status.requested}, "
             f"selected={status.selected}, activated={status.activated}, "
             f"effective={status.effective}, fallback_reason="
-            f"{status.fallback_reason or 'none'}.")
+            f"{fallback_reason}.")
 
     @staticmethod
     def _is_weight_cache_enabled() -> bool:
@@ -439,10 +441,7 @@ class HfWeightLoader(BaseWeightLoader):
                 "Checkpoint I/O policy is falling back for a sessionless "
                 f"load: requested={status.requested}, "
                 f"selected={status.selected}, reason={status.fallback_reason}.")
-            if status.requested == _RANK_STRIPED_IO_POLICY:
-                logger.warning(message)
-            else:
-                logger.info(message)
+            logger.info(message)
         weights = self._load_weights_native(checkpoint_dir, mapping,
                                             use_consolidated, **kwargs)
         self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY

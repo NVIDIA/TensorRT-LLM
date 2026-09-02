@@ -42,7 +42,13 @@ def test_make_startup_observation_combines_checkpoint_phases(
                 "weight_population_seconds": 2.5,
                 "checkpoint_finalization_seconds": 0.5,
                 "total_model_loading_seconds": 6.0,
-            }
+            },
+            "draft_model_loader": {
+                "checkpoint_preparation_seconds": 0.25,
+                "weight_population_seconds": 0.5,
+                "checkpoint_finalization_seconds": 0.25,
+                "total_model_loading_seconds": 1.5,
+            },
         }
     }
 
@@ -50,6 +56,8 @@ def test_make_startup_observation_combines_checkpoint_phases(
 
     assert observation["metrics"]["checkpoint_pipeline_seconds"] == 4.0
     assert observation["metrics"]["total_model_loading_seconds"] == 6.0
+    assert observation["metrics"]["draft_model_checkpoint_pipeline_seconds"] == 1.0
+    assert observation["metrics"]["draft_model_total_model_loading_seconds"] == 1.5
     assert observation["checkpoint_io_policies"] == [
         {
             "requested": "auto",
@@ -57,6 +65,31 @@ def test_make_startup_observation_combines_checkpoint_phases(
             "activated": True,
             "effective": "rank_striped_read_ahead",
             "fallback_reason": "none",
+        }
+    ]
+
+
+def test_parse_checkpoint_io_policies_preserves_escaped_multiline_reason(
+    tmp_path: Path,
+) -> None:
+    server_log = tmp_path / "trtllm-serve.0.log"
+    server_log.write_text(
+        "Checkpoint I/O policy: requested=rank_striped_read_ahead, "
+        "selected=native, activated=False, effective=native, "
+        r"fallback_reason=RuntimeError: first line\nsecond line."
+        "\n",
+        encoding="utf-8",
+    )
+
+    statuses = perf_sanity.parse_checkpoint_io_policies([str(server_log)])
+
+    assert statuses == [
+        {
+            "requested": "rank_striped_read_ahead",
+            "selected": "native",
+            "activated": False,
+            "effective": "native",
+            "fallback_reason": r"RuntimeError: first line\nsecond line",
         }
     ]
 
@@ -101,7 +134,152 @@ def test_add_startup_metric_values_uses_slowest_disagg_worker() -> None:
     assert new_data["d_gen_checkpoint_pipeline_seconds"] == 8.0
     assert new_data["d_gen_total_model_loading_seconds"] == 10.0
     assert new_data["s_gen_checkpoint_io_policy_effective"] == "rank_striped_read_ahead"
-    assert new_data["b_gen_checkpoint_io_policy_activated"] is True
+    assert new_data["l_gen_checkpoint_io_policy_status_count"] == 2
+    assert new_data["l_gen_checkpoint_io_policy_activated_status_count"] == 2
+    assert new_data["l_gen_startup_metrics_expected_server_count"] == 2
+    assert new_data["l_gen_startup_metrics_discovered_server_count"] == 2
+    assert new_data["l_gen_startup_metrics_failed_server_count"] == 0
+    assert new_data["b_gen_startup_metrics_collection_complete"] is True
+
+
+def test_add_startup_metric_values_preserves_mixed_policy_activation() -> None:
+    observations = [
+        {
+            "role": "aggregate",
+            "metrics": {},
+            "checkpoint_io_policies": [
+                {
+                    "requested": "rank_striped_read_ahead",
+                    "selected": "rank_striped_read_ahead",
+                    "activated": True,
+                    "effective": "rank_striped_read_ahead",
+                },
+                {
+                    "requested": "rank_striped_read_ahead",
+                    "selected": "native",
+                    "activated": False,
+                    "effective": "native",
+                },
+            ],
+        }
+    ]
+    new_data = {}
+
+    perf_sanity.add_startup_metric_values(new_data, observations)
+
+    assert new_data["s_checkpoint_io_policy_effective"] == "native,rank_striped_read_ahead"
+    assert new_data["l_checkpoint_io_policy_status_count"] == 2
+    assert new_data["l_checkpoint_io_policy_activated_status_count"] == 1
+    assert "b_checkpoint_io_policy_activated" not in new_data
+
+
+def test_collect_startup_observation_records_fetch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_fetch(*_args, **_kwargs) -> None:
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(perf_sanity, "fetch_startup_observation", fail_fetch)
+
+    observation = perf_sanity.collect_startup_observation("worker:8000", [], "gen", "GEN0")
+
+    assert observation == {
+        "role": "gen",
+        "server_name": "GEN0",
+        "error": "OSError: connection reset",
+    }
+
+
+def test_add_startup_metric_values_marks_partial_collection() -> None:
+    observations = [
+        {
+            "role": "gen",
+            "metrics": {"total_model_loading_seconds": 10.0},
+            "checkpoint_io_policies": [],
+        },
+        {"role": "gen", "server_name": "GEN1", "error": "OSError: timed out"},
+    ]
+    new_data = {}
+
+    perf_sanity.add_startup_metric_values(new_data, observations, role="gen")
+
+    assert new_data["d_gen_total_model_loading_seconds"] == 10.0
+    assert new_data["l_gen_startup_metrics_expected_server_count"] == 2
+    assert new_data["l_gen_startup_metrics_discovered_server_count"] == 2
+    assert new_data["l_gen_startup_metrics_failed_server_count"] == 1
+    assert new_data["b_gen_startup_metrics_collection_complete"] is False
+
+
+def test_add_startup_metric_values_marks_missing_server() -> None:
+    new_data = {}
+
+    perf_sanity.add_startup_metric_values(new_data, [], role="ctx", expected_server_count=1)
+
+    assert new_data["l_ctx_startup_metrics_expected_server_count"] == 1
+    assert new_data["l_ctx_startup_metrics_discovered_server_count"] == 0
+    assert new_data["l_ctx_startup_metrics_failed_server_count"] == 0
+    assert new_data["b_ctx_startup_metrics_collection_complete"] is False
+
+
+def test_worker_startup_collection_handles_directory_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commands = perf_sanity.DisaggTestCmds(
+        server_cmds=[],
+        client_cmds={},
+        timeout=1,
+        hostname="localhost",
+        disagg_serving_type="BENCHMARK",
+        num_ctx_servers=1,
+        num_gen_servers=1,
+        output_dir=str(tmp_path),
+        test_output_dir=str(tmp_path),
+    )
+
+    def fail_listdir(_path: str) -> None:
+        raise OSError("shared filesystem unavailable")
+
+    monkeypatch.setattr(perf_sanity.os, "listdir", fail_listdir)
+
+    assert commands._collect_worker_startup_observations(0) == []
+
+
+def test_worker_startup_collection_records_address_file_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commands = perf_sanity.DisaggTestCmds(
+        server_cmds=[],
+        client_cmds={},
+        timeout=1,
+        hostname="localhost",
+        disagg_serving_type="BENCHMARK",
+        num_ctx_servers=0,
+        num_gen_servers=1,
+        output_dir=str(tmp_path),
+        test_output_dir=str(tmp_path),
+    )
+    hostnames_dir = Path(commands._hostnames_dir(0))
+    hostnames_dir.mkdir()
+    address_path = hostnames_dir / "GEN_0.txt"
+    address_path.touch()
+    real_open = open
+
+    def fail_address_open(path, *args, **kwargs):
+        if Path(path) == address_path:
+            raise OSError("address file unavailable")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(perf_sanity, "open", fail_address_open, raising=False)
+
+    assert commands._collect_worker_startup_observations(0) == [
+        {
+            "role": "gen",
+            "server_name": "GEN_0",
+            "error": "OSError: address file unavailable",
+        }
+    ]
 
 
 def test_run_benchmark_with_log_returns_successful_output(tmp_path: Path) -> None:

@@ -17,6 +17,7 @@
 import copy
 import fcntl
 import glob
+import http.client
 import json
 import math
 import os
@@ -28,6 +29,7 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
@@ -37,7 +39,7 @@ from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
 from test_common.perf_sanity_matching import get_test_case_match_keys
 
 from defs.common import wait_for_reported_addr
-from defs.trt_test_alternative import print_info
+from defs.trt_test_alternative import print_info, print_warning
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT
@@ -663,30 +665,40 @@ def parse_checkpoint_io_policies(log_paths: List[str]) -> List[dict]:
         if not os.path.exists(log_path):
             continue
         with open(log_path, "r", encoding="utf-8", errors="replace") as log_file:
-            for match in CHECKPOINT_IO_POLICY_PATTERN.finditer(log_file.read()):
-                status = match.groupdict()
-                status["activated"] = status["activated"] == "True"
-                statuses.append(status)
+            for line in log_file:
+                for match in CHECKPOINT_IO_POLICY_PATTERN.finditer(line):
+                    status = match.groupdict()
+                    status["activated"] = status["activated"] == "True"
+                    statuses.append(status)
     return statuses
 
 
 def make_startup_observation(server_info: dict, log_paths: List[str], role: str) -> dict:
     """Normalize startup data from ``/server_info`` and server logs."""
-    model_loader_metrics = server_info.get("startup_metrics", {}).get("model_loader", {})
+    startup_metrics = server_info.get("startup_metrics", {})
+    if not isinstance(startup_metrics, dict):
+        startup_metrics = {}
     metrics = {}
-    for metric_name in STARTUP_METRIC_NAMES:
-        value = model_loader_metrics.get(metric_name)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            metrics[metric_name] = float(value)
+    for loader_name, metric_prefix in (
+        ("model_loader", ""),
+        ("draft_model_loader", "draft_model_"),
+    ):
+        loader_metrics = startup_metrics.get(loader_name, {})
+        if not isinstance(loader_metrics, dict):
+            continue
+        for metric_name in STARTUP_METRIC_NAMES:
+            value = loader_metrics.get(metric_name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                metrics[f"{metric_prefix}{metric_name}"] = float(value)
 
-    if all(name in metrics for name in CHECKPOINT_PIPELINE_PHASES):
-        metrics["checkpoint_pipeline_seconds"] = sum(
-            metrics[name] for name in CHECKPOINT_PIPELINE_PHASES
-        )
-    if all(name in metrics for name in DRAFT_CHECKPOINT_PIPELINE_PHASES):
-        metrics["draft_checkpoint_pipeline_seconds"] = sum(
-            metrics[name] for name in DRAFT_CHECKPOINT_PIPELINE_PHASES
-        )
+        if all(f"{metric_prefix}{name}" in metrics for name in CHECKPOINT_PIPELINE_PHASES):
+            metrics[f"{metric_prefix}checkpoint_pipeline_seconds"] = sum(
+                metrics[f"{metric_prefix}{name}"] for name in CHECKPOINT_PIPELINE_PHASES
+            )
+        if all(f"{metric_prefix}{name}" in metrics for name in DRAFT_CHECKPOINT_PIPELINE_PHASES):
+            metrics[f"{metric_prefix}draft_checkpoint_pipeline_seconds"] = sum(
+                metrics[f"{metric_prefix}{name}"] for name in DRAFT_CHECKPOINT_PIPELINE_PHASES
+            )
 
     return {
         "role": role,
@@ -703,7 +715,31 @@ def fetch_startup_observation(server_address: str, log_paths: List[str], role: s
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         server_info = json.load(response)
+    if not isinstance(server_info, dict):
+        raise ValueError("/server_info did not return a JSON object")
     return make_startup_observation(server_info, log_paths, role)
+
+
+def collect_startup_observation(
+    server_address: str,
+    log_paths: List[str],
+    role: str,
+    server_name: str,
+) -> dict:
+    """Collect startup data without making optional telemetry fail the test."""
+    try:
+        observation = fetch_startup_observation(server_address, log_paths, role)
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        print_warning(
+            f"Failed to collect startup metrics from {server_name} ({server_address}): {error}"
+        )
+        return {
+            "role": role,
+            "server_name": server_name,
+            "error": f"{type(error).__name__}: {error}",
+        }
+    observation["server_name"] = server_name
+    return observation
 
 
 def write_startup_observations(
@@ -726,7 +762,10 @@ def read_startup_observations(test_output_dir: str, server_idx: int) -> List[dic
 
 
 def add_startup_metric_values(
-    new_data: dict, observations: List[dict], role: Optional[str] = None
+    new_data: dict,
+    observations: List[dict],
+    role: Optional[str] = None,
+    expected_server_count: Optional[int] = None,
 ) -> None:
     """Add informational startup fields to one OpenSearch result row.
 
@@ -734,13 +773,24 @@ def add_startup_metric_values(
     is recorded because the slowest server determines fleet readiness.
     """
     selected = [entry for entry in observations if role is None or entry.get("role") == role]
-    if not selected:
+    if expected_server_count is None:
+        expected_server_count = len(selected)
+    if expected_server_count == 0 and not selected:
         return
 
     field_prefix = f"{role}_" if role else ""
-    metric_names = {name for entry in selected for name in entry.get("metrics", {})}
+    failed = [entry for entry in selected if entry.get("error")]
+    new_data[f"l_{field_prefix}startup_metrics_expected_server_count"] = expected_server_count
+    new_data[f"l_{field_prefix}startup_metrics_discovered_server_count"] = len(selected)
+    new_data[f"l_{field_prefix}startup_metrics_failed_server_count"] = len(failed)
+    new_data[f"b_{field_prefix}startup_metrics_collection_complete"] = (
+        len(selected) == expected_server_count and not failed
+    )
+
+    successful = [entry for entry in selected if not entry.get("error")]
+    metric_names = {name for entry in successful for name in entry.get("metrics", {})}
     for metric_name in metric_names:
-        values = [entry.get("metrics", {}).get(metric_name) for entry in selected]
+        values = [entry.get("metrics", {}).get(metric_name) for entry in successful]
         numeric_values = [
             float(value)
             for value in values
@@ -749,16 +799,21 @@ def add_startup_metric_values(
         if numeric_values:
             new_data[f"d_{field_prefix}{metric_name}"] = max(numeric_values)
 
-    policies = [policy for entry in selected for policy in entry.get("checkpoint_io_policies", [])]
+    policies = [
+        policy for entry in successful for policy in entry.get("checkpoint_io_policies", [])
+    ]
     for policy_field in ("requested", "selected", "effective"):
         values = sorted(
             {str(policy[policy_field]) for policy in policies if policy.get(policy_field)}
         )
         if values:
             new_data[f"s_{field_prefix}checkpoint_io_policy_{policy_field}"] = ",".join(values)
-    activated = [policy.get("activated") for policy in policies if "activated" in policy]
+    activated = [
+        policy["activated"] for policy in policies if isinstance(policy.get("activated"), bool)
+    ]
     if activated:
-        new_data[f"b_{field_prefix}checkpoint_io_policy_activated"] = all(activated)
+        new_data[f"l_{field_prefix}checkpoint_io_policy_status_count"] = len(activated)
+        new_data[f"l_{field_prefix}checkpoint_io_policy_activated_status_count"] = sum(activated)
 
 
 def get_model_dir(model_name: str) -> str:
@@ -1630,10 +1685,11 @@ class AggrTestCmds(NamedTuple):
                     check_files=[server_file_path],
                     server_proc=server_proc,
                 )
-                observation = fetch_startup_observation(
+                observation = collect_startup_observation(
                     f"{server_hostname}:{server_port}",
                     [server_file_path],
                     "aggregate",
+                    f"aggregate_{server_idx}",
                 )
                 write_startup_observations(self.test_output_dir, server_idx, [observation])
 
@@ -1880,8 +1936,17 @@ class DisaggTestCmds(NamedTuple):
     def _collect_worker_startup_observations(self, server_idx: int) -> List[dict]:
         """Collect startup data from every ready context/generation server."""
         observations = []
+        worker_requests = []
         hostnames_dir = self._hostnames_dir(server_idx)
-        for filename in sorted(os.listdir(hostnames_dir)):
+        try:
+            hostname_files = sorted(os.listdir(hostnames_dir))
+        except OSError as error:
+            print_warning(
+                f"Failed to discover workers for startup metrics in {hostnames_dir}: {error}"
+            )
+            return observations
+
+        for filename in hostname_files:
             if not filename.endswith(".txt"):
                 continue
             worker_name = os.path.splitext(filename)[0]
@@ -1891,17 +1956,37 @@ class DisaggTestCmds(NamedTuple):
                 role = "gen"
             else:
                 continue
-            with open(
-                os.path.join(hostnames_dir, filename), "r", encoding="utf-8"
-            ) as hostname_file:
-                server_address = hostname_file.read().strip()
+            try:
+                with open(
+                    os.path.join(hostnames_dir, filename), "r", encoding="utf-8"
+                ) as hostname_file:
+                    server_address = hostname_file.read().strip()
+            except OSError as error:
+                print_warning(f"Failed to read startup metrics address for {worker_name}: {error}")
+                observations.append(
+                    {
+                        "role": role,
+                        "server_name": worker_name,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+                continue
             log_paths = [
                 os.path.join(
                     self.test_output_dir,
                     f"trtllm-serve.{worker_name}.{server_idx}.log",
                 )
             ]
-            observations.append(fetch_startup_observation(server_address, log_paths, role))
+            worker_requests.append((server_address, log_paths, role, worker_name))
+
+        # A missing or wedged optional endpoint must not serially add one full
+        # request timeout per worker to an otherwise healthy benchmark.
+        with ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(collect_startup_observation, *request)
+                for request in worker_requests
+            ]
+            observations.extend(future.result() for future in futures)
         return observations
 
     def wait_for_benchmark_ready(
@@ -3112,7 +3197,11 @@ class PerfSanityTestConfig:
                         server_perf_results[client_idx],
                         spec_decoding=client_config.spec_decoding,
                     )
-                    add_startup_metric_values(new_data, startup_observations)
+                    add_startup_metric_values(
+                        new_data,
+                        startup_observations,
+                        expected_server_count=1,
+                    )
 
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
@@ -3175,8 +3264,18 @@ class PerfSanityTestConfig:
                         spec_decoding=client_config.spec_decoding,
                         benchmark_mode=disagg_config.benchmark_mode,
                     )
-                    add_startup_metric_values(new_data, startup_observations, role="ctx")
-                    add_startup_metric_values(new_data, startup_observations, role="gen")
+                    add_startup_metric_values(
+                        new_data,
+                        startup_observations,
+                        role="ctx",
+                        expected_server_count=num_ctx_servers,
+                    )
+                    add_startup_metric_values(
+                        new_data,
+                        startup_observations,
+                        role="gen",
+                        expected_server_count=num_gen_servers,
+                    )
 
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
