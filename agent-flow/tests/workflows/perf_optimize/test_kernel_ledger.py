@@ -139,8 +139,44 @@ def test_comm_bound_shorthand_is_normalized(tmp_path, shorthand):
 def test_ncu_degrade_string_is_allowed(tmp_path):
     ledger = _ledger()
     ledger["kernels"][0]["ncu"] = "unavailable: no pass captured this stem (3 passes exhausted)"
+    ledger["kernels"][0]["bound"] = "memory"
     data = load_ledger(_write(tmp_path, ledger))
     assert data["kernels"][0]["ncu"].startswith("unavailable")
+    assert data["kernels"][0]["bound"] == "memory"
+
+
+def test_ncu_degrade_string_still_owes_a_row_level_bound(tmp_path):
+    # A collective never goes under ncu, so the row-level `bound` beside the
+    # degrade string is the only bound class it will ever have.
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"] = "unavailable: collective — replay deadlocks the ranks"
+    with pytest.raises(LedgerError, match=r"kernels\[0\].bound"):
+        load_ledger(_write(tmp_path, ledger))
+
+
+def test_collective_row_records_comm_beside_the_degrade_string(tmp_path):
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"] = "unavailable: collective — replay deadlocks the ranks"
+    ledger["kernels"][0]["bound"] = "comm"
+    data = load_ledger(_write(tmp_path, ledger))
+    assert data["kernels"][0]["bound"] == "comm"
+
+
+@pytest.mark.parametrize("shorthand", ["communication", "comm-bound", "NCCL", "Collective"])
+def test_row_level_bound_shorthand_is_normalized(tmp_path, shorthand):
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"] = "unavailable: collective — replay deadlocks the ranks"
+    ledger["kernels"][0]["bound"] = shorthand
+    data = load_ledger(_write(tmp_path, ledger))
+    assert data["kernels"][0]["bound"] == "comm"
+
+
+def test_row_level_bound_must_be_a_known_class(tmp_path):
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"] = "unavailable: no pass captured this stem"
+    ledger["kernels"][0]["bound"] = "quantum"
+    with pytest.raises(LedgerError, match=r"kernels\[0\].bound"):
+        load_ledger(_write(tmp_path, ledger))
 
 
 def test_empty_ncu_degrade_string_rejected(tmp_path):
@@ -191,8 +227,10 @@ def test_absent_ncu_metric_is_treated_as_null(tmp_path):
 
 
 def test_note_does_not_excuse_a_missing_bound(tmp_path):
-    # `bound` is required on a partial capture too.
+    # `bound` is required on a partial capture too — null a metric so this
+    # crosses that branch rather than the all-populated one.
     ledger = _ledger()
+    ledger["kernels"][0]["ncu"]["sm_sol_pct"] = None
     ledger["kernels"][0]["ncu"]["bound"] = None
     ledger["kernels"][0]["ncu"]["note"] = "SOL sections came back empty"
     with pytest.raises(LedgerError, match="ncu.bound"):

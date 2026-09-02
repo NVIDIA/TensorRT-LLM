@@ -978,6 +978,39 @@ def test_kernel_coverage_note_bounds_the_capture():
     assert "below-materiality` dismissal wearing an item costume" in block
 
 
+def test_kernel_coverage_template_never_shows_a_note_the_schema_rejects():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    # `has_note` requires a non-empty string, so an empty exemplar would
+    # teach a copy-paste that the schema then rejects.
+    assert 'note: ""' not in block
+    # The template demonstrates the partial-capture shape it is teaching.
+    assert "occupancy_pct: null" in block
+    assert 'note: "occupancy section empty' in block
+
+
+def test_kernel_coverage_degrade_string_takes_bound_on_the_row():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    # A collective is excluded from every ncu pass, so `bound: comm` cannot
+    # live under `ncu`; the template and the rule must agree on where it goes.
+    assert "bound: comm" in block
+    assert "on the row, beside `ncu`" in block
+    assert "on the row when `ncu` is the degrade string" in block
+
+
+def test_kernel_coverage_note_requires_marking_unmeasured_rows():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "did *not* come from an ncu capture" in block
+
+
+def test_kernel_coverage_reporter_discloses_how_much_ncu_measured():
+    block = _norm(KERNEL_COVERAGE_REPORTER_GUIDANCE)
+    # A ledger of degrade strings / null metrics is valid, so the reporter
+    # must say so — otherwise an unmeasured coverage proof renders exactly
+    # like a measured one.
+    assert "Say how much of the table ncu actually measured" in block
+    assert "must never render" in block
+
+
 def test_kernel_coverage_bundle_extends_analyzer_and_reporter_only():
     base = build_perf_optimize_prompts()
     coverage = _coverage_bundle()

@@ -1083,13 +1083,13 @@ kernels:                        # descending share_pct; one row per kernel/group
   - kernel: gdn_bf16_state              # distinctive stem or group label (unique)
     full_name: "void tensorrt_llm::..." # representative full name(s); group members
     share_pct: 18.4                     # % of profiled GPU time (nsys kern_sum)
-    ncu:                                # from your capture passes, or the string
-      duration_us: 41.2                 # "unavailable: <reason>". A metric the
-      sm_sol_pct: 12.1                  # capture did not yield may be null when
-      mem_sol_pct: 78.5                 # `note` says why — never invent one.
-      occupancy_pct: 62.0
+    ncu:                                # metrics mapping (or the string below)
+      duration_us: 41.2
+      sm_sol_pct: 12.1
+      mem_sol_pct: 78.5
+      occupancy_pct: null               # a metric the capture did not yield is null
       bound: memory                     # compute | memory | latency | balanced | comm
-      note: ""                          # required when a metric above is null
+      note: "occupancy section empty: replay stalled"   # required by that null
     faster:
       disposition: item                 # item | dismissed
       ref: opt-003                      # roadmap item id | evidence-backed dismissal
@@ -1097,6 +1097,18 @@ kernels:                        # descending share_pct; one row per kernel/group
       disposition: dismissed
       neighbors: "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace, step 120)"
       ref: "multi-consumer-pinned: intermediate feeds residual add + next norm (torch_trace)"
+  - kernel: allreduce_fusion            # a collective: never goes under ncu at all
+    full_name: "void tensorrt_llm::kernels::ar_fusion::..."
+    share_pct: 9.2
+    ncu: "unavailable: collective — kernel replay deadlocks the ranks"
+    bound: comm                         # with the string form, `bound` sits here
+    faster:
+      disposition: dismissed
+      ref: "approach-restricted: strategy A/B falsified in a prior round; no NVLS here"
+    fusion:
+      disposition: dismissed
+      neighbors: "sigmoid_gate_mul_add -> THIS -> scaleMatrixPerTensorVec (step 120)"
+      ref: "already-fused: this IS the AR + residual/norm/quant fused epilogue"
 ```
 
 Rules:
@@ -1111,11 +1123,14 @@ Rules:
   file, a failed item's `evaluation.md`).
 - **Say "not measured", never guess it.** A collective never goes under
   `ncu` — kernel replay deadlocks it — so disposition an allreduce from
-  its nsys share and the source, and record `bound: comm`. When a pass
-  reaches a kernel but a section comes back empty, null that metric and
-  say why in `note`, rather than fabricating a percentage or throwing
-  away the numbers you did measure; `bound` is the one field always
-  owed. `neighbors` is the evidence a fusion *dismissal* rests on — a
+  its nsys share and the source, give `ncu` the `unavailable: <reason>`
+  string, and record `bound: comm` **on the row, beside `ncu`**. When a
+  pass reaches a kernel but a section comes back empty, null that metric
+  and say why in `note`, rather than fabricating a percentage or
+  throwing away the numbers you did measure. `bound` is the one field
+  always owed, and the schema enforces it in both shapes: inside `ncu`
+  when `ncu` is a metrics mapping, on the row when `ncu` is the degrade
+  string. `neighbors` is the evidence a fusion *dismissal* rests on — a
   fusion `item` carries its adjacency in the roadmap entry `ref` names.
 - **An unactionable item is not an answer.** Do not park a kernel on an
   item whose `expected_gain_pct` sits below `optimize.noise_floor_pct`
@@ -1129,8 +1144,11 @@ Rules:
   kernels that newly crossed the bar.
 - **Mirror it for humans**: add a `## Kernel disposition ledger` section
   to `profile_findings.md` — the same rows as a table (kernel, share,
-  bound, faster →, fusion →) with a one-line rationale each. The YAML
-  file is authoritative; the findings section carries the prose.
+  bound, faster →, fusion →) with a one-line rationale each, marking
+  every row whose `bound` did *not* come from an ncu capture (the
+  degrade string, or a null metric's `note`) so the table cannot be read
+  as more measured than it is. The YAML file is authoritative; the
+  findings section carries the prose.
 """
 
 
@@ -1174,6 +1192,15 @@ Rigor rules for this section:
 - **The final round's ledger is the coverage proof.** Earlier rounds'
   ledgers are history (cite one only to show how a disposition
   evolved); the guarantee the section attests is the final state's.
+- **Say how much of the table ncu actually measured.** A row whose `ncu`
+  is the `unavailable: <reason>` string, or whose metrics are null with
+  a `note` explaining the gap, was dispositioned from nsys and the SOL
+  correlation — not from a capture. Count those rows, state it in the
+  headline ("ncu contributed per-kernel metrics for 3 of 22 rows; the
+  rest carry the ledger's degrade reason"), and qualify each such
+  `bound` cell with the ledger's reason (`memory — no ncu: replay
+  stalled`). A coverage proof built on unmeasured rows must never render
+  like one built on measured rows.
 - If the final round's ledger is missing or invalid, say so plainly
   ("Kernel coverage ledger unavailable (<reason>)") — never reconstruct
   rows from memory.
