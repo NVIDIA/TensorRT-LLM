@@ -888,6 +888,13 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 re.sub(r"(model\.layers\.)?backbone", "model", k)
                 for k in model_config.quant_config.exclude_modules
             ]
+        else:
+            model_config.quant_config.exclude_modules = []
+        # Depthwise conv1d is stored in a Linear for TP, but it is not a GEMM.
+        # NVFP4 groups along in_features (d_conv, typically 4), which is not
+        # divisible by the block size of 16, so keep this Linear unquantized.
+        if "*.mixer.conv1d" not in model_config.quant_config.exclude_modules:
+            model_config.quant_config.exclude_modules.append("*.mixer.conv1d")
 
         # Rename quant_config_dict keys from 'backbone.layers.' to 'model.layers.' so that
         # apply_layerwise_quant_config() can correctly match TRT-LLM module names, which use
