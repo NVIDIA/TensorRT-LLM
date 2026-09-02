@@ -4,7 +4,7 @@
 import random
 import unittest
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional, Union
 from unittest import mock
@@ -18,7 +18,7 @@ from tensorrt_llm._torch.attention_backend import (FlashInferAttention,
 from tensorrt_llm._torch.attention_backend import \
     flashinfer as flashinfer_backend
 from tensorrt_llm._torch.attention_backend.flashinfer import (
-    FlashInferMultiItemParams, FlashInferWrappers, PlanParams)
+    FlashInferWrappers, PlanParams)
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -70,37 +70,6 @@ class CUDAGraphTestScenario:
 
 
 class TestFlashInferAttention(unittest.TestCase):
-
-    @staticmethod
-    def _make_plan(*,
-                   num_generations: int,
-                   window_left: int = -1,
-                   head_dim: int = 128) -> PlanParams:
-        return PlanParams(
-            num_heads=8,
-            num_kv_heads=4,
-            head_dim=head_dim,
-            q_dtype=torch.bfloat16,
-            kv_dtype=torch.bfloat16,
-            attention_mask_type=AttentionMaskType.causal,
-            window_left=window_left,
-            num_generations=num_generations,
-        )
-
-    @staticmethod
-    def _make_workspace_metadata(
-        max_num_requests: int = 4
-    ) -> tuple[torch.Tensor, FlashInferAttentionMetadata]:
-        workspace = torch.empty(1024, dtype=torch.uint8, device="cuda")
-        metadata = FlashInferAttentionMetadata(
-            seq_lens=torch.ones(max_num_requests, dtype=torch.int32),
-            num_contexts=0,
-            kv_cache_manager=None,
-            max_num_requests=max_num_requests,
-            max_num_tokens=max_num_requests,
-            workspace_buffer=workspace,
-        )
-        return workspace, metadata
 
     def test_generation_page_table_uses_reserved_block_count(self):
         manager = SimpleNamespace(get_batch_cache_indices=mock.Mock(
@@ -183,129 +152,6 @@ class TestFlashInferAttention(unittest.TestCase):
                 attention_mask_type=AttentionMaskType.causal.value,
                 flashinfer_backend="trtllm-gen",
             )
-
-    def test_cuda_graph_plan_workspaces_are_shared_by_plan_kind(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required for FlashInfer metadata")
-
-        workspace, metadata = self._make_workspace_metadata()
-        graph_batch_1 = metadata.create_cuda_graph_metadata(1)
-        graph_batch_4 = metadata.create_cuda_graph_metadata(4)
-
-        global_batch_1 = self._make_plan(num_generations=1)
-        sliding_batch_1 = self._make_plan(num_generations=1, window_left=4096)
-        global_batch_4 = self._make_plan(num_generations=4)
-        sliding_batch_4 = self._make_plan(num_generations=4, window_left=4096)
-
-        with mock.patch.object(torch, "empty_like",
-                               wraps=torch.empty_like) as allocate_workspace:
-            global_workspace_1 = graph_batch_1._get_plan_workspace(
-                global_batch_1)
-            sliding_workspace_1 = graph_batch_1._get_plan_workspace(
-                sliding_batch_1)
-            global_workspace_4 = graph_batch_4._get_plan_workspace(
-                global_batch_4)
-            sliding_workspace_4 = graph_batch_4._get_plan_workspace(
-                sliding_batch_4)
-            self.assertEqual(allocate_workspace.call_count, 2)
-
-        self.assertNotEqual(global_workspace_1.data_ptr(),
-                            sliding_workspace_1.data_ptr())
-        self.assertNotEqual(global_workspace_1.data_ptr(), workspace.data_ptr())
-        self.assertNotEqual(sliding_workspace_1.data_ptr(),
-                            workspace.data_ptr())
-        self.assertIs(global_workspace_1, global_workspace_4)
-        self.assertIs(sliding_workspace_1, sliding_workspace_4)
-        self.assertIs(graph_batch_1._plan_workspace_buffers,
-                      graph_batch_4._plan_workspace_buffers)
-        self.assertIs(graph_batch_1._plan_workspace_owners,
-                      graph_batch_4._plan_workspace_owners)
-        self.assertEqual(len(graph_batch_1._plan_workspace_buffers), 2)
-
-        self.assertIs(metadata._get_plan_workspace(global_batch_1), workspace)
-        self.assertIs(metadata._get_plan_workspace(sliding_batch_1), workspace)
-
-        single_workspace, single_metadata = self._make_workspace_metadata(1)
-        single_metadata = single_metadata.create_cuda_graph_metadata(1)
-        with mock.patch.object(torch, "empty_like",
-                               wraps=torch.empty_like) as allocate_workspace:
-            persistent_workspace = single_metadata._get_plan_workspace(
-                global_batch_1)
-        self.assertEqual(allocate_workspace.call_count, 1)
-        self.assertNotEqual(persistent_workspace.data_ptr(),
-                            single_workspace.data_ptr())
-
-    def test_cuda_graph_persistent_plan_workspace_isolated_from_ephemeral(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required for FlashInfer metadata")
-
-        workspace, metadata = self._make_workspace_metadata(1)
-        metadata = metadata.create_cuda_graph_metadata(1)
-        persistent_plan = self._make_plan(num_generations=1)
-        custom_mask_plan = replace(
-            persistent_plan,
-            attention_mask_data=torch.ones(1, dtype=torch.bool, device="cuda"),
-        )
-        multi_item_plan = replace(
-            persistent_plan,
-            multi_item_params=FlashInferMultiItemParams(
-                prefix_len_ptr=torch.zeros(1, dtype=torch.int32, device="cuda"),
-                max_item_len_ptr=torch.zeros(1,
-                                             dtype=torch.int32,
-                                             device="cuda"),
-                token_pos_in_items_ptr=torch.zeros(1,
-                                                   dtype=torch.int32,
-                                                   device="cuda"),
-                token_pos_in_items_len=1,
-            ),
-        )
-
-        persistent_workspace = metadata._get_plan_workspace(persistent_plan)
-        self.assertIs(metadata._get_plan_workspace(custom_mask_plan), workspace)
-        self.assertIs(metadata._get_plan_workspace(multi_item_plan), workspace)
-        self.assertNotEqual(persistent_workspace.data_ptr(),
-                            workspace.data_ptr())
-
-    def test_cuda_graph_batch_replica_replans_shared_workspace(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required for FlashInfer metadata")
-
-        _, metadata = self._make_workspace_metadata()
-        graph_batch_1 = metadata.create_cuda_graph_metadata(1)
-        graph_batch_4 = metadata.create_cuda_graph_metadata(4)
-
-        batch_1_plan = self._make_plan(num_generations=1, head_dim=256)
-        batch_4_plan = self._make_plan(num_generations=4, head_dim=256)
-        batch_1_wrappers = FlashInferWrappers(
-            is_planned=True,
-            workspace_buffer=graph_batch_1._get_plan_workspace(batch_1_plan),
-            fa2_plan_num_blocks=(1, ),
-        )
-        batch_4_wrappers = FlashInferWrappers(
-            is_planned=True,
-            workspace_buffer=graph_batch_4._get_plan_workspace(batch_4_plan),
-            fa2_plan_num_blocks=(1, 1, 1, 1),
-        )
-        self.assertIs(batch_1_wrappers.workspace_buffer,
-                      batch_4_wrappers.workspace_buffer)
-
-        graph_batch_1._plan_params_to_wrappers = {
-            batch_1_plan: batch_1_wrappers
-        }
-        graph_batch_1.num_blocks = [1]
-
-        graph_batch_1._set_plan_workspace_owner(batch_1_plan, batch_1_wrappers)
-        graph_batch_4._set_plan_workspace_owner(batch_4_plan, batch_4_wrappers)
-        self.assertFalse(
-            graph_batch_1._owns_plan_workspace(batch_1_plan, batch_1_wrappers))
-        self.assertTrue(
-            graph_batch_4._owns_plan_workspace(batch_4_plan, batch_4_wrappers))
-        self.assertTrue(graph_batch_1.needs_plan(batch_1_plan))
-
-        with mock.patch.object(graph_batch_1, "_plan_with_params") as replan:
-            graph_batch_1._refresh_fa2_cuda_graph_plans()
-
-        replan.assert_called_once_with(batch_1_plan)
 
     def test_generation_page_table_keeps_logical_positions(self):
         if not torch.cuda.is_available():
@@ -408,7 +254,6 @@ class TestFlashInferAttention(unittest.TestCase):
                 object():
                 FlashInferWrappers(
                     is_planned=True,
-                    workspace_buffer=metadata.workspace_buffer,
                     decode_wrapper=SimpleNamespace(
                         _kv_lens_buffer=kv_lens_buffer),
                 )
@@ -1086,28 +931,16 @@ class TestFlashInferAttention(unittest.TestCase):
             for _ in range(2):
                 layer.forward(q, k, v, attn_metadata_cuda_graph)
 
-        # Every persistent CUDA-graph plan must be ready before capture. Plan
-        # kinds use isolated workspaces, while eager plans keep sharing the
-        # original workspace and defer replanning when there is more than one.
+        # prepare() may change the page metadata used by every persistent
+        # wrapper. CUDA graph replay cannot re-enter Python to plan lazily, so
+        # all wrappers must be refreshed before capture or replay.
         attn_metadata_cuda_graph.prepare()
         graph_wrappers = list(
             attn_metadata_cuda_graph._plan_params_to_wrappers.values())
         self.assertTrue(all(wrapper.is_planned for wrapper in graph_wrappers))
-        self.assertEqual(len(attn_metadata_cuda_graph._plan_workspace_buffers),
-                         num_layers)
-        graph_workspace_ptrs = {
-            wrapper.workspace_buffer.data_ptr()
-            for wrapper in graph_wrappers
-        }
-        self.assertEqual(len(graph_workspace_ptrs), num_layers)
-        self.assertNotIn(workspace.data_ptr(), graph_workspace_ptrs)
 
         eager_wrappers = list(
             attn_metadata_ref._plan_params_to_wrappers.values())
-        self.assertEqual(
-            {wrapper.workspace_buffer.data_ptr()
-             for wrapper in eager_wrappers},
-            {attn_metadata_ref.workspace_buffer.data_ptr()})
         attn_metadata_ref.prepare()
         self.assertEqual(
             [wrapper.is_planned for wrapper in eager_wrappers],
