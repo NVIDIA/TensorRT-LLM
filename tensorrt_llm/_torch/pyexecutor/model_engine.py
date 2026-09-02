@@ -1458,6 +1458,26 @@ class PyTorchModelEngine(ModelEngine):
         # Deduplicate the warmup_configs while keeping the order.
         return list(dict.fromkeys(warmup_configs))
 
+    @contextmanager
+    def maybe_autotune_lora(self):
+        """Enable autotuning while warming up CUDA-graph LoRA kernels."""
+        if not (self.llm_args.enable_autotuner
+                and self.cuda_graph_lora_manager is not None):
+            yield
+            return
+
+        cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+        with autotune(cache_path=cache_path):
+            try:
+                yield
+            finally:
+                # Complete the PP cache hand-off even on ranks without a
+                # CUDA-graph-only tunable op.
+                autotuner = AutoTuner.get()
+                autotuner.cache_pp_recv()
+                autotuner.cache_pp_send()
+                autotuner.clean_pp_flag()
+
     @with_warmup_flag
     @warmup_with_kv_cache_cleanup
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -1558,7 +1578,8 @@ class PyTorchModelEngine(ModelEngine):
             with self.cuda_graph_runner.allow_capture():
                 self.cuda_graph_runner.is_warmup_only = True
                 try:
-                    self._run_cuda_graph_warmup(resource_manager)
+                    with self.maybe_autotune_lora():
+                        self._run_cuda_graph_warmup(resource_manager)
                 finally:
                     self.cuda_graph_runner.is_warmup_only = False
                 self.cuda_graph_runner.padding_dummy_requests = {}
