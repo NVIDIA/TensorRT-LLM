@@ -212,6 +212,17 @@
       "path": "cache_transceiver_config.transceiver_runtime"
     },
     {
+      "allowed_values": [
+        "auto",
+        "native",
+        "rank_striped_read_ahead"
+      ],
+      "annotation": "Literal['auto', 'native', 'rank_striped_read_ahead']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "checkpoint_io_policy"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
