@@ -7292,8 +7292,23 @@ class PyExecutor:
 
     def _finish_transfer_only_requests(self, requests):
         for request in requests:
+            first_gen_tokens = request.context_phase_params.first_gen_tokens
+            for beam in range(0, request.py_beam_width):
+                request.add_new_token(first_gen_tokens[beam], beam)
             request.finish_by_reason(FinishReason.LENGTH)
             request.decoding_iter = request.py_decoding_iter
+            response = request.create_response(False, self.dist.rank)
+            if response:
+                response.result.cached_tokens = request.cached_tokens
+                self._maybe_attach_ctx_usage(request, response)
+                self._pending_transfer_responses.append(
+                    (request.py_request_id, response))
+            if request in self.active_requests:
+                self.active_requests.remove(request)
+            if response:
+                self._pending_response_terminations.append(request)
+            else:
+                self._terminate_request(request)
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
