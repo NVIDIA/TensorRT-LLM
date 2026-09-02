@@ -112,15 +112,14 @@ from ..distributed import AllReduce, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
+from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.linear import TensorParallelMode, load_weight_shard
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
-from ..moe.fused_moe import ConfigurableMoE, create_moe
-from ..moe.fused_moe.interface import _compute_ep_partition
+from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, create_moe
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
-from ..utils import ActivationType, ActType_TrtllmGen
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -1120,6 +1119,16 @@ class KimiK3MoERuntime(nn.Module):
             layer_idx=layer_idx,
             # Let CommunicationFactory select the best available strategy.
             communication_method=None,
+            activation=SiTuActivation(
+                gate_softcap=situ_beta,
+                linear_softcap=situ_linear_beta,
+            ),
+            # A MegaMoE request that silently degraded to CUTLASS would be
+            # benchmarked as if it were MegaMoE, and the decline is easy to
+            # trigger (EP-only, own token / top-k limits). Fail in the resolver
+            # instead, which reports the rejection trail.
+            allow_backend_degradation=routed_moe_model_config.moe_backend
+            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"),
         )
         # trtllm-gen ships SiTu cubins for exactly one dtype combination
         # (``Bmm_MxE4m3_MxE2m1MxE4m3`` = MXFP8 act x MXFP4 weight) and has no
@@ -1141,82 +1150,11 @@ class KimiK3MoERuntime(nn.Module):
                 "CUTLASS or MEGAMOE_CUTEDSL."
             )
 
-        if routed_moe_model_config.moe_backend == "CUTLASS":
-            # Size the per-expert SiTU constants with the same ceil/floor
-            # partition the MoE backend uses for ``expert_size_per_partition``.
-            # A plain ``num_experts // ep_size`` is one element short on the
-            # first ``num_experts % ep_size`` ranks, which trips the
-            # ``swiglu_alpha must have num_experts_on_rank elements`` check in
-            # moeOp.cpp. K3's 384 experts divide evenly at EP8/EP16, so the
-            # mismatch is latent there but real for any uneven split.
-            local_num_experts, _, _ = _compute_ep_partition(
-                self.num_experts,
-                routed_moe_model_config.mapping.moe_ep_size,
-                routed_moe_model_config.mapping.moe_ep_rank,
-            )
-            device = torch.device("cuda", torch.cuda.current_device())
-            self.routed_situ_alpha = torch.full(
-                (local_num_experts,), float(situ_beta), dtype=torch.float32, device=device
-            )
-            self.routed_situ_beta = torch.full(
-                (local_num_experts,),
-                situ_linear_beta,
-                dtype=torch.float32,
-                device=device,
-            )
-            routed_moe_kwargs.update(
-                activation_type=ActivationType.SiTu,
-                swiglu_alpha=self.routed_situ_alpha,
-                swiglu_beta=self.routed_situ_beta,
-            )
-        elif routed_moe_model_config.moe_backend == "TRTLLM":
-            routed_moe_kwargs.update(
-                trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-                # Cubin alpha is the gate-side SiTU beta; cubin beta is the
-                # linear-side SiTU beta.
-                trtllm_gen_activation_alpha=situ_beta,
-                trtllm_gen_activation_beta=situ_linear_beta,
-            )
-        elif routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            routed_moe_kwargs.update(
-                activation="situ",
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
-        # MEGAMOE_CUTEDSL has no branch on purpose. ``MegaMoECuteDsl`` resolves
-        # SiTU from the pretrained config in ``_resolve_activation_config``
-        # (``activation=None`` -> "situ" when ``activation_situ_beta`` is
-        # present), and ``create_moe`` currently rejects the explicit
-        # ``activation``/``situ_beta``/``situ_linear_beta`` trio for anything
-        # other than ``MegaMoEDeepGemm``, so passing them here would raise.
-        # Unifying that plumbing is tracked in TRTLLM-15649.
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
                 "Kimi K3 requires ConfigurableMoE; ENABLE_CONFIGURABLE_MOE must not be disabled."
             )
-        if routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            from ..moe.fused_moe.mega_moe import MegaMoEDeepGemm
-
-            if not isinstance(self.routed_experts.backend, MegaMoEDeepGemm):
-                raise RuntimeError(
-                    "Kimi K3 explicitly requested MEGAMOE_DEEPGEMM, but the "
-                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
-                )
-        if routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL":
-            from ..moe.fused_moe.mega_moe import MegaMoECuteDsl
-
-            # Same guard as MEGAMOE_DEEPGEMM above, and for the same reason:
-            # create_moe silently falls back when a backend declines the
-            # config, and for MegaMoE the decline is easy to trigger (it is
-            # EP-only and has its own token/top-k limits), so an explicit
-            # request that quietly became CUTLASS would be measured as if it
-            # were MegaMoE.
-            if not isinstance(self.routed_experts.backend, MegaMoECuteDsl):
-                raise RuntimeError(
-                    "Kimi K3 explicitly requested MEGAMOE_CUTEDSL, but the "
-                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
-                )
         if self.routed_experts.layer_load_balancer is not None:
             raise NotImplementedError(
                 "Kimi K3 packed-checkpoint streaming does not yet support "
@@ -1985,6 +1923,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     text backbone by the multimodal ``KimiK3ForConditionalGeneration`` wrapper
     (``modeling_kimi_k3_vl``). The composite ``KimiK3ForConditionalGeneration``
     architecture is registered by that wrapper, not here."""
+
+    mamba_metadata_cls = KimiK3MambaMetadata
 
     def __init__(self, model_config: ModelConfig):
         cfg = _get_text_config(model_config.pretrained_config)

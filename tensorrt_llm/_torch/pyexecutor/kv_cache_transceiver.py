@@ -13,6 +13,7 @@ from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
                                           CacheTransceiverConfig)
 from tensorrt_llm.mapping import Mapping
 
+from .config_utils import resolve_cache_transceiver_config
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
@@ -149,18 +150,10 @@ def create_kv_cache_transceiver(
     cache_transceiver_config: CacheTransceiverConfig,
     mamba_cache_manager: Optional[BaseMambaCacheManager] = None
 ) -> Optional["KvCacheTransceiver"]:
+    resolve_cache_transceiver_config(cache_transceiver_config)
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
-
-    # "auto" is normally resolved against the model's preference at config
-    # load time (ModelLoader.load_config_and_apply_defaults); paths that skip
-    # that step (e.g. AutoDeploy) fall back to the C++ transceiver here. This
-    # must run before any consumer of transceiver_runtime below (e.g. the
-    # inflight-cancel validation, which treats non-CPP runtimes as
-    # unsupported).
-    if cache_transceiver_config.transceiver_runtime == "auto":
-        cache_transceiver_config.transceiver_runtime = None
 
     if (cache_transceiver_config.transceiver_runtime != "PYTHON"
             and isinstance(mamba_cache_manager, MixedMambaHybridCacheManager)):
@@ -168,6 +161,7 @@ def create_kv_cache_transceiver(
             "MixedMambaHybridCacheManager requires the Python transceiver "
             "runtime in disaggregated serving.")
 
+    # Runs while backend may still be "DEFAULT", which it rejects as ambiguous.
     _validate_disagg_inflight_cancel_config(cache_transceiver_config)
 
     if cache_transceiver_config.backend == "DEFAULT":
@@ -222,6 +216,7 @@ def create_kv_cache_transceiver(
         from tensorrt_llm._torch.disaggregation.transceiver import \
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
+        # MixedMambaHybridCacheManager contains both the KV and Mamba pools.
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
                                     cache_transceiver_config)
 
@@ -288,6 +283,25 @@ class KvCacheTransceiver(ABC):
     # may remain in flight indefinitely and the executor skips its
     # timeout/cancellation sweeps. Implementations must set this attribute.
     kv_transfer_timeout_ms: Optional[int]
+
+    @property
+    def pipeline_transfer_enabled(self) -> bool:
+        """Whether pipelined prefill-transfer is enabled."""
+        return False
+
+    def has_inflight_transfer(self, req: LlmRequest) -> bool:
+        """Whether this transceiver still owns transfer resources for req.
+
+        Independent of ``LlmRequestState``: with pipelined transfer a chunk can
+        be in flight while the request is still in its context-compute phase.
+        True means the request's KV pages may be read by the fabric and must
+        not be released.
+        """
+        return False
+
+    def has_retired_send_session(self, req: LlmRequest) -> bool:
+        """Whether the send session closed before its final slice."""
+        return False
 
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest) -> None:

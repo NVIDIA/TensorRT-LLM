@@ -169,6 +169,13 @@ def CBTS_COVERAGE_PILOT_USERS = [
     "leslie-fang25",
     "rosong11",
     "tongyuantongyu",
+    "jieli-matrix",
+    "StanleySun639",
+    "xinhe-nv",
+    "ruodil",
+    "fredricz-20070104",
+    "yufeiwu-nv",
+    "yingguo-trt",
 ] as Set
 @Field
 def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
@@ -2029,17 +2036,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 // Single-GPU was infra-incomplete (UNSTABLE): its coverage is a
-                // prerequisite for multi-GPU. In pre-merge, skip multi-GPU rather than
-                // spend scarce multi-GPU resource on a partially-unverified premise --
-                // the single-GPU sub-job should be re-run first. Keep the build UNSTABLE
-                // (already set by launchJob); do NOT escalate to FAILURE. Post-merge keeps
-                // running multi-GPU for max signal, mirroring the single-GPU-failed policy.
+                // prerequisite for multi-GPU. In pre-merge, explicitly block multi-GPU
+                // rather than mark it skipped: it is required but cannot run until the
+                // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
+                // maximum signal, mirroring the single-GPU-failed policy.
                 if (singleGpuInfraIncomplete) {
                     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
                         echo "In the official post-merge pipeline, x86_64 single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
                     } else {
-                        stage("[Test-x86_64-Multi-GPU] Skipped - single-GPU infra-incomplete") {
-                            echo "x86_64 single-GPU was infra-incomplete (UNSTABLE); skipping multi-GPU (premise not fully validated). Build stays UNSTABLE."
+                        stage("[Test-x86_64-Multi-GPU] Blocked") {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                error "This pipeline requires running x86_64 multi-GPU test, but x86_64 single-GPU test is infra-incomplete (UNSTABLE)."
+                            }
                         }
                         return
                     }
@@ -2231,17 +2239,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 // Single-GPU was infra-incomplete (UNSTABLE): its coverage is a
-                // prerequisite for multi-GPU. In pre-merge, skip multi-GPU rather than
-                // spend scarce multi-GPU resource on a partially-unverified premise --
-                // the single-GPU sub-job should be re-run first. Keep the build UNSTABLE
-                // (already set by launchJob); do NOT escalate to FAILURE. Post-merge keeps
-                // running multi-GPU for max signal, mirroring the single-GPU-failed policy.
+                // prerequisite for multi-GPU. In pre-merge, explicitly block multi-GPU
+                // rather than mark it skipped: it is required but cannot run until the
+                // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
+                // maximum signal, mirroring the single-GPU-failed policy.
                 if (singleGpuInfraIncomplete) {
                     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
                         echo "In the official post-merge pipeline, SBSA single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
                     } else {
-                        stage("[Test-SBSA-Multi-GPU] Skipped - single-GPU infra-incomplete") {
-                            echo "SBSA single-GPU was infra-incomplete (UNSTABLE); skipping multi-GPU (premise not fully validated). Build stays UNSTABLE."
+                        stage("[Test-SBSA-Multi-GPU] Blocked") {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test is infra-incomplete (UNSTABLE)."
+                            }
                         }
                         return
                     }
