@@ -390,6 +390,8 @@ class PendingEncoderStep:
 
 
 class PyExecutor:
+    _mm_encoder_item_scheduling_enabled: bool = False
+
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
     # If the number of micro batches is too small, the executor will spend too much time in synchronization.
