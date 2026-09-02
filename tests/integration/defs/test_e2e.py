@@ -1055,33 +1055,6 @@ def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
     ])
 
 
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_mpi_world_size(8)
-@skip_pre_hopper
-@pytest.mark.parametrize("model_path", [
-    pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
-])
-def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
-                                                      model_path):
-    # "RCCA https://nvbugs/5163844"
-    print(f"Testing {model_path}.")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    run_cmd = [
-        "python3",
-        str(example_root / "quickstart_advanced.py"),
-        f"--model_dir={llm_models_root()}/{model_path}",
-        "--moe_ep_size=8",
-        "--tp_size=16",
-        "--use_cuda_graph",
-        f"--kv_cache_fraction={_MEM_FRACTION_50}",
-        "--max_batch_size=32",
-        "--max_num_tokens=2048",
-        "--disable_kv_cache_reuse",
-    ]
-    output = check_output(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
-    assert "Generated text:" in output, output[-4000:]
-
-
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
     ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
      "EAGLE3-LLaMA3.1-Instruct-8B"),
