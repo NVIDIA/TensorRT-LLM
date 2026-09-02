@@ -815,33 +815,62 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
         raise ValueError(
             f"Unsupported TRTLLM-Gen BF16 weight_layout={self.weight_layout}")
 
-    def process_weights_after_loading(self, module: torch.nn.Module):
-        if module.w3_w1_weight.numel() == 0 or module.w2_weight.numel() == 0:
-            module._trtllm_gen_layout_transform_pending = False
-            return
+    def _transform_expert_stacks_for_trtllm_gen(
+            self, module: torch.nn.Module, w3_w1: torch.Tensor,
+            w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rewrite stacked expert weights into shuffled BlockMajorK.
+
+        The permute indices depend only on the per-expert shape, so they are
+        derived once from expert 0 and reused for the whole stack.
+        """
+
+        def transform(weights: torch.Tensor,
+                      permute_indices: torch.Tensor) -> torch.Tensor:
+            # One expert at a time on the GPU: the gather is far cheaper there,
+            # while a host-resident stack never needs a device-sized allocation
+            # of its own. Each expert returns to the stack's original device.
+            return torch.stack([
+                self._prepare_bf16_weight_for_trtllm_gen(
+                    expert.cuda(), permute_indices).to(weights.device)
+                for expert in weights
+            ])
 
         w3_w1_permute_indices = self._get_w3_w1_permute_indices(
-            module.w3_w1_weight.data[0],
+            w3_w1[0],
             is_gated_act_gemm=getattr(module, "is_gated_activation", True))
-        w2_permute_indices = self._get_w2_permute_indices(
-            module.w2_weight.data[0])
+        w2_permute_indices = self._get_w2_permute_indices(w2[0])
+        return (transform(w3_w1, w3_w1_permute_indices),
+                transform(w2, w2_permute_indices))
 
-        processed_w3_w1 = torch.stack([
-            self._prepare_bf16_weight_for_trtllm_gen(expert,
-                                                     w3_w1_permute_indices)
-            for expert in module.w3_w1_weight.data
-        ])
-        processed_w2 = torch.stack([
-            self._prepare_bf16_weight_for_trtllm_gen(expert, w2_permute_indices)
-            for expert in module.w2_weight.data
-        ])
-
-        replace_parameter_and_save_metadata(module, "w3_w1_weight",
-                                            processed_w3_w1,
-                                            module.rebuild_tensor_metadata)
-        replace_parameter_and_save_metadata(module, "w2_weight", processed_w2,
-                                            module.rebuild_tensor_metadata)
+    def process_weights_after_loading(self, module: torch.nn.Module):
+        if module.w3_w1_weight.numel() != 0 and module.w2_weight.numel() != 0:
+            processed_w3_w1, processed_w2 = self._transform_expert_stacks_for_trtllm_gen(
+                module, module.w3_w1_weight.data, module.w2_weight.data)
+            replace_parameter_and_save_metadata(module, "w3_w1_weight",
+                                                processed_w3_w1,
+                                                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(module, "w2_weight",
+                                                processed_w2,
+                                                module.rebuild_tensor_metadata)
         module._trtllm_gen_layout_transform_pending = False
+
+    def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
+        """Put the online-EPLB host copies in the same layout as the slots.
+
+        ``process_weights_after_loading`` rewrites the device weights into
+        shuffled BlockMajorK, but the shared CPU tensors were staged from the
+        checkpoint's MajorK layout. Registering them unchanged would migrate
+        MajorK bytes into a slot the kernel reads as BlockMajorK, so the layer
+        would silently produce garbage after the first expert move.
+        """
+        if module.w3_w1_weight.numel() == 0 or module.w2_weight.numel() == 0:
+            # The device transform bailed out on empty weights, so the slots are
+            # still MajorK and the host copies must match them.
+            return
+        (module.local_shared_w3_w1_tensors, module.local_shared_w2_tensors) = (
+            self._transform_expert_stacks_for_trtllm_gen(
+                module, module.local_shared_w3_w1_tensors,
+                module.local_shared_w2_tensors))
 
     def transform_weights(self, module: torch.nn.Module) -> None:
         if getattr(module, "_trtllm_gen_layout_transform_pending", False):
