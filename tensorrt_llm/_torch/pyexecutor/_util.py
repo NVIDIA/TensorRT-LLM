@@ -83,10 +83,20 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
+_DEFAULT_INDEX_MAPPER_RESERVED_SLOTS = 1
+_CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS = 2
 
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def _get_num_reserved_index_slots(
+        spec_config: Optional[SpeculativeConfig]) -> int:
+    """Return IndexMapper headroom required by the execution policy."""
+    if getattr(spec_config, "enable_confidence_scheduling", False):
+        return _CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS
+    return _DEFAULT_INDEX_MAPPER_RESERVED_SLOTS
 
 
 def _get_initial_lora_data_type(
@@ -2980,6 +2990,8 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
+        manager_extra_kwargs["num_reserved_index_slots"] = (
+            _get_num_reserved_index_slots(spec_config))
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs[
