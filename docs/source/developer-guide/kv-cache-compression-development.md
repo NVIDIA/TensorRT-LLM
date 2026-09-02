@@ -178,7 +178,7 @@ every scheduled iteration, before forward
   prepare_resources()
     -> on_generation_step_begin(scheduled_batch)
 
-after forward and native KVCM update
+every scheduled iteration, after forward and native KVCM update
   update_resources()
     -> on_context_step_end(final-prefill requests), when present
     -> on_generation_step_end(scheduled_batch)
@@ -194,8 +194,8 @@ request completes or aborts
 |---|---|---|
 | `on_request_init(request)` | The request's first context chunk reaches `prepare_resources()` | Allocate request-local algorithm state or raise a capacity high-water mark |
 | `on_context_step_end(requests)` | The iteration containing each request's final context chunk has completed | Perform one batched context-final action for that cohort |
-| `on_generation_step_begin(scheduled_batch)` | Before the current iteration's forward | Snapshot scheduler-owned information that cannot be reconstructed after overlap |
-| `on_generation_step_end(scheduled_batch)` | After forward and after the native KVCM update | Apply periodic or budget-triggered compression against authoritative KV state |
+| `on_generation_step_begin(scheduled_batch)` | Every scheduled iteration, before forward | Inspect the generation cohort or snapshot scheduler-owned information that cannot be reconstructed after overlap |
+| `on_generation_step_end(scheduled_batch)` | Every scheduled iteration, after forward and the native KVCM update | Process the generation cohort against authoritative KV state |
 | `on_request_finish(request)` | Request completion or abort | Release request-local algorithm state; do not release KVCM Pages |
 
 All five hooks default to no-op. Override only hooks required by the algorithm.
@@ -207,10 +207,13 @@ does not need a generation-begin snapshot.
 watching request-state transitions. This matters for short-output requests and
 the overlap scheduler, where a request may move directly toward completion.
 
-`on_generation_step_end()` is the normal final-reconciliation point for
-physical eviction. Because the compression manager is ordered after KVCM, the
-hook sees accepted writes, rewinds, and current mappings before it compacts,
-publishes the new visible length, and asks KVCM to resize or reclaim.
+The generation begin and end hooks run for every scheduled batch, including a
+context-only or mixed batch. An algorithm must select the generation requests
+it handles from `scheduled_batch`. `on_generation_step_end()` is the normal
+final-reconciliation point for physical eviction. Because the compression
+manager is ordered after KVCM, the hook sees accepted writes, rewinds, and
+current mappings before it compacts, publishes the new visible length, and asks
+KVCM to resize or reclaim.
 
 ### Resource-manager adapter methods
 
@@ -354,10 +357,10 @@ layout from its name.
 Provider-unowned lifecycles, such as recurrent state in a hybrid model, use the
 embedded lossless codec. The native adapter verifies that every declared
 provider layer appears exactly once and rejects ambiguous lifecycle ownership.
-On host kernels where KVCM requires chunked pinned-memory registration, the
-current adapter rejects a configuration that combines provider-owned and
-fallback lifecycles because the embedded lossless codec cannot split its
-batched copies at those registration boundaries.
+On systems running Linux kernels where KVCM requires chunked pinned-memory
+registration, the current adapter rejects a configuration that combines
+provider-owned and fallback lifecycles because the embedded lossless codec
+cannot split its batched copies at those registration boundaries.
 
 ### `encode_cold_pages()` and `decode_cold_pages()`
 
@@ -366,13 +369,14 @@ These methods receive:
 - the codec state and provider-lifecycle index;
 - the cold allocation base address;
 - a `PageIndexPair` array address;
-- the number of complete Pages; and
+- the number of Pages in this codec call; and
 - the KVCM-owned CUDA stream.
 
-They must submit the complete batch to the format-specific native launcher.
+They must submit every Page in the call to the format-specific native launcher.
 Avoid a Python loop over Pages or layers; launcher-internal tiling or chunking
-belongs below this interface. The current adapter forwards one complete KVCM
-batch in one provider call.
+belongs below this interface. A call may represent the full migration batch or
+a chunk created by Page-index or Disk staging, so a provider must not assume it
+sees the original batch or every lifecycle in a batching-equivalence class.
 
 The provider may enqueue work only on the supplied stream and must not retain
 the cold pointer, Page-index pointer, or stream past the documented lifetime.
@@ -390,7 +394,7 @@ representatives, staging rules, and failure transaction are documented in the
 | Component | Owns | Does not own |
 |---|---|---|
 | Compression configuration and factory | Method selection and supported-combination admission | Pages, kernels, or request mappings |
-| Compression manager | Algorithm cadence, request state, decisions, format metadata, and algorithm launches | KVCM allocation policy or Attention-private state |
+| Compression manager | Algorithm cadence, request state, decisions, format metadata, and algorithm launches | KVCM allocation policy or Attention runtime state |
 | Native cold-page adapter | KVCM-layout resolution, provider routing, fallback routing, and Python/native lifetime bridge | Format-specific quantization policy |
 | KVCM V2 | Pages, Slots, pools, mappings, migration streams, events, publication, release, rollback, and cold storage | Algorithm scores or quantization decisions |
 | Attention backend | Consumption of the published active GPU representation | Cold storage and migration |
