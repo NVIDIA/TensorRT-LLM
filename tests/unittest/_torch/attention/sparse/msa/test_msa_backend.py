@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Structural tests for the MiniMax-M3 MSA sparse attention backend.
+"""MiniMax-M3 integration tests for its MSA sparse attention backend.
 
-These validate backend selection, decode scratch-buffer sizing, and the paged
-HND view contract passed to the packaged MSA kernel. Numerical parity against
-the Triton reference is covered by the SM100 integration accuracy test.
+These validate MiniMax-M3 backend selection, indexer/cache integration, decode
+scratch-buffer sizing, and the paged HND contract passed to the packaged MSA
+kernel. Generic block-sparse MQA/GQA numerical coverage lives in the parent
+``test_sparse_mqa_gqa.py`` module.
 """
 
 import sys

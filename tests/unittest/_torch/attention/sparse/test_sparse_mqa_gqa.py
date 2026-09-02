@@ -13,19 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression tests for the internal token-sparse MQA/GQA kernel.
+"""Executable examples and regression tests for sparse MQA/GQA compute.
 
-These tests replace the model-specific sparse selector with static token-index
-lists, then exercise the same backend path used by ``TrtllmAttention``:
+The token-sparse tests replace the model-specific sparse selector with static
+token-index lists, then exercise the same backend path used by
+``TrtllmAttention``:
 
 1. Build request-local ``int32`` token indices.
 2. Translate them to paged KV-cache pool indices.
 3. Return them from the sparse prediction hooks.
 4. Call ``TrtllmAttention.forward`` and compare with a PyTorch reference.
 
-This is an executable backend-integration example, not a public
-``SparseAttentionConfig`` algorithm. Algorithm-independent sparse framework
-tests remain in ``test_sparse_attention.py``.
+The block-sparse tests pass static block-index lists to the MSA FMHA wrapper
+and compare its paged MQA/GQA output with an independent PyTorch reference.
+Algorithm-independent sparse framework tests remain in
+``test_sparse_attention.py``.
 """
 
 import math
@@ -37,6 +39,7 @@ import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_sparse_gqa
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
     AttentionRuntimeFeatures,
@@ -44,6 +47,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.sparse.dsa.kernels import (
     triton_convert_req_index_to_global_index,
 )
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_package_available
 from tensorrt_llm._torch.attention_backend.sparse.params import SparseParams
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention,
@@ -53,7 +57,7 @@ from tensorrt_llm._torch.attention_backend.trtllm import (
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import is_sm_100f, str_dtype_to_binding, torch_dtype_to_str
+from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -66,17 +70,21 @@ FP8_RTOL = 4e-2
 SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 SUPPORTED_KV_CACHE_DTYPES = (*SUPPORTED_DTYPES, torch.float8_e4m3fn)
 SUPPORTED_HEAD_DIMS = (64, 80, 128, 256)
+SUPPORTED_FP8_HEAD_DIMS = (64, 128, 256)
+SUPPORTED_TEST_PAGE_SIZES = (8, 16, 32, 64, 128, 256, 512)
+TOKEN_SPARSE_PAGE_TEST_KV_LEN = 64
 MAX_Q_HEADS_PER_KV_HEAD = 32
+SUPPORTED_SPARSE_MQA_GQA_SMS = (100, 103)
 
 pytestmark = pytest.mark.skipif(
-    not is_sm_100f(getSMVersion()),
-    reason="Sparse MQA/GQA requires an SM100-family GPU (SM100 or SM103)",
+    getSMVersion() not in SUPPORTED_SPARSE_MQA_GQA_SMS,
+    reason="Sparse MQA/GQA requires an SM100 or SM103 GPU",
 )
 
 
 @pytest.fixture(autouse=True)
 def _force_trtllm_gen_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep every test on the internal TRTLLM-Gen fallback path."""
+    """Keep token-sparse tests on the internal TRTLLM-Gen fallback path."""
     monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
 
 
@@ -185,6 +193,77 @@ class GenerationScenario(SparseMqaGqaScenario):
     @property
     def has_draft_tokens(self) -> bool:
         return self.max_query_len > 1
+
+
+@dataclass(kw_only=True, frozen=True)
+class BlockSparseGqaScenario:
+    """Packed block-sparse MQA/GQA inputs for the MSA FMHA backend."""
+
+    q_lens: Tuple[int, ...] = (1,)
+    kv_lens: Tuple[int, ...] = (2176,)
+    num_q_heads: int = 16
+    num_kv_heads: int = 1
+    head_dim: int = 128
+    page_size: int = 128
+    topk: int = 16
+    dtype: torch.dtype = torch.bfloat16
+    qo_offsets: Optional[Tuple[int, ...]] = None
+    active_blocks: Optional[int] = None
+    shuffle_pages: bool = False
+    per_token_blocks: bool = False
+
+    def __post_init__(self) -> None:
+        if len(self.q_lens) != len(self.kv_lens):
+            raise ValueError("q_lens and kv_lens must describe the same batch")
+        if self.qo_offsets is not None and len(self.qo_offsets) != len(self.q_lens):
+            raise ValueError("qo_offsets must describe the same batch as q_lens")
+        if self.num_q_heads % self.num_kv_heads != 0:
+            raise ValueError("num_q_heads must be divisible by num_kv_heads")
+        if self.q_heads_per_kv_head not in (2, 4, 8, 16):
+            raise ValueError("block-sparse MQA/GQA supports 2, 4, 8, or 16 Q heads per KV head")
+        if self.head_dim != 128 or self.page_size != 128:
+            raise ValueError("MSA block-sparse MQA/GQA requires head_dim=page_size=128")
+        if self.topk not in (4, 8, 16, 32):
+            raise ValueError("MSA block-sparse MQA/GQA supports Top-K 4, 8, 16, or 32")
+        if self.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError("MSA block-sparse MQA/GQA supports BF16 or E4M3 FP8 Q/K/V")
+        active_blocks = self.topk if self.active_blocks is None else self.active_blocks
+        if not 0 < active_blocks <= self.topk:
+            raise ValueError("active_blocks must be in [1, topk]")
+        for q_len, kv_len, qo_offset in zip(
+            self.q_lens,
+            self.kv_lens,
+            self.causal_offsets,
+            strict=True,
+        ):
+            if q_len <= 0 or q_len > kv_len:
+                raise ValueError("each q_len must be positive and no larger than kv_len")
+            if qo_offset < 0 or qo_offset + q_len > kv_len:
+                raise ValueError("each qo_offset must place every query inside its KV sequence")
+            if kv_len % self.page_size:
+                raise ValueError("each kv_len must be a multiple of page_size")
+            if kv_len // self.page_size <= active_blocks:
+                raise ValueError("each request needs more KV pages than selected active blocks")
+
+    @property
+    def q_heads_per_kv_head(self) -> int:
+        return self.num_q_heads // self.num_kv_heads
+
+    @property
+    def total_q(self) -> int:
+        return sum(self.q_lens)
+
+    @property
+    def selected_blocks(self) -> int:
+        return self.topk if self.active_blocks is None else self.active_blocks
+
+    @property
+    def causal_offsets(self) -> Tuple[int, ...]:
+        if self.qo_offsets is not None:
+            return self.qo_offsets
+        return tuple(
+            kv_len - q_len for q_len, kv_len in zip(self.q_lens, self.kv_lens, strict=True)
+        )
 
 
 class _SparseMqaGqaParams(SparseParams):
@@ -366,17 +445,48 @@ def test_prefill_sparse_kv_compaction(scenario: ContextScenario) -> None:
 #
 # Sparse MQA/GQA support matrix:
 #
-#   GPU architecture       SM100 and SM103
-#   Inference phase        Packed prefill; single-token and linear draft decode
-#   Attention type         MQA and GQA; num_heads % num_kv_heads == 0
-#   Q heads per KV head    <= 32; tests cover 2, 3, 4, 8, 16, 24, 31, and 32
-#   Model QKV input        BF16 or FP16
-#   Kernel output          BF16, FP16, or E4M3 FP8
-#   KV-cache dtype         BF16, FP16, or E4M3 FP8
-#   Q/K/V head dimension  Equal dimensions: 64, 80, 128, or 256
-#   KV-cache layout        Paged; page size is a power of two and at least 8
-#   Sparse indices         int32, token-granular, one list per KV head/query
-#   Sparse Top-K           Positive multiple of 4; unused entries are -1
+# Values after "tested" are regression coverage, not narrower support constraints.
+#
+#   Parameter               Token-sparse                   Block-sparse
+#   Sparse block size       1 token; tested                128 tokens; tested
+#   GPU architecture        SM100 and SM103;               SM100 and SM103;
+#                           tested on SM100                 tested on SM100
+#   Compute phase           Packed prefill, single-token,  Packed prefill, single-token,
+#                           and linear draft decode;        linear multi-query compute,
+#                           tested q_len 1 and 4            and mixed batches; tested; the
+#                                                          integrated MiniMax-M3 decode uses 1
+#   Attention type          MQA/GQA; Q heads divisible    MQA/GQA; Q heads divisible
+#                           by KV heads                    by KV heads
+#   Q heads per KV head     <= 32; tested 2, 3, 4, 8,      2, 4, 8, or 16; tested all
+#                           16, 24, 31, and 32              integrated MiniMax-M3 uses 16
+#   Q/KV head counts        No additional discrete limit;  No additional discrete kernel limit;
+#                           tested Q={6,8,16,32,48,62,64},  tested Q={4,8,16,32}, KV={1,2}
+#                           KV={1,2,4,8}
+#   Attention input dtype   BF16 or FP16; tested both      BF16 or E4M3 FP8; tested both
+#   Q/K/V input layout      Fused QKV; tested              Q [T,Hq,D], paged K/V
+#                                                          [P,Hkv,128,D]; tested
+#   Kernel output           BF16/FP16 for all head dims;   BF16; tested
+#                           E4M3 FP8 for 64/128/256;
+#                           tested all dtype/dim pairs
+#   KV-cache dtype          BF16/FP16 for all head dims;   BF16 or E4M3 FP8; tested both
+#                           E4M3 FP8 for 64/128/256;
+#                           tested all dtype/dim pairs
+#   Q/K/V head dimension   64, 80, 128, or 256;           128; tested
+#                           tested all
+#   KV-cache layout         Paged; power-of-two page size  Paged HND; page size 128;
+#                           >= 8; tested 8 through 512      shuffled physical pages and
+#                                                          strided outer page storage tested
+#   Sparse indices          int32 physical token indices   int32 request-local block indices
+#                           per KV head/query; tested       per KV head/query; per-token lists,
+#                                                          -1 padding, and physical remap tested
+#   Sparse Top-K            Positive multiple of 4;        Prefill kernel accepts 4, 8, 16,
+#                           tested 4, 32, 64, and 128       or 32 and tests cover all; the
+#                                                          integrated MiniMax-M3 path uses 16
+#   Attention semantics     Causal; tested                 Causal with per-request Q offsets;
+#                                                          bottom-right and custom offsets tested
+
+
+# Token-granular sparse computation (block_size=1).
 
 
 _PREFILL_COMPUTE_CASES = [
@@ -610,60 +720,73 @@ _GENERATION_CORRECTNESS_CASES = [
 ]
 
 
-_GENERATION_SUPPORT_CASES = [
-    pytest.param(
-        GenerationScenario(
-            dtype=dtype,
-            kvcache_dtype=dtype,
-            num_heads=8,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            batch_size=1,
-            past_kv_lens=(64,),
-            num_pages=4,
-            num_sparse_topk=32,
-        ),
-        id=(
-            f"support_{str(dtype).removeprefix('torch.')}_h{head_dim}_"
-            f"{'mqa' if num_kv_heads == 1 else 'gqa_2to1'}"
-        ),
-    )
-    for dtype in SUPPORTED_DTYPES
-    for head_dim in SUPPORTED_HEAD_DIMS
-    for num_kv_heads in (1, 4)
-    # These two option combinations are already covered by correctness cases.
-    if not (dtype == torch.bfloat16 and head_dim == 128)
-] + [
-    pytest.param(
-        GenerationScenario(
-            dtype=torch.bfloat16,
-            kvcache_dtype=torch.float8_e4m3fn,
-            num_heads=8,
-            num_kv_heads=4,
-            head_dim=128,
-            batch_size=1,
-            past_kv_lens=(64,),
-            num_pages=8,
-            num_sparse_topk=32,
-        ),
-        id="support_bf16_io_fp8_kv_cache",
-    ),
-    pytest.param(
-        GenerationScenario(
-            dtype=torch.bfloat16,
-            kvcache_dtype=torch.float8_e4m3fn,
-            num_heads=8,
-            num_kv_heads=4,
-            head_dim=128,
-            batch_size=1,
-            past_kv_lens=(64,),
-            num_pages=8,
-            num_sparse_topk=32,
-            fp8_output=True,
-        ),
-        id="support_fp8_qkv_math_and_output",
-    ),
-]
+_GENERATION_SUPPORT_CASES = (
+    [
+        pytest.param(
+            GenerationScenario(
+                dtype=dtype,
+                kvcache_dtype=dtype,
+                num_heads=8,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                batch_size=1,
+                past_kv_lens=(64,),
+                num_pages=4,
+                num_sparse_topk=32,
+            ),
+            id=(
+                f"support_{str(dtype).removeprefix('torch.')}_h{head_dim}_"
+                f"{'mqa' if num_kv_heads == 1 else 'gqa_2to1'}"
+            ),
+        )
+        for dtype in SUPPORTED_DTYPES
+        for head_dim in SUPPORTED_HEAD_DIMS
+        for num_kv_heads in (1, 4)
+        # These two option combinations are already covered by correctness cases.
+        if not (dtype == torch.bfloat16 and head_dim == 128)
+    ]
+    + [
+        pytest.param(
+            GenerationScenario(
+                dtype=torch.bfloat16,
+                kvcache_dtype=torch.float8_e4m3fn,
+                num_heads=8,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                batch_size=1,
+                past_kv_lens=(64,),
+                num_pages=8,
+                num_sparse_topk=32,
+                fp8_output=fp8_output,
+            ),
+            id=(
+                f"support_fp8_kv_h{head_dim}_"
+                f"{'mqa' if num_kv_heads == 1 else 'gqa_2to1'}_"
+                f"{'fp8' if fp8_output else 'bf16'}_output"
+            ),
+        )
+        for head_dim in SUPPORTED_FP8_HEAD_DIMS
+        for num_kv_heads in (1, 4)
+        for fp8_output in (False, True)
+    ]
+    + [
+        pytest.param(
+            GenerationScenario(
+                page_size=page_size,
+                batch_size=1,
+                past_kv_lens=(TOKEN_SPARSE_PAGE_TEST_KV_LEN,),
+                num_pages=max(
+                    4,
+                    (TOKEN_SPARSE_PAGE_TEST_KV_LEN + page_size) // page_size,
+                ),
+                num_sparse_topk=32,
+            ),
+            id=f"support_page_size_{page_size}",
+        )
+        for page_size in SUPPORTED_TEST_PAGE_SIZES
+        if page_size not in (32, 64)
+    ]
+)
 
 
 @pytest.mark.parametrize("scenario", _PREFILL_COMPUTE_CASES)
@@ -777,6 +900,168 @@ def test_generation_sparse_mqa_gqa(scenario: GenerationScenario) -> None:
         )
     finally:
         inputs.kv_cache_manager.shutdown()
+
+
+# Block-granular sparse computation (block_size=128).
+
+
+_BLOCK_SPARSE_GQA_CASES = [
+    pytest.param(
+        BlockSparseGqaScenario(
+            q_lens=(1, 1, 1, 1),
+            kv_lens=(2176, 2304, 2432, 2560),
+        ),
+        id="msa_mqa_single_token_varlen_batch4",
+    ),
+    pytest.param(
+        BlockSparseGqaScenario(
+            q_lens=(4, 4),
+            kv_lens=(2176, 2304),
+            num_q_heads=32,
+            num_kv_heads=2,
+            per_token_blocks=True,
+        ),
+        id="msa_gqa_linear_draft_tokens",
+    ),
+    *[
+        pytest.param(
+            BlockSparseGqaScenario(
+                q_lens=(1,),
+                kv_lens=(2176,),
+                num_q_heads=2 * q_heads_per_kv_head,
+                num_kv_heads=2,
+            ),
+            id=f"msa_gqa_single_token_{q_heads_per_kv_head}q_per_kv",
+        )
+        for q_heads_per_kv_head in (2, 4, 8)
+    ],
+    pytest.param(
+        BlockSparseGqaScenario(
+            q_lens=(1, 4, 33),
+            kv_lens=(1152, 1280, 1408),
+            num_q_heads=8,
+            num_kv_heads=2,
+            active_blocks=3,
+            shuffle_pages=True,
+            per_token_blocks=True,
+        ),
+        id="msa_gqa_mixed_varlen_shuffled_pages_padded_indices",
+    ),
+    pytest.param(
+        BlockSparseGqaScenario(
+            q_lens=(33,),
+            kv_lens=(640,),
+            num_q_heads=4,
+            num_kv_heads=2,
+            topk=4,
+        ),
+        id="msa_gqa_2q_per_kv_topk4",
+    ),
+    pytest.param(
+        BlockSparseGqaScenario(
+            q_lens=(33,),
+            kv_lens=(1152,),
+            num_q_heads=8,
+            num_kv_heads=2,
+            topk=8,
+        ),
+        id="msa_gqa_4q_per_kv_topk8",
+    ),
+    pytest.param(
+        BlockSparseGqaScenario(
+            q_lens=(33,),
+            kv_lens=(2176,),
+            num_q_heads=16,
+            num_kv_heads=2,
+            topk=16,
+        ),
+        id="msa_gqa_8q_per_kv_topk16",
+    ),
+    pytest.param(
+        BlockSparseGqaScenario(
+            q_lens=(33,),
+            kv_lens=(4224,),
+            num_q_heads=32,
+            num_kv_heads=2,
+            topk=32,
+        ),
+        id="msa_gqa_16q_per_kv_topk32",
+    ),
+    pytest.param(
+        BlockSparseGqaScenario(
+            q_lens=(33,),
+            kv_lens=(2176,),
+            num_q_heads=16,
+            num_kv_heads=1,
+            dtype=torch.float8_e4m3fn,
+            per_token_blocks=True,
+        ),
+        id="msa_mqa_fp8_qkv_bf16_output",
+    ),
+    pytest.param(
+        BlockSparseGqaScenario(
+            q_lens=(33, 40),
+            kv_lens=(2176, 2304),
+            qo_offsets=(512, 1024),
+            num_q_heads=16,
+            num_kv_heads=2,
+        ),
+        id="msa_gqa_custom_per_request_q_offsets",
+    ),
+    pytest.param(
+        BlockSparseGqaScenario(
+            q_lens=(1, 1),
+            kv_lens=(2176, 2304),
+            num_q_heads=32,
+            num_kv_heads=2,
+            dtype=torch.float8_e4m3fn,
+        ),
+        id="msa_gqa_fp8_single_token",
+    ),
+]
+
+
+@pytest.mark.parametrize("scenario", _BLOCK_SPARSE_GQA_CASES)
+def test_block_sparse_mqa_gqa(scenario: BlockSparseGqaScenario) -> None:
+    """MSA-selected KV blocks match a direct PyTorch block-sparse reference."""
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA) is not importable")
+
+    inputs = _create_block_sparse_gqa_inputs(scenario)
+    output = torch.empty(
+        scenario.total_q,
+        scenario.num_q_heads,
+        scenario.head_dim,
+        dtype=torch.bfloat16,
+        device=inputs["q"].device,
+    )
+    run_msa_sparse_gqa(
+        inputs["q"],
+        inputs["k_paged"],
+        inputs["v_paged"],
+        inputs["kv_block_indexes"],
+        kv_indices=inputs["kv_indices"],
+        sm_scale=scenario.head_dim**-0.5,
+        qo_lens_cpu=torch.tensor(scenario.q_lens, dtype=torch.int32),
+        kv_lens_cpu=torch.tensor(scenario.kv_lens, dtype=torch.int32),
+        qo_offset_cpu=torch.tensor(scenario.causal_offsets, dtype=torch.int32),
+        causal=True,
+        head_dim=scenario.head_dim,
+        out=output,
+        use_fp8=scenario.dtype == torch.float8_e4m3fn,
+    )
+    torch.cuda.synchronize()
+
+    reference = _reference_block_sparse_gqa(inputs, scenario)
+    output_float = output.float()
+    reference_float = reference.float()
+    assert output.dtype == torch.bfloat16
+    assert torch.isfinite(output_float).all()
+    cosine_similarity = torch.nn.functional.cosine_similarity(
+        output_float.flatten(), reference_float.flatten(), dim=0
+    )
+    threshold = 0.999 if scenario.dtype == torch.float8_e4m3fn else 0.9999
+    assert cosine_similarity > threshold
 
 
 # Sparse index and paged KV-cache helpers.
@@ -1195,7 +1480,7 @@ def _reference_sparse_generation_attention(
     return torch.stack(outputs, dim=0)
 
 
-# Test input builders. Kernel selection remains explicit in each test below.
+# Test input builders. Kernel selection remains explicit in each test above.
 
 
 def _create_context_inputs(s: ContextScenario) -> _ContextInputs:
@@ -1328,3 +1613,134 @@ def _create_generation_inputs(s: GenerationScenario) -> _GenerationInputs:
         request_ids=request_ids,
         metadata=metadata,
     )
+
+
+def _create_block_sparse_gqa_inputs(s: BlockSparseGqaScenario) -> dict[str, torch.Tensor]:
+    """Build packed Q, paged KV, page tables, and request-local block indices."""
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(42)
+    total_pages = sum(kv_len // s.page_size for kv_len in s.kv_lens)
+
+    def random_qkv(shape: Tuple[int, ...]) -> torch.Tensor:
+        tensor = torch.randn(
+            shape,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        return tensor.to(s.dtype)
+
+    q = random_qkv((s.total_q, s.num_q_heads, s.head_dim))
+    logical_k = random_qkv((total_pages, s.num_kv_heads, s.page_size, s.head_dim))
+    logical_v = random_qkv((total_pages, s.num_kv_heads, s.page_size, s.head_dim))
+
+    if s.shuffle_pages:
+        kv_indices = torch.randperm(total_pages, device=device, generator=generator)
+        k_paged = torch.empty_like(logical_k)
+        v_paged = torch.empty_like(logical_v)
+        k_paged[kv_indices] = logical_k
+        v_paged[kv_indices] = logical_v
+    else:
+        kv_indices = torch.arange(total_pages, device=device)
+        k_paged = logical_k
+        v_paged = logical_v
+    kv_indices = kv_indices.to(torch.int32)
+
+    kv_block_indexes = torch.full(
+        (s.total_q, s.num_kv_heads, s.topk),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    q_offset = 0
+    for q_len, kv_len in zip(s.q_lens, s.kv_lens, strict=True):
+        num_pages = kv_len // s.page_size
+        for query_idx in range(q_len):
+            for kv_head_idx in range(s.num_kv_heads):
+                start = (query_idx + kv_head_idx) % num_pages if s.per_token_blocks else 0
+                blocks = sorted(
+                    (start + block_idx) % num_pages for block_idx in range(s.selected_blocks)
+                )
+                kv_block_indexes[
+                    q_offset + query_idx,
+                    kv_head_idx,
+                    : s.selected_blocks,
+                ] = torch.tensor(blocks, dtype=torch.int32, device=device)
+        q_offset += q_len
+
+    return {
+        "q": q,
+        "k_paged": k_paged,
+        "v_paged": v_paged,
+        "kv_indices": kv_indices,
+        "kv_block_indexes": kv_block_indexes,
+    }
+
+
+def _reference_block_sparse_gqa(
+    inputs: dict[str, torch.Tensor], s: BlockSparseGqaScenario
+) -> torch.Tensor:
+    """Evaluate request-local block selection and per-request causal offsets."""
+    output = torch.empty(
+        s.total_q,
+        s.num_q_heads,
+        s.head_dim,
+        dtype=torch.float32,
+        device=inputs["q"].device,
+    )
+    q_offset = 0
+    page_offset = 0
+    for q_len, kv_len, causal_offset in zip(
+        s.q_lens,
+        s.kv_lens,
+        s.causal_offsets,
+        strict=True,
+    ):
+        num_pages = kv_len // s.page_size
+        physical_pages = inputs["kv_indices"][page_offset : page_offset + num_pages].long()
+        k = (
+            inputs["k_paged"]
+            .index_select(0, physical_pages)
+            .permute(0, 2, 1, 3)
+            .reshape(kv_len, s.num_kv_heads, s.head_dim)
+            .float()
+        )
+        v = (
+            inputs["v_paged"]
+            .index_select(0, physical_pages)
+            .permute(0, 2, 1, 3)
+            .reshape(kv_len, s.num_kv_heads, s.head_dim)
+            .float()
+        )
+        q = inputs["q"][q_offset : q_offset + q_len].float()
+        request_blocks = inputs["kv_block_indexes"][q_offset : q_offset + q_len]
+        token_positions = torch.arange(kv_len, device=q.device)
+        block_ids = token_positions // s.page_size
+        causal_mask = token_positions.view(1, -1) <= (
+            torch.arange(q_len, device=q.device).view(-1, 1) + causal_offset
+        )
+
+        for kv_head_idx in range(s.num_kv_heads):
+            selected_blocks = request_blocks[:, kv_head_idx]
+            selected_mask = (
+                (selected_blocks.unsqueeze(-1) == block_ids.view(1, 1, -1))
+                & (selected_blocks.unsqueeze(-1) >= 0)
+            ).any(dim=1)
+            mask = selected_mask & causal_mask
+            q_head_begin = kv_head_idx * s.q_heads_per_kv_head
+            q_head_end = q_head_begin + s.q_heads_per_kv_head
+            scores = torch.einsum(
+                "qhd,kd->qhk",
+                q[:, q_head_begin:q_head_end] * (s.head_dim**-0.5),
+                k[:, kv_head_idx],
+            )
+            scores.masked_fill_(~mask.unsqueeze(1), float("-inf"))
+            probabilities = torch.softmax(scores, dim=-1)
+            output[q_offset : q_offset + q_len, q_head_begin:q_head_end] = torch.einsum(
+                "qhk,kd->qhd", probabilities, v[:, kv_head_idx]
+            )
+
+        q_offset += q_len
+        page_offset += num_pages
+
+    return output.to(torch.bfloat16)
