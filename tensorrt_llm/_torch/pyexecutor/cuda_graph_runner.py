@@ -752,7 +752,6 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
-            self.memory_pool = graph_pool
             with nccl_window_graph_capture(graph, graph_pool):
                 output = forward_fn(capture_inputs)
             if postprocess_fn is not None:
@@ -2115,7 +2114,6 @@ class EncoderCUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
-            self.memory_pool = graph_pool
             with nccl_window_graph_capture(graph,
                                            graph_pool,
                                            stream=self._get_capture_stream(),
