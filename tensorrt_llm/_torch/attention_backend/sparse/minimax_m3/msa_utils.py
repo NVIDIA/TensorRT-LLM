@@ -213,12 +213,17 @@ def write_msa_main_kv(
     out_cache_loc: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    num_live_tokens: int,
 ) -> None:
     """Write new-token K and V into the paged main cache at out_cache_loc.
 
     fmha_sm100 reads the paged cache directly, so the new-token K and V must be
     resident before the sparse GQA runs. The write uses the head-major HND view
     so `msa_paged_kv` can return a zero-copy view.
+
+    `num_live_tokens` is forwarded to `write_kv_slots`. The sub-paged branch
+    below takes no equivalent, since its scatter masks the sentinel itself.
     """
     buffers = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
     k_view, v_view = buffers[:, 0], buffers[:, 1]
@@ -226,10 +231,18 @@ def write_msa_main_kv(
     head_dim = int(k_view.shape[3])
     num_tokens = int(k.shape[0])
     write_kv_slots(
-        k_view, out_cache_loc, k.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+        k_view,
+        out_cache_loc,
+        k.reshape(num_tokens, num_kv_heads, head_dim),
+        layout="HND",
+        num_live_tokens=num_live_tokens,
     )
     write_kv_slots(
-        v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+        v_view,
+        out_cache_loc,
+        v.reshape(num_tokens, num_kv_heads, head_dim),
+        layout="HND",
+        num_live_tokens=num_live_tokens,
     )
 
 

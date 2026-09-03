@@ -67,8 +67,9 @@ torch::Tensor minimax_m3_fp8_indexer_qk_norm_rope(torch::Tensor const& qk, torch
     auto stream = at::cuda::getCurrentCUDAStream(qk.get_device());
     tensorrt_llm::kernels::launchMinimaxM3Fp8IndexerQKNormRope(qk.data_ptr(), q_out.data_ptr(),
         index_k_cache.data_ptr(), out_cache_loc.data_ptr<int>(), index_k_cache.stride(0), index_k_cache.stride(2),
-        index_k_cache.size(2), num_tokens, num_heads_q, head_dim, rotary_dim, static_cast<float>(eps),
-        q_weight.data_ptr(), k_weight.data_ptr(), static_cast<float>(base), position_ids.data_ptr<int>(), stream);
+        index_k_cache.size(2), index_k_cache.size(0), num_tokens, num_heads_q, head_dim, rotary_dim,
+        static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(), static_cast<float>(base),
+        position_ids.data_ptr<int>(), stream);
     return q_out;
 }
 

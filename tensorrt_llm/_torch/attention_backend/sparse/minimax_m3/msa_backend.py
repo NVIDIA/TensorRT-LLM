@@ -1345,6 +1345,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Drop any prewritten marker a failed prior step left unconsumed, so
         # it can never suppress a later step's cache write.
         self._msa_prewritten_layer = None
+        # The live counts describe the slot mapping staged at the end of this
+        # method, so clear them with the ready flag. An early return below would
+        # otherwise leave counts describing a batch that is no longer scheduled.
+        self._msa_live_batch = 0
+        self._msa_live_total_q = 0
         if not self._msa_buffers_ready:
             return
         request_ids = self.request_ids
@@ -1493,6 +1498,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_page_size = page_size
         self._msa_fields_ready = True
 
+    def msa_live_token_count(self) -> int:
+        """This step's live, unpadded new-token count.
+
+        Cache writers take the padded token extent and need this to find where
+        `msa_out_cache_loc` stops holding real slots. Raising when no mapping is
+        staged keeps an unprepared step from writing against another step's
+        slots, which a stale count would otherwise allow.
+        """
+        if not self._msa_fields_ready:
+            raise RuntimeError(
+                "MiniMax-M3 MSA cache write requires prepared metadata, but "
+                "prepare() did not stage a slot mapping for this step."
+            )
+        return self._msa_live_total_q
+
     def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
         """Return the paged index-K cache in the HND layout MSA consumes."""
         return self.kv_cache_manager.get_index_k_buffer(layer_idx, kv_layout="HND")
@@ -1507,6 +1527,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self.msa_out_cache_loc[:num_tokens],
             idx_k.reshape(num_tokens, 1, sparse_index_dim),
             layout="HND",
+            num_live_tokens=self.msa_live_token_count(),
         )
 
     def msa_write_layer_caches(
@@ -1567,17 +1588,20 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             if not fused_write_layer_caches(k_view, v_view, idx_cache, out_cache_loc, k, v, idx_k):
                 num_kv_heads = int(k_view.shape[1])
                 head_dim = int(k_view.shape[3])
+                num_live_tokens = self.msa_live_token_count()
                 write_kv_slots(
                     k_view,
                     out_cache_loc,
                     k.reshape(num_tokens, num_kv_heads, head_dim),
                     layout="HND",
+                    num_live_tokens=num_live_tokens,
                 )
                 write_kv_slots(
                     v_view,
                     out_cache_loc,
                     v.reshape(num_tokens, num_kv_heads, head_dim),
                     layout="HND",
+                    num_live_tokens=num_live_tokens,
                 )
                 if idx_k is not None:
                     write_kv_slots(
@@ -1585,6 +1609,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                         out_cache_loc,
                         idx_k.reshape(num_tokens, 1, int(idx_cache.shape[-1])),
                         layout="HND",
+                        num_live_tokens=num_live_tokens,
                     )
         self._msa_prewritten_layer = layer_idx
 

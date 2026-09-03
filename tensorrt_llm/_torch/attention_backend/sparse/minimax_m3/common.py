@@ -178,6 +178,7 @@ def write_kv_slots(
     values: torch.Tensor,
     *,
     layout: Literal["NHD", "HND"] = "NHD",
+    num_live_tokens: int,
 ) -> None:
     """Write per-token values into a K, V, or index-K cache at given slots.
 
@@ -186,7 +187,29 @@ def write_kv_slots(
     "HND" is [num_pages, num_heads, tokens_per_block, channel]. The paged view
     is non-contiguous, so the slot id is split into (page, within) and written
     by multi-dim assignment. `values` is always [num_tokens, num_heads, channel].
+
+    `num_live_tokens` is how many leading rows own a real cache slot. Under
+    piecewise CUDA graphs callers pass the padded token extent, where
+    `out_cache_loc` holds a -1 sentinel past the live count, and those rows are
+    dropped. There is no safe default, so it is required: passing the padded
+    height corrupts the cache silently, because torch wraps negative indices
+    and the sentinel lands in the last page instead of raising.
     """
+    # Trimming by count rather than masking on `out_cache_loc >= 0` keeps this
+    # sync-free, since the sentinel tail is contiguous by construction. The Triton
+    # scatters in msa_scatter.py apply the same contract with a slot predicate.
+    if num_live_tokens < 0:
+        raise ValueError(f"num_live_tokens must be non-negative, got {num_live_tokens}")
+    if out_cache_loc.shape[0] < num_live_tokens or values.shape[0] < num_live_tokens:
+        raise ValueError(
+            f"num_live_tokens={num_live_tokens} exceeds the rows supplied "
+            f"(out_cache_loc={out_cache_loc.shape[0]}, values={values.shape[0]})"
+        )
+    if num_live_tokens == 0:
+        return
+    out_cache_loc = out_cache_loc[:num_live_tokens]
+    values = values[:num_live_tokens]
+
     with torch.no_grad():
         if cache.ndim >= 4:
             token_axis = 2 if layout == "HND" else 1
