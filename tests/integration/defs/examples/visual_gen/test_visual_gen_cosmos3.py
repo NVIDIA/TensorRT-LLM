@@ -75,10 +75,11 @@ COSMOS3_LPIPS_THRESHOLD = 0.05
 # B300-cut media measured LPIPS 0.020/0.075/0.151 on B200 at 1/9/189 frames
 # with everything else held fixed), so a tight bar just re-fires whenever the
 # media host and the CI lane disagree. The bars sit above the 9-frame
-# cross-stepping floor (0.075) so the gates catch severe model regressions
-# (historical reds were 0.45-0.61) and survive a CI GPU change without
-# re-cutting media. The V2V golden is B300-cut and scores 0.070 on the B200
-# lane; the T2V golden is cut on B200, the lane's own GPU.
+# cross-stepping floor (0.075) so the gates catch model regressions and survive
+# a CI GPU change without re-cutting media. The one code-caused regression
+# these gates have caught measured 0.608404 (nvbugs/6418815), well above both
+# bars. The V2V golden is B300-cut and scores 0.070 on the B200 lane; the T2V
+# golden is cut on B200, the lane's own GPU.
 COSMOS3_LPIPS_T2V_THRESHOLD = 0.20
 COSMOS3_LPIPS_V2V_THRESHOLD = 0.15
 COSMOS3_I2V_4STEP_MODEL_SUBPATH = "Cosmos3-Super-Image2Video-4Step"
