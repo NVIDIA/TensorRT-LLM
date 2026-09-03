@@ -345,6 +345,7 @@ def worker_fn(
             send_kv_slice = KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=[block_ids],
+                first_ordinals=[0],
             )
             sender_session.send(send_kv_slice)
 
@@ -390,6 +391,7 @@ def worker_fn(
             recv_kv_slice = KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=[block_ids],
+                first_ordinals=[0],
             )
             receiver_session.receive(recv_kv_slice)
 

@@ -43,7 +43,6 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     LayerRange,
     SessionStatus,
-    TokenRange,
     WaitResult,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
@@ -100,31 +99,28 @@ class KvCacheConfigV2:
 
 
 @pytest.mark.cpu_only
-def test_token_range_valid():
-    tr = TokenRange(start=0, end=10)
-    assert tr.start == 0
-    assert tr.end == 10
+def test_kv_slice_first_ordinals_parallel_to_layer_groups():
+    """Each layer group's anchor rides next to its block list."""
+    s = KVSlice(
+        block_ids_per_layer_groups=[
+            np.array([7, 8], dtype=np.int64),
+            np.array([], dtype=np.int64),
+        ],
+        first_ordinals=[3, 0],
+    )
+    assert s.first_ordinals == [3, 0]
+    assert len(s.first_ordinals) == len(s.block_ids_per_layer_groups)
 
 
 @pytest.mark.cpu_only
-def test_token_range_allows_empty():
-    """A chunk clamped past the end of the prompt covers no tokens."""
-    tr = TokenRange(start=8, end=8)
-    assert tr.start == tr.end == 8
-
-
-@pytest.mark.cpu_only
-def test_token_range_invalid_negative():
-    with pytest.raises(ValueError, match="non-negative"):
-        TokenRange(start=-1, end=5)
-    with pytest.raises(ValueError, match="non-negative"):
-        TokenRange(start=0, end=-1)
-
-
-@pytest.mark.cpu_only
-def test_token_range_invalid_start_gt_end():
-    with pytest.raises(ValueError, match="Invalid range"):
-        TokenRange(start=10, end=3)
+def test_kv_slice_empty_group_uses_anchor_zero():
+    """Empty lists (deferred SWA groups, STATE with no slot) anchor at 0."""
+    s = KVSlice(
+        block_ids_per_layer_groups=[np.array([], dtype=np.int64)],
+        first_ordinals=[0],
+    )
+    assert s.first_ordinals == [0]
+    assert s.block_ids_per_layer_groups[0].size == 0
 
 
 @pytest.mark.cpu_only
@@ -157,19 +153,19 @@ def test_kv_slice_construction():
         layer_range=lr,
         block_ids_per_layer_groups=[[1, 2, 3]],
         is_last_slice=True,
-        token_range=TokenRange(start=0, end=3),
+        first_ordinals=[0],
     )
     assert s.layer_range == lr
     assert s.block_ids_per_layer_groups == [[1, 2, 3]]
     assert s.is_last_slice is True
-    assert s.token_range == TokenRange(start=0, end=3)
+    assert s.first_ordinals == [0]
 
     # Test defaults
     s2 = KVSlice()
     assert s2.layer_range is None
     assert s2.block_ids_per_layer_groups == []
     assert s2.is_last_slice is False
-    assert s2.token_range is None
+    assert s2.first_ordinals == []
 
 
 @pytest.mark.cpu_only
@@ -205,10 +201,17 @@ def _send_prefill_chunks(
     """Build and optionally send slices through the real prefill-chunk path."""
     all_block_ids = [np.asarray(ids, dtype=np.int64) for ids in all_block_ids]
     total_blocks = max((len(ids) for ids in all_block_ids), default=0)
-    base_slice = KVSlice(block_ids_per_layer_groups=all_block_ids)
+    base_slice = KVSlice(
+        block_ids_per_layer_groups=all_block_ids,
+        first_ordinals=[0] * len(all_block_ids),
+    )
     session = sender_session if sender_session is not None else MagicMock()
     session.kv_tasks = []
     transceiver = MagicMock()
+    # Bind the real predicate: on a bare MagicMock it returns a truthy
+    # auto-mock, which would defer every group (even full-attention) to the
+    # final slice.
+    transceiver._defers_to_final_slice = KvCacheTransceiverV2._defers_to_final_slice
     transceiver._get_or_create_send_session.return_value = session
     transceiver._create_kv_slice = MagicMock(return_value=base_slice)
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
@@ -274,6 +277,9 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
     chunk_blocks = 16
 
     transceiver = MagicMock()
+    # Bind the real predicate so full-attention groups stream (a bare
+    # MagicMock's truthy auto-mock would defer every group).
+    transceiver._defers_to_final_slice = KvCacheTransceiverV2._defers_to_final_slice
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
@@ -282,7 +288,8 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
     # A full-attention group keeps the whole prompt resident from block 0, so
     # _create_kv_slice describes every block regardless of prefill progress.
     transceiver._create_kv_slice.return_value = KVSlice(
-        block_ids_per_layer_groups=[np.arange(prompt_blocks, dtype=np.int64)]
+        block_ids_per_layer_groups=[np.arange(prompt_blocks, dtype=np.int64)],
+        first_ordinals=[0],
     )
 
     req = MagicMock()
@@ -307,20 +314,19 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
             kv_slice.block_ids_per_layer_groups[0],
             np.arange(chunk_start, chunk_end, dtype=np.int64),
         )
-        assert kv_slice.token_range == TokenRange(
-            start=chunk_start * tokens_per_block, end=chunk_end * tokens_per_block
-        )
+        # The chunk slice is anchored at its own first block ordinal.
+        assert kv_slice.first_ordinals == [chunk_start]
 
 
 @pytest.mark.parametrize(
-    "source_block_ids",
+    "source_block_ids,span_anchor",
     [
-        np.arange(16, dtype=np.int64),
-        np.arange(9, 13, dtype=np.int64),
+        (np.arange(16, dtype=np.int64), 0),
+        (np.arange(9, 13, dtype=np.int64), 12),
     ],
     ids=["v1_full_prompt_allocation", "v2_incremental_allocation"],
 )
-def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
+def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids, span_anchor):
     """A partial SWA chunk is deferred for both cache-manager allocation strategies."""
     tokens_per_block = 8
     prompt_blocks = 16
@@ -333,8 +339,9 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         get_cached_token_count_per_layer_group=lambda req, layer_groups: [0],
-        get_block_ids=lambda req, idx, lg: source_block_ids,
+        get_transfer_span=lambda req, idx, lg: (source_block_ids, span_anchor),
     )
+    transceiver._mapping = SimpleNamespace(cp_size=1)
     transceiver._page_table = SimpleNamespace(layer_groups=[layer_group])
     transceiver._kv_cache_manager = SimpleNamespace(
         tokens_per_block=tokens_per_block,
@@ -404,10 +411,7 @@ def test_send_prefill_chunks_unaligned_boundary_splits_on_a_block():
         boundary_offset_tokens=2,
     )
 
-    assert [s.token_range for s in slices] == [
-        TokenRange(start=0, end=4 * tokens_per_block),
-        TokenRange(start=4 * tokens_per_block, end=8 * tokens_per_block),
-    ]
+    assert [s.first_ordinals for s in slices] == [[0], [4]]
     assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.arange(4))
     assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.arange(4, 8))
 
@@ -421,9 +425,9 @@ def test_send_prefill_chunks_multiple_layer_groups():
     assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.array([4, 5, 6, 7]))
     assert np.array_equal(slices[0].block_ids_per_layer_groups[1], np.array([100, 101, 102, 103]))
     assert np.array_equal(slices[1].block_ids_per_layer_groups[1], np.array([104, 105, 106, 107]))
-    # Default tokens_per_block is 1, so the token range doubles as block coords.
-    assert slices[0].token_range == TokenRange(start=0, end=4)
-    assert slices[1].token_range == TokenRange(start=4, end=8)
+    # Each layer group carries its own explicit anchor for each chunk.
+    assert slices[0].first_ordinals == [0, 0]
+    assert slices[1].first_ordinals == [4, 4]
 
 
 def create_transfer_worker_setup(
@@ -818,11 +822,23 @@ def get_block_data(
 
 
 def get_block_ids_per_layer_groups(
-    kv_cache_manager, transfer_worker, request_id: int, use_v2: bool, tokens_per_block: int
-) -> List[List[int]]:
-    """Get block_ids for each layer group with window_size filtering."""
+    kv_cache_manager,
+    transfer_worker,
+    request_id: int,
+    use_v2: bool,
+    tokens_per_block: int,
+    request_len: int,
+):
+    """Get (block_ids, first_block_ordinal) for each layer group.
+
+    Windowed groups are trimmed to the active window; the anchor makes the
+    trimmed list's position explicit (KVSlice.first_ordinals) instead of
+    leaving it to be inferred from the list length.
+    """
     page_table = transfer_worker._rank_info.page_table
-    block_ids_per_layer_groups: List[List[int]] = []
+    block_ids_per_layer_groups: List[np.ndarray] = []
+    first_ordinals: List[int] = []
+    prompt_blocks = (request_len + tokens_per_block - 1) // tokens_per_block
 
     for group_id, group_meta in enumerate(page_table.layer_groups):
         if use_v2:
@@ -845,8 +861,11 @@ def get_block_ids_per_layer_groups(
                 block_ids = block_ids[-max_blocks_in_window:]
 
         block_ids_per_layer_groups.append(np.asarray(block_ids, dtype=np.int64))
+        # The lists above are resident suffixes of [0, prompt_blocks); anchor
+        # them explicitly at their first block ordinal.
+        first_ordinals.append(max(0, prompt_blocks - len(block_ids)))
 
-    return block_ids_per_layer_groups
+    return block_ids_per_layer_groups, first_ordinals
 
 
 def add_and_verify_request(
@@ -962,32 +981,38 @@ def add_and_verify_request(
                 [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request]
             )
 
-    # Get block_ids per layer_group with window_size filtering
-    ctx_block_ids_per_groups = [
+    # Get (block_ids, anchors) per layer_group with window_size filtering
+    ctx_spans_per_rank = [
         get_block_ids_per_layer_groups(
             ctx_kv_cache_manager,
             ctx_transfer_worker,
             ctx_request.py_request_id,
             use_v2,
             tokens_per_block,
+            request_len,
         )
         for ctx_kv_cache_manager, ctx_transfer_worker in zip(
             valid_ctx_kv_cache_managers, valid_ctx_transfer_workers
         )
     ]
+    ctx_block_ids_per_groups = [blocks for blocks, _ in ctx_spans_per_rank]
+    ctx_first_ordinals = [anchors for _, anchors in ctx_spans_per_rank]
 
-    gen_block_ids_per_groups = [
+    gen_spans_per_rank = [
         get_block_ids_per_layer_groups(
             gen_kv_cache_manager,
             gen_transfer_worker,
             gen_request.py_request_id,
             use_v2,
             tokens_per_block,
+            request_len,
         )
         for gen_kv_cache_manager, gen_transfer_worker in zip(
             valid_gen_kv_cache_managers, valid_gen_transfer_workers
         )
     ]
+    gen_block_ids_per_groups = [blocks for blocks, _ in gen_spans_per_rank]
+    gen_first_ordinals = [anchors for _, anchors in gen_spans_per_rank]
 
     # Determine number of layer_groups
     num_layer_groups = len(ctx_block_ids_per_groups[0]) if ctx_block_ids_per_groups else 1
@@ -1002,8 +1027,11 @@ def add_and_verify_request(
             KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=ctx_block_ids_per_group,
+                first_ordinals=ctx_anchors,
             )
-            for ctx_block_ids_per_group in ctx_block_ids_per_groups
+            for ctx_block_ids_per_group, ctx_anchors in zip(
+                ctx_block_ids_per_groups, ctx_first_ordinals
+            )
         ]
         for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices):
             sender_session.send(send_kv_slice)
@@ -1019,8 +1047,11 @@ def add_and_verify_request(
             KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=gen_block_ids_per_group,
+                first_ordinals=gen_anchors,
             )
-            for gen_block_ids_per_group in gen_block_ids_per_groups
+            for gen_block_ids_per_group, gen_anchors in zip(
+                gen_block_ids_per_groups, gen_first_ordinals
+            )
         ]
         for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices):
             receiver_session.receive(recv_kv_slice)
@@ -1034,8 +1065,11 @@ def add_and_verify_request(
             KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=gen_block_ids_per_group,
+                first_ordinals=gen_anchors,
             )
-            for gen_block_ids_per_group in gen_block_ids_per_groups
+            for gen_block_ids_per_group, gen_anchors in zip(
+                gen_block_ids_per_groups, gen_first_ordinals
+            )
         ]
         for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices):
             receiver_session.receive(recv_kv_slice)
@@ -1056,8 +1090,11 @@ def add_and_verify_request(
             KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=ctx_block_ids_per_group,
+                first_ordinals=ctx_anchors,
             )
-            for ctx_block_ids_per_group in ctx_block_ids_per_groups
+            for ctx_block_ids_per_group, ctx_anchors in zip(
+                ctx_block_ids_per_groups, ctx_first_ordinals
+            )
         ]
         for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices):
             sender_session.send(send_kv_slice)
@@ -1363,8 +1400,9 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
 
     Simulates gen-side prefix cache: ctx sends all blocks for [0, request_len),
-    gen only provides the suffix block list. The receiver-side prefix is
-    implicit in the block count; the sender derives dst_start from it.
+    gen only provides the suffix block list, anchored at its first block
+    ordinal via KVSlice.first_ordinals (positions are explicit, never derived
+    from the block count).
     """
     tensorrt_llm.logger.set_level("info")
     tokens_per_block = 8
@@ -1439,22 +1477,29 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         )
 
     # Get block IDs
-    ctx_block_ids = get_block_ids_per_layer_groups(ctx_mgr, ctx_tw, 0, use_v2, tokens_per_block)
-    gen_block_ids = get_block_ids_per_layer_groups(gen_mgr, gen_tw, 1, use_v2, tokens_per_block)
+    ctx_block_ids, ctx_anchors = get_block_ids_per_layer_groups(
+        ctx_mgr, ctx_tw, 0, use_v2, tokens_per_block, request_len
+    )
+    gen_block_ids, gen_anchors = get_block_ids_per_layer_groups(
+        gen_mgr, gen_tw, 1, use_v2, tokens_per_block, request_len
+    )
 
-    # Gen: only provide suffix block IDs (skip prefix_blocks)
+    # Gen: only provide suffix block IDs (skip prefix_blocks); the skipped
+    # prefix is declared explicitly by advancing each anchor.
     gen_suffix_block_ids = [
         np.asarray(bids[prefix_blocks:], dtype=np.int64) for bids in gen_block_ids
     ]
+    gen_suffix_anchors = [anchor + prefix_blocks for anchor in gen_anchors]
 
     try:
         tx = ctx_tw.create_tx_session(ctx_request)
 
-        # Gen receives only the suffix list; dst_start is derived from block count.
+        # Gen receives only the suffix list, anchored at its true block ordinal.
         rx = gen_tw.create_rx_session(gen_request)
         recv_slice = KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=gen_suffix_block_ids,
+            first_ordinals=gen_suffix_anchors,
         )
         rx.receive(recv_slice)
 
@@ -1463,6 +1508,7 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
                 KVSlice(
                     is_last_slice=True,
                     block_ids_per_layer_groups=ctx_block_ids,
+                    first_ordinals=ctx_anchors,
                 )
             )
         else:
@@ -1603,7 +1649,11 @@ def test_session_cancel_after_send():
         # changed shape across versions).
         page_table = ctx_transfer_worker._rank_info.page_table
         block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
-        kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
+        kv_slice = KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=block_ids_per_groups,
+            first_ordinals=[0] * len(block_ids_per_groups),
+        )
         tx_session.send(kv_slice)
 
         # No receiver registered yet; task is INIT.
@@ -1682,12 +1732,16 @@ def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
                 [(gen_request.py_request_id, request_len, 1)], [gen_request]
             )
 
-    ctx_block_ids = [
-        get_block_ids_per_layer_groups(mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block)
+    ctx_spans = [
+        get_block_ids_per_layer_groups(
+            mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block, request_len
+        )
         for mgr, tw in zip(ctx_kv_cache_managers, ctx_transfer_workers, strict=True)
     ]
-    gen_block_ids = [
-        get_block_ids_per_layer_groups(mgr, tw, gen_request.py_request_id, use_v2, tokens_per_block)
+    gen_spans = [
+        get_block_ids_per_layer_groups(
+            mgr, tw, gen_request.py_request_id, use_v2, tokens_per_block, request_len
+        )
         for mgr, tw in zip(gen_kv_cache_managers, gen_transfer_workers, strict=True)
     ]
 
@@ -1696,8 +1750,10 @@ def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
         "gen_request": gen_request,
         "ctx_kv_caches": ctx_kv_caches,
         "gen_kv_caches": gen_kv_caches,
-        "ctx_block_ids": ctx_block_ids,
-        "gen_block_ids": gen_block_ids,
+        "ctx_block_ids": [blocks for blocks, _ in ctx_spans],
+        "ctx_first_ordinals": [anchors for _, anchors in ctx_spans],
+        "gen_block_ids": [blocks for blocks, _ in gen_spans],
+        "gen_first_ordinals": [anchors for _, anchors in gen_spans],
     }
 
 
@@ -1852,7 +1908,11 @@ def test_session_has_transferring_tasks_false():
         # TxSession: after send(), task is INIT (no receiver → not yet dispatched)
         page_table = ctx_transfer_worker._rank_info.page_table
         block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
-        kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
+        kv_slice = KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=block_ids_per_groups,
+            first_ordinals=[0] * len(block_ids_per_groups),
+        )
         tx_session.send(kv_slice)
         assert not tx_session.has_transferring_tasks()
         tx_session.close()
@@ -1920,6 +1980,7 @@ def test_incompatible_peer_fails_only_affected_requests():
     empty_slice = KVSlice(
         is_last_slice=True,
         block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.layer_groups],
+        first_ordinals=[0] * len(page_table.layer_groups),
     )
 
     validate_calls = []
@@ -2004,10 +2065,13 @@ def add_and_verify_pipelined_request(
     receiver_sessions = [
         tw.create_rx_session(ctx_info["gen_request"]) for tw in gen_transfer_workers
     ]
-    for recv_session, block_ids_per_groups in zip(receiver_sessions, gen_block_ids, strict=True):
+    for recv_session, block_ids_per_groups, anchors in zip(
+        receiver_sessions, gen_block_ids, ctx_info["gen_first_ordinals"], strict=True
+    ):
         full_slice = KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=block_ids_per_groups,
+            first_ordinals=anchors,
         )
         recv_session.receive(full_slice)
 

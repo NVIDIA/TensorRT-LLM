@@ -28,7 +28,6 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     RxSessionBase,
     SessionStatus,
-    TokenRange,
     TxSessionBase,
     WaitResult,
     get_unique_rid,
@@ -41,6 +40,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, T
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
+    split_packed_beam_block_ids,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
@@ -285,8 +285,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return self._kv_cache_manager.mamba_cache_index[req.py_request_id]
         return None
 
-    def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
-        """Create a KV slice covering the request's whole prompt."""
+    @staticmethod
+    def _defers_to_final_slice(lg, prompt_len: int) -> bool:
+        """Whether a layer group's SWA window forces whole-window transfer.
+
+        Pipelined senders skip such groups on intermediate chunks and send the
+        complete final active window with the last slice. Single source for the
+        predicate so producer and chunker can never disagree on a group.
+        """
+        window_size = getattr(lg, "sliding_window_size", None)
+        return window_size is not None and window_size < prompt_len
+
+    def _create_kv_slice(self, req: LlmRequest, include_window_groups: bool = True) -> KVSlice:
+        """Create a KV slice covering the request's whole prompt.
+
+        Each layer group carries an explicit block-ordinal anchor
+        (``KVSlice.first_ordinals``). The adapter reports the manager-truth
+        span; transfer-policy trims (SWA pre-window skip, gen-side reuse skip)
+        are applied here as explicit head-slices that advance the anchor.
+
+        Args:
+            req: The request whose KV blocks to describe.
+            include_window_groups: When False, layer groups whose sliding
+                window is smaller than the prompt get empty lists. Pipelined
+                senders defer those groups to the final chunk.
+        """
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
@@ -307,8 +330,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if is_gen_only
             else [0] * len(layer_groups)
         )
+        # Helix CP block lists are strided local subsets of the global blocks;
+        # anchors are local (0) and global-position trims do not apply.
+        is_helix = self._mapping.cp_size > 1
 
-        groups = []
+        groups: List[np.ndarray] = []
+        first_ordinals: List[int] = []
         for idx, lg in enumerate(layer_groups):
             if lg.kind == CacheKind.STATE:
                 slot = self._get_mamba_slot_for_request(req)
@@ -317,66 +344,47 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     if slot is not None
                     else np.array([], dtype=np.int64)
                 )
+                first_ordinals.append(0)
                 continue
-            block_ids = adapter.get_block_ids(req, idx, lg)
             window_size = lg.sliding_window_size
+            if not include_window_groups and self._defers_to_final_slice(lg, req.prompt_len):
+                groups.append(np.array([], dtype=np.int64))
+                first_ordinals.append(0)
+                continue
 
-            if window_size is not None:
-                allocated_blocks = (
-                    req.prompt_len + self._kv_cache_manager.num_extra_kv_tokens + tpb - 1
-                ) // tpb
-                beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
-                    block_ids,
-                    req.py_beam_width,
-                    allocated_blocks,
+            pages, anchor = adapter.get_transfer_span(req, idx, lg)
+
+            # Transfer-policy head-slice: skip pre-window prompt blocks (the
+            # receiver never reads them; bandwidth only) and the gen-side
+            # reused prefix. The anchor advances with the slice so block
+            # positions stay explicit.
+            target_start = anchor
+            if window_size is not None and not is_helix:
+                target_start = max(target_start, (req.prompt_len + 1 - window_size) // tpb)
+            if is_gen_only:
+                target_start = max(target_start, cached_per_lg[idx] // tpb)
+            skip = target_start - anchor
+            if skip > 0 and pages.size > 0:
+                beam0, tails = split_packed_beam_block_ids(
+                    pages, req.py_beam_width, prompt_blocks - anchor
                 )
-                if beam0_block_ids.size > allocated_blocks:
-                    beam0_block_ids = beam0_block_ids[:allocated_blocks]
-                    block_ids = (
-                        np.concatenate([beam0_block_ids, tail_block_ids])
-                        if tail_block_ids.size > 0
-                        else beam0_block_ids
-                    )
-                # Current PyExecutor cache managers disable KV-cache token sinks,
-                # so SWA block lists contain an evictable prompt prefix followed
-                # by the speculative scratch tail. If token sinks are enabled,
-                # this must use block-ordinal metadata to preserve the sink prefix.
-                # Remove scratch before trimming stale prompt blocks; otherwise a
-                # boundary-crossing allocation can displace initialized prompt KV.
-                scratch_blocks = max(0, allocated_blocks - prompt_blocks)
-                if scratch_blocks > 0:
-                    if req.py_beam_width != 1:
-                        raise ValueError("speculative scratch blocks require beam_width == 1")
-                    block_ids = (
-                        block_ids[:-scratch_blocks]
-                        if scratch_blocks < block_ids.size
-                        else np.array([], dtype=np.int64)
-                    )
-                # Drop stale blocks the manager may still expose (V1 pre-eviction).
-                stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                expected_valid = max(0, prompt_blocks - stale_end)
-                # Skip reused blocks that remain after stale-prefix pruning.
-                cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
-            else:
-                # Drop the speculative scratch tail; only prompt_len is transferred.
-                if block_ids.size > prompt_blocks:
-                    block_ids = block_ids[:prompt_blocks]
-                expected_valid = prompt_blocks
-                cache_skip = cached_per_lg[idx] // tpb
+                beam0 = beam0[skip:] if skip < beam0.size else beam0[:0]
+                if beam0.size == 0:
+                    pages = np.array([], dtype=np.int64)
+                    anchor = 0
+                else:
+                    pages = np.concatenate([beam0, tails]) if tails.size > 0 else beam0
+                    anchor = target_start
+            elif pages.size == 0:
+                anchor = 0
 
-            block_ids = self._trim_packed_beam_block_ids(
-                block_ids,
-                beam_width=req.py_beam_width,
-                total_blocks=prompt_blocks,
-                expected_valid=expected_valid,
-                cache_skip=cache_skip,
-            )
-
-            groups.append(block_ids)
+            groups.append(pages)
+            first_ordinals.append(anchor)
 
         return KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=groups,
+            first_ordinals=first_ordinals,
         )
 
     def _slice_num_bytes(self, slice: KVSlice) -> int:
@@ -409,56 +417,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     # Attention: n blocks, each slot covers all layers.
                     total += n * pool.slot_bytes
         return total
-
-    @staticmethod
-    def _split_packed_beam_block_ids(
-        block_ids: np.ndarray,
-        beam_width: int,
-        total_blocks: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Split 1-D block IDs into beam-0 prefix and appended beam-tail blocks."""
-        if beam_width <= 1 or block_ids.size <= total_blocks:
-            return block_ids, np.array([], dtype=np.int64)
-        tail_count = min(beam_width - 1, block_ids.size - total_blocks)
-        if tail_count <= 0:
-            return block_ids, np.array([], dtype=np.int64)
-        return block_ids[:-tail_count], block_ids[-tail_count:]
-
-    @staticmethod
-    def _trim_packed_beam_block_ids(
-        block_ids: np.ndarray,
-        beam_width: int,
-        total_blocks: int,
-        expected_valid: int,
-        cache_skip: int,
-    ) -> np.ndarray:
-        """Trim/skip beam-0 blocks while preserving packed beam-tail blocks."""
-        if expected_valid <= 0:
-            return np.array([], dtype=np.int64)
-
-        beam0_block_ids, tail_block_ids = KvCacheTransceiverV2._split_packed_beam_block_ids(
-            block_ids, beam_width, total_blocks
-        )
-
-        if beam0_block_ids.size > expected_valid:
-            beam0_block_ids = (
-                beam0_block_ids[-expected_valid:]
-                if expected_valid > 0
-                else np.array([], dtype=np.int64)
-            )
-            if beam0_block_ids.size == 0:
-                tail_block_ids = np.array([], dtype=np.int64)
-
-        if cache_skip > 0:
-            if cache_skip < beam0_block_ids.size:
-                beam0_block_ids = beam0_block_ids[cache_skip:]
-            else:
-                beam0_block_ids = np.array([], dtype=np.int64)
-                tail_block_ids = np.array([], dtype=np.int64)
-
-        if tail_block_ids.size == 0:
-            return beam0_block_ids
-        return np.concatenate([beam0_block_ids, tail_block_ids])
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
@@ -761,32 +719,46 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if chunk_end <= chunk_start and not is_last_chunk:
             return None
 
-        base_slice = self._create_kv_slice(req)
-        all_block_ids = base_slice.block_ids_per_layer_groups
+        base_slice = self._create_kv_slice(req, include_window_groups=is_last_chunk)
         chunk_block_ids = []
+        chunk_first_ordinals = []
         assert self._page_table is not None
-        for lg, block_ids in zip(self._page_table.layer_groups, all_block_ids):
-            window_size = getattr(lg, "sliding_window_size", None)
-            if window_size is not None and window_size < req.prompt_len:
+        for lg, block_ids, anchor in zip(
+            self._page_table.layer_groups,
+            base_slice.block_ids_per_layer_groups,
+            base_slice.first_ordinals,
+        ):
+            if self._defers_to_final_slice(lg, req.prompt_len):
                 # SWA pages can leave the active window between chunks. Defer
-                # the group and send its complete final active window at once.
+                # the group and send its complete final active window at once,
+                # anchored at its true window-start ordinal.
                 chunk_block_ids.append(block_ids if is_last_chunk else block_ids[:0])
+                chunk_first_ordinals.append(anchor if is_last_chunk else 0)
             else:
-                # _build_kv_write_meta derives the chunk's start token from list length
-                # (total_blocks - len), which only agrees with the slice below
-                # once the group covers the chunk end.
-                assert block_ids.size >= chunk_end, (
-                    f"layer group holds {block_ids.size} blocks, fewer than the "
-                    f"chunk end {chunk_end}; cannot address chunk "
-                    f"[{chunk_start}, {chunk_end}) by position"
+                if anchor + block_ids.size < chunk_end:
+                    # Not an assert: must fail under python -O too, or a short
+                    # span would silently transfer misaligned chunk blocks.
+                    raise ValueError(
+                        f"layer group span [{anchor}, {anchor + block_ids.size}) does "
+                        f"not cover the chunk end {chunk_end}; cannot address chunk "
+                        f"[{chunk_start}, {chunk_end}) by block ordinal"
+                    )
+                # Intersect the chunk's global block range with the group span;
+                # a span starting past the chunk end contributes nothing.
+                start = max(chunk_start, anchor)
+                sub = (
+                    block_ids[start - anchor : chunk_end - anchor]
+                    if start < chunk_end
+                    else block_ids[:0]
                 )
-                chunk_block_ids.append(block_ids[chunk_start:chunk_end])
+                chunk_block_ids.append(sub)
+                chunk_first_ordinals.append(start if sub.size > 0 else 0)
         if not is_last_chunk and not any(block_ids.size for block_ids in chunk_block_ids):
             return None
         return KVSlice(
             is_last_slice=is_last_chunk,
             block_ids_per_layer_groups=chunk_block_ids,
-            token_range=TokenRange(start=chunk_start * tpb, end=chunk_end * tpb),
+            first_ordinals=chunk_first_ordinals,
         )
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")

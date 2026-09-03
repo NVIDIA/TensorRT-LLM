@@ -12,23 +12,6 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 
 @dataclass
-class TokenRange:
-    """Half-open token range [start, end) within one request.
-
-    ``KVSlice`` ranges are block-aligned. Empty ranges are valid.
-    """
-
-    start: int
-    end: int  # exclusive
-
-    def __post_init__(self):
-        if self.start < 0 or self.end < 0:
-            raise ValueError("Token indices must be non-negative")
-        if self.start > self.end:
-            raise ValueError(f"Invalid range: [{self.start}, {self.end})")
-
-
-@dataclass
 class LayerRange:
     """Range of layers to transfer."""
 
@@ -46,10 +29,16 @@ class LayerRange:
 class KVSlice:
     """KV-cache blocks for one request transfer slice.
 
-    Monolithic transfers omit ``token_range`` and cover ``prompt_len``.
-    Pipelined transfers use a block-aligned ``token_range`` and mark only the
-    final chunk with ``is_last_slice``. Block lists may omit cached or evicted
-    prefixes.
+    Each layer group's block list is anchored explicitly: ``first_ordinals[i]``
+    is the block ordinal (0-based sequence block index) of element 0 of group
+    ``i``'s beam-0 list, so positions never have to be inferred from list
+    lengths. The anchor describes only the beam-0 prefix; packed beam tails
+    (``beam_width > 1`` appends per-beam tail blocks after beam-0) stay outside
+    the anchored region. STATE groups and empty lists use anchor 0.
+
+    Monolithic transfers cover ``prompt_len``. Pipelined transfers send one
+    slice per prefill chunk (anchored at the chunk's first block ordinal) and
+    mark only the final chunk with ``is_last_slice``.
     """
 
     layer_range: Optional[LayerRange] = None
@@ -57,7 +46,9 @@ class KVSlice:
         default_factory=list
     )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
-    token_range: Optional[TokenRange] = None
+    # Block ordinal of element 0 of each group's beam-0 list; parallel to
+    # block_ids_per_layer_groups.
+    first_ordinals: List[int] = field(default_factory=list)
 
 
 class SessionStatus(Enum):
@@ -96,7 +87,8 @@ class SessionArgsBase:
     """Base arguments for transfer sessions."""
 
     params: DisaggregatedParams
-    # Captured from LlmRequest.prompt_len; needed for SWA stale_end derivation.
+    # Captured from LlmRequest.prompt_len; bounds the beam-0 span
+    # (ceil(prompt_len / tokens_per_block) block ordinals).
     prompt_len: int
     beam_width: int = 1
 
@@ -156,9 +148,8 @@ class TxSessionBase(_SessionBase):
 
         Args:
             slice: The KV slice describing which source blocks to send.
-                For pipelined chunks, ``token_range`` is the shared sender-side
-                chunk cursor; each layer group projects it into its own
-                resident/windowed source and destination block ranges.
+                For pipelined chunks, each layer group's list is anchored at
+                the chunk's first block ordinal via ``first_ordinals``.
         """
         ...
 

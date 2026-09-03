@@ -900,6 +900,7 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
     transceiver._page_table = SimpleNamespace(layer_groups=[])
+    transceiver._mapping = SimpleNamespace(cp_size=1)
     request = SimpleNamespace(
         is_generation_only_request=lambda: False,
         prompt_len=0,
@@ -927,6 +928,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
     transceiver._page_table = SimpleNamespace(layer_groups=[mamba_lg])
+    transceiver._mapping = SimpleNamespace(cp_size=1)
     request = SimpleNamespace(
         is_generation_only_request=lambda: False,
         prompt_len=0,

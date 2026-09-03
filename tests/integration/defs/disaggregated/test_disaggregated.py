@@ -1498,7 +1498,7 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
     """End-to-end check: Python transceiver + ctx-side host offload.
 
     The fix translates logical block IDs to primary-pool slot indices in
-    `_CacheReuseAdapterV1.get_block_ids` before they reach the disagg
+    `_CacheReuseAdapterV1.get_transfer_span` before they reach the disagg
     sender. Without that translation, once host offload moves blocks
     around, the sender computes pool pointers from stale block IDs and
     either reads garbage memory or aborts. This test stresses that path

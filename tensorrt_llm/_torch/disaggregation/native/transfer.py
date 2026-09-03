@@ -69,6 +69,7 @@ from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, per
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
+from tensorrt_llm._torch.disaggregation.resource.cache_reuse import split_packed_beam_block_ids
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
@@ -104,9 +105,10 @@ class RecvReqInfo:
         np.ndarray
     ]  # Block IDs per layer group, each np.ndarray(dtype=np.int64)
     unique_rid: int
-    # Block-aligned token offset where the receiver's block list starts.
-    # None means "end-of-range suffix" — sender derives it from len(blocks).
-    dst_start_token: Optional[int] = None
+    # Block ordinal (0-based sequence block index) of element 0 of each
+    # group's beam-0 list; parallel to block_ids_per_layer_groups. 0 for
+    # STATE groups and empty lists (see KVSlice.first_ordinals).
+    first_ordinals: list[int]
     aux_slot: Optional[int] = None
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
@@ -121,7 +123,7 @@ class RecvReqInfo:
                     arr.tobytes() for arr in self.block_ids_per_layer_groups
                 ],
                 "unique_rid": self.unique_rid,
-                "dst_start_token": self.dst_start_token,
+                "first_ordinals": self.first_ordinals,
                 "aux_slot": self.aux_slot,
                 "slice_id": self.slice_id,
                 "bounce_dst_base": self.bounce_dst_base,
@@ -130,6 +132,8 @@ class RecvReqInfo:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RecvReqInfo":
+        # No wire compatibility: a peer that still sends the pre-anchor layout
+        # (dst_start_token) fails here loudly instead of misaligning KV.
         d = msgpack.unpackb(data, raw=False)
         d["block_ids_per_layer_groups"] = [
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
@@ -147,36 +151,6 @@ class ReadMeta:
 class WriteMetaType(Enum):
     KV = "KV"
     AUX = "AUX"
-
-
-def project_blocks_to_global_chunk(
-    block_ids: np.ndarray,
-    chunk_block_offset: int,
-    chunk_block_count: int,
-    resident_block_end: int,
-) -> np.ndarray:
-    """Project a global block chunk into a suffix-resident block list.
-
-    ``block_ids`` represents the resident suffix of the logical range
-    ``[0, resident_block_end)``. ``chunk_block_offset`` and
-    ``chunk_block_count`` describe a chunk in that global coordinate space.
-    """
-    if chunk_block_count <= 0 or len(block_ids) == 0:
-        return block_ids[:0]
-
-    resident_start = max(0, resident_block_end - len(block_ids))
-    resident_end = resident_block_end
-    chunk_start = chunk_block_offset
-    chunk_end = chunk_start + chunk_block_count
-
-    overlap_start = max(chunk_start, resident_start)
-    overlap_end = min(chunk_end, resident_end)
-    if overlap_start >= overlap_end:
-        return block_ids[:0]
-
-    local_start = overlap_start - resident_start
-    local_end = overlap_end - resident_start
-    return block_ids[local_start:local_end]
 
 
 @dataclass
@@ -797,7 +771,7 @@ class Sender(SenderBase):
           1. No prefix cache on either side  → identity (start_token == 0 both)
           2. Context prefix cache (src starts later than 0)  → trim dst head
           3. Generation prefix cache (dst starts later than 0)  → trim src head
-          4. Chunked context (each slice has its own token_range)  → correct
+          4. Chunked context (each slice anchored at its chunk start)  → correct
              overlap even when the slice is entirely before dst_token_start
         """
         overlap_start = max(src_token_start, dst_token_start)
@@ -811,47 +785,15 @@ class Sender(SenderBase):
             dst_block_ids[dst_skip : dst_skip + n_transfer],
         )
 
-    @staticmethod
-    def _beam0_block_count(block_ids: np.ndarray, total_blocks: int, beam_width: int) -> int:
-        """Return the number of beam-0 blocks in a packed 1-D beam layout."""
-        if beam_width <= 1 or block_ids.size <= total_blocks:
-            return block_ids.size
-        return max(0, block_ids.size - (beam_width - 1))
-
-    @staticmethod
-    def _trim_receiver_window_head(
-        src_block_ids: np.ndarray,
-        dst_block_ids: np.ndarray,
-        peer_window_size: Optional[int],
-        beam_width: int,
-    ) -> np.ndarray:
-        """Drop the receiver's extra leading blocks for a windowed layer group.
-
-        A windowed receiver keeps a larger window when only it runs speculative
-        decoding, so its suffix starts earlier and the extra blocks are at the
-        head. Both starts are derived from list length, so trimming the tail
-        instead would shift every block one position early.
-
-        Non-windowed lists are both trimmed to ceil(prompt_len / tpb) in
-        _create_kv_slice, so there dst must not exceed src. A smaller dst
-        (generation prefix-cache reuse) is handled via dst_start.
-        """
-        block_diff = dst_block_ids.size - src_block_ids.size
-        if block_diff <= 0:
-            return dst_block_ids
-        if peer_window_size is None or beam_width > 1:
-            raise ValueError(
-                f"src/dst block count mismatch: {src_block_ids.size} vs "
-                f"{dst_block_ids.size} (dst must not exceed src)"
-            )
-        return dst_block_ids[block_diff:]
-
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         self_ri = self._registrar.self_rank_info
-        token_range = task._slice.token_range
-        if token_range is not None and (self_ri.cp_size > 1 or peer_ri.cp_size > 1):
+        # A partial chunk (any non-final slice, or a final slice after earlier
+        # ones) addresses a global block sub-range, which the helix striding
+        # below cannot represent.
+        is_partial_chunk = task.slice_id > 0 or not task._slice.is_last_slice
+        if is_partial_chunk and (self_ri.cp_size > 1 or peer_ri.cp_size > 1):
             raise ValueError(
                 "enable_pipelined_transfer is not supported with context parallelism "
                 f"(sender cp_size={self_ri.cp_size}, receiver cp_size={peer_ri.cp_size})"
@@ -902,74 +844,53 @@ class Sender(SenderBase):
                 dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
             else:
                 tpb = extractor.page_table.tokens_per_block
+                src_first = task._slice.first_ordinals[self_lg]
+                dst_first = req_info.first_ordinals[peer_lg]
                 if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
-                    # (same protocol as partition_context_for_helix). The strided
-                    # subset has exactly the receiver's block count, so the
-                    # suffix alignment below degenerates to identity; block
-                    # reuse is rejected under helix.
+                    # (same protocol as partition_context_for_helix). Block
+                    # reuse and SWA trims are rejected under helix, so both
+                    # anchors must be 0; the strided subset is then in the
+                    # receiver's local ordinal space and aligns identically.
+                    if src_first != 0 or dst_first != 0:
+                        raise ValueError(
+                            f"helix CP requires zero block anchors, got src={src_first} "
+                            f"dst={dst_first} for unique_rid={task._unique_rid}"
+                        )
                     src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
-                window_size = getattr(lg_info, "sliding_window_size", None)
 
-                # Block lists are the suffix of [..., slice_end); cached prefix
-                # is implicit in their size. token_start = (total_blocks - n) * tpb.
-                slice_end = token_range.end if token_range is not None else task._prompt_len
-                total_blocks = (slice_end + tpb - 1) // tpb
-
-                # Project the peer's whole-prompt list only for partial chunks.
-                # A final SWA slice carries the complete active window rather than
-                # only the last context chunk, so its peer list must remain whole.
+                assert task._prompt_len is not None, (
+                    "paged KV transfer requires session.prompt_len; "
+                    "set TxSession(prompt_len=request.prompt_len)."
+                )
                 prompt_blocks = (task._prompt_len + tpb - 1) // tpb
-                is_windowed = window_size is not None and window_size < task._prompt_len
-                if (
-                    token_range is not None
-                    and (token_range.start > 0 or total_blocks < prompt_blocks)
-                    and not (is_windowed and task._slice.is_last_slice)
-                ):
-                    dst_block_ids = project_blocks_to_global_chunk(
-                        dst_block_ids,
-                        chunk_block_offset=token_range.start // tpb,
-                        chunk_block_count=total_blocks - token_range.start // tpb,
-                        resident_block_end=prompt_blocks,
-                    )
-
-                peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
-                dst_block_ids = Sender._trim_receiver_window_head(
-                    src_block_ids,
-                    dst_block_ids,
-                    peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
-                    beam_width=task._beam_width,
+                beam_width = task._beam_width
+                # Anchors make the beam-0 length known (prompt_blocks − first
+                # ordinal), so tail counts are exact, not beam_width guesses.
+                src_beam0, src_tail = split_packed_beam_block_ids(
+                    src_block_ids, beam_width, max(0, prompt_blocks - src_first)
                 )
-                src_beam0 = Sender._beam0_block_count(src_block_ids, total_blocks, task._beam_width)
-                dst_beam0 = Sender._beam0_block_count(dst_block_ids, total_blocks, task._beam_width)
-                assert src_beam0 <= total_blocks, (
-                    f"src beam-0 block list ({src_beam0}) exceeds total slice "
-                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
+                dst_beam0, dst_tail = split_packed_beam_block_ids(
+                    dst_block_ids, beam_width, max(0, prompt_blocks - dst_first)
                 )
-                assert dst_beam0 <= total_blocks, (
-                    f"dst beam-0 block list ({dst_beam0}) exceeds total slice "
-                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
-                )
-                src_start = (total_blocks - src_beam0) * tpb
-                dst_start = (total_blocks - dst_beam0) * tpb
-                if req_info.dst_start_token is not None:
-                    dst_start = max(dst_start, req_info.dst_start_token)
-                if window_size is not None:
-                    # SWA eviction is based on the full prompt, not this slice.
-                    assert task._prompt_len is not None, (
-                        "SWA layer requires session.prompt_len; "
-                        "set TxSession(prompt_len=request.prompt_len)."
-                    )
-                    stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
-                    src_start = max(stale_end * tpb, src_start)
-                    dst_start = max(stale_end * tpb, dst_start)
+                # Pure interval intersection of the two anchored beam-0 spans.
                 src_block_ids, dst_block_ids = Sender._align_kv_blocks(
-                    src_block_ids,
-                    dst_block_ids,
-                    src_token_start=src_start,
-                    dst_token_start=dst_start,
+                    src_beam0,
+                    dst_beam0,
+                    src_token_start=src_first * tpb,
+                    dst_token_start=dst_first * tpb,
                     tokens_per_block=tpb,
                 )
+                if src_block_ids.size > 0 and (src_tail.size > 0 or dst_tail.size > 0):
+                    # Beam tails pair up positionally after the beam-0 spans.
+                    if src_tail.size != dst_tail.size:
+                        raise ValueError(
+                            f"packed beam-tail count mismatch for unique_rid="
+                            f"{task._unique_rid}: src has {src_tail.size} tail "
+                            f"block(s), dst has {dst_tail.size}"
+                        )
+                    src_block_ids = np.concatenate([src_block_ids, src_tail])
+                    dst_block_ids = np.concatenate([dst_block_ids, dst_tail])
                 src_region = extractor.extract(src_block_ids, self_lg, self_pi)
                 dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
 
@@ -1727,14 +1648,22 @@ class Receiver(ReceiverBase):
                 "both ctx_request_id and disagg_request_id are None for task "
                 f"unique_rid={task._unique_rid}"
             )
-        # Receiver's cached prefix is implicit in block_ids size; sender derives dst_start.
+        kv_slice = task._kv_slice
+        if len(kv_slice.first_ordinals) != len(kv_slice.block_ids_per_layer_groups):
+            # Not an assert: must survive python -O so an unanchored slice never
+            # reaches the wire.
+            raise ValueError(
+                f"KVSlice for unique_rid={task._unique_rid} carries "
+                f"{len(kv_slice.first_ordinals)} first_ordinals for "
+                f"{len(kv_slice.block_ids_per_layer_groups)} layer groups"
+            )
         return RecvReqInfo(
             sender_req_id=sender_req_id,
             instance_name=self_ri.instance_name,
             instance_rank=self_ri.instance_rank,
-            block_ids_per_layer_groups=task._kv_slice.block_ids_per_layer_groups,
+            block_ids_per_layer_groups=kv_slice.block_ids_per_layer_groups,
             unique_rid=task._unique_rid,
-            dst_start_token=None,
+            first_ordinals=kv_slice.first_ordinals,
             aux_slot=task._aux_slot,
             slice_id=task.slice_id,
         )

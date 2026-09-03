@@ -18,28 +18,25 @@ These tests validate the session state machine using the real
 TxSession/RxSession classes with lightweight stub sender/receiver objects.
 """
 
+import itertools
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
+import msgpack
 import numpy as np
 import pytest
 
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base.transfer import (
-    KVSlice,
-    SessionStatus,
-    TokenRange,
-    WaitResult,
-)
+from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,
+    Receiver,
     RecvReqInfo,
     RxSession,
     Sender,
     TaskStatus,
     TxSession,
-    project_blocks_to_global_chunk,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, LlmRequestType
@@ -112,80 +109,76 @@ def _make_rx_session(num_slices: int, rid: int = 42, prompt_len: int = 8) -> RxS
 
 
 # ---------------------------------------------------------------------------
-# Global chunk projection tests
+# Anchored span intersection tests
+#
+# The deleted project_blocks_to_global_chunk inferred a list's global position
+# from its length (suffix convention). Anchors make the position explicit;
+# _align_kv_blocks intersects two anchored spans directly.
 # ---------------------------------------------------------------------------
 
+_ANCHOR_TPB = 8
 
-def test_chunk_projection_noops_when_chunk_is_outside_short_layer_group():
-    """A shared chunk cursor past a short layer group's resident range is a no-op."""
-    block_ids = np.array([10, 11, 12], dtype=np.int64)
 
-    projected_ids = project_blocks_to_global_chunk(
-        block_ids,
-        chunk_block_offset=4,
-        chunk_block_count=4,
-        resident_block_end=3,
+def _align_anchored(src_ids, src_anchor, dst_ids, dst_anchor, tpb=_ANCHOR_TPB):
+    return Sender._align_kv_blocks(
+        np.asarray(src_ids, dtype=np.int64),
+        np.asarray(dst_ids, dtype=np.int64),
+        src_token_start=src_anchor * tpb,
+        dst_token_start=dst_anchor * tpb,
+        tokens_per_block=tpb,
     )
 
-    assert projected_ids.size == 0
+
+def test_chunk_anchored_past_short_group_span_is_a_noop():
+    """A chunk anchored past a short layer group's declared span transfers nothing."""
+    src, dst = _align_anchored(
+        src_ids=np.arange(4, 8, dtype=np.int64),  # chunk covering block ordinals [4, 8)
+        src_anchor=4,
+        dst_ids=np.array([10, 11, 12], dtype=np.int64),  # short group spans [0, 3)
+        dst_anchor=0,
+    )
+
+    assert src.size == 0
+    assert dst.size == 0
 
 
 @pytest.mark.parametrize(
-    "resident_block_end,chunk_block_offset,expected",
+    "chunk_anchor,chunk_ids,expected_dst",
     [
-        (16, 0, np.arange(16, dtype=np.int64)),
-        (32, 16, np.arange(16, 32, dtype=np.int64)),
+        (0, np.arange(16, dtype=np.int64), np.arange(100, 116, dtype=np.int64)),
+        (16, np.arange(16, 32, dtype=np.int64), np.arange(116, 132, dtype=np.int64)),
     ],
     ids=["first_chunk", "later_chunk"],
 )
-def test_chunk_projection_maps_incrementally_allocated_source(
-    resident_block_end, chunk_block_offset, expected
-):
-    """Source blocks end at the current chunk, not at the full prompt."""
-    block_ids = np.arange(resident_block_end, dtype=np.int64)
+def test_anchored_chunks_map_incrementally_allocated_source(chunk_anchor, chunk_ids, expected_dst):
+    """Each chunk's anchor addresses the receiver's whole-prompt list directly."""
+    dst_ids = np.arange(100, 132, dtype=np.int64)  # 32 blocks anchored at 0
 
-    projected_ids = project_blocks_to_global_chunk(
-        block_ids,
-        chunk_block_offset=chunk_block_offset,
-        chunk_block_count=16,
-        resident_block_end=resident_block_end,
-    )
+    src, dst = _align_anchored(chunk_ids, chunk_anchor, dst_ids, 0)
 
-    assert np.array_equal(projected_ids, expected)
+    assert np.array_equal(src, chunk_ids)
+    assert np.array_equal(dst, expected_dst)
 
 
-def test_chunk_projection_maps_prefix_reuse_suffix_by_overlap():
-    """Destination suffixes are matched by overlap, not by raw chunk-offset indexing."""
-    block_ids = np.array([104, 105, 106, 107], dtype=np.int64)
+def test_anchored_chunks_map_prefix_reuse_suffix_by_overlap():
+    """A receiver suffix anchored at its true ordinal overlaps only later chunks."""
+    dst_ids = np.array([104, 105, 106, 107], dtype=np.int64)  # spans [4, 8)
+    dst_anchor = 4
 
-    first_chunk = project_blocks_to_global_chunk(
-        block_ids,
-        chunk_block_offset=0,
-        chunk_block_count=4,
-        resident_block_end=8,
-    )
-    second_chunk = project_blocks_to_global_chunk(
-        block_ids,
-        chunk_block_offset=4,
-        chunk_block_count=4,
-        resident_block_end=8,
-    )
+    first_src, first_dst = _align_anchored(np.arange(4), 0, dst_ids, dst_anchor)
+    second_src, second_dst = _align_anchored(np.arange(4, 8), 4, dst_ids, dst_anchor)
 
-    assert first_chunk.size == 0
-    assert np.array_equal(second_chunk, block_ids)
+    assert first_src.size == 0 and first_dst.size == 0
+    assert np.array_equal(second_src, np.arange(4, 8))
+    assert np.array_equal(second_dst, dst_ids)
 
 
 _PROJECTION_TPB = 8
 _PROJECTION_PROMPT_TOKENS = 8 * _PROJECTION_TPB
 
 
-def _projection_token_range(start_block: int, end_block: int) -> TokenRange:
-    """A chunk's block window as the block-aligned token range that rides the slice."""
-    return TokenRange(start=start_block * _PROJECTION_TPB, end=end_block * _PROJECTION_TPB)
-
-
-def _make_projection_sender() -> Sender:
-    """Create a Sender wired to a stub registrar with two full-attention layer groups.
+def _make_projection_sender(num_groups: int = 2, tpb: int = _PROJECTION_TPB) -> Sender:
+    """Create a Sender wired to a stub registrar with full-attention layer groups.
 
     Full attention is spelled as a window the prompt never outgrows, which is
     how both extractor paths build it; they read max_attention_window_vec, so an
@@ -203,10 +196,10 @@ def _make_projection_sender() -> Sender:
 
     extractor = MagicMock()
     extractor.page_table = SimpleNamespace(
-        tokens_per_block=_PROJECTION_TPB,
+        tokens_per_block=tpb,
         layer_groups=[
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS),
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS),
+            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS)
+            for _ in range(num_groups)
         ],
     )
     # extract(region_ids, layer_group_id, pool_idx) - the caller passes the
@@ -230,10 +223,7 @@ def _make_projection_sender() -> Sender:
     registrar.get_peer_rank_info.return_value = peer_ri
     registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
     registrar.should_send_kv.return_value = True
-    registrar.get_pool_mapping.return_value = {
-        (0, 0): (0, 0),
-        (1, 0): (1, 0),
-    }
+    registrar.get_pool_mapping.return_value = {(lg, 0): (lg, 0) for lg in range(num_groups)}
     registrar.peer_extractor.return_value = extractor
     registrar.get_kv_map.return_value = mapper
 
@@ -242,7 +232,9 @@ def _make_projection_sender() -> Sender:
     return sender
 
 
-def _make_projection_task(slice_id: int = 1) -> KVSendTask:
+def _make_projection_task(slice_id: int = 1, beam_width: int = 1) -> KVSendTask:
+    # Group 0 carries the chunk covering block ordinals [4, 8); group 1 is a
+    # shorter (asymmetric) group whose resident suffix spans [5, 8).
     return KVSendTask(
         KVSlice(
             is_last_slice=True,
@@ -250,11 +242,12 @@ def _make_projection_task(slice_id: int = 1) -> KVSendTask:
                 np.array([4, 5, 6, 7], dtype=np.int64),
                 np.array([10, 11, 12], dtype=np.int64),
             ],
-            token_range=_projection_token_range(4, 8),
+            first_ordinals=[4, 5],
         ),
         _make_params(),
         slice_id=slice_id,
         prompt_len=_PROJECTION_PROMPT_TOKENS,
+        beam_width=beam_width,
     )
 
 
@@ -268,6 +261,7 @@ def _make_projection_req_info(slice_id=None) -> RecvReqInfo:
             np.array([200, 201, 202], dtype=np.int64),
         ],
         unique_rid=42,
+        first_ordinals=[4, 5],
         slice_id=slice_id,
     )
 
@@ -305,7 +299,9 @@ def test_final_swa_slice_keeps_the_receivers_complete_active_window():
                 np.arange(2, 8, dtype=np.int64),
                 np.array([], dtype=np.int64),
             ],
-            token_range=_projection_token_range(6, 8),
+            # The deferred SWA group is anchored at its true window start (2),
+            # not at the final context chunk's start (6).
+            first_ordinals=[2, 0],
         ),
         _make_params(),
         slice_id=1,
@@ -320,6 +316,7 @@ def test_final_swa_slice_keeps_the_receivers_complete_active_window():
             np.array([], dtype=np.int64),
         ],
         unique_rid=42,
+        first_ordinals=[2, 0],
     )
 
     write_meta = sender._build_kv_write_meta(task, req_info)
@@ -328,34 +325,55 @@ def test_final_swa_slice_keeps_the_receivers_complete_active_window():
     assert np.array_equal(write_meta.dst_ptrs, np.arange(102, 108, dtype=np.int64))
 
 
-def test_whole_prompt_chunk_addresses_like_a_monolithic_slice():
-    """A whole-prompt chunk has monolithic addressing."""
+def test_chunked_slices_reassemble_to_the_monolithic_transfer():
+    """Anchored chunks concatenate to exactly the monolithic slice's pairs."""
     sender = _make_projection_sender()
-    src_per_group = [
-        np.arange(8, dtype=np.int64),
-        np.array([10, 11, 12], dtype=np.int64),
-    ]
+    src_group0 = np.arange(8, dtype=np.int64)  # full-attention, anchored at 0
+    src_group1 = np.array([10, 11, 12], dtype=np.int64)  # short group, spans [5, 8)
 
-    def task_for(token_range):
-        return KVSendTask(
+    monolithic_task = KVSendTask(
+        KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=[src_group0, src_group1],
+            first_ordinals=[0, 5],
+        ),
+        _make_params(),
+        slice_id=0,
+        prompt_len=64,
+    )
+    chunk_tasks = [
+        KVSendTask(
             KVSlice(
-                is_last_slice=True,
-                block_ids_per_layer_groups=src_per_group,
-                token_range=token_range,
+                is_last_slice=False,
+                block_ids_per_layer_groups=[src_group0[:4], src_group1[:0]],
+                first_ordinals=[0, 0],
             ),
             _make_params(),
             slice_id=0,
             prompt_len=64,
-        )
+        ),
+        KVSendTask(
+            KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=[src_group0[4:], src_group1],
+                first_ordinals=[4, 5],
+            ),
+            _make_params(),
+            slice_id=1,
+            prompt_len=64,
+        ),
+    ]
 
-    chunked = sender._build_kv_write_meta(
-        task_for(_projection_token_range(0, 8)), _make_projection_req_info()
+    monolithic = sender._build_kv_write_meta(monolithic_task, _make_projection_req_info())
+    chunked = [sender._build_kv_write_meta(t, _make_projection_req_info()) for t in chunk_tasks]
+
+    chunked_src = np.concatenate([m.src_ptrs for m in chunked])
+    chunked_dst = np.concatenate([m.dst_ptrs for m in chunked])
+    # Pair sets are equal: every (src, dst) block pair is transferred exactly once.
+    assert sorted(zip(chunked_src.tolist(), chunked_dst.tolist())) == sorted(
+        zip(monolithic.src_ptrs.tolist(), monolithic.dst_ptrs.tolist())
     )
-    monolithic = sender._build_kv_write_meta(task_for(None), _make_projection_req_info())
-
-    assert np.array_equal(chunked.src_ptrs, monolithic.src_ptrs)
-    assert np.array_equal(chunked.dst_ptrs, monolithic.dst_ptrs)
-    assert np.array_equal(chunked.sizes, monolithic.sizes)
+    assert np.concatenate([m.sizes for m in chunked]).sum() == monolithic.sizes.sum()
 
 
 def test_build_kv_write_meta_tracks_sender_and_receiver_slice_ids():
@@ -368,6 +386,417 @@ def test_build_kv_write_meta_tracks_sender_and_receiver_slice_ids():
 
     assert write_meta.slice_id == 1
     assert write_meta.receiver_slice_id == 3
+
+
+def test_helix_receiver_requires_zero_block_anchors():
+    """A helix peer rejects anchored (trimmed/reused) spans loudly."""
+    sender = _make_projection_sender()
+    sender._registrar.get_peer_rank_info.return_value.cp_size = 2
+    sender._registrar.get_peer_rank_info.return_value.cp_rank = 0
+
+    # slice_id=0 and is_last_slice=True: not a partial chunk, so the pipelined
+    # CP guard passes and the anchor guard is what must fire.
+    with pytest.raises(ValueError, match="helix CP requires zero block anchors"):
+        sender._build_kv_write_meta(_make_projection_task(slice_id=0), _make_projection_req_info())
+
+
+def test_beam_tails_pair_positionally_after_the_beam0_spans():
+    """Packed beam-tail blocks ride behind the anchored beam-0 intersection."""
+    sender = _make_projection_sender(num_groups=1)
+    beam_width = 4
+    # 8 prompt blocks + 3 per-beam tail blocks on each side, both anchored at 0.
+    task = KVSendTask(
+        KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=[
+                np.concatenate([np.arange(8), np.array([70, 71, 72])]).astype(np.int64)
+            ],
+            first_ordinals=[0],
+        ),
+        _make_params(),
+        slice_id=0,
+        prompt_len=_PROJECTION_PROMPT_TOKENS,
+        beam_width=beam_width,
+    )
+    req_info = RecvReqInfo(
+        sender_req_id=42,
+        instance_name="decode",
+        instance_rank=0,
+        block_ids_per_layer_groups=[
+            np.concatenate([np.arange(100, 108), np.array([170, 171, 172])]).astype(np.int64)
+        ],
+        unique_rid=42,
+        first_ordinals=[0],
+    )
+
+    write_meta = sender._build_kv_write_meta(task, req_info)
+
+    assert np.array_equal(
+        write_meta.src_ptrs, np.concatenate([np.arange(8), np.array([70, 71, 72])])
+    )
+    assert np.array_equal(
+        write_meta.dst_ptrs, np.concatenate([np.arange(100, 108), np.array([170, 171, 172])])
+    )
+
+
+def test_fewer_shared_tails_than_beam_width_pair_correctly():
+    """Anchored beam-0 length splits partially-shared beam tails exactly.
+
+    The packer appends only UNSHARED final blocks, so beam_width=4 lists can
+    carry just 2 tails; the old beam_width-1 guess misclassified the last
+    beam-0 block as a tail here.
+    """
+    sender = _make_projection_sender(num_groups=1)
+    beam_width = 4
+    # 8 prompt blocks + 2 unshared tail blocks on each side, both anchored at 0.
+    task = KVSendTask(
+        KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=[
+                np.concatenate([np.arange(8), np.array([70, 71])]).astype(np.int64)
+            ],
+            first_ordinals=[0],
+        ),
+        _make_params(),
+        slice_id=0,
+        prompt_len=_PROJECTION_PROMPT_TOKENS,
+        beam_width=beam_width,
+    )
+    req_info = RecvReqInfo(
+        sender_req_id=42,
+        instance_name="decode",
+        instance_rank=0,
+        block_ids_per_layer_groups=[
+            np.concatenate([np.arange(100, 108), np.array([170, 171])]).astype(np.int64)
+        ],
+        unique_rid=42,
+        first_ordinals=[0],
+    )
+
+    write_meta = sender._build_kv_write_meta(task, req_info)
+
+    # All 8 beam-0 blocks pair by ordinal; exactly the 2 tails ride behind.
+    assert np.array_equal(write_meta.src_ptrs, np.concatenate([np.arange(8), np.array([70, 71])]))
+    assert np.array_equal(
+        write_meta.dst_ptrs, np.concatenate([np.arange(100, 108), np.array([170, 171])])
+    )
+
+
+def test_beam_tail_count_mismatch_raises():
+    """Unequal packed beam-tail counts cannot pair positionally and must fail."""
+    sender = _make_projection_sender(num_groups=1)
+    task = KVSendTask(
+        KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=[
+                np.concatenate([np.arange(8), np.array([70, 71, 72])]).astype(np.int64)
+            ],
+            first_ordinals=[0],
+        ),
+        _make_params(),
+        slice_id=0,
+        prompt_len=_PROJECTION_PROMPT_TOKENS,
+        beam_width=4,
+    )
+    # dst has no tail blocks (its final blocks are shared across beams).
+    req_info = RecvReqInfo(
+        sender_req_id=42,
+        instance_name="decode",
+        instance_rank=0,
+        block_ids_per_layer_groups=[np.arange(100, 108, dtype=np.int64)],
+        unique_rid=42,
+        first_ordinals=[0],
+    )
+
+    with pytest.raises(ValueError, match="packed beam-tail count mismatch"):
+        sender._build_kv_write_meta(task, req_info)
+
+
+def test_receiver_with_larger_window_resolves_via_anchors():
+    """The receiver's earlier-starting window is aligned by anchors, not trimmed.
+
+    Old behavior (_trim_receiver_window_head, deleted): a receiver keeping a
+    larger SWA window (only it runs speculative decoding) held extra leading
+    blocks, which the sender dropped by count so that suffix-derived starts
+    lined up. With explicit anchors the sender simply intersects the two
+    declared spans: the receiver's extra head block gets no source and the
+    last prompt block maps exactly (the old off-by-one regression).
+    """
+    tpb = 128
+    total_blocks = 1225
+    sender = _make_projection_sender(num_groups=1, tpb=tpb)
+    task = KVSendTask(
+        KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=[np.array([10], dtype=np.int64)],
+            first_ordinals=[total_blocks - 1],  # sender window: last block only
+        ),
+        _make_params(),
+        slice_id=0,
+        prompt_len=total_blocks * tpb,
+    )
+    req_info = RecvReqInfo(
+        sender_req_id=42,
+        instance_name="decode",
+        instance_rank=0,
+        block_ids_per_layer_groups=[np.array([20, 21], dtype=np.int64)],
+        unique_rid=42,
+        first_ordinals=[total_blocks - 2],  # receiver window starts one block earlier
+    )
+
+    write_meta = sender._build_kv_write_meta(task, req_info)
+
+    # src block 10 lands on dst block 21 (same ordinal); dst block 20 has no
+    # source and is not written.
+    assert np.array_equal(write_meta.src_ptrs, np.array([10], dtype=np.int64))
+    assert np.array_equal(write_meta.dst_ptrs, np.array([21], dtype=np.int64))
+
+
+# ---------------------------------------------------------------------------
+# Anchored alignment property test
+#
+# For a grid over (tpb, prompt length, per-side window sizes, gen cached
+# prefix, chunk boundaries, beam width): every (src, dst) pointer pair maps
+# equal block ordinals, and the transferred set equals the intersection of the
+# declared spans. Block IDs encode their ordinal so the mocked extractors
+# (identity ptrs) expose the mapping directly.
+# ---------------------------------------------------------------------------
+
+_SRC_ID_BASE = 1_000
+_DST_ID_BASE = 5_000
+_SRC_TAIL_BASE = 3_000
+_DST_TAIL_BASE = 7_000
+
+
+def _swa_start_block(prompt_len, window, tpb):
+    if window is None or window >= prompt_len:
+        return 0
+    return (prompt_len + 1 - window) // tpb
+
+
+def _grid_req_info(dst_ids: np.ndarray, dst_anchor: int) -> RecvReqInfo:
+    return RecvReqInfo(
+        sender_req_id=42,
+        instance_name="decode",
+        instance_rank=0,
+        block_ids_per_layer_groups=[dst_ids],
+        unique_rid=42,
+        first_ordinals=[dst_anchor],
+    )
+
+
+def test_anchored_alignment_property_grid():
+    tpb_values = (4, 16)
+    prompt_block_counts = (1, 3, 8)
+    window_block_options = (None, 2, 5)  # window sizes in blocks (None = full attention)
+    gen_cached_block_options = (0, 1, 4)
+    beam_widths = (1, 2)
+
+    for tpb, prompt_blocks, src_wblocks, dst_wblocks, gen_cached, beam_width in itertools.product(
+        tpb_values,
+        prompt_block_counts,
+        window_block_options,
+        window_block_options,
+        gen_cached_block_options,
+        beam_widths,
+    ):
+        prompt_len = prompt_blocks * tpb - 1  # exercise the ceil in prompt_blocks
+        src_window = src_wblocks * tpb + 1 if src_wblocks is not None else None
+        dst_window = dst_wblocks * tpb + 1 if dst_wblocks is not None else None
+
+        src_anchor = _swa_start_block(prompt_len, src_window, tpb)
+        dst_anchor = max(
+            _swa_start_block(prompt_len, dst_window, tpb), min(gen_cached, prompt_blocks)
+        )
+        # Beam search never combines with eviction/reuse trims in production
+        # (front-block eviction and chunked transfer assert beam_width == 1).
+        if beam_width > 1 and (src_anchor > 0 or dst_anchor > 0):
+            continue
+
+        case = (
+            f"tpb={tpb} prompt_blocks={prompt_blocks} src_w={src_wblocks} "
+            f"dst_w={dst_wblocks} cached={gen_cached} beam={beam_width}"
+        )
+        src_span = np.arange(_SRC_ID_BASE + src_anchor, _SRC_ID_BASE + prompt_blocks)
+        dst_span = np.arange(_DST_ID_BASE + dst_anchor, _DST_ID_BASE + prompt_blocks)
+        n_tails = beam_width - 1
+        src_ids = np.concatenate([src_span, np.arange(_SRC_TAIL_BASE, _SRC_TAIL_BASE + n_tails)])
+        dst_ids = np.concatenate([dst_span, np.arange(_DST_TAIL_BASE, _DST_TAIL_BASE + n_tails)])
+
+        sender = _make_projection_sender(num_groups=1, tpb=tpb)
+
+        # --- monolithic slice ---
+        task = KVSendTask(
+            KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=[src_ids.astype(np.int64)],
+                first_ordinals=[src_anchor],
+            ),
+            _make_params(),
+            slice_id=0,
+            prompt_len=prompt_len,
+            beam_width=beam_width,
+        )
+        meta = sender._build_kv_write_meta(
+            task, _grid_req_info(dst_ids.astype(np.int64), dst_anchor)
+        )
+
+        expected_ordinals = list(range(max(src_anchor, dst_anchor), prompt_blocks))
+        got_pairs = list(zip(meta.src_ptrs.tolist(), meta.dst_ptrs.tolist()))
+        beam0_pairs = [p for p in got_pairs if p[0] < _SRC_TAIL_BASE]
+        tail_pairs = [p for p in got_pairs if p[0] >= _SRC_TAIL_BASE]
+        # Every pair maps equal ordinals on both sides.
+        assert all(s - _SRC_ID_BASE == d - _DST_ID_BASE for s, d in beam0_pairs), case
+        # The transferred range is exactly the intersection of the two spans.
+        assert [s - _SRC_ID_BASE for s, _ in beam0_pairs] == expected_ordinals, case
+        if expected_ordinals and n_tails:
+            assert tail_pairs == [
+                (_SRC_TAIL_BASE + i, _DST_TAIL_BASE + i) for i in range(n_tails)
+            ], case
+        else:
+            assert tail_pairs == [], case
+
+        # --- chunked slices (full-attention source only; SWA groups are
+        # deferred whole to the final chunk by _build_prefill_chunk) ---
+        if src_wblocks is not None or beam_width > 1:
+            continue
+        for chunk_blocks in (1, 2, prompt_blocks):
+            seen_ordinals = []
+            bounds = list(range(0, prompt_blocks, chunk_blocks)) + [prompt_blocks]
+            for slice_id, (c0, c1) in enumerate(zip(bounds[:-1], bounds[1:])):
+                if c0 >= c1:
+                    continue
+                chunk_ids = np.arange(_SRC_ID_BASE + c0, _SRC_ID_BASE + c1)
+                chunk_task = KVSendTask(
+                    KVSlice(
+                        is_last_slice=(c1 == prompt_blocks),
+                        block_ids_per_layer_groups=[chunk_ids.astype(np.int64)],
+                        first_ordinals=[c0],
+                    ),
+                    _make_params(),
+                    slice_id=slice_id,
+                    prompt_len=prompt_len,
+                )
+                chunk_meta = sender._build_kv_write_meta(
+                    chunk_task, _grid_req_info(dst_ids.astype(np.int64), dst_anchor)
+                )
+                for s, d in zip(chunk_meta.src_ptrs.tolist(), chunk_meta.dst_ptrs.tolist()):
+                    assert s - _SRC_ID_BASE == d - _DST_ID_BASE, f"{case} chunk={chunk_blocks}"
+                    seen_ordinals.append(s - _SRC_ID_BASE)
+            # Chunks tile the intersection exactly once, in order.
+            assert seen_ordinals == expected_ordinals, f"{case} chunk={chunk_blocks}"
+
+
+# ---------------------------------------------------------------------------
+# RecvReqInfo wire format
+# ---------------------------------------------------------------------------
+
+
+def test_recv_req_info_first_ordinals_roundtrip():
+    """first_ordinals survive to_bytes/from_bytes unchanged."""
+    info = RecvReqInfo(
+        sender_req_id=7,
+        instance_name="decode",
+        instance_rank=3,
+        block_ids_per_layer_groups=[
+            np.array([104, 105], dtype=np.int64),
+            np.array([], dtype=np.int64),
+        ],
+        unique_rid=42,
+        first_ordinals=[6, 0],
+        aux_slot=1,
+        slice_id=2,
+        bounce_dst_base=None,
+    )
+
+    restored = RecvReqInfo.from_bytes(info.to_bytes())
+
+    assert restored.first_ordinals == [6, 0]
+    assert restored.sender_req_id == 7
+    assert restored.instance_name == "decode"
+    assert restored.instance_rank == 3
+    assert restored.unique_rid == 42
+    assert restored.aux_slot == 1
+    assert restored.slice_id == 2
+    assert np.array_equal(restored.block_ids_per_layer_groups[0], [104, 105])
+    assert restored.block_ids_per_layer_groups[1].size == 0
+
+
+def test_recv_req_info_rejects_pre_anchor_wire_layout():
+    """Bytes from a peer still sending dst_start_token fail loudly, never misalign."""
+    old_layout = msgpack.packb(
+        {
+            "sender_req_id": 7,
+            "instance_name": "decode",
+            "instance_rank": 0,
+            "block_ids_per_layer_groups": [np.array([104], dtype=np.int64).tobytes()],
+            "unique_rid": 42,
+            "dst_start_token": 128,  # pre-anchor field, no first_ordinals
+            "aux_slot": None,
+            "slice_id": 0,
+            "bounce_dst_base": None,
+        }
+    )
+
+    with pytest.raises(TypeError):
+        RecvReqInfo.from_bytes(old_layout)
+
+
+# ---------------------------------------------------------------------------
+# Receiver-side anchor validation
+# ---------------------------------------------------------------------------
+
+
+def _make_recv_task(kv_slice: KVSlice) -> SimpleNamespace:
+    return SimpleNamespace(
+        _unique_rid=42,
+        _params=SimpleNamespace(ctx_request_id=7, disagg_request_id=42),
+        _kv_slice=kv_slice,
+        _aux_slot=None,
+        slice_id=0,
+    )
+
+
+def _make_bare_receiver() -> Receiver:
+    receiver = Receiver.__new__(Receiver)
+    receiver._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="decode", instance_rank=0)
+    )
+    return receiver
+
+
+def test_recv_req_info_requires_one_anchor_per_layer_group():
+    """An unanchored slice never reaches the wire."""
+    receiver = _make_bare_receiver()
+    kv_slice = KVSlice(
+        is_last_slice=True,
+        block_ids_per_layer_groups=[
+            np.array([1, 2], dtype=np.int64),
+            np.array([3], dtype=np.int64),
+        ],
+        first_ordinals=[0],  # one anchor missing
+    )
+
+    with pytest.raises(ValueError, match="first_ordinals"):
+        receiver._build_recv_req_info(_make_recv_task(kv_slice))
+
+
+def test_recv_req_info_carries_the_slice_anchors():
+    receiver = _make_bare_receiver()
+    kv_slice = KVSlice(
+        is_last_slice=True,
+        block_ids_per_layer_groups=[
+            np.array([1, 2], dtype=np.int64),
+            np.array([], dtype=np.int64),
+        ],
+        first_ordinals=[3, 0],
+    )
+
+    info = receiver._build_recv_req_info(_make_recv_task(kv_slice))
+
+    assert info.first_ordinals == [3, 0]
+    assert info.unique_rid == 42
+    assert info.sender_req_id == 7
 
 
 def test_process_kv_agent_result_resolves_task_by_receiver_slice_id():
@@ -935,12 +1364,13 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     transceiver._transfer_worker = SimpleNamespace(create_tx_session=lambda _req: session)
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_block_ids=lambda _req, _idx, _lg: source_block_ids,
+        get_transfer_span=lambda _req, _idx, _lg: (source_block_ids, 0),
     )
     transceiver._page_table = SimpleNamespace(
         layer_groups=[SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=None)]
     )
     transceiver._kv_cache_manager = SimpleNamespace(tokens_per_block=tokens_per_block)
+    transceiver._mapping = SimpleNamespace(cp_size=1)
     transceiver._dp_rank = 0
     transceiver._context_info_endpoint = "ctx"
 
@@ -965,10 +1395,7 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     request.context_remaining_length = 0
     transceiver.respond_and_send_async(request)
 
-    assert [task._slice.token_range for task in session.kv_tasks] == [
-        TokenRange(start=0, end=2 * tokens_per_block),
-        TokenRange(start=2 * tokens_per_block, end=4 * tokens_per_block),
-    ]
+    assert [task._slice.first_ordinals for task in session.kv_tasks] == [[0], [2]]
     assert [task._slice.block_ids_per_layer_groups[0].tolist() for task in session.kv_tasks] == [
         [0, 1],
         [2, 3],
@@ -989,11 +1416,6 @@ _REUSE_TPB = 4
 _REUSE_TOTAL_BLOCKS = 8
 
 
-def _reuse_token_range(start_block: int, end_block: int) -> TokenRange:
-    """A chunk's block window as the block-aligned token range that rides the slice."""
-    return TokenRange(start=start_block * _REUSE_TPB, end=end_block * _REUSE_TPB)
-
-
 def _build_prefill_chunk_tokens_for(
     prepopulated_tokens,
     chunk_start_pos,
@@ -1001,11 +1423,13 @@ def _build_prefill_chunk_tokens_for(
     resident_blocks=None,
     sliding_window_size=_REUSE_TOTAL_BLOCKS * _REUSE_TPB,
     source_block_ids=None,
+    span_anchor=0,
 ):
     """Drive the real _build_prefill_chunk for one chunk, in token coordinates.
 
     ``resident_blocks`` is how many blocks the mocked ``_create_kv_slice`` hands
-    back, and defaults to the block holding ``chunk_end_pos``.
+    back, and defaults to the block holding ``chunk_end_pos``. ``span_anchor``
+    is the block ordinal the mocked base slice is anchored at.
 
     ``sliding_window_size`` defaults to a full-attention layer as the V1
     extractor actually builds one: its groups come from max_attention_window_vec
@@ -1022,9 +1446,13 @@ def _build_prefill_chunk_tokens_for(
         source_block_ids = np.arange(resident_blocks, dtype=np.int64)
     base_slice = KVSlice(
         block_ids_per_layer_groups=[np.asarray(source_block_ids, dtype=np.int64)],
+        first_ordinals=[span_anchor],
     )
 
     transceiver = MagicMock()
+    # Bind the real predicate: a bare MagicMock's truthy auto-mock would defer
+    # every group (even full-attention) to the final slice.
+    transceiver._defers_to_final_slice = KvCacheTransceiverV2._defers_to_final_slice
     transceiver._kv_cache_manager.tokens_per_block = _REUSE_TPB
     transceiver._create_kv_slice.return_value = base_slice
     transceiver._page_table = SimpleNamespace(
@@ -1069,7 +1497,7 @@ def test_build_prefill_chunk_rounds_unaligned_non_final_end_down():
     )
 
     assert kv_slice.is_last_slice is False
-    assert kv_slice.token_range == _reuse_token_range(0, 1)
+    assert kv_slice.first_ordinals == [0]
     assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(1, dtype=np.int64))
 
 
@@ -1086,7 +1514,8 @@ def test_unaligned_chunk_boundaries_tile_block_space_exactly():
     ]
 
     block_spans = [
-        (s.token_range.start // _REUSE_TPB, s.token_range.end // _REUSE_TPB) for s in slices
+        (s.first_ordinals[0], s.first_ordinals[0] + s.block_ids_per_layer_groups[0].size)
+        for s in slices
     ]
     assert block_spans == [(0, 1), (1, 3), (3, _REUSE_TOTAL_BLOCKS)]
 
@@ -1129,6 +1558,7 @@ def test_swa_blocks_are_deferred_until_the_complete_final_window():
         resident_blocks=_REUSE_TOTAL_BLOCKS,
         sliding_window_size=16,
         source_block_ids=np.arange(4, _REUSE_TOTAL_BLOCKS),
+        span_anchor=4,
     )
 
     assert first_slice is None
@@ -1137,6 +1567,9 @@ def test_swa_blocks_are_deferred_until_the_complete_final_window():
         final_slice.block_ids_per_layer_groups[0],
         np.arange(4, _REUSE_TOTAL_BLOCKS, dtype=np.int64),
     )
+    # The deferred window rides anchored at its true window-start ordinal, not
+    # at the final chunk's start.
+    assert final_slice.first_ordinals == [4]
 
 
 @pytest.mark.parametrize(
@@ -1163,6 +1596,7 @@ def test_window_covering_the_whole_prompt_streams_like_full_attention(window_tok
 
     assert kv_slice is not None
     assert kv_slice.is_last_slice is False
+    assert kv_slice.first_ordinals == [0]
     assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(4, dtype=np.int64))
 
 
@@ -1174,7 +1608,7 @@ def test_unaligned_reuse_prefix_still_extends_first_chunk_to_block_zero():
         chunk_end_pos=14,
     )
 
-    assert kv_slice.token_range == _reuse_token_range(0, 3)
+    assert kv_slice.first_ordinals == [0]
     assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(3, dtype=np.int64))
 
 
@@ -1186,7 +1620,7 @@ def test_first_chunk_covers_ctx_prefix_reuse():
         chunk_end_block=6,
     )
 
-    assert kv_slice.token_range == _reuse_token_range(0, 6)
+    assert kv_slice.first_ordinals == [0]
     assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(6, dtype=np.int64))
     assert kv_slice.is_last_slice is False
 
@@ -1211,7 +1645,7 @@ def test_only_the_first_chunk_extends_to_block_zero(
         resident_blocks=_REUSE_TOTAL_BLOCKS,
     )
 
-    assert kv_slice.token_range == _reuse_token_range(expected_start_block, chunk_end_block)
+    assert kv_slice.first_ordinals == [expected_start_block]
     assert np.array_equal(
         kv_slice.block_ids_per_layer_groups[0],
         np.arange(expected_start_block, chunk_end_block, dtype=np.int64),
@@ -1221,9 +1655,9 @@ def test_only_the_first_chunk_extends_to_block_zero(
 def test_single_chunk_with_reuse_degenerates_to_monolithic_slice():
     """One chunk plus a reuse hit yields the same slice shape a monolithic send would.
 
-    The chunk still spans [0, total_blocks), which _build_kv_write_meta addresses
-    exactly as an unpipelined write — see
-    test_whole_prompt_chunk_addresses_like_a_monolithic_slice.
+    The chunk still spans [0, total_blocks) anchored at 0, which
+    _build_kv_write_meta addresses exactly as an unpipelined write — see
+    test_chunked_slices_reassemble_to_the_monolithic_transfer.
     """
     kv_slice = _build_prefill_chunk_for(
         prepopulated_blocks=3,
@@ -1233,11 +1667,63 @@ def test_single_chunk_with_reuse_degenerates_to_monolithic_slice():
     )
 
     assert kv_slice.is_last_slice is True
-    assert kv_slice.token_range == _reuse_token_range(0, _REUSE_TOTAL_BLOCKS)
+    assert kv_slice.first_ordinals == [0]
     assert np.array_equal(
         kv_slice.block_ids_per_layer_groups[0],
         np.arange(_REUSE_TOTAL_BLOCKS, dtype=np.int64),
     )
+
+
+def test_chunk_before_an_anchored_group_span_contributes_nothing():
+    """A chunk entirely before a group's anchored span sends no blocks for it."""
+    # The group's span covers block ordinals [4, 8); the chunk covers [0, 4).
+    kv_slice = _build_prefill_chunk_tokens_for(
+        prepopulated_tokens=0,
+        chunk_start_pos=0,
+        chunk_end_pos=4 * _REUSE_TPB,
+        resident_blocks=4,
+        source_block_ids=np.array([104, 105, 106, 107], dtype=np.int64),
+        span_anchor=4,
+    )
+
+    # Nothing to send yet: the only group contributes no blocks.
+    assert kv_slice is None
+
+
+def test_chunk_overlapping_an_anchored_group_span_starts_at_the_anchor():
+    """The chunk's sub-slice starts at max(chunk_start, span anchor)."""
+    kv_slice = _build_prefill_chunk_tokens_for(
+        prepopulated_tokens=0,
+        chunk_start_pos=3 * _REUSE_TPB,
+        chunk_end_pos=6 * _REUSE_TPB,
+        resident_blocks=4,
+        source_block_ids=np.array([104, 105, 106, 107], dtype=np.int64),
+        span_anchor=4,
+    )
+
+    # Span [4, 8) ∩ chunk [3, 6) = [4, 6): blocks 104, 105 anchored at 4.
+    assert kv_slice.first_ordinals == [4]
+    assert np.array_equal(
+        kv_slice.block_ids_per_layer_groups[0], np.array([104, 105], dtype=np.int64)
+    )
+
+
+def test_span_not_covering_the_chunk_end_raises():
+    """A short streaming-group span cannot address the chunk by ordinal.
+
+    A ValueError (not a bare assert) so the guard survives python -O: a short
+    span silently transferring misaligned chunk blocks is the failure mode the
+    anchors exist to prevent.
+    """
+    with pytest.raises(ValueError, match="does not cover the chunk end"):
+        _build_prefill_chunk_tokens_for(
+            prepopulated_tokens=0,
+            chunk_start_pos=0,
+            chunk_end_pos=_REUSE_TOTAL_BLOCKS * _REUSE_TPB,  # final chunk: end block 8
+            resident_blocks=2,
+            source_block_ids=np.array([104, 105], dtype=np.int64),  # span [4, 6)
+            span_anchor=4,
+        )
 
 
 # ---------------------------------------------------------------------------
