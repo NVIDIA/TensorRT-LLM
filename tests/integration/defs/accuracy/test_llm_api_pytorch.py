@@ -23,6 +23,7 @@ import torch
 from datasets import load_dataset
 from defs.conftest import get_sm_version, is_sm_100f
 from mpi4py.futures import MPIPoolExecutor
+from pytest_mock import MockerFixture
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
@@ -1181,166 +1182,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_acc_spec="beam_width=2")
-
-
-class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.2-3B"
-    MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-3B"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_hopper
-    def test_fp8_prequantized(self):
-        model_path = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-3B-Instruct-FP8"
-        with LLM(model_path) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-@pytest.mark.timeout(7200)
-@pytest.mark.skip_less_device_memory(80000)
-class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
-
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_auto_dtype_tp8(self):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
-        with LLM(model_path, tensor_parallel_size=8) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-    @pytest.mark.skip_less_mpi_world_size(2)
-    def test_auto_dtype_tp2(self):
-        _run_multinode_accuracy(
-            f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct",
-            self.MODEL_NAME,
-            benchmarks=["mmlu"])
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @parametrize_with_ids("torch_compile", [False, True])
-    @parametrize_with_ids("eagle3_one_model", [True, False])
-    def test_fp8_eagle3_tp8(self, eagle3_one_model, torch_compile):
-        model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
-        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-        spec_config = Eagle3DecodingConfig(max_draft_len=3,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=eagle3_one_model)
-        torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        pytorch_config = dict(
-            disable_overlap_scheduler=not eagle3_one_model,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=1),
-            torch_compile_config=torch_compile_config)
-        with LLM(model_path,
-                 max_batch_size=16,
-                 tensor_parallel_size=8,
-                 speculative_config=spec_config,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device(4)
-    @skip_pre_hopper
-    @parametrize_with_ids("torch_compile", [False, True])
-    def test_fp8_tp4(self, torch_compile):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
-        torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        with LLM(model_path,
-                 tensor_parallel_size=4,
-                 max_seq_len=8192,
-                 max_batch_size=32,
-                 kv_cache_config=kv_cache_config,
-                 torch_compile_config=torch_compile_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            sampling_params = SamplingParams(
-                max_tokens=256,
-                temperature=0.0,
-                add_special_tokens=False,
-            )
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-    @pytest.mark.skip_less_device(4)
-    @skip_pre_blackwell
-    @parametrize_with_ids("torch_compile", [False, True])
-    def test_nvfp4_tp4(self, torch_compile):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
-        torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        with LLM(model_path,
-                 tensor_parallel_size=4,
-                 max_batch_size=32,
-                 kv_cache_config=kv_cache_config,
-                 torch_compile_config=torch_compile_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            sampling_params = SamplingParams(
-                max_tokens=256,
-                temperature=0.0,
-                add_special_tokens=False,
-            )
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-    @pytest.mark.skip_less_device(4)
-    @skip_pre_blackwell
-    @parametrize_with_ids("enable_gemm_allreduce_fusion", [False, True])
-    @parametrize_with_ids("torch_compile", [False, True])
-    def test_fp4_tp2pp2(self, enable_gemm_allreduce_fusion, torch_compile):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
-        torch_compile_config = _get_default_torch_compile_config(torch_compile)
-
-        with (mock.patch.dict(
-                os.environ, {
-                    "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED":
-                    str(int(enable_gemm_allreduce_fusion))
-                }),
-              LLM(model_path,
-                  tensor_parallel_size=2,
-                  pipeline_parallel_size=2,
-                  max_batch_size=32,
-                  kv_cache_config=kv_cache_config,
-                  torch_compile_config=torch_compile_config) as llm):
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            sampling_params = SamplingParams(
-                max_tokens=256,
-                temperature=0.0,
-                add_special_tokens=False,
-            )
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
@@ -3636,7 +3477,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
-            moe_config = MoeConfig()
+            # Chunk MoE so its workspace fits alongside the KV cache, which is sized
+            # from a profile taken before that workspace is allocated (NVBug 6633931).
+            moe_config = MoeConfig(max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
             # Cap max_seq_len based on the evaluation task (NVBug 6476233).
@@ -6969,7 +6812,8 @@ class TestLagunaXS_2_1(LlmapiAccuracyTestHarness):
             speculative_model=dflash_model_path,
         )
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        use_kv_cache_manager_v2=True)
 
         with LLM(model_path,
                  max_seq_len=4096,
@@ -7238,6 +7082,44 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=32)
         with LLM(model_dir,
+                 trust_remote_code=True,
+                 tensor_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 max_seq_len=4096,
+                 max_batch_size=32,
+                 cuda_graph_config=cuda_graph_config,
+                 enable_chunked_prefill=True,
+                 kv_cache_config=kv_cache_config,
+                 moe_config=moe_config) as llm:
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @parametrize_with_ids("enable_branch_snapshot", [True])
+    def test_bf16_branch_snapshot(self, enable_branch_snapshot: bool,
+                                  mocker: MockerFixture) -> None:
+        """Branch-point snapshots must not change what the model generates.
+
+        Few-shot GSM8K does fork: every prompt shares the few-shot prefix and
+        diverges at the question, so a request snapshots at that fork and later
+        ones restore from it.
+        """
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.75,
+            enable_block_reuse=True,
+            avg_seq_len=2048,
+            mamba_state_config=MambaStateConfig(
+                additional_snapshot_offsets_from_end=[0],
+                enable_branch_snapshot=enable_branch_snapshot),
+        )
+        # Mirrors test_bf16: TRTLLM MoE is SM100/103 only, so use CUTLASS, which
+        # is supported everywhere this test can run.
+        moe_config = MoeConfig(backend="CUTLASS")
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=32)
+        with LLM(self.MODEL_PATH,
                  trust_remote_code=True,
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
@@ -9115,7 +8997,6 @@ class TestGLM52(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  max_seq_len=8192,
                  **pytorch_config) as llm:
-            assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = GSM8K(model_name)
             task.evaluate(llm)

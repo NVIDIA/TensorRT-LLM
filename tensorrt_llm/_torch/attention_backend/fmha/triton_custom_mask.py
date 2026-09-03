@@ -81,7 +81,7 @@ class TritonCustomMaskFmha(PhasedFmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
         *,
-        phase: FmhaPhase,
+        phase: Optional[FmhaPhase] = None,
     ) -> bool:
         supported, reason = self._check_support_with_reason(
             q,
@@ -103,7 +103,7 @@ class TritonCustomMaskFmha(PhasedFmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
         *,
-        phase: FmhaPhase,
+        phase: Optional[FmhaPhase] = None,
     ) -> tuple[bool, str]:
         if phase != FmhaPhase.CONTEXT:
             return False, "Only context attention is supported."

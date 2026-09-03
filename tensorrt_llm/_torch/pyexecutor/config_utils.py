@@ -8,7 +8,54 @@ import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.logger import logger
+
+
+def resolve_cache_transceiver_config(
+        cache_transceiver_config: Optional[CacheTransceiverConfig]) -> None:
+    """Resolve defaults and validate runtime-independent configuration."""
+    if cache_transceiver_config is None or cache_transceiver_config.backend is None:
+        return
+
+    # Paths that skip model defaults treat "auto" as the C++ runtime.
+    if cache_transceiver_config.transceiver_runtime == "auto":
+        cache_transceiver_config.transceiver_runtime = None
+
+    # Keep "DEFAULT" on the config until in-flight-cancel validation runs.
+    effective_backend = cache_transceiver_config.backend
+    if effective_backend == "DEFAULT":
+        effective_backend, _ = cache_transceiver_config._resolve_default_backend(
+        )
+
+    runtime = cache_transceiver_config.transceiver_runtime
+    enable_pipelined_transfer = cache_transceiver_config.enable_pipelined_transfer
+    if runtime is None and enable_pipelined_transfer:
+        if effective_backend != "NIXL":
+            raise ValueError(
+                f"enable_pipelined_transfer is set but backend "
+                f"'{effective_backend}' requires the C++ "
+                f"transceiver, which does not support pipelined transfer. Use NIXL backend to "
+                f"enable pipelined transfer.")
+        logger.warning(
+            "enable_pipelined_transfer is set; auto-selecting the Python "
+            "transceiver instead of the C++ transceiver to enable "
+            "pipelined KV cache transfer. "
+            "Set transceiver_runtime='CPP' to disable this auto-selection.")
+        cache_transceiver_config.transceiver_runtime = "PYTHON"
+    elif runtime == "CPP" and enable_pipelined_transfer:
+        raise ValueError(
+            "enable_pipelined_transfer is set but transceiver_runtime='CPP' "
+            "explicitly disables Python auto-selection. Use transceiver_runtime='PYTHON' to enable pipelined transfer."
+        )
+
+    if (cache_transceiver_config.transceiver_runtime == "PYTHON"
+            and effective_backend != "NIXL"):
+        raise ValueError(
+            f"Python transceiver currently only supports NIXL backend, "
+            f"got {effective_backend}. "
+            f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
+        )
 
 
 def uses_vswa_kv_cache_layout(
