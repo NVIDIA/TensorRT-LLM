@@ -90,6 +90,7 @@ suffix, for example:
 - `wan21_t2v_14b_blackwell.yaml`
 - `wan22_i2v_a14b_blackwell.yaml`
 - `flux2_blackwell.yaml`
+- `ltx2_blackwell.yaml`
 
 ### YAML Structure
 
@@ -297,7 +298,7 @@ extraction in `build_visual_gen_db_entry` and treat it as a baseline reset.
 pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-wan21_t2v_14b_blackwell-wan21_14b_nvfp4_trtllm_cfg2_ulysses4_teacache_on]
 
 # Run all server recipes from one family YAML without uploading
-pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg-flux2_blackwell]
+pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg-ltx2_blackwell]
 ```
 
 Set `LLM_MODELS_ROOT` to the shared model cache before running locally:
