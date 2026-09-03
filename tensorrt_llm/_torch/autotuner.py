@@ -1439,10 +1439,12 @@ class AutoTuner:
     def _run_profile_runner(runner: TunableRunner, inputs: List[torch.Tensor],
                             tactic: Any, **kwargs) -> None:
         with nccl_window_tensor_scope(inputs) as scope:
-            runner(inputs, tactic=tactic, **kwargs)
-            # Profiling inputs outlive each candidate run; everything newly
-            # allocated by the runner is an internal, discarded result.
-            scope.escape(inputs)
+            try:
+                runner(inputs, tactic=tactic, **kwargs)
+            finally:
+                # Profiling inputs outlive each candidate run; everything newly
+                # allocated by the runner is an internal, discarded result.
+                scope.escape(inputs)
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
 

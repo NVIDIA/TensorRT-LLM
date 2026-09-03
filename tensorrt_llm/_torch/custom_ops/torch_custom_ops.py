@@ -2491,7 +2491,8 @@ def _(inputs: List[torch.Tensor]) -> None:
 
 
 @torch.library.register_fake("trtllm::end_nccl_window_tensor_scope")
-def _(outputs: List[torch.Tensor], failed: bool) -> None:
+def _(inputs: List[torch.Tensor], outputs: List[torch.Tensor],
+      failed: bool) -> None:
     return None
 
 

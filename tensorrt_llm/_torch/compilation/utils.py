@@ -126,7 +126,8 @@ def inplace_info():
             1: "inputs"
         },
         torch.ops.trtllm.end_nccl_window_tensor_scope.default: {
-            1: "outputs"
+            1: "inputs",
+            2: "outputs",
         },
         torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell.default: {
             1: "output"

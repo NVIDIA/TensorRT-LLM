@@ -15,12 +15,27 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(autouse=True)
-def mock_synchronize_releases(monkeypatch):
+def reset_nccl_window_state(monkeypatch):
+    with nccl_window_graph._pool_owners_lock:
+        nccl_window_graph._pool_owners.clear()
+        nccl_window_graph._next_pool_owner = nccl_window_graph._OWNER_BASE
+    nccl_window_graph._capture_owner.value = nccl_window_graph._EAGER_OWNER
     monkeypatch.setattr(
         nccl_window_graph.torch.ops.trtllm,
-        "synchronize_nccl_window_buffer_releases",
-        lambda: None,
+        "get_nccl_window_buffer_release_epoch",
+        lambda: 0,
     )
+    monkeypatch.setattr(
+        nccl_window_graph.torch.ops.trtllm,
+        "promote_nccl_window_buffer_releases",
+        lambda _device, _release_epoch: None,
+    )
+    monkeypatch.setattr(nccl_window_graph.torch.cuda, "current_device", lambda: 0)
+    yield
+    with nccl_window_graph._pool_owners_lock:
+        nccl_window_graph._pool_owners.clear()
+        nccl_window_graph._next_pool_owner = nccl_window_graph._OWNER_BASE
+    nccl_window_graph._capture_owner.value = nccl_window_graph._EAGER_OWNER
 
 
 def test_pool_owner_is_value_based():
@@ -96,8 +111,13 @@ def test_graph_capture_sets_and_restores_owner(monkeypatch):
     )
     monkeypatch.setattr(
         nccl_window_graph.torch.ops.trtllm,
-        "synchronize_nccl_window_buffer_releases",
-        lambda: events.append(("synchronize_releases",)),
+        "get_nccl_window_buffer_release_epoch",
+        lambda: events.append(("release_epoch",)) or 17,
+    )
+    monkeypatch.setattr(
+        nccl_window_graph.torch.ops.trtllm,
+        "promote_nccl_window_buffer_releases",
+        lambda device, epoch: events.append(("promote_releases", device, epoch)),
     )
     monkeypatch.setattr(nccl_window_graph.torch.cuda, "graph", capture)
 
@@ -108,13 +128,14 @@ def test_graph_capture_sets_and_restores_owner(monkeypatch):
 
     assert events == [
         ("owner", owner),
-        ("synchronize_releases",),
+        ("release_epoch",),
         (
             "capture",
             graph,
             pool,
             {"capture_error_mode": "thread_local"},
         ),
+        ("promote_releases", 0, 17),
         ("body",),
         ("capture_exit",),
         ("owner", nccl_window_graph._EAGER_OWNER),
@@ -279,10 +300,14 @@ def test_nested_graph_capture_restores_previous_owner(monkeypatch):
 def tensor_scope_events(monkeypatch):
     events = []
 
+    def collect_tensors(value, tensors):
+        if value is not None:
+            tensors.extend(value)
+
     monkeypatch.setattr(
         nccl_window_tensor_scope,
         "_cuda_tensors",
-        lambda value, tensors: tensors.extend(value),
+        collect_tensors,
     )
     monkeypatch.setattr(
         nccl_window_tensor_scope.torch.ops.trtllm,
@@ -292,7 +317,7 @@ def tensor_scope_events(monkeypatch):
     monkeypatch.setattr(
         nccl_window_tensor_scope.torch.ops.trtllm,
         "end_nccl_window_tensor_scope",
-        lambda tensors, failed: events.append(("end", tensors, failed)),
+        lambda inputs, outputs, failed: events.append(("end", inputs, outputs, failed)),
     )
     return events
 
@@ -304,7 +329,7 @@ def test_tensor_scope_transfers_outputs_and_releases_other_leases(tensor_scope_e
     with nccl_window_tensor_scope.nccl_window_tensor_scope(inputs) as scope:
         scope.escape(outputs)
 
-    assert tensor_scope_events == [("begin", inputs), ("end", outputs, False)]
+    assert tensor_scope_events == [("begin", inputs), ("end", inputs, outputs, False)]
 
 
 def test_tensor_scope_quarantines_adopted_leases_on_failure(tensor_scope_events):
@@ -314,7 +339,41 @@ def test_tensor_scope_quarantines_adopted_leases_on_failure(tensor_scope_events)
         with nccl_window_tensor_scope.nccl_window_tensor_scope(inputs):
             raise RuntimeError("scope failed")
 
-    assert tensor_scope_events == [("begin", inputs), ("end", inputs, True)]
+    assert tensor_scope_events == [("begin", inputs), ("end", inputs, [], True)]
+
+
+def test_tensor_scope_releases_leases_when_forward_has_no_cuda_output(
+    tensor_scope_events,
+):
+    inputs = [object()]
+
+    with nccl_window_tensor_scope.nccl_window_tensor_scope(inputs):
+        pass
+
+    assert tensor_scope_events == [("begin", inputs), ("end", inputs, [], False)]
+
+
+def test_failed_autotuner_tactic_preserves_profile_inputs(monkeypatch, tensor_scope_events):
+    from tensorrt_llm._torch import autotuner
+
+    inputs = [object()]
+
+    def fail_runner(_inputs, *, tactic):
+        del tactic
+        raise RuntimeError("tactic failed")
+
+    monkeypatch.setattr(
+        autotuner,
+        "nccl_window_tensor_scope",
+        nccl_window_tensor_scope.nccl_window_tensor_scope,
+    )
+    with pytest.raises(RuntimeError, match="tactic failed"):
+        autotuner.AutoTuner._run_profile_runner(fail_runner, inputs, tactic=1)
+
+    assert tensor_scope_events == [
+        ("begin", inputs),
+        ("end", inputs, inputs, True),
+    ]
 
 
 def test_tensor_scope_collects_cuda_tensors_from_dataclass():
@@ -369,6 +428,25 @@ def test_eager_decoder_layer_hooks_scope_each_invocation(tensor_scope_events):
 
     assert [event[0] for event in tensor_scope_events] == ["begin", "end"]
     assert tensor_scope_events[-1][-1] is False
+
+
+def test_eager_decoder_layer_hook_allows_no_cuda_output(tensor_scope_events):
+    from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
+
+    class TestLayer(DecoderLayer):
+        def forward(self, hidden_states, **kwargs):
+            return None
+
+    layer = TestLayer()
+    handles = nccl_window_tensor_scope.install_eager_nccl_window_tensor_scopes(layer)
+    try:
+        assert layer([object()]) is None
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert [event[0] for event in tensor_scope_events] == ["begin", "end"]
+    assert tensor_scope_events[-1][2:] == ([], False)
 
 
 def test_eager_decoder_layer_hook_propagates_forward_failure(tensor_scope_events):
@@ -465,13 +543,15 @@ def test_tensor_scope_compilation_metadata_pins_boundaries_to_primary_stream(mon
     begin = torch.ops.trtllm.begin_nccl_window_tensor_scope.default
     end = torch.ops.trtllm.end_nccl_window_tensor_scope.default
     assert inplace_info()[begin] == {1: "inputs"}
-    assert inplace_info()[end] == {1: "outputs"}
+    assert inplace_info()[end] == {1: "inputs", 2: "outputs"}
 
     graph = torch.fx.Graph()
     hidden_states = graph.placeholder("hidden_states")
     begin_node = graph.call_function(begin, kwargs={"inputs": [hidden_states]})
     output = graph.call_function(torch.ops.aten.add.Tensor, args=(hidden_states, 1))
-    end_node = graph.call_function(end, kwargs={"outputs": [output], "failed": False})
+    end_node = graph.call_function(
+        end, kwargs={"inputs": [hidden_states], "outputs": [output], "failed": False}
+    )
     graph.output(output)
 
     monkeypatch.setattr(auto_multi_stream, "estimate_time", lambda _node: 1)
