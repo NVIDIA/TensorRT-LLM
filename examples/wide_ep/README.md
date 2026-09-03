@@ -89,6 +89,8 @@ To disable MoE load balancing, omit the whole `load_balancer` section. EPLB is e
 
 Number of layers updated per iteration, defaults to `0`. `0` means offline, while `>0` means online EPLB.
 
+This is the number of layers refreshed per iteration, not how often a given layer is refreshed. Layers take turns over `ceil(num_moe_layers / layer_updates_per_iter)` iterations before the plan repeats, so with `layer_updates_per_iter: 1` a DeepSeek-R1 layer (58 MoE layers) is refreshed once every 59 iterations. See [Update Strategy](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#update-strategy) for the statistics, the replication and placement rules, and a worked example.
+
 ### Offline Load Balancer Configuration
 
 Refer to the [Offline EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#offline-ep-load-balancer) documentation.
