@@ -1156,6 +1156,14 @@ class KvCacheCreator:
 
         fraction = self._kv_cache_config.free_gpu_memory_fraction
 
+        # Warmup (torch.compile specialization, autotuning, CUDA-graph capture,
+        # memory-pool pre-population) already ran in PyExecutor.__init__ and is
+        # replayed against the final KV cache once this estimate is applied. Its
+        # high-water mark can exceed the text-only profiling dummy's, so latch it
+        # before reset_peak_memory_stats() drops it; otherwise the pool is sized
+        # against the smaller peak and warmup OOMs on the second pass.
+        warmup_peak_memory = torch.cuda.max_memory_allocated()
+
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         end, total_gpu_memory = torch.cuda.mem_get_info()
@@ -1197,8 +1205,8 @@ class KvCacheCreator:
                         if response.has_error():
                             raise RuntimeError(response.error_msg)
 
-                torch_peak_memory = torch.cuda.memory_stats(
-                )["allocated_bytes.all.peak"]
+                torch_peak_memory = max(torch.cuda.max_memory_allocated(),
+                                        warmup_peak_memory)
 
                 # Release before measuring current usage so the retained
                 # embeddings count toward the peak but not the steady state.
