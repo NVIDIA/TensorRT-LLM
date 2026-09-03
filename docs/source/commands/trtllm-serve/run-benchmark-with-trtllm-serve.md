@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Run benchmarking with `trtllm-serve`
 
 TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command.
@@ -148,6 +153,27 @@ Median E2EL (ms):                        1643.44
 P99 E2EL (ms):                           1643.44
 ==================================================
 ```
+
+### Output Token Length and EOS
+
+The requested output length in synthetic benchmarks is a maximum generation
+budget, not a guarantee that every request will generate exactly that many
+tokens. A request can finish earlier if the model emits an EOS token, reaches a
+stop condition, or if the benchmark client/server applies stop-token handling.
+In that case, TensorRT LLM's `benchmark_serving.py` output reports the actual
+generated length as `Total generated tokens`, so the average and minimum can be
+lower than the configured output length. External clients can use different
+labels for the same concept, such as output sequence length; interpret those as
+actual generated tokens rather than the requested token budget.
+
+When benchmarking a fixed output sequence length, make sure EOS handling matches
+the methodology you want to measure. The `benchmark_serving.py` example above
+passes `--ignore-eos` through `RequestFuncInput`; in the TensorRT LLM request
+path this is translated to `min_length = output_len`, avoiding early EOS
+termination without forwarding a literal `ignore_eos` request field. If you use
+an external client such as AIPerf or GenAI-Perf, use the equivalent ignore-EOS
+setting when available; otherwise interpret output-length metrics as actual
+generated tokens rather than the requested token budget.
 
 ### Key Metrics
 
@@ -390,6 +416,10 @@ aiperf profile \
     --url localhost:8000 \
     --streaming
 ```
+
+This AIPerf example does not pass an ignore-EOS equivalent, so output-length
+metrics can be shorter than `--output-tokens-mean` if the model emits EOS before
+the requested token budget is reached.
 
 ### Example: Benchmark a multimodal model
 
