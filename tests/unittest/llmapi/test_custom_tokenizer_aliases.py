@@ -39,25 +39,25 @@ pytestmark = pytest.mark.cpu_only
 DUMMY_MODEL = "/tmp/dummy_model"
 
 
-def _resolve(alias: str):
+def _resolve(alias: str) -> type[TokenizerBase]:
     module_path, class_name = TOKENIZER_ALIASES[alias].rsplit(".", 1)
     return getattr(importlib.import_module(module_path), class_name)
 
 
-def test_llm_args_uses_the_canonical_alias_table():
+def test_llm_args_uses_the_canonical_alias_table() -> None:
     """One table, not a copy that can drift."""
     assert llm_args_mod.TOKENIZER_ALIASES is TOKENIZER_ALIASES
 
 
 @pytest.mark.parametrize("alias", sorted(TOKENIZER_ALIASES))
-def test_every_alias_names_an_importable_tokenizer_class(alias):
+def test_every_alias_names_an_importable_tokenizer_class(alias: str) -> None:
     tokenizer_class = _resolve(alias)
     assert issubclass(tokenizer_class, TokenizerBase)
     assert callable(getattr(tokenizer_class, "from_pretrained", None))
 
 
 @pytest.mark.parametrize("alias", sorted(TOKENIZER_ALIASES))
-def test_llm_args_resolves_every_registered_alias(alias):
+def test_llm_args_resolves_every_registered_alias(alias: str) -> None:
     """``custom_tokenizer=<alias>`` reaches the aliased class's loader.
 
     ``from_pretrained`` is stubbed so no checkpoint is read; the point is that
@@ -75,6 +75,6 @@ def test_llm_args_resolves_every_registered_alias(alias):
     assert args.tokenizer is loaded
 
 
-def test_unknown_custom_tokenizer_is_still_rejected():
+def test_unknown_custom_tokenizer_is_still_rejected() -> None:
     with pytest.raises(ValueError, match="Failed to load custom tokenizer"):
         TorchLlmArgs(model=DUMMY_MODEL, custom_tokenizer="not_a_registered_alias")
