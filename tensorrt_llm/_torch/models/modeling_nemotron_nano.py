@@ -4,7 +4,18 @@ import math
 import re
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -434,6 +445,138 @@ class SquaredReLU(nn.Module):
         return torch.pow(torch.nn.functional.relu(x), 2)
 
 
+_RADIO_BLOCKS = "vision_model.radio_model.model.blocks."
+_RADIO_PATCH_GEN = "vision_model.radio_model.model.patch_generator."
+
+# ModelOpt names tensors after the module attribute path; ``RADIOVisionModel``
+# loads the release checkpoint's hand-built layout. This table maps one onto the
+# other.
+_MODELOPT_VISION_RENAMES = {
+    "vision_projector.mlp1.norm.weight": "mlp1.0.weight",
+    "vision_projector.mlp1.linear1.weight": "mlp1.1.weight",
+    # Index 2 of the mlp1 Sequential is SquaredReLU, which has no parameters.
+    "vision_projector.mlp1.linear2.weight": "mlp1.3.weight",
+    "vision_model.embeddings.patch_projection.weight": _RADIO_PATCH_GEN + "embedder.weight",
+    "vision_model.embeddings.video_patch_projection.weight": (
+        _RADIO_PATCH_GEN + "video_embedder.weight"
+    ),
+    "vision_model.embeddings.position_embedding": _RADIO_PATCH_GEN + "pos_embed",
+    "vision_model.embeddings.cls_register_token": _RADIO_PATCH_GEN + "cls_token.token",
+}
+
+# Per-block leaf renames. ``mlp.fc{1,2}`` and ``norm{1,2}`` already agree.
+_MODELOPT_BLOCK_RENAMES = {
+    "attention.output.dense": "attn.proj",
+    "mlp.fc1": "mlp.fc1",
+    "mlp.fc2": "mlp.fc2",
+    "norm1": "norm1",
+    "norm2": "norm2",
+}
+
+_MODELOPT_QKV_PARTS = {"query": 0, "key": 1, "value": 2}
+_MODELOPT_FUSION_ORDER = sorted(_MODELOPT_QKV_PARTS, key=_MODELOPT_QKV_PARTS.get)
+
+_MODELOPT_BLOCK_RE = re.compile(r"^vision_model\.encoder\.layer\.(\d+)\.(.+)$")
+
+
+def _normalize_vision_weights(weights: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Return the vision subset of ``weights`` in the BF16 release's key spelling.
+
+    A no-op for release-format checkpoints; ModelOpt ones get their encoder,
+    embeddings and projector namespaces rewritten and their Q/K/V re-fused. The
+    result aliases ``weights``, which still holds every tensor, so a caller
+    freeing by prefix must free ``vision_projector`` as well as ``mlp1``.
+    """
+    # The two layouts share no key, so any ModelOpt spelling present identifies
+    # the format. Probing the rename table keeps the check and the mapping it
+    # selects from drifting apart.
+    is_modelopt = any(key in weights for key in _MODELOPT_VISION_RENAMES)
+    if not is_modelopt:
+        return {k: v for k, v in weights.items() if k.startswith(("mlp1.", "vision_model."))}
+
+    remapped: Dict[str, torch.Tensor] = {}
+    # layer index -> part ("query"/"key"/"value") -> suffix -> tensor
+    qkv_parts: Dict[str, Dict[str, Dict[str, torch.Tensor]]] = {}
+
+    for key, value in weights.items():
+        if key in _MODELOPT_VISION_RENAMES:
+            remapped[_MODELOPT_VISION_RENAMES[key]] = value
+            continue
+        if not key.startswith(("vision_model.", "vision_projector.")):
+            continue
+        # Summary-token indices are derived at runtime, not loaded.
+        if key == "vision_model.summary_idxs":
+            continue
+        if key.startswith("vision_projector.vision_final_layernorm."):
+            # No counterpart module exists, so these are dropped, not renamed.
+            continue
+
+        match = _MODELOPT_BLOCK_RE.match(key)
+        if match is None:
+            raise ValueError(
+                f"Unrecognized vision weight in ModelOpt-exported checkpoint: {key}. "
+                "The vision key layout changed; extend _MODELOPT_VISION_RENAMES."
+            )
+        layer, rest = match.group(1), match.group(2)
+
+        # There is no LayerScale module to load these into, so dropping them is
+        # only sound while they are the identity.
+        if rest in ("layer_scale1.lambda1", "layer_scale2.lambda1"):
+            if not torch.allclose(value.float(), torch.ones_like(value, dtype=torch.float32)):
+                raise ValueError(
+                    f"{key} is not all-ones, so LayerScale is not the identity for this "
+                    "checkpoint. The RADIO port has no LayerScale and would silently drop it."
+                )
+            continue
+
+        leaf, _, suffix = rest.rpartition(".")
+        qkv_match = re.match(r"^attention\.attention\.(query|key|value)$", leaf)
+        if qkv_match is not None:
+            part = qkv_match.group(1)
+            qkv_parts.setdefault(layer, {}).setdefault(part, {})[suffix] = value
+            continue
+
+        renamed_leaf = _MODELOPT_BLOCK_RENAMES.get(leaf)
+        if renamed_leaf is None:
+            raise ValueError(
+                f"Unrecognized vision block weight in ModelOpt-exported checkpoint: {key}. "
+                "Extend _MODELOPT_BLOCK_RENAMES."
+            )
+        remapped[f"{_RADIO_BLOCKS}{layer}.{renamed_leaf}.{suffix}"] = value
+
+    # Fuse in the order ``split_fused_qkv`` splits them back apart.
+    for layer, parts in qkv_parts.items():
+        missing = set(_MODELOPT_QKV_PARTS) - set(parts)
+        if missing:
+            raise ValueError(
+                f"vision encoder layer {layer} is missing {sorted(missing)} of the Q/K/V "
+                "projections; cannot re-fuse the attention weights."
+            )
+        # Only weights and biases can be concatenated row-wise, and all three
+        # parts must carry the same set. Anything else -- a per-tensor scale, or
+        # a bias on q but not k -- would fuse into a silently wrong tensor.
+        suffixes = set(parts["query"])
+        for part in ("key", "value"):
+            if set(parts[part]) != suffixes:
+                raise ValueError(
+                    f"vision encoder layer {layer}: {part} carries {sorted(parts[part])} "
+                    f"but query carries {sorted(suffixes)}; cannot re-fuse the "
+                    "attention weights."
+                )
+        unfusable = suffixes - {"weight", "bias"}
+        if unfusable:
+            raise ValueError(
+                f"vision encoder layer {layer} attaches {sorted(unfusable)} to its Q/K/V "
+                "projections. Row-wise concatenation is only correct for weights and "
+                "biases; extend this branch before loading such a checkpoint."
+            )
+        for suffix in sorted(suffixes):
+            tensors = [parts[p][suffix] for p in _MODELOPT_FUSION_ORDER]
+            remapped[f"{_RADIO_BLOCKS}{layer}.attn.qkv.{suffix}"] = torch.cat(tensors, dim=0)
+
+    return remapped
+
+
 # Source codes are from NemotronH_Nano_VL_V2 modeling.py.
 class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
     _supports_flash_attn = True
@@ -517,6 +660,8 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         )
 
     def load_weights(self, weights):
+        weights = _normalize_vision_weights(weights)
+
         # Load mlp1 weights.
         mlp1_weights = {
             k.replace("mlp1.", ""): v for k, v in weights.items() if k.startswith("mlp1.")
@@ -2735,6 +2880,7 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         if hasattr(weights, "mark_consumed"):
             weights.mark_consumed("vision_model")
             weights.mark_consumed("mlp1")
+            weights.mark_consumed("vision_projector")
 
         # Load sound encoder weights.
         if self.sound_encoder is not None:

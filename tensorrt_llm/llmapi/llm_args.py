@@ -25,9 +25,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (TYPE_CHECKING, Annotated, Any, ClassVar, Dict, List,
-                    Literal, Optional, Set, Tuple, Type, TypeAlias, TypeVar,
-                    Union, get_args, get_origin)
+from typing import (TYPE_CHECKING, Annotated, Any, Callable, ClassVar, Dict,
+                    List, Literal, Optional, Set, Tuple, Type, TypeAlias,
+                    TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -3972,6 +3972,18 @@ class MambaStateConfig(StrictBaseModel):
         "Offsets that do not resolve inside the prompt are ignored. These "
         "snapshots require KV cache manager V2.")
 
+    enable_branch_snapshot: bool = Field(
+        default=False,
+        status="prototype",
+        telemetry=True,
+        description=
+        "Snapshot the Mamba recurrent state where a request's content "
+        "diverges from the prefix cache, so that later requests sharing the "
+        "same prefix can reuse up to the fork instead of being truncated to "
+        "an earlier snapshot. The prompt end is always snapshotted as well. "
+        "Independent of periodic_snapshot_interval. Requires KV cache "
+        "manager V2.")
+
 
 class BlockReuseConfig(StrictBaseModel):
     """Configuration for KV cache block reuse policies."""
@@ -4386,6 +4398,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.mamba_state_config additional snapshot "
                 "offsets require kv_cache_config.use_kv_cache_manager_v2=True.")
+        if (state_config.enable_branch_snapshot
+                and self.use_kv_cache_manager_v2 is False):
+            raise ValueError(
+                "kv_cache_config.mamba_state_config.enable_branch_snapshot "
+                "requires kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @field_validator('max_attention_window')
@@ -5341,6 +5358,39 @@ class TorchCompileConfig(StrictBaseModel):
         "The maximum number of CUDA streams to use for torch.compile.")
 
 
+def _check_removed_sampler_type(value: Any) -> None:
+    """Validate a value passed to the removed ``sampler_type`` argument.
+
+    ``auto`` and ``TorchSampler`` always resolved to TorchSampler, so dropping
+    the argument honors them. ``TRTLLMSampler`` cannot be honored: callers
+    asking for it tune the rest of their configuration to its conventions, so
+    substituting TorchSampler would silently run a mismatched configuration.
+    """
+    if value in ("auto", "TorchSampler"):
+        logger.warning(
+            f"'sampler_type' was removed (got {value!r}) and is ignored; "
+            "TorchSampler is the only sampler. Remove the argument to silence "
+            "this warning.")
+        return
+    raise ValueError(
+        f"'sampler_type' was removed and {value!r} is no longer available; "
+        "TorchSampler is the only sampler. Drop the argument, and make sure "
+        "the surrounding configuration targets TorchSampler -- notably "
+        "`logprobs=0` for the sampled token's logprob and a real `end_id`, "
+        "which differ from the TRTLLMSampler conventions.")
+
+
+# Arguments removed from `TorchLlmArgs` but still accepted on input, so that
+# integrations pinned to an older TRT-LLM keep constructing. Declaring one here
+# is enough: the pre-pydantic kwarg gates in `llm.py` consult
+# `TORCH_LLMARGS_REMOVED_ARGS`, and `_drop_removed_args` runs the check below.
+_TORCH_LLMARGS_REMOVED_ARG_CHECKS: Dict[str, Callable[[Any], None]] = {
+    "sampler_type": _check_removed_sampler_type,
+}
+
+TORCH_LLMARGS_REMOVED_ARGS = frozenset(_TORCH_LLMARGS_REMOVED_ARG_CHECKS)
+
+
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
     generation_config: Literal["auto", "trtllm"] = Field(
@@ -5465,6 +5515,20 @@ class TorchLlmArgs(BaseLlmArgs):
             "model's largest atomic item when necessary."),
         status="prototype")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_removed_args(cls, data: Any) -> Any:
+        """Drop removed arguments; their checks reject unserviceable values."""
+        if not isinstance(data, dict):
+            return data
+        removed = TORCH_LLMARGS_REMOVED_ARGS.intersection(data)
+        if not removed:
+            return data
+        data = dict(data)
+        for key in sorted(removed):
+            _TORCH_LLMARGS_REMOVED_ARG_CHECKS[key](data.pop(key))
+        return data
+
     @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
     @classmethod
     def validate_encoder_runtime_sizes(cls, v: Optional[int]) -> Optional[int]:
@@ -5498,6 +5562,33 @@ class TorchLlmArgs(BaseLlmArgs):
         # Recognized values mirror get_attention_backend dispatch in
         # tensorrt_llm/_torch/attention_backend/utils.py.
         telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER"))
+
+    enable_mla_skip_correction: bool = Field(
+        default=False,
+        description=
+        ("Enable threshold-based skip-correction for trtllm-gen MLA attention "
+         "kernels on SM100 and SM103. When enabled, "
+         "mla_skip_correction_threshold controls the optimization threshold."),
+        status="prototype")
+
+    mla_skip_correction_threshold: float = Field(
+        default=8.0,
+        gt=0.0,
+        le=32.0,
+        description=
+        ("Threshold for threshold-based skip-correction. This is used only "
+         "when enable_mla_skip_correction is True. The default is 8. The maximum "
+         "supported value depends on the selected kernel's BMM2 dtype: 8 for "
+         "E4M3, 15 for FP16, and 32 for BF16."),
+        status="prototype")
+
+    @model_validator(mode="after")
+    def validate_mla_skip_correction_config(self) -> 'TorchLlmArgs':
+        if self.enable_mla_skip_correction and self.attn_backend.upper(
+        ) != "TRTLLM":
+            raise ValueError(
+                "enable_mla_skip_correction requires attn_backend='TRTLLM'.")
+        return self
 
     sampler_force_async_worker: bool = Field(
         default=False,

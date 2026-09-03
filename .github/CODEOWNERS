@@ -467,6 +467,7 @@
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/py_executor.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/model_engine.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/_torch/pyexecutor/engine/ @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 
 # ===== COMPATIBILITY FORWARDING MODULES =====
 # Definition-free re-export modules left at a retired import path so external

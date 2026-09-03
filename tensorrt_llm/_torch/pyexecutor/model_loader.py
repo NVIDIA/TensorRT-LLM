@@ -19,6 +19,7 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
@@ -86,6 +87,12 @@ _MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
 _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     rope_fusion=frozenset({False}),
+)
+# Mistral realizes a per-layer attention window from its checkpoint config.
+# The dense profile is qualified only when every layer runs full attention.
+_MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    sliding_windows=frozenset({"none"}),
 )
 
 
@@ -577,6 +584,19 @@ class ModelLoader:
             transform_abi_id=QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="mistral-for-causal-lm-bf16-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_mistral",
+                "MistralForCausalLM"),
+            architecture="MistralForCausalLM",
+            model_type="mistral",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS,
         ),
     ))
 
@@ -1679,6 +1699,9 @@ class ModelLoader:
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,
+            skip_correction_threshold=(
+                self.llm_args.mla_skip_correction_threshold
+                if self.llm_args.enable_mla_skip_correction else 0.0),
             moe_backend=self.llm_args.moe_config.backend,
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
