@@ -92,7 +92,13 @@ from .kv_cache_stats import (
     KVCacheV2SsmLifeCycleIterationStats,
     KVCacheV2SsmSnapshotIterationStats,
 )
-from .llm_request import LlmRequest, LlmRequestState, SamplingConfig, get_draft_token_length
+from .llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    SamplingConfig,
+    get_draft_token_length,
+    get_kv_capacity_tokens,
+)
 from .resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
@@ -2661,7 +2667,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Helix requests carry the rank-local strided slice in prompt_len;
         # the global ledger sizes off the full prompt instead.
         prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
-        target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
+        target = get_kv_capacity_tokens(req, self.num_extra_kv_tokens, prompt_len=prompt_len)
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 

@@ -28,7 +28,9 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.llm_request import get_kv_capacity_tokens
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.logger import logger
 
 pytestmark = pytest.mark.cpu_only
 
@@ -385,6 +387,8 @@ def _build_transceiver_for_kv_slice(
     cached_tokens: int = 0,
     is_generation_only: bool = False,
     beam_width: int = 1,
+    draft_len: int = 0,
+    exposes_block_ordinals: bool = True,
 ):
     """Stub a KvCacheTransceiverV2 so _create_kv_slice runs without dist setup.
 
@@ -392,23 +396,48 @@ def _build_transceiver_for_kv_slice(
       - reuse adapter: tokens_per_block, per-layer-group cached count, block ids
       - page table:    layer groups
       - cache manager: num_extra_kv_tokens (read in this code path)
+      - request:       py_draft_tokens (read via get_draft_token_length)
+
+    draft_len is the number of draft tokens the request currently carries. The
+    manager allocates for them on top of num_extra_kv_tokens, so the default
+    block list has to cover both.
     """
     layer_group = AttentionLayerGroup(
         pool_group_idx=0,
         kv_head_num_per_rank=1,
         sliding_window_size=sliding_window_size,
     )
-    total_blocks = (prompt_len + num_extra_kv_tokens + tokens_per_block - 1) // tokens_per_block
+    # Sized through the shared helper so the stub tracks the allocator's
+    # definition instead of drifting with the consumer under test.
+    total_blocks = (
+        get_kv_capacity_tokens(
+            SimpleNamespace(prompt_len=prompt_len, py_draft_tokens=[0] * draft_len),
+            num_extra_kv_tokens,
+        )
+        + tokens_per_block
+        - 1
+    ) // tokens_per_block
     if block_ids is None:
         block_ids = np.arange(total_blocks, dtype=np.int64)
     else:
         block_ids = np.asarray(block_ids, dtype=np.int64)
+
+    # A manager exposes one entry per block ordinal, -1 where no page is bound.
+    # The stale prefix the caller trimmed out of block_ids is exactly that.
+    stale_end = 0
+    if sliding_window_size is not None:
+        stale_end = max(0, (prompt_len + 1 - sliding_window_size) // tokens_per_block)
+    ordinals = np.concatenate(
+        [np.full(stale_end, -1, dtype=np.int64), np.asarray(block_ids, dtype=np.int64)]
+    )
 
     reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         get_cached_token_count_per_layer_group=lambda req, layer_groups: [cached_tokens]
         * len(layer_groups),
         get_block_ids=lambda req, idx, lg: block_ids,
+        get_block_ordinals=lambda req, idx, lg: ordinals,
+        exposes_block_ordinals=exposes_block_ordinals,
     )
     page_table = SimpleNamespace(layer_groups=[layer_group])
     cache_manager = SimpleNamespace(num_extra_kv_tokens=num_extra_kv_tokens)
@@ -422,6 +451,7 @@ def _build_transceiver_for_kv_slice(
         prompt_len=prompt_len,
         py_request_id=0,
         py_beam_width=beam_width,
+        py_draft_tokens=list(range(draft_len)),
         is_generation_only_request=lambda: is_generation_only,
     )
     return transceiver, req
@@ -480,6 +510,7 @@ class TestCreateKvSliceTokenRange:
             prompt_len=32,
             block_ids=[100, 101, 102, 103, 104],
             sliding_window_size=16,
+            exposes_block_ordinals=False,
         )
 
         kv_slice = transceiver._create_kv_slice(req)
@@ -505,14 +536,19 @@ class TestCreateKvSliceTokenRange:
             np.array([102, 103, 200, 201, 202], dtype=np.int64),
         )
 
+    # A manager either hands back the whole chain (ordinals unavailable, legacy
+    # count-based trim) or the pruned valid list (ordinals available). Pairing
+    # the two spellings keeps each case honest about which it simulates.
     @pytest.mark.parametrize(
-        "block_ids",
+        "block_ids,exposes_block_ordinals",
         (
-            pytest.param([100, 101, 102, 103, 104], id="v1-pre-eviction"),
-            pytest.param([102, 103, 104], id="v2-valid-only"),
+            pytest.param([100, 101, 102, 103, 104], False, id="v1-pre-eviction"),
+            pytest.param([102, 103, 104], True, id="v2-valid-only"),
         ),
     )
-    def test_swa_trims_speculative_tail_before_stale_prompt_blocks(self, block_ids):
+    def test_swa_trims_speculative_tail_before_stale_prompt_blocks(
+        self, block_ids, exposes_block_ordinals
+    ):
         transceiver, req = _build_transceiver_for_kv_slice(
             num_extra_kv_tokens=2,
             prompt_len=32,
@@ -520,6 +556,7 @@ class TestCreateKvSliceTokenRange:
             sliding_window_size=16,
             cached_tokens=16,
             is_generation_only=True,
+            exposes_block_ordinals=exposes_block_ordinals,
         )
 
         kv_slice = transceiver._create_kv_slice(req)
@@ -570,6 +607,94 @@ class TestCreateKvSliceTokenRange:
         np.testing.assert_array_equal(
             kv_slice.block_ids_per_layer_groups[0],
             block_ids[:-1],
+        )
+
+
+class TestSwaDraftTokenBlockAccounting:
+    """The SWA slice must cover the prompt window, whatever the request drafts.
+
+    A generation-side windowed list is trimmed to its last expected_valid
+    entries, because for a sliding window the live blocks are a suffix. That is
+    only safe while the list holds prompt blocks alone: a speculative block left
+    in it makes the list longer for a reason the trim reads as "extra window",
+    so it drops real prompt blocks off the FRONT and every survivor lands one
+    block late.
+
+    _create_kv_slice sizes the speculative tail from num_extra_kv_tokens plus
+    the request's own draft tokens. Dropping either term undercounts the tail,
+    which leaves a block behind exactly when the missing tokens cross a block
+    boundary -- a few percent of prompt lengths, so it costs accuracy without
+    ever looking like a crash.
+
+    Expected values here come from prompt_len, the window and tokens_per_block
+    only, never from an allocation size, so they cannot drift with the code
+    under test.
+    """
+
+    TPB = 8
+    WINDOW = 16
+    TAG = 1000  # block id TAG+i holds tokens [i*TPB, (i+1)*TPB)
+
+    def _blocks(self, prompt_len, max_draft_len):
+        """Position-tagged list a V2 manager exposes: valid blocks, no stale prefix."""
+        num_extra = max(0, max_draft_len - 1)
+        allocated = (prompt_len + max_draft_len + num_extra + self.TPB - 1) // self.TPB
+        stale_end = max(0, (prompt_len + 1 - self.WINDOW) // self.TPB)
+        return np.arange(self.TAG + stale_end, self.TAG + allocated, dtype=np.int64)
+
+    def _expected(self, prompt_len):
+        total_blocks = (prompt_len + self.TPB - 1) // self.TPB
+        stale_end = max(0, (prompt_len + 1 - self.WINDOW) // self.TPB)
+        return np.arange(self.TAG + stale_end, self.TAG + total_blocks, dtype=np.int64)
+
+    # A contiguous span of more than one block period, so the prompt lengths
+    # whose draft tokens cross a boundary are covered by construction rather
+    # than by picking them out by hand.
+    _PROMPT_LENS = tuple(range(24, 41))
+
+    @pytest.mark.parametrize("max_draft_len", (2, 3, 5))
+    @pytest.mark.parametrize("prompt_len", _PROMPT_LENS)
+    def test_window_blocks_are_not_shifted_by_draft_tokens(self, prompt_len, max_draft_len):
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=max_draft_len - 1,
+            prompt_len=prompt_len,
+            tokens_per_block=self.TPB,
+            block_ids=self._blocks(prompt_len, max_draft_len),
+            sliding_window_size=self.WINDOW,
+            is_generation_only=True,
+            draft_len=max_draft_len,
+        )
+
+        produced = transceiver._create_kv_slice(req).block_ids_per_layer_groups[0]
+        expected = self._expected(prompt_len)
+
+        shift = int(produced[0] - expected[0]) if produced.size and expected.size else 0
+        assert shift == 0, (
+            f"prompt_len={prompt_len} max_draft_len={max_draft_len}: the window's "
+            f"first block moved by {shift}. Block {expected[0]} holds tokens "
+            f"[{(expected[0] - self.TAG) * self.TPB}, ...) but the slice starts at "
+            f"block {produced[0]}, so the peer writes every block one position late."
+        )
+        np.testing.assert_array_equal(produced, expected)
+
+    @pytest.mark.parametrize("max_draft_len", (2, 3, 5))
+    def test_span_contains_a_boundary_crossing(self, max_draft_len):
+        """Guards the guard: the span above must contain the case that bites.
+
+        Asserted on the inputs, not on _create_kv_slice, so it keeps holding
+        once the accounting is correct -- it pins the test data, not the bug.
+        """
+        num_extra = max_draft_len - 1
+        crossing = [
+            prompt_len
+            for prompt_len in self._PROMPT_LENS
+            if (prompt_len + max_draft_len + num_extra + self.TPB - 1) // self.TPB
+            > (prompt_len + num_extra + self.TPB - 1) // self.TPB
+        ]
+        assert crossing, (
+            f"no prompt_len in {self._PROMPT_LENS} makes the draft tokens cross a "
+            f"block boundary at max_draft_len={max_draft_len}; the test above would "
+            "pass without ever exercising the undercount"
         )
 
 
@@ -910,3 +1035,228 @@ class TestTransceiverContextManager:
         tc.shutdown()
         tc.shutdown()  # second call short-circuits on the _shutdown guard.
         tc._transfer_worker.shutdown.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# The capacity contract: one derivation, several consumers.
+# ---------------------------------------------------------------------------
+
+_DIVERGENCE_KEY = "disagg_kv_slice_capacity_divergence"
+
+
+class TestKvCapacityContract:
+    """Asserts positions, not counts.
+
+    The defect kept every count correct while dropping a live block.
+    """
+
+    TPB = 8
+    WINDOW = 16
+    TAG = 1000  # block id TAG+i holds tokens [i*TPB, (i+1)*TPB)
+
+    @staticmethod
+    def _req(prompt_len, draft_len):
+        return SimpleNamespace(prompt_len=prompt_len, py_draft_tokens=[0] * draft_len)
+
+    def test_helper_is_the_sum_of_its_three_terms(self):
+        req = self._req(100, 3)
+        assert get_kv_capacity_tokens(req, 2) == 100 + 3 + 2
+        assert get_kv_capacity_tokens(req, 0) == 100 + 3
+        assert get_kv_capacity_tokens(self._req(100, 0), 2) == 100 + 2
+        # The override exists for context-parallel Helix requests, whose
+        # rank-local prompt_len is not the length the ledger sizes off.
+        assert get_kv_capacity_tokens(req, 2, prompt_len=64) == 64 + 3 + 2
+
+    def _manager_blocks(self, prompt_len, draft_len, num_extra):
+        """Manager's list, sized through the shared helper the allocator uses."""
+        allocated = (
+            get_kv_capacity_tokens(self._req(prompt_len, draft_len), num_extra) + self.TPB - 1
+        ) // self.TPB
+        stale_end = max(0, (prompt_len + 1 - self.WINDOW) // self.TPB)
+        return np.arange(self.TAG + stale_end, self.TAG + allocated, dtype=np.int64)
+
+    def _blocks_in_window(self, prompt_len):
+        """Expected output, from prompt/window/tpb alone -- never from a size."""
+        total_blocks = (prompt_len + self.TPB - 1) // self.TPB
+        stale_end = max(0, (prompt_len + 1 - self.WINDOW) // self.TPB)
+        return np.arange(self.TAG + stale_end, self.TAG + total_blocks, dtype=np.int64)
+
+    # Longer than one block period, so boundary-crossing lengths are covered.
+    _PROMPT_LENS = tuple(range(24, 41))
+
+    @pytest.mark.parametrize("num_extra", (0, 1, 2))
+    @pytest.mark.parametrize("draft_len", (0, 1, 3, 5))
+    @pytest.mark.parametrize("prompt_len", _PROMPT_LENS)
+    def test_slice_follows_the_shared_capacity_definition(self, prompt_len, draft_len, num_extra):
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=num_extra,
+            prompt_len=prompt_len,
+            tokens_per_block=self.TPB,
+            block_ids=self._manager_blocks(prompt_len, draft_len, num_extra),
+            sliding_window_size=self.WINDOW,
+            is_generation_only=True,
+            draft_len=draft_len,
+        )
+
+        produced = transceiver._create_kv_slice(req).block_ids_per_layer_groups[0]
+        expected = self._blocks_in_window(prompt_len)
+
+        shift = int(produced[0] - expected[0]) if produced.size and expected.size else 0
+        assert shift == 0, (
+            f"prompt_len={prompt_len} draft_len={draft_len} num_extra={num_extra}: "
+            f"the window's first block moved by {shift}. Block {expected[0]} holds "
+            f"tokens [{(expected[0] - self.TAG) * self.TPB}, ...) but the slice "
+            f"starts at block {produced[0]}, so the receiver writes every block "
+            "one position late."
+        )
+        np.testing.assert_array_equal(produced, expected)
+
+    def test_span_contains_a_boundary_crossing(self):
+        """Guards the guard: the sweep must contain a boundary-crossing case.
+
+        Asserted on inputs, so it pins the test data rather than the bug.
+        """
+        crossing = [
+            (p, d, e)
+            for p in self._PROMPT_LENS
+            for d in (1, 3, 5)
+            for e in (0, 1, 2)
+            if (get_kv_capacity_tokens(self._req(p, d), e) + self.TPB - 1) // self.TPB
+            > (get_kv_capacity_tokens(self._req(p, 0), e) + self.TPB - 1) // self.TPB
+        ]
+        assert crossing, (
+            "no parameter combination makes the draft tokens cross a block "
+            "boundary; the sweep above would pass without ever exercising the "
+            "case that produced the disagg speculative-decoding KV shift"
+        )
+
+
+class TestCapacityDivergenceIsReported:
+    """A warning that also fires on healthy traffic is one nobody reads."""
+
+    TPB = 8
+    WINDOW = 16
+
+    @pytest.fixture(autouse=True)
+    def _reset_log_once(self):
+        logger._appeared_keys.discard(_DIVERGENCE_KEY)
+        yield
+        logger._appeared_keys.discard(_DIVERGENCE_KEY)
+
+    def _run(self, block_ids, prompt_len=36, draft_len=3, num_extra=2):
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=num_extra,
+            prompt_len=prompt_len,
+            tokens_per_block=self.TPB,
+            block_ids=block_ids,
+            sliding_window_size=self.WINDOW,
+            is_generation_only=True,
+            draft_len=draft_len,
+            exposes_block_ordinals=False,
+        )
+        transceiver._create_kv_slice(req)
+        return _DIVERGENCE_KEY in logger._appeared_keys
+
+    def test_pruned_list_longer_than_the_window_is_reported(self):
+        """One block more than the shared definition allows: the 6676406 shape."""
+        prompt_len, draft_len, num_extra = 36, 3, 2
+        allocated = (
+            get_kv_capacity_tokens(
+                SimpleNamespace(prompt_len=prompt_len, py_draft_tokens=[0] * draft_len),
+                num_extra,
+            )
+            + self.TPB
+            - 1
+        ) // self.TPB
+        stale_end = max(0, (prompt_len + 1 - self.WINDOW) // self.TPB)
+        # One block MORE than the definition allows; arange(stale_end,
+        # allocated) would be the correct list and would test nothing.
+        pruned = np.arange(stale_end, allocated + 1, dtype=np.int64)
+        total_blocks = (prompt_len + self.TPB - 1) // self.TPB
+        scratch = max(0, allocated - total_blocks)
+        assert total_blocks > pruned.size - scratch > total_blocks - stale_end, (
+            "input must land strictly between the two healthy post-scratch "
+            "sizes, or it is not a divergence at all"
+        )
+
+        assert self._run(pruned), (
+            "a pruned windowed list longer than the in-window count went "
+            "unreported; the trim silently dropped live KV, which is exactly "
+            "how the disagg speculative-decoding KV shift stayed invisible"
+        )
+
+    def test_full_pre_eviction_list_is_not_reported(self):
+        """Stay quiet when the surplus really is the stale head.
+
+        A V1 manager may return every block, and then keeping the tail is right.
+        """
+        prompt_len, draft_len, num_extra = 36, 3, 2
+        allocated = (
+            get_kv_capacity_tokens(
+                SimpleNamespace(prompt_len=prompt_len, py_draft_tokens=[0] * draft_len),
+                num_extra,
+            )
+            + self.TPB
+            - 1
+        ) // self.TPB
+        full = np.arange(allocated, dtype=np.int64)
+
+        assert not self._run(full), (
+            "the detector fired on a full pre-eviction list, where trimming to "
+            "the last expected_valid entries is the documented, correct "
+            "behaviour; a warning that fires on healthy traffic gets ignored"
+        )
+
+
+class TestWindowSelectionIsPositional:
+    """A hole must not shift its neighbours.
+
+    Count-based selection passes the happy path and fails exactly here.
+    """
+
+    TPB = 8
+    WINDOW = 16
+    TAG = 1000
+
+    def _slice(self, prompt_len, ordinals):
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=2,
+            prompt_len=prompt_len,
+            tokens_per_block=self.TPB,
+            block_ids=np.asarray(ordinals, dtype=np.int64),
+            sliding_window_size=self.WINDOW,
+            is_generation_only=True,
+            draft_len=3,
+        )
+        transceiver._reuse_adapter.get_block_ordinals = lambda req_, idx, lg, _o=np.asarray(
+            ordinals, dtype=np.int64
+        ): _o
+        return transceiver._create_kv_slice(req).block_ids_per_layer_groups[0]
+
+    def _window(self, prompt_len):
+        total = (prompt_len + self.TPB - 1) // self.TPB
+        stale = max(0, (prompt_len + 1 - self.WINDOW) // self.TPB)
+        return stale, total
+
+    def test_scratch_past_the_prompt_is_not_selected(self):
+        """Ordinals beyond the prompt are speculative scratch, never transferred."""
+        prompt_len = 33
+        stale, total = self._window(prompt_len)
+        ordinals = np.arange(self.TAG, self.TAG + total + 2, dtype=np.int64)
+
+        produced = self._slice(prompt_len, ordinals)
+        np.testing.assert_array_equal(produced, ordinals[stale:total])
+
+    def test_a_hole_does_not_shift_its_neighbours(self):
+        """Selecting by count would shift everything after the hole."""
+        prompt_len = 33
+        stale, total = self._window(prompt_len)
+        ordinals = np.arange(self.TAG, self.TAG + total + 2, dtype=np.int64)
+        hole = total - 1
+        assert stale <= hole < total, "the hole must land inside the window"
+        ordinals[hole] = -1
+
+        produced = self._slice(prompt_len, ordinals)
+        expected = np.array([o for o in ordinals[stale:total] if o >= 0], dtype=np.int64)
+        np.testing.assert_array_equal(produced, expected)
+        assert self.TAG + hole not in produced.tolist()

@@ -74,6 +74,20 @@ class CacheReuseAdapter(ABC):
         must translate before returning.
         """
 
+    #: V1 hands back a pre-eviction chain the legacy trim already understands.
+    exposes_block_ordinals: bool = False
+
+    @abstractmethod
+    def get_block_ordinals(
+        self,
+        req: LlmRequest,
+        group_idx: int,
+        lg: AttentionLayerGroup,
+    ) -> np.ndarray:
+        """Entry ``i`` is the slot for tokens ``[i * tokens_per_block, ...)``,
+        ``-1`` where no page is bound. Position must not come from a length.
+        """
+
     @abstractmethod
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit KV blocks to radix tree for future prefix reuse.
@@ -123,6 +137,10 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
         )
         return np.asarray(pool_indices, dtype=np.int64)
 
+    def get_block_ordinals(self, req, group_idx, lg):
+        # V1 exposes the whole chain in order, so ids are already positional.
+        return self.get_block_ids(req, group_idx, lg)
+
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         if not self.enable_block_reuse:
             return
@@ -161,6 +179,16 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         return np.fromiter(
             self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
                 group_idx, valid_only=True
+            ),
+            dtype=np.int64,
+        )
+
+    exposes_block_ordinals = True
+
+    def get_block_ordinals(self, req, group_idx, lg):  # noqa: ARG002
+        return np.fromiter(
+            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
+                group_idx, valid_only=False
             ),
             dtype=np.int64,
         )

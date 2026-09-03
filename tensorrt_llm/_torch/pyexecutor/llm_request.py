@@ -1702,3 +1702,17 @@ def get_draft_token_length(request: LlmRequest) -> int:
     if request.py_draft_tokens is not None:
         return len(request.py_draft_tokens)
     return 0
+
+
+def get_kv_capacity_tokens(request: LlmRequest,
+                           num_extra_kv_tokens: int,
+                           *,
+                           prompt_len: Optional[int] = None,
+                           include_drafts: bool = True) -> int:
+    """KV tokens a request occupies, defined once.
+
+    Consumers that each spell the sum out drift apart silently.
+    """
+    base = request.prompt_len if prompt_len is None else prompt_len
+    draft_len = get_draft_token_length(request) if include_drafts else 0
+    return base + draft_len + num_extra_kv_tokens

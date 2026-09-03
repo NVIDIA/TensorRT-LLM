@@ -50,7 +50,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
     GenTransferStatus,
     KvCacheTransceiver,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_kv_capacity_tokens
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MambaHybridCacheManager,
     MambaHybridCacheManagerV2,
@@ -318,9 +318,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             window_size = lg.sliding_window_size
 
             if window_size is not None:
-                allocated_blocks = (
-                    req.prompt_len + self._kv_cache_manager.num_extra_kv_tokens + tpb - 1
-                ) // tpb
+                stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
+                if req.py_beam_width == 1 and adapter.exposes_block_ordinals:
+                    # Position comes from the index, never from a length.
+                    ordinals = adapter.get_block_ordinals(req, idx, lg)
+                    in_window = ordinals[stale_end:total_blocks]
+                    groups.append(in_window[in_window >= 0].astype(np.int64))
+                    continue
+
+                capacity_tokens = get_kv_capacity_tokens(
+                    req,
+                    self._kv_cache_manager.num_extra_kv_tokens,
+                    include_drafts=is_gen_only,
+                )
+                allocated_blocks = (capacity_tokens + tpb - 1) // tpb
                 beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
                     block_ids,
                     req.py_beam_width,
@@ -333,24 +344,27 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         if tail_block_ids.size > 0
                         else beam0_block_ids
                     )
-                # Current PyExecutor cache managers disable KV-cache token sinks,
-                # so SWA block lists contain an evictable prompt prefix followed
-                # by the speculative scratch tail. If token sinks are enabled,
-                # this must use block-ordinal metadata to preserve the sink prefix.
-                # Remove scratch before trimming stale prompt blocks; otherwise a
-                # boundary-crossing allocation can displace initialized prompt KV.
-                scratch_blocks = max(0, allocated_blocks - total_blocks)
+                # Beam search still walks the packed-beam path below.
+                expected_valid = max(0, total_blocks - stale_end)
+                surplus_blocks = max(0, block_ids.size - expected_valid)
+                scratch_blocks = min(max(0, allocated_blocks - total_blocks), surplus_blocks)
                 if scratch_blocks > 0:
                     if req.py_beam_width != 1:
                         raise ValueError("speculative scratch blocks require beam_width == 1")
-                    block_ids = (
-                        block_ids[:-scratch_blocks]
-                        if scratch_blocks < block_ids.size
-                        else np.array([], dtype=np.int64)
+                    block_ids = block_ids[:-scratch_blocks]
+                # Only two sizes are explainable here: the manager kept the
+                # stale head (total_blocks) or pruned it (expected_valid).
+                size_is_unexplained = expected_valid < block_ids.size < total_blocks
+                if req.py_beam_width == 1 and size_is_unexplained:
+                    logger.warning_once(
+                        "disagg KV slice: windowed layer group has "
+                        f"{block_ids.size} pruned blocks but only {expected_valid} "
+                        f"are in window (prompt_len={req.prompt_len}, tpb={tpb}, "
+                        f"window={window_size}, allocated={allocated_blocks}). "
+                        "Some producer disagrees with get_kv_capacity_tokens; "
+                        "the trim is about to drop live KV.",
+                        key="disagg_kv_slice_capacity_divergence",
                     )
-                # Drop stale blocks the manager may still expose (V1 pre-eviction).
-                stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                expected_valid = max(0, total_blocks - stale_end)
                 # Stale prefix already pruned above; skip reuse-hit blocks that
                 # land inside the window. Clamp to 0: ctx side has cached_per_lg
                 # synthetically 0, and a reuse hit may fall entirely inside the
