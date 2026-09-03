@@ -260,16 +260,20 @@ class CUDAGraphRunner:
                     and self._is_mixed_encoder_decoder_batch(batch)))
 
     def _gather_adp_graph_batch_info(self, batch: ScheduledRequests,
-                                     can_run_cuda_graph: bool):
-        """Return ``[(can_run_cuda_graph, batch_size)]`` per TP rank.
+                                     can_run_cuda_graph: bool,
+                                     sample_type: SampleType):
+        """Return ``[(can_run_cuda_graph, batch_size, sample_type)]`` per TP rank.
 
-        One fixed-size exchange, entered by every rank unconditionally.
+        One fixed-size exchange, entered by every rank unconditionally. The
+        sampling tier rides along because it is part of the graph key: ranks
+        that resolved different tiers would otherwise replay different graphs.
         """
         gathered = self.config.dist.tp_allgather_int64(
-            [bool(can_run_cuda_graph), batch.batch_size])
+            [bool(can_run_cuda_graph), batch.batch_size, sample_type.value])
         flags = gathered[:, 0].astype(bool).tolist()
         sizes = gathered[:, 1].tolist()
-        return list(zip(flags, sizes))
+        tiers = gathered[:, 2].tolist()
+        return list(zip(flags, sizes, tiers))
 
     def _get_seq_len_mode(
         self,
@@ -345,6 +349,7 @@ class CUDAGraphRunner:
         promoted_context_request_ids: frozenset[int] = frozenset(),
         peft_cache_data_type: Optional[torch.dtype] = None,
         use_lora_graph: bool = False,
+        forced_sample_type: Optional[SampleType] = None,
     ) -> Optional[KeyType]:
         batch_size = batch.batch_size
 
@@ -364,8 +369,10 @@ class CUDAGraphRunner:
         # Sampling tier this graph must contain. Only meaningful when the fast
         # sampler is enabled; otherwise it stays FULL so every batch shares one
         # graph and sampling runs eagerly after the forward, as before.
-        sample_type = self._resolve_sample_type(batch,
-                                                promoted_context_request_ids)
+        # Under attention DP the caller has already agreed a tier across ranks.
+        sample_type = (forced_sample_type if forced_sample_type is not None
+                       else self._resolve_sample_type(
+                           batch, promoted_context_request_ids))
 
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
@@ -535,9 +542,17 @@ class CUDAGraphRunner:
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
+        # The sampling tier joins the graph key, so it has to agree across the
+        # attention-DP ranks or they would replay different graphs -- the same
+        # reason can_run_cuda_graph and batch_size are all-gathered here. Ranks
+        # see different batches (an idle one resolves FULL), so fall back to
+        # FULL for the whole group unless every rank picked the same tier.
+        forced_sample_type: Optional[SampleType] = None
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
+            local_sample_type = self._resolve_sample_type(
+                batch, promoted_context_request_ids)
             graph_batch_info = self._gather_adp_graph_batch_info(
-                batch, can_run_cuda_graph)
+                batch, can_run_cuda_graph, local_sample_type)
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
             all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
@@ -545,6 +560,10 @@ class CUDAGraphRunner:
 
             if not all_can_run_cuda_graph or not all_batch_sizes_equal:
                 return None, None, None
+
+            forced_sample_type = (local_sample_type if all(
+                rank_info[2] == graph_batch_info[0][2]
+                for rank_info in graph_batch_info) else SampleType.FULL)
 
         if not self.enabled or not can_run_cuda_graph:
             return None, None, None
@@ -561,7 +580,8 @@ class CUDAGraphRunner:
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata,
                                  promoted_context_request_ids,
-                                 peft_cache_data_type, use_lora_graph)
+                                 peft_cache_data_type, use_lora_graph,
+                                 forced_sample_type)
         if key is None:
             return None, None, None
         if is_mixed_encoder_decoder:
