@@ -975,6 +975,135 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     assert stats.cached_tokens_by_level == [5, 2, 1]
 
 
+def _make_admission_manager(
+    *,
+    counts: list[int],
+    num_committed_tokens: int,
+    last_cached_token_level: int | None = 0,
+) -> tuple[KVCacheManagerV2, Mock]:
+    """Partial manager whose kv_cache_map already holds a cache for request 1.
+
+    Exercises the cached-token attribution branch of _prepare_context_impl without a GPU.
+    """
+    manager = object.__new__(KVCacheManagerV2)
+    manager.conversation_manager = None
+    manager.enable_block_reuse = True
+    manager.tokens_per_block = TOKENS_PER_BLOCK
+    manager.is_draft = False
+    manager.kv_cache_type = CacheType.SELF
+    manager.is_estimating_kv_cache = False
+    manager.impl = SimpleNamespace(record_cached_tokens_by_level=Mock())
+    manager._resume_and_restore = lambda _req_id, _kv_cache: True
+    kv_cache = SimpleNamespace(
+        num_committed_tokens=num_committed_tokens,
+        cached_tokens_by_level=counts,
+        _get_last_cached_token_level=lambda: last_cached_token_level,
+        enable_swa_scratch_reuse=True,
+    )
+    manager.kv_cache_map = {1: kv_cache}
+    return manager, manager.impl.record_cached_tokens_by_level
+
+
+@pytest.mark.parametrize(
+    ("counts", "num_committed_tokens", "expected_key"),
+    [
+        ([4, 2, 0], 7, "kv_cache_v2_cached_tokens_by_level_sum_mismatch"),
+        ([4, -1, 0], 3, "kv_cache_v2_cached_tokens_by_level_invalid"),
+    ],
+)
+def test_prepare_context_drops_bad_cached_token_attribution_without_failing_request(
+    counts: list[int], num_committed_tokens: int, expected_key: str
+) -> None:
+    manager, record = _make_admission_manager(
+        counts=counts, num_committed_tokens=num_committed_tokens
+    )
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1")
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.logger.warning_once"
+    ) as mock_warning:
+        assert manager.prepare_context(request)
+
+    assert mock_warning.call_count == 1
+    assert mock_warning.call_args.kwargs["key"] == expected_key
+    record.assert_not_called()
+    assert request.prepopulated_prompt_len == num_committed_tokens
+
+
+def test_prepare_context_records_consistent_cached_token_attribution() -> None:
+    manager, record = _make_admission_manager(counts=[4, 3, 0], num_committed_tokens=7)
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1")
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.logger.warning_once"
+    ) as mock_warning:
+        assert manager.prepare_context(request)
+
+    mock_warning.assert_not_called()
+    record.assert_called_once_with([4, 3, 0])
+
+
+def test_disagg_gen_init_drops_attribution_when_partial_level_is_unknown() -> None:
+    manager, record = _make_admission_manager(
+        counts=[4, 3, 0], num_committed_tokens=7, last_cached_token_level=None
+    )
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1", is_disagg_generation_init_state=True)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.logger.warning_once"
+    ) as mock_warning:
+        assert manager._prepare_context_impl(request)
+
+    assert mock_warning.call_count == 1
+    assert (
+        mock_warning.call_args.kwargs["key"]
+        == "kv_cache_v2_cached_tokens_by_level_missing_last_level"
+    )
+    record.assert_not_called()
+
+
+def test_disagg_generation_preserved_cached_tokens_drops_partial_block() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.tokens_per_block = TOKENS_PER_BLOCK
+
+    assert manager._get_disagg_generation_preserved_cached_tokens_by_level([4, 3, 0], 7, 1) == [
+        4,
+        0,
+        0,
+    ]
+    assert manager._get_disagg_generation_preserved_cached_tokens_by_level([4, 4, 0], 8, 1) == [
+        4,
+        4,
+        0,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("counts", "num_cached_tokens", "last_level", "expected_key"),
+    [
+        ([4, 3, 0], 7, None, "kv_cache_v2_cached_tokens_by_level_missing_last_level"),
+        ([4, 3, 0], 7, 3, "kv_cache_v2_cached_tokens_by_level_missing_last_level"),
+        ([4, 1, 2], 7, 1, "kv_cache_v2_cached_tokens_by_level_partial_negative"),
+    ],
+)
+def test_disagg_generation_preserved_cached_tokens_returns_none_on_inconsistency(
+    counts: list[int], num_cached_tokens: int, last_level: int | None, expected_key: str
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.tokens_per_block = TOKENS_PER_BLOCK
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.logger.warning_once"
+    ) as mock_warning:
+        result = manager._get_disagg_generation_preserved_cached_tokens_by_level(
+            counts, num_cached_tokens, last_level
+        )
+
+    assert result is None
+    assert mock_warning.call_count == 1
+    assert mock_warning.call_args.kwargs["key"] == expected_key
+
+
 def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager._cold_pool_group_membership = lambda: ((0, frozenset({0, 1})),)

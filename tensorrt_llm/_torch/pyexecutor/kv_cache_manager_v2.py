@@ -2661,16 +2661,27 @@ class KVCacheManagerV2(BaseResourceManager):
                 and not req.is_dummy_request
                 and not self.is_estimating_kv_cache
             ):
-                counts = list(kv_cache.cached_tokens_by_level)
+                # This attribution only feeds an observability counter. A mismatch means the
+                # counter would be wrong, not that the request cannot be served, so drop the
+                # sample and log instead of failing the request. The underlying invariant is a
+                # debug-only assertion in both the Python and C++ core for the same reason.
+                counts: Optional[List[int]] = list(kv_cache.cached_tokens_by_level)
                 if any(type(count) is not int or count < 0 for count in counts):
-                    raise RuntimeError(f"Invalid cached-token level attribution: {counts!r}")
-                if sum(counts) != kv_cache.num_committed_tokens:
-                    raise RuntimeError(
-                        "Cached-token level attribution does not match the "
-                        f"reused-token count: {counts!r} vs "
-                        f"{kv_cache.num_committed_tokens}"
+                    logger.warning_once(
+                        f"Dropping cached-token level attribution for request {req.py_request_id}: "
+                        f"invalid counts {counts!r}",
+                        key="kv_cache_v2_cached_tokens_by_level_invalid",
                     )
-                if req.is_disagg_generation_init_state:
+                    counts = None
+                elif sum(counts) != kv_cache.num_committed_tokens:
+                    logger.warning_once(
+                        f"Dropping cached-token level attribution for request {req.py_request_id}: "
+                        f"{counts!r} does not sum to the reused-token count "
+                        f"{kv_cache.num_committed_tokens}",
+                        key="kv_cache_v2_cached_tokens_by_level_sum_mismatch",
+                    )
+                    counts = None
+                if counts is not None and req.is_disagg_generation_init_state:
                     counts = self._get_disagg_generation_preserved_cached_tokens_by_level(
                         counts,
                         kv_cache.num_committed_tokens,
@@ -2701,16 +2712,32 @@ class KVCacheManagerV2(BaseResourceManager):
         counts: List[int],
         num_cached_tokens: int,
         last_cached_token_level: Optional[int],
-    ) -> List[int]:
-        """Keep only complete local blocks not overwritten by P/D transfer."""
+    ) -> Optional[List[int]]:
+        """Keep only complete local blocks not overwritten by P/D transfer.
+
+        Returns None when the attribution cannot be adjusted consistently, so the caller skips
+        recording this sample rather than failing the request over an observability counter.
+        """
         result = list(counts)
         partial_tokens = num_cached_tokens % self.tokens_per_block
         if partial_tokens:
             if last_cached_token_level is None or not 0 <= last_cached_token_level < len(result):
-                raise RuntimeError("Partial cached prefix is missing its final cache level")
+                logger.warning_once(
+                    "Dropping cached-token level attribution: partial cached prefix of "
+                    f"{num_cached_tokens} tokens is missing its final cache level "
+                    f"(got {last_cached_token_level!r} for {len(result)} levels)",
+                    key="kv_cache_v2_cached_tokens_by_level_missing_last_level",
+                )
+                return None
             result[last_cached_token_level] -= partial_tokens
             if result[last_cached_token_level] < 0:
-                raise RuntimeError("Invalid partial cached-prefix attribution")
+                logger.warning_once(
+                    "Dropping cached-token level attribution: removing the "
+                    f"{partial_tokens}-token partial block from level {last_cached_token_level} "
+                    f"of {counts!r} goes negative",
+                    key="kv_cache_v2_cached_tokens_by_level_partial_negative",
+                )
+                return None
         return result
 
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:

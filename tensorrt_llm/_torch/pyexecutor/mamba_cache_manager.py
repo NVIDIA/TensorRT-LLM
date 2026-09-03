@@ -2890,7 +2890,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         counts: List[int],
         num_cached_tokens: int,
         last_cached_token_level: Optional[int],
-    ) -> List[int]:
+    ) -> Optional[List[int]]:
         if self.local_num_mamba_layers > 0:
             # The incoming recurrent state overwrites the whole local slot and summarizes the
             # complete prefix, so none of those tokens count as a local cache hit.
