@@ -77,6 +77,36 @@ def _get_benchmark_config(module: ModuleType, concurrency):
     return module.get_benchmark_config(config)
 
 
+@pytest.mark.parametrize(
+    ("runtime_mode", "hardware_config", "expect_ucx"),
+    (
+        ("aggregated", {"gpus_per_server": 1}, False),
+        ("aggregated", {"gpus_per_server": 4}, True),
+        ("disaggregated", {}, True),
+    ),
+)
+def test_get_ucx_env_cmd_covers_multi_rank_launches(
+    submit_module: ModuleType,
+    runtime_mode: str,
+    hardware_config: dict[str, int],
+    expect_ucx: bool,
+) -> None:
+    command = submit_module.get_ucx_env_cmd(
+        runtime_mode,
+        hardware_config,
+        "oci-aga-cs-001",
+        "GB300",
+    )
+
+    if expect_ucx:
+        assert "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp" in command
+        assert "UCX_NET_DEVICES=eth0" in command
+        assert "TRTLLM_PRESERVE_UCX_ENV=1" in command
+        assert command.startswith("unset UCX_CUDA_IPC_ENABLE_MNNVL UCX_TLS UCX_NET_DEVICES")
+    else:
+        assert command == ""
+
+
 @pytest.mark.parametrize("concurrency", ("1", 1, "4301"))
 def test_get_benchmark_config_accepts_positive_integer(submit_module: ModuleType, concurrency):
     benchmark_config = _get_benchmark_config(submit_module, concurrency)

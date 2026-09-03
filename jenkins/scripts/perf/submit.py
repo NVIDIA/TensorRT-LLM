@@ -43,7 +43,7 @@ import sys
 
 import yaml
 from benchmark_utils import parse_positive_concurrency
-from cluster_env import get_ucx_tls_cmd, gpu_type_from_stage_name
+from cluster_env import get_ucx_env_cmd, gpu_type_from_stage_name
 
 
 def _import_precheck_config(llm_src):
@@ -844,6 +844,14 @@ def main():
     test_output_dir = get_test_output_dir(script_prefix_lines, test_case_name)
 
     gpu_type = gpu_type_from_stage_name(args.stage_name)
+    ucx_tls_cmd = get_ucx_env_cmd(
+        runtime_mode,
+        hardware_config,
+        args.cluster_name,
+        gpu_type,
+    )
+    if ucx_tls_cmd:
+        print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
 
     if runtime_mode == "aggregated":
         # Aggregated (incl. ctx_only): single pytestCommand built from the
@@ -852,12 +860,8 @@ def main():
         # every rank before trtllm-llmapi-launch dispatches to pytest (rank 0)
         # or mgmn_worker_node (others).
         server_env_var = env_config["server_env_var"]
-        if server_env_var.strip():
-            pytest_command_with_env = (
-                f'export pytestCommand="{server_env_var} $partialPytestCommand"'
-            )
-        else:
-            pytest_command_with_env = 'export pytestCommand="$partialPytestCommand"'
+        pytest_command = _join_env(ucx_tls_cmd, server_env_var, "$partialPytestCommand")
+        pytest_command_with_env = f'export pytestCommand="{pytest_command}"'
 
         script_prefix_lines.extend(
             [
@@ -903,8 +907,6 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
-        ucx_tls_cmd = get_ucx_tls_cmd(args.cluster_name, gpu_type)
-        print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
         ucx_tls_server_cmd = ucx_tls_cmd
 
         pytest_common_vars = ""

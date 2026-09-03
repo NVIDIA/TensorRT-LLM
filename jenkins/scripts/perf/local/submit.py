@@ -28,7 +28,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from benchmark_utils import parse_positive_concurrency  # noqa: E402
-from cluster_env import get_ucx_tls_cmd, gpu_type_from_supported_gpus  # noqa: E402
+from cluster_env import get_ucx_env_cmd, gpu_type_from_supported_gpus  # noqa: E402
 
 
 def _import_precheck_config(llm_src):
@@ -795,14 +795,11 @@ def main():
         with open(config_yaml, "r") as f:
             config = yaml.safe_load(f)
 
-    # Detect GPU type and cluster only for disaggregated UCX selection.
-    if runtime_mode == "disaggregated":
-        supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
-        gpu_type = gpu_type_from_supported_gpus(supported_gpus)
-        cluster_name = args.cluster_name or detect_cluster_name()
-    else:
-        gpu_type = ""
-        cluster_name = ""
+    # Cluster-specific UCX settings apply to disaggregated cache transceivers
+    # and to multi-rank aggregated MPI launches.
+    supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
+    gpu_type = gpu_type_from_supported_gpus(supported_gpus)
+    cluster_name = args.cluster_name or detect_cluster_name()
 
     # Create timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -851,6 +848,14 @@ def main():
         benchmark_mode,
         test_name=select_pattern,
     )
+    ucx_tls_cmd = get_ucx_env_cmd(
+        runtime_mode,
+        hardware_config,
+        cluster_name,
+        gpu_type,
+    )
+    if ucx_tls_cmd:
+        print(f"UCX env: cluster={cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
 
     # Generate sbatch params
     sbatch_lines = generate_sbatch_params(args, hardware_config, work_dir)
@@ -1023,8 +1028,6 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size} {gen_worker_env_vars}"
             )
 
-        ucx_tls_cmd = get_ucx_tls_cmd(cluster_name, gpu_type)
-        print(f"UCX env: cluster={cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
         script_prefix_lines.extend(
             [
                 f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',
@@ -1107,12 +1110,18 @@ def main():
         agg_server_env_vars = env_config.get("server_env_var", "")
         launcher_seg = "" if hardware_config.get("total_gpus") == 1 else " $LLM_API_LAUNCH"
         # Aggregated mode (including ctx_only)
+        pytest_command_prefix = _join_env(
+            ucx_tls_cmd,
+            "$SERVER_ENV_VARS",
+            "$WORKER_ENV_VARS",
+            "$PYTEST_COMMON_VARS",
+        )
         script_prefix_lines.extend(
             [
                 f'export WORKER_ENV_VARS="{worker_env_vars}"',
                 f'export SERVER_ENV_VARS="{agg_server_env_vars}"',
                 (
-                    'export pytestCommand="$SERVER_ENV_VARS $WORKER_ENV_VARS $PYTEST_COMMON_VARS'
+                    f'export pytestCommand="{pytest_command_prefix}'
                     f"{launcher_seg}"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
