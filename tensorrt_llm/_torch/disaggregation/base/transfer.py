@@ -49,8 +49,8 @@ class KVSlice:
     Monolithic transfers omit ``token_range`` and cover ``prompt_len``.
     Pipelined transfers use a block-aligned ``token_range`` and mark only the
     final chunk with ``is_last_slice``. Block lists may omit cached or evicted
-    prefixes. Paged-attention block lists contain beam 0 only; the receiver
-    replicates its final partial block to the other beams locally.
+    prefixes. Paged-attention block lists contain beam 0 only; beam-search
+    attention reads prompt positions through beam 0's block table.
     """
 
     layer_range: Optional[LayerRange] = None

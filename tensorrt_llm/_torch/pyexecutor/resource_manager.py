@@ -1440,11 +1440,6 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.store_blocks_for_reuse(request.py_request_id, request,
                                                 pin_blocks)
 
-    def copy_last_attention_block_to_all_beams(self,
-                                               request: LlmRequest) -> bool:
-        """Replicate beam 0's final partial attention block across beams."""
-        return self.impl.copy_last_attention_block_to_all_beams(request)
-
     @staticmethod
     def calculate_scaling_factor_size_bytes(
             cache_size: int, quant_vector_size: int,

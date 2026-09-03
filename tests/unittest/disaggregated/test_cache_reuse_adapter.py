@@ -27,7 +27,6 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 pytestmark = pytest.mark.cpu_only
 
@@ -140,41 +139,6 @@ class TestBeam0BlockLayout:
         assert mgr.calls == [([1], 0)]
         assert mgr.pool_indices_window == 512
         np.testing.assert_array_equal(block_ids, [10, 11, 12])
-
-
-class TestBeamTailCopy:
-    def test_refreshes_v1_blocks_after_copy(self):
-        manager = object.__new__(KVCacheManager)
-        manager.impl = MagicMock()
-        manager.impl.copy_last_attention_block_to_all_beams.return_value = True
-        transceiver = object.__new__(KvCacheTransceiverV2)
-        transceiver._kv_cache_manager = manager
-        req = SimpleNamespace(py_beam_width=4)
-
-        transceiver._copy_last_attention_block_to_all_beams(req)
-
-        manager.impl.copy_last_attention_block_to_all_beams.assert_called_once_with(req)
-        manager.impl.refresh_blocks.assert_called_once_with()
-
-    def test_skips_refresh_when_blocks_are_shared(self):
-        manager = object.__new__(KVCacheManager)
-        manager.impl = MagicMock()
-        manager.impl.copy_last_attention_block_to_all_beams.return_value = False
-        transceiver = object.__new__(KvCacheTransceiverV2)
-        transceiver._kv_cache_manager = manager
-        req = SimpleNamespace(py_beam_width=4)
-
-        transceiver._copy_last_attention_block_to_all_beams(req)
-
-        manager.impl.refresh_blocks.assert_not_called()
-
-    def test_single_beam_is_a_noop(self):
-        transceiver = object.__new__(KvCacheTransceiverV2)
-        transceiver._kv_cache_manager = MagicMock()
-
-        transceiver._copy_last_attention_block_to_all_beams(SimpleNamespace(py_beam_width=1))
-
-        transceiver._kv_cache_manager.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

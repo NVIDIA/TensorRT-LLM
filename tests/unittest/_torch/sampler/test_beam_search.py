@@ -40,7 +40,8 @@ from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
 from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
-    CBAGroupHost, _gather_beam_path, _prepare_beam_history_cba, finalize_beam)
+    CBAGroupHost, _gather_beam_path, _prepare_beam_history_cba, finalize_beam,
+    prepare_beam_search)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     BEAM_SEARCH_PAD_TOKEN, BeamSearch, BeamSearchEarlyStop, BeamSearchMetadata,
     CBAState, _StrategyImpls, beam_search_sampling_batch_cba)
@@ -1709,6 +1710,35 @@ def create_default_sampler(test_params: GeneralTestParams) -> TorchSampler:
         max_batch_size, max_beam_width,
         max_seq_len), "Original tokens shape mismatch"
     return sampler
+
+
+def test_beam_prompt_cache_indirection_uses_beam0():
+    """Aggregated and disaggregated beam search share prompt KV through beam 0."""
+    test_params = GeneralTestParams()
+    sampler = create_default_sampler(test_params)
+    beam_search_store = sampler.store.beam_search_store
+    assert beam_search_store is not None
+    seq_slot = test_params.seq_slot
+    prompt_len = test_params.prompt_len
+    beam_search_store.cache_indirection[seq_slot, :, :prompt_len].fill_(1)
+
+    prepare_beam_search(
+        beam_search_store,
+        sampler.store.log_probs_store,
+        seq_slots_long=torch.tensor([seq_slot],
+                                    dtype=torch.int64,
+                                    device="cuda"),
+        max_prompt_len=prompt_len,
+        prompt_lens_cuda=torch.tensor([prompt_len],
+                                      dtype=torch.int32,
+                                      device="cuda"),
+        beam_caps_cuda=torch.tensor([test_params.beam_width],
+                                    dtype=torch.int32,
+                                    device="cuda"),
+    )
+
+    assert torch.count_nonzero(
+        beam_search_store.cache_indirection[seq_slot, :, :prompt_len]) == 0
 
 
 def _vbws_request(beam_width_array: list[int] | None,

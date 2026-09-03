@@ -2428,19 +2428,6 @@ bool BlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequ
     return didCopy;
 }
 
-bool BlockManager::copyLastAttentionBlockToAllBeams(GenerationRequest& sequence, SizeType32 validTokens)
-{
-    bool didCopy = false;
-    for (auto& [windowSize, manager] : mWindowBlockManagers)
-    {
-        static_cast<void>(windowSize);
-        // Use a temporary to avoid short-circuiting; every attention window must run.
-        bool const windowDidCopy = manager.copyLastAttentionBlockToAllBeams(sequence, validTokens);
-        didCopy = didCopy || windowDidCopy;
-    }
-    return didCopy;
-}
-
 bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams)
 {
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
@@ -2670,46 +2657,6 @@ bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
                              // manager to copy the entire block.
             sequence.getTransferMode(), sequence.getDirectory());
         onboardedBlocks.insert({prevBlockId, nextBlockId});
-        didCopy = true;
-    }
-    return didCopy;
-}
-
-bool WindowBlockManager::copyLastAttentionBlockToAllBeams(GenerationRequest& sequence, SizeType32 validTokens)
-{
-    auto const beamWidth = sequence.getBeamWidth();
-    if (isRecurrentState() || beamWidth <= 1 || validTokens <= 0)
-    {
-        return false;
-    }
-
-    auto const requestId = sequence.getRequestId();
-    auto const& blockIdsPerBeam = sequence.getCacheBlockIds(mWindowSize);
-    TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(blockIdsPerBeam.size()) == beamWidth,
-        "Expected %d beam block lists for request %lu, got %zu.", beamWidth, static_cast<unsigned long>(requestId),
-        blockIdsPerBeam.size());
-    TLLM_CHECK_WITH_INFO(!blockIdsPerBeam[0].empty(), "Beam 0 has no KV cache blocks for request %lu.",
-        static_cast<unsigned long>(requestId));
-
-    auto const beam0BlockId = blockIdsPerBeam[0].back();
-    auto const beam0Block = getBlockById(beam0BlockId);
-    std::set<KVCacheBlock::IdType> copiedBlockIds;
-    bool didCopy = false;
-    for (SizeType32 beamIdx = 1; beamIdx < beamWidth; ++beamIdx)
-    {
-        TLLM_CHECK_WITH_INFO(!blockIdsPerBeam[beamIdx].empty(), "Beam %d has no KV cache blocks for request %lu.",
-            beamIdx, static_cast<unsigned long>(requestId));
-        auto const beamBlockId = blockIdsPerBeam[beamIdx].back();
-        if (beamBlockId == beam0BlockId || !copiedBlockIds.insert(beamBlockId).second)
-        {
-            continue;
-        }
-
-        auto const beamBlock = getBlockById(beamBlockId);
-        TLLM_LOG_DEBUG("%s::copyLastAttentionBlockToAllBeams - Copying request %lu block %d to %d", mLogPrefix.c_str(),
-            static_cast<unsigned long>(requestId), beam0BlockId, beamBlockId);
-        mTransferManager->onboard(
-            beam0Block, beamBlock, mPools, validTokens, sequence.getTransferMode(), sequence.getDirectory());
         didCopy = true;
     }
     return didCopy;
@@ -3891,17 +3838,6 @@ bool KVCacheManager::copyLinearAttentionBlockBatch(std::vector<std::shared_ptr<L
         }
     }
     return copiedAny;
-}
-
-bool KVCacheManager::copyLastAttentionBlockToAllBeams(LlmRequest const& llmRequest)
-{
-    auto const validTokens = llmRequest.getPromptLen() % getTokensPerBlock();
-    if (validTokens == 0)
-    {
-        return false;
-    }
-    auto& sequence = getSequence(llmRequest.mRequestId);
-    return mBlockManager.copyLastAttentionBlockToAllBeams(sequence, validTokens);
 }
 
 void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)

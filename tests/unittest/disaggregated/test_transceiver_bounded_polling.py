@@ -425,7 +425,7 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._gen_consensus.assert_called_once_with([])
 
 
-def test_sync_receive_copies_beam_tail_before_marking_complete() -> None:
+def test_sync_receive_marks_request_complete() -> None:
     rid = 17
     req = SimpleNamespace(
         request_id=rid,
@@ -445,48 +445,14 @@ def test_sync_receive_copies_beam_tail_before_marking_complete() -> None:
     transceiver._kv_size_rank_factor = 1
     transceiver._need_aux_transfer = Mock(return_value=False)
     transceiver._assert_disagg_history_declared = Mock()
-    copied_states = []
-    transceiver._copy_last_attention_block_to_all_beams = lambda request: copied_states.append(
-        request.state
-    )
 
     transceiver.request_and_receive_sync(req)
 
-    assert copied_states == [LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS]
     assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
     assert session.closed
 
 
-def test_sync_receive_marks_copy_failure_as_transfer_error() -> None:
-    rid = 19
-    req = SimpleNamespace(
-        request_id=rid,
-        py_disaggregated_params=SimpleNamespace(disagg_request_id=rid),
-        state=None,
-        set_kv_cache_size=Mock(),
-    )
-    session = _FakeSession(rid, WaitResult.COMPLETED)
-    session.receive = Mock()
-
-    transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._recv_sessions = {}
-    transceiver._recv_reqs = {}
-    transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=session))
-    transceiver._create_kv_slice = Mock(return_value=object())
-    transceiver._slice_num_bytes = Mock(return_value=1)
-    transceiver._kv_size_rank_factor = 1
-    transceiver._copy_last_attention_block_to_all_beams = Mock(
-        side_effect=RuntimeError("copy failed")
-    )
-
-    with pytest.raises(RuntimeError, match="copy failed"):
-        transceiver.request_and_receive_sync(req)
-
-    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
-    assert session.closed
-
-
-def test_async_receive_copies_beam_tail_before_marking_complete() -> None:
+def test_async_receive_marks_request_complete() -> None:
     rid = 18
     req = SimpleNamespace(
         state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
@@ -513,17 +479,12 @@ def test_async_receive_copies_beam_tail_before_marking_complete() -> None:
     transceiver._need_aux_transfer = Mock(return_value=False)
     transceiver._assert_disagg_history_declared = Mock()
     transceiver._close_failed_sessions = Mock()
-    copied_states = []
-    transceiver._copy_last_attention_block_to_all_beams = lambda request: copied_states.append(
-        request.state
-    )
 
     completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
 
     assert completed == [rid]
     assert failed == []
     assert cancelled == []
-    assert copied_states == [LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS]
     assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
     assert session.closed
 

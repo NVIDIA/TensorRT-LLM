@@ -404,17 +404,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     total += n * pool.slot_bytes
         return total
 
-    def _copy_last_attention_block_to_all_beams(self, req: LlmRequest) -> None:
-        """Replicate received prompt KV into every beam's final partial block."""
-        if req.py_beam_width <= 1:
-            return
-        if isinstance(self._kv_cache_manager, KVCacheManagerV2):
-            raise ValueError("Disaggregated beam search requires KVCacheManager V1")
-        if not isinstance(self._kv_cache_manager, KVCacheManager):
-            raise TypeError("Disaggregated beam search requires a V1 attention KV cache manager")
-        if self._kv_cache_manager.copy_last_attention_block_to_all_beams(req):
-            self._kv_cache_manager.impl.refresh_blocks()
-
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
         params = req.py_disaggregated_params
@@ -788,7 +777,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if result == WaitResult.COMPLETED:
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
                 req.set_kv_cache_size(self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor)
-                self._copy_last_attention_block_to_all_beams(req)
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
@@ -974,21 +962,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     kv_cache_size=req.kv_cache_size,
                 )
 
-        fanout_failed = []
         for rid in completed:
             session = self._recv_sessions[rid]
             req = self._recv_reqs[rid]
             # transfer_end already stamped at completion detection above.
             req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
-            try:
-                self._copy_last_attention_block_to_all_beams(req)
-            except Exception:
-                logger.exception(
-                    "Failed to replicate the final attention block for disaggregated "
-                    f"beam request {rid}"
-                )
-                fanout_failed.append(rid)
-                continue
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
             self._assert_disagg_history_declared(req)
@@ -996,9 +974,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session.close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
-        if fanout_failed:
-            failed.extend(fanout_failed)
-            completed = [rid for rid in completed if rid not in fanout_failed]
         if failed:
             logger.warning(
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "

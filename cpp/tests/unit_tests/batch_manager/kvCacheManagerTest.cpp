@@ -219,31 +219,6 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
         idSet.insert(beam.begin(), beam.end());
     }
     EXPECT_EQ(idSet.size(), occupiedBlocks);
-
-    auto const primaryPool = blockManager.getPrimaryPool(0);
-    auto const beam0Block = blockManager.getBlockById(ids[0].back(), maxAttentionWindow);
-    auto const beam0BlockData = tr::ITensor::slice(primaryPool, beam0Block->getMemoryPoolBlockIndex(), 1);
-    auto const blockSizeBytes
-        = tr::ITensor::volume(beam0BlockData->getShape()) * tc::getDTypeSize(beam0BlockData->getDataType());
-    EXPECT_EQ(cudaMemset(beam0BlockData->data(), 0x5A, blockSizeBytes), cudaSuccess);
-    for (SizeType32 beamIdx = 1; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto const beamBlock = blockManager.getBlockById(ids[beamIdx].back(), maxAttentionWindow);
-        auto const beamBlockData = tr::ITensor::slice(primaryPool, beamBlock->getMemoryPoolBlockIndex(), 1);
-        EXPECT_EQ(cudaMemset(beamBlockData->data(), 0, blockSizeBytes), cudaSuccess);
-    }
-
-    EXPECT_TRUE(blockManager.copyLastAttentionBlockToAllBeams(seq0, numTokensNotAligned % tokensPerBlock));
-    blockManager.refreshBlocks();
-    std::vector<std::uint8_t> hostBlock(blockSizeBytes);
-    for (SizeType32 beamIdx = 1; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto const beamBlock = blockManager.getBlockById(ids[beamIdx].back(), maxAttentionWindow);
-        auto const beamBlockData = tr::ITensor::slice(primaryPool, beamBlock->getMemoryPoolBlockIndex(), 1);
-        EXPECT_EQ(
-            cudaMemcpy(hostBlock.data(), beamBlockData->data(), blockSizeBytes, cudaMemcpyDeviceToHost), cudaSuccess);
-        EXPECT_GT(std::count(hostBlock.begin(), hostBlock.end(), std::uint8_t{0x5A}), 0);
-    }
     blockManager.releaseBlocks(seq0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
     for (auto const blockId : idSet)
@@ -269,7 +244,6 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
             EXPECT_EQ(idsShared.at(beam).at(i), idsShared.at(0).at(i));
         }
     }
-    EXPECT_FALSE(blockManager.copyLastAttentionBlockToAllBeams(seq0b, numTokens % tokensPerBlock));
     blockManager.releaseBlocks(seq0b);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
