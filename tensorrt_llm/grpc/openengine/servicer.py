@@ -489,6 +489,30 @@ def _deserialize_first_gen_log_probs(positions: Sequence[Any]) -> list[Any]:
     return result
 
 
+def _validate_kv_session(session: Any) -> None:
+    """Reject a session the generation worker cannot resolve.
+
+    The engine consumes the handoff on its executor loop with no timeout and no
+    guard: a session naming an unreachable context worker blocks that loop
+    indefinitely, so every later request on this engine stalls too. Validating
+    what we can here turns an engine-wide hang into one INVALID_ARGUMENT.
+    """
+    attrs = _struct_to_dict(session.attributes_struct)
+    endpoint = attrs.get("ctx_info_endpoint") or _endpoint_to_str(session.endpoints)
+    if endpoint:
+        parts = _split_endpoint(str(endpoint))
+        if parts is None or not parts[1]:
+            raise ValueError(
+                f"kv.session ctx_info_endpoint '{endpoint}' is not a usable address"
+            )
+    elif not attrs.get("opaque_state"):
+        # One or the other locates the context worker: an endpoint on builds that
+        # fetch its info over ZMQ, opaque_state on builds that carry it inline.
+        raise ValueError("kv.session carries neither a ctx_info_endpoint nor an opaque_state")
+    if not session.session_id and attrs.get("disagg_request_id") is None:
+        raise ValueError("kv.session carries neither a session_id nor a disagg_request_id")
+
+
 def _disaggregated_params_from_request(
     request: generation_pb2.GenerateRequest,
 ) -> Optional[DisaggregatedParams]:
@@ -502,6 +526,7 @@ def _disaggregated_params_from_request(
     has_session = request.HasField("kv") and request.kv.HasField("session")
     if has_session:
         session = request.kv.session
+        _validate_kv_session(session)
         params = DisaggregatedParams(request_type="generation_only")
         if session.session_id:
             try:
@@ -979,6 +1004,11 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                     f"for {_RESPONSE_STALL_TIMEOUT_SECONDS:g} seconds"
                 )
                 abort_request("response consumer stalled")
+                # The generator is suspended in `yield` and may never resume, so
+                # its `finally` may never run. Drop the registration here or the
+                # id stays in flight forever: GetLoad over-reports it and the id
+                # is permanently unusable.
+                self._active_requests.pop(request_id, None)
                 stall_timer = None
             else:
                 stall_timer = loop.call_later(
