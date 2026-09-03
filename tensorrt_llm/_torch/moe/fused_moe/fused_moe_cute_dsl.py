@@ -807,8 +807,6 @@ class CuteDslFusedMoE(MoEImplBase):
         }
 
         self._weights_created = False
-        if not model_config.skip_create_weights_in_init:
-            self.create_weights()
 
         self.scaling_vector_size = 16
         # locality domain: fork/join with _locality_domain kernel variants + shared output buffers.
@@ -871,6 +869,14 @@ class CuteDslFusedMoE(MoEImplBase):
         # method owns a weight layout these kernels cannot read.
         raise ValueError(
             f"CuteDslFusedMoE only supports NVFP4, got {self.quant_config}")
+
+    def _supports_load_balancer(self) -> bool:
+        return True
+
+    def _check_configs(self):
+        assert self._weights_created
+        if self.apply_router_weight_on_input:
+            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
 
     def supports_moe_output_in_alltoall_workspace(self):
         return self.has_nvfp4 or (not self.has_any_quant
