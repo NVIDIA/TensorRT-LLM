@@ -814,6 +814,7 @@ class CuteDslFusedMoE(MoEImplBase):
             moe_backend=model_config.moe_backend,
             use_fused_finalize=self.use_fused_finalize,
             dtype_activation=self.dtype,
+            activation=ActivationType(self.activation_type).name,
         )
         if self._locality_domain_plan.enabled:
             self._locality_domain_runtime = LocalityDomainRuntime(
