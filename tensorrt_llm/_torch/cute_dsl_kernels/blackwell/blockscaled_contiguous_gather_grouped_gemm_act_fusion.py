@@ -35,8 +35,9 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass._mlir.dialects import math
+from cutlass._mlir.dialects import llvm, math
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cutlass_dsl import dsl_user_op
 
 from ...utils import ActivationType, is_gated_activation
 from .custom_pipeline import PipelineCpAsyncUmma
@@ -51,6 +52,43 @@ from .utils import (
 )
 
 SUPPORTED_ACTIVATION_TYPES = (ActivationType.Swiglu, ActivationType.Relu2)
+SUPPORTED_SWIGLU_COMPUTE_DTYPES = (
+    cutlass.Float32,
+    cutlass.Float16,
+    cutlass.BFloat16,
+)
+
+
+@dsl_user_op
+def _ex2_approx_f16(value: cutlass.Float16, *, loc=None, ip=None) -> cutlass.Float16:
+    """Compute native half-precision ``2**value`` with NVVM approximate EX2."""
+    return cutlass.Float16(
+        llvm.call_intrinsic(
+            cutlass.Float16.mlir_type,
+            "llvm.nvvm.ex2.approx",
+            [cutlass.Float16(value).ir_value(loc=loc, ip=ip)],
+            [],
+            [],
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ex2_approx_bf16(value: cutlass.BFloat16, *, loc=None, ip=None) -> cutlass.BFloat16:
+    """Compute native bfloat16 ``2**value`` with NVVM approximate EX2."""
+    return cutlass.BFloat16(
+        llvm.call_intrinsic(
+            cutlass.BFloat16.mlir_type,
+            "llvm.nvvm.ex2.approx.ftz",
+            [cutlass.BFloat16(value).ir_value(loc=loc, ip=ip)],
+            [],
+            [],
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 def validate_activation_type(activation_type) -> ActivationType:
@@ -63,6 +101,16 @@ def validate_activation_type(activation_type) -> ActivationType:
         f"got {activation_type.name}"
     )
     return activation_type
+
+
+def validate_swiglu_compute_dtype(
+    swiglu_compute_dtype: Type[cutlass.Numeric],
+) -> Type[cutlass.Numeric]:
+    """Validate the register compute type for SwiGLU."""
+    assert swiglu_compute_dtype in SUPPORTED_SWIGLU_COMPUTE_DTYPES, (
+        f"swiglu_compute_dtype must be Float32, Float16, or BFloat16, got {swiglu_compute_dtype}"
+    )
+    return swiglu_compute_dtype
 
 
 """
@@ -276,6 +324,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         raster_along_m: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_limit: cutlass.Float32 = float("inf"),
+        swiglu_compute_dtype: Type[cutlass.Numeric] = cutlass.Float32,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -318,6 +367,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param activation_type: Fused activation. Must be ``ActivationType.Swiglu``
             (gated, default) or ``ActivationType.Relu2`` (non-gated).
         :type activation_type: ActivationType
+        :param swiglu_compute_dtype: Register compute type used after loading FP32
+            accumulators from TMEM. Must be Float32, Float16, or BFloat16.
+        :type swiglu_compute_dtype: Type[cutlass.Numeric]
         """
 
         self.sf_vec_size = sf_vec_size
@@ -325,6 +377,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.activation_type = validate_activation_type(activation_type)
         self.is_gated = is_gated_activation(self.activation_type)
         self.acc_dtype = cutlass.Float32
+        self.swiglu_compute_dtype = validate_swiglu_compute_dtype(swiglu_compute_dtype)
+        self.epilogue_compute_dtype = self.swiglu_compute_dtype if self.is_gated else self.acc_dtype
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
@@ -377,6 +431,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
         )
         self.threads_wo_sched = self.threads_per_warp * self.warps_wo_sched
+
+        self.num_regs_epilogue_warps = 192
+        self.num_regs_non_epilogue_warps = 152
 
         # Set barrier for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_barrier = pipeline.NamedBarrier(
@@ -1309,6 +1366,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.cta_sync_barrier.arrive_and_wait()
 
         griddepcontrol_wait()
+
+        if cutlass.const_expr(self.is_gated and self.swiglu_compute_dtype != cutlass.Float32):
+            if warp_idx <= self.epilog_warp_id[-1]:
+                cute.arch.setmaxregister_increase(self.num_regs_epilogue_warps)
+            else:
+                cute.arch.setmaxregister_decrease(self.num_regs_non_epilogue_warps)
 
         #
         # Specialized Schedule Warp
@@ -2368,15 +2431,29 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             acc_consumer_state.advance()
 
                     acc_vec_up = tTR_rAcc_up.load()
+                    if cutlass.const_expr(
+                        self.is_gated and self.swiglu_compute_dtype != cutlass.Float32
+                    ):
+                        acc_vec_up = acc_vec_up.to(self.swiglu_compute_dtype)
 
-                    tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
+                    tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.epilogue_compute_dtype)
                     if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
                         acc_vec_gate = tTR_rAcc_gate.load()
+                        if cutlass.const_expr(self.swiglu_compute_dtype != cutlass.Float32):
+                            acc_vec_gate = acc_vec_gate.to(self.swiglu_compute_dtype)
                         self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     elif cutlass.const_expr(self.activation_type == ActivationType.Relu2):
                         self._apply_relu2_epilogue(acc_vec_up, alpha_val, tCompute)
 
                     if cutlass.const_expr(self.generate_sfc):
+                        # Keep SwiGLU arithmetic in the requested 16-bit dtype,
+                        # then widen its rounded result for the canonical NVFP4
+                        # scale computation and Float32-to-E2M1 conversion.
+                        tQuantCompute = tCompute
+                        if cutlass.const_expr(self.epilogue_compute_dtype != cutlass.Float32):
+                            tQuantCompute = cute.make_rmem_tensor(tCompute.shape, cutlass.Float32)
+                            tQuantCompute.store(tCompute.load().to(cutlass.Float32))
+
                         #
                         # Quantization path for Float4E2M1FN output:
                         # 1. Compute per-vector absolute max from activation result
@@ -2402,7 +2479,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         # Get absolute max across a vector and Compute SFC
                         #
                         tTR_rAcc_frg = cute.logical_divide(
-                            tCompute, cute.make_layout(self.sf_vec_size)
+                            tQuantCompute, cute.make_layout(self.sf_vec_size)
                         )
                         acc_frg = tTR_rAcc_frg.load()
                         acc_frg = epilogue_op(acc_frg)
@@ -2493,7 +2570,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 for ei in cutlass.range_constexpr(self.sf_vec_size):
                                     vec[ei] = vec[ei] * acc_scale
 
-                        acc_vec = tiled_copy_r2s.retile(tCompute).load()
+                        acc_vec = tiled_copy_r2s.retile(tQuantCompute).load()
                         tRS_rC.store(acc_vec.to(self.c_dtype))
                     else:
                         #
@@ -2602,7 +2679,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ``up`` and ``gate`` come from the two interleaved accumulator
         subtiles loaded by the caller.
         """
-        if cutlass.const_expr(self.vectorized_f32):
+        if cutlass.const_expr(self.swiglu_compute_dtype == cutlass.Float32 and self.vectorized_f32):
             # Packed f32x2: compute silu via 1 / (1 + exp2(-log2_e * x))
             LOG2_E = cutlass.Float32(1.4426950408889634)
             for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
@@ -2652,7 +2729,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     (tCompute[i], tCompute[i + 1]),
                     (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
                 )
-        else:
+        elif cutlass.const_expr(self.swiglu_compute_dtype == cutlass.Float32):
             for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
                 acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
                 acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
@@ -2660,6 +2737,33 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit)
                     acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
                 tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
+        else:
+            compute_dtype = self.swiglu_compute_dtype
+            alpha_compute = compute_dtype(alpha_val)
+            limit_compute = compute_dtype(self.swiglu_limit)
+            for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
+                acc_vec_up_alpha = compute_dtype(acc_vec_up[i] * alpha_compute)
+                acc_vec_gate_alpha = compute_dtype(acc_vec_gate[i] * alpha_compute)
+                if cutlass.const_expr(self.has_swiglu_limit):
+                    acc_vec_gate_alpha = cute.math.min(acc_vec_gate_alpha, limit_compute)
+                    acc_vec_up_alpha = cute.math.max(
+                        cute.math.min(acc_vec_up_alpha, limit_compute),
+                        -limit_compute,
+                    )
+
+                neg_log2e_gate = compute_dtype(
+                    acc_vec_gate_alpha * compute_dtype(-1.4426950408889634)
+                )
+                if cutlass.const_expr(compute_dtype == cutlass.Float16):
+                    exp_value = _ex2_approx_f16(neg_log2e_gate)
+                else:
+                    exp_value = _ex2_approx_bf16(neg_log2e_gate)
+                sigmoid_f32_value = cute.arch.rcp_approx(
+                    cutlass.Float32(1.0) + cutlass.Float32(exp_value)
+                )
+                sigmoid = compute_dtype(sigmoid_f32_value)
+                silu = compute_dtype(acc_vec_gate_alpha * sigmoid)
+                tCompute[i] = compute_dtype(acc_vec_up_alpha * silu)
 
     @cute.jit
     def _apply_relu2_epilogue(

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -532,6 +532,7 @@ def run(
     use_cupti: bool = False,
     raster_along_m: bool = False,
     swiglu_limit: float = float("inf"),
+    swiglu_compute_dtype: Type[cutlass.Numeric] = cutlass.Float32,
     **kwargs,
 ):
     """Run contiguous grouped GEMM with gather operation and SwiGLU fusion for FC1 layer.
@@ -563,6 +564,7 @@ def run(
     print(f"Use cold L2: {use_cold_l2}")
     print(f"Use CUPTI: {use_cupti}")
     print(f"Raster along M: {raster_along_m}")
+    print(f"SwiGLU compute dtype: {swiglu_compute_dtype}")
 
     # Unpack parameters
     n, k, num_groups = nkl
@@ -650,6 +652,7 @@ def run(
         topk=1,
         raster_along_m=raster_along_m,
         swiglu_limit=swiglu_limit,
+        swiglu_compute_dtype=swiglu_compute_dtype,
     )
 
     # Compute max active clusters on current device
@@ -710,6 +713,7 @@ def run(
 
         # Step 1: Compute full GEMM first
         gemm_result = torch.empty((1, valid_m, n), dtype=torch.float32)
+        alpha_by_row = torch.empty((valid_m, 1), dtype=torch.float32)
         start = 0
         a_torch_cpu_f32 = torch.einsum("mk,mk->mk", a_torch_cpu[:, :, 0], sfa_torch_cpu[:, :, 0])
         for i, group_m in enumerate(aligned_group_m_list):
@@ -717,9 +721,8 @@ def run(
             res_a = a_torch_cpu_f32[token_id_mapping_cpu[start:end]]
 
             res_b = torch.einsum("nk,nk->nk", b_torch_cpu[:, :, i], sfb_torch_cpu[:, :, i])
-            alpha_val = alpha_torch_cpu[i]
-
-            gemm_result[0, start:end, :] = torch.einsum("mk,nk->mn", res_a, res_b) * alpha_val
+            gemm_result[0, start:end, :] = torch.einsum("mk,nk->mn", res_a, res_b)
+            alpha_by_row[start:end] = alpha_torch_cpu[i]
             start = end
 
         # Step 2: Apply SwiGLU on interleaved GEMM result
@@ -734,19 +737,44 @@ def run(
                 0, :, n_block + interleave_granularity : n_block + 2 * interleave_granularity
             ]
 
+            if swiglu_compute_dtype == cutlass.Float32:
+                up_result = up_result * alpha_by_row
+                gate_result = gate_result * alpha_by_row
+            else:
+                torch_compute_dtype = {
+                    cutlass.Float16: torch.float16,
+                    cutlass.BFloat16: torch.bfloat16,
+                }[swiglu_compute_dtype]
+                alpha_compute = alpha_by_row.to(torch_compute_dtype)
+                up_result = (up_result.to(torch_compute_dtype) * alpha_compute).to(
+                    torch_compute_dtype
+                )
+                gate_result = (gate_result.to(torch_compute_dtype) * alpha_compute).to(
+                    torch_compute_dtype
+                )
+
             # SwiGLU clamp
             if swiglu_limit != float("inf"):
                 gate_result = gate_result.clamp(max=swiglu_limit)
                 up_result = up_result.clamp(min=-swiglu_limit, max=swiglu_limit)
 
-            # SwiGLU: up * silu(gate) where silu(x) = x * sigmoid(x)
-            silu_gate = gate_result * torch.sigmoid(gate_result)
-            output_block = up_result * silu_gate
+            # SwiGLU: up * silu(gate), following the kernel's compute dtype and
+            # operation ordering so the reference includes intermediate rounding.
+            if swiglu_compute_dtype == cutlass.Float32:
+                silu_gate = gate_result * torch.sigmoid(gate_result)
+                output_block = up_result * silu_gate
+            else:
+                log2_e = torch.tensor(1.4426950408889634, dtype=torch_compute_dtype)
+                neg_log2e_gate = (-log2_e * gate_result).to(torch_compute_dtype)
+                exp_value = torch.exp2(neg_log2e_gate).to(torch_compute_dtype)
+                sigmoid = (1.0 + exp_value.float()).reciprocal().to(torch_compute_dtype)
+                silu_gate = (gate_result * sigmoid).to(torch_compute_dtype)
+                output_block = (up_result * silu_gate).to(torch_compute_dtype)
 
             # Store to output at n_block/2 position
             out_start = n_block // 2
             out_end = out_start + interleave_granularity
-            ref[0, :, out_start:out_end] = output_block
+            ref[0, :, out_start:out_end] = output_block.float()
 
         ref = ref.permute((1, 2, 0))
 
@@ -1207,7 +1235,13 @@ if __name__ == "__main__":
         default=float("inf"),
         help="Swiglu clamp factor, +inf (default) disables clamp",
     )
-
+    parser.add_argument(
+        "--swiglu_compute_dtype",
+        type=cutlass.dtype,
+        choices=[cutlass.Float32, cutlass.Float16, cutlass.BFloat16],
+        default=cutlass.Float32,
+        help="SwiGLU arithmetic dtype after loading FP32 accumulators from TMEM",
+    )
     args = parser.parse_args()
 
     # Process arguments to generate nkl and group_m_list
@@ -1263,6 +1297,7 @@ if __name__ == "__main__":
         args.use_cupti,
         args.raster_along_m,
         args.swiglu_limit,
+        args.swiglu_compute_dtype,
     )
     print(f"Execution time: {exec_time:.2f} us")
     print("PASS")
