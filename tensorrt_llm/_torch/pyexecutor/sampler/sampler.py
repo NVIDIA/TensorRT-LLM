@@ -2853,7 +2853,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self._log_probs._process_logprobs(
                 batched_sampling_result,
                 logits_cuda=logits_cuda,
-                new_tokens_cuda=new_tokens_cuda,
+                # Drop the trailing scratch slot row (see dummy_slot_row): it
+                # belongs to no request, and the logprobs stores are sized by
+                # max_num_sequences, which also sets the flat gather stride
+                # there. contiguous() because slicing the slot dimension leaves
+                # a strided view and _process_logprobs calls view() on it.
+                new_tokens_cuda=new_tokens_cuda[:, : self.max_num_sequences].contiguous(),
                 seq_slots=seq_slots_host,
                 requests=sampling_requests,
                 req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens_output,
