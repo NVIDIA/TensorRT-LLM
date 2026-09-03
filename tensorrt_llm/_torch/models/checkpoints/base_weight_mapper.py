@@ -6,6 +6,7 @@ from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor.config_utils import read_layer_config_attr
 
 
 class BaseWeightMapper(ABC):
@@ -323,7 +324,7 @@ class BaseWeightMapper(ABC):
     @property
     def _head_dim(self) -> int:
         model = self.model
-        head_dim = model.config.head_dim if hasattr(
-            model.config, 'head_dim'
-        ) and model.config.head_dim is not None else model.config.hidden_size // model.config.num_attention_heads
+        head_dim = read_layer_config_attr(model.config, 0, 'head_dim')
+        if head_dim is None:
+            head_dim = model.config.hidden_size // model.config.num_attention_heads
         return head_dim

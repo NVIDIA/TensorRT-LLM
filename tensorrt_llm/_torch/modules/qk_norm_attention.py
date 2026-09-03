@@ -166,6 +166,7 @@ class QKNormRoPEAttention(Attention):
         reduce_output: bool = True,
         rope_fusion: bool = True,
         mapping_with_cp: Optional[Mapping] = None,
+        head_dim: Optional[int] = None,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -201,6 +202,7 @@ class QKNormRoPEAttention(Attention):
             attn_output_gate=attn_output_gate,
             reduce_output=reduce_output,
             mapping_with_cp=mapping_with_cp,
+            head_dim=head_dim,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
