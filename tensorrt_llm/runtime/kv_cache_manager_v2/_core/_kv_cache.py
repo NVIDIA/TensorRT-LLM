@@ -34,7 +34,6 @@ from .._common import (
     BlockOrdinal,
     BlockOrdinalT,
     CacheLevel,
-    CacheTier,
     CudaStream,
     PageIndex,
     PageIndexMode,
@@ -1482,12 +1481,6 @@ class _KVCache:
 
         num_pool_groups = storage.num_pool_groups
         lc2pg = storage.get_pool_group_index
-        track_disk_tokens = (
-            self._should_record_manager_stats()
-            and storage.cache_tiers[target] == CacheTier.HOST_MEM
-        )
-        has_disk_page = False
-
         all_pages = make_typed(
             lambda _: make_typed(lambda _: list[Page](), num_tiers), num_pool_groups
         )
@@ -1500,24 +1493,18 @@ class _KVCache:
             lvl = page.cache_level
             if lvl < target:
                 continue
-            if track_disk_tokens and storage.cache_tiers[lvl] == CacheTier.DISK:
-                has_disk_page = True
             pg_idx = lc2pg(lc_idx)
             all_pages[pg_idx][lvl].append(page)
 
         try:
-            storage.prefetch(target, all_pages)
+            # StorageManager reports what it actually migrated. Blocks, the unit
+            # iter_offload_blocks and iter_onboard_blocks use: one page per block per life cycle.
+            # Unrelated to _cached_tokens_by_level, which answers where matched tokens lived.
+            disk_blocks_migrated = storage.prefetch(target, all_pages)
+            if disk_blocks_migrated > 0 and self._should_record_manager_stats():
+                manager.record_disk_prefetch_blocks(disk_blocks_migrated)
         except OutOfPagesError:
             return False
-        if has_disk_page:
-            # The metric counts disk-to-host movement, so fold together every level the config
-            # maps to the disk tier rather than assuming a single disk level.
-            disk_tokens = sum(
-                count
-                for level, count in enumerate(self._cached_tokens_by_level)
-                if storage.cache_tiers[level] == CacheTier.DISK
-            )
-            manager.record_disk_prefetch_tokens(disk_tokens)
         return True
 
     def _active_pages(self) -> Iterator[tuple[BlockOrdinal, BeamIndex, LifeCycleId]]:

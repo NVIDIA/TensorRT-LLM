@@ -2328,7 +2328,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "get_and_reset_iteration_suspend_resume_stats", &kv::KvCacheManager::getAndResetIterationSuspendResumeStats)
         .def(
-            "get_and_reset_iteration_disk_prefetch_tokens", &kv::KvCacheManager::getAndResetIterationDiskPrefetchTokens)
+            "get_and_reset_iteration_disk_prefetch_blocks", &kv::KvCacheManager::getAndResetIterationDiskPrefetchBlocks)
         .def(
             "record_cached_tokens_by_level",
             [](kv::KvCacheManager& self, std::vector<int64_t> counts)

@@ -953,7 +953,7 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
         get_and_reset_iteration_stats=lambda: {},
         get_and_reset_ssm_snapshot_iteration_stats=lambda: {3: snapshot_delta},
         get_and_reset_iteration_suspend_resume_stats=lambda: (0, 0),
-        get_and_reset_iteration_disk_prefetch_tokens=lambda: 7,
+        get_and_reset_iteration_disk_prefetch_blocks=lambda: 7,
         get_and_reset_iteration_cached_tokens_by_level=lambda: [5, 2, 1],
         get_and_reset_iteration_reused_blocks_by_level=lambda: {},
     )
@@ -971,7 +971,7 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     assert ssm_stats.pool_group_id == 1
     assert ssm_stats.snapshot_stats.iter_snapshot_hit_rate == 0.5
     assert ssm_stats.snapshot_stats.iter_reused_tokens == 32
-    assert stats.disk_prefetch_tokens == 7
+    assert stats.disk_prefetch_blocks == 7
     assert stats.cached_tokens_by_level == [5, 2, 1]
 
 

@@ -245,10 +245,12 @@ public:
     // counts; a freshly-created cache is activated by its first resume(), but
     // that is an admission, not a recovery, and is not counted.
     void recordRequestResumed();
-    // Add logical tokens successfully scheduled for disk-to-host prefetch in the current iteration window.
-    void recordDiskPrefetchTokens(int64_t numTokens);
-    // Return the number of disk-prefetched tokens since the last drain and reset it.
-    int64_t getAndResetIterationDiskPrefetchTokens();
+    // Add the blocks a prefetch call actually migrated off disk in the current iteration window.
+    // Independent of reuse-hit attribution, which asks where matched tokens lived rather than
+    // what a prefetch moved.
+    void recordDiskPrefetchBlocks(int64_t numBlocks);
+    // Return the number of disk-prefetched blocks since the last drain and reset it.
+    int64_t getAndResetIterationDiskPrefetchBlocks();
     // Accumulate a request's initial current-residency cached-token attribution, indexed by cache
     // level, into the current iteration window.
     void recordCachedTokensByLevel(CountsByLevel const& counts);
@@ -381,7 +383,7 @@ private:
     std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;
     int64_t mIterSuspendedRequests{0};
     int64_t mIterResumedRequests{0};
-    int64_t mIterDiskPrefetchTokens{0};
+    int64_t mIterDiskPrefetchBlocks{0};
     CountsByLevel mIterCachedTokensByLevel;
 };
 

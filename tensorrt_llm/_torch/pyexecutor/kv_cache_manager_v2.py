@@ -3441,7 +3441,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self.enable_stats:
             return None
 
-        disk_prefetch_tokens = self.impl.get_and_reset_iteration_disk_prefetch_tokens()
+        disk_prefetch_blocks = self.impl.get_and_reset_iteration_disk_prefetch_blocks()
         cached_tokens_by_level = self.impl.get_and_reset_iteration_cached_tokens_by_level()
         reused_blocks_by_level = self.impl.get_and_reset_iteration_reused_blocks_by_level()
 
@@ -3541,7 +3541,7 @@ class KVCacheManagerV2(BaseResourceManager):
             ),
             suspended_requests=suspended_requests,
             resumed_requests=resumed_requests,
-            disk_prefetch_tokens=disk_prefetch_tokens,
+            disk_prefetch_blocks=disk_prefetch_blocks,
             cached_tokens_by_level=list(cached_tokens_by_level),
             cache_level_tiers=self._stats_cache_level_tier_names(),
         )

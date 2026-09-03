@@ -512,7 +512,7 @@ class TestStatsSerializer:
             },
             suspended_requests=2,
             resumed_requests=1,
-            disk_prefetch_tokens=7,
+            disk_prefetch_blocks=7,
             cached_tokens_by_level=[5, 2, 1],
             cache_level_tiers=["gpu", "host", "disk"],
         )
@@ -522,7 +522,7 @@ class TestStatsSerializer:
 
         assert d["iterSuspendedRequests"] == 2
         assert d["iterResumedRequests"] == 1
-        assert d["iterDiskPrefetchTokens"] == 7
+        assert d["iterDiskPrefetchBlocks"] == 7
         assert d["iterCachedTokensByLevel"] == [5, 2, 1]
         assert d["kvCacheLevelTiers"] == ["gpu", "host", "disk"]
         # Manager-level, not nested inside the per-pool-group breakdown.

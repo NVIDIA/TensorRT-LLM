@@ -542,21 +542,21 @@ void KvCacheManager::recordRequestResumed()
     ++mIterResumedRequests;
 }
 
-void KvCacheManager::recordDiskPrefetchTokens(int64_t numTokens)
+void KvCacheManager::recordDiskPrefetchBlocks(int64_t numBlocks)
 {
-    TLLM_CHECK_DEBUG(numTokens >= 0);
+    TLLM_CHECK_DEBUG(numBlocks >= 0);
     if (!mConfig.enableStats)
     {
         return;
     }
-    mIterDiskPrefetchTokens += numTokens;
+    mIterDiskPrefetchBlocks += numBlocks;
 }
 
-int64_t KvCacheManager::getAndResetIterationDiskPrefetchTokens()
+int64_t KvCacheManager::getAndResetIterationDiskPrefetchBlocks()
 {
-    auto const numTokens = mIterDiskPrefetchTokens;
-    mIterDiskPrefetchTokens = 0;
-    return numTokens;
+    auto const numBlocks = mIterDiskPrefetchBlocks;
+    mIterDiskPrefetchBlocks = 0;
+    return numBlocks;
 }
 
 void KvCacheManager::recordCachedTokensByLevel(CountsByLevel const& counts)

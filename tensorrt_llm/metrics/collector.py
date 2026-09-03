@@ -67,7 +67,7 @@ class MetricsCollector:
             trtllm_kv_cache_gen_alloc_blocks_total
             trtllm_kv_cache_onboard_bytes_total
             trtllm_kv_cache_offload_bytes_total
-            trtllm_kv_cache_disk_prefetch_tokens_total
+            trtllm_kv_cache_disk_prefetch_blocks_total
             trtllm_kv_cache_intra_device_copy_bytes_total
             trtllm_num_requests_running
             trtllm_num_requests_waiting
@@ -295,11 +295,11 @@ class MetricsCollector:
             name=self.metric_prefix + "kv_cache_offload_bytes_total",
             documentation="Total bytes transferred from GPU to host (offload)",
             labelnames=self.labels.keys())
-        self.kv_cache_disk_prefetch_tokens_total = Counter(
-            name=self.metric_prefix + "kv_cache_disk_prefetch_tokens_total",
+        self.kv_cache_disk_prefetch_blocks_total = Counter(
+            name=self.metric_prefix + "kv_cache_disk_prefetch_blocks_total",
             documentation=(
-                "Process-lifetime total logical prompt tokens successfully "
-                "scheduled for disk-to-host V2 KV-cache prefetch. "
+                "Process-lifetime total V2 KV-cache blocks migrated from disk "
+                "to host by the prefetch mechanism. "
                 "Resets only when the serving process restarts."),
             labelnames=self.labels.keys())
         self.kv_cache_intra_device_copy_bytes_total = Counter(
@@ -866,10 +866,10 @@ class MetricsCollector:
 
         # Per-iteration KV cache stats. V2 reports reuse/miss by lifecycle and
         # storage/transfer counters by pool group; legacy V1 uses window stats.
-        disk_prefetch_tokens = iteration_stats.get("iterDiskPrefetchTokens", 0)
-        if disk_prefetch_tokens > 0:
-            self._log_counter(self.kv_cache_disk_prefetch_tokens_total, {},
-                              disk_prefetch_tokens)
+        disk_prefetch_blocks = iteration_stats.get("iterDiskPrefetchBlocks", 0)
+        if disk_prefetch_blocks > 0:
+            self._log_counter(self.kv_cache_disk_prefetch_blocks_total, {},
+                              disk_prefetch_blocks)
 
         self._log_cached_tokens_by_level(
             iteration_stats.get("iterCachedTokensByLevel"),

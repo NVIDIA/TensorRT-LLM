@@ -2113,6 +2113,13 @@ class TestResizeQuota(TestKVCacheManagerV2):
             prefetch_counts_before[HOST_LEVEL] + prefetch_counts_before[DISK_LEVEL],
         )
         self.assertEqual(unscheduled_evictable_after[HOST_LEVEL], 0)
+        # The disk-prefetch counter measures what this call moved: every page that was on disk
+        # beforehand, counted the way iterOnboardBlocks/iterOffloadBlocks count.
+        moved_blocks = self.manager.get_and_reset_iteration_disk_prefetch_blocks()
+        self.assertEqual(moved_blocks, prefetch_counts_before[DISK_LEVEL])
+        # Nothing is left on disk now, so a second prefetch moves nothing and counts nothing.
+        self.assertTrue(prefetch_target.prefetch(HOST_LEVEL))
+        self.assertEqual(self.manager.get_and_reset_iteration_disk_prefetch_blocks(), 0)
         # Now both requests can resume
         for kv_cache in kv_cache_lst:
             success = kv_cache.resume(stream)
