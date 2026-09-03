@@ -1010,6 +1010,55 @@ def test_KvCacheConfig_requires_v2_for_additional_snapshot_offsets(
     assert getattr(config.mamba_state_config, field) == offsets
 
 
+def test_MambaStateConfig_branch_snapshot_defaults_off():
+    assert MambaStateConfig().enable_branch_snapshot is False
+    assert MambaStateConfig(
+        enable_branch_snapshot=True).enable_branch_snapshot is True
+
+
+def test_KvCacheConfig_requires_v2_for_branch_snapshots():
+    state_config = MambaStateConfig(enable_branch_snapshot=True)
+
+    with pytest.raises(ValidationError, match="use_kv_cache_manager_v2=True"):
+        KvCacheConfig(
+            mamba_state_config=state_config,
+            use_kv_cache_manager_v2=False,
+        )
+
+    config = KvCacheConfig(
+        mamba_state_config=state_config,
+        use_kv_cache_manager_v2=True,
+    )
+    assert config.mamba_state_config.enable_branch_snapshot is True
+
+
+def test_KvCacheConfig_keeps_branch_snapshots_under_per_conversation():
+    """per_conversation zeroes the periodic interval but not this flag."""
+    config = KvCacheConfig(
+        block_reuse_config=BlockReuseConfig(policy="per_conversation"),
+        mamba_state_config=MambaStateConfig(
+            periodic_snapshot_interval=64,
+            enable_branch_snapshot=True,
+        ),
+    )
+
+    assert config.mamba_state_config.periodic_snapshot_interval == 0
+    assert config.mamba_state_config.enable_branch_snapshot is True
+
+
+@pytest.mark.parametrize("interval", [0, 64])
+@pytest.mark.parametrize("enable_branch_snapshot", [False, True])
+def test_MambaStateConfig_branch_snapshot_is_orthogonal_to_periodic_interval(
+        interval, enable_branch_snapshot):
+    state_config = MambaStateConfig(
+        periodic_snapshot_interval=interval,
+        enable_branch_snapshot=enable_branch_snapshot,
+    )
+
+    assert state_config.periodic_snapshot_interval == interval
+    assert state_config.enable_branch_snapshot is enable_branch_snapshot
+
+
 @pytest.mark.cpu_only
 def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
     warnings_seen = []
