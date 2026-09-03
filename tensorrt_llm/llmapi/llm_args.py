@@ -4593,8 +4593,10 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Transfer each completed prefill chunk's KV cache while later chunks "
         "compute. Requires Python NIXL, generation-first scheduling, chunked "
         "prefill, pipeline_parallel_size=1, context_parallel_size=1 on both "
-        "peers, beam_width=1, no bounce buffer or Mamba/hybrid cache, and block "
-        "reuse disabled or set to all_reusable. Invalid static settings fail at "
+        "peers, beam_width=1, no Python bounce buffer (the C++ transfer-agent "
+        "bounce selected by agent_bounce_buffer_enable is allowed) or "
+        "Mamba/hybrid cache, and block reuse disabled or set to all_reusable. "
+        "Invalid static settings fail at "
         "startup; per-request constraints reject the request.")
 
     agent_bounce_buffer_enable: bool = Field(
