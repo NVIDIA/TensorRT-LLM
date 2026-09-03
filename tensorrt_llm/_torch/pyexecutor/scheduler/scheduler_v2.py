@@ -997,7 +997,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # in-place, so this is the only point where the transition is
         # still observable. Gated on peft_cache_manager so non-LoRA
         # deployments (where it is None) pay no extra cost.
-        was_suspended = self.peft_cache_manager is not None and not (
+        peft_cache_manager = getattr(self, "peft_cache_manager", None)
+        was_suspended = peft_cache_manager is not None and not (
             self.kv_cache_manager.is_request_active(req.py_request_id)
         )
 
@@ -1039,7 +1040,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # never re-enters context admission, so PEFT ownership
                 # must be re-registered explicitly. Idempotent and a
                 # no-op for non-LoRA requests.
-                self.peft_cache_manager.add_request_peft(req, True)
+                peft_cache_manager.add_request_peft(req, True)
             return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
 
         # Self-eviction: suspend this gen request to free its

@@ -1192,7 +1192,7 @@ class TestPeftSuspendResume:
     PeftCacheManager.prepare_resources()'s context-admission path.
     """
 
-    def test_self_eviction_pauses_peft_ownership(self):
+    def test_self_eviction_pauses_peft_ownership(self) -> None:
         """Sole gen request self-evicts (alloc fails, no victim available):
         mark_request_done(A, pause=True) must fire exactly once."""
         mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
@@ -1206,7 +1206,7 @@ class TestPeftSuspendResume:
         peft.mark_request_done.assert_called_once_with(req_a, pause=True)
         peft.add_request_peft.assert_not_called()
 
-    def test_victim_eviction_pauses_peft_ownership(self):
+    def test_victim_eviction_pauses_peft_ownership(self) -> None:
         """A (adapter A) is evicted as a victim to free pages for B (adapter
         B); mark_request_done(A, pause=True) must fire exactly once so B can
         use the PEFT cache."""
@@ -1228,7 +1228,7 @@ class TestPeftSuspendResume:
         assert ids(out.paused_requests) == [99]
         peft.mark_request_done.assert_called_once_with(req_a, pause=True)
 
-    def test_resume_reregisters_peft_ownership_once(self):
+    def test_resume_reregisters_peft_ownership_once(self) -> None:
         """A resumes after a prior suspension: add_request_peft(A, True)
         must fire exactly once before A is returned as scheduled, and must
         not fire again on later steady-state iterations while A stays
@@ -1253,7 +1253,7 @@ class TestPeftSuspendResume:
         assert ids(out2.generation_requests) == [0]
         peft.add_request_peft.assert_called_once_with(req_a, True)  # still just once
 
-    def test_suspend_without_peft_manager_does_not_crash(self):
+    def test_suspend_without_peft_manager_does_not_crash(self) -> None:
         """No LoRA config at all (peft_cache_manager=None): self-eviction
         must behave exactly as before this fix -- no AttributeError from an
         unguarded self.peft_cache_manager access."""
@@ -1265,7 +1265,7 @@ class TestPeftSuspendResume:
 
         assert ids(out.paused_requests) == [0]
 
-    def test_resume_without_peft_manager_does_not_crash(self):
+    def test_resume_without_peft_manager_does_not_crash(self) -> None:
         """Same as above, for the resume path."""
         mgr = make_kv_cache_manager()
         mgr.kv_cache_map[0].is_active = False
@@ -1276,7 +1276,7 @@ class TestPeftSuspendResume:
 
         assert ids(out.generation_requests) == [0]
 
-    def test_suspend_with_peft_manager_no_lora_task_id(self):
+    def test_suspend_with_peft_manager_no_lora_task_id(self) -> None:
         """Request has no adapter; the call to mark_request_done is still
         made (the C++ layer no-ops for lora_task_id=None, see
         PeftCacheManager::markRequestDone), so no per-request lora_task_id
@@ -1291,7 +1291,7 @@ class TestPeftSuspendResume:
         assert ids(out.paused_requests) == [0]
         peft.mark_request_done.assert_called_once_with(req, pause=True)
 
-    def test_suspend_never_started_context_request_does_not_pause_peft(self):
+    def test_suspend_never_started_context_request_does_not_pause_peft(self) -> None:
         """A context request suspended (e.g. cross-context admission failure
         in _try_schedule_context_full/_chunked) before ever completing its
         first chunk has never been through PeftCacheManager.prepare_resources
@@ -1308,7 +1308,7 @@ class TestPeftSuspendResume:
 
         peft.mark_request_done.assert_not_called()
 
-    def test_suspend_already_started_context_request_pauses_peft(self):
+    def test_suspend_already_started_context_request_pauses_peft(self) -> None:
         """A non-first-chunk context request suspended mid-chunking WAS
         already admitted (and PEFT-registered) via an earlier chunk's
         prepare_resources() call, so it does own PEFT state that must be
@@ -1322,7 +1322,7 @@ class TestPeftSuspendResume:
 
         peft.mark_request_done.assert_called_once_with(req, pause=True)
 
-    def test_repeated_suspend_resume_cycle_keeps_peft_calls_one_to_one(self):
+    def test_repeated_suspend_resume_cycle_keeps_peft_calls_one_to_one(self) -> None:
         """running -> suspended -> resumed -> suspended -> resumed: each
         transition must produce exactly one new PEFT call, with no
         duplicate registration or leaked state across cycles."""
