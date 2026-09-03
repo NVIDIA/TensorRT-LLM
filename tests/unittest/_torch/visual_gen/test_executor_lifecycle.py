@@ -36,6 +36,8 @@ from tensorrt_llm._torch.visual_gen import executor as executor_module
 from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient
 from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
+pytestmark = pytest.mark.cpu_only
+
 _THREADING_EVENT = threading.Event
 _COLD_SPAWN_TIMEOUT = 120.0
 

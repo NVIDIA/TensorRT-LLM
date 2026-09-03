@@ -23,6 +23,8 @@ from tensorrt_llm import visual_gen
 from tensorrt_llm._torch.visual_gen import executor as executor_module
 from tensorrt_llm.commands import serve
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True)
 def _disable_external_launch(monkeypatch: pytest.MonkeyPatch) -> None:
