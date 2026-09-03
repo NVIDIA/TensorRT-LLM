@@ -26,16 +26,21 @@ from tensorrt_llm._torch.visual_gen.executor import (
     run_diffusion_worker,
 )
 from tensorrt_llm._torch.visual_gen.output import split_visual_gen_output, to_visual_gen_output
-from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 from tensorrt_llm.visual_gen.output import VisualGenOutput
-from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+from tensorrt_llm.visual_gen.params import (
+    VisualGenParams,
+    prepare_reference_slots,
+    validate_visual_gen_params,
+)
 
 __all__ = [
     "VisualGen",
     "VisualGenParams",
     "ExtraParamSchema",
+    "RefSlotSpec",
     "VisualGenResult",
 ]
 from tensorrt_llm.llmapi.utils import set_api_status
@@ -288,6 +293,16 @@ class VisualGen:
         return self.executor.extra_param_specs
 
     @property
+    def ref_slot_specs(self) -> Dict[str, "RefSlotSpec"]:
+        """Reference slots the loaded pipeline accepts.
+
+        Maps ``image_reference`` / ``video_reference`` / ``audio_reference`` to
+        a ``RefSlotSpec`` (accepted roles + per-role counts). Empty when the
+        pipeline takes no reference inputs.
+        """
+        return self.executor.ref_slot_specs
+
+    @property
     def default_params(self) -> "VisualGenParams":
         """Returns a ``VisualGenParams`` with all defaults resolved for the loaded pipeline.
 
@@ -409,6 +424,7 @@ class VisualGen:
                 resolved_params,
                 declared_defaults=self.executor.default_generation_params,
                 extra_param_specs=self.executor.extra_param_specs,
+                ref_slot_specs=self.executor.ref_slot_specs,
             )
         else:
             resolved_params = self.default_params
@@ -421,12 +437,21 @@ class VisualGen:
         if resolved_params.seed is None:
             resolved_params.seed = secrets.randbits(63)
 
+        # Resolve references to bytes here, on the coordinator, before the
+        # request is broadcast — the single choke point shared by serve and the
+        # standalone Python API. Runs synchronously so bad-media ``ValueError``
+        # reaches the caller before dispatch (serve keeps its 400).
+        prepare_reference_slots(resolved_params)
+
         request = DiffusionRequest(
             request_id=req_id,
             prompt=prompt,
             params=resolved_params,
         )
-
+        # Hand the reference payloads to rank0 through shared memory instead of
+        # through the request pickle, which copies every reference byte to
+        # cross one process boundary.
+        request.refs_to_shm()
         self.executor.enqueue_requests([request])
         return VisualGenResult(req_id, self.executor, batch_size=batch_size)
 

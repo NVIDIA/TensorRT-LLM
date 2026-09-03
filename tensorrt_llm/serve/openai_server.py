@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
                     AsyncIterator, List, Optional, Union)
 
+import msgspec
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -107,8 +108,8 @@ from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
-from tensorrt_llm.serve.visual_gen_utils import (
-    cleanup_materialized_conditioning_inputs, parse_visual_gen_params)
+from tensorrt_llm.serve.visual_gen_utils import (local_media_path_is_disallowed,
+                                                 parse_visual_gen_params)
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -136,52 +137,38 @@ def _is_visual_gen_instance(obj) -> bool:
 
 # yapf: enable
 
-# msgspec msgpack is an opt-in transport for the disagg orchestrator->worker
-# request body: the large agentic chat body otherwise blocks the serving event
-# loop on stdlib json.loads. Enable with TRTLLM_SERVE_ENABLE_MSGSPEC=1 (must be
-# set on both orchestrator and worker). The worker decodes bodies flagged with
-# the X-TRTLLM-Msgpack header via msgspec and falls back to stdlib json for
-# everything else, so the JSON path is byte-for-byte unchanged when the flag is off.
-_MSGSPEC_ENABLED = os.getenv("TRTLLM_SERVE_ENABLE_MSGSPEC", "0") == "1"
-if _MSGSPEC_ENABLED:
-    try:
-        import msgspec
-    except ImportError as exc:
-        raise ImportError(
-            "TRTLLM_SERVE_ENABLE_MSGSPEC=1 requires the msgspec package "
-            "(listed in requirements.txt).") from exc
-    _msgpack_decoder = msgspec.msgpack.Decoder()
+_msgpack_decoder = msgspec.msgpack.Decoder()
 
-    class _MsgspecRequest(Request):
-        """Request that decodes msgpack bodies (X-TRTLLM-Msgpack: 1) with msgspec.
 
-        The orchestrator sends Content-Type application/json (so FastAPI still
-        routes the body through Request.json()) with the X-TRTLLM-Msgpack header
-        flagging a msgspec-msgpack payload; everything else is stdlib json.
-        """
+class _MsgspecRequest(Request):
+    """Request that decodes X-TRTLLM-Msgpack bodies with msgspec."""
 
-        async def json(self):
-            if not hasattr(self, "_json_body"):
-                body = await self.body()
-                if not body:
-                    self._json_body = {}
-                elif self.headers.get("x-trtllm-msgpack") == "1":
+    async def json(self):
+        if not hasattr(self, "_json_body"):
+            body = await self.body()
+            if not body:
+                self._json_body = {}
+            elif self.headers.get("x-trtllm-msgpack") == "1":
+                try:
                     self._json_body = _msgpack_decoder.decode(body)
-                else:
-                    self._json_body = json.loads(body)
-            return self._json_body
+                except msgspec.DecodeError as e:
+                    raise json.JSONDecodeError(f"msgpack: {e}", "", 0) from e
+            else:
+                self._json_body = json.loads(body)
+        return self._json_body
 
-    class _MsgspecRoute(APIRoute):
-        """APIRoute that parses request bodies via :class:`_MsgspecRequest`."""
 
-        def get_route_handler(self):
-            original_route_handler = super().get_route_handler()
+class _MsgspecRoute(APIRoute):
+    """APIRoute that parses request bodies via :class:`_MsgspecRequest`."""
 
-            async def route_handler(request: Request):
-                return await original_route_handler(
-                    _MsgspecRequest(request.scope, request.receive))
+    def get_route_handler(self):
+        original_route_handler = super().get_route_handler()
 
-            return route_handler
+        async def route_handler(request: Request):
+            return await original_route_handler(
+                _MsgspecRequest(request.scope, request.receive))
+
+        return route_handler
 
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -868,8 +855,7 @@ class OpenAIServer(_VideoRoutesMixin):
             self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
-        if _MSGSPEC_ENABLED:
-            self.app.router.route_class = _MsgspecRoute
+        self.app.router.route_class = _MsgspecRoute
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
@@ -3056,6 +3042,7 @@ class OpenAIServer(_VideoRoutesMixin):
         with ``request.format`` extended to accept tensor payloads
         (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
         """
+        request_received = raw_request.state.server_arrival_time
         try:
             image_id = f"image_{uuid.uuid4().hex}"
 
@@ -3069,14 +3056,16 @@ class OpenAIServer(_VideoRoutesMixin):
             # through to the outer ``except Exception`` → 500 so the
             # client doesn't get blamed for a server-internal failure.
             try:
-                params = parse_visual_gen_params(request, image_id,
-                                                 self.generator)
+                params = parse_visual_gen_params(request, self.generator)
                 logger.info(
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
                 image_gen_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt,
-                                                 params=params)
+                # Offload the blocking resolve/enqueue off the event loop but
+                # await it (bad params → 400 here); then await generation.
+                handle = await asyncio.to_thread(self.generator.generate_async,
+                                                 request.prompt, params)
+                output = await handle.aresult()
             except ValueError as exc:
                 logger.error(f"Image request error: {exc}")
                 return self.create_error_response(
@@ -3168,8 +3157,9 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} generated and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
+            total = get_steady_clock_now_in_seconds() - request_received
             headers = build_visual_gen_timing_headers(
-                build_visual_gen_server_timings(metrics))
+                build_visual_gen_server_timings(metrics, total=total))
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 
@@ -3223,20 +3213,12 @@ class OpenAIServer(_VideoRoutesMixin):
             self, response_format: Optional[str]) -> Optional[Response]:
         """Return a 400 when ``response_format='path'`` but it is disabled.
 
-        ``path`` discloses absolute server-side filesystem paths, so it can be
-        turned off via ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1`` on shared /
-        untrusted deployments (enabled by default). Returns ``None`` when
-        allowed.
+        Shares the switch with ``format='path'`` on the request side; see
+        :func:`local_media_path_is_disallowed`. Returns ``None`` when allowed.
         """
         if response_format != "path":
             return None
-        raw = os.environ.get("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "0")
-        if raw not in ("0", "1"):
-            logger.warning(
-                "Unrecognized value for TRTLLM_DISALLOW_LOCAL_MEDIA_PATH: "
-                f"{raw!r}. Expected '0' or '1'. Treating as '0' "
-                "(response_format='path' enabled).")
-        if raw == "1":
+        if local_media_path_is_disallowed():
             return self.create_error_response(
                 "response_format='path' is disabled on this server "
                 "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "
@@ -3247,13 +3229,15 @@ class OpenAIServer(_VideoRoutesMixin):
             )
         return None
 
-    def _image_object(self, request: ImageGenerationRequest,
+    def _image_object(self, request: Union[ImageGenerationRequest,
+                                           ImageEditRequest],
                       raw_request: Request, image_id: str, i: int,
                       path: Path) -> ImageObject:
         """Build the per-item ``ImageObject`` for the ``path``/``url`` transports.
 
-        ``b64_json`` is handled separately. Shared by the tensor and encoder
-        branches so they cannot drift when a transport changes.
+        ``b64_json`` is handled separately. Shared by the generation
+        (tensor + encoder) and edit routes so they cannot drift when a
+        transport changes.
         """
         if request.response_format == "path":
             return ImageObject(path=str(path), revised_prompt=request.prompt)
@@ -3316,6 +3300,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_image_edit(self, raw_request: Request) -> Response:
         """OpenAI-compatible image editing endpoint."""
+        request_received = raw_request.state.server_arrival_time
         if not self._supports_image_edit():
             return self._create_not_supported_error(
                 "Image editing is not supported by the loaded visual generation model."
@@ -3323,26 +3308,19 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             image_id = f"image_{uuid.uuid4().hex}"
-            input_paths = None
 
             try:
                 request = await self._parse_image_edit_request(raw_request)
-                params = parse_visual_gen_params(
-                    request,
-                    image_id,
-                    self.generator,
-                    media_storage_path=str(self.media_storage_path),
-                )
-                input_paths = params.image
+                path_error = self._reject_disabled_path(request.response_format)
+                if path_error is not None:
+                    return path_error
+                params = parse_visual_gen_params(request, self.generator)
                 logger.info(
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
                 image_edit_start = time.perf_counter()
-                try:
-                    output = self.generator.generate(inputs=request.prompt,
-                                                     params=params)
-                finally:
-                    cleanup_materialized_conditioning_inputs(input_paths)
+                output = self.generator.generate(inputs=request.prompt,
+                                                 params=params)
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)
             except ValueError as exc:
@@ -3382,11 +3360,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     path = self.media_storage_path / f"{image_id}_{i}{ext}"
                     path.write_bytes(image_to_bytes(image, format=pil_format))
                     data.append(
-                        ImageObject(
-                            url=self._build_image_content_url(
-                                raw_request, image_id, i),
-                            revised_prompt=request.prompt,
-                        ))
+                        self._image_object(request, raw_request, image_id, i,
+                                           path))
 
             response = ImageGenerationResponse(
                 created=int(time.time()),
@@ -3402,8 +3377,9 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} edited and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
+            total = get_steady_clock_now_in_seconds() - request_received
             headers = build_visual_gen_timing_headers(
-                build_visual_gen_server_timings(metrics))
+                build_visual_gen_server_timings(metrics, total=total))
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 

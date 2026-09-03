@@ -29,6 +29,7 @@ collision symbols carry a ``__<family>`` suffix.
 
 import contextlib
 import sys
+from typing import Any
 
 import cutlass
 import cutlass.cute as cute
@@ -1326,7 +1327,8 @@ class GvrMainKernel:
         next_n: int = 1,
         cr_shift: int = 0,
         r_const: int = 1,
-    ):
+        hint_free: bool = False,
+    ) -> None:
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
         assert kpt in (1, 2, 4, 8) and minb in (1, 2, 4)
@@ -1346,6 +1348,8 @@ class GvrMainKernel:
         self.next_n = int(next_n)
         self.cr_shift = int(cr_shift)
         self.r_const = int(r_const)
+        # hint-free: gather_hint sites compiled out (sentinel pass-through)
+        self.hint_free = bool(hint_free)
         if self.varlen:
             assert self.next_n >= 1 and self.cr_shift in (0, 2) and self.r_const >= 1
         # TSH-floor staging arm.  SPLIT-only compile-time key; the CUDA form
@@ -1973,9 +1977,10 @@ class GvrMainKernel:
         if T > cutlass.Float32(_NEG_INF):
             needg = cutlass.Int32(0)
         if needg != cutlass.Int32(0):
-            GMIN, GMAX = C.gather_hint(
-                x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=KPT
-            )  # 2 barriers inside
+            if cutlass.const_expr(not self.hint_free):
+                GMIN, GMAX = C.gather_hint(
+                    x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=KPT
+                )  # 2 barriers inside
             T = GMIN
         if sok != cutlass.Int32(0):  # HIC tighten
             if tot0 >= TGT:
@@ -2373,9 +2378,10 @@ class GvrMainKernel:
                         else:
                             # LAZY GATHER (sentinel equality flag)
                             if GMIN == cutlass.Float32(C.SENT_LO):
-                                GMIN, GMAX = C.gather_hint(
-                                    x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=KPT
-                                )
+                                if cutlass.const_expr(not self.hint_free):
+                                    GMIN, GMAX = C.gather_hint(
+                                        x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=KPT
+                                    )
                             floorhit = cutlass.Int32(1)
                             if T > GMIN:
                                 floorhit = cutlass.Int32(0)
@@ -2960,19 +2966,21 @@ class GvrMainKernel:
 _COMPILE_CACHE = {}
 
 
-def get_compiled(tpl, options_extra: str = ""):
+def get_compiled(tpl: tuple, options_extra: str = "", hint_free: bool = False) -> Any:
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG, NEXT_N, CR_SHIFT, R_CONST)
     — per-row varlen mode (TSHG slot is ignored: varlen compiles the TSH
     machinery in whenever SPLIT and gates it per row at runtime)."""
-    key = (tuple(tpl), options_extra)
+    key = (tuple(tpl), options_extra, bool(hint_free))
     hit = _COMPILE_CACHE.get(key)
     if hit is not None:
         return hit
     if len(tpl) == 7:
         blk, u, minb, nbs, kpt, split, tshg = tpl
-        kern = GvrMainKernel(blk, u, minb, nbs, kpt, bool(split), bool(tshg))
+        kern = GvrMainKernel(
+            blk, u, minb, nbs, kpt, bool(split), bool(tshg), hint_free=bool(hint_free)
+        )
     else:
         blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
         kern = GvrMainKernel(
@@ -2987,6 +2995,7 @@ def get_compiled(tpl, options_extra: str = ""):
             next_n=next_n,
             cr_shift=cr_shift,
             r_const=r_const,
+            hint_free=bool(hint_free),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3309,7 +3318,8 @@ class GvrTopkRegKernel:
         varlen: bool = False,
         next_n: int = 1,
         cr_shift: int = 0,
-    ):
+        hint_free: bool = False,
+    ) -> None:
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
         assert nbh % blk == 0 or blk % nbh == 0
@@ -3334,8 +3344,11 @@ class GvrTopkRegKernel:
         # derived compile-time constants
         self.S = vpt * 4
         self.lnbh = {256: 8, 512: 9, 2048: 11}.get(nbh, 10)
-        self.use_bm = (not deg) and (not img) and kpt >= 2 and vpt == 1
-        self.use_img = img and vpt == 1
+        # hint-free: bracket = min/max fold of the first k row values
+        # (already in registers); the hint-gather bracket arms are forced off
+        self.hint_free = bool(hint_free)
+        self.use_bm = (not deg) and (not img) and kpt >= 2 and vpt == 1 and (not hint_free)
+        self.use_img = img and vpt == 1 and (not hint_free)
         self.brl = (minb * blk <= 1024) or (vpt == 1)
 
     # ------------------------------------------------------------------
@@ -3415,9 +3428,6 @@ class GvrTopkRegKernel:
         j = cutlass.Int32(0)
         r = cutlass.Int32(0)
         tinc = cutlass.Int32(0)
-        cnt = cutlass.Int32(0)
-        bit = cutlass.Int32(0)
-        abv = cutlass.Int32(0)
         nA = cutlass.Int32(0)
         nT = cutlass.Int32(0)
         n1 = cutlass.Int32(0)
@@ -3463,8 +3473,6 @@ class GvrTopkRegKernel:
         nbw = cutlass.Int32(0)
         uq = cutlass.Uint32(0)
         vq = cutlass.Uint32(0)
-        kt = cutlass.Uint32(0)
-        klo = cutlass.Uint32(0)
         kv = cutlass.Uint32(0)
         rlo = cutlass.Uint32(0)
         rhi = cutlass.Uint32(0)
@@ -3551,7 +3559,7 @@ class GvrTopkRegKernel:
             # ---- hint prefetch: KPT coalesced pre_idx words BEFORE any
             # dependent gather; compiled out under DEG.
             pvs = []
-            if cutlass.const_expr(not self.deg):
+            if cutlass.const_expr(not (self.deg or self.hint_free)):
                 for t in cutlass.range_constexpr(KPT):
                     pv = cutlass.Int32(-1)
                     j = tid + cutlass.Int32(t * self.blk)
@@ -3646,6 +3654,19 @@ class GvrTopkRegKernel:
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)  # monotone
                 cute.arch.barrier()  # bm dies
+            elif cutlass.const_expr(self.hint_free and not self.deg):
+                lmn = cutlass.Float32(_POS_INF)
+                lmx = cutlass.Float32(_NEG_INF__reg)
+                for s in cutlass.range_constexpr(S):
+                    pos = (
+                        (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                    ) + cutlass.Int32(s % 4)
+                    if pos < k:
+                        v = _val(frags, s)
+                        lmn = fmin_f32(lmn, v)
+                        lmx = fmax_f32(lmx, v)
+                lmin = fkey(lmn)
+                lmax = fkey(lmx)
             elif cutlass.const_expr(self.deg):
                 lmn = cutlass.Float32(_POS_INF)
                 lmx = cutlass.Float32(_NEG_INF__reg)
@@ -3762,16 +3783,28 @@ class GvrTopkRegKernel:
             above = s_res[RES_ABOVE]
             m = s_res[RES_M]
             Bv = s_res[RES_B]
+            tot = s_res[RES_TOT]
             need = k - above
             whole = cutlass.Int32(0)
             if need >= m:
                 whole = cutlass.Int32(1)
 
-            # ---- ESCAPE: 32-step key-space bisection
+            # ---- ESCAPE: radix descent over the key space
+            # Count-crossing enforcement: when the hint-derived bracket's low
+            # edge sits above the true k-th value, the classify arms count
+            # fewer than k entries (q < 0 is never histogrammed) and the
+            # crossing scan pins its bin-0 fallback as a fake crossing — the
+            # whole-bin emit would then stop at the histogram total and leave
+            # out_row[tot:k) unwritten. Exactness must come from the
+            # count-crossing invariant, never from the bracket estimate: when
+            # the histogram never reaches k (tot < k), take the escape — it
+            # ranks the FULL row in key space, independent of the bracket.
             esc = cutlass.Int32(0)
             if whole == cutlass.Int32(0):
                 if m > cmp_:
                     esc = cutlass.Int32(1)
+            if tot < k:
+                esc = cutlass.Int32(1)
             if esc == cutlass.Int32(1):
                 if tid == cutlass.Int32(0):
                     s_cnt[0] = cutlass.Int32(0)
@@ -3785,61 +3818,106 @@ class GvrTopkRegKernel:
                     s_e12[0] = cutlass.Int32(0)
                     s_e12[1] = cutlass.Int32(0)
                 cute.arch.barrier()  # escape init
-                klo = cutlass.Uint32(0)
-                bit = cutlass.Int32(31)
-                while bit >= cutlass.Int32(0):
-                    kt = klo | (cutlass.Uint32(1) << cutlass.Uint32(bit))
-                    cnt = cutlass.Int32(0)
-                    for s in cutlass.range_constexpr(S):
-                        ix = (
-                            (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
-                        ) + cutlass.Int32(s % 4)
-                        if ix < n:
-                            if fkey(_val(frags, s)) >= kt:
-                                cnt = cnt + cutlass.Int32(1)
-                    if tid < ntail:
-                        if fkey(tval) >= kt:
-                            cnt = cnt + cutlass.Int32(1)
-                    cnt = cutlass.Int32(warp_add_i32(cnt))
-                    if lane == cutlass.Int32(0):
-                        if cnt != cutlass.Int32(0):
-                            atomic_add_cta(s_cnt.iterator, cnt)
-                    cute.arch.barrier()  # count published
-                    if s_cnt[0] >= k:
-                        klo = kt
-                    cute.arch.barrier()  # count consumed
-                    if tid == cutlass.Int32(0):
-                        s_cnt[0] = cutlass.Int32(0)
-                    cute.arch.barrier()  # count reset
-                    bit = bit - cutlass.Int32(1)
-                ethr = cutlass.Int64(klo)  # k-th largest key
-                abv = cutlass.Int32(0)
-                for s in cutlass.range_constexpr(S):
-                    ix = (
-                        (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
-                    ) + cutlass.Int32(s % 4)
-                    if ix < n:
-                        if cutlass.Int64(fkey(_val(frags, s))) > ethr:
-                            abv = abv + cutlass.Int32(1)
-                if tid < ntail:
-                    if cutlass.Int64(fkey(tval)) > ethr:
-                        abv = abv + cutlass.Int32(1)
-                abv = cutlass.Int32(warp_add_i32(abv))
-                if lane == cutlass.Int32(0):
-                    if abv != cutlass.Int32(0):
-                        atomic_add_cta(s_cnt.iterator + 1, abv)
-                cute.arch.barrier()  # above-count published
-                nA = s_cnt[1]
-                nT = k - nA
-                # (rezero dropped — emit counters live in s_e12, see race-fix note)
-                cute.arch.barrier()  # nA consumed
+                # Vector-lane bound: the register batch holds real data only
+                # below 4*n4 — lanes in [4*n4, n) are the -inf FILL of the
+                # last partial float4 (the real values there live in tval).
+                # Bounding by n would count/emit each tail element twice
+                # (once as a fill key, once via tval): benign while the tie
+                # threshold is finite (a fill key loses every compare), but
+                # it emits duplicate indices when the tie class is the -inf
+                # key itself (in-window -inf entries are admissible).
+                nvec = n4 << cutlass.Int32(2)
+                # Narrow LNBH bits per level over the register batch — the
+                # same descent the Phase-3 ck fallback below runs — instead of
+                # one rescan per key bit: ceil(32/LNBH) levels at worst and
+                # two in practice, since the first level's LNBH bits already
+                # cut inside the exponent field, where the bisection took 32.
+                # The exit arms carry the count crossing, so the old separate
+                # above-count pass folds in.
+                # Neither ethr nor aboveC is carried across the descent: ethr
+                # is an Int64 derivable from rlo and the exit arm, and
+                # aboveC + needC == k holds at every exit.
+                rlo = cutlass.Uint32(0)
+                rhi = cutlass.Uint32(0xFFFFFFFF)
+                needC = k
+                mm = n  # in-range count, carried from the previous level
+                lev = cutlass.Int32(0)
+                state = cutlass.Int32(0)  # 1 -> ethr = rlo, 2 -> ethr = rlo - 1
+                while state == cutlass.Int32(0):
+                    if needC == mm:
+                        # whole in-range block is needed: threshold below it
+                        needC = cutlass.Int32(0)
+                        state = cutlass.Int32(2)
+                    if state == cutlass.Int32(0):
+                        if rlo >= rhi:  # single key left == the k-th key
+                            state = cutlass.Int32(1)
+                        if lev >= cutlass.Int32(34):  # non-binding: sh2 strictly shrinks
+                            state = cutlass.Int32(1)
+                    if state == cutlass.Int32(0):
+                        d2 = rhi - rlo
+                        b2w = cutlass.Int32(32) - clz_i32(cutlass.Int32(d2 | cutlass.Uint32(1)))
+                        sh2 = cutlass.Int32(0)
+                        if b2w > cutlass.Int32(LNBH):
+                            sh2 = b2w - cutlass.Int32(LNBH)
+                        for z in cutlass.range_constexpr(self.nbh // self.blk):
+                            s_hist[tid + cutlass.Int32(z * self.blk)] = cutlass.Int32(0)
+                        cute.arch.barrier()  # esc level clear
+                        for s in cutlass.range_constexpr(S):
+                            ix = (
+                                (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                            ) + cutlass.Int32(s % 4)
+                            if ix < nvec:
+                                uev = fkey(_val(frags, s))
+                                if uev >= rlo:
+                                    if uev <= rhi:
+                                        bne = _umin_u32(
+                                            (uev - rlo) >> cutlass.Uint32(sh2),
+                                            cutlass.Uint32(self.nbh - 1),
+                                        )
+                                        atomic_add_cta(
+                                            s_hist.iterator + cutlass.Int32(bne),
+                                            cutlass.Int32(1),
+                                        )
+                        if tid < ntail:
+                            uev = fkey(tval)
+                            if uev >= rlo:
+                                if uev <= rhi:
+                                    bne = _umin_u32(
+                                        (uev - rlo) >> cutlass.Uint32(sh2),
+                                        cutlass.Uint32(self.nbh - 1),
+                                    )
+                                    atomic_add_cta(
+                                        s_hist.iterator + cutlass.Int32(bne), cutlass.Int32(1)
+                                    )
+                        cute.arch.barrier()  # esc level hist
+                        if cutlass.const_expr(self.nbh > 1024):
+                            scan_cross_w(s_hist, s_ws, needC, tid, s_res, blk=self.blk, nb=self.nbh)
+                        else:
+                            find_cross(s_hist, needC, tid, s_res, nb=self.nbh)
+                        cute.arch.barrier()  # esc level scan
+                        needC = needC - s_res[RES_ABOVE]
+                        mm = s_res[RES_M]
+                        b_lv = s_res[RES_B]
+                        nlo = rlo + (cutlass.Uint32(b_lv) << cutlass.Uint32(sh2))
+                        if b_lv != cutlass.Int32(self.nbh - 1):
+                            rhi = nlo + (
+                                (cutlass.Uint32(1) << cutlass.Uint32(sh2)) - cutlass.Uint32(1)
+                            )
+                        rlo = nlo
+                        lev = lev + cutlass.Int32(1)
+                nA = k - needC
+                nT = needC
+                ethr = cutlass.Int64(rlo)
+                if state == cutlass.Int32(2):
+                    ethr = ethr - cutlass.Int64(1)
+                cute.arch.barrier()  # descent done
                 lml = cutlass.Int32(cute.arch.lanemask_lt())
                 for s in cutlass.range_constexpr(S):
                     ixv = (
                         (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                     ) + cutlass.Int32(s % 4)
                     u64 = cutlass.Int64(-1)
-                    if ixv < n:
+                    if ixv < nvec:
                         u64 = cutlass.Int64(fkey(_val(frags, s)))
                     q1e = cutlass.Int32(0)
                     q2e = cutlass.Int32(0)
@@ -4207,10 +4285,18 @@ class GvrTopkRegKernel:
 _COMPILE_CACHE__reg: dict = {}
 
 
-def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0):
+def get_compiled__reg(
+    tpl: tuple,
+    dump_dir: str | None = None,
+    pdl: bool = False,
+    varlen: bool = False,
+    next_n: int = 1,
+    cr_shift: int = 0,
+    hint_free: bool = False,
+) -> Any:
     """Compile (or fetch) the variant for constexpr tuple
     (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH)."""
-    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift))
+    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), bool(hint_free))
     compiled = _COMPILE_CACHE__reg.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
@@ -4229,6 +4315,7 @@ def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_
             varlen=varlen,
             next_n=next_n,
             cr_shift=cr_shift,
+            hint_free=hint_free,
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -4377,7 +4464,8 @@ class GvrClusKernel:
         varlen: bool = False,
         next_n: int = 1,
         cr_shift: int = 0,
-    ):
+        hint_free: bool = False,
+    ) -> None:
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
         assert nbs == 256, "SNB must stay 256"
@@ -4392,6 +4480,7 @@ class GvrClusKernel:
         self.cr_shift = int(cr_shift)
         if self.varlen:
             assert self.next_n >= 1 and self.cr_shift in (0, 2)
+        self.hint_free = bool(hint_free)  # hint-free: gather_hint sites compiled out
         self.lcs = cs.bit_length() - 1  # log2(CS) for the per-row Q shift
         self.blk = blk
         self.u = u
@@ -4947,9 +5036,10 @@ class GvrClusKernel:
                 needg = cutlass.Int32(0)
             if needg != cutlass.Int32(0):
                 # degenerate sample: identical on every rank of the cluster
-                GMIN, GMAX = C.gather_hint(
-                    x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=1
-                )  # 2 barriers
+                if cutlass.const_expr(not self.hint_free):
+                    GMIN, GMAX = C.gather_hint(
+                        x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=1
+                    )  # 2 barriers
                 T = GMIN
             if sok != cutlass.Int32(0):  # HIC tighten
                 if tot0 >= TGT:
@@ -5178,9 +5268,10 @@ class GvrClusKernel:
                         if tshtaken == cutlass.Int32(0):
                             # LAZY GATHER — every rank computes identical GMIN
                             if GMIN == cutlass.Float32(C.SENT_LO):
-                                GMIN, GMAX = C.gather_hint(
-                                    x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=1
-                                )  # 2 barriers inside
+                                if cutlass.const_expr(not self.hint_free):
+                                    GMIN, GMAX = C.gather_hint(
+                                        x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=1
+                                    )  # 2 barriers inside
                             floorhit = cutlass.Int32(1)
                             if T > GMIN:
                                 floorhit = cutlass.Int32(0)
@@ -5552,24 +5643,44 @@ _COMPILE_CACHE__clus = {}
 
 
 def get_compiled__clus(
-    tpl,
+    tpl: tuple,
     scap: int = 8192,
     cmp_: int = 2048,
     options_extra: str = "",
     varlen: bool = False,
     next_n: int = 1,
     cr_shift: int = 0,
-):
+    hint_free: bool = False,
+) -> Any:
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
     reachable route has 8192/2048 — asserted by run__clus())."""
-    key = (tuple(tpl), scap, cmp_, options_extra, bool(varlen), int(next_n), int(cr_shift))
+    key = (
+        tuple(tpl),
+        scap,
+        cmp_,
+        options_extra,
+        bool(varlen),
+        int(next_n),
+        int(cr_shift),
+        bool(hint_free),
+    )
     hit = _COMPILE_CACHE__clus.get(key)
     if hit is not None:
         return hit
     blk, u, minb, nbs, cs = tpl
     kern = GvrClusKernel(
-        blk, u, minb, nbs, cs, scap=scap, cmp_=cmp_, varlen=varlen, next_n=next_n, cr_shift=cr_shift
+        blk,
+        u,
+        minb,
+        nbs,
+        cs,
+        scap=scap,
+        cmp_=cmp_,
+        varlen=varlen,
+        next_n=next_n,
+        cr_shift=cr_shift,
+        hint_free=hint_free,
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -5787,7 +5898,8 @@ class GvrRegClusKernel:
         varlen: bool = False,
         next_n: int = 1,
         cr_shift: int = 0,
-    ):
+        hint_free: bool = False,
+    ) -> None:
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
         self.blk = blk
@@ -5803,6 +5915,8 @@ class GvrRegClusKernel:
         self.cr_shift = int(cr_shift)
         if self.varlen:
             assert self.next_n >= 1 and self.cr_shift in (0, 2)
+        # hint-free: P0 samples the first k row elements (coalesced) instead of the hint
+        self.hint_free = bool(hint_free)
         self.S = vpt * 4
         self.span = blk * vpt  # float4 per CTA
 
@@ -5958,8 +6072,12 @@ class GvrRegClusKernel:
             # ---- P0: redundant hint gather, EVERY CTA (k<=BLK by dispatch
             # gate). One coalesced word per thread, NO cluster barrier —
             # GMIN/GMAX identical everywhere by construction.
-            if tid < k:
-                pv0 = ld_g_i32(p_addr, tid)
+            if cutlass.const_expr(self.hint_free):
+                if tid < k:
+                    pv0 = tid
+            else:
+                if tid < k:
+                    pv0 = ld_g_i32(p_addr, tid)
 
             # ---- P1: row load — predicated flat float4[VPT] batch (the CUDA
             # has NO exact-fit peel here, guard is per-load). Issue all loads
@@ -6461,16 +6579,31 @@ class GvrRegClusKernel:
 _COMPILE_CACHE__regclus: dict = {}
 
 
-def get_compiled__regclus(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0):
+def get_compiled__regclus(
+    tpl: tuple,
+    dump_dir: str | None = None,
+    pdl: bool = False,
+    varlen: bool = False,
+    next_n: int = 1,
+    cr_shift: int = 0,
+    hint_free: bool = False,
+) -> Any:
     """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS)."""
-    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift))
+    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), bool(hint_free))
     compiled = _COMPILE_CACHE__regclus.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
         blk, vpt, cs = tpl
         kernel = GvrRegClusKernel(
-            blk, vpt, cs, pdl=pdl, varlen=varlen, next_n=next_n, cr_shift=cr_shift
+            blk,
+            vpt,
+            cs,
+            pdl=pdl,
+            varlen=varlen,
+            next_n=next_n,
+            cr_shift=cr_shift,
+            hint_free=hint_free,
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()

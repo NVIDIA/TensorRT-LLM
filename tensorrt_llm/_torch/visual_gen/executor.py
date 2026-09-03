@@ -17,6 +17,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import zmq
 
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
@@ -27,6 +28,7 @@ from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen.params import VisualGenParams
+
 
 # Timeouts (seconds) for the client-side coordinator.
 POLL_TIMEOUT = 0.01
@@ -359,6 +361,58 @@ class DiffusionRequest:
     prompt: List[str]
     params: Optional["VisualGenParams"] = None
     prepared_inputs: Dict[str, Any] = field(default_factory=dict, repr=False)
+    # Set only between the two ends of the coordinator -> rank0 hop; see
+    # ``refs_to_shm``.
+    ref_handles: Optional[List[Dict[str, Any]]] = field(default=None, repr=False)
+    # Set only while the request is in flight on the rank0 -> N-rank hop; see
+    # ``DiffusionExecutor._broadcast_request``.
+    ref_sizes: Optional[List[int]] = field(default=None, repr=False)
+
+    def refs_to_shm(self) -> None:
+        """Move reference payloads into shared memory, in place (producer side).
+
+        Only the coordinator -> rank0 hop travels as handles: rank0 restores the
+        bytes before broadcasting, because a shared-tensor handle is consumed
+        exactly once and minting one for N ranks would free the block N-1 times.
+        """
+        if self.params is None:
+            return
+        self.ref_handles = handles = []
+        for slot in ("image_reference", "video_reference", "audio_reference"):
+            for index, ref in enumerate(getattr(self.params, slot, None) or []):
+                # A read-only view: the one copy happens inside from_tensor(),
+                # which is what moves the payload into shared memory.
+                buffer = torch.frombuffer(ref.content, dtype=torch.uint8)
+                handles.append(
+                    {
+                        "slot": slot,
+                        "index": index,
+                        "handle": SharedTensorContainer.from_tensor(buffer).dump_to_dict(),
+                    }
+                )
+                ref.content = b""
+        if not handles:
+            self.ref_handles = None
+
+    def refs_from_shm(self) -> None:
+        """Restore reference payloads from shared memory, in place (consumer side).
+
+        Each handle is taken independently so one that cannot be rebuilt does
+        not strand the blocks behind it.
+        """
+        failures = []
+        for entry in self.ref_handles or []:
+            try:
+                ref = getattr(self.params, entry["slot"])[entry["index"]]
+                container = SharedTensorContainer.from_dict(entry["handle"])
+                ref.content = container.get_local_view().numpy().tobytes()
+            except Exception as exc:
+                failures.append(f"{entry['slot']}[{entry['index']}]: {exc}")
+        self.ref_handles = None
+        if failures:
+            raise RuntimeError(
+                "failed to restore reference payloads from shared memory: " + "; ".join(failures)
+            )
 
 
 @dataclass
@@ -413,6 +467,7 @@ class DiffusionExecutor:
         self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
         self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
         self.response_queue = queue.Queue()
         self.sender_thread = None
 
@@ -487,9 +542,58 @@ class DiffusionExecutor:
                         "default_generation_params": self.pipeline.default_generation_params,
                         "extra_param_specs": self.pipeline.extra_param_specs,
                         "supports_image_edit": self.pipeline.supports_image_edit,
+                        "ref_slot_specs": self.pipeline.ref_slot_specs,
                     },
                 )
             )
+
+    def _broadcast_request(self, req: Optional[DiffusionRequest]) -> Optional[DiffusionRequest]:
+        """Send one request from rank0 to every rank.
+
+        Reference payloads ride as raw uint8 tensors alongside the request
+        rather than inside it, because ``broadcast_object_list`` pickles the
+        object into a tensor first and that copy dominates the collective.
+        """
+        payloads = []
+        if self.rank == 0 and req is not None:
+            # Take the payloads out before the object is pickled, and leave their
+            # sizes behind so the peers can size their receive buffers.
+            for slot in ("image_reference", "video_reference", "audio_reference"):
+                for ref in getattr(req.params, slot, None) or []:
+                    payloads.append(ref.content)
+                    ref.content = b""
+            req.ref_sizes = [len(p) for p in payloads]
+
+        obj_list = [req]
+        dist.broadcast_object_list(obj_list, src=0)
+        req = obj_list[0]
+        if req is None:
+            return None
+
+        if self.rank == 0:
+            # Read-only views: the src rank only reads its buffer.
+            buffers = [torch.frombuffer(p, dtype=torch.uint8) for p in payloads]
+        else:
+            buffers = [torch.empty(n, dtype=torch.uint8) for n in req.ref_sizes or []]
+        for buffer in buffers:
+            dist.broadcast(buffer, src=0)
+
+        if self.rank != 0:
+            payloads = [b.numpy().tobytes() for b in buffers]
+
+        refs = [
+            ref
+            for slot in ("image_reference", "video_reference", "audio_reference")
+            for ref in getattr(req.params, slot, None) or []
+        ]
+        if len(refs) != len(payloads):
+            # zip() would silently leave the tail of either side behind, and
+            # clearing ref_sizes below would erase the evidence.
+            raise ValueError(f"expected {len(refs)} reference payloads, got {len(payloads)}.")
+        for ref, payload in zip(refs, payloads):
+            ref.content = payload
+        req.ref_sizes = None
+        return req
 
     def serve_forever(self):
         """Main execution loop."""
@@ -497,15 +601,14 @@ class DiffusionExecutor:
             req = None
             if self.rank == 0:
                 req = self.requests_ipc.get()
+                if req is not None:
+                    req.refs_from_shm()
                 logger.info(f"Worker {self.device_id}: Request available")
 
-            # Broadcast to all ranks. ``req.params.seed`` is already a
-            # concrete int — resolved once on the coordinator process at
-            # :meth:`VisualGen.generate_async` entry — so the broadcast
-            # propagates the same value to every rank.
-            obj_list = [req]
-            dist.broadcast_object_list(obj_list, src=0)
-            req = obj_list[0]
+            # Skipped at world_size 1: with no peer, the object broadcast would
+            # still serialize the whole request to a tensor before finding out.
+            if self.world_size > 1:
+                req = self._broadcast_request(req)
 
             if req is None:
                 logger.info(f"Worker {self.device_id}: Shutdown signal received")
@@ -530,7 +633,7 @@ class DiffusionExecutor:
         for field_name, default_value in self.pipeline.default_generation_params.items():
             if hasattr(params, field_name) and getattr(params, field_name) is None:
                 if (
-                    params.image is not None
+                    params.image_reference
                     and getattr(self.pipeline, "derive_output_size_from_reference", False) is True
                     and field_name in ("height", "width")
                 ):
@@ -822,7 +925,6 @@ class DiffusionRemoteClient:
         # full PipelineOutput tensor does not pin in completed_responses for
         # the process lifetime.
         self._abandoned_request_ids: Set[int] = set()
-
         # Iteration-stats tracker — populated on lifecycle events (enqueue,
         # request started, response received) and drained by
         # ``get_iteration_stats`` for the /metrics HTTP endpoint.  Mirrors
@@ -859,6 +961,7 @@ class DiffusionRemoteClient:
         self.default_generation_params: Dict = {}
         self.extra_param_specs: Dict = {}
         self.supports_image_edit: bool = False
+        self.ref_slot_specs: Dict = {}
 
         # --- Launch workers ---
         # multiprocessing installs its own timeout-less child joins at import
@@ -1076,6 +1179,7 @@ class DiffusionRemoteClient:
 
     def _process_requests(self):
         """Process pending requests."""
+        req = None
         try:
             if self._request_to_send is None:
                 req = self.pending_requests.get(timeout=POLL_TIMEOUT)
@@ -1419,6 +1523,7 @@ class DiffusionRemoteClient:
                         )
                         self.extra_param_specs = payload.get("extra_param_specs", {})
                         self.supports_image_edit = bool(payload.get("supports_image_edit", False))
+                        self.ref_slot_specs = payload.get("ref_slot_specs", {})
                     if self._worker_failure is not None:
                         raise RuntimeError(self._worker_failure)
                     elapsed = time.time() - start_time

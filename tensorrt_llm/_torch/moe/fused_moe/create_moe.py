@@ -5,10 +5,10 @@ from typing import Dict, Optional
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.utils import (ActivationType, ActType_TrtllmGen,
-                                       AuxStreamType)
+from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
@@ -55,18 +55,8 @@ def create_moe_backend(
     bias: bool = False,
     apply_router_weight_on_input: bool = False,
     layer_idx: Optional[int] = None,
-    swiglu_alpha: Optional[torch.Tensor] = None,
-    swiglu_beta: Optional[torch.Tensor] = None,
-    swiglu_limit: Optional[torch.Tensor] = None,
-    swiglu_limit_scalar: Optional[float] = None,
     init_load_balancer: bool = False,
-    activation_type: ActivationType = ActivationType.Swiglu,
-    activation: Optional[str] = None,
-    situ_beta: Optional[float] = None,
-    situ_linear_beta: Optional[float] = None,
-    trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
-    trtllm_gen_activation_alpha: Optional[float] = None,
-    trtllm_gen_activation_beta: Optional[float] = None,
+    activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
 ) -> MoE | MoEImplBase | VanillaMoE:
     """
     Create a MoE backend or a self-contained MoE layer.
@@ -91,17 +81,9 @@ def create_moe_backend(
         bias: Whether to use bias
         apply_router_weight_on_input: Whether to apply router weight on input
         layer_idx: Layer index
-        swiglu_alpha: SwiGLU alpha parameter
-        swiglu_beta: SwiGLU beta parameter
-        swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
-        swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
-        activation_type: Activation type
-        activation: Optional MegaMoE DeepGEMM activation name
-        situ_beta: Optional MegaMoE DeepGEMM SiTU beta
-        situ_linear_beta: Optional MegaMoE DeepGEMM SiTU linear beta
-        trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
-        trtllm_gen_activation_alpha: Optional backend-local activation alpha
-        trtllm_gen_activation_beta: Optional backend-local activation beta
+        activation: The layer's activation kind and its constants. Whether a
+            constant reaches the kernel per expert or as one baked scalar is the
+            backend's declaration (``activation_support``), not a caller choice.
 
     Returns:
         A ``MoEImplBase`` execution unit, a self-contained ``MoE`` layer, or
@@ -129,49 +111,24 @@ def create_moe_backend(
         "intermediate_size must be provided or model_config.pretrained_config "
         "must expose moe_intermediate_size / intermediate_size")
 
-    moe_load_balancer = get_moe_load_balancer()
-    if moe_load_balancer is not None:
-        supported_load_balancer_backends = (
-            CutlassFusedMoE,
-            TRTLLMGenFusedMoE,
-            CuteDslFusedMoE,
-            DeepGemmFusedMoE,
-            DenseGEMMFusedMoE,
-            MegaMoEDeepGemm,
-            MegaMoECuteDsl,
+    # Backstop for the direct-``moe_cls`` callers that bypass resolution: a
+    # backend that cannot run under a load balancer already declines in
+    # ``can_implement``.
+    eplb_enabled = get_moe_load_balancer() is not None
+    if eplb_enabled and not moe_cls.capabilities.supports_eplb:
+        raise ValueError(
+            f"{moe_cls.__name__} does not support the MoE load balancer.")
+
+    if bias and not moe_cls.capabilities.supports_expert_bias:
+        raise ValueError(f"bias not supported in {moe_cls.__name__}.")
+
+    if (apply_router_weight_on_input
+            and not moe_cls.capabilities.supports_apply_router_weight_on_input):
+        raise ValueError(
+            f"apply_router_weight_on_input not supported in {moe_cls.__name__}."
         )
-        assert moe_cls in supported_load_balancer_backends, (
-            "MoE Load Balance is only supported in "
-            f"{', '.join(cls.__name__ for cls in supported_load_balancer_backends)}."
-        )
-
-    if bias:
-        assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE
-                           ], f"bias not supported in {moe_cls.__name__}."
-
-    if swiglu_alpha is not None or swiglu_beta is not None:
-        assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE], \
-            f"swiglu_alpha and swiglu_beta are only supported in CutlassFusedMoE, TritonFusedMoE and TRTLLMGenFusedMoE, not in {moe_cls.__name__}."
-        assert swiglu_alpha is not None and swiglu_beta is not None, \
-            "Both swiglu_alpha and swiglu_beta must be provided."
-
-    if swiglu_limit is not None:
-        assert moe_cls in [
-            CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE,
-            DeepGemmFusedMoE, MegaMoECuteDsl
-        ], f"swiglu_limit is not supported in {moe_cls.__name__}."
-
-    if swiglu_limit_scalar is not None:
-        # MegaMoECuteDsl uses the scalar only as a fallback when no per-expert
-        # tensor limit is given (see the MegaMoE branch below).
-        assert moe_cls in [
-            CutlassFusedMoE, TRTLLMGenFusedMoE, DeepGemmFusedMoE,
-            MegaMoEDeepGemm, CuteDslFusedMoE, MegaMoECuteDsl
-        ], f"swiglu_limit_scalar is not supported in {moe_cls.__name__}."
 
     if moe_cls == TRTLLMGenFusedMoE:
-        assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
-
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -184,33 +141,13 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             bias=bias,
             layer_idx=layer_idx,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
-            activation_type=activation_type,
-            trtllm_gen_activation_type=trtllm_gen_activation_type,
-            trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
-            trtllm_gen_activation_beta=trtllm_gen_activation_beta,
+            activation=activation,
         )
 
-    if any(value is not None
-           for value in (activation, situ_beta,
-                         situ_linear_beta)) and moe_cls is not MegaMoEDeepGemm:
-        raise ValueError("MegaMoE DeepGEMM activation options require "
-                         f"MegaMoEDeepGemm, got {moe_cls.__name__}")
-
-    if any(value is not None for value in (trtllm_gen_activation_type,
-                                           trtllm_gen_activation_alpha,
-                                           trtllm_gen_activation_beta)):
-        raise ValueError(
-            "TRTLLM-Gen backend-local activation options are only supported "
-            f"by TRTLLMGenFusedMoE, got {moe_cls.__name__}")
-    elif moe_cls in (CutlassFusedMoE, MarlinFusedMoE):
-        # CuteDslFusedMoE, DeepGemmFusedMoE, and CuteDslB12xFusedMoE
-        # also subclass CutlassFusedMoE but have narrower constructors, so
-        # they take their own branches below.
+    if moe_cls in (CutlassFusedMoE, MarlinFusedMoE):
+        # The two whose constructor takes an expert-bias flag. Marlin declines
+        # the flag itself, so the check above already rejected a True.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -224,16 +161,10 @@ def create_moe_backend(
             bias=bias,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
-            activation_type=activation_type,
+            activation=activation,
         )
     elif moe_cls == VanillaMoE:
-        assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
-
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -245,13 +176,10 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
-            activation_type=activation_type,
+            activation=activation,
         )
     elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE):
-        # Both are constructed through the narrower CuteDsl argument set (no
-        # bias / swiglu_alpha-beta-limit). CuteDslB12xFusedMoE now delegates to
-        # CutlassFusedMoE.__init__, which does accept those four, so widening
-        # this branch would need the allow-lists above to admit b12x first.
+        # The narrower CuteDsl argument set: these kernels take no expert bias.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -264,9 +192,8 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
-            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
-            activation_type=activation_type,
+            activation=activation,
         )
     elif moe_cls == DeepGemmFusedMoE:
         return moe_cls(
@@ -282,12 +209,9 @@ def create_moe_backend(
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
-            swiglu_limit=swiglu_limit,
-            swiglu_limit_scalar=swiglu_limit_scalar,
+            activation=activation,
         )
     elif moe_cls == TritonFusedMoE:
-        assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TritonFusedMoE."
-
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -299,9 +223,7 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             bias=bias,
             layer_idx=layer_idx,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
+            activation=activation,
         )
     elif moe_cls == DenseGEMMFusedMoE:
         return moe_cls(
@@ -317,15 +239,10 @@ def create_moe_backend(
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
-            activation_type=activation_type,
+            activation=activation,
         )
     elif moe_cls in (MegaMoEDeepGemm, MegaMoECuteDsl):
-        # MegaMoE fused-comm backends share the same construction surface.
-        # ``mega_moe_deepgemm`` lazily resolves DG via ``_import_deep_gemm``
-        # at runtime and ``mega_moe_cute_dsl`` lazily imports the CuteDSL
-        # kernel package, so a top-level import here doesn't pull either
-        # heavyweight dependency on boxes that don't use these backends.
-        megamoe_kwargs = dict(
+        return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -338,22 +255,8 @@ def create_moe_backend(
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
-            activation_type=activation_type,
+            activation=activation,
         )
-        if moe_cls is MegaMoECuteDsl:
-            # ``_resolve_gate_up_clamp`` accepts tensor or scalar; fall back
-            # to the scalar form when only that was wired.
-            megamoe_kwargs["swiglu_limit"] = (swiglu_limit
-                                              if swiglu_limit is not None else
-                                              swiglu_limit_scalar)
-        else:
-            megamoe_kwargs.update(
-                swiglu_limit_scalar=swiglu_limit_scalar,
-                activation=activation,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
-        return moe_cls(**megamoe_kwargs)
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
 
@@ -372,18 +275,9 @@ def create_moe(
     bias: bool = False,
     apply_router_weight_on_input: bool = False,
     layer_idx: Optional[int] = None,
-    swiglu_alpha: Optional[torch.Tensor] = None,
-    swiglu_beta: Optional[torch.Tensor] = None,
-    swiglu_limit: Optional[torch.Tensor] = None,
-    swiglu_limit_scalar: Optional[float] = None,
-    activation_type: ActivationType = ActivationType.Swiglu,
-    activation: Optional[str] = None,
-    situ_beta: Optional[float] = None,
-    situ_linear_beta: Optional[float] = None,
-    trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
-    trtllm_gen_activation_alpha: Optional[float] = None,
-    trtllm_gen_activation_beta: Optional[float] = None,
+    activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
     communication_method: Optional[str] = None,
+    allow_backend_degradation: bool = True,
 ) -> MoE | VanillaMoE:
     """
     Create MoE instance with automatic parameter inference from model_config.
@@ -402,18 +296,14 @@ def create_moe(
         bias: Whether to use bias
         apply_router_weight_on_input: Whether to apply router weight on input
         layer_idx: Layer index
-        swiglu_alpha: SwiGLU alpha parameter
-        swiglu_beta: SwiGLU beta parameter
-        swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
-        swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
-        activation_type: Activation type
-        activation: Optional MegaMoE DeepGEMM activation name
-        situ_beta: Optional MegaMoE DeepGEMM SiTU beta
-        situ_linear_beta: Optional MegaMoE DeepGEMM SiTU linear beta
-        trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
-        trtllm_gen_activation_alpha: Optional backend-local activation alpha
-        trtllm_gen_activation_beta: Optional backend-local activation beta
+        activation: The layer's activation kind and its constants, e.g.
+            ``SwigluActivation(clamp=7.0)`` or
+            ``SiTuActivation(gate_softcap=..., linear_softcap=...)``
         communication_method: Optional ConfigurableMoE communication method
+        allow_backend_degradation: When False, a requested backend that cannot
+            serve this layer raises with the rejection trail instead of falling
+            back. For callers that must know they got the backend they asked
+            for, e.g. because they are measuring it.
 
     Returns:
         A complete MoE layer: a ``MoE`` (``ConfigurableMoE`` around an
@@ -452,30 +342,14 @@ def create_moe(
         intermediate_size=intermediate_size,
         swiglu_gptoss_style=infer_swiglu_gptoss_style(
             bias=bias,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            activation_type=activation_type,
+            activation_type=activation.kind,
         ),
         bias=bias,
-        activation_type=activation_type,
+        activation=activation,
         routing=routing_method,
         layer_idx=layer_idx,
+        allow_degradation=allow_backend_degradation,
     )
-    if (any(value is not None
-            for value in (activation, situ_beta, situ_linear_beta))
-            and moe_cls is not MegaMoEDeepGemm):
-        raise ValueError(
-            "MegaMoE DeepGEMM activation options require "
-            "MegaMoEDeepGemm without backend fallback, but resolved "
-            f"{moe_cls.__name__}.")
-    if (any(value is not None for value in (trtllm_gen_activation_type,
-                                            trtllm_gen_activation_alpha,
-                                            trtllm_gen_activation_beta))
-            and moe_cls is not TRTLLMGenFusedMoE):
-        raise ValueError(
-            "A TRTLLM-Gen backend-local activation requires "
-            "TRTLLMGenFusedMoE without backend fallback, but resolved "
-            f"{moe_cls.__name__}.")
 
     # This dispatch needs no per-class entry: inheriting ``MoEImplBase`` is
     # enough to be wrapped. Becoming *selectable* still needs the constructor
@@ -497,17 +371,7 @@ def create_moe(
             layer_idx=layer_idx,
             override_quant_config=override_quant_config,
             bias=bias,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            swiglu_limit_scalar=swiglu_limit_scalar,
-            activation_type=activation_type,
             activation=activation,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-            trtllm_gen_activation_type=trtllm_gen_activation_type,
-            trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
-            trtllm_gen_activation_beta=trtllm_gen_activation_beta,
             communication_method=communication_method,
         )
 
@@ -529,15 +393,5 @@ def create_moe(
         bias=bias,
         apply_router_weight_on_input=apply_router_weight_on_input,
         layer_idx=layer_idx,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        swiglu_limit=swiglu_limit,
-        swiglu_limit_scalar=swiglu_limit_scalar,
-        activation_type=activation_type,
         activation=activation,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        trtllm_gen_activation_type=trtllm_gen_activation_type,
-        trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
-        trtllm_gen_activation_beta=trtllm_gen_activation_beta,
     )

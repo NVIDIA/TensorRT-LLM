@@ -52,7 +52,9 @@ __all__ = [
     "TelemetryField",
     "TerminalOutcome",
     "UsageContext",
+    "apply_usage_session_config",
     "get_observed_signal",
+    "is_usage_stats_enabled",
     "record_llm_initialization_attempt",
     "record_llm_initialization_failure",
     "record_llm_initialized",
@@ -63,6 +65,4 @@ __all__ = [
     "report_usage",
     "set_lifecycle_phase",
     "set_usage_context",
-    "apply_usage_session_config",
-    "is_usage_stats_enabled",
 ]
