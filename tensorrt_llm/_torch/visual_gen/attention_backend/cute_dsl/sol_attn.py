@@ -33,7 +33,7 @@ public BTHD entry point, plus the dense_layers layer-skip guard.
 
 ``disabled_until_timestep`` is the dense-prefix control, and mirrors
 skip_softmax's field of the same name: sparse attention stays disabled (that
-is, the layer runs dense SDPA) while the normalized denoising timestep is at
+is, the layer runs the backend's dense kernel) while the normalized timestep is at
 or above the cutoff, and switches to the sparse kernel once it drops below.
 
 The timestep arrives as a forward kwarg -- ``modules/attention.py`` already
@@ -129,7 +129,7 @@ def _parse_dense_layers(spec: Optional[str]) -> frozenset:
 class SolAttnAttention(AttentionBackend):
     """Sol-Attn dynamic block-routing sparse attention (CuTeDSL, sm100).
 
-    The kernel wrapper already falls back to dense SDPA on any unsupported
+    The kernel wrapper already falls back to dense attention on any unsupported
     shape/dtype/arch (see ``_run_sol_attn_bthd``); this class only adds the
     ``dense_layers`` layer-skip guard (evaluated at construction time, no
     external plumbing needed) and forwards the routing knobs from config.

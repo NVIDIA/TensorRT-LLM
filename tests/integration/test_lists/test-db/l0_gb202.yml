@@ -20,9 +20,6 @@ l0_gb202:
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=CUTLASS-quant=NVFP4-routing=Renormalize]
   # - unittest/_torch/modeling -k "modeling_qwen3" # https://nvbugs/5234573
   - unittest/_torch/attention/test_attention_mla.py
-  # ------------- Visual Gen tests ---------------
-  # sm120 (GB202) coverage for the Sol-Attn CuTeDSL kernel; the same file
-  # is registered in l0_b200.yml for sm100.
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_bf16[latency]

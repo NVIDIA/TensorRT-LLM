@@ -38,7 +38,7 @@ attention_config:
     algorithm: sol_attn
     tau: 2.0                        # routing threshold; higher routes more blocks sparse
     thresh_type: diag               # or "exact"
-    disabled_until_timestep: 0.9545 # dense while normalized timestep >= cutoff
+    disabled_until_timestep: 0.9090 # dense while normalized timestep >= cutoff
     dense_layers: '0'               # optional: layers forced dense
 ```
 
@@ -49,7 +49,8 @@ below it. Use `None` rather than `0.0` to disable the prefix.
 
 On an input the kernel cannot serve — an unsupported architecture, a
 `head_dim` other than 128, a non-bfloat16 dtype — Sol-Attn falls back to dense
-SDPA, logs the specific reason once, and counts the fallback. Set
+dense attention -- the configured backend's dense kernel where available, torch
+SDPA otherwise -- logs the specific reason once, and counts the fallback. Set
 `SOL_ATTN_STRICT=1` to raise instead of falling back, which is useful when
 benchmarking to confirm the kernel actually ran.
 
