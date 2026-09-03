@@ -39,9 +39,8 @@ from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs, MTPDecodingConfig
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
-from ..conftest import (get_device_count, get_sm_version, llm_models_root,
-                        parametrize_with_ids, skip_no_hopper,
-                        skip_pre_blackwell, skip_pre_hopper)
+from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
+                        skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail,
                             LlmapiAccuracyTestHarness, get_accuracy_task)
@@ -108,38 +107,6 @@ def has_nvlink():
     except Exception:
         # Any other unexpected error
         return False
-
-
-def get_disagg_ucx_tls() -> str:
-    """UCX transports for the disaggregated worker processes.
-
-    Without NVLink, cuda_ipc is excluded (preserving the pre-existing
-    behavior, which leaves IB allowed there). With NVLink on Hopper (SM90),
-    IB is allowed: KVCacheManagerV2 KV pools are VMM allocations that CUDA
-    IPC cannot map without fabric handles, so KV transfers need IB GPUDirect
-    RDMA to avoid falling back to slow non-IPC emulation. gdr_copy is
-    intentionally excluded on SM90, matching the get_ucx_tls() helpers under
-    disaggregated/. On the remaining NVLink architectures IB stays excluded
-    to avoid hangs on the CI B200 cluster.
-
-    Returns:
-        str: The UCX_TLS transport selection string.
-    """
-    if not has_nvlink():
-        return "^cuda_ipc"
-    if get_sm_version() == 90:
-        return "^gdr_copy"
-    return "^ib"
-
-
-# get_disagg_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
-# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
-# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
-# address handles to cross-rail peers and time out, hanging the workers.
-# Drop it at import time so worker environments (copied from os.environ)
-# fall back to standard GID-based address resolution; no-op when absent.
-if get_sm_version() == 90:
-    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
@@ -351,7 +318,8 @@ def launch_disaggregated_llm(
         # NIXL backend ignores this env-var fallback; skip it.
         if cache_transceiver_config_backend != "NIXL":
             env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-        env["UCX_TLS"] = get_disagg_ucx_tls()
+        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
+        env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
 
@@ -360,6 +328,8 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + ctx_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        if not has_nvlink():
+            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += ctx_total_gpus
 
         ctx_server_args = ctx_args + [
@@ -385,7 +355,8 @@ def launch_disaggregated_llm(
         # NIXL backend ignores this env-var fallback; skip it.
         if cache_transceiver_config_backend != "NIXL":
             env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-        env["UCX_TLS"] = get_disagg_ucx_tls()
+        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
+        env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
         if cache_transceiver_config_backend == "NIXL":
@@ -393,6 +364,8 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        if not has_nvlink():
+            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += gen_total_gpus
 
         gen_server_args = gen_args + [
@@ -1202,9 +1175,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             # DEFAULT drops the per-test UCX pinning but still runs UCX, since
             # launch_disaggregated_llm sets TRTLLM_USE_UCX_KVCACHE=1 for every
             # backend but NIXL. Transport coverage is unchanged by this move.
+            # CPP is explicit: this test runs on UCX (see the DEFAULT note
+            # above), and DeepSeek's Python preference would otherwise be
+            # adopted verbatim and fail at creation on a non-NIXL backend.
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
+                "transceiver_runtime": "CPP",
             },
         }
         gen_server_config = {
@@ -1225,6 +1202,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
+                "transceiver_runtime": "CPP",
             },
             "enable_attention_dp": enable_attention_dp,
         }
@@ -1508,6 +1486,54 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(2)
+    @parametrize_with_ids("enable_block_reuse", [True])
+    @parametrize_with_ids("use_kv_cache_manager_v2", [True, False])
+    def test_pipelined_kv_transfer_nixl_python_accuracy(
+            self, enable_block_reuse: bool, use_kv_cache_manager_v2: bool):
+        """Test pipelined Python transfer with Gemma 3 VSWA."""
+        kv_cache_config = {
+            "use_kv_cache_manager_v2": use_kv_cache_manager_v2,
+            "enable_block_reuse": enable_block_reuse,
+            "enable_partial_reuse": enable_block_reuse,
+            "max_attention_window": [512, 512, 512, 512, 512, 32768],
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+            "enable_pipelined_transfer": True,
+        }
+        ctx_server_config = {
+            "max_num_tokens": 256,
+            "cuda_graph_config": None,
+            "kv_cache_config": dict(kv_cache_config),
+            "cache_transceiver_config": dict(cache_transceiver_config),
+            "enable_chunked_prefill": True,
+        }
+        gen_server_config = {
+            "cuda_graph_config": None,
+            "kv_cache_config": dict(kv_cache_config),
+            "cache_transceiver_config": dict(cache_transceiver_config),
+            "enable_chunked_prefill": True,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "schedule_style": "generation_first",
+            "context_servers": {
+                "num_instances": 1,
+            },
+            "generation_servers": {
+                "num_instances": 1,
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
@@ -1714,6 +1740,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     def test_nixl_backend(self):
+        # transceiver_runtime is left at 'auto', which resolves to the Python
+        # transceiver (the global default) on the NIXL backend.
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
@@ -2040,6 +2068,9 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     def test_mixed_ctx_gen_model(self, ctx_pp, gen_tp):
         ctx_model = self.FP4_MODEL
         gen_model = self.FP8_MODEL
+        # Explicit NIXL so the launcher does not force the UCX env fallback;
+        # with the NIXL backend, transceiver_runtime='auto' resolves to the
+        # Python transceiver (the global default).
         return run_parallel_test("Qwen3/Qwen3-30B-A3B",
                                  ctx_model,
                                  ctx_pp=ctx_pp,
@@ -2050,7 +2081,8 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                                  ctx_model=ctx_model,
                                  gen_model=gen_model,
                                  ctx_instances=1,
-                                 gen_instances=1)
+                                 gen_instances=1,
+                                 cache_transceiver_backend="NIXL")
 
 
 @pytest.mark.timeout(10800)

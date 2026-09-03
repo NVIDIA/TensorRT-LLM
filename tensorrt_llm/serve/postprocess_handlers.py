@@ -91,8 +91,10 @@ class ChatPostprocArgs(PostprocArgs):
     model: str
     num_choices: int = 1
     tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[Union[Literal["none"],
-                                ChatCompletionNamedToolChoiceParam]] = "none"
+    # None means "not specified": only an explicit client "none" (always set
+    # by from_request) suppresses parsed tool calls in apply_tool_parser.
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
+                                ChatCompletionNamedToolChoiceParam]] = None
     return_logprobs: bool = False
     top_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
@@ -240,6 +242,11 @@ def apply_tool_parser(args: ChatPostprocArgs,
                 result = StreamingParseResult(
                     normal_text=result.normal_text + finish_result.normal_text,
                     calls=result.calls + finish_result.calls)
+        if args.tool_choice == "none":
+            # tool_choice="none": still run the parser (including the finish
+            # flush above) so tool-call markup is stripped from content, but
+            # never surface tool calls.
+            return result.normal_text, []
         normal_text, calls = result.normal_text, result.calls
         if result.calls:
             args.has_tool_call[output_index] = True
@@ -347,7 +354,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
     res: List[str] = []
     finish_reason_sent = [False] * args.num_choices
+    # num_prompt_tokens stays None until a prompt length is recorded, and only
+    # the usage branches below consume it, so offset it only once it exists.
     prompt_tokens = args.num_prompt_tokens
+    if prompt_tokens is not None:
+        prompt_tokens -= args.num_prompt_tokens_offset
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     stream_response_id, stream_created = _ensure_stream_metadata(
         args, rsp, "chatcmpl")
@@ -357,6 +368,17 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
     else:
         include_usage = False
         include_continuous_usage = False
+    if include_usage and prompt_tokens is None:
+        # The usage chunks below feed prompt_tokens into UsageInfo (int fields)
+        # and into the total_tokens arithmetic. The server records the prompt
+        # length before the first chunk is post-processed (the executor does so
+        # on the postproc-worker path), so a missing count here means the
+        # caller wired PostprocArgs without one; fail with a clear message
+        # instead of a TypeError from the usage math.
+        raise ValueError(
+            "Streaming usage was requested, but PostprocArgs.num_prompt_tokens "
+            "is not set; record the prompt token count before "
+            "chat_stream_post_processor reports usage.")
     if args.first_iteration:
         for i in range(args.num_choices):
             res.append(
@@ -678,7 +700,7 @@ def chat_response_post_processor(
             full_message = args.last_message_content + choice.message.content
             choice.message.content = full_message
 
-    num_prompt_tokens = args.num_prompt_tokens
+    num_prompt_tokens = args.num_prompt_tokens - args.num_prompt_tokens_offset
     num_generated_tokens = sum(len(output.token_ids) for output in rsp.outputs)
     usage = UsageInfo(
         prompt_tokens=num_prompt_tokens,
@@ -883,7 +905,7 @@ def completion_response_post_processor(
 class ChatCompletionPostprocArgs(PostprocArgs):
     model: str
     tools: Optional[List[ChatCompletionToolsParam]]
-    tool_choice: Optional[Union[Literal["none", "auto"],
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]]
     request_id: Optional[int] = None
     stream_options: Optional[StreamOptions] = None
@@ -980,6 +1002,7 @@ def responses_api_post_processor(
         use_harmony=args.use_harmony,
         reasoning_parser=args.reasoning_parser,
         tool_parser=args.tool_parser,
+        num_prompt_tokens=args.num_prompt_tokens,
     )
 
 
@@ -992,5 +1015,6 @@ def responses_api_streaming_post_processor(
     outputs = args.streaming_processor.process_single_output(rsp)
     if rsp._done:
         outputs.append(
-            args.streaming_processor.get_final_response_non_store(rsp))
+            args.streaming_processor.get_final_response_non_store(
+                rsp, args.num_prompt_tokens))
     return outputs

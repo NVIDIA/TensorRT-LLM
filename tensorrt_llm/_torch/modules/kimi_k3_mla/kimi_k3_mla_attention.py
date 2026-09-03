@@ -61,6 +61,34 @@ def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
     return backend
 
 
+def _validate_mla_generation_backend(backend: str, num_heads: int) -> None:
+    """Fail fast when `backend` can never run at this per-rank head count.
+
+    FlashInfer's `trtllm_batch_decode_with_kv_cache_mla` rejects
+    `64 < num_heads_q < 128` for every batch shape, and the per-batch policy
+    never demotes away from an explicit `trtllm-gen` selection (the
+    FP8-KV-cache override or a `TLLM_K3_MLA_GEN_BACKEND=trtllm-gen` request).
+    Without this check the conflict only surfaces as a FlashInfer error deep
+    in attention warmup.
+
+    The bound mirrors FlashInfer's validation gate verbatim: it predicts
+    FlashInfer's rejection, it is not a verified support claim for the head
+    counts outside the range. For Kimi K3 the open side above 128 is
+    unreachable anyway — per-rank Q heads never exceed 96 (all heads
+    replicated under attention-DP, `96 / tp_size` under TEP head sharding).
+    """
+    if backend == "trtllm-gen" and 64 < num_heads < 128:
+        raise ValueError(
+            "Kimi K3 MLA: the trtllm-gen generation backend cannot run with "
+            f"{num_heads} query heads per rank (trtllm-gen MLA decode rejects "
+            "64 < num_heads_q < 128; under attention-DP every rank keeps all "
+            "heads). trtllm-gen was selected explicitly — by the FP8-KV-cache "
+            f"override or by {_KIMI_K3_MLA_GEN_BACKEND_ENV}=trtllm-gen. Use "
+            "tensor-parallel head sharding (TEP) so each rank has <= 64 "
+            "heads, or a BF16 KV cache with the default cute-dsl backend."
+        )
+
+
 def _kimi_k3_mla_decode_backend_policy(
     requested_backend: str,
     metadata: TrtllmAttentionMetadata,
@@ -77,19 +105,21 @@ def _kimi_k3_mla_decode_backend_policy(
     CuTe-DSL reuses one staged page table across MLA layers for a
     generation-only, one-token-per-request batch. Other mixed batches repeat
     the staging copies in every MLA layer and regress time to first token, so
-    they fall back to TRTLLM-Gen. The H=96 path is the correctness exception:
-    TRTLLM-Gen may select a 64-head Q tile, which does not divide 96 and
-    produces an invalid configuration after K3's head padding was removed.
-
-    The CuTe-DSL kernel itself accepts multi-token queries, but K3's decode
-    tuning covers only the one-token-per-request regime, so generation-only
-    speculative verification also falls back.
+    they fall back to TRTLLM-Gen. The H=96 path is the correctness exception
+    and applies to EVERY fallback candidate: TRTLLM-Gen may select a 64-head
+    Q tile, which does not divide 96 (invalid after K3's head padding was
+    removed), and its decode gate rejects 64 < num_heads_q < 128 outright —
+    falling back would fail engine initialization. H=96 per rank is K3's
+    attention-DP shape, so this keeps attention-DP + speculative
+    verification (a generation-only multi-token batch) on CuTe-DSL, which
+    accepts multi-token queries; K3's decode tuning preference for
+    TRTLLM-Gen only applies where TRTLLM-Gen is valid at all.
     """
     is_single_token_generation = num_gen_tokens == metadata.num_generations
-    requires_cute_dsl_for_mixed_batch = metadata.num_contexts > 0 and num_heads == 96
+    requires_cute_dsl = num_heads == 96
     if (
         requested_backend == "cute-dsl"
-        and not requires_cute_dsl_for_mixed_batch
+        and not requires_cute_dsl
         and (metadata.num_contexts > 0 or not is_single_token_generation)
     ):
         return "trtllm-gen"
@@ -296,6 +326,11 @@ class KimiK3MLAAttention(MLA):
         # Only the absorbed-generation backend (mqa) requests CuTe-DSL, so
         # only it needs K3's per-batch fallback policy; mha keeps the
         # default trtllm-gen selection.
+        # Validate here rather than in _select_mla_generation_backend: the
+        # per-rank head count (replicated under attention-DP, sharded under
+        # TEP) is only authoritative once the base MLA module has built its
+        # generation backend.
+        _validate_mla_generation_backend(self.mqa.flashinfer_mla_backend, self.mqa.num_heads)
         self.mqa.mla_backend_policy = partial(
             _kimi_k3_mla_decode_backend_policy,
             num_heads=self.mqa.num_heads,

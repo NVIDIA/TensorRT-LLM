@@ -21,6 +21,8 @@ from tensorrt_llm._torch.weight_sharing.artifact_identity import (
 from tensorrt_llm._torch.weight_sharing.post_transform_profiles import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    LazyRootModelIdentity,
     PostTransformConfigIdentity,
     PostTransformFeature,
     PostTransformProfile,
@@ -43,10 +45,15 @@ from tensorrt_llm._torch.weight_sharing.source_identity import (
 
 __all__ = [
     "ARTIFACT_IDENTITY_FORMAT_VERSION",
-    "ArtifactIdentity",
     "LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1",
     "QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1",
+    "QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1",
     "SOURCE_IDENTITY_FORMAT_VERSION",
+    "ArtifactIdentity",
+    "IdentityCheckDecision",
+    "IdentityCheckPolicy",
+    "IdentityMatchResult",
+    "LazyRootModelIdentity",
     "PostTransformConfigIdentity",
     "PostTransformFeature",
     "PostTransformProfile",
@@ -57,9 +64,6 @@ __all__ = [
     "PostTransformRuntimeConstraints",
     "PostTransformTransferScope",
     "SourceIdentity",
-    "IdentityMatchResult",
-    "IdentityCheckPolicy",
-    "IdentityCheckDecision",
     "SourceIdentityMismatchError",
     "check_weight_sharing_compatibility",
 ]

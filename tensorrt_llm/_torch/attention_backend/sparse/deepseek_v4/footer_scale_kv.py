@@ -1,15 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM120 footer-scale KV packing for DeepSeek-V4 sparse MLA.
+"""Footer-scale KV packing for DeepSeek-V4 sparse MLA.
 
 Each token occupies 584 bytes: 448 FP8 values, 64 BF16 RoPE values, and
 seven UE8M0 scales plus one padding byte in the page footer.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 import triton
 import triton.language as tl
+
+from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm.bindings import DataType
+
+from .kernels import deepseek_v4_local_to_global_indices
+from .params import DeepseekV4AttentionType
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+
+    from .metadata import DeepseekV4TrtllmAttentionMetadata
 
 DIM_NOPE = 448
 DIM_ROPE = 64
@@ -18,7 +34,7 @@ NUM_NOPE_TILES = DIM_NOPE // QUANT_TILE
 DATA_ROW_BYTES = DIM_NOPE + DIM_ROPE * 2
 FOOTER_ROW_BYTES = NUM_NOPE_TILES + 1
 TOKEN_BYTES = DATA_ROW_BYTES + FOOTER_ROW_BYTES
-PAGE_SIZE = 64  # the main-pool page size the SM120 kernels are built for
+PAGE_SIZE = 64  # the page size the FlashInfer SM120 kernels are built for
 PAGE_BYTES = PAGE_SIZE * TOKEN_BYTES
 
 _FP8_DTYPE = torch.float8_e4m3fn
@@ -135,31 +151,181 @@ def quant_scatter(
     )
 
 
+def get_pool_2d(
+    metadata: DeepseekV4TrtllmAttentionMetadata,
+    attn_type: DeepseekV4AttentionType,
+    compress_ratio: int,
+    page_size: int | None = None,
+) -> torch.Tensor:
+    """Return a pool-base-relative uint8 view, cached per cache manager."""
+    manager = metadata.kv_cache_manager
+    cache = getattr(metadata, "_footer_scale_pools", None)
+    if cache is None:
+        cache = {}
+        metadata._footer_scale_pools = cache
+    if attn_type == DeepseekV4AttentionType.SWA:
+        base_ptr = manager.swa_pool_ptr
+        block_tokens = manager.tokens_per_block
+        layers = list(manager.pp_layers)
+    else:
+        base_ptr = manager.compress_pool_ptrs[compress_ratio]
+        layers = [
+            layer
+            for layer in manager.pp_layers
+            if manager._compress_ratios[layer] == compress_ratio
+        ]
+        block_tokens = manager.compressed_block_sizes[layers[0]]
+
+    page_size = min(block_tokens, PAGE_SIZE) if page_size is None else page_size
+    assert block_tokens % page_size == 0, (
+        f"{attn_type.name} block size {block_tokens} must be divisible by "
+        f"footer-scale page size {page_size}"
+    )
+    key = (id(manager), attn_type, compress_ratio, page_size)
+    pool = cache.get(key)
+    if pool is not None:
+        return pool
+
+    max_end_bytes = 0
+    for layer in layers:
+        buffer = manager.get_buffers(layer, attn_type)
+        offset = buffer.data_ptr() - base_ptr
+        assert offset >= 0 and offset % TOKEN_BYTES == 0, (
+            f"{attn_type.name} buffer for layer {layer} is not slot-aligned "
+            f"to its pool base (offset {offset} bytes)"
+        )
+        max_end_bytes = max(max_end_bytes, offset + buffer.numel() * buffer.element_size())
+
+    page_bytes = page_size * TOKEN_BYTES
+    assert max_end_bytes % page_bytes == 0, (
+        f"{attn_type.name} pool extent {max_end_bytes} is not a whole number "
+        f"of {page_size}-token footer-scale pages"
+    )
+    pool = convert_to_torch_tensor(
+        TensorWrapper(base_ptr, DataType.UINT8, (max_end_bytes // page_bytes, page_bytes))
+    )
+    cache[key] = pool
+    return pool
+
+
+def append_swa(
+    attn: TrtllmAttention,
+    metadata: DeepseekV4TrtllmAttentionMetadata,
+    latent_rows: torch.Tensor,
+    start_idx: int,
+    end_idx: int,
+    page_size: int = PAGE_SIZE,
+) -> None:
+    """Quantize new latent rows and scatter them into the canonical SWA pool."""
+    positions = metadata.token_positions_cuda[start_idx:end_idx]
+    req_id = metadata.req_idx_per_token[start_idx:end_idx]
+    local_layer_idx = metadata.kv_cache_manager.layer_offsets[attn.layer_idx]
+    block_table_swa = metadata.sliding_block_tables[
+        local_layer_idx, DeepseekV4AttentionType.SWA.value
+    ]
+    loc = deepseek_v4_local_to_global_indices(
+        req_id=req_id,
+        block_table_swa=block_table_swa,
+        swa_local_indices=positions.unsqueeze(1).contiguous(),
+        swa_pool_base_ptr=metadata.sparse_mla_base_ptrs[1],
+        swa_buffer_ptr=metadata.swa_buffer_ptrs[attn.layer_idx],
+        tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
+        token_stride=TOKEN_BYTES,
+    ).view(-1)
+    swa_pool = get_pool_2d(metadata, DeepseekV4AttentionType.SWA, 1, page_size=page_size)
+    quant_scatter(swa_pool, loc, latent_rows, page_size=page_size)
+
+
+def apply_rope_and_append_swa(
+    attn: TrtllmAttention,
+    metadata: DeepseekV4TrtllmAttentionMetadata,
+    q: torch.Tensor,
+    latent_rows: torch.Tensor | None,
+    start_idx: int,
+    end_idx: int,
+    rotary_cos_sin: torch.Tensor,
+    is_neox: bool,
+    *,
+    apply_rope: bool = True,
+    page_size: int = PAGE_SIZE,
+) -> None:
+    """Apply MLA RoPE and append latent rows to the canonical SWA cache."""
+    num_tokens = end_idx - start_idx
+    if num_tokens == 0:
+        return
+    if attn.mla_params is None:
+        raise ValueError("Footer-scale MLA cache requires MLA parameters")
+
+    positions = metadata.token_positions_cuda[start_idx:end_idx]
+    if positions.numel() != num_tokens:
+        raise ValueError(
+            "Expected one cached token position per footer-scale append, got "
+            f"{positions.numel()} positions for {num_tokens=}"
+        )
+    head_dim = attn.mla_params.kv_lora_rank + attn.mla_params.qk_rope_head_dim
+    q_view = q.view(num_tokens, attn.num_heads, head_dim)
+    if apply_rope:
+        torch.ops.trtllm.mla_rope_inplace(
+            q_view,
+            positions,
+            rotary_cos_sin,
+            attn.num_heads,
+            attn.mla_params.kv_lora_rank,
+            attn.mla_params.qk_rope_head_dim,
+            False,
+            is_neox,
+        )
+        if latent_rows is not None:
+            torch.ops.trtllm.mla_rope_inplace(
+                latent_rows.view(num_tokens, 1, head_dim),
+                positions,
+                rotary_cos_sin,
+                1,
+                attn.mla_params.kv_lora_rank,
+                attn.mla_params.qk_rope_head_dim,
+                False,
+                is_neox,
+            )
+
+    if latent_rows is not None:
+        append_swa(
+            attn,
+            metadata,
+            latent_rows,
+            start_idx,
+            end_idx,
+            page_size=page_size,
+        )
+
+
+@maybe_compile(dynamic=True, options={"max-autotune": True})
 def dequant_gather(
     pool_u8: torch.Tensor,
     loc: torch.Tensor,
     page_size: int = PAGE_SIZE,
 ) -> torch.Tensor:
-    """Torch reference: gather footer-scale slots back to bf16 rows (tests only)."""
-    assert pool_u8.dtype == torch.uint8
+    """Gather footer-scale slots and dequantize them to BF16 latent rows."""
+    assert pool_u8.dtype == torch.uint8 and pool_u8.is_contiguous()
     page_bytes = page_size * TOKEN_BYTES
     footer_offset = page_size * DATA_ROW_BYTES
     pages = pool_u8.reshape(-1, page_bytes)
-    page, off = loc // page_size, loc % page_size
-    rows = torch.empty(
-        loc.shape[0], DIM_NOPE + DIM_ROPE, dtype=torch.bfloat16, device=pool_u8.device
+    loc_flat = loc.reshape(-1).to(torch.long)
+    page = loc_flat // page_size
+    offset = loc_flat % page_size
+
+    data_offsets = offset.unsqueeze(1) * DATA_ROW_BYTES + torch.arange(
+        DATA_ROW_BYTES, dtype=torch.long, device=pool_u8.device
     )
-    for i in range(loc.shape[0]):
-        p, o = int(page[i]), int(off[i])
-        row = pages[p, o * DATA_ROW_BYTES : (o + 1) * DATA_ROW_BYTES]
-        scales = pages[
-            p,
-            footer_offset + o * FOOTER_ROW_BYTES : footer_offset
-            + o * FOOTER_ROW_BYTES
-            + NUM_NOPE_TILES,
-        ]
-        nope = row[:DIM_NOPE].view(_FP8_DTYPE).to(torch.float32)
-        tile_scales = torch.pow(2.0, scales.to(torch.float32) - 127.0).repeat_interleave(QUANT_TILE)
-        rows[i, :DIM_NOPE] = (nope * tile_scales).to(torch.bfloat16)
-        rows[i, DIM_NOPE:] = row[DIM_NOPE:].view(torch.bfloat16)
-    return rows
+    encoded_rows = pages[page.unsqueeze(1), data_offsets]
+    scale_offsets = (
+        footer_offset
+        + offset.unsqueeze(1) * FOOTER_ROW_BYTES
+        + torch.arange(NUM_NOPE_TILES, dtype=torch.long, device=pool_u8.device)
+    )
+    scales = pages[page.unsqueeze(1), scale_offsets]
+
+    nope = encoded_rows[:, :DIM_NOPE].contiguous().view(_FP8_DTYPE).to(torch.float32)
+    tile_scales = torch.exp2(scales.to(torch.float32) - 127.0).repeat_interleave(QUANT_TILE, dim=-1)
+    rope = encoded_rows[:, DIM_NOPE:].contiguous().view(torch.bfloat16).reshape(-1, DIM_ROPE)
+    rows = torch.cat(((nope * tile_scales).to(torch.bfloat16), rope), dim=-1)
+    return rows.reshape(*loc.shape, DIM_NOPE + DIM_ROPE)

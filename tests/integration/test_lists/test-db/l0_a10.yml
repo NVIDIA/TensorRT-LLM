@@ -18,6 +18,9 @@ l0_a10:
   - unittest/_torch/sampler/test_penalties.py
   - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_torch_multi_arange.py
+  - unittest/_torch/test_fused_relu2.py
+  - unittest/_torch/test_mnnvl_alltoall_workspace.py
+  - unittest/_torch/test_mnnvl_memory_lifecycle.py
   - unittest/utils/test_util.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
@@ -26,14 +29,13 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_radio.py
   - unittest/_torch/modeling/test_modeling_minicpmv4_6.py
   - unittest/_torch/modeling/test_multimodal_encoder_mixin.py
-  - unittest/_torch/sampler/test_trtllm_sampler.py
   - unittest/_torch/sampler/test_token_ban.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
   - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/executor/test_resource_manager.py
-  - unittest/_torch/modules/moe/test_communication_factory.py
+  - unittest/_torch/moe/test_communication_factory.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints
@@ -53,7 +55,21 @@ l0_a10:
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_bounce.py
   - unittest/disaggregated/test_mamba_transfer.py
-  - unittest/tools
+  # unittest/tools is listed per file rather than as a directory. The directory
+  # form swept test_layer_wise_benchmarks.py onto A10, whose DeepSeek FP4 cases
+  # pin SM100+ checkpoints -- that is https://nvbugs/6337228.
+  #
+  # Only files with at least one non-cpu_only test belong here: this stage runs
+  # unittests with `-m not cpu_only`, and one pytest invocation is made per
+  # entry, so a file whose tests are all cpu_only collects nothing and errors.
+  # The fully-cpu_only ones (test_config_database_sync, test_periodic_junit,
+  # test_prepare_dataset, test_test_to_stage_mapping) are covered by
+  # l0_cpu.yml, which lists unittest/tools as a directory.
+  - unittest/tools/test_host_profiler.py
+  - unittest/tools/test_infra_dry_run_pipeline.py
+  - unittest/tools/test_infra_dry_run_pytest.py
+  - unittest/tools/test_perf_sanity_matching.py
+  - unittest/tools/test_unittest_culprits.py
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
@@ -159,8 +175,6 @@ l0_a10:
       stage: post_merge
       backend: pytorch
   tests:
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_examples.py::test_llmapi_server_example
   - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen3/Qwen3-0.6B]
