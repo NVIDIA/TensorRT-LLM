@@ -2499,11 +2499,46 @@ class RankInfoServer:
         self.shutdown()
 
 
-def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAgent:
+def _unset_ucx_env_for_engine_config(engine_config: str) -> None:
+    """Unset UCX_<KEY> env vars named in an NIXL 'engine_config' backend param.
+
+    NIXL applies 'engine_config' entries via ucp_config_modify only when the
+    matching UCX_<KEY> environment variable is NOT set (env wins otherwise).
+    Removing those variables up front lets the configured values take effect.
+    Keys are parsed exactly as NIXL does: comma-separated KEY=VALUE elements,
+    elements without '=' are ignored.
+    """
+    for elem in engine_config.split(","):
+        key, sep, _ = elem.partition("=")
+        if not sep or not key:
+            continue
+        env_key = "UCX_" + key
+        old = os.environ.pop(env_key, None)
+        if old is not None:
+            logger.info(
+                f"Unset {env_key}={old!r} so NIXL engine_config entry {elem!r} takes effect"
+            )
+
+
+def _create_nixl_agent(
+    name: str,
+    rank: int,
+    world_size: int,
+    backend_params: Optional[dict[str, str]] = None,
+) -> NixlTransferAgent:
     num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
     kwargs = {}
     if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
         kwargs["split_batch_size"] = int(os.environ["TRTLLM_NIXL_SPLIT_BATCH_SIZE"])
+    if backend_params:
+        # Explicit config wins over the legacy env-var defaults above.
+        kwargs.update(backend_params)
+        engine_config = backend_params.get("engine_config")
+        if engine_config:
+            _unset_ucx_env_for_engine_config(engine_config)
+    # num_threads is a named parameter of the agent constructor; passing it
+    # through kwargs as well would raise a duplicate-keyword TypeError.
+    num_threads = int(kwargs.pop("num_threads", num_threads))
     return NixlTransferAgent(
         name,
         True,
@@ -2540,6 +2575,7 @@ class TransferWorkerConfig:
     rx_timeout_s: Optional[float] = None
     bounce: Optional["Config"] = None
     tx_overall_timeout_s: Optional[float] = None
+    backend_params: Optional[dict[str, str]] = None
 
 
 class TransferWorker:
@@ -2610,6 +2646,7 @@ class TransferWorker:
             self._rank_info.instance_name + str(self._rank_info.instance_rank),
             rank=mapping.rank,
             world_size=mapping.world_size,
+            backend_params=self._config.backend_params,
         )
         self._registered_mem: list = []
         try:

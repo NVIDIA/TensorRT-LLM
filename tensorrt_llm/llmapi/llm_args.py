@@ -4549,6 +4549,18 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "reuse disabled or set to all_reusable. Invalid static settings fail at "
         "startup; per-request constraints reject the request.")
 
+    backend_params: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=
+        "Extra key/value parameters forwarded verbatim to the NIXL backend at "
+        "creation (nixlAgent.createBackend), e.g. 'device_list', "
+        "'engine_config' (comma-separated UCX KEY=VALUE pairs, keys uppercase "
+        "without the UCX_ prefix), 'num_workers'. For keys named in "
+        "'engine_config' the matching UCX_<KEY> environment variables are "
+        "unset before agent creation so the configured values take effect. "
+        "Only used by the Python (v2) transceiver with the NIXL backend.",
+        status="prototype")
+
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
 
