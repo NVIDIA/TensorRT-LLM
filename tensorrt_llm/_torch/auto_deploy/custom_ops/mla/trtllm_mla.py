@@ -1213,6 +1213,7 @@ def _handle_prefill_thop_cached_kv(
         host_kv_cache_pool_pointers,
         planner.host_pool_mapping,
         planner.kv_scale_orig_quant,
+        0,  # residual_dim
         _CONTEXT_LAYER_OFFSET,
         tokens_per_block,
         max_context_length,
@@ -1667,6 +1668,7 @@ def _handle_decode_impl(
         host_kv_cache_pool_mapping,
         planner.kv_scale_orig_quant,
         planner.kv_scale_quant_orig,
+        None,  # kv_cache_scale_orig_quant
         None,  # out_scale
         planner.block_ids_per_seq,
         [None, None],  # mla_tensor_params (helix)
@@ -1675,6 +1677,7 @@ def _handle_decode_impl(
         num_heads,
         num_kv_heads,
         gen_head_size,
+        0,  # residual_dim
         tokens_per_block,
         max_context_length,  # attention_window_size
         1,  # beam_width
