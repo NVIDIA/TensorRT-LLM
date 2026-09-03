@@ -1796,20 +1796,32 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",
                                           mapping: "Mapping") -> int:
-        """fp8 context-MLA stages a K/V dequant workspace sized by the summed attended KV length
-        (``total_kv_len``) across the context requests in a forward step, not by ``max_num_tokens`` -- so
-        KV-cache reuse can push it far past the profiling floor. This buffer is shared across attention
-        layers. ``0`` for non-MLA / non-fp8-KV / absorption-mode sparse MLA (which reads K/V straight from
-        the paged cache and stages no dequant buffer).
+        """Context-MLA workspace sized by summed attended KV length.
 
-        The per-token cost is the single source of truth in C++
-        (``AttentionOp::contextMlaWorkspaceBytesPerToken``, exposed via nanobind), so it cannot drift
-        from the runtime allocation.
+        Dense fp8 context-MLA stages expanded K/V. NVFP4 DSA stages selected
+        latent rows in fp8 plus selection/scan workspace. Cached tokens can
+        grow both beyond the fresh-prefill profiling floor.
         """
         config = model_config.pretrained_config
         if not is_mla(config):
             return 0
         quant_config = model_config.quant_config
+        quant_mode = getattr(quant_config, "quant_mode", None)
+        sparse_algorithm = getattr(model_config.sparse_attention_config,
+                                   "algorithm", None)
+        nvfp4_dsa_context = (quant_mode is not None and getattr(
+            quant_mode, "has_fp4_kv_cache", lambda: False)()
+                             and sparse_algorithm == "dsa"
+                             and get_sm_version() >= 100)
+        if nvfp4_dsa_context:
+            # The output row has one fp8 value per latent element. The gather
+            # also allocates three int32 arrays, CUB scan storage, and aligned
+            # padding; 64 B/token is a conservative bound for that auxiliary
+            # workspace.
+            nvfp4_gather_aux_bytes_per_token = 64
+            return int(config.kv_lora_rank + config.qk_rope_head_dim +
+                       nvfp4_gather_aux_bytes_per_token)
+
         fp8_context_mla = (quant_config is not None
                            and quant_config.quant_mode.has_fp8_kv_cache()
                            and get_sm_version() in (90, 100, 103, 120))
@@ -1828,8 +1840,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         #   * short-seq MHA fallback off -- it routes short contexts back through the dense path.
         # Match the runtime predicate, not just "a sparse config exists": over-reserving costs KV pool,
         # under-reserving OOMs mid-forward.
-        sparse_algorithm = getattr(model_config.sparse_attention_config,
-                                   "algorithm", None)
         sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
                       and get_sm_version() in (100, 103))
         short_seq_mha_enabled = int(
@@ -1846,6 +1856,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 separate_q_and_kv_input=True,
                 sparse_mla=stages_no_buffer,
             ))
+
+    @classmethod
+    def runtime_workspace_is_chunked_prefill_bounded(
+            cls, model_config: "ModelConfig") -> bool:
+        """NVFP4 DSA gathers from the complete attended prefix."""
+        config = model_config.pretrained_config
+        if not is_mla(config):
+            return True
+        quant_config = model_config.quant_config
+        quant_mode = getattr(quant_config, "quant_mode", None)
+        sparse_algorithm = getattr(model_config.sparse_attention_config,
+                                   "algorithm", None)
+        return not (quant_mode is not None
+                    and getattr(quant_mode, "has_fp4_kv_cache", lambda: False)()
+                    and sparse_algorithm == "dsa" and get_sm_version() >= 100)
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
         if self.local_layer_idx is not None:
@@ -2732,6 +2757,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             None,  # kv_scale_orig_quant
+            0,  # residual_dim
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
@@ -2857,6 +2883,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             None,  # kv_scale_orig_quant
             None,  # kv_scale_quant_orig
+            getattr(self, "_nvfp4_mla_kv_scale_orig_quant", None),
             out_scale,
             metadata.block_ids_per_seq,
             helix_tensor_params,
@@ -2865,6 +2892,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
+            getattr(metadata.kv_cache_manager, "mla_kv_cache_residual_dim", 0),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.max_seq_len,  # attention_window_size
             metadata.beam_width,
