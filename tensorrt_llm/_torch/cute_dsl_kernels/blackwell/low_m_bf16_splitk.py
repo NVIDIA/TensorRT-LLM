@@ -15,16 +15,22 @@ Each cluster rank accumulates an exact K slice in FP32. Peers publish partials
 to rank 0 through DSMEM; rank 0 reduces, casts, and stores once. The public
 ``A[M, K] @ B[K, N]`` problem is swapped internally, so tile dimensions below
 use kernel coordinates: kernel-M carries public N and kernel-N carries public M.
+
+Each rank of a split tactic requires whole CTA-K tiles. An unsplit tactic can
+accept a K tail because its final TMA load zero-fills the residual tile.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import functools
+from collections.abc import Callable
+from types import MappingProxyType
 
 import cuda.bindings.driver as _cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.math as cute_math
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch as _torch
@@ -160,7 +166,9 @@ def validate_tactic(
         raise ValueError(f"this low-M policy requires 1 <= M <= {MAX_M}, got {m}")
     if n <= 0:
         raise ValueError(f"N must be positive, got {n}")
-    if k <= 0 or k % _CTA_K or (k // _CTA_K) % tactic.split_k:
+    if k <= 0:
+        raise ValueError(f"K must be positive, got {k}")
+    if tactic.split_k > 1 and (k % _CTA_K or (k // _CTA_K) % tactic.split_k):
         raise ValueError(
             f"K={k} with CTA_K={_CTA_K} does not divide evenly across split_k={tactic.split_k}"
         )
@@ -225,7 +233,7 @@ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
             mma_m = 128 if k <= 1024 and m <= 24 else 64
             requested_split = 1
 
-    if k <= 4 * _CTA_K:
+    if k <= 4 * _CTA_K or k % _CTA_K:
         requested_split = 1
     split_k = next(
         split_k
@@ -255,7 +263,11 @@ __all__ = [
     "SplitKTactic",
     "autotune_tactics",
     "default_tactic",
+    "get_splitk_dense_epilogue_runner",
+    "interleave_grouped_output_rows",
     "run_splitk_dense",
+    "run_splitk_dense_sigmoid_grouped_reduce",
+    "validate_sigmoid_grouped_reduce_tactic",
     "validate_tactic",
 ]
 
@@ -322,6 +334,71 @@ def _store_shared_remote_v4(
 OWNER_RANK = 0
 
 
+def _sigmoid_f32(value):
+    return 1.0 / (cute_math.exp(value * -1.0) + 1.0)
+
+
+#: Epilogue modes; "none" preserves the generic GEMM store path.
+_EPILOGUE_MODES = ("none", "sigmoid_grouped_reduce")
+
+#: Named barrier for the grouped epilogue's shared-memory staging round-trip.
+_GROUPED_REDUCTION_BARRIER_ID = 7
+
+#: Alignment of the grouped epilogue shared-memory tile.
+_GROUPED_REDUCTION_TILE_ALIGN_BYTES = 16
+
+
+def _validate_sigmoid_grouped_reduce_configuration(
+    tactic: SplitKTactic,
+    group_count: int,
+    smem_capacity: int,
+) -> None:
+    if not isinstance(group_count, int) or isinstance(group_count, bool):
+        raise ValueError("group_count must be an integer")
+    if tactic.split_k != 1:
+        raise ValueError("sigmoid grouped reduction requires split_k=1")
+    if group_count < 2 or tactic.mma_m % group_count:
+        raise ValueError(f"group_count={group_count} must divide mma_m={tactic.mma_m}")
+    output_elements = (tactic.mma_m // group_count) * tactic.mma_n
+    if output_elements % 128:
+        raise ValueError(
+            f"grouped reduction tile ({tactic.mma_m}, {tactic.mma_n}) gives "
+            f"{output_elements} outputs; must be a multiple of 128"
+        )
+    required_smem = (
+        _align_up(
+            _smem_bytes(tactic, tactic.ab_stages),
+            _GROUPED_REDUCTION_TILE_ALIGN_BYTES,
+        )
+        + tactic.mma_m * tactic.mma_n * _FP32_BYTES
+    )
+    if required_smem > smem_capacity:
+        raise ValueError(
+            f"sigmoid grouped reduction needs {required_smem} B of shared memory; "
+            f"only {smem_capacity} B available"
+        )
+
+
+def validate_sigmoid_grouped_reduce_tactic(
+    tactic: SplitKTactic,
+    m: int,
+    n: int,
+    k: int,
+    group_count: int,
+    *,
+    smem_capacity: int = _SMEM_CAPACITY_BYTES,
+) -> None:
+    """Reject a tactic that cannot serve a sigmoid grouped reduction."""
+    validate_tactic(tactic, m, n, k, smem_capacity=smem_capacity)
+    _validate_sigmoid_grouped_reduce_configuration(tactic, group_count, smem_capacity)
+    if n % group_count:
+        raise ValueError(f"N={n} must be divisible by group_count={group_count}")
+    if n % tactic.mma_m:
+        raise ValueError(
+            f"sigmoid grouped reduction requires N={n} divisible by mma_m={tactic.mma_m}"
+        )
+
+
 class SplitKDenseGemmKernel:
     """Standalone BF16/FP16 GEMM with a cluster-local split-K reduction."""
 
@@ -331,6 +408,9 @@ class SplitKDenseGemmKernel:
         tactic: SplitKTactic,
         use_pdl: bool,
         has_bias: bool,
+        epilogue_mode: str = "none",
+        epilogue_scale: float = 1.0,
+        epilogue_group: int = 1,
     ) -> None:
         self.acc_dtype = cutlass.Float32
         self.cta_m = tactic.mma_m
@@ -340,6 +420,20 @@ class SplitKDenseGemmKernel:
         self.split_k = tactic.split_k
         self.use_pdl = use_pdl
         self.has_bias = has_bias
+        self.epilogue_mode = epilogue_mode
+        self.epilogue_scale = epilogue_scale
+        self.epilogue_group = epilogue_group
+
+        if epilogue_mode not in _EPILOGUE_MODES:
+            raise ValueError(f"unsupported epilogue_mode={epilogue_mode}")
+        if epilogue_mode == "sigmoid_grouped_reduce":
+            if has_bias:
+                raise ValueError("sigmoid grouped reduction does not support bias")
+            _validate_sigmoid_grouped_reduce_configuration(
+                tactic,
+                epilogue_group,
+                _SMEM_CAPACITY_BYTES,
+            )
 
         self.threads_per_cta = 256
         self.epilog_threads = 128
@@ -365,10 +459,12 @@ class SplitKDenseGemmKernel:
         b: cute.Tensor,
         c: cute.Tensor,
         bias: cute.Tensor,
+        reduction_input: cute.Tensor,
+        reduction_output: cute.Tensor,
         stream: _cuda.CUstream,
     ):
         # Grid-y packs output-N tile and cluster rank.
-        self.kernel(a, b, c, bias).launch(
+        self.kernel(a, b, c, bias, reduction_input, reduction_output).launch(
             grid=(
                 cute.ceil_div(c.layout.shape[0], self.cta_m),
                 cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
@@ -388,6 +484,8 @@ class SplitKDenseGemmKernel:
         mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         mBias: cute.Tensor,  # Broadcast bias; dead when has_bias=False
+        mReductionInput: cute.Tensor,  # Dead unless sigmoid grouped reduction.
+        mReductionOutput: cute.Tensor,  # Dead unless sigmoid grouped reduction.
     ):
         """Allocate storage and dispatch the specialized warps."""
         stages = self.num_ab_stage
@@ -482,6 +580,16 @@ class SplitKDenseGemmKernel:
             mailbox = sA
             bar_reduce = bar_mma_epilog
 
+        if cutlass.const_expr(self.epilogue_mode == "sigmoid_grouped_reduce"):
+            sigmoid_tile = cute_ext.allocate(
+                cutlass.Float32,
+                cute.AddressSpace.smem,
+                cute.make_layout((self.cta_m, self.cta_n)),
+                alignment=_GROUPED_REDUCTION_TILE_ALIGN_BYTES,
+            )
+        else:
+            sigmoid_tile = mailbox
+
         if warp_idx == 0:
             with cute.arch.elect_one():
                 for i in range(stages):
@@ -502,8 +610,11 @@ class SplitKDenseGemmKernel:
         else:
             cute.arch.barrier()
 
-        # Host validation guarantees an equal, tail-free K partition.
-        k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
+        if cutlass.const_expr(self.split_k == 1):
+            k_tile_count = cute.ceil_div(cute.size(mA, mode=[1]), self.cta_k)
+        else:
+            # Host validation guarantees an equal, tail-free K partition.
+            k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
         k_tile_start = split_rank * k_tile_count
 
         if cutlass.const_expr(self.split_k > 1):
@@ -563,6 +674,11 @@ class SplitKDenseGemmKernel:
                 mailbox,
                 bar_reduce,
                 split_rank,
+                sigmoid_tile,
+                mReductionInput,
+                mReductionOutput,
+                bidx,
+                n_idx,
             )
 
     @cute.experimental.jit
@@ -690,6 +806,11 @@ class SplitKDenseGemmKernel:
         mailbox,
         bar_reduce,
         split_rank: cutlass.Int32,
+        sigmoid_tile,
+        mReductionInput: cute.Tensor,
+        mReductionOutput: cute.Tensor,
+        bidx: cutlass.Int32,
+        n_idx: cutlass.Int32,
     ):
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
@@ -802,9 +923,58 @@ class SplitKDenseGemmKernel:
             if cutlass.const_expr(self.has_bias):
                 rAcc.store(rAcc.load() + rBiasAcc.load())
 
-            rD.store(rAcc.load().to(c_dtype))
-            # Preserve TMEM coordinates; the copy predicates output tails.
-            cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+            if cutlass.const_expr(self.epilogue_mode == "sigmoid_grouped_reduce"):
+                group = self.epilogue_group
+                rSigmoid = cute_ext.allocate(
+                    self.acc_dtype,
+                    cute.AddressSpace.rmem,
+                    rmem_layout,
+                    alignment=32,
+                )
+                # Match the unfused GEMM output's BF16 materialization before
+                # applying sigmoid and reducing the grouped input.
+                rounded = rAcc.load().to(c_dtype).to(self.acc_dtype)
+                rSigmoid.store(_sigmoid_f32(rounded))
+                sSigmoid_epi = cute.flat_divide(sigmoid_tile, epi_tile)
+                cute_ext.partition_and_copy(
+                    thr_t2r,
+                    rSigmoid,
+                    sSigmoid_epi[None, None, 0, 0],
+                )
+                cute.arch.barrier(
+                    barrier_id=_GROUPED_REDUCTION_BARRIER_ID,
+                    number_of_threads=self.epilog_threads,
+                )
+
+                rows = cute.size(mReductionOutput, mode=[0])
+                hidden_size = cute.size(mReductionOutput, mode=[1])
+                hidden_per_tile = self.cta_m // group
+                output_elements = hidden_per_tile * self.cta_n
+                for iteration in cutlass.range_constexpr(output_elements // self.epilog_threads):
+                    element = iteration * self.epilog_threads + epi_tid
+                    hidden_local = element % hidden_per_tile
+                    row_local = element // hidden_per_tile
+                    row_global = n_idx * self.cta_n + row_local
+                    hidden_global = bidx * hidden_per_tile + hidden_local
+                    if row_global < rows:
+                        gated = cutlass.Float32(0.0)
+                        for stream_idx in cutlass.range_constexpr(group):
+                            sigmoid = sigmoid_tile[
+                                hidden_local * group + stream_idx,
+                                row_local,
+                            ]
+                            value = mReductionInput[
+                                row_global,
+                                stream_idx * hidden_size + hidden_global,
+                            ].to(cutlass.Float32)
+                            gated = gated + sigmoid * value
+                        mReductionOutput[row_global, hidden_global] = (
+                            gated * self.epilogue_scale
+                        ).to(c_dtype)
+            else:
+                rD.store(rAcc.load().to(c_dtype))
+                # Preserve TMEM coordinates; the copy predicates output tails.
+                cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
 
         # The reduction mbarrier covers remote stores; no cluster barrier needed.
 
@@ -826,6 +996,8 @@ def _bmm_no_bias(
         cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
         c,
         cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
+        c,
+        c,
         stream,
     )
 
@@ -839,11 +1011,36 @@ def _bmm_bias(
     bias: cute.Tensor,
     stream: _cuda.CUstream,
 ):
+    c_swapped = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
     gemm_op(
         cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0])),
         cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
-        cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0])),
+        c_swapped,
         cute.make_tensor(bias.iterator, cute.select(bias.layout, mode=[1, 2, 0])),
+        c_swapped,
+        c_swapped,
+        stream,
+    )
+
+
+@cute.experimental.jit
+def _bmm_sigmoid_grouped_reduce(
+    gemm_op: cutlass.Constexpr,
+    a: cute.Tensor,
+    b: cute.Tensor,
+    c: cute.Tensor,
+    reduction_input: cute.Tensor,
+    reduction_output: cute.Tensor,
+    stream: _cuda.CUstream,
+):
+    c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
+    gemm_op(
+        cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0])),
+        cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
+        c,
+        cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
+        reduction_input,
+        reduction_output,
         stream,
     )
 
@@ -862,6 +1059,15 @@ def _detect_leading_dim(tensor: _torch.Tensor) -> int:
     raise ValueError("tensor has no stride-1 dimension")
 
 
+def _is_row_or_column_major(tensor: _torch.Tensor) -> bool:
+    """Accept a dense matrix whose outer dimension may contain padding."""
+    rows, columns = tensor.shape
+    row_stride, column_stride = tensor.stride()
+    return (column_stride == 1 and row_stride >= columns) or (
+        row_stride == 1 and column_stride >= rows
+    )
+
+
 def _make_layout_tensor(
     shape: tuple[int, ...], dtype: _torch.dtype, leading_dim: int
 ) -> _torch.Tensor:
@@ -877,6 +1083,7 @@ def _make_compile_repr_tensors(
     a_leading: int,
     b_leading: int,
     c_leading: int,
+    epilogue_mode: str = "none",
 ):
     m, n, k, batch = 64, 8, _CTA_K, 1
     tensors = tuple(
@@ -887,6 +1094,12 @@ def _make_compile_repr_tensors(
             ((batch, n, m), c_leading),
         )
     )
+    if epilogue_mode == "sigmoid_grouped_reduce":
+        return (
+            *tensors,
+            _from_dlpack_dynamic(_torch.empty((n, m), dtype=dtype, device="cuda"), 1),
+            _from_dlpack_dynamic(_torch.empty((n, m), dtype=dtype, device="cuda"), 1),
+        )
     if not has_bias:
         return (*tensors, None)
     return (
@@ -930,6 +1143,9 @@ def _get_compiled_splitk_kernel(
     use_pdl: bool,
     has_bias: bool,
     leading_dims: tuple[int, int, int],
+    epilogue_mode: str = "none",
+    epilogue_scale: float = 1.0,
+    epilogue_group: int = 1,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}")
@@ -938,10 +1154,25 @@ def _get_compiled_splitk_kernel(
         tactic=tactic,
         use_pdl=use_pdl,
         has_bias=has_bias,
+        epilogue_mode=epilogue_mode,
+        epilogue_scale=epilogue_scale,
+        epilogue_group=epilogue_group,
     )
-    compile_tensors = _make_compile_repr_tensors(dtype, has_bias, *leading_dims)
+    compile_tensors = _make_compile_repr_tensors(
+        dtype,
+        has_bias,
+        *leading_dims,
+        epilogue_mode=epilogue_mode,
+    )
     stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
-    if has_bias:
+    if epilogue_mode == "sigmoid_grouped_reduce":
+        compiled = cute_ext.compile(
+            _bmm_sigmoid_grouped_reduce,
+            kernel,
+            *compile_tensors,
+            stream,
+        )
+    elif has_bias:
         compiled = cute_ext.compile(_bmm_bias, kernel, *compile_tensors, stream)
     else:
         compiled = cute_ext.compile(_bmm_no_bias, kernel, *compile_tensors[:3], stream)
@@ -958,8 +1189,11 @@ def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
         raise ValueError("all tensors must be on the same CUDA device")
     if a.dtype not in _SUPPORTED_TORCH_DTYPES or any(tensor.dtype != a.dtype for tensor in tensors):
         raise ValueError("a, b, out, and bias must share BF16 or FP16 dtype")
-    if any(not (tensor.is_contiguous() or tensor.t().is_contiguous()) for tensor in (a, b, out)):
-        raise ValueError("a, b, and out must be dense row-major or column-major matrices")
+    if any(not _is_row_or_column_major(tensor) for tensor in (a, b, out)):
+        raise ValueError(
+            "a, b, and out must be non-overlapping row-major or column-major "
+            "matrices, optionally with outer-dimension padding"
+        )
     if any(tensor.data_ptr() % 32 for tensor in (a, b, out)):
         raise ValueError("a, b, and out must be 32-byte aligned")
     # cute_ext.tma_load is used for a and b (not out, which uses partition_and_copy).
@@ -1029,3 +1263,117 @@ def run_splitk_dense(
     else:
         compiled(*cute_tensors[:3], stream)
     return out
+
+
+def interleave_grouped_output_rows(
+    weight: _torch.Tensor,
+    group_count: int,
+) -> _torch.Tensor:
+    """Interleave stream-major output rows for grouped reduction.
+
+    Args:
+        weight: Two-dimensional ``[group_count * hidden_size, K]`` tensor whose
+            output rows are grouped as ``[group_count, hidden_size]``.
+        group_count: Number of equally sized row groups.
+
+    Returns:
+        A contiguous tensor whose output rows are grouped as
+        ``[hidden_size, group_count]``.
+    """
+    if not isinstance(weight, _torch.Tensor):
+        raise ValueError("weight must be a torch tensor")
+    if weight.ndim != 2:
+        raise ValueError(f"weight must be two-dimensional, got shape={weight.shape}")
+    if not isinstance(group_count, int) or isinstance(group_count, bool) or group_count < 2:
+        raise ValueError(f"group_count must be an integer >= 2, got {group_count!r}")
+    if weight.shape[0] % group_count:
+        raise ValueError(
+            f"weight rows={weight.shape[0]} must divide evenly into group_count={group_count}"
+        )
+    hidden_size = weight.shape[0] // group_count
+    return (
+        weight.reshape(group_count, hidden_size, weight.shape[1])
+        .permute(1, 0, 2)
+        .reshape(weight.shape)
+        .contiguous()
+    )
+
+
+def run_splitk_dense_sigmoid_grouped_reduce(
+    a: _torch.Tensor,
+    b: _torch.Tensor,
+    reduction_input: _torch.Tensor,
+    reduction_output: _torch.Tensor,
+    pdl: bool,
+    tactic: SplitKTactic,
+    reduction_scale: float,
+    group_count: int,
+) -> _torch.Tensor:
+    """Fuse BF16 GEMM with a sigmoid-weighted grouped reduction.
+
+    ``b`` must expose GEMM output columns in ``[hidden_size, group_count]``
+    order, as produced by :func:`interleave_grouped_output_rows`. The
+    reduction computes ``reduction_scale * sum_g(sigmoid(gemm[..., h, g]) *
+    reduction_input[..., g, h])`` without materializing the GEMM output.
+    """
+    m, n, k = _validate_runtime_tensors(a, b, None, reduction_input)
+    if a.dtype != _torch.bfloat16:
+        raise ValueError(f"sigmoid grouped reduction supports BF16; got {a.dtype}")
+    validate_sigmoid_grouped_reduce_tactic(tactic, m, n, k, group_count)
+    hidden_size = n // group_count
+    if (
+        not isinstance(reduction_output, _torch.Tensor)
+        or reduction_output.ndim != 2
+        or reduction_output.shape != (m, hidden_size)
+        or reduction_output.dtype != a.dtype
+        or reduction_output.device != a.device
+        or reduction_output.stride(1) != 1
+        or reduction_output.stride(0) < hidden_size
+        or reduction_output.data_ptr() % 32
+        or reduction_input.stride(1) != 1
+    ):
+        raise ValueError(
+            "reduction_output must be a 32-byte-aligned row-major "
+            f"{(m, hidden_size)} tensor matching a, and reduction_input "
+            "must be row-major"
+        )
+    cute_tensors = _to_cute_swap(a, b, reduction_input, None)
+    compiled = _get_compiled_splitk_kernel(
+        dtype=a.dtype,
+        tactic=tactic,
+        use_pdl=pdl,
+        has_bias=False,
+        leading_dims=cute_tensors[4],
+        epilogue_mode="sigmoid_grouped_reduce",
+        epilogue_scale=reduction_scale,
+        epilogue_group=group_count,
+    )
+    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+    compiled(
+        *cute_tensors[:3],
+        _from_dlpack_dynamic(reduction_input, 1),
+        _from_dlpack_dynamic(reduction_output, 1),
+        stream,
+    )
+    return reduction_output
+
+
+_SPLITK_DENSE_EPILOGUE_RUNNERS = MappingProxyType(
+    {
+        "none": run_splitk_dense,
+        "sigmoid_grouped_reduce": run_splitk_dense_sigmoid_grouped_reduce,
+    }
+)
+
+
+def get_splitk_dense_epilogue_runner(name: str) -> Callable[..., _torch.Tensor]:
+    """Return the registered Split-K GEMM runner for an epilogue name."""
+    if not isinstance(name, str):
+        raise ValueError(f"Split-K GEMM epilogue name must be a string, got {name!r}")
+    try:
+        return _SPLITK_DENSE_EPILOGUE_RUNNERS[name]
+    except KeyError as error:
+        available = ", ".join(_SPLITK_DENSE_EPILOGUE_RUNNERS)
+        raise ValueError(
+            f"unsupported Split-K GEMM epilogue {name!r}; expected one of: {available}"
+        ) from error

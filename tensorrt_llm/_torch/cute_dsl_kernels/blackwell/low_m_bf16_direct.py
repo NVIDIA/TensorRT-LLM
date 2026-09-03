@@ -34,10 +34,13 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from collections.abc import Callable
+from types import MappingProxyType
 
 import cuda.bindings.driver as _cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.math as cute_math
 import torch as _torch
 from cutlass import const_expr
 from cutlass.cute import experimental as cute_ext
@@ -57,6 +60,13 @@ MAX_M = 32
 
 #: ptxas register cap (keeps occupancy predictable across block sizes).
 _COMPILE_OPTIONS = "--ptxas-options -maxrregcount=64"
+
+#: Epilogue modes; "none" preserves the generic GEMM store path.
+_EPILOGUE_MODES = ("none", "silu_prefix")
+
+
+def _sigmoid_f32(value):
+    return 1.0 / (cute_math.exp(value * -1.0) + 1.0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -168,8 +178,19 @@ class _DirectDenseGemmKernel:
         k_extent: int,
         tactic: DirectTactic,
         use_pdl: bool,
+        epilogue_mode: str = "none",
+        epilogue_scale: float = 1.0,
+        epilogue_prefix: int = 0,
     ) -> None:
         validate_tactic(tactic, num_rows, tactic.outputs_per_block, k_extent)
+        if epilogue_mode not in _EPILOGUE_MODES:
+            raise ValueError(f"unsupported epilogue_mode={epilogue_mode}")
+        if epilogue_mode == "silu_prefix" and (
+            not isinstance(epilogue_prefix, int) or isinstance(epilogue_prefix, bool)
+        ):
+            raise ValueError("silu epilogue_prefix must be an integer")
+        if epilogue_mode == "silu_prefix" and epilogue_prefix <= 0:
+            raise ValueError(f"silu epilogue_prefix must be positive, got {epilogue_prefix}")
         self.element_type = element_type
         self.num_rows = num_rows
         self.rows_per_block = tactic.rows_per_block
@@ -178,6 +199,9 @@ class _DirectDenseGemmKernel:
         self.outputs_per_block = tactic.outputs_per_block
         self.vector_width = _VECTOR_WIDTH
         self.use_pdl = use_pdl
+        self.epilogue_mode = epilogue_mode
+        self.epilogue_scale = epilogue_scale
+        self.epilogue_prefix = epilogue_prefix
         self.num_warps = tactic.block_size // cute.arch.WARP_SIZE
         self.num_k_tiles = k_extent // (tactic.block_size * _VECTOR_WIDTH)
 
@@ -308,7 +332,14 @@ class _DirectDenseGemmKernel:
                     total = cutlass.Float32(0.0)
                     for warp in cutlass.range_constexpr(num_warps):
                         total = total + partials[mi, ni, warp]
-                    gC[m_base + mi, n_base + ni] = total.to(self.element_type)
+                    value = total.to(self.element_type)
+                    if const_expr(self.epilogue_mode == "silu_prefix"):
+                        if n_base + ni < self.epilogue_prefix:
+                            # Preserve GEMM -> BF16 -> activation rounding when
+                            # replacing the separate pointwise kernel.
+                            scaled = value.to(cutlass.Float32) * self.epilogue_scale
+                            value = (scaled * _sigmoid_f32(scaled)).to(self.element_type)
+                    gC[m_base + mi, n_base + ni] = value
 
         if const_expr(self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()
@@ -338,6 +369,9 @@ def _get_compiled_direct_kernel(
     k: int,
     tactic: DirectTactic,
     use_pdl: bool,
+    epilogue_mode: str = "none",
+    epilogue_scale: float = 1.0,
+    epilogue_prefix: int = 0,
 ):
     """JIT-compile and cache a specialised ``_DirectDenseGemmKernel``."""
     if dtype != _torch.bfloat16:
@@ -348,6 +382,9 @@ def _get_compiled_direct_kernel(
         k_extent=k,
         tactic=tactic,
         use_pdl=use_pdl,
+        epilogue_mode=epilogue_mode,
+        epilogue_scale=epilogue_scale,
+        epilogue_prefix=epilogue_prefix,
     )
     tensors = _make_compile_repr_tensors(dtype, m, n, k)
     stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
@@ -422,12 +459,71 @@ def run_direct_dense(
     return out
 
 
+def run_direct_dense_silu_prefix(
+    a: _torch.Tensor,
+    b: _torch.Tensor,
+    out: _torch.Tensor,
+    pdl: bool,
+    tactic: DirectTactic,
+    scale: float,
+    prefix: int,
+) -> _torch.Tensor:
+    """Apply ``silu(scale * x)`` to a GEMM output prefix.
+
+    Columns after ``prefix`` retain the ordinary GEMM result.
+    """
+    m, n, k = _validate_runtime_tensors(a, b, out, tactic)
+    if not isinstance(prefix, int) or isinstance(prefix, bool):
+        raise ValueError("prefix must be an integer")
+    if not 0 < prefix <= n:
+        raise ValueError(f"prefix must be in [1, {n}], got {prefix}")
+    compiled = _get_compiled_direct_kernel(
+        a.dtype,
+        m,
+        n,
+        k,
+        tactic,
+        pdl,
+        "silu_prefix",
+        scale,
+        prefix,
+    )
+    # Pass b.T (row-major [N, K]) so the kernel sees gB[N, K].
+    tensors = tuple(_from_dlpack_static(t) for t in (a, b.T, out))
+    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+    compiled(*tensors, stream)
+    return out
+
+
+_DIRECT_DENSE_EPILOGUE_RUNNERS = MappingProxyType(
+    {
+        "none": run_direct_dense,
+        "silu_prefix": run_direct_dense_silu_prefix,
+    }
+)
+
+
+def get_direct_dense_epilogue_runner(name: str) -> Callable[..., _torch.Tensor]:
+    """Return the registered Direct GEMM runner for an epilogue name."""
+    if not isinstance(name, str):
+        raise ValueError(f"Direct GEMM epilogue name must be a string, got {name!r}")
+    try:
+        return _DIRECT_DENSE_EPILOGUE_RUNNERS[name]
+    except KeyError as error:
+        available = ", ".join(_DIRECT_DENSE_EPILOGUE_RUNNERS)
+        raise ValueError(
+            f"unsupported Direct GEMM epilogue {name!r}; expected one of: {available}"
+        ) from error
+
+
 __all__ = [
     "MAX_M",
     "DirectTactic",
     "autotune_tactics",
     "default_tactic",
+    "get_direct_dense_epilogue_runner",
     "prefer_direct_bf16_gemm_sm100",
     "run_direct_dense",
+    "run_direct_dense_silu_prefix",
     "validate_tactic",
 ]
