@@ -1245,7 +1245,8 @@ def test_warm_ctx_from_gen(model, generation_overlap):
             )
             warm_tokens = responses[0][0].token_ids or []
             assert len(warm_tokens) <= 1, (
-                f"transfer_only request produced {len(warm_tokens)} tokens. Instead no decode steps should be run.")
+                f"transfer_only request produced {len(warm_tokens)} tokens. Instead no decode steps should be run."
+            )
 
             # 4. Next turn on worker 1: turn 1 plus a new user message, as token ids so the
             #    prefix stays byte-identical to what worker 0 served.
