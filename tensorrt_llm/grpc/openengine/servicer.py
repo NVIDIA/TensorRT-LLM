@@ -661,8 +661,7 @@ def _set_disagg_attr(params: Any, name: str, value: Any, *, optional: bool = Fal
         return
     if not optional:
         raise ValueError(
-            f"the peer's handoff carries '{name}', which this TensorRT-LLM build "
-            "does not support"
+            f"the peer's handoff carries '{name}', which this TensorRT-LLM build does not support"
         )
     logger.warning(
         f"OpenEngine handoff attribute '{name}' is not supported by this "

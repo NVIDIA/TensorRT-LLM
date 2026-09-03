@@ -269,12 +269,12 @@ def test_logprob_ceiling_is_the_limit_the_engine_enforces(llm, model_info):
             )
         )
 
-    assert _accepted(
-        llm, candidates(limit)
-    ), f"advertised max_top_n={limit} but the engine rejected it"
-    assert not _accepted(
-        llm, candidates(limit + 1)
-    ), f"engine accepted top_n={limit + 1}, above the advertised ceiling {limit}"
+    assert _accepted(llm, candidates(limit)), (
+        f"advertised max_top_n={limit} but the engine rejected it"
+    )
+    assert not _accepted(llm, candidates(limit + 1)), (
+        f"engine accepted top_n={limit + 1}, above the advertised ceiling {limit}"
+    )
 
 
 def test_logprob_ceiling_matches_the_enforced_constant(model_info):
