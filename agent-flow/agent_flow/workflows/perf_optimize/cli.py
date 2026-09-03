@@ -11,6 +11,7 @@ from agent_flow.workflows.perf_analyze.task_schema import casebook_enabled
 
 from .disagg import has_disagg
 from .prompts import PROMPTS_DIRNAME, build_perf_optimize_prompts
+from .sol_track import track_name
 from .state import STATE_FILENAME
 from .task_schema import (
     TaskSchemaError,
@@ -149,6 +150,7 @@ def main(argv: list[str] | None = None) -> None:
         sol_methodology=methodology.name,
         include_disagg=has_disagg(task_data),
         include_casebook=casebook_enabled(task_data),
+        sol_track=track_name(task_data),
     )
     with PerfOptimizeWorkflow(
         workspace=args.workspace,
