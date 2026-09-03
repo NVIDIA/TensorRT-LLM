@@ -17,9 +17,6 @@ l0_dgx_b200:
   tests:
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
-  # ------------- Disaggregated Serving: Pipelined KV Transfer (multi-GPU) ---------------
-  - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[use_kv_cache_manager_v2=False-enable_block_reuse=True]
-  - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[use_kv_cache_manager_v2=True-enable_block_reuse=True]
   # ------------- KV Cache V2 Scheduler IT (multi-GPU) ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_draft_tokens
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_chunked_draft_tokens

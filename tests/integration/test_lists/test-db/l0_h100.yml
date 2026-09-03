@@ -120,6 +120,8 @@ l0_h100:
   - unittest/scaffolding
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
+  - accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[no_overlap]
+  - accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[overlap]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=False-attn_backend=TRTLLM] TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=True-attn_backend=TRTLLM] TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dummy_load_format

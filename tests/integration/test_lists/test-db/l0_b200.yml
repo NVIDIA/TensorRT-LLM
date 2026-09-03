@@ -321,6 +321,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_flux.py::test_flux1_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_example
@@ -439,12 +440,18 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[nvfp4]
   - examples/visual_gen/test_visual_gen_glm.py::test_glm_image_feature_accuracy_against_golden[fp8-blockwise]
   - examples/visual_gen/test_visual_gen_glm.py::test_glm_image_feature_accuracy_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[cuda-graph]
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-fp8-blockwise]
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-nvfp4]
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-cuda-graph]
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-fp8-blockwise]
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-nvfp4]
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-cuda-graph]
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_lpips_matches_eager
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend
   - examples/visual_gen/test_visual_gen_wan.py::test_wan21_t2v_lpips_against_golden
   - examples/visual_gen/test_visual_gen_wan.py::test_wan22_t2v_lpips_against_golden
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
