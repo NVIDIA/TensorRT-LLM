@@ -4952,12 +4952,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 task = CnnDailymail(self.MODEL_NAME)
                 task.evaluate(llm)
 
-        # SM103 context falls back because unused paged-V tail NaNs can poison
-        # PrimTS's persistent PV matrix multiply (NVBug 6641268).
-        if get_sm_version() == 103:
-            assert calls["context"] == 0
-        else:
-            assert calls["context"] > 0
+        assert calls["context"] > 0
         assert calls["generation"] > 0
 
     @parametrize_with_ids(
