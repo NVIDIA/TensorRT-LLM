@@ -133,7 +133,11 @@ def run_kda_decode_fusion_cuda(
         )
     if ssm_state_indices is None and not state.is_contiguous():
         raise ValueError("state must be contiguous because it is updated in place")
-    if out is not None:
+    if out is None:
+        # The op is inplace-only and never allocates, so supply a buffer here.
+        # Hot decode paths pass a persistent one instead.
+        out = x_q.new_empty((B, 1, HV, 128))
+    else:
         _require_cuda_bf16("out", out)
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
@@ -226,4 +230,5 @@ def run_kda_decode_fusion_cuda(
         float(scale),
         float(onorm_eps),
     )
-    return torch.ops.trtllm.kda_decode(*args, *launch_args, output=out)
+    torch.ops.trtllm.kda_decode(*args, *launch_args, output=out)
+    return out
