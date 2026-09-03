@@ -25,6 +25,7 @@ import os
 import shutil
 import socket
 import subprocess
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +38,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     maybe_provision_pool,
     provision_pool,
+    resolve_master_address,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, MooncakeStoreConfig
 
@@ -423,3 +425,106 @@ def test_a_described_pool_is_provisioned(running_master):
         written = json.loads(open(os.environ[CONFIG_PATH_ENV]).read())
         assert written["master_server_address"] == running_master
     assert CONFIG_PATH_ENV not in os.environ
+
+
+# ---- reaching a master whose host nobody knew in advance ----
+
+
+@pytest.mark.parametrize("address", ["10.0.0.1:50051", "unix:///var/run/mooncake"])
+def test_an_address_that_is_not_a_file_passes_through(address):
+    assert resolve_master_address(address, timeout=1.0) == address
+
+
+def test_a_published_address_is_read_from_the_file_that_names_it(tmp_path):
+    published = tmp_path / "master.addr"
+    published.write_text("10.0.0.7:50051\n")
+
+    assert resolve_master_address(f"file://{published}", timeout=1.0) == "10.0.0.7:50051"
+
+
+def test_an_address_not_published_yet_is_waited_for(tmp_path):
+    """Master and workers are started together; neither one orders the other."""
+    published = tmp_path / "master.addr"
+    threading.Timer(0.5, published.write_text, ["10.0.0.9:50051\n"]).start()
+
+    assert resolve_master_address(f"file://{published}", timeout=10.0) == "10.0.0.9:50051"
+
+
+def test_an_empty_address_file_is_not_taken_for_an_address(tmp_path):
+    """It exists, which is not the same as holding somewhere to connect to."""
+    published = tmp_path / "master.addr"
+    published.write_text("")
+
+    with pytest.raises(TimeoutError, match="No Mooncake master address"):
+        resolve_master_address(f"file://{published}", timeout=1.0)
+
+
+def test_an_unpublished_address_names_the_command_that_publishes_it(tmp_path):
+    with pytest.raises(TimeoutError, match="--address-file"):
+        resolve_master_address(f"file://{tmp_path / 'absent'}", timeout=1.0)
+
+
+# ---- a master with a lifetime of its own ----
+
+
+def test_a_standalone_master_publishes_an_address_that_can_be_dialed(fake_master, tmp_path):
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    address_file = tmp_path / "master.addr"
+    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+
+    with master_module.running_master(
+        pool, str(tmp_path / "run"), address_file=str(address_file)
+    ) as master:
+        assert resolve_master_address(f"file://{address_file}", timeout=5.0) == master.address
+        host, _, named_port = master.address.rpartition(":")
+        assert int(named_port) == port
+        with socket.create_connection((host, port), timeout=5):
+            pass
+
+
+def test_a_stopped_master_leaves_no_address_behind(fake_master, tmp_path):
+    """A stale address would send the next run's workers at a dead port."""
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    address_file = tmp_path / "master.addr"
+    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+
+    with master_module.running_master(
+        pool, str(tmp_path / "run"), address_file=str(address_file)
+    ):
+        assert address_file.exists()
+
+    assert not address_file.exists()
+    assert fake_master.process.terminated
+
+
+def test_a_standalone_master_keeps_its_log(fake_master, tmp_path):
+    """Its whole point is outliving servers, so its history is worth more."""
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    run_dir = tmp_path / "run"
+    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+
+    with master_module.running_master(pool, str(run_dir)):
+        pass
+
+    assert (run_dir / master_module.MASTER_LOG_NAME).exists()
+
+
+def test_provisioning_joins_a_master_it_was_never_given_the_address_of(fake_master, tmp_path):
+    """The point of the file: no config and no script names a host."""
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    address_file = tmp_path / "master.addr"
+    standalone = MooncakeStoreConfig(launch_master=True, master_port=port)
+    worker = MooncakeStoreConfig(master_server_address=f"file://{address_file}")
+
+    with master_module.running_master(
+        standalone, str(tmp_path / "run"), address_file=str(address_file)
+    ) as master:
+        with provision_pool(worker) as config_path:
+            # Mooncake cannot dial a file:// URL, so what reaches the workers
+            # has to be the address it resolved to.
+            written = json.loads(open(config_path).read())
+            assert written["master_server_address"] == master.address

@@ -39,6 +39,11 @@ Describing the pool in ``KvCacheConnectorConfig.mooncake_store`` instead lets
 master and writing that JSON itself -- so no external script has to. See
 ``master.py``.
 
+Capacity, separately, comes only from processes that open a store handle, which
+in a disaggregated deployment is the context servers alone. ``donor.py`` lends
+a node's memory to the pool without giving it a connector, so the generation
+nodes can hold cache they never read.
+
 By default the KV pools themselves are registered with Mooncake, so the store
 reads and writes device memory and no copy is added. That needs the HCA to be
 able to pin GPU pages -- GPUDirect RDMA, through ``nvidia_peermem`` or dma-buf.
@@ -49,16 +54,25 @@ pinned host buffer instead, so only host memory is ever registered. The stored
 bytes are the same either way, so the two modes can share a pool.
 """
 
-from .config import MooncakeStoreConnectorConfig, StoreRole
-from .master import maybe_provision_pool, provision_pool
+from .config import MooncakeStoreConnectorConfig, StoreRole, parse_size
+from .donor import DEFAULT_DONOR_LOCAL_BUFFER_SIZE, donate_segment
+from .master import (local_address, master_timeout, maybe_provision_pool,
+                     provision_pool, resolve_master_address, running_master)
 from .scheduler import MooncakeStoreConnectorScheduler
 from .worker import MooncakeStoreConnectorWorker
 
 __all__ = [
+    "DEFAULT_DONOR_LOCAL_BUFFER_SIZE",
     "MooncakeStoreConnectorConfig",
     "MooncakeStoreConnectorScheduler",
     "MooncakeStoreConnectorWorker",
     "StoreRole",
+    "donate_segment",
+    "local_address",
+    "master_timeout",
     "maybe_provision_pool",
+    "parse_size",
     "provision_pool",
+    "resolve_master_address",
+    "running_master",
 ]

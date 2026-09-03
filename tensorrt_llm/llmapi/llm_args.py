@@ -1965,8 +1965,11 @@ class MooncakeStoreConfig(StrictBaseModel):
     """
     master_server_address: Optional[str] = Field(
         None,
-        description="Address (host:port) of an already-running "
-        "mooncake_master. Mutually exclusive with launch_master.")
+        description="Address of an already-running mooncake_master, as "
+        "host:port or file://<path> naming a file that holds one -- which is "
+        "how to reach a master whose host a scheduler chose, since "
+        "'trtllm-serve mooncake_master --address_file' publishes it there "
+        "once it answers. Mutually exclusive with launch_master.")
     launch_master: bool = Field(
         False,
         telemetry=False,

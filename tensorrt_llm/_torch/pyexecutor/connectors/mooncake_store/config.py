@@ -94,7 +94,7 @@ class StoreRole(Enum):
         return self is not StoreRole.CONSUMER
 
 
-def _parse_size(value: Any) -> int:
+def parse_size(value: Any) -> int:
     """Accept either a byte count or a suffixed string such as ``"4GiB"``."""
     if isinstance(value, bool):
         raise ValueError(f"expected a size, got {value!r}")
@@ -167,10 +167,10 @@ class MooncakeStoreConnectorConfig:
             master_server_address=raw.get("master_server_address", ""),
             protocol=raw.get("protocol", "rdma"),
             device_name=raw.get("device_name", ""),
-            global_segment_size=_parse_size(
+            global_segment_size=parse_size(
                 raw.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            local_buffer_size=_parse_size(raw.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE)),
+            local_buffer_size=parse_size(raw.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE)),
             local_hostname=raw.get("local_hostname") or None,
             tenant_id=raw.get("tenant_id") or None,
             role=StoreRole(str(raw.get("role", StoreRole.BOTH.value)).strip().lower()),
@@ -178,7 +178,7 @@ class MooncakeStoreConnectorConfig:
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
             stage_through_host=bool(raw.get("stage_through_host", False)),
-            staging_buffer_bytes=_parse_size(
+            staging_buffer_bytes=parse_size(
                 raw.get("staging_buffer_bytes", DEFAULT_STAGING_BUFFER_SIZE)
             ),
         )

@@ -48,7 +48,14 @@ from tensorrt_llm.logger import logger
 from ..registry import uses_connector
 from .config import CONFIG_PATH_ENV
 
-__all__ = ["maybe_provision_pool", "provision_pool"]
+__all__ = [
+    "local_address",
+    "maybe_provision_pool",
+    "master_timeout",
+    "provision_pool",
+    "resolve_master_address",
+    "running_master",
+]
 
 #: Override the binary that ``launch_master`` runs.
 MASTER_BINARY_ENV = "TRTLLM_MOONCAKE_MASTER_BINARY"
@@ -62,9 +69,12 @@ DEFAULT_MASTER_BINARY = "mooncake_master"
 DEFAULT_MASTER_TIMEOUT = 60.0
 CLIENT_CONFIG_NAME = "mooncake.json"
 MASTER_LOG_NAME = "mooncake_master.log"
+#: Prefix that makes ``master_server_address`` name a file holding the address
+#: rather than the address itself.
+ADDRESS_FILE_SCHEME = "file://"
 
 
-def _local_address() -> str:
+def local_address() -> str:
     """The address this host is known by inside the pool.
 
     Deliberately the same derivation the connector worker uses for its own
@@ -77,7 +87,7 @@ def _local_address() -> str:
         return "127.0.0.1"
 
 
-def _master_timeout() -> float:
+def master_timeout() -> float:
     raw = os.getenv(MASTER_TIMEOUT_ENV)
     if not raw:
         return DEFAULT_MASTER_TIMEOUT
@@ -96,6 +106,42 @@ def _split_address(address: str) -> Optional[Tuple[str, int]]:
     if not separator or not port.isdigit():
         return None
     return host.strip("[]"), int(port)
+
+
+def resolve_master_address(address: str, timeout: float) -> str:
+    """Read a ``file://`` address through, and pass anything else along.
+
+    A master with its own lifetime is on whichever host its scheduler gave
+    it, which is not known when the worker configs are written. Naming the
+    file it publishes to instead keeps the address out of the config and out
+    of a launch script: ``trtllm-serve mooncake_master --address-file`` writes
+    it, every worker's ``master_server_address`` names the same path, and the
+    wait here is also the wait for the master to exist at all.
+    """
+    if not address.startswith(ADDRESS_FILE_SCHEME):
+        return address
+
+    path = address[len(ADDRESS_FILE_SCHEME):]
+    deadline = time.monotonic() + timeout
+    while True:
+        # Written whole by the master command, so a non-empty file is a
+        # complete address rather than a prefix of one.
+        try:
+            published = open(path).read().strip()
+        except FileNotFoundError:
+            published = ""
+        if published:
+            logger.info(f"mooncake-store: {path} names the master at {published}")
+            return published
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"No Mooncake master address appeared in {path} within "
+                f"{timeout:g}s. Start one with 'trtllm-serve mooncake_master "
+                f"--address-file {path}', or name a reachable host:port in "
+                f"master_server_address. Raise {MASTER_TIMEOUT_ENV} if the "
+                "master is only slow to start."
+            )
+        time.sleep(0.5)
 
 
 def _wait_until_accepting(
@@ -191,7 +237,7 @@ def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
             "set master_server_address to a master you run yourself."
         )
 
-    host = _local_address()
+    host = local_address()
     log_path = os.path.join(run_dir, MASTER_LOG_NAME)
     hint = f" See {log_path}."
 
@@ -218,7 +264,7 @@ def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
         process=process, address=f"{host}:{pool.master_port}", log_path=log_path
     )
     try:
-        _wait_until_accepting(host, pool.master_port, _master_timeout(), process=process, hint=hint)
+        _wait_until_accepting(host, pool.master_port, master_timeout(), process=process, hint=hint)
     except BaseException:
         master.stop()
         raise
@@ -228,6 +274,41 @@ def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
         f"(metrics http://{host}:{pool.master_metrics_port}, log {log_path})"
     )
     return master
+
+
+@contextlib.contextmanager
+def running_master(
+    pool: Any, run_dir: str, address_file: Optional[str] = None
+) -> Iterator[LaunchedMaster]:
+    """Run a master whose lifetime is this process's rather than an engine's.
+
+    ``provision_pool`` covers the server that owns its pool. Everything else --
+    several engines on one pool, a pool that has to survive a restart -- needs
+    the master somewhere that is not any of them, which is what this is for.
+
+    ``address_file`` receives ``host:port`` once the master answers, so the
+    workers can name the file instead of an address nobody knows until the
+    scheduler has placed this process.
+    """
+    os.makedirs(run_dir, exist_ok=True)
+    master = _launch_master(pool, run_dir)
+    try:
+        if address_file:
+            # Renamed into place so a reader sees either nothing or the whole
+            # address. A half-written one would be dialed as if it were real.
+            staging = f"{address_file}.partial"
+            with open(staging, "w") as handle:
+                handle.write(f"{master.address}\n")
+            os.replace(staging, address_file)
+            logger.info(f"mooncake-store: published {master.address} to {address_file}")
+        yield master
+    finally:
+        if address_file:
+            # The address outliving the master would send the next run's
+            # workers to a port with nothing behind it.
+            with contextlib.suppress(OSError):
+                os.remove(address_file)
+        master.stop()
 
 
 @contextlib.contextmanager
@@ -264,7 +345,9 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
             master = _launch_master(pool, run_dir)
             master_address = master.address
         else:
-            master_address = pool.master_server_address
+            master_address = resolve_master_address(
+                pool.master_server_address, master_timeout()
+            )
             # Reaching a master that is not there fails inside store.setup on
             # every rank, after the model has been loaded. Spend a socket now.
             if (endpoint := _split_address(master_address)) is None:
@@ -274,7 +357,7 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
                     "left for the workers to discover."
                 )
             else:
-                _wait_until_accepting(*endpoint, _master_timeout())
+                _wait_until_accepting(*endpoint, master_timeout())
             logger.info(f"mooncake-store: using the master at {master_address}")
 
         config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
