@@ -634,7 +634,7 @@ def test_exact_selector_applies_strict_iteration_drain_group_value():
     )
 
 
-@pytest.mark.parametrize("graph_batch_size", [16, 32, 64, 128])
+@pytest.mark.parametrize("graph_batch_size", [16, 32, 64, 128, 192, 256])
 def test_exact_selector_reranks_every_g_by_guarded_group_value(graph_batch_size):
     table = ExactSpsCostTable(
         tables={
@@ -727,3 +727,25 @@ def test_exact_table_limits_compact_graph_cells_per_g():
             },
             max_draft_len=5,
         )
+
+
+def test_exact_table_accepts_four_compact_cells_for_six_graph_sizes():
+    graphs = (16, 32, 64, 128, 192, 256)
+    table = ExactSpsCostTable(
+        tables={
+            graph: SpsCostTable(
+                token_counts=(0, int(2.5 * graph), 3 * graph, 4 * graph, 5 * graph),
+                step_time_ms=(10.0, 6.0, 7.0, 8.0, 9.0),
+            )
+            for graph in graphs
+        },
+        max_draft_len=5,
+    )
+
+    assert len(table.candidate_cells()) == 24
+    assert table.candidate_cells()[-4:] == (
+        (256, 640),
+        (256, 768),
+        (256, 1024),
+        (256, 1280),
+    )
