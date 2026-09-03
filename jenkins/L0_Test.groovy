@@ -876,6 +876,34 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     }
 }
 
+// SLURM job --comment tag carrying the owning build's URL, so the Tier-3 janitor
+// (jenkins/L0_ResourceJanitor.groovy) can identify and reap orphaned SLURM jobs
+// when the whole build dies (the in-process ledger can't -- its state dies with
+// the build). Keep this key in sync with the janitor's OWNER_TAG_KEY.
+SLURM_OWNER_TAG_KEY = "trtllm-ci-owner"
+
+// Best-effort injection of a --comment carrying the CI owner tag into a generated
+// SLURM launch command (sbatch/salloc/srun) -- used by the agent path, whose
+// command comes from SlurmConfig.generateCommand and so can't take a #SBATCH
+// directive. FAIL SAFE: the tag value has no shell metacharacters (so it needs no
+// quoting and survives the ssh command wrapping); if the command already carries a
+// --comment or its leading launcher isn't recognized, the command is returned
+// UNCHANGED -- never risk breaking submission; an un-tagged job is simply invisible
+// to the janitor.
+@NonCPS
+String addSlurmOwnerComment(String command, String ownerTag) {
+    if (!command || !ownerTag || command.contains('--comment')) {
+        return command
+    }
+    // Match only the leading launcher (after any env-assignment / export prefix).
+    def m = (command =~ /^(\s*(?:[A-Za-z_][\w]*=[^;]*;\s*|export\s+[^;]*;\s*)*)(sbatch|salloc|srun)\b/)
+    if (!m.find()) {
+        return command
+    }
+    int insertAt = m.end()
+    return command.substring(0, insertAt) + " --comment=" + ownerTag + command.substring(insertAt)
+}
+
 // ---- Off-pod SLURM resource reconciliation --------------------------------
 // A SLURM stage runs inside a K8s dispatcher pod that ssh-drives the job on the
 // login node. If that pod dies mid-run (eviction, container error, agent
@@ -1139,6 +1167,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         echo "[INFRA-RETRY] ${stageName}: could not inject ${slurmExcludeArg} into generated SLURM agent command; submitting without node exclusion"
                     }
                 }
+
+                // Stamp the owner tag so L0_ResourceJanitor can reap this SLURM job if
+                // the whole build dies (best-effort; leaves the command untouched if it
+                // cannot inject safely). Applied after the exclude-injection check above
+                // so it does not perturb that comparison.
+                slurmCommandWithExclusion = addSlurmOwnerComment(slurmCommandWithExclusion, "${SLURM_OWNER_TAG_KEY}=${env.BUILD_URL}")
 
                 def slurmSubmitCommand = slurmCommandWithExclusion
                 if (enrootConfigDir) {
@@ -2093,10 +2127,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     srunArgs.add("--container-env=${varName}")
                 }
 
-                def exemptionComment = ""
+                // Owner tag first (';'-separated) so L0_ResourceJanitor can parse the
+                // owning BUILD_URL out of squeue's comment field regardless of any
+                // trailing idle-GPU-exemption payload.
+                def slurmCommentPayload = "${SLURM_OWNER_TAG_KEY}=${env.BUILD_URL}"
                 if (SlurmConfig.needsIdleGpuExemption(cluster)) {
-                    exemptionComment = "--comment='${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}'"
+                    // Space after ';' to match the idle-GPU-exemption payload format.
+                    // The janitor parser stops the owner URL at ';' or whitespace, so
+                    // this stays compatible.
+                    slurmCommentPayload += "; ${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}"
                 }
+                def exemptionComment = "--comment='${slurmCommentPayload}'"
                 def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName))
                 def slurmExcludeDirective = slurmExcludeArg ? "#SBATCH ${slurmExcludeArg}" : ""
                 if (slurmExcludeArg) {
