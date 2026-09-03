@@ -859,6 +859,7 @@ class TestTransceiverContextManager:
         tc._send_reqs = {}
         tc._recv_reqs = {}
         tc._transfer_worker = MagicMock()
+        tc._shutdown_complete = False
         return tc
 
     def test_enter_returns_self(self):
@@ -871,7 +872,7 @@ class TestTransceiverContextManager:
         with tc:
             pass
         tc._transfer_worker.shutdown.assert_called_once()
-        assert tc._shutdown is True
+        assert tc._shutdown_complete is True
 
     def test_exit_calls_shutdown_on_exception(self):
         tc = self._tc()
@@ -880,10 +881,10 @@ class TestTransceiverContextManager:
                 raise RuntimeError("boom")
         # __exit__ still ran shutdown despite the in-block exception.
         tc._transfer_worker.shutdown.assert_called_once()
-        assert tc._shutdown is True
+        assert tc._shutdown_complete is True
 
     def test_shutdown_is_idempotent(self):
         tc = self._tc()
         tc.shutdown()
-        tc.shutdown()  # second call short-circuits on the _shutdown guard.
+        tc.shutdown()  # second call short-circuits after completed teardown.
         tc._transfer_worker.shutdown.assert_called_once()
