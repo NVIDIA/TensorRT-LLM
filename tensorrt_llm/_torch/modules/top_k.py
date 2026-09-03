@@ -467,7 +467,9 @@ class TopK(nn.Module):
         Args:
             output_indices: Int32 prefill selections with shape
                 ``[num_prefill_rows, top_k]``.
-            request_lengths: Per-request prefill row counts.
+            request_lengths: Per-request prefill row counts on
+                ``output_indices.device``; a host tensor here makes the row
+                gather a synchronous host-to-device copy.
             gvr_prior_indices: Int32 caller-owned state on
                 ``output_indices.device`` with shape ``[capacity, top_k]``.
                 The slice starting at ``request_offset`` is updated in place.

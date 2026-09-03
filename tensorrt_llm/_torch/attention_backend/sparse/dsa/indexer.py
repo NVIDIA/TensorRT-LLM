@@ -1609,9 +1609,11 @@ class Indexer(nn.Module):
 
         # Dense skip outputs remain valid priors if a later step enters GVR.
         if has_prefill:
+            # Device lengths: gathering the CUDA selections with the host
+            # seq_lens would force a synchronous H2D copy every layer.
             self.top_k.update_gvr_prior_from_prefill(
                 topk_indices_buffer[:num_ctx_tokens],
-                metadata.seq_lens[:num_contexts],
+                metadata.seq_lens_cuda[:num_contexts],
                 gvr_prior_indices,
                 request_offset=num_generations,
             )
