@@ -229,9 +229,25 @@ def create_link_for_models():
 def run_sanity_check(examples_path="../../examples"):
     """Run sanity checks after installation."""
     print("##########  Test import tensorrt_llm  ##########")
+    # -X importtime writes a per-module import-time breakdown to stderr;
+    # redirect it to a file instead of the main log so it doesn't drown out
+    # the rest of the sanity-check output. This is a diagnostic aid for
+    # https://nvbugspro.nvidia.com/bug/6646201 (the first quickstart_example.py
+    # call has a silent startup window of up to ~24 minutes on GH200; this
+    # narrows down whether that time is spent importing tensorrt_llm or
+    # elsewhere, e.g. in the model construction / checkpoint path that runs
+    # after import).
     subprocess.check_call(
-        'python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"',
+        'python3 -X importtime -c '
+        '"import tensorrt_llm; print(tensorrt_llm.__version__)" '
+        '2> import_profile.log',
         shell=True)
+    # The importtime breakdown is large; only the cumulative total for the
+    # top-level "import tensorrt_llm" (its last line) is printed to the main
+    # console log, which Jenkins always retains. The full per-module
+    # breakdown stays in import_profile.log for anyone who pulls the
+    # workspace artifacts.
+    subprocess.check_call('tail -n 1 import_profile.log', shell=True)
     print("##########  Verify license files  ##########")
     verify_license_files()
 
@@ -239,8 +255,18 @@ def run_sanity_check(examples_path="../../examples"):
     create_link_for_models()
 
     print("##########  Test quickstart example  ##########")
+    # TEMPORARY diagnostic for https://nvbugspro.nvidia.com/bug/6646201: dump
+    # every thread's stack to stderr every 60s until the process exits, so a
+    # hang inside the ~20min silent window shows up directly in the Jenkins
+    # console log without needing to SSH/kubectl into the CI node. Remove
+    # once the root cause of the silent window is found.
+    quickstart_script = f"{examples_path}/llm-api/quickstart_example.py"
     subprocess.check_call(
-        f"python3 {examples_path}/llm-api/quickstart_example.py", shell=True)
+        "python3 -c \""
+        "import faulthandler, runpy; "
+        "faulthandler.dump_traceback_later(60, repeat=True); "
+        f"runpy.run_path('{quickstart_script}', run_name='__main__')\"",
+        shell=True)
 
 
 def install_system_libs():
