@@ -29,7 +29,7 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.attention_backend import CuTeDSLAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import (
-    SolAttnAttention,
+    SolAttention,
     _parse_dense_layers,
     sol_attn_graph_phase,
 )
@@ -39,7 +39,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm.visual_gen.args import AttentionConfig, SolAttnAttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, SolAttentionConfig
 
 
 def test_cute_dsl_factory_dispatches_dense_and_sol_attn() -> None:
@@ -52,7 +52,7 @@ def test_cute_dsl_factory_dispatches_dense_and_sol_attn() -> None:
         attention_config=dense_config,
     )
 
-    sparse_config = SolAttnAttentionConfig(tau=2.0, disabled_until_timestep=0.9545)
+    sparse_config = SolAttentionConfig(tau=2.0, disabled_until_timestep=0.9545)
     sol_attn_config = AttentionConfig(backend="CUTEDSL", sparse_attention_config=sparse_config)
     sol_attn_attention = create_attention(
         backend="CUTEDSL",
@@ -63,7 +63,7 @@ def test_cute_dsl_factory_dispatches_dense_and_sol_attn() -> None:
     )
 
     assert isinstance(dense_attention, CuTeDSLAttention)
-    assert isinstance(sol_attn_attention, SolAttnAttention)
+    assert isinstance(sol_attn_attention, SolAttention)
     assert sol_attn_attention.tau == 2.0
     assert sol_attn_attention.disabled_until_timestep == 0.9545
 
@@ -83,7 +83,7 @@ def _make_config(
         eps=1e-6,
     )
     sparse_attention_config = (
-        SolAttnAttentionConfig(tau=sol_attn_tau) if sol_attn_tau is not None else None
+        SolAttentionConfig(tau=sol_attn_tau) if sol_attn_tau is not None else None
     )
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
@@ -107,7 +107,7 @@ def test_sol_attn_cross_attention_uses_dense_cutedsl():
     a backend difference masquerading as a sparsity difference in any A/B.
     """
     from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import CuTeDSLAttention
-    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import SolAttnAttention
+    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import SolAttention
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -125,7 +125,7 @@ def test_sol_attn_cross_attention_uses_dense_cutedsl():
     assert isinstance(cross_attn.attn, CuTeDSLAttention), (
         f"expected the dense CuTeDSL kernel, got {type(cross_attn.attn).__name__}"
     )
-    assert not isinstance(cross_attn.attn, SolAttnAttention), (
+    assert not isinstance(cross_attn.attn, SolAttention), (
         "cross-attention must not re-select the sparse backend"
     )
 
@@ -142,7 +142,7 @@ def test_sol_attn_with_context_parallelism_raises():
         pretrained_config=pretrained_config,
         attention=AttentionConfig(
             backend="CUTEDSL",
-            sparse_attention_config=SolAttnAttentionConfig(tau=1.0),
+            sparse_attention_config=SolAttentionConfig(tau=1.0),
         ),
         skip_create_weights_in_init=False,
     )
@@ -164,7 +164,7 @@ def test_sol_attn_with_context_parallelism_raises():
 def test_sol_attn_rejects_gqa_mqa():
     """Sol-Attn is MHA-only; num_kv_heads != num_heads must fail fast at construction."""
     with pytest.raises(AssertionError, match="MHA-only"):
-        SolAttnAttention(layer_idx=0, num_heads=8, head_dim=128, num_kv_heads=2)
+        SolAttention(layer_idx=0, num_heads=8, head_dim=128, num_kv_heads=2)
 
 
 @pytest.mark.parametrize(
@@ -227,7 +227,7 @@ def test_dense_prefix_skips_kernel(monkeypatch):
 
     monkeypatch.setattr(sol_attn_mod, "_sol_attn_run", _fail_if_called)
 
-    attn = SolAttnAttention(layer_idx=0, num_heads=2, head_dim=16)
+    attn = SolAttention(layer_idx=0, num_heads=2, head_dim=16)
     attn.disabled_until_timestep = 0.9
     q = k = v = torch.randn(1, 4, 2, 16)
     out = attn.forward(q, k, v, timestep=torch.tensor(0.95))
@@ -250,7 +250,7 @@ def test_missing_timestep_fails_open_to_sparse(monkeypatch):
 
     monkeypatch.setattr(sol_attn_mod, "_sol_attn_run", _record)
 
-    attn = SolAttnAttention(layer_idx=0, num_heads=2, head_dim=16)
+    attn = SolAttention(layer_idx=0, num_heads=2, head_dim=16)
     attn.disabled_until_timestep = 0.9
     q = k = v = torch.randn(1, 4, 2, 16)
     attn.forward(q, k, v)  # no timestep kwarg
@@ -266,7 +266,7 @@ def test_dense_layers_guard_skips_kernel(monkeypatch):
 
     monkeypatch.setattr(sol_attn_mod, "_sol_attn_run", _fail_if_called)
 
-    attn = SolAttnAttention(layer_idx=3, num_heads=2, head_dim=16)
+    attn = SolAttention(layer_idx=3, num_heads=2, head_dim=16)
     attn.dense_layers = frozenset({3})
     q = k = v = torch.randn(1, 4, 2, 16)
     out = attn.forward(q, k, v)
@@ -285,7 +285,7 @@ def _make_solattn_model(disabled_until_timestep=None, dense_layers=None):
         pretrained_config=pretrained_config,
         attention=AttentionConfig(
             backend="CUTEDSL",
-            sparse_attention_config=SolAttnAttentionConfig(
+            sparse_attention_config=SolAttentionConfig(
                 tau=2.0,
                 disabled_until_timestep=disabled_until_timestep,
                 dense_layers=dense_layers,
@@ -405,7 +405,7 @@ def test_quant_attention_config_rejected_with_sol_attn():
         AttentionConfig(
             backend="CUTEDSL",
             quant_attention_config=QuantAttentionConfig(),
-            sparse_attention_config=SolAttnAttentionConfig(tau=2.0),
+            sparse_attention_config=SolAttentionConfig(tau=2.0),
         )
 
 
@@ -413,8 +413,8 @@ def test_zero_cutoff_rejected():
     """0.0 is the natural thing to type for 'no prefix', but it would run dense
     on every step and turn Sol-Attn off entirely. Must be rejected, not silent."""
     with pytest.raises(ValueError):
-        SolAttnAttentionConfig(tau=2.0, disabled_until_timestep=0.0)
-    assert SolAttnAttentionConfig(tau=2.0).disabled_until_timestep is None
+        SolAttentionConfig(tau=2.0, disabled_until_timestep=0.0)
+    assert SolAttentionConfig(tau=2.0).disabled_until_timestep is None
 
 
 @pytest.mark.skip(
@@ -438,8 +438,8 @@ def test_kv_splits_rejects_unsupported_value():
     otherwise rejected deep inside the kernel and caught by the blanket
     except, silently degrading the entire run to dense attention."""
     with pytest.raises(ValueError):
-        SolAttnAttentionConfig(tau=2.0, kv_splits="4")
-    assert SolAttnAttentionConfig(tau=2.0).kv_splits == "auto"
+        SolAttentionConfig(tau=2.0, kv_splits="4")
+    assert SolAttentionConfig(tau=2.0).kv_splits == "auto"
 
 
 def _is_dynamo_disabled(fn) -> bool:
@@ -465,8 +465,8 @@ def test_timestep_scalar_read_is_opaque_to_dynamo():
 
     Otherwise it graph-breaks the enclosing block once per attention layer.
     """
-    assert _is_dynamo_disabled(SolAttnAttention._dense_by_step), (
-        "SolAttnAttention._dense_by_step must be decorated with @torch.compiler.disable"
+    assert _is_dynamo_disabled(SolAttention._dense_by_step), (
+        "SolAttention._dense_by_step must be decorated with @torch.compiler.disable"
     )
 
 
@@ -490,7 +490,7 @@ def test_dense_paths_use_cutedsl_backend(monkeypatch):
     q = k = v = torch.randn(1, 64, 2, 128, device=device, dtype=torch.bfloat16)
 
     def _make():
-        a = SolAttnAttention(layer_idx=0, num_heads=2, head_dim=128)
+        a = SolAttention(layer_idx=0, num_heads=2, head_dim=128)
         calls = {"n": 0}
         real = a._dense_backend.forward
 
