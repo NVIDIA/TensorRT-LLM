@@ -2634,8 +2634,10 @@ class PyTorchModelEngine(ModelEngine):
         flashinfer_autotune_context = (
             flashinfer_mxfp8_autotune() if self.cuda_graph_runner.is_warmup_only
             and flashinfer_methods else contextlib.nullcontext())
-        tune_mxfp8_backends = (self.cuda_graph_runner.is_warmup_only
-                               and self._use_mxfp8_graph_backend_selection)
+        # getattr: warmup unit tests build engines with object.__new__.
+        tune_mxfp8_backends = (
+            self.cuda_graph_runner.is_warmup_only
+            and getattr(self, "_use_mxfp8_graph_backend_selection", False))
         with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture(
                 tune_backends=tune_mxfp8_backends):
             self._capture_generation_cuda_graphs(resource_manager)
