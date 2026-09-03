@@ -18,6 +18,9 @@ from openengine.v1 import kv_pb2, lifecycle_pb2, lora_pb2, model_pb2, server_pb2
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 
+# Runs on the CPU stage: the engine is stubbed, so nothing here needs a GPU.
+pytestmark = pytest.mark.cpu_only
+
 MODEL = "test-model"
 
 

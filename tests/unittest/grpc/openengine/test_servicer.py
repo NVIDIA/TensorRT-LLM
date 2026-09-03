@@ -25,6 +25,9 @@ from tensorrt_llm.grpc.openengine.servicer import (  # noqa: E402
     sampling_params_from_request,
 )
 
+# Runs on the CPU stage: the engine is stubbed, so nothing here needs a GPU.
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeTokenizer:
     def convert_ids_to_tokens(

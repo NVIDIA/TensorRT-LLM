@@ -79,7 +79,9 @@ l0_cpu:
   - unittest/executor/test_spec_dec_perf_metrics.py
   - unittest/executor/test_stop_word_side_output_trim.py
   - unittest/executor/test_ray_stub.py
+  - unittest/grpc/openengine/test_control.py
   - unittest/grpc/openengine/test_openengine.py
+  - unittest/grpc/openengine/test_servicer.py
   - unittest/inputs
   - unittest/kv_cache_manager_v2_tests
   - unittest/llmapi/apps/test_chat_utils.py
