@@ -103,7 +103,7 @@ FLUX_FEATURE_PROFILES = (
 FLUX_STATIC_QUANT_ACCURACY_CASES = (
     FluxAccuracyCase(
         id="flux1-nvfp4-static",
-        checkpoint_subdir="FLUX.1-dev-NVFP4",
+        checkpoint_subdir="FLUX.1-dev-modelopt-NVFP4",
         golden_file="flux1_nvfp4_static_lpips_golden.png",
         features=FeatureConfigState(
             quantization="NVFP4",
@@ -113,7 +113,7 @@ FLUX_STATIC_QUANT_ACCURACY_CASES = (
     ),
     FluxAccuracyCase(
         id="flux1-nvfp4-static-mha-quantize",
-        checkpoint_subdir="FLUX.1-dev-NVFP4",
+        checkpoint_subdir="FLUX.1-dev-modelopt-NVFP4",
         golden_file="flux1_nvfp4_static_mha_quantize_lpips_golden.png",
         features=FeatureConfigState(
             quantization="NVFP4",

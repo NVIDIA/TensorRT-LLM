@@ -1,6 +1,6 @@
 {
   "image": "flux1_nvfp4_static_lpips_golden.png",
-  "model": "FLUX.1-dev-NVFP4",
+  "model": "FLUX.1-dev-modelopt-NVFP4",
   "source": "TensorRT-LLM VisualGen",
   "prompt": "a tiny astronaut hatching from an egg on the moon",
   "height": 256,
