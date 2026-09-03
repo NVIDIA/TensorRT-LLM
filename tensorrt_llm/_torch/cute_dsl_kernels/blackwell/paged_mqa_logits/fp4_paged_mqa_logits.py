@@ -584,77 +584,85 @@ class _PagedMQAEmissionMixin:
                     and pB_k == cutlass.Int32(0)
                 ):
                     pC_k = cutlass.Int32(1)
-            # ---- A: exact claim ----
-            mA_k = cute.arch.vote_ballot_sync(pA_k != cutlass.Int32(0))
-            cntA_k = cutlass.Int32(cute.arch.popc(mA_k))
-            offA_k = cutlass.Int32(cute.arch.popc(mA_k & lmk_k))
-            baseA_k = cutlass.Int32(0)
-            if meta_lane == cutlass.Int32(0) and cntA_k > cutlass.Int32(0):
-                baseA_k = _atom_global_add_s32(cur_k, cntA_k)
-            baseA_k = cute.arch.shuffle_sync(baseA_k, cutlass.Int32(0))
-            slotA_k = baseA_k + offA_k
+            # Band gates on the warp-uniform block max: a block whose max
+            # sits below a line cannot contain a hit for that band (or a
+            # spill from a tighter one), so its ballot rounds are skipped
+            # wholesale. Collectives stay at the top level of warp-uniform
+            # gates, same safety class as the enclosing t0 gate.
             spA_k = cutlass.Int32(0)
-            if pA_k != cutlass.Int32(0) and slotA_k >= cutlass.Int32(segA_k):
-                spA_k = cutlass.Int32(1)
-            if pA_k != cutlass.Int32(0) and slotA_k < cutlass.Int32(segA_k):
-                vp_k = cute.make_ptr(
-                    cutlass.Float32,
-                    vb_k + cutlass.Int64(slotA_k) * cutlass.Int64(4),
-                    cute.AddressSpace.gmem,
-                    assumed_align=4,
-                )
-                cute.make_tensor(vp_k, cute.make_layout((1,)))[0] = f32_t
-                ip_k = cute.make_ptr(
-                    cutlass.Int32,
-                    ib_k + cutlass.Int64(slotA_k) * cutlass.Int64(4),
-                    cute.AddressSpace.gmem,
-                    assumed_align=4,
-                )
-                cute.make_tensor(ip_k, cute.make_layout((1,)))[0] = kv_pos
-            # ---- B: exact claim (native + A spill) ----
-            pBe_k = cutlass.Int32(0)
-            if pB_k != cutlass.Int32(0) or spA_k != cutlass.Int32(0):
-                pBe_k = cutlass.Int32(1)
-            mB_k = cute.arch.vote_ballot_sync(pBe_k != cutlass.Int32(0))
-            cntB_k = cutlass.Int32(cute.arch.popc(mB_k))
-            offB_k = cutlass.Int32(cute.arch.popc(mB_k & lmk_k))
-            baseB_k = cutlass.Int32(0)
-            if meta_lane == cutlass.Int32(0) and cntB_k > cutlass.Int32(0):
-                baseB_k = _atom_global_add_s32(cur_k + cutlass.Int64(4), cntB_k)
-            baseB_k = cute.arch.shuffle_sync(baseB_k, cutlass.Int32(0))
-            slotB_k = baseB_k + offB_k
             spB_k = cutlass.Int32(0)
-            if pBe_k != cutlass.Int32(0) and slotB_k >= cutlass.Int32(segA_k):
-                spB_k = cutlass.Int32(1)
-            if pBe_k != cutlass.Int32(0) and slotB_k < cutlass.Int32(segA_k):
-                vp2_k = cute.make_ptr(
-                    cutlass.Float32,
-                    vb_k + cutlass.Int64(segA_k + slotB_k) * cutlass.Int64(4),
-                    cute.AddressSpace.gmem,
-                    assumed_align=4,
+            if r_bmax >= sthr[t * 3 + 1]:
+                cntA_k = cutlass.Int32(0)
+                if r_bmax >= sthr[t * 3 + 2]:
+                    # ---- A: exact claim ----
+                    mA_k = cute.arch.vote_ballot_sync(pA_k != cutlass.Int32(0))
+                    cntA_k = cutlass.Int32(cute.arch.popc(mA_k))
+                    offA_k = cutlass.Int32(cute.arch.popc(mA_k & lmk_k))
+                    baseA_k = cutlass.Int32(0)
+                    if meta_lane == cutlass.Int32(0) and cntA_k > cutlass.Int32(0):
+                        baseA_k = _atom_global_add_s32(cur_k, cntA_k)
+                    baseA_k = cute.arch.shuffle_sync(baseA_k, cutlass.Int32(0))
+                    slotA_k = baseA_k + offA_k
+                    if pA_k != cutlass.Int32(0) and slotA_k >= cutlass.Int32(segA_k):
+                        spA_k = cutlass.Int32(1)
+                    if pA_k != cutlass.Int32(0) and slotA_k < cutlass.Int32(segA_k):
+                        vp_k = cute.make_ptr(
+                            cutlass.Float32,
+                            vb_k + cutlass.Int64(slotA_k) * cutlass.Int64(4),
+                            cute.AddressSpace.gmem,
+                            assumed_align=4,
+                        )
+                        cute.make_tensor(vp_k, cute.make_layout((1,)))[0] = f32_t
+                        ip_k = cute.make_ptr(
+                            cutlass.Int32,
+                            ib_k + cutlass.Int64(slotA_k) * cutlass.Int64(4),
+                            cute.AddressSpace.gmem,
+                            assumed_align=4,
+                        )
+                        cute.make_tensor(ip_k, cute.make_layout((1,)))[0] = kv_pos
+                # ---- B: exact claim (native + A spill) ----
+                pBe_k = cutlass.Int32(0)
+                if pB_k != cutlass.Int32(0) or spA_k != cutlass.Int32(0):
+                    pBe_k = cutlass.Int32(1)
+                mB_k = cute.arch.vote_ballot_sync(pBe_k != cutlass.Int32(0))
+                cntB_k = cutlass.Int32(cute.arch.popc(mB_k))
+                offB_k = cutlass.Int32(cute.arch.popc(mB_k & lmk_k))
+                baseB_k = cutlass.Int32(0)
+                if meta_lane == cutlass.Int32(0) and cntB_k > cutlass.Int32(0):
+                    baseB_k = _atom_global_add_s32(cur_k + cutlass.Int64(4), cntB_k)
+                baseB_k = cute.arch.shuffle_sync(baseB_k, cutlass.Int32(0))
+                slotB_k = baseB_k + offB_k
+                if pBe_k != cutlass.Int32(0) and slotB_k >= cutlass.Int32(segA_k):
+                    spB_k = cutlass.Int32(1)
+                if pBe_k != cutlass.Int32(0) and slotB_k < cutlass.Int32(segA_k):
+                    vp2_k = cute.make_ptr(
+                        cutlass.Float32,
+                        vb_k + cutlass.Int64(segA_k + slotB_k) * cutlass.Int64(4),
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    )
+                    cute.make_tensor(vp2_k, cute.make_layout((1,)))[0] = f32_t
+                    ip2_k = cute.make_ptr(
+                        cutlass.Int32,
+                        ib_k + cutlass.Int64(segA_k + slotB_k) * cutlass.Int64(4),
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    )
+                    cute.make_tensor(ip2_k, cute.make_layout((1,)))[0] = kv_pos
+                # n0 += exact placements in A and B
+                plc_k = (
+                    cntA_k
+                    - cutlass.Int32(
+                        cute.arch.popc(cute.arch.vote_ballot_sync(spA_k != cutlass.Int32(0)))
+                    )
+                ) + (
+                    cntB_k
+                    - cutlass.Int32(
+                        cute.arch.popc(cute.arch.vote_ballot_sync(spB_k != cutlass.Int32(0)))
+                    )
                 )
-                cute.make_tensor(vp2_k, cute.make_layout((1,)))[0] = f32_t
-                ip2_k = cute.make_ptr(
-                    cutlass.Int32,
-                    ib_k + cutlass.Int64(segA_k + slotB_k) * cutlass.Int64(4),
-                    cute.AddressSpace.gmem,
-                    assumed_align=4,
-                )
-                cute.make_tensor(ip2_k, cute.make_layout((1,)))[0] = kv_pos
-            # n0 += exact placements in A and B
-            plc_k = (
-                cntA_k
-                - cutlass.Int32(
-                    cute.arch.popc(cute.arch.vote_ballot_sync(spA_k != cutlass.Int32(0)))
-                )
-            ) + (
-                cntB_k
-                - cutlass.Int32(
-                    cute.arch.popc(cute.arch.vote_ballot_sync(spB_k != cutlass.Int32(0)))
-                )
-            )
-            if meta_lane == cutlass.Int32(0) and plc_k > cutlass.Int32(0):
-                _atom_global_add_s32(ctl_k, plc_k)
+                if meta_lane == cutlass.Int32(0) and plc_k > cutlass.Int32(0):
+                    _atom_global_add_s32(ctl_k, plc_k)
             # ---- C: claim window (native + B spill) ----
             pCe_k = cutlass.Int32(0)
             if pC_k != cutlass.Int32(0) or spB_k != cutlass.Int32(0):
