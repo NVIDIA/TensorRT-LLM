@@ -558,8 +558,21 @@ def mergeWaiveList(pipeline, globalVars)
         globalVars[MAINTENANCE_ENTRIES] = parseMaintenanceConfig(
             maintenanceCurrent, "PR fallback").values().toList()
     } else {
-        def maintenanceDiff = getMergeRequestOneFileChanges(
-            pipeline, globalVars, MAINTENANCE_CONFIG_PATH)
+        def maintenanceDiff = ""
+        try {
+            def fetchedMaintenanceDiff = getMergeRequestOneFileChanges(
+                pipeline, globalVars, MAINTENANCE_CONFIG_PATH)
+            if (fetchedMaintenanceDiff == null) {
+                echo "WARNING: Maintenance config diff is unavailable. Using target TOT entries."
+            } else {
+                maintenanceDiff = fetchedMaintenanceDiff
+            }
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "WARNING: Failed to get maintenance config diff. " +
+                 "Using target TOT entries. Error: ${e.toString()}"
+        }
         if (!fileExists(maintenanceSource) && maintenanceDiff) {
             error "Deleting or renaming ${MAINTENANCE_CONFIG_PATH} is not allowed."
         }
