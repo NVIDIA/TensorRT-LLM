@@ -78,11 +78,12 @@ def nccl_window_graph_capture(
     **capture_kwargs: Any,
 ) -> Iterator[None]:
     with nccl_window_graph_owner(pool):
-        # PyTorch synchronizes before switching to its internal capture stream. Mirror that
-        # boundary in the window allocator so warmup leases are eligible on the side stream
-        # without changing PyTorch's capture-stream behavior.
-        torch.ops.trtllm.synchronize_nccl_window_buffer_releases()
+        device = torch.cuda.current_device()
+        release_epoch = torch.ops.trtllm.get_nccl_window_buffer_release_epoch()
         with torch.cuda.graph(graph, pool=pool, **capture_kwargs):
+            # capture_begin has synchronized PyTorch warmup work. Promote explicitly
+            # released windows before the captured body can request them.
+            torch.ops.trtllm.promote_nccl_window_buffer_releases(device, release_epoch)
             yield
 
 

@@ -41,12 +41,17 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #if ENABLE_MULTI_DEVICE
+
+#ifndef TLLM_NCCL_WINDOW_LIFECYCLE_ASSERT
+#define TLLM_NCCL_WINDOW_LIFECYCLE_ASSERT 0
+#endif
 
 // TLLM_NCCL_CHECK (throw on failure) is provided by multiDeviceUtils.h.
 
@@ -253,27 +258,27 @@ public:
     // Returns false when ptr is not a currently active registered buffer.
     bool releaseBuffer(ncclComm_t comm, void* ptr, cudaStream_t stream);
 
-    // Synchronize the current CUDA device, then make its explicitly released buffers reusable on
-    // any stream. PyTorch CUDA-graph setup uses this boundary before switching from warmup work to
-    // its internal capture stream. Destructor-released/quarantined buffers remain ineligible.
-    void synchronizeBufferReleases();
+    // Snapshot explicitly released buffers before the caller synchronizes the device, then mark
+    // only those releases reusable on any stream. PyTorch CUDA-graph setup uses its existing
+    // capture-begin synchronization between these calls. Destructor-released/quarantined buffers
+    // remain ineligible.
+    uint64_t getBufferReleaseEpoch();
+    void promoteBufferReleases(int device, uint64_t releaseEpoch);
 
     // Bind a PyTorch storage to the exact checkout that backs it. Views share StorageImpl, so
     // explicit release through any view still resolves the original lease generation.
-    void registerTensorLease(
-        ncclComm_t comm, c10::StorageImpl const* storage, void* ptr, uint64_t leaseId, int device, cudaStream_t stream);
+    void registerTensorLease(ncclComm_t comm, c10::StorageImpl const* storage, void* ptr, uint64_t leaseId, int device);
     bool releaseTensorBuffer(c10::StorageImpl const* storage, cudaStream_t stream);
     bool releaseTensorBuffer(ncclComm_t comm, c10::StorageImpl const* storage, cudaStream_t stream);
 
     // A scope adopts window-backed input storages and all window tensors created while it is
     // active. On successful exit, returned storages escape to the parent scope and every other
-    // lease is released on stream. Failed scopes quarantine their leases instead of making
-    // partially submitted work reusable. Scopes are keyed by CUDA device and stream rather than
-    // host thread so compiled launches remain in the scope that established their stream. Scopes
-    // on each stream are strictly nested. Before ending a scope, callers must order any
-    // auxiliary-stream consumers of its leases before the supplied completion stream.
-    void beginTensorLeaseScope(
-        std::vector<c10::StorageImpl const*> const& inputStorages, int device, cudaStream_t stream);
+    // lease is released on stream. Failed scopes preserve escaped inputs but quarantine every other
+    // lease instead of making partially submitted work reusable. Scopes are keyed by CUDA device and
+    // host execution thread, so allocations made while the caller temporarily selects an auxiliary
+    // stream still join the active compiled scope. Before ending a scope, callers must order
+    // auxiliary-stream consumers before the supplied completion stream.
+    void beginTensorLeaseScope(std::vector<c10::StorageImpl const*> const& inputStorages, int device);
     void endTensorLeaseScope(
         std::vector<c10::StorageImpl const*> const& outputStorages, int device, cudaStream_t stream, bool failed);
 
@@ -333,11 +338,9 @@ private:
 
     using CudaGetLastErrorFunc = cudaError_t (*)();
 
-    // Drain the sticky CUDA error when capture state cannot be queried because another thread owns
-    // a global capture. TRT-LLM serializes production captures that can request NCCL windows, so
-    // this is a defensive path for unsupported overlapping external/unwrapped captures. Returns
-    // true when the caller must use an unregistered buffer.
-    static bool clearCudaErrorIfCaptureStateUnknown(
+    // Drain a sticky CUDA error when capture state cannot be queried. Registration is unsafe when
+    // the capture state is unknown, so the caller must use an unregistered buffer.
+    static bool clearCudaErrorIfCaptureQueryFailed(
         cudaError_t captureError, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
 
     // Drain the sticky CUDA error left by a failed symmetric allocation.
@@ -367,6 +370,7 @@ private:
         // by its destructor fallback and is quarantined.
         bool reusableOnAnyStream{false};
         std::optional<cudaStream_t> reusableStream;
+        uint64_t releaseEpoch{0};
     };
 
     struct TensorLeaseScope;
@@ -386,14 +390,16 @@ private:
         std::vector<TensorLease> detachedLeases;
     };
 
-    using TensorLeaseScopeKey = std::pair<int, uintptr_t>;
-    static TensorLeaseScopeKey getTensorLeaseScopeKey(int device, cudaStream_t stream);
+    using TensorLeaseScopeKey = std::pair<int, std::thread::id>;
+    static TensorLeaseScopeKey getTensorLeaseScopeKey(int device);
 
     bool releaseTensorLeaseLocked(TensorLease const& tensorLease, cudaStream_t stream);
     bool releaseTensorBufferLocked(c10::StorageImpl const* storage, cudaStream_t stream, ncclComm_t expectedComm);
     void quarantineTensorLeaseLocked(TensorLease const& tensorLease);
+    void assertLifecycleWarning() const noexcept;
 
     mutable std::mutex mMutex;
+    std::atomic_bool mSuppressLifecycleWarningAssertionsForTest{false};
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
     std::unordered_set<ncclComm_t> mRegisteredComms;
     // Smallest request size that is known to fail collectively for each communicator.
@@ -404,7 +410,8 @@ private:
     std::unordered_map<ncclComm_t, uint8_t> mLoggedFallbackWarnings;
     std::unordered_map<c10::StorageImpl const*, TensorLease> mTensorLeases;
     uint64_t mNextLeaseId{1};
-    // Deque keeps scope addresses stable while scopes are pushed onto the per-stream stack.
+    uint64_t mNextReleaseEpoch{1};
+    // Deque keeps scope addresses stable while scopes are pushed onto the per-thread stack.
     std::map<TensorLeaseScopeKey, std::deque<TensorLeaseScope>> mTensorLeaseScopeStacks;
 };
 
@@ -426,7 +433,7 @@ public:
     {
         if (mBuffer.isValid())
         {
-            NCCLWindowAllocator::getInstance().releaseBufferFromDestructor(*mComm, mBuffer.ptr, mBuffer.leaseId);
+            NCCLWindowAllocator::getInstance().releaseBuffer(*mComm, mBuffer.ptr);
         }
     }
 
@@ -510,9 +517,7 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     // Create tensor from the buffer
     auto tensor = torch::from_blob(buffer.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(torch::kCUDA));
     auto const device = tensor.get_device();
-    auto const stream = at::cuda::getCurrentCUDAStream(device);
-    allocator.registerTensorLease(
-        *comm, tensor.storage().unsafeGetStorageImpl(), buffer.ptr, buffer.leaseId, device, stream);
+    allocator.registerTensorLease(*comm, tensor.storage().unsafeGetStorageImpl(), buffer.ptr, buffer.leaseId, device);
 
     return std::make_pair(tensor, buffer);
 }

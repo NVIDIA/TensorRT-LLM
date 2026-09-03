@@ -27,6 +27,7 @@
 #include <mutex>
 #include <nccl.h>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #if ENABLE_MULTI_DEVICE && BUILD_PYT
@@ -58,10 +59,10 @@ public:
         return NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(localAllocOk, getLastError);
     }
 
-    static bool clearCudaErrorIfCaptureStateUnknown(
+    static bool clearCudaErrorIfCaptureQueryFailed(
         cudaError_t captureError, NCCLWindowAllocator::CudaGetLastErrorFunc getLastError = cudaGetLastError)
     {
-        return NCCLWindowAllocator::clearCudaErrorIfCaptureStateUnknown(captureError, getLastError);
+        return NCCLWindowAllocator::clearCudaErrorIfCaptureQueryFailed(captureError, getLastError);
     }
 
     static bool markCaptureStateUnknownWarning(NCCLWindowAllocator& allocator, ncclComm_t comm)
@@ -98,6 +99,16 @@ public:
         allocator.mLoggedFallbackWarnings.erase(comm);
     }
 
+    static void suppressLifecycleWarningAssertions(NCCLWindowAllocator& allocator, bool suppress)
+    {
+        allocator.mSuppressLifecycleWarningAssertionsForTest.store(suppress, std::memory_order_relaxed);
+    }
+
+    static void assertLifecycleWarning(NCCLWindowAllocator& allocator)
+    {
+        allocator.assertLifecycleWarning();
+    }
+
     static bool isQuarantined(NCCLWindowAllocator& allocator, ncclComm_t comm, void* ptr)
     {
         std::lock_guard<std::mutex> lock(allocator.mMutex);
@@ -124,6 +135,19 @@ public:
         }
         return false;
     }
+
+    static bool isReusableOnAnyStream(NCCLWindowAllocator& allocator, ncclComm_t comm, void* ptr)
+    {
+        std::lock_guard<std::mutex> lock(allocator.mMutex);
+        for (auto const& entry : allocator.mBufferPool[comm])
+        {
+            if (entry.buffer.ptr == ptr)
+            {
+                return !entry.inUse && entry.reusableOnAnyStream;
+            }
+        }
+        return false;
+    }
 };
 } // namespace tensorrt_llm::common::nccl_util
 
@@ -137,7 +161,33 @@ cudaError_t fakeCudaGetLastError()
     return cudaErrorLaunchFailure;
 }
 
+class ExpectedLifecycleWarning
+{
+public:
+    explicit ExpectedLifecycleWarning(nccl_util::NCCLWindowAllocator& allocator)
+        : mAllocator(allocator)
+    {
+        nccl_util::NCCLWindowAllocatorTestAccess::suppressLifecycleWarningAssertions(mAllocator, true);
+    }
+
+    ~ExpectedLifecycleWarning()
+    {
+        nccl_util::NCCLWindowAllocatorTestAccess::suppressLifecycleWarningAssertions(mAllocator, false);
+    }
+
+private:
+    nccl_util::NCCLWindowAllocator& mAllocator;
+};
+
 } // namespace
+
+#if TLLM_NCCL_WINDOW_LIFECYCLE_ASSERT
+TEST(NCCLWindowLifecycleAssertionTest, UnexpectedWarningIsFatal)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    ASSERT_DEATH(nccl_util::NCCLWindowAllocatorTestAccess::assertLifecycleWarning(allocator), "");
+}
+#endif
 
 TEST(NCCLWindowAllocatorWarningTest, FallbackWarningsAreLatchedIndependentlyPerCommunicator)
 {
@@ -438,9 +488,22 @@ TEST_F(NCCLWindowAllocatorTest, BufferReuse)
     allocator.releaseBuffer(*mComm, buffer2.ptr);
 }
 
+TEST_F(NCCLWindowAllocatorTest, EagerRequestInsideGraphOwnerScopeUsesUnownedBuffer)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+
+    allocator.setGraphPoolOwner(404);
+    auto buffer = allocator.requestBuffer(*mComm, 128 * 1024);
+    allocator.setGraphPoolOwner(-1);
+
+    ASSERT_TRUE(buffer.isValid());
+    allocator.releaseBuffer(*mComm, buffer.ptr);
+}
+
 TEST_F(NCCLWindowAllocatorTest, CaptureWithoutOwnerUsesUnregisteredFallback)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    ExpectedLifecycleWarning const expectedWarning{allocator};
     auto const captureStream = at::cuda::getStreamFromPool();
     c10::cuda::CUDAStreamGuard const streamGuard{captureStream};
     auto const stream = captureStream.stream();
@@ -510,7 +573,10 @@ TEST_F(NCCLWindowAllocatorTest, GraphPoolsReserveAndReuseBuffers)
     allocator.releaseBuffer(*mComm, thirdEagerBuffer.ptr);
 
     void* const deferredPtr = captureRequest(303, false);
-    allocator.releaseGraphPoolOwner(303);
+    {
+        ExpectedLifecycleWarning const expectedWarning{allocator};
+        allocator.releaseGraphPoolOwner(303);
+    }
     allocator.releaseBuffer(*mComm, deferredPtr);
     auto deferredReclaimedBuffer = allocator.requestBuffer(*mComm, bufferSize);
     EXPECT_EQ(deferredReclaimedBuffer.ptr, deferredPtr);
@@ -625,21 +691,21 @@ TEST_F(NCCLWindowAllocatorTest, ClearsCudaErrorAfterLocalAllocationFailure)
     EXPECT_EQ(gCudaGetLastErrorCallCount, 1);
 }
 
-TEST_F(NCCLWindowAllocatorTest, CaptureStateUnknownUsesFallbackAndClearsCudaError)
+TEST_F(NCCLWindowAllocatorTest, CaptureQueryFailureUsesFallbackAndClearsCudaError)
 {
-    auto const clearCudaErrorIfUnknown = [](cudaError_t captureError)
+    auto const clearCudaErrorIfFailed = [](cudaError_t captureError)
     {
-        return nccl_util::NCCLWindowAllocatorTestAccess::clearCudaErrorIfCaptureStateUnknown(
+        return nccl_util::NCCLWindowAllocatorTestAccess::clearCudaErrorIfCaptureQueryFailed(
             captureError, fakeCudaGetLastError);
     };
 
     gCudaGetLastErrorCallCount = 0;
-    EXPECT_TRUE(clearCudaErrorIfUnknown(cudaErrorStreamCaptureImplicit));
+    EXPECT_TRUE(clearCudaErrorIfFailed(cudaErrorStreamCaptureImplicit));
     EXPECT_EQ(gCudaGetLastErrorCallCount, 1);
 
-    EXPECT_FALSE(clearCudaErrorIfUnknown(cudaSuccess));
-    EXPECT_FALSE(clearCudaErrorIfUnknown(cudaErrorInvalidValue));
-    EXPECT_EQ(gCudaGetLastErrorCallCount, 1);
+    EXPECT_FALSE(clearCudaErrorIfFailed(cudaSuccess));
+    EXPECT_TRUE(clearCudaErrorIfFailed(cudaErrorInvalidValue));
+    EXPECT_EQ(gCudaGetLastErrorCallCount, 2);
 }
 
 TEST_F(NCCLWindowAllocatorTest, MultipleBuffers)
@@ -913,6 +979,13 @@ protected:
         mComm.reset();
     }
 
+    void releaseTensor(torch::Tensor const& tensor)
+    {
+        auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+        ASSERT_TRUE(allocator.releaseTensorBuffer(
+            *mComm, tensor.storage().unsafeGetStorageImpl(), at::cuda::getCurrentCUDAStream()));
+    }
+
     int mWorldSize;
     int mRank;
     std::shared_ptr<ncclComm_t> mComm;
@@ -948,6 +1021,7 @@ TEST_F(CreateNCCLWindowTensorTest, BasicTensorCreation)
     // Tensor should be in use
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
     EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
+    releaseTensor(tensor);
 }
 
 TEST_F(CreateNCCLWindowTensorTest, DifferentDtypes)
@@ -963,6 +1037,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentDtypes)
         // ncclMemAlloc may allocate more than requested, so check at least the requested size
         EXPECT_GE(buffer.size, 10 * sizeof(float));
         EXPECT_EQ(tensor.data_ptr(), buffer.ptr);
+        releaseTensor(tensor);
     }
 
     // Test float16
@@ -972,6 +1047,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentDtypes)
         // ncclMemAlloc may allocate more than requested, so check at least the requested size
         EXPECT_GE(buffer.size, 10 * sizeof(at::Half));
         EXPECT_EQ(tensor.data_ptr(), buffer.ptr);
+        releaseTensor(tensor);
     }
 
     // Test int32
@@ -981,6 +1057,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentDtypes)
         // ncclMemAlloc may allocate more than requested, so check at least the requested size
         EXPECT_GE(buffer.size, 10 * sizeof(int32_t));
         EXPECT_EQ(tensor.data_ptr(), buffer.ptr);
+        releaseTensor(tensor);
     }
 }
 
@@ -996,6 +1073,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentShapes)
         EXPECT_EQ(tensor.size(0), 100);
         // ncclMemAlloc may allocate more than requested, so check at least the requested size
         EXPECT_GE(buffer.size, 100 * sizeof(float));
+        releaseTensor(tensor);
     }
 
     // 3D tensor
@@ -1008,6 +1086,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentShapes)
         EXPECT_EQ(tensor.size(2), 4);
         // ncclMemAlloc may allocate more than requested, so check at least the requested size
         EXPECT_GE(buffer.size, 2 * 3 * 4 * sizeof(float));
+        releaseTensor(tensor);
     }
 
     // 4D tensor
@@ -1018,6 +1097,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentShapes)
         EXPECT_EQ(tensor.numel(), 1 * 2 * 3 * 4);
         // ncclMemAlloc may allocate more than requested, so check at least the requested size
         EXPECT_GE(buffer.size, 1 * 2 * 3 * 4 * sizeof(float));
+        releaseTensor(tensor);
     }
 }
 
@@ -1026,7 +1106,9 @@ TEST_F(CreateNCCLWindowTensorTest, TensorDeleterQuarantinesBuffer)
     using nccl_util::createNCCLWindowTensor;
 
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    ExpectedLifecycleWarning const expectedWarning{allocator};
     void* bufferPtr = nullptr;
+    int device = -1;
 
     {
         std::vector<int64_t> shape = {16, 16};
@@ -1035,6 +1117,7 @@ TEST_F(CreateNCCLWindowTensorTest, TensorDeleterQuarantinesBuffer)
         EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
         EXPECT_TRUE(buffer.isValid());
         bufferPtr = buffer.ptr;
+        device = tensor.get_device();
 
         // Tensor goes out of scope - the fallback deleter makes it inactive but not reusable.
     }
@@ -1044,8 +1127,8 @@ TEST_F(CreateNCCLWindowTensorTest, TensorDeleterQuarantinesBuffer)
 
     // The quarantined buffer remains registered until communicator teardown.
     EXPECT_GE(allocator.getBufferCount(*mComm), 1);
-    allocator.synchronizeBufferReleases();
-    // Device synchronization must not make destructor-released storage reusable.
+    allocator.promoteBufferReleases(device, allocator.getBufferReleaseEpoch());
+    // Promotion must not make destructor-released storage reusable.
     EXPECT_TRUE(nccl_util::NCCLWindowAllocatorTestAccess::isQuarantined(allocator, *mComm, bufferPtr));
 }
 
@@ -1077,7 +1160,9 @@ TEST_F(CreateNCCLWindowTensorTest, SynchronizedReleaseCanBeReusedOnDifferentStre
     ASSERT_TRUE(buffer.isValid());
     ASSERT_TRUE(allocator.releaseTensorBuffer(*mComm, tensor.storage().unsafeGetStorageImpl(), warmupStream));
 
-    allocator.synchronizeBufferReleases();
+    auto const releaseEpoch = allocator.getBufferReleaseEpoch();
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    allocator.promoteBufferReleases(tensor.get_device(), releaseEpoch);
 
     auto const captureStream = at::cuda::getStreamFromPool();
     c10::cuda::CUDAStreamGuard const streamGuard{captureStream};
@@ -1085,6 +1170,29 @@ TEST_F(CreateNCCLWindowTensorTest, SynchronizedReleaseCanBeReusedOnDifferentStre
     ASSERT_TRUE(reused.isValid());
     EXPECT_EQ(reused.ptr, buffer.ptr);
     EXPECT_TRUE(allocator.releaseBuffer(*mComm, reused.ptr, captureStream));
+}
+
+TEST_F(CreateNCCLWindowTensorTest, PromotionExcludesReleasesAfterSnapshot)
+{
+    using nccl_util::createNCCLWindowTensor;
+
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    int const device = at::cuda::current_device();
+    cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
+    std::vector<int64_t> shape = {16, 16};
+    auto [first, firstBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    auto [second, secondBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    ASSERT_TRUE(firstBuffer.isValid());
+    ASSERT_TRUE(secondBuffer.isValid());
+
+    ASSERT_TRUE(allocator.releaseTensorBuffer(first.storage().unsafeGetStorageImpl(), stream));
+    auto const releaseEpoch = allocator.getBufferReleaseEpoch();
+    ASSERT_TRUE(allocator.releaseTensorBuffer(second.storage().unsafeGetStorageImpl(), stream));
+    allocator.promoteBufferReleases(device, releaseEpoch);
+
+    EXPECT_TRUE(nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnAnyStream(allocator, *mComm, firstBuffer.ptr));
+    EXPECT_TRUE(
+        nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, secondBuffer.ptr, stream));
 }
 
 TEST_F(CreateNCCLWindowTensorTest, TensorLeaseScopeReleasesTemporariesAndEscapesOutputs)
@@ -1098,7 +1206,7 @@ TEST_F(CreateNCCLWindowTensorTest, TensorLeaseScopeReleasesTemporariesAndEscapes
     auto [input, inputBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
     ASSERT_TRUE(inputBuffer.isValid());
 
-    allocator.beginTensorLeaseScope({input.storage().unsafeGetStorageImpl()}, device, stream);
+    allocator.beginTensorLeaseScope({input.storage().unsafeGetStorageImpl()}, device);
     EXPECT_TRUE(allocator.releaseTensorBuffer(input.storage().unsafeGetStorageImpl(), stream));
     nccl_util::NCCLWindowBuffer temporaryBuffer;
     {
@@ -1121,6 +1229,33 @@ TEST_F(CreateNCCLWindowTensorTest, TensorLeaseScopeReleasesTemporariesAndEscapes
     EXPECT_TRUE(allocator.releaseTensorBuffer(output.storage().unsafeGetStorageImpl(), stream));
 }
 
+TEST_F(CreateNCCLWindowTensorTest, AuxiliaryStreamTensorJoinsCurrentThreadScope)
+{
+    using nccl_util::createNCCLWindowTensor;
+
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    int const device = at::cuda::current_device();
+    cudaStream_t const completionStream = at::cuda::getCurrentCUDAStream();
+    auto const auxiliaryStream = at::cuda::getStreamFromPool();
+    std::vector<int64_t> shape = {16, 16};
+
+    allocator.beginTensorLeaseScope({}, device);
+    torch::Tensor tensor;
+    nccl_util::NCCLWindowBuffer buffer;
+    {
+        c10::cuda::CUDAStreamGuard const streamGuard{auxiliaryStream};
+        std::tie(tensor, buffer) = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    }
+    ASSERT_TRUE(buffer.isValid());
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
+
+    allocator.endTensorLeaseScope({}, device, completionStream, false);
+
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 0);
+    EXPECT_TRUE(
+        nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, buffer.ptr, completionStream));
+}
+
 TEST_F(CreateNCCLWindowTensorTest, AsymmetricTensorDestructionKeepsPoolSelectionRankSymmetric)
 {
     using nccl_util::createNCCLWindowTensor;
@@ -1139,7 +1274,7 @@ TEST_F(CreateNCCLWindowTensorTest, AsymmetricTensorDestructionKeepsPoolSelection
     EXPECT_TRUE(allocator.releaseBuffer(*mComm, bufferA.ptr, stream));
     EXPECT_TRUE(allocator.releaseBuffer(*mComm, bufferB.ptr, stream));
 
-    allocator.beginTensorLeaseScope({}, device, stream);
+    allocator.beginTensorLeaseScope({}, device);
     auto [first, firstBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
     ASSERT_TRUE(firstBuffer.isValid());
     EXPECT_EQ(firstBuffer.ptr, bufferA.ptr);
@@ -1184,11 +1319,11 @@ TEST_F(CreateNCCLWindowTensorTest, NestedTensorLeaseScopesTransferEscapedOutputs
     cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
     std::vector<int64_t> shape = {16, 16};
 
-    allocator.beginTensorLeaseScope({}, device, stream);
+    allocator.beginTensorLeaseScope({}, device);
     auto [outerInput, outerInputBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
     ASSERT_TRUE(outerInputBuffer.isValid());
 
-    allocator.beginTensorLeaseScope({outerInput.storage().unsafeGetStorageImpl()}, device, stream);
+    allocator.beginTensorLeaseScope({outerInput.storage().unsafeGetStorageImpl()}, device);
     auto [innerOutput, innerOutputBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
     ASSERT_TRUE(innerOutputBuffer.isValid());
     allocator.endTensorLeaseScope({innerOutput.storage().unsafeGetStorageImpl()}, device, stream, false);
@@ -1209,13 +1344,32 @@ TEST_F(CreateNCCLWindowTensorTest, FailedTensorLeaseScopeQuarantinesBuffers)
     cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
     std::vector<int64_t> shape = {16, 16};
 
-    allocator.beginTensorLeaseScope({}, device, stream);
+    allocator.beginTensorLeaseScope({}, device);
     auto [tensor, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
     ASSERT_TRUE(buffer.isValid());
     allocator.endTensorLeaseScope({}, device, stream, true);
 
     EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 0);
     EXPECT_TRUE(nccl_util::NCCLWindowAllocatorTestAccess::isQuarantined(allocator, *mComm, buffer.ptr));
+}
+
+TEST_F(CreateNCCLWindowTensorTest, FailedTensorLeaseScopePreservesEscapedInputs)
+{
+    using nccl_util::createNCCLWindowTensor;
+
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    int const device = at::cuda::current_device();
+    cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
+    std::vector<int64_t> shape = {16, 16};
+    auto [input, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    ASSERT_TRUE(buffer.isValid());
+
+    auto* storage = input.storage().unsafeGetStorageImpl();
+    allocator.beginTensorLeaseScope({storage}, device);
+    allocator.endTensorLeaseScope({storage}, device, stream, true);
+
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
+    EXPECT_TRUE(allocator.releaseTensorBuffer(storage, stream));
 }
 
 TEST_F(CreateNCCLWindowTensorTest, MultipleTensors)
@@ -1238,6 +1392,10 @@ TEST_F(CreateNCCLWindowTensorTest, MultipleTensors)
     EXPECT_TRUE(tensor1.defined());
     EXPECT_TRUE(tensor2.defined());
     EXPECT_TRUE(tensor3.defined());
+
+    releaseTensor(tensor1);
+    releaseTensor(tensor2);
+    releaseTensor(tensor3);
 }
 
 TEST_F(CreateNCCLWindowTensorTest, TensorStrides)
@@ -1251,6 +1409,7 @@ TEST_F(CreateNCCLWindowTensorTest, TensorStrides)
     EXPECT_EQ(tensor.stride(0), 4 * 5); // stride for first dimension
     EXPECT_EQ(tensor.stride(1), 5);     // stride for second dimension
     EXPECT_EQ(tensor.stride(2), 1);     // stride for third dimension
+    releaseTensor(tensor);
 }
 
 #endif // ENABLE_MULTI_DEVICE && BUILD_PYT
