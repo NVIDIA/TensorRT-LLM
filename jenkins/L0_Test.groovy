@@ -6845,7 +6845,22 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.12.0+cu130 torchvision==0.27.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                         }
 
-                        def libEnv = []
+                        // A stock image, so nothing here went through docker/Dockerfile.multi
+                        // or install_base.sh: both things that let a singleton MPI_Comm_spawn
+                        // work under Open MPI 5 have to be redone by hand, or the quickstart
+                        // that checkPipInstall runs hangs in MpiPoolSession until the timeout.
+                        // The script is idempotent.
+                        sh "bash ${LLM_ROOT}/jenkins/scripts/mpi_pod_hostname_fix.sh"
+
+                        // PRRTE refuses to start as root unless told otherwise, and the
+                        // singleton spawn forks a prte DVM. Open MPI 4 only checked this in
+                        // mpirun.
+                        def libEnv = [
+                            "OMPI_ALLOW_RUN_AS_ROOT=1",
+                            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                            "PRTE_ALLOW_RUN_AS_ROOT=1",
+                            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                        ]
                         if (env.alternativeTRT) {
                             stage("Replace TensorRT") {
                                 trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
