@@ -654,7 +654,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 template <int kNumThreadsPerBlock, bool useRadixSort, bool multipleBlocksPerRow = false, bool mergeBlocks = false,
     typename InputT = float>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(InputT const* logits, int const* seqLens,
-    int* outIndices, int stride0, int stride1, int const topK, int next_n, int compressRatio,
+    int* outIndices, int stride0, int stride1, int numColumns, int const topK, int next_n, int compressRatio,
     float* outLogits = nullptr, int const numBlocksToMerge = 0, int const* indices = nullptr,
     int const* rowKvLens = nullptr)
 {
@@ -666,6 +666,13 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
 
     // The range of logits within the row.
     int rowStart = 0;
+    int rowEnd = 0;
+    // The merge kernel consumes only the bounded partial Top-K workspace. It
+    // must not reinterpret the original request-indexed sequence metadata.
+    if constexpr (mergeBlocks)
+    {
+        rowEnd = numBlocksToMerge * topK;
+    }
     // Two ways to learn how far back this query row may attend.
     //
     // Uniform (rowKvLens == nullptr): every request contributes exactly next_n
@@ -677,17 +684,25 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
     // rows, so neither rowIdx / next_n nor rowIdx % next_n means anything. The
     // caller precomputes the extent per row -- it is the only quantity this
     // kernel ever derived from next_n, which is why one array is enough.
-    int actual_kv_len;
-    if (rowKvLens != nullptr)
+    else if (rowKvLens != nullptr)
     {
-        actual_kv_len = rowKvLens[rowIdx];
+        int const actualKvLen = rowKvLens[rowIdx];
+        int const compressedKvLen = actualKvLen / compressRatio;
+        // rowKvLens is device-produced and may change between graph replays,
+        // so a host-side value check would synchronize the hot path and bake
+        // stale values into capture. Validate at the point of use instead. An
+        // invalid extent becomes an empty row: topKPerRowJob writes -1 (and
+        // -FLT_MAX for split-work scratch), preventing an out-of-bounds read
+        // while failing closed under eager execution and graph replay.
+        bool const validExtent = actualKvLen >= 0 && compressedKvLen <= numColumns;
+        rowEnd = validExtent ? compressedKvLen : 0;
     }
     else
     {
         int seq_len = seqLens[rowIdx / next_n];
-        actual_kv_len = seq_len - next_n + (rowIdx % next_n) + 1;
+        int actual_kv_len = seq_len - next_n + (rowIdx % next_n) + 1;
+        rowEnd = actual_kv_len / compressRatio;
     }
-    int rowEnd = actual_kv_len / compressRatio;
 
     // Local pointers to this block
     if constexpr (!multipleBlocksPerRow && !mergeBlocks)
@@ -704,7 +719,6 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
     }
     else if constexpr (mergeBlocks)
     {
-        rowEnd = numBlocksToMerge * topK;
         indices += static_cast<int64_t>(rowIdx) * numBlocksToMerge * topK;
         outIndices += static_cast<int64_t>(rowIdx) * topK;
     }
@@ -1046,8 +1060,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
-            compressRatio, nullptr, 0, nullptr, rowKvLens);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, numColumns, topK,
+            next_n, compressRatio, nullptr, 0, nullptr, rowKvLens);
     }
     else
     {
@@ -1062,8 +1076,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config_part1.numAttrs = 1;
         config_part1.attrs = attrs;
 
-        cudaLaunchKernelEx(&config_part1, kernel_instance_part1, logits, seqLens, outIndicesAux, stride0, stride1, topK,
-            next_n, compressRatio, outLogitsAux, 0, nullptr, rowKvLens);
+        cudaLaunchKernelEx(&config_part1, kernel_instance_part1, logits, seqLens, outIndicesAux, stride0, stride1,
+            numColumns, topK, next_n, compressRatio, outLogitsAux, 0, nullptr, rowKvLens);
 
         constexpr int kNumThreadsPerBlockMerge = 1024;
         auto* kernel_instance_part2 = &topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>;
@@ -1075,12 +1089,10 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config_part2.numAttrs = 1;
         config_part2.attrs = attrs;
 
-        // The merge pass overrides rowEnd with numBlocksToMerge * topK, so the
-        // extent is unused -- but rowKvLens still has to be forwarded, because
-        // otherwise the uniform branch would index seqLens by rowIdx / next_n,
-        // and on a ragged batch next_n is not a divisor of the row count.
+        // The merge specialization ignores request metadata and reads only the
+        // bounded partial Top-K workspace.
         cudaLaunchKernelEx(&config_part2, kernel_instance_part2, outLogitsAux, seqLens, indices, blocksPerRow * topK, 1,
-            topK, next_n, 1, nullptr, blocksPerRow, outIndicesAux, rowKvLens);
+            blocksPerRow * topK, topK, next_n, 1, nullptr, blocksPerRow, outIndicesAux, nullptr);
     }
     sync_check_cuda_error(stream);
 }
@@ -1164,8 +1176,8 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
-            compressRatio, nullptr, 0, nullptr, rowKvLens);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, numColumns, topK,
+            next_n, compressRatio, nullptr, 0, nullptr, rowKvLens);
     }
     else if (numColumns < effectiveSplitWorkThreshold)
     {
@@ -1184,8 +1196,8 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
-            compressRatio, nullptr, 0, nullptr, rowKvLens);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, numColumns, topK,
+            next_n, compressRatio, nullptr, 0, nullptr, rowKvLens);
     }
     else
     {
