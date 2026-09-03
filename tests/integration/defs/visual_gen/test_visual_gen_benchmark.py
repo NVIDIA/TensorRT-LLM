@@ -204,6 +204,23 @@ def test_online_benchmark(
 ):
     """Run benchmark_visual_gen.py and validate output and saved results."""
     result_dir = str(tmp_path / "results")
+    width, _, height = _SMALL_GEN_PARAMS["size"].partition("x")
+    requests_path = tmp_path / "requests.yaml"
+    requests_path.write_text(
+        yaml.safe_dump(
+            {
+                "common_params": {
+                    "width": int(width),
+                    "height": int(height),
+                    "num_frames": int(_SMALL_GEN_PARAMS["num_frames"]),
+                    "frame_rate": float(_SMALL_GEN_PARAMS["fps"]),
+                    "num_inference_steps": int(_SMALL_GEN_PARAMS["num_inference_steps"]),
+                    "seed": int(_SMALL_GEN_PARAMS["seed"]),
+                },
+                "requests": [{"prompt": "A bird flying over the ocean"}],
+            }
+        )
+    )
     cmd = [
         sys.executable,
         benchmark_script,
@@ -215,20 +232,8 @@ def test_online_benchmark(
         server.host,
         "--port",
         str(server.port),
-        "--prompt",
-        "A bird flying over the ocean",
-        "--num-prompts",
-        "1",
-        "--size",
-        _SMALL_GEN_PARAMS["size"],
-        "--num-frames",
-        _SMALL_GEN_PARAMS["num_frames"],
-        "--fps",
-        _SMALL_GEN_PARAMS["fps"],
-        "--num-inference-steps",
-        _SMALL_GEN_PARAMS["num_inference_steps"],
-        "--seed",
-        _SMALL_GEN_PARAMS["seed"],
+        "--workload",
+        str(requests_path),
         "--max-concurrency",
         "1",
         "--save-result",
@@ -255,8 +260,7 @@ def test_online_benchmark(
         data = json.load(f)
     assert "completed" in data
     assert data["completed"] >= 1
-    assert "mean_latency" in data
-    assert "mean_generation" in data
+    assert data["e2e_latency"]["mean"] > 0
 
 
 # ===========================================================================
@@ -320,5 +324,4 @@ def test_offline_benchmark(tmp_path):
         data = json.load(f)
     assert "completed" in data
     assert data["completed"] >= 1
-    assert "mean_latency" in data
-    assert "mean_generation" in data
+    assert data["mean_latency"] > 0

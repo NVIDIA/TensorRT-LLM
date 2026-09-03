@@ -64,17 +64,19 @@ MATCH_KEYS = [
     "l_max_concurrency",
 ]
 
+# The generation metrics read the Server-Timing "generation" header, not the
+# client-side gen_latency, so the gate keeps measuring engine wall clock rather
+# than network plus polling granularity. That series lives under --save-detailed.
 RESULT_METRIC_PATHS = {
     "d_request_throughput": "request_throughput",
-    "d_per_gpu_throughput": "per_gpu_throughput",
-    "d_mean_latency": "mean_latency",
-    "d_median_latency": "median_latency",
-    "d_p90_latency": "percentiles_latency.p90",
-    "d_p99_latency": "percentiles_latency.p99",
-    "d_mean_generation": "mean_generation",
-    "d_median_generation": "median_generation",
-    "d_p90_generation": "percentiles_generation.p90",
-    "d_p99_generation": "percentiles_generation.p99",
+    "d_mean_latency": "e2e_latency.mean",
+    "d_median_latency": "e2e_latency.median",
+    "d_p90_latency": "e2e_latency.percentiles.p90",
+    "d_p99_latency": "e2e_latency.percentiles.p99",
+    "d_mean_generation": "timings.server_gen.mean",
+    "d_median_generation": "timings.server_gen.median",
+    "d_p90_generation": "timings.server_gen.percentiles.p90",
+    "d_p99_generation": "timings.server_gen.percentiles.p99",
 }
 
 
@@ -157,13 +159,6 @@ def build_visual_gen_db_entry(
 ) -> dict[str, Any]:
     """Build one OpenSearch document from VisualGen config and result JSON."""
     expected_num_gpus = get_visual_gen_num_gpus_from_server_config(server_config)
-    result_num_gpus = int(result_data.get("num_gpus", expected_num_gpus))
-    if result_num_gpus != expected_num_gpus:
-        raise ValueError(
-            "Benchmark result GPU count mismatch: "
-            f"result={result_num_gpus}, expected={expected_num_gpus}"
-        )
-
     client_name = str(client_config.get("name", "default"))
     entry = {
         "s_runtime": "visual_gen",
@@ -201,4 +196,6 @@ def build_visual_gen_db_entry(
         "s_test_case_name": f"{server_name}-{client_name}",
     }
     entry.update(extract_visual_gen_metrics(result_data))
+    # The client no longer knows the topology, so per-GPU throughput is derived here.
+    entry["d_per_gpu_throughput"] = entry["d_request_throughput"] / expected_num_gpus
     return entry
