@@ -93,7 +93,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             max_blocks_per_row,
             stream,
         )
-        # Live per-row route counts occupy the first words of run scratch.
+        # Per-run row-route counts occupy the first words of run scratch.
         row_route_counts = route_workspace.iterator
         route_metadata = route_workspace.iterator + Int32(
             prepare_routes.route_metadata_base_word_offset

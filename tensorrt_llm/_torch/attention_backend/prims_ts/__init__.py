@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Experimental task-scheduled attention entry points."""
+"""Task-scheduled attention entry points."""
 
 from .block_sparse import (
     BlockSparsePagedTSWrapper,

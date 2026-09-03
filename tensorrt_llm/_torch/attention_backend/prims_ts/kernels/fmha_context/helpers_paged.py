@@ -51,6 +51,24 @@ def _runtime_last_valid_page_idx(cfg: FmhaConfig, seq_len_kv: Int32) -> Int32:
 
 
 @cute.jit
+def _load_paged_request_bounds(
+    paged_kv_indptr: cute.Pointer,
+    cfg: FmhaConfig,
+    seq_len_kv: Int32,
+    batch_coord: Int32,
+) -> tuple[Int32, Int32]:
+    """Load one CSR row base and its runtime-valid inclusive page bound."""
+    request_begin = Int32(paged_kv_indptr[batch_coord])
+    request_end = Int32(paged_kv_indptr[batch_coord + Int32(1)])
+    row_page_idx_ub = cute.math.max(request_end - request_begin - Int32(1), Int32(0))
+    page_idx_ub = cute.math.min(
+        row_page_idx_ub,
+        _runtime_last_valid_page_idx(cfg, seq_len_kv),
+    )
+    return request_begin, page_idx_ub
+
+
+@cute.jit
 def _resolve_kv_tile_idx_context(
     stage_info: StageInfo,
     kv_tile_start: Int32,

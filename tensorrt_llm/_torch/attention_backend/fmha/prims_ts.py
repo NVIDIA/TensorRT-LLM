@@ -67,23 +67,13 @@ class PrimsTSFmha(PhasedFmha):
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
-        # Stable fixed-stride CSR storage for standard decode, plus aligned
-        # sequence-length staging shared by context and MLA decode.
+        # Stable fixed-stride CSR storage shared by context and decode, plus
+        # aligned sequence-length staging shared by context and MLA decode.
         self._page_indices_buffer: Optional[torch.Tensor] = None
         self._fixed_indptr_buffer: Optional[torch.Tensor] = None
         self._sequence_lengths_buffer: Optional[torch.Tensor] = None
-        # Allocation-free scratch used to stage the dense, KV-tile-aligned
-        # context page table and its repeated-last-page gather indices.
-        self._context_page_indices_buffer: Optional[torch.Tensor] = None
-        self._context_page_gather_indices_buffer: Optional[torch.Tensor] = None
-        self._context_page_columns_buffer: Optional[torch.Tensor] = None
-        self._context_last_page_indices_buffer: Optional[torch.Tensor] = None
-        # Decode CSR and context page tables resize independently, so keep
-        # their row and column capacities separate.
         self._metadata_row_capacity = 0
         self._metadata_column_capacity = 0
-        self._context_metadata_row_capacity = 0
-        self._context_page_column_capacity = 0
         # Cache each manager/pool's K-to-V page displacement without retaining
         # the manager itself.
         self._kv_page_offset_cache: dict[tuple[int, int], int] = {}
@@ -431,30 +421,13 @@ class PrimsTSFmha(PhasedFmha):
             return False, "the K-to-V page displacement could not be resolved."
         return True, ""
 
-    @staticmethod
-    def _get_context_pages_per_kv_tile(page_size: int) -> int:
-        # Keep this import lazy: importing the vendored context module eagerly
-        # would make every FMHA registry import depend on FlashInfer and CuTe.
-        from tensorrt_llm._torch.attention_backend.prims_ts.context import _CONTEXT_KV_TILE_N
-
-        return _CONTEXT_KV_TILE_N // page_size
-
     def _ensure_metadata_buffers(
         self,
         device: torch.device,
         row_capacity: int,
         column_capacity: int,
-        page_size: int,
-        *,
-        need_context: bool = False,
     ) -> None:
-        context_column_capacity = 0
-        if need_context:
-            pages_per_kv_tile = self._get_context_pages_per_kv_tile(page_size)
-            context_column_capacity = (
-                (column_capacity + pages_per_kv_tile - 1) // pages_per_kv_tile
-            ) * pages_per_kv_tile
-        base_needs_allocation = (
+        needs_allocation = (
             self._page_indices_buffer is None
             or self._fixed_indptr_buffer is None
             or self._sequence_lengths_buffer is None
@@ -462,96 +435,45 @@ class PrimsTSFmha(PhasedFmha):
             or self._metadata_row_capacity < row_capacity
             or self._metadata_column_capacity != column_capacity
         )
-        context_needs_allocation = need_context and (
-            self._context_page_indices_buffer is None
-            or self._context_page_gather_indices_buffer is None
-            or self._context_page_columns_buffer is None
-            or self._context_last_page_indices_buffer is None
-            or self._context_page_indices_buffer.device != device
-            or self._context_metadata_row_capacity < row_capacity
-            or self._context_page_column_capacity != context_column_capacity
-        )
-        if not base_needs_allocation and not context_needs_allocation:
+        if not needs_allocation:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "PrimTS metadata buffers must be allocated before CUDA graph capture."
             )
         retained_buffers: list[torch.Tensor] = []
-        if base_needs_allocation:
-            if (
-                self._page_indices_buffer is not None
-                and self._fixed_indptr_buffer is not None
-                and self._sequence_lengths_buffer is not None
-            ):
-                retained_buffers.extend(
-                    (
-                        self._page_indices_buffer,
-                        self._fixed_indptr_buffer,
-                        self._sequence_lengths_buffer,
-                    )
+        if (
+            self._page_indices_buffer is not None
+            and self._fixed_indptr_buffer is not None
+            and self._sequence_lengths_buffer is not None
+        ):
+            retained_buffers.extend(
+                (
+                    self._page_indices_buffer,
+                    self._fixed_indptr_buffer,
+                    self._sequence_lengths_buffer,
                 )
-            self._page_indices_buffer = torch.empty(
-                (row_capacity, column_capacity), dtype=torch.int32, device=device
             )
-            self._fixed_indptr_buffer = torch.arange(
-                row_capacity + 1, dtype=torch.int32, device=device
-            ).mul_(column_capacity)
-            self._sequence_lengths_buffer = torch.empty(
-                row_capacity, dtype=torch.int32, device=device
-            )
-            self._metadata_row_capacity = row_capacity
-            self._metadata_column_capacity = column_capacity
-
-        if context_needs_allocation:
-            if (
-                self._context_page_indices_buffer is not None
-                and self._context_page_gather_indices_buffer is not None
-                and self._context_page_columns_buffer is not None
-                and self._context_last_page_indices_buffer is not None
-            ):
-                retained_buffers.extend(
-                    (
-                        self._context_page_indices_buffer,
-                        self._context_page_gather_indices_buffer,
-                        self._context_page_columns_buffer,
-                        self._context_last_page_indices_buffer,
-                    )
-                )
-            self._context_page_indices_buffer = torch.zeros(
-                (row_capacity, 2, context_column_capacity),
-                dtype=torch.int32,
-                device=device,
-            )
-            self._context_page_gather_indices_buffer = torch.empty(
-                (row_capacity, context_column_capacity),
-                dtype=torch.int64,
-                device=device,
-            )
-            self._context_page_columns_buffer = torch.arange(
-                context_column_capacity,
-                dtype=torch.int64,
-                device=device,
-            )
-            self._context_last_page_indices_buffer = torch.empty(
-                row_capacity,
-                dtype=torch.int64,
-                device=device,
-            )
-            self._context_metadata_row_capacity = row_capacity
-            self._context_page_column_capacity = context_column_capacity
+        self._page_indices_buffer = torch.empty(
+            (row_capacity, column_capacity), dtype=torch.int32, device=device
+        )
+        self._fixed_indptr_buffer = torch.arange(
+            row_capacity + 1, dtype=torch.int32, device=device
+        ).mul_(column_capacity)
+        self._sequence_lengths_buffer = torch.empty(row_capacity, dtype=torch.int32, device=device)
+        self._metadata_row_capacity = row_capacity
+        self._metadata_column_capacity = column_capacity
 
         if retained_buffers:
             # Captured copies and kernel nodes retain these addresses. A replay
             # still updates the old destinations, so keeping the allocations
-            # alive preserves both pointer validity and live metadata values.
+            # alive preserves both pointer validity and per-run metadata values.
             self._retained_metadata_buffers.append(tuple(retained_buffers))
 
     def _make_fixed_stride_csr(
         self,
         block_tables: torch.Tensor,
         batch_size: int,
-        page_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Copy the K page table into stable fixed-stride CSR storage."""
         if block_tables.ndim != 3 or block_tables.shape[1] != 2:
@@ -566,23 +488,21 @@ class PrimsTSFmha(PhasedFmha):
                 f"Invalid PrimTS CSR batch size {batch_size} for {block_tables.shape[0]} rows."
             )
         columns = int(block_tables.shape[-1])
-        self._ensure_metadata_buffers(block_tables.device, batch_size, columns, page_size)
+        self._ensure_metadata_buffers(block_tables.device, batch_size, columns)
         if self._page_indices_buffer is None or self._fixed_indptr_buffer is None:
             raise RuntimeError("PrimTS metadata buffers were not allocated.")
         page_table = self._page_indices_buffer[:batch_size]
         page_table.copy_(block_tables[:batch_size, 0, :])
         return self._fixed_indptr_buffer[: batch_size + 1], page_table.reshape(-1)
 
-    def _stage_context_metadata(
+    def _stage_context_csr_metadata(
         self,
         block_tables: torch.Tensor,
         cu_kv_seqlens: torch.Tensor,
         *,
         batch_size: int,
-        page_size: int,
-        max_kv_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build the live native context metadata entirely on the current stream."""
+        """Stage graph-stable context CSR metadata on the current stream."""
         if block_tables.ndim != 3 or block_tables.shape[1] != 2:
             raise RuntimeError(
                 "PrimTS expects block tables with shape [batch, 2, max_blocks], got "
@@ -593,49 +513,20 @@ class PrimsTSFmha(PhasedFmha):
         if cu_kv_seqlens.numel() < batch_size + 1:
             raise RuntimeError("PrimTS context cumulative KV lengths are too short.")
 
-        pages_per_kv_tile = self._get_context_pages_per_kv_tile(page_size)
-        active_pages = (max_kv_len + page_size - 1) // page_size
-        required_padded_pages = (
-            (active_pages + pages_per_kv_tile - 1) // pages_per_kv_tile
-        ) * pages_per_kv_tile
-        padded_pages = self._context_page_column_capacity
-        if (
-            self._sequence_lengths_buffer is None
-            or self._context_page_indices_buffer is None
-            or self._context_page_gather_indices_buffer is None
-            or self._context_page_columns_buffer is None
-            or self._context_last_page_indices_buffer is None
-            or batch_size > self._context_metadata_row_capacity
-            or required_padded_pages > padded_pages
-        ):
+        paged_kv_indptr, paged_kv_indices = self._make_fixed_stride_csr(
+            block_tables,
+            batch_size,
+        )
+        if self._sequence_lengths_buffer is None:
             raise RuntimeError("PrimTS context metadata storage was not prepared.")
 
-        logical_kv_indptr = cu_kv_seqlens[: batch_size + 1]
         seq_lens_kv = self._sequence_lengths_buffer[:batch_size]
         torch.sub(
-            logical_kv_indptr[1:],
-            logical_kv_indptr[:-1],
+            cu_kv_seqlens[1 : batch_size + 1],
+            cu_kv_seqlens[:batch_size],
             out=seq_lens_kv,
         )
-        last_page_indices = self._context_last_page_indices_buffer[:batch_size]
-        last_page_indices.copy_(seq_lens_kv)
-        last_page_indices.sub_(1)
-        last_page_indices.div_(page_size, rounding_mode="floor")
-        gather_indices = self._context_page_gather_indices_buffer[:batch_size, :padded_pages]
-        torch.minimum(
-            self._context_page_columns_buffer[:padded_pages].view(1, -1),
-            last_page_indices.view(-1, 1),
-            out=gather_indices,
-        )
-        dense_page_idx_kv = self._context_page_indices_buffer[:batch_size, :, :padded_pages]
-        torch.gather(
-            block_tables[:batch_size, 0, :],
-            1,
-            gather_indices,
-            out=dense_page_idx_kv[:, 0, :],
-        )
-        dense_page_idx_kv[:, 1, :].copy_(dense_page_idx_kv[:, 0, :])
-        return logical_kv_indptr, seq_lens_kv, dense_page_idx_kv
+        return paged_kv_indptr, paged_kv_indices, seq_lens_kv
 
     def _get_mla_sequence_lengths(
         self,
@@ -697,8 +588,7 @@ class PrimsTSFmha(PhasedFmha):
         *,
         batch_size: int,
         max_seq_len_q: int,
-        max_seq_len_k: int,
-        max_num_pages_per_seq_kv: int,
+        max_kv_len: int,
         page_size: int,
         mask_type: str,
         window_left: int,
@@ -719,8 +609,7 @@ class PrimsTSFmha(PhasedFmha):
             device=q.device,
             batch_size=batch_size,
             max_seq_len_q=max_seq_len_q,
-            max_seq_len_k=max_seq_len_k,
-            max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
+            max_kv_len=max_kv_len,
             num_qo_heads=int(q.shape[-2]),
             num_kv_heads=int(k_cache.shape[1]),
             head_dim=int(q.shape[-1]),
@@ -853,8 +742,6 @@ class PrimsTSFmha(PhasedFmha):
             q.device,
             max(int(metadata.max_num_requests), 1),
             column_capacity,
-            int(metadata.tokens_per_block),
-            need_context=has_context and not self.attn.is_mla_enable,
         )
 
         if self._multi_processor_count is None:
@@ -1116,13 +1003,11 @@ class PrimsTSFmha(PhasedFmha):
             raise RuntimeError("PrimTS could not resolve the K-to-V page displacement.")
         k_cache, v_cache = self._standard_kv_views(kv_pool, kv_page_offset)
         max_seq_len_q = int(meta.max_context_length)
-        max_seq_len_k = int(meta.max_seq_len)
-        logical_kv_indptr, seq_lens_kv, dense_page_idx_kv = self._stage_context_metadata(
+        max_kv_len = int(meta.max_seq_len)
+        paged_kv_indptr, paged_kv_indices, seq_lens_kv = self._stage_context_csr_metadata(
             block_tables,
             cu_kv_seqlens,
             batch_size=params.batch_size,
-            page_size=params.tokens_per_block,
-            max_kv_len=max_seq_len_k,
         )
         mask_type = self._get_prims_mask_type(fwd)
         wrapper = self._get_or_plan_context_wrapper(
@@ -1131,8 +1016,7 @@ class PrimsTSFmha(PhasedFmha):
             v_cache,
             batch_size=params.batch_size,
             max_seq_len_q=max_seq_len_q,
-            max_seq_len_k=max_seq_len_k,
-            max_num_pages_per_seq_kv=int(dense_page_idx_kv.shape[-1]),
+            max_kv_len=max_kv_len,
             page_size=params.tokens_per_block,
             mask_type=mask_type,
             window_left=window_left,
@@ -1144,8 +1028,8 @@ class PrimsTSFmha(PhasedFmha):
             k_cache,
             v_cache,
             cu_q_seqlens,
-            logical_kv_indptr,
-            dense_page_idx_kv,
+            paged_kv_indptr,
+            paged_kv_indices,
             seq_lens_kv,
             out=params.context_buf,
             validate=False,
@@ -1284,7 +1168,6 @@ class PrimsTSFmha(PhasedFmha):
         paged_kv_indptr, paged_kv_indices = self._make_fixed_stride_csr(
             block_tables,
             batch_size,
-            params.tokens_per_block,
         )
         max_seq_len = int(block_tables.shape[-1]) * params.tokens_per_block
         seq_lens = params.sequence_lengths[:batch_size]
@@ -1378,7 +1261,6 @@ class PrimsTSFmha(PhasedFmha):
         _, page_indices = self._make_fixed_stride_csr(
             block_tables,
             batch_size,
-            params.tokens_per_block,
         )
         dense_block_tables = page_indices.view(batch_size, block_tables.shape[-1])
         seq_len_q = params.input_seq_length
