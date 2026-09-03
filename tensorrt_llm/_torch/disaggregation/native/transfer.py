@@ -21,6 +21,7 @@ import struct
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Union
@@ -53,6 +54,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     SessionStatus,
     TxSessionBase,
     WaitResult,
+    resolve_transfer_rid,
 )
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBuffer,
@@ -268,7 +270,8 @@ class SendTaskBase:
         self._exception: Optional[Exception] = None
         self.lock = threading.Lock()
         self._params = params
-        self._unique_rid: Optional[int] = params.disagg_request_id
+        # Same key the sessions register under; see resolve_transfer_rid().
+        self._unique_rid: Optional[int] = resolve_transfer_rid(params)
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
 
     def fail(self, exc: Exception) -> None:
@@ -332,6 +335,9 @@ class Sender(SenderBase):
     # are evicted during periodic sweeps.
     _STALE_REQ_INFO_TTL_S = 120.0
 
+    # Cap on remembered cancelled request ids (see _cancelled_rids).
+    _MAX_CANCELLED_RIDS = 65536
+
     def __init__(
         self,
         peer_registrar: PeerRegistrar,
@@ -349,8 +355,12 @@ class Sender(SenderBase):
         self._dealers = {}  # used by listener thread only (single-threaded path)
         self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
         self._sessions = {}  # unique_rid -> TxSession
-        self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
+        # Protects _sessions, _pre_cancelled_rids and _cancelled_rids.
+        self._sessions_lock = threading.Lock()
         self._pre_cancelled_rids: set[int] = set()
+        # Cancelled+torn-down rids, so a REQUEST_DATA arriving afterwards can
+        # still be answered. Bounded LRU; request ids are never reused.
+        self._cancelled_rids: OrderedDict[int, None] = OrderedDict()
         self._shutdown = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
         # Guards concurrent add() from the listener thread.
@@ -734,6 +744,44 @@ class Sender(SenderBase):
         timer = aux_task._perf_timer
         if timer:
             timer.record_push_end(write_meta.peer_rank)
+
+        # Hold session.lock to serialize the INIT->TRANSFERRING transition with
+        # cancel(), mirroring _deliver_kv_to_agent(): prevents the cancel echo
+        # from freeing receiver-side aux buffers while a worker is about to
+        # write into them.
+        with session.lock:
+            status = session.status
+            if status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                should_abort = True
+            else:
+                # One aux task serves several peers; only the first delivery
+                # leaves INIT.
+                if aux_task.status == TaskStatus.INIT:
+                    aux_task.status = TaskStatus.TRANSFERRING
+                should_abort = False
+
+        if should_abort:
+            logger.warning(
+                f"_deliver_aux_to_agent: session {write_meta.unique_rid} already "
+                f"in {status.value} state; sending FAILED to receiver"
+            )
+            # cancel() fails an INIT aux task, but this write_meta may have been
+            # enqueued after cancel() ran. Set the future here as a fallback.
+            if not aux_task.is_done:
+                aux_task.fail(
+                    RuntimeError(
+                        f"session {write_meta.unique_rid} {status.value}, aux transfer aborted"
+                    )
+                )
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
+                [
+                    MessageType.AUX_AGENT_RESULT,
+                    str(self._instance_rank).encode("ascii"),
+                    str(write_meta.unique_rid).encode("ascii"),
+                    AgentResult.FAILED.value.encode("ascii"),
+                ]
+            )
+            return
 
         agent_result = AgentResult.SUCCESS
         if write_meta.src_ptrs.size > 0:
@@ -1147,18 +1195,42 @@ class Sender(SenderBase):
                 if session is None:
                     self._pre_cancelled_rids.add(unique_rid)
         if session is not None:
-            session.cancel()
+            # Mid-write: answer nothing and let it finish, the worker reports
+            # its own result. Otherwise the echoed CANCEL_SESSION releases the
+            # asking receiver.
+            if not session.cancel(only_if_idle=True):
+                logger.debug(
+                    f"_handle_cancel_session: rid={unique_rid} has a write in "
+                    "flight; letting it finish instead of cancelling"
+                )
+            return
+        # No session, so nothing was dispatched and no worker will report a
+        # result; the receiver cannot fail its own task, so answer explicitly.
+        # Snapshot under the lock; the listener thread mutates this dict.
+        with self._peer_requests_lock:
+            req_info_map = self._peer_requests.get(unique_rid)
+            req_infos = list(req_info_map.values()) if req_info_map else []
+        for req_info in req_infos:
+            self._send_failed_result_to_receiver(req_info)
 
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        cancelled = False
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
-                self._save_peer_req_info(info)
-                return
+                cancelled = info.unique_rid in self._cancelled_rids
+                if not cancelled:
+                    self._save_peer_req_info(info)
+        if session is None:
+            if cancelled:
+                # Torn down before this receiver registered, so nobody will
+                # report a result. Sent outside the lock: it is network I/O.
+                self._send_failed_result_to_receiver(info)
+            return
         with session.lock:
             self._save_peer_req_info(info)
             tasks = list(session.kv_tasks)
@@ -1228,8 +1300,21 @@ class Sender(SenderBase):
                 del self._sessions[unique_rid]
         self._remove_req_info(unique_rid)
 
+    def _mark_cancelled(self, unique_rid: int) -> None:
+        """Record a cancelled request id, evicting the oldest when full."""
+        with self._sessions_lock:
+            self._cancelled_rids.pop(unique_rid, None)
+            self._cancelled_rids[unique_rid] = None
+            while len(self._cancelled_rids) > self._MAX_CANCELLED_RIDS:
+                self._cancelled_rids.popitem(last=False)
+
     def send_cancel_to_receivers(self, unique_rid: int) -> None:
-        """Notify all receivers involved in this session to cancel."""
+        """Notify all receivers involved in this session to cancel.
+
+        Only already-registered receivers are reachable here; the tombstone
+        recorded below is what answers a later REQUEST_DATA.
+        """
+        self._mark_cancelled(unique_rid)
         # Snapshot under the lock to avoid RuntimeError if the listener thread
         # mutates the dict via _add_req_info() concurrently.
         with self._peer_requests_lock:
@@ -1332,15 +1417,7 @@ class TxSession(TxSessionBase):
 
     @property
     def disagg_request_id(self) -> int:
-        params = self._base_args.params
-        if params.disagg_request_id is not None:
-            return params.disagg_request_id
-        # ctx_request_id is set on gen-side requests to the ctx server's request ID,
-        # which matches the key the ctx TxSession registered under.  Fall back to
-        # the local request_id only when neither field is available.
-        if params.ctx_request_id is not None:
-            return params.ctx_request_id
-        return self.request_id
+        return resolve_transfer_rid(self._base_args.params, self.request_id)
 
     @property
     def status(self) -> SessionStatus:
@@ -1417,17 +1494,26 @@ class TxSession(TxSessionBase):
             return True
         return self.aux_task is not None and self.aux_task.status == TaskStatus.ERROR
 
-    def cancel(self) -> None:
+    def cancel(self, only_if_idle: bool = False) -> bool:
         """Cancel the session and notify the remote receiver.
 
         Safe to call multiple times. TRANSFERRING tasks keep running (mid-write).
         Only INIT tasks have their events signalled immediately.
         The lock serializes with _deliver_kv_to_agent() so has_transferring_tasks()
         is accurate the moment this returns.
+
+        With ``only_if_idle`` a mid-write session is left untouched and False
+        returned. This lock also serializes _deliver_kv_to_agent()'s
+        INIT->TRANSFERRING transition, so no write can start in between.
         """
         with self.lock:
+            if only_if_idle and (
+                any(task.status == TaskStatus.TRANSFERRING for task in self.kv_tasks)
+                or (self.aux_task is not None and self.aux_task.status == TaskStatus.TRANSFERRING)
+            ):
+                return False
             if self._terminal_status == SessionStatus.CANCELLED:
-                return
+                return True
             self._terminal_status = SessionStatus.CANCELLED
             exc = RuntimeError(f"TxSession {self.disagg_request_id} cancelled")
             for task in self.kv_tasks:
@@ -1437,13 +1523,16 @@ class TxSession(TxSessionBase):
                 self.aux_task.fail(exc)
         # Send outside the lock to avoid holding it during I/O.
         self._sender.send_cancel_to_receivers(self.disagg_request_id)
+        return True
 
     def has_transferring_tasks(self) -> bool:
         """True if any KV or auxiliary task is currently mid-write.
 
         cancel_request() must return False while this is True.
         """
-        return any(t.status == TaskStatus.TRANSFERRING for t in self.kv_tasks)
+        return any(t.status == TaskStatus.TRANSFERRING for t in self.kv_tasks) or (
+            self.aux_task is not None and self.aux_task.status == TaskStatus.TRANSFERRING
+        )
 
     def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]:
         """Poll or block until KV (and optionally aux) transfer finishes.
@@ -1605,6 +1694,11 @@ class KVRecvTask:
         self.status = TaskStatus.INIT
         self.expected_transfers = 0
         self.last_slice_count = 0
+        # Fan-in writers that reported FAILED (set: dedups a repeated report).
+        # The task resolves only once every expected writer is terminal; see
+        # process_kv_agent_result().
+        self.failed_peers: set[int] = set()
+        self.first_failure: Optional[Exception] = None
 
         self._unique_rid = unique_rid
         self._kv_slice = kv_slice
@@ -1715,11 +1809,8 @@ class Receiver(ReceiverBase):
         self_ri = self._registrar.self_rank_info
         assert task._unique_rid is not None, "KVRecvTask unique_rid is None"
         # Some requests arrive with ctx_request_id None while disagg_request_id
-        # is set; disagg_request_id is the receive-session key, so fall back to
-        # it instead of failing here (nvbugs/6482576).
-        sender_req_id = task._params.ctx_request_id
-        if sender_req_id is None:
-            sender_req_id = task._params.disagg_request_id
+        # is set (nvbugs/6482576); resolve_transfer_rid falls back for us.
+        sender_req_id = resolve_transfer_rid(task._params)
         if sender_req_id is None:
             # Not an assert: must survive python -O so a None id never reaches
             # RecvReqInfo.sender_req_id / the wire.
@@ -2123,15 +2214,7 @@ class RxSession(RxSessionBase):
 
     @property
     def disagg_request_id(self) -> int:
-        params = self._base_args.params
-        if params.disagg_request_id is not None:
-            return params.disagg_request_id
-        # ctx_request_id is set on gen-side requests to the ctx server's request ID,
-        # which matches the key the ctx TxSession registered under.  Fall back to
-        # the local request_id only when neither field is available.
-        if params.ctx_request_id is not None:
-            return params.ctx_request_id
-        return self.request_id
+        return resolve_transfer_rid(self._base_args.params, self.request_id)
 
     @property
     def status(self) -> SessionStatus:
@@ -2194,7 +2277,7 @@ class RxSession(RxSessionBase):
                 on_done = None
                 if is_last_slice:
                     task.last_slice_count += 1
-                    if task.last_slice_count == task.expected_transfers:
+                    if task.last_slice_count + len(task.failed_peers) == task.expected_transfers:
                         # Completing message: defer task.complete()+perf until the scatter has actually
                         # landed. scatter_write_result fires this inline for the non-bounced path, or on
                         # the scatter worker (after cudaStreamSynchronize) for the bounced path, so the
@@ -2226,6 +2309,12 @@ class RxSession(RxSessionBase):
                                 return
                             if task.status == TaskStatus.ERROR:
                                 return  # a concurrent FAILED writer already failed it; don't un-fail
+                            if task.failed_peers:
+                                # This SUCCESS drained a fan-in with at least one
+                                # failed writer: everything is quiesced now, so
+                                # resolve as failure (data is incomplete).
+                                task.fail(task.first_failure)
+                                return
                             try:
                                 if task._perf_timer is not None:
                                     task._perf_timer.record_task_end(peer_rank)
@@ -2269,9 +2358,21 @@ class RxSession(RxSessionBase):
                 self._receiver._bounce.record_failure(
                     (self.disagg_request_id, task.slice_id), peer_rank
                 )
-                task.fail(RuntimeError(detail))
-                if self._terminal_status is None:  # Don't overwrite CANCELLED with ERROR
-                    self._terminal_status = SessionStatus.ERROR
+                # Same drain rule at the task level: one writer's FAILED says
+                # nothing about a sibling's in-flight RMA into the same KV
+                # blocks. Failing the task here would drop it out of the
+                # has_transferring_tasks()/wait_complete guards and let the
+                # executor free blocks a sibling is still writing. Record the
+                # failure and resolve only once every expected writer is
+                # terminal; a writer that never reports is bounded by the
+                # session's overall deadline.
+                if task.first_failure is None:
+                    task.first_failure = RuntimeError(detail)
+                task.failed_peers.add(peer_rank)
+                if task.last_slice_count + len(task.failed_peers) == task.expected_transfers:
+                    task.fail(task.first_failure)
+                    if self._terminal_status is None:  # Don't overwrite CANCELLED with ERROR
+                        self._terminal_status = SessionStatus.ERROR
             else:
                 raise ValueError(
                     f"Session {self.request_id} received unknown task status: {status.value}"

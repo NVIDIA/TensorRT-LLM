@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -194,7 +195,9 @@ def test_enabled_generation_timeout_fails_transfer_that_completed_late(monkeypat
 
 def test_flag_unset_context_timeout_preserves_legacy_cleanup():
     request = _make_timeout_request()
-    request.py_kv_transfer_start_time = 1.0
+    timeout_ms = 1000
+    abandon_s = (timeout_ms * executor_module._DISAGG_CTX_TRANSFER_ABANDON_MULTIPLIER) / 1000.0
+    request.py_kv_transfer_start_time = time.monotonic() - abandon_s - 1.0
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
@@ -202,6 +205,7 @@ def test_flag_unset_context_timeout_preserves_legacy_cleanup():
         [], []
     )
     executor.kv_cache_transceiver.cancel_request.return_value = True
+    executor.kv_cache_transceiver.kv_transfer_timeout_ms = timeout_ms
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.requests_in_transfer.return_value = {
         request.py_request_id: request

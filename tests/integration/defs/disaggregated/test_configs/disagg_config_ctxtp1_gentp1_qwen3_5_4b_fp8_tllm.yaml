@@ -19,6 +19,7 @@ context_servers:
   cache_transceiver_config:
     backend: DEFAULT
     max_tokens_in_buffer: 16384
+    kv_cache_bounce_size_mb: 2048
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
@@ -48,3 +49,4 @@ generation_servers:
   cache_transceiver_config:
     backend: DEFAULT
     max_tokens_in_buffer: 16384
+    kv_cache_bounce_size_mb: 2048
