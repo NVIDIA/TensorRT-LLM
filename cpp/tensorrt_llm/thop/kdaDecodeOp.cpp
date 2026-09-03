@@ -54,10 +54,9 @@ void validate_kda_decode_fusion_inputs(at::Tensor x_q, at::Tensor x_k, at::Tenso
     at::Tensor onorm_g, at::Tensor onorm_weight, std::optional<at::Tensor> const& ssm_state_indices, at::Tensor state,
     bool apply_onorm, bool update_conv_cache, bool use_lower_bound, bool apply_beta_sigmoid)
 {
-    // Non-production feature combinations are uncommon and unsupported by the Blackwell kernels.
-    TORCH_CHECK(apply_onorm && !update_conv_cache && use_lower_bound && apply_beta_sigmoid,
-        "KDA decode only supports the production configuration: apply_onorm=true, update_conv_cache=false, "
-        "use_lower_bound=true, and apply_beta_sigmoid=true");
+    // Non-production feature combinations are uncommon and unsupported by the optimized kernels.
+    TORCH_CHECK(apply_onorm && use_lower_bound && apply_beta_sigmoid,
+        "KDA decode only supports apply_onorm=true, use_lower_bound=true, and apply_beta_sigmoid=true");
 
     TORCH_CHECK(x_q.is_cuda() && x_q.scalar_type() == at::kBFloat16, "x_q must be a CUDA bfloat16 tensor");
     TORCH_CHECK(x_k.is_cuda() && x_k.scalar_type() == at::kBFloat16, "x_k must be a CUDA bfloat16 tensor");

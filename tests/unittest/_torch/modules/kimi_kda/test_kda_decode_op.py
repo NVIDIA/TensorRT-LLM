@@ -25,8 +25,6 @@ NUM_HEADS = 96
 HEAD_DIM = 128
 CONV_KERNEL_SIZE = 4
 HIDDEN_SIZE = 7168
-SUPPORTED_HEADS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 96)
-COMPACT_WORK_THRESHOLD = 144
 
 
 def _has_supported_gpu() -> bool:
@@ -553,7 +551,7 @@ def test_decode_reads_row_strided_projection_slices(num_heads: int) -> None:
     torch.testing.assert_close(strided_conv_pool[0], initial_conv_pool[0], rtol=0, atol=0)
 
 
-def _profile_decode_backend(kwargs: dict) -> str:
+def _profile_decode_kernel(kwargs: dict) -> str:
     _kda_decode.run_kda_decode_fusion_cuda(**kwargs)
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
@@ -565,62 +563,39 @@ def _profile_decode_backend(kwargs: dict) -> str:
         for event in prof.key_averages()
         if event.device_type == torch.autograd.DeviceType.CUDA
     ]
-    has_compact = any("kda_decode_fusion_compact_heads_kernel" in name for name in kernel_names)
-    has_many = any("kda_decode_fusion_many_heads_kernel" in name for name in kernel_names)
-    assert has_compact != has_many, kernel_names
-    return "compact" if has_compact else "many"
-
-
-@torch.no_grad()
-@pytest.mark.parametrize("num_heads", SUPPORTED_HEADS)
-def test_sm103_selector_dispatches_each_supported_head_at_boundary(num_heads: int) -> None:
-    if torch.cuda.get_device_capability(0) != (10, 3):
-        pytest.skip("compact-head selector sweep is tuned only for SM103")
-
-    compact_batch = COMPACT_WORK_THRESHOLD // num_heads
-    compact_args = _make_direct_decode_args(
-        compact_batch,
-        num_heads,
-        indexed_state=False,
-    )
-    many_args = _make_direct_decode_args(
-        compact_batch + 1,
-        num_heads,
-        indexed_state=False,
-    )
-    assert _profile_decode_backend(compact_args) == "compact"
-    assert _profile_decode_backend(many_args) == "many"
-
-
-@torch.no_grad()
-def test_selector_preserves_legacy_compact_heads_off_sm103() -> None:
-    if torch.cuda.get_device_capability(0) == (10, 3):
-        pytest.skip("non-SM103 fallback requires a different Blackwell target")
-    # Off SM103 the H==2 legacy rule dispatches the compact kernel; the
-    # SM103-only selector must not change that.
-    args = _make_direct_decode_args(1, 2, indexed_state=False)
-    assert _profile_decode_backend(args) == "compact"
+    selected_kernels = [
+        kernel_name for kernel_name in kernel_names if "kda_decode_native_kernel" in kernel_name
+    ]
+    assert len(selected_kernels) == 1, kernel_names
+    return selected_kernels[0]
 
 
 @torch.no_grad()
 @pytest.mark.parametrize(
-    ("batch_size", "indexed_state", "expected_backend"),
-    [(1, False, "compact"), (2, True, "many")],
+    ("num_heads", "indexed_state", "expected_schedule"),
+    [
+        (2, False, 3),
+        (96, True, 1),
+    ],
 )
-def test_sm103_selector_is_cuda_graph_safe(
-    batch_size: int,
+def test_blackwell_selector_is_cuda_graph_safe(
+    num_heads: int,
     indexed_state: bool,
-    expected_backend: str,
+    expected_schedule: int,
 ) -> None:
-    if torch.cuda.get_device_capability(0) != (10, 3):
-        pytest.skip("compact-head selector sweep is tuned only for SM103")
-
     args = _make_direct_decode_args(
-        batch_size,
-        96,
+        1,
+        num_heads,
         indexed_state=indexed_state,
     )
-    assert _profile_decode_backend(args) == expected_backend
+    kernel_name = _profile_decode_kernel(args)
+    assert any(
+        marker in kernel_name
+        for marker in (
+            f"KernelSchedule){expected_schedule}",
+            f"KernelScheduleE{expected_schedule}",
+        )
+    ), kernel_name
 
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()

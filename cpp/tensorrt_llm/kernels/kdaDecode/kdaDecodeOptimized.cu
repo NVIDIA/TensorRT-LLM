@@ -94,6 +94,14 @@ __device__ __forceinline__ __nv_bfloat16 bf16_store(float value)
     return __float2bfloat16(value);
 }
 
+__device__ __forceinline__ void update_conv_state(
+    __nv_bfloat16* state, __nv_bfloat16 state_1, __nv_bfloat16 state_2, __nv_bfloat16 value)
+{
+    state[0] = state_1;
+    state[1] = state_2;
+    state[2] = value;
+}
+
 __device__ __forceinline__ float sigmoid_fast(float value)
 {
     return 1.0f / (1.0f + __expf(-value));
@@ -234,12 +242,12 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     __nv_bfloat16 const* __restrict__ w_q_t, __nv_bfloat16 const* __restrict__ w_k_t,
     __nv_bfloat16 const* __restrict__ w_v_t, __nv_bfloat16 const* __restrict__ bias_q,
     __nv_bfloat16 const* __restrict__ bias_k, __nv_bfloat16 const* __restrict__ bias_v,
-    __nv_bfloat16 const* __restrict__ cs_q, __nv_bfloat16 const* __restrict__ cs_k,
-    __nv_bfloat16 const* __restrict__ cs_v, float const* __restrict__ a_log, __nv_bfloat16 const* __restrict__ g,
-    float const* __restrict__ dt_bias, __nv_bfloat16 const* __restrict__ beta,
-    __nv_bfloat16 const* __restrict__ onorm_g, float const* __restrict__ onorm_weight,
-    int const* __restrict__ ssm_state_indices, float* __restrict__ state, int64_t state_slot_stride,
-    __nv_bfloat16* __restrict__ out, float lower_bound, float scale, float onorm_epsilon, KdaDecodeIoLayout layout)
+    __nv_bfloat16* __restrict__ cs_q, __nv_bfloat16* __restrict__ cs_k, __nv_bfloat16* __restrict__ cs_v,
+    float const* __restrict__ a_log, __nv_bfloat16 const* __restrict__ g, float const* __restrict__ dt_bias,
+    __nv_bfloat16 const* __restrict__ beta, __nv_bfloat16 const* __restrict__ onorm_g,
+    float const* __restrict__ onorm_weight, int const* __restrict__ ssm_state_indices, float* __restrict__ state,
+    int64_t state_slot_stride, int64_t conv_state_slot_stride, __nv_bfloat16* __restrict__ out, bool update_conv_cache,
+    float lower_bound, float scale, float onorm_epsilon, KdaDecodeIoLayout layout)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
     __trap();
@@ -270,6 +278,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     cudaGridDependencySynchronize();
 #endif
     int const state_slot = ssm_state_indices == nullptr ? batch_index : ssm_state_indices[batch_index];
+    int const conv_slot = update_conv_cache ? state_slot : batch_index;
     float* const state_head
         = state + static_cast<int64_t>(state_slot) * state_slot_stride + static_cast<int64_t>(head) * kDim * kDim;
 
@@ -321,11 +330,14 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
         cp_async_state_chunk(&shared_state[0][0][0], state_head, first_chunk, 0);
     }
 
+    __nv_bfloat16 q_new_conv_state[kConvCacheWidth];
+    __nv_bfloat16 k_new_conv_state[kConvCacheWidth];
     if (tid < kDim)
     {
         int const column = tid;
         int const head_column = head_offset + column;
-        int const cache_base = (batch_index * kFlat + head_column) * kConvCacheWidth;
+        int64_t const cache_base
+            = static_cast<int64_t>(conv_slot) * conv_state_slot_stride + head_column * kConvCacheWidth;
         float const exp_a = __shfl_sync(0xffffffffu, lane == 0 ? __expf(a_log[head]) : 0.0f, 0);
 
         float q_accumulator = bf16_load(bias_q, head_column);
@@ -333,20 +345,57 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
 #pragma unroll
         for (int width = 0; width < kConvCacheWidth; ++width)
         {
-            int const cache_index = cache_base + width;
-            q_accumulator += bf16_load(cs_q, cache_index) * bf16_load(w_q_t, width * kFlat + head_column);
-            k_accumulator += bf16_load(cs_k, cache_index) * bf16_load(w_k_t, width * kFlat + head_column);
+            int64_t const cache_index = cache_base + width;
+            __nv_bfloat16 const q_conv_state = cs_q[cache_index];
+            __nv_bfloat16 const k_conv_state = cs_k[cache_index];
+            q_accumulator += __bfloat162float(q_conv_state) * bf16_load(w_q_t, width * kFlat + head_column);
+            k_accumulator += __bfloat162float(k_conv_state) * bf16_load(w_k_t, width * kFlat + head_column);
+            if (width > 0)
+            {
+                q_new_conv_state[width - 1] = q_conv_state;
+                k_new_conv_state[width - 1] = k_conv_state;
+            }
         }
         int64_t const q_index = static_cast<int64_t>(batch_index) * layout.xQRowStride + head_column;
         int64_t const k_index = static_cast<int64_t>(batch_index) * layout.xKRowStride + head_column;
-        q_accumulator += bf16_load(x_q, q_index) * bf16_load(w_q_t, (kKernelWidth - 1) * kFlat + head_column);
-        k_accumulator += bf16_load(x_k, k_index) * bf16_load(w_k_t, (kKernelWidth - 1) * kFlat + head_column);
+        q_new_conv_state[kConvCacheWidth - 1] = x_q[q_index];
+        k_new_conv_state[kConvCacheWidth - 1] = x_k[k_index];
+        q_accumulator += __bfloat162float(q_new_conv_state[kConvCacheWidth - 1])
+            * bf16_load(w_q_t, (kKernelWidth - 1) * kFlat + head_column);
+        k_accumulator += __bfloat162float(k_new_conv_state[kConvCacheWidth - 1])
+            * bf16_load(w_k_t, (kKernelWidth - 1) * kFlat + head_column);
         shared_q[column] = silu_fast(q_accumulator);
         shared_k[column] = silu_fast(k_accumulator);
 
         int64_t const gate_index = static_cast<int64_t>(batch_index) * layout.gateRowStride + head_column;
         float const gate = bf16_load(g, gate_index) + dt_bias[head_column];
         shared_decay[column] = __expf(lower_bound * sigmoid_fast(exp_a * gate));
+
+        if constexpr (!kUseCluster)
+        {
+            if (update_conv_cache)
+            {
+                update_conv_state(cs_q + cache_base, q_new_conv_state[0], q_new_conv_state[1], q_new_conv_state[2]);
+                update_conv_state(cs_k + cache_base, k_new_conv_state[0], k_new_conv_state[1], k_new_conv_state[2]);
+            }
+        }
+    }
+
+    if constexpr (kUseCluster)
+    {
+        if (update_conv_cache)
+        {
+            // Defer update until all ranks have consumed the old values.
+            cluster.sync();
+            if (tid < kDim && cluster_rank == 0)
+            {
+                int const head_column = head_offset + tid;
+                int64_t const cache_base
+                    = static_cast<int64_t>(conv_slot) * conv_state_slot_stride + head_column * kConvCacheWidth;
+                update_conv_state(cs_q + cache_base, q_new_conv_state[0], q_new_conv_state[1], q_new_conv_state[2]);
+                update_conv_state(cs_k + cache_base, k_new_conv_state[0], k_new_conv_state[1], k_new_conv_state[2]);
+            }
+        }
     }
 
     if (tid >= kVThreadBase && tid < kVThreadBase + kLocalVThreads)
@@ -354,17 +403,31 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
         int const local_row = tid - kVThreadBase;
         int const row = kUseCluster ? cluster_rank * kLocalVThreads + local_row : local_row;
         int const head_row = head_offset + row;
-        int const cache_base = (batch_index * kFlat + head_row) * kConvCacheWidth;
+        int64_t const cache_base
+            = static_cast<int64_t>(conv_slot) * conv_state_slot_stride + head_row * kConvCacheWidth;
         float v_accumulator = bf16_load(bias_v, head_row);
+        __nv_bfloat16 v_new_conv_state[kConvCacheWidth];
 #pragma unroll
         for (int width = 0; width < kConvCacheWidth; ++width)
         {
-            int const cache_index = cache_base + width;
-            v_accumulator += bf16_load(cs_v, cache_index) * bf16_load(w_v_t, width * kFlat + head_row);
+            int64_t const cache_index = cache_base + width;
+            __nv_bfloat16 const v_conv_state = cs_v[cache_index];
+            v_accumulator += __bfloat162float(v_conv_state) * bf16_load(w_v_t, width * kFlat + head_row);
+            if (width > 0)
+            {
+                v_new_conv_state[width - 1] = v_conv_state;
+            }
         }
         int64_t const v_index = static_cast<int64_t>(batch_index) * layout.xVRowStride + head_row;
-        v_accumulator += bf16_load(x_v, v_index) * bf16_load(w_v_t, (kKernelWidth - 1) * kFlat + head_row);
+        v_new_conv_state[kConvCacheWidth - 1] = x_v[v_index];
+        v_accumulator += __bfloat162float(v_new_conv_state[kConvCacheWidth - 1])
+            * bf16_load(w_v_t, (kKernelWidth - 1) * kFlat + head_row);
         shared_v[row] = silu_fast(v_accumulator);
+
+        if (update_conv_cache)
+        {
+            update_conv_state(cs_v + cache_base, v_new_conv_state[0], v_new_conv_state[1], v_new_conv_state[2]);
+        }
 
         if constexpr (!kUseCluster)
         {
@@ -644,13 +707,12 @@ cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t str
         static_cast<__nv_bfloat16 const*>(params.xV), static_cast<__nv_bfloat16 const*>(params.wQT),
         static_cast<__nv_bfloat16 const*>(params.wKT), static_cast<__nv_bfloat16 const*>(params.wVT),
         static_cast<__nv_bfloat16 const*>(params.biasQ), static_cast<__nv_bfloat16 const*>(params.biasK),
-        static_cast<__nv_bfloat16 const*>(params.biasV), static_cast<__nv_bfloat16 const*>(params.convStateQ),
-        static_cast<__nv_bfloat16 const*>(params.convStateK), static_cast<__nv_bfloat16 const*>(params.convStateV),
-        params.logA, static_cast<__nv_bfloat16 const*>(params.gate), params.dtBias,
-        static_cast<__nv_bfloat16 const*>(params.beta), static_cast<__nv_bfloat16 const*>(params.outputNormGate),
-        params.outputNormWeight, params.ssmStateIndices, params.state, params.stateSlotStride,
-        static_cast<__nv_bfloat16*>(params.output), params.lowerBound, params.scale, params.outputNormEps,
-        params.layout);
+        static_cast<__nv_bfloat16 const*>(params.biasV), static_cast<__nv_bfloat16*>(params.convStateQ),
+        static_cast<__nv_bfloat16*>(params.convStateK), static_cast<__nv_bfloat16*>(params.convStateV), params.logA,
+        static_cast<__nv_bfloat16 const*>(params.gate), params.dtBias, static_cast<__nv_bfloat16 const*>(params.beta),
+        static_cast<__nv_bfloat16 const*>(params.outputNormGate), params.outputNormWeight, params.ssmStateIndices,
+        params.state, params.stateSlotStride, params.convStateSlotStride, static_cast<__nv_bfloat16*>(params.output),
+        params.updateConvCache, params.lowerBound, params.scale, params.outputNormEps, params.layout);
     if (launchStatus != cudaSuccess)
     {
         return launchStatus;
@@ -663,7 +725,6 @@ void validateOptimizedParams(KdaDecodeParams const& params)
     TLLM_CHECK_WITH_INFO(
         params.numHeads == params.numValueHeads, "Optimized KDA decode requires numHeads == numValueHeads");
     TLLM_CHECK_WITH_INFO(params.applyOutputNorm, "Optimized KDA decode requires output normalization");
-    TLLM_CHECK_WITH_INFO(!params.updateConvCache, "Optimized KDA decode does not yet support updateConvCache=true");
     TLLM_CHECK_WITH_INFO(params.useLowerBound, "Optimized KDA decode requires the lower-bound gate");
     TLLM_CHECK_WITH_INFO(params.applyBetaSigmoid, "Optimized KDA decode requires beta sigmoid in the kernel");
 }
