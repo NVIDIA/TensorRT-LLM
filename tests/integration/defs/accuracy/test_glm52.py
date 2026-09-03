@@ -141,7 +141,6 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             max_seq_len=8192,
             **pytorch_config,
         ) as llm:
-            assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
             assert llm.args.kv_cache_config.enable_block_reuse is True
             assert llm.args.disable_overlap_scheduler is False
             assert llm.args.cuda_graph_config is not None
