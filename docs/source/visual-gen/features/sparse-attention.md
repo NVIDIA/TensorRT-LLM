@@ -6,6 +6,7 @@ This page is an unindexed draft until the VisualGen documentation hub is introdu
 
 - [Overview](#overview)
   - [Algorithms](#algorithms)
+  - [Sol-Attn](#sol-attn)
 - [Skip Softmax Attention](#skip-softmax-attention)
 - [Video Sparse Attention (VSA)](#video-sparse-attention-vsa)
 
@@ -49,8 +50,8 @@ below it. Use `None` rather than `0.0` to disable the prefix.
 
 On an input the kernel cannot serve — an unsupported architecture, a
 `head_dim` other than 128, a non-bfloat16 dtype — Sol-Attn falls back to dense
-dense attention -- the configured backend's dense kernel where available, torch
-SDPA otherwise -- logs the specific reason once, and counts the fallback. Set
+attention -- the configured backend's dense kernel where available, torch SDPA
+otherwise -- logs the specific reason once, and counts the fallback. Set
 `SOL_ATTN_STRICT=1` to raise instead of falling back, which is useful when
 benchmarking to confirm the kernel actually ran.
 
