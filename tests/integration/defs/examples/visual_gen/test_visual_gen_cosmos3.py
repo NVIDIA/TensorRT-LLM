@@ -69,7 +69,11 @@ COSMOS3_LPIPS_NUM_INFERENCE_STEPS = 35
 COSMOS3_LPIPS_GUIDANCE_SCALE = 6.0
 COSMOS3_LPIPS_SEED = 42
 COSMOS3_LPIPS_FRAME_RATE = 24.0
-COSMOS3_LPIPS_THRESHOLD = 0.05
+# T2I stays at the original tight bar: the 1-frame shape has the smallest
+# cross-stepping exposure in the family (its B300-cut golden scores 0.020 on
+# the B200 lane), so 0.05 keeps ~2.5x margin over that floor without the
+# relaxed band the longer trajectories need.
+COSMOS3_LPIPS_T2I_THRESHOLD = 0.05
 # T2V/V2V gate at a relaxed KPI-backstop band, not at 0.05: Cosmos3-Nano
 # trajectories are not bit-stable across GPU steppings (nvbugs/6655359 --
 # B300-cut media measured LPIPS 0.020/0.075/0.151 on B200 at 1/9/189 frames
@@ -419,7 +423,7 @@ def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, tmp_path):
         golden_path,
         generated_path,
     )
-    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_T2I_THRESHOLD)
 
 
 def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
