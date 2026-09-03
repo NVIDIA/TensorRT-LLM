@@ -111,12 +111,8 @@ def _infer_generation_mode(client_config: dict[str, Any]) -> str:
         and extra_body["extra_params"].get("enable_audio") is True
     )
     has_legacy_reference = client_config.get("input_reference") is not None
-    has_image_reference = (
-        isinstance(extra_body, dict) and "image_reference" in extra_body
-    )
-    has_video_reference = (
-        isinstance(extra_body, dict) and "video_reference" in extra_body
-    )
+    has_image_reference = isinstance(extra_body, dict) and "image_reference" in extra_body
+    has_video_reference = isinstance(extra_body, dict) and "video_reference" in extra_body
 
     if audio_enabled and (has_legacy_reference or has_image_reference):
         return "ti2av"
