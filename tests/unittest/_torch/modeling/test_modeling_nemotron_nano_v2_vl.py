@@ -504,25 +504,49 @@ class _ForceTokenScript(LogitsProcessor):
     survives untouched so callers can still compare raw model output. Because
     both the batched and the solo run add the *same* bias at the *same* index,
     the bias cancels in their difference and even the forced index stays
-    comparable.
+    comparable. The PyTorch backend supplies fp32 logits to processors, so the
+    bias retains substantially more precision than the comparison tolerance.
     """
 
     BIAS = 1.0e4
 
-    def __init__(self, script):
+    def __init__(self, script: list[int]) -> None:
         self._script = script
-        self._step = 0
+        self._initial_token_count: int | None = None
 
-    def __call__(self, req_id, logits, token_ids, stream_ptr, client_id):
-        stream = None if stream_ptr is None else torch.cuda.ExternalStream(stream_ptr)
-        with torch.cuda.stream(stream):
-            if self._step < len(self._script):
-                logits[..., self._script[self._step]] += self.BIAS
-            self._step += 1
+    def __call__(
+        self,
+        req_id: int,
+        logits: torch.Tensor,
+        token_ids: list[list[int]],
+        stream_ptr: int | None,
+        client_id: int | None,
+    ) -> None:
+        if self._initial_token_count is None:
+            self._initial_token_count = len(token_ids[0])
+        step = len(token_ids[0]) - self._initial_token_count
+        if step < len(self._script):
+            logits[..., self._script[step]] += self.BIAS
+
+
+@pytest.mark.cpu_only
+def test_force_token_script_is_replay_safe() -> None:
+    """Repeated processor calls at one decode step must force the same token."""
+    processor = _ForceTokenScript([3, 7])
+    prompt_token_ids = [[11, 12]]
+
+    for _ in range(2):
+        logits = torch.zeros(1, 1, 10)
+        processor(0, logits, prompt_token_ids, None, None)
+        assert logits.argmax().item() == 3
+
+    logits = torch.zeros(1, 1, 10)
+    processor(0, logits, [[11, 12, 3]], None, None)
+    assert logits.argmax().item() == 7
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
+def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model: LLM) -> None:
     """End-to-end equivalence check for cross-request video batching.
 
     Video counterpart of `test_nemotron_nano_v2_vl_image_batch_equivalence`:
@@ -585,10 +609,11 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
         device="cpu",
     )
 
-    def _sampling_params(script=None):
+    def _sampling_params(script: list[int] | None = None) -> SamplingParams:
         return SamplingParams(
             max_tokens=max_tokens,
             temperature=0.0,
+            ignore_eos=True,
             add_special_tokens=False,
             # Only the teacher-forced runs are compared, so skip the logits
             # storage and device-to-host copy for the script-discovery pass.
@@ -596,7 +621,7 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
             logits_processor=None if script is None else _ForceTokenScript(script),
         )
 
-    def _assert_follows_script(label, token_ids, script):
+    def _assert_follows_script(label: str, token_ids: list[int], script: list[int]) -> None:
         assert list(token_ids) == script, (
             f"{label} did not follow the forced script, so the teacher-forced "
             f"comparison would not be step-aligned.\n"
@@ -609,8 +634,12 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
     scripts = [
         list(nano_llm.generate([inp], _sampling_params())[0].outputs[0].token_ids) for inp in inputs
     ]
+    for i, script in enumerate(scripts):
+        assert len(script) == max_tokens, (
+            f"Request {i}: expected a {max_tokens}-token forcing script, got {len(script)} tokens."
+        )
 
-    sep_logits = []
+    sep_logits: list[torch.Tensor] = []
     for i, inp in enumerate(inputs):
         out = nano_llm.generate([inp], _sampling_params(scripts[i]))[0]
         _assert_follows_script(f"Request {i}: separate run", out.outputs[0].token_ids, scripts[i])
@@ -619,7 +648,7 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
     batched_outputs = nano_llm.generate(inputs, [_sampling_params(script) for script in scripts])
     assert len(batched_outputs) == 2
 
-    for i, (b_out, s_logits) in enumerate(zip(batched_outputs, sep_logits)):
+    for i, (b_out, s_logits) in enumerate(zip(batched_outputs, sep_logits, strict=True)):
         _assert_follows_script(f"Request {i}: batched run", b_out.outputs[0].token_ids, scripts[i])
 
         b_logits = b_out.outputs[0].generation_logits.float().cpu()
@@ -627,8 +656,8 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
             f"Request {i}: generation_logits shape differs between batched "
             f"{tuple(b_logits.shape)} and separate {tuple(s_logits.shape)} runs."
         )
-        assert b_logits.shape[0] == max_tokens, (
-            f"Request {i}: expected {max_tokens} decode steps of logits, got "
+        assert b_logits.shape[0] == len(scripts[i]), (
+            f"Request {i}: expected {len(scripts[i])} decode steps of logits, got "
             f"{b_logits.shape[0]}; the comparison below would silently cover "
             f"fewer steps than intended."
         )
