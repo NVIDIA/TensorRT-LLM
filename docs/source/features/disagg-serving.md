@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Disaggregated Serving
 
 - [Motivation](#motivation)
@@ -13,6 +18,7 @@
   - [Coordinator and Worker Fleet](#coordinator-and-worker-fleet)
 - [Environment Variables](#environment-variables)
 - [Troubleshooting and FAQ](#troubleshooting-and-faq)
+  - [AWS EFA with LIBFABRIC](#aws-efa-with-libfabric)
 
 For the internals of the component that actually moves the KV blocks, see
 [Introduction to KV Cache Transmission](../developer-guide/kv-transfer.md).
@@ -58,6 +64,20 @@ In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache 
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. KV cache exchange architecture</em></sub></p>
+
+### NIXL Backend Configuration
+
+NIXL supports multiple underlying communication backends for KV cache exchange in disaggregated serving. The backend can be configured using the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
+
+**Supported NIXL backends:**
+- **UCX** (default)
+- **LIBFABRIC** (available from v0.16.0)
+
+If an unsupported backend is specified, NIXL will automatically fall back to UCX.
+
+For detailed setup instructions and configuration examples, please refer to the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md).
+
+For AWS EFA deployments, see the [AWS EFA and LIBFABRIC for Disaggregated Serving](disagg-serving-aws-efa.md) checklist.
 
 ### Overlap Optimization
 
@@ -365,6 +385,23 @@ A. Yes, but it's not recommended. TRT-LLM does not implement optimal scheduling 
 A. Yes, it's recommended that different server instances use different GPUs. We support running context and generation servers on the same node or different nodes. The `CUDA_VISIBLE_DEVICES` env variable can be used to control which GPUs are used by each instance.
 
 ### Debugging FAQs
+
+#### AWS EFA with LIBFABRIC
+
+For cross-node deployments on AWS EFA, the NIXL cache transceiver can use the
+LIBFABRIC transport by setting `cache_transceiver_config.backend: NIXL` and
+`TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC`. See
+[AWS EFA and LIBFABRIC for Disaggregated Serving](disagg-serving-aws-efa.md) for
+the EFA device-plugin, container, Kubernetes, and verification checklist.
+
+*Q. Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?*
+
+A: The TensorRT-LLM container doesn't include the NIXL LIBFABRIC plugin by default. You need to either:
+
+1. **Rebuild NIXL**: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above
+2. **Use a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory
+
+Please see the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md) for detailed installation and configuration instructions.
 
 *Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
 

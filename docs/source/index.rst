@@ -1,3 +1,6 @@
+.. SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+.. SPDX-License-Identifier: Apache-2.0
+
 .. TensorRT LLM documentation master file, created by
    sphinx-quickstart on Wed Sep 20 08:35:21 2023.
    You can adapt this file completely to your liking, but it should at least
@@ -65,6 +68,7 @@ Welcome to TensorRT LLM's Documentation!
    features/feature-combination-matrix.md
    features/attention.md
    features/disagg-serving.md
+   features/disagg-serving-aws-efa.md
    features/embeddings.md
    features/kvcache.md
    features/long-sequence.md
