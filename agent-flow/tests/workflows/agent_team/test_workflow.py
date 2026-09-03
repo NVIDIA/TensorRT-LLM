@@ -3268,3 +3268,240 @@ def test_replan_reviewer_prompt_flags_feedback_trigger(tmp_path):
             f"feedback_triggered={flag}: expected marker presence "
             f"{expected}, prompt head: {captured[0][:200]!r}"
         )
+
+
+# --------------------------------------------------------------------------
+# No-in-process-MCP mode (--no-mcp-tools)
+# --------------------------------------------------------------------------
+
+
+def test_no_mcp_mode_builds_agents_without_tools(tmp_path):
+    """Every role — claude-code *and* codex backed — loses its custom tools."""
+    module = _load_module()
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    try:
+        assert wf.use_in_process_tools is False
+        for agent in (wf.plan_drafter, wf.plan_reviewer, wf.coder, wf.reviewer, wf.qa):
+            assert agent.config.backend.tools is None
+            assert agent.config.backend.hooks is None
+            assert agent.config.human_input_enabled is False
+        # The backend split itself is untouched: only the tools are dropped.
+        assert wf.plan_drafter.config.backend.kind == "codex"
+        assert wf.reviewer.config.backend.kind == "codex"
+        assert wf.coder.config.backend.kind == "claude-code"
+    finally:
+        wf.close()
+
+
+def test_mcp_mode_is_the_default_and_keeps_tools(tmp_path):
+    module = _load_module()
+    wf = module.AgentTeamWorkflow(workspace=tmp_path)
+    try:
+        assert wf.use_in_process_tools is True
+        assert wf.plan_drafter.config.backend.tools is not None
+        assert wf.plan_drafter.config.backend.hooks is not None
+        assert wf.plan_drafter.config.human_input_enabled is True
+    finally:
+        wf.close()
+
+
+def test_no_mcp_mode_resets_rebuild_agents_without_tools(tmp_path):
+    """Context recycling must not silently re-arm the MCP tools."""
+    module = _load_module()
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    try:
+        wf._reset_coder()
+        wf._reset_reviewer()
+        assert wf.coder.config.backend.tools is None
+        assert wf.coder.config.backend.hooks is None
+        assert wf.reviewer.config.backend.tools is None
+        assert wf.reviewer.config.backend.hooks is None
+    finally:
+        wf.close()
+
+
+class _HandoffStub:
+    """Callable agent stand-in with a no-op ``__exit__`` (safe for ``close()``).
+
+    ``on_call(stub, prompt)`` runs on each invocation; it can inspect
+    ``stub.calls`` (1-based within the call) and write a handoff file.
+    """
+
+    def __init__(self, on_call) -> None:
+        self.calls = 0
+        self.prompts: list[str] = []
+        self._on_call = on_call
+
+    def __call__(self, prompt: str) -> None:
+        self.calls += 1
+        self.prompts.append(prompt)
+        self._on_call(self, prompt)
+
+    def __exit__(self, *_args, **_kwargs) -> None:
+        return None
+
+
+def test_invoke_agent_records_handoff(tmp_path):
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.coder.__exit__(None, None, None)
+
+    stub = _HandoffStub(
+        lambda s, p: mcpless.handoff_path(wf.turn_dir, "coder").write_text(
+            "summary: did the thing\n", encoding="utf-8"
+        )
+    )
+    wf.coder = stub
+    try:
+        wf._invoke_agent("coder", wf.coder, "PROMPT", 5)
+        entry = progress_module.latest_entry(wf.progress_path, "coder")
+        assert entry["summary"] == "did the thing"
+        assert entry["iteration"] == 5
+        assert entry["agent"] == "coder"
+    finally:
+        wf.close()
+
+
+def test_invoke_agent_missing_handoff_retries_then_raises(tmp_path):
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.reviewer.__exit__(None, None, None)
+
+    stub = _HandoffStub(lambda s, p: None)  # never writes a handoff
+    wf.reviewer = stub
+    try:
+        with pytest.raises(mcpless.HandoffError):
+            wf._invoke_agent("reviewer", wf.reviewer, "P", 1)
+        assert stub.calls == 2  # initial attempt + one corrective retry
+        assert "=== RETRY ===" in stub.prompts[1]
+    finally:
+        wf.close()
+
+
+def test_invoke_agent_invalid_then_valid_handoff_recovers(tmp_path):
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.qa.__exit__(None, None, None)
+
+    def _on_call(s, p):
+        hp = mcpless.handoff_path(wf.turn_dir, "qa")
+        if s.calls == 1:
+            hp.write_text("summary: s\ndecision: MAYBE\n", encoding="utf-8")  # bad enum
+        else:
+            hp.write_text("summary: s\ndecision: APPROVE\nweighted_score: 9\n", encoding="utf-8")
+
+    stub = _HandoffStub(_on_call)
+    wf.qa = stub
+    try:
+        wf._invoke_agent("qa", wf.qa, "P", 2)
+        assert stub.calls == 2
+        assert progress_module.latest_entry(wf.progress_path, "qa")["decision"] == "APPROVE"
+    finally:
+        wf.close()
+
+
+def test_invoke_agent_ignores_a_stale_handoff_from_a_prior_turn(tmp_path):
+    """A leftover file must not be mistaken for this turn's handoff."""
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.coder.__exit__(None, None, None)
+
+    wf.turn_dir.mkdir(parents=True, exist_ok=True)
+    mcpless.handoff_path(wf.turn_dir, "coder").write_text(
+        "summary: stale from last turn\n", encoding="utf-8"
+    )
+
+    stub = _HandoffStub(lambda s, p: None)  # writes nothing this turn
+    wf.coder = stub
+    try:
+        with pytest.raises(mcpless.HandoffError):
+            wf._invoke_agent("coder", wf.coder, "P", 1)
+        assert progress_module.latest_entry(wf.progress_path, "coder") is None
+    finally:
+        wf.close()
+
+
+def test_invoke_agent_prepends_preamble_and_keeps_original_prompt(tmp_path):
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.qa.__exit__(None, None, None)
+
+    stub = _HandoffStub(
+        lambda s, p: mcpless.handoff_path(wf.turn_dir, "qa").write_text(
+            "summary: s\ndecision: APPROVE\nweighted_score: 9\n", encoding="utf-8"
+        )
+    )
+    wf.qa = stub
+    try:
+        wf._invoke_agent("qa", wf.qa, "ORIGINAL-PROMPT-BODY", 1)
+        assert "ORIGINAL-PROMPT-BODY" in stub.prompts[0]
+        assert "available in this run" in stub.prompts[0]
+        assert str(mcpless.handoff_path(wf.turn_dir, "qa")) in stub.prompts[0]
+    finally:
+        wf.close()
+
+
+def test_mcp_mode_invoke_agent_is_passthrough(tmp_path):
+    module = _load_module()
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=True)
+    wf.coder.__exit__(None, None, None)
+    stub = _PromptStub()
+    wf.coder = stub
+    try:
+        wf._invoke_agent("coder", wf.coder, "PLAIN", 1)
+        assert stub.prompts == ["PLAIN"]  # no preamble, no handoff dance
+    finally:
+        wf.close()
+
+
+def test_no_mcp_mode_run_qa_records_the_verdict_end_to_end(tmp_path):
+    """``_run_qa`` (not just ``_invoke_agent``) lands a real progress entry."""
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.qa.__exit__(None, None, None)
+
+    stub = _HandoffStub(
+        lambda s, p: mcpless.handoff_path(wf.turn_dir, "qa").write_text(
+            "summary: verified\ndecision: APPROVE\nweighted_score: 9.5\n", encoding="utf-8"
+        )
+    )
+    wf.qa = stub
+    try:
+        wf._run_qa(7)
+        assert wf._latest_qa_decision() == "APPROVE"
+        assert wf._latest_qa_score() == 9.5
+        assert progress_module.latest_entry(wf.progress_path, "qa")["iteration"] == 7
+    finally:
+        wf.close()
+
+
+def test_plan_human_review_flag_rejected_in_no_mcp(tmp_path):
+    module = _load_module()
+    with pytest.raises(ValueError, match="human review"):
+        module.AgentTeamWorkflow(
+            workspace=tmp_path,
+            use_in_process_tools=False,
+            plan_human_review_enabled=True,
+        )
+
+
+def test_build_human_review_flag_rejected_in_no_mcp(tmp_path):
+    module = _load_module()
+    with pytest.raises(ValueError, match="human review"):
+        module.AgentTeamWorkflow(
+            workspace=tmp_path,
+            use_in_process_tools=False,
+            build_human_review_enabled=True,
+        )
