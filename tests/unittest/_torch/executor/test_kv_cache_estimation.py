@@ -22,7 +22,11 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig, TorchLlmArgs
@@ -106,6 +110,58 @@ def _make_reserve_creator(
         is_disagg=False,
         skip_est=True,
     )
+
+
+def test_adp_dummy_requests_form_rank_uniform_admission_cohorts():
+    """Each ADP profiling wave must route the same sequence shape to every rank."""
+    tp_size = 4
+    max_num_active_requests = 1
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=128))
+        ),
+        use_mrope=False,
+    )
+    creator._mapping = SimpleNamespace(enable_attention_dp=True, tp_size=tp_size)
+    creator._max_num_tokens = 10
+    creator._max_beam_width = 1
+
+    requests = creator._create_dummy_context_requests(input_seq_len=6)
+
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.add_requests(
+        [RequestQueueItem(request_id, request) for request_id, request in enumerate(requests)]
+    )
+
+    rank_states = [RankState(rank=rank) for rank in range(tp_size)]
+    router = DefaultADPRouter(dist=SimpleNamespace(tp_size=tp_size))
+
+    # Each max-active=1 profiling wave drains before the next wave, so the
+    # next admission starts again from empty rank state.
+    for expected_seq_len in (6, 4):
+        admitted = get_from_waiting_queue(
+            waiting_queue,
+            max_req_count=tp_size,
+            enable_attention_dp=True,
+            max_num_active_requests=max_num_active_requests,
+            all_ranks_num_active_requests=[0] * tp_size,
+        )
+
+        routed, expected_num_active_requests = router.route_requests(
+            rank_states,
+            admitted,
+            max_num_active_requests=max_num_active_requests,
+        )
+
+        assert len(admitted) == tp_size
+        assert expected_num_active_requests == 1
+        assert {
+            rank: [len(request_item.request.input_token_ids) for request_item in rank_requests]
+            for rank, rank_requests in routed.items()
+        } == {rank: [expected_seq_len] for rank in range(tp_size)}
+
+    assert not waiting_queue
 
 
 def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
