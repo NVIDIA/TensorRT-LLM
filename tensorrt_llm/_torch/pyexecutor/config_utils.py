@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
-from typing import List, Optional, Sequence
+from typing import List, Optional, Protocol, Sequence, Union, cast
 
 import torch
 import transformers
@@ -12,6 +12,24 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.logger import logger
 
 _GEMMA4_TEXT_MODEL_TYPES = {"gemma4_text", "gemma4_unified_text"}
+
+
+class _NamedLayerType(Protocol):
+    name: str
+
+
+_LayerType = Union[str, _NamedLayerType]
+
+
+class _Gemma4LayerGeometry(Protocol):
+    head_dim: int
+    num_key_value_heads: int
+
+
+class _Gemma4GeometryConfig(Protocol):
+    head_dim: int
+    num_key_value_heads: int
+    layer_types: Sequence[_LayerType]
 
 
 def resolve_cache_transceiver_config(
@@ -73,22 +91,25 @@ def uses_vswa_kv_cache_layout(
                     for window in max_attention_windows))
 
 
-def _is_sliding_attention_layer(layer_type: object) -> bool:
+def _is_sliding_attention_layer(layer_type: _LayerType) -> bool:
     """Return whether a config layer type denotes sliding attention."""
     layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
     return "sliding" in layer_type_name
 
 
-def _get_gemma4_per_layer_config(config: object,
-                                 layer_idx: int) -> Optional[object]:
+def _get_gemma4_per_layer_config(
+    config: _Gemma4GeometryConfig,
+    layer_idx: int,
+) -> Optional[_Gemma4LayerGeometry]:
     """Return a concrete Gemma4 layer config when Transformers provides one."""
     per_layer_config = getattr(config, "per_layer_config", None)
     if per_layer_config is None:
         return None
-    return per_layer_config[layer_idx]
+    return cast(Sequence[_Gemma4LayerGeometry], per_layer_config)[layer_idx]
 
 
-def get_gemma4_layer_head_dim(config: object, layer_idx: int) -> int:
+def get_gemma4_layer_head_dim(config: _Gemma4GeometryConfig,
+                              layer_idx: int) -> int:
     """Return Gemma4's head dimension for one layer across HF config schemas."""
     layer_config = _get_gemma4_per_layer_config(config, layer_idx)
     if layer_config is not None:
@@ -101,7 +122,8 @@ def get_gemma4_layer_head_dim(config: object, layer_idx: int) -> int:
     return global_head_dim if global_head_dim is not None else head_dim
 
 
-def get_gemma4_layer_num_kv_heads(config: object, layer_idx: int) -> int:
+def get_gemma4_layer_num_kv_heads(config: _Gemma4GeometryConfig,
+                                  layer_idx: int) -> int:
     """Return Gemma4's KV-head count for one layer across HF config schemas."""
     layer_config = _get_gemma4_per_layer_config(config, layer_idx)
     if layer_config is not None:
