@@ -1654,6 +1654,7 @@ class SmemKVResource(MemoryResource):
         kv_head_coord: Int32,
         batch_coord: Int32,
         cuseqlen_k: Int32,
+        seqlen_k: Int32,
         kv_tile_start: Int32,
     ) -> None:
         """Issue TMA bulk-copy for one K or V tile."""
@@ -1665,12 +1666,12 @@ class SmemKVResource(MemoryResource):
 
         if cutlass.const_expr(self.cfg.use_paged_kv):
             # Paged-KV path: read pre-staged page IDs and issue one TMA per
-            # (page fragment, d fragment). The descriptor is shaped
-            # (d_inner, num_tokens_per_page, h_kv, total_pages); coords are
-            # (d_off, 0, kv_head_coord, page_id). SMEM layout per stage matches
-            # the contiguous path: two d-halves (tma_copy_kv_granu_elems each)
-            # with page fragments concatenated along the seq axis inside each
-            # d-half.
+            # (page fragment, d fragment). K uses the dense descriptor with
+            # coordinates (d_off, 0, kv_head_coord, page_id). V uses the
+            # flattened ragged descriptor (D, Hkv * page_size, pages); its
+            # per-request logical extent makes TMA zero-fill invalid final-page
+            # rows before PV consumes them. SMEM layout and transaction counts
+            # remain identical for both descriptors.
             tile_idx = kv_tile_start + stage_info.loop_offset + tile_offset
             pages_per_tile = self.cfg.kv_tile_n // self.cfg.num_tokens_per_page
             d_granu_inner = self.cfg.tma_copy_kv_granu_inner
@@ -1714,16 +1715,39 @@ class SmemKVResource(MemoryResource):
                             )
                 for frag in cutlass.range_constexpr(pages_per_tile):
                     page_id = Int32(page_ids[frag])
+                    logical_page_idx = tile_idx * Int32(pages_per_tile) + Int32(frag)
                     for i in cutlass.range_constexpr(self.cfg.tma_copy_kv_stage_iters):
                         d_offset = Int32(
                             head_dim_stage_idx * self.cfg.head_dim_per_stage_kv
                             + i * d_granu_inner
                         )
                         smem_offset = Int32(i * d_iter_elems + frag * page_d_elems)
+                        if cutlass.const_expr(is_v):
+                            tma_coords = transform_ragged_coords(
+                                (
+                                    d_offset,
+                                    kv_head_coord * Int32(self.cfg.num_tokens_per_page),
+                                    page_id,
+                                ),
+                                ragged_dim_idx=1,
+                                ragged_box_size=self.cfg.num_tokens_per_page,
+                                ragged_extent=(
+                                    seqlen_k
+                                    - logical_page_idx
+                                    * Int32(self.cfg.num_tokens_per_page)
+                                ),
+                            )
+                        else:
+                            tma_coords = (
+                                d_offset,
+                                Int32(0),
+                                kv_head_coord,
+                                page_id,
+                            )
                         prims.cp_async_bulk_tensor_shared_cta_global(
                             sK_curr.subview(smem_offset),
                             tma_desc,
-                            (d_offset, Int32(0), kv_head_coord, page_id),
+                            tma_coords,
                             stage_info.barrier,
                         )
             return
@@ -1768,6 +1792,7 @@ class SmemKVResource(MemoryResource):
             kv_head_coord=kv_head_coord,
             batch_coord=batch_coord,
             cuseqlen_k=cuseqlen_k,
+            seqlen_k=Int32(0),
             kv_tile_start=kv_tile_start,
         )
 
@@ -1794,6 +1819,7 @@ class SmemKVResource(MemoryResource):
             kv_head_coord=kv_head_coord,
             batch_coord=batch_coord,
             cuseqlen_k=cuseqlen_k,
+            seqlen_k=Int32(0),
             kv_tile_start=kv_tile_start,
         )
 
@@ -1808,6 +1834,7 @@ class SmemKVResource(MemoryResource):
         kv_head_coord: Int32,
         batch_coord: Int32,
         cuseqlen_k: Int32,
+        seqlen_k: Int32,
         kv_tile_start: Int32,
     ) -> None:
         """TMA load V tile from GMEM to SMEM."""
@@ -1820,6 +1847,7 @@ class SmemKVResource(MemoryResource):
             kv_head_coord=kv_head_coord,
             batch_coord=batch_coord,
             cuseqlen_k=cuseqlen_k,
+            seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
         )
 
@@ -1835,6 +1863,7 @@ class SmemKVResource(MemoryResource):
         kv_head_coord: Int32,
         batch_coord: Int32,
         cuseqlen_k: Int32,
+        seqlen_k: Int32,
         kv_tile_start: Int32,
     ) -> None:
         """TMA load one current or previous V head-dim stage."""
@@ -1847,6 +1876,7 @@ class SmemKVResource(MemoryResource):
             kv_head_coord=kv_head_coord,
             batch_coord=batch_coord,
             cuseqlen_k=cuseqlen_k,
+            seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
         )
 
@@ -1862,6 +1892,7 @@ class SmemKVResource(MemoryResource):
         kv_head_coord: Int32,
         batch_coord: Int32,
         cuseqlen_k: Int32,
+        seqlen_k: Int32,
         kv_tile_start: Int32,
     ) -> None:
         """Load one V head-dimension stage using register-cached page IDs."""
@@ -1875,6 +1906,7 @@ class SmemKVResource(MemoryResource):
             kv_head_coord=kv_head_coord,
             batch_coord=batch_coord,
             cuseqlen_k=cuseqlen_k,
+            seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
         )
 
