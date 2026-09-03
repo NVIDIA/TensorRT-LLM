@@ -858,7 +858,10 @@ class TestPipelineMetadataBridging:
         assert restored.output["default_generation_params"]["height"] == 1024
 
     def test_client_extracts_metadata_from_ready(self):
-        """DiffusionRemoteClient stores metadata when processing a READY response."""
+        """The real READY wait path stores pipeline and telemetry metadata."""
+        import asyncio
+        from types import SimpleNamespace
+
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
         from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
         from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient
@@ -869,17 +872,23 @@ class TestPipelineMetadataBridging:
         ltx2_defaults = LTX2Pipeline.default_generation_params.fget(None)
         ltx2_specs = LTX2Pipeline.extra_param_specs.fget(None)
 
-        # Simulate what _wait_ready_async does: extract from the response payload
-        client = MagicMock(spec=DiffusionRemoteClient)
-        client.default_generation_params = {}
-        client.extra_param_specs = {}
-        client.telemetry_metadata = {}
+        async def wait_ready():
+            client = SimpleNamespace(
+                lock=asyncio.Lock(),
+                completed_responses={-1: restored},
+                default_generation_params={},
+                extra_param_specs={},
+                supports_image_edit=False,
+                ref_slot_specs={},
+                telemetry_metadata={},
+                worker_processes=[],
+                _ext_worker_thread=None,
+                response_event=asyncio.Event(),
+            )
+            await DiffusionRemoteClient._wait_ready_async(client)
+            return client
 
-        payload = restored.output
-        if isinstance(payload, dict):
-            client.default_generation_params = payload.get("default_generation_params", {})
-            client.extra_param_specs = payload.get("extra_param_specs", {})
-            client.telemetry_metadata = payload.get("telemetry_metadata", {})
+        client = asyncio.run(wait_ready())
 
         assert client.default_generation_params == ltx2_defaults
         assert set(client.extra_param_specs.keys()) == set(ltx2_specs.keys())

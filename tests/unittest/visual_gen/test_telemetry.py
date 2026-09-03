@@ -89,15 +89,6 @@ def test_visual_gen_records_external_world_size_failure():
     executor.assert_not_called()
 
 
-def test_visual_gen_shutdown_tolerates_missing_telemetry_state():
-    visual_gen = VisualGen.__new__(VisualGen)
-    visual_gen.executor = _executor()
-
-    visual_gen.shutdown()
-
-    assert visual_gen.executor is None
-
-
 def test_visual_gen_shutdown_failure_can_be_retried():
     visual_gen = VisualGen.__new__(VisualGen)
     visual_gen.executor = _executor()

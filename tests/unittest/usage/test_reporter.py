@@ -203,46 +203,8 @@ class TestReportUsage:
         assert thread_cls.call_args.kwargs["daemon"] is True
         mock_thread.start.assert_called_once()
 
-    def test_visual_gen_background_reporter_sends_bounded_initial_event(self, reporter_session):
-        """Resolved worker metadata appears in the VisualGen initial event."""
-        usage_lib._REPORTER_STOP.set()
-        sent = []
-        metadata = {
-            "model_id": "nvidia/test-model",
-            "pipeline_class_name": "TestPipeline",
-            "resolved_pipeline_class": "ResolvedPipeline",
-            "modality": "image",
-            "launch_mode": "local_spawn",
-            "node_count": 1,
-            "n_workers": 2,
-            "quantization_algo": "NVFP4",
-            "dynamic_weight_quant": True,
-            "quantized_components": ["transformer"],
-        }
-
-        with (
-            patch.object(usage_lib, "_collect_system_info", return_value={}),
-            patch.object(usage_lib, "_collect_gpu_info", return_value={"gpu_count": 2}),
-            patch.object(
-                usage_lib,
-                "_collect_visual_gen_config_payloads",
-                return_value=("{}", "{}"),
-            ),
-            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
-        ):
-            usage_lib._visual_gen_background_reporter(
-                _visual_gen_args(), metadata, "visual_gen_class"
-            )
-
-        parameters = sent[0]["events"][0]["parameters"]
-        assert sent[0]["events"][0]["name"] == "trtllm_visual_gen_initial_report"
-        assert parameters["modelId"] == "nvidia/test-model"
-        assert parameters["modality"] == "image"
-        assert parameters["nWorkers"] == 2
-        assert parameters["quantizedComponentsJson"] == '["transformer"]'
-
-    def test_visual_gen_heartbeat_reports_runtime_and_current_counters(self, monkeypatch):
-        """VisualGen heartbeat carries topology and the latest lifecycle snapshot."""
+    def test_visual_gen_reporter_sends_initial_and_heartbeat(self, monkeypatch):
+        """VisualGen reports bounded runtime metadata and current lifecycle counters."""
 
         class _OneHeartbeat:
             def __init__(self):
@@ -257,6 +219,22 @@ class TestReportUsage:
         assert usage_lib.record_visual_gen_initialization_attempt()
         assert usage_lib.record_visual_gen_initialized()
         sent = []
+        visual_gen_args = _visual_gen_args()
+        visual_gen_args.parallel_config.cfg_size = 2
+        visual_gen_args.parallel_config.tp_size = 2
+        visual_gen_args.cache_config = SimpleNamespace(cache_backend="teacache")
+        metadata = {
+            "model_id": "nvidia/test-model",
+            "pipeline_class_name": "TestPipeline",
+            "resolved_pipeline_class": "ResolvedPipeline",
+            "modality": "image",
+            "launch_mode": "local_spawn",
+            "node_count": 2,
+            "n_workers": 3,
+            "quantization_algo": "NVFP4",
+            "dynamic_weight_quant": True,
+            "quantized_components": ["transformer"],
+        }
 
         with (
             patch.object(usage_lib, "_collect_system_info", return_value={}),
@@ -269,14 +247,31 @@ class TestReportUsage:
             patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
             patch.object(usage_lib, "_REPORTER_STOP", _OneHeartbeat()),
         ):
-            usage_lib._visual_gen_background_reporter(
-                _visual_gen_args(), {"n_workers": 3}, "visual_gen_class"
-            )
+            usage_lib._visual_gen_background_reporter(visual_gen_args, metadata, "visual_gen_class")
 
         assert [payload["events"][0]["name"] for payload in sent] == [
             "trtllm_visual_gen_initial_report",
             "trtllm_visual_gen_heartbeat",
         ]
+        initial = sent[0]["events"][0]["parameters"]
+        expected_initial = {
+            "modelId": "nvidia/test-model",
+            "pipelineClassName": "TestPipeline",
+            "resolvedPipelineClass": "ResolvedPipeline",
+            "modality": "image",
+            "launchMode": "local_spawn",
+            "nodeCount": 2,
+            "nWorkers": 3,
+            "quantizationAlgo": "NVFP4",
+            "dynamicWeightQuant": True,
+            "quantizedComponentsJson": '["transformer"]',
+            "cfgSize": 2,
+            "tensorParallelSize": 2,
+            "stepCaching": True,
+            "cacheBackend": "teacache",
+        }
+        assert {key: initial[key] for key in expected_initial} == expected_initial
+
         heartbeat = sent[1]["events"][0]["parameters"]
         assert heartbeat["seq"] == 0
         assert heartbeat["runtimeKind"] == "visual_gen"
