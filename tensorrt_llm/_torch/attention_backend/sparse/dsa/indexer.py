@@ -133,7 +133,7 @@ def _compute_slot_mappings(
     tokens_per_block: int,
     quant_block_size: int,
     data_bytes_per_token: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Compute flat byte indices for FP8/FP4 data and scales from global token positions.
 
     Shared by Indexer.prepare() (CPU) and on_update_kv_lens() (GPU) to avoid
@@ -257,6 +257,52 @@ def transform_local_topk_and_prepare_pool_view(
     )
 
     return global_indices, attn_metadata._cached_pool_view
+
+
+def transform_local_topk_and_prepare_pool_view_grouped(
+    topk_indices: torch.Tensor,
+    attn_metadata: "DSAtrtllmAttentionMetadata",
+    layer_ids: torch.Tensor,
+    page_index_scale: int,
+    is_generation: bool = False,
+) -> torch.Tensor:
+    """Grouped (cross-layer fan-out) variant of the local-topk → global-index
+    remap (``TRTLLM_DISABLE_DSA_GROUP_REMAP``).
+
+    Computes the global-index output for a whole full+shared indexer group in a
+    single launch. All members of a group share the same top-k selection,
+    ``req_idx`` and ``block_table`` (constant across layers within a forward);
+    only the additive ``layer_offset * tokens_per_block`` term differs per
+    member. ``layer_ids`` (int32 CUDA tensor of length ``group_size``) carries
+    each member's layer offset; ``page_index_scale`` is the (uniform) primary-
+    pool page scale for the group.
+
+    Returns a tensor of shape ``[group_size, num_tokens, topk]``; slice ``[z]``
+    is bit-identical to ``transform_local_topk_and_prepare_pool_view`` for the
+    member with offset ``layer_ids[z]``. MLA-only path.
+    """
+    assert topk_indices.dtype == torch.int32
+
+    attn_metadata._ensure_pool_view_cached()
+
+    if is_generation:
+        block_table = attn_metadata._cached_block_table_gen
+        req_idx = attn_metadata._cached_req_idx_gen
+    else:
+        block_table = attn_metadata._cached_block_table_ctx
+        req_idx = attn_metadata._cached_req_idx_ctx
+
+    global_indices = torch.ops.trtllm.convert_req_index_to_global_grouped(
+        req_idx,
+        block_table,
+        topk_indices,
+        attn_metadata._cached_tokens_per_block,
+        topk_indices.shape[1],
+        page_index_scale * attn_metadata._cached_tokens_per_block,
+        layer_ids,
+    )
+
+    return global_indices
 
 
 def split_prefill_chunks(
@@ -582,11 +628,19 @@ class Indexer(nn.Module):
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True,
         )
+        # When TRTLLM_DSA_INDEXER_BF16=1, run the fused wk + weights_proj
+        # projection in the model dtype instead of fp32. The fp32 path has no
+        # native GEMM on recent architectures (it falls back to a TF32 tensor-
+        # core kernel) and requires bf16<->fp32 casts around it; the model-dtype
+        # path runs a single native GEMM with no casts. The default stays fp32
+        # because the indexer top-k selection is precision sensitive.
+        self._indexer_bf16 = os.environ.get("TRTLLM_DSA_INDEXER_BF16", "0") == "1"
+        _wk_wp_dtype = dtype if self._indexer_bf16 else torch.float32
         self.wk = Linear(
             self.hidden_size,
             self.head_dim,
             bias=False,
-            dtype=torch.float32,
+            dtype=_wk_wp_dtype,
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True,
@@ -596,14 +650,15 @@ class Indexer(nn.Module):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            dtype=torch.float32,
+            dtype=_wk_wp_dtype,
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True,
         )
 
-        # Fused wk + weights_proj weight for single F.linear FP32 GEMM under allow_tf32.
-        # Maps to TF32 tensor cores on Ampere+.
+        # Fused wk + weights_proj weight for a single F.linear GEMM. fp32 by
+        # default (TF32 tensor cores on Ampere+); model dtype when
+        # TRTLLM_DSA_INDEXER_BF16 is enabled.
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
 
         indexer_rope_interleave = sparse_params.indexer_rope_interleave
@@ -673,6 +728,16 @@ class Indexer(nn.Module):
             prefill_implementation=TopKImplementation.CUDA_RADIX,
             decode_implementation=decode_top_k_implementation,
             compress_ratio=self.compress_ratio,
+        )
+        # GVR emission-assisted decode (opt-in, experimental): the FP4/FP8
+        # indexer epilogue emits candidates the GVR Top-K consumes (see
+        # gvr_emission / gvr_routing; state lives on the TopK module)
+        # only the FP4 scoring op accepts emission kwargs
+        self.use_gvr_emission = (
+            os.environ.get("TRTLLM_GVR_EMISSION", "0") == "1"
+            and decode_top_k_implementation == TopKImplementation.CUTE_DSL_GVR
+            and self.use_cute_dsl_paged_mqa_logits
+            and self.use_fp4
         )
 
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
@@ -1550,6 +1615,13 @@ class Indexer(nn.Module):
                 gvr_prior_indices,
                 request_offset=num_generations,
             )
+            if self.use_gvr_emission:
+                # reused slots cold-start the emission closed loop; stale
+                # lines only mis-place cuts - counts are re-measured
+                # in-kernel, so exactness never rides on this reset
+                self.top_k.reset_gvr_emission_rows(
+                    slice(num_generations, num_generations + num_contexts)
+                )
 
         reuse_topk = (
             self.mtp_index_share
@@ -1642,6 +1714,25 @@ class Indexer(nn.Module):
                     metadata.dsl_expand_factor > 1
                     and next_n == metadata.dsl_expand_factor * metadata.dsl_atom
                 )
+                gvr_emit_kwargs: dict = {}
+                # emitting for a step the Top-K cannot consume only churns
+                # the closed-loop state, so gate on the consumable shape
+                if (
+                    self.use_gvr_emission
+                    and gvr_prior_indices is not None
+                    and next_n == 1
+                    and not dsl_atom_split
+                    and num_gen_tokens <= 256
+                    # ext tiers are single-CTA/sort-path only; row reordering
+                    # routes the Top-K through order_row, which excludes them
+                    and metadata.kv_lens_row_reorder is None
+                ):
+                    gvr_emit_kwargs = self.top_k.prepare_gvr_emission(
+                        num_generations,
+                        indexer_max_seq_len,
+                        torch.cuda.get_device_properties(q_decode.device).multi_processor_count,
+                        gvr_prior_indices,
+                    )
                 if self.use_fp4:
                     # FP4 DSL signature splits DG's (q, sf_q) tuple into two
                     # separate args and requires q.dtype == uint8 (q_decode
@@ -1674,6 +1765,7 @@ class Indexer(nn.Module):
                         dsl_block_table,
                         dsl_schedule_meta,
                         indexer_max_seq_len,
+                        **gvr_emit_kwargs,
                     )
                 else:
                     # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
@@ -1701,6 +1793,7 @@ class Indexer(nn.Module):
                         fp8_block_table,
                         fp8_schedule_meta,
                         indexer_max_seq_len,
+                        **gvr_emit_kwargs,
                     )
             else:
                 decode_q_scale = (
@@ -1883,16 +1976,21 @@ class Indexer(nn.Module):
             hidden_states_bf = hidden_states.unquantized_hidden_states
         else:
             hidden_states_bf = hidden_states
-        hidden_float = _to_float(hidden_states_bf)
-        with _tf32_matmul_enabled():
-            # F.linear computes input @ weight.T internally; no explicit .t() needed.
-            # _fused_wk_wp_weight is [head_dim + n_heads, hidden_size] (nn.Linear convention).
-            # Goes through PyTorch's cuBLAS handle which respects allow_tf32 and
-            # dispatches CUBLAS_COMPUTE_32F_FAST_TF32, unlike torch.ops.trtllm.cublas_mm
-            # which uses its own handle and always falls back to CUDA-core SGEMM.
-            fused_out = F.linear(hidden_float, self._fused_wk_wp_weight)
+        if self._indexer_bf16:
+            # hidden_states_bf and _fused_wk_wp_weight are both the model dtype,
+            # so this runs a single native GEMM with no fp32 cast around it.
+            fused_out = F.linear(hidden_states_bf, self._fused_wk_wp_weight)
+        else:
+            with _tf32_matmul_enabled():
+                # F.linear computes input @ weight.T internally; no explicit .t() needed.
+                # _fused_wk_wp_weight is [head_dim + n_heads, hidden_size] (nn.Linear convention).
+                # Goes through PyTorch's cuBLAS handle which respects allow_tf32 and
+                # dispatches CUBLAS_COMPUTE_32F_FAST_TF32, unlike torch.ops.trtllm.cublas_mm
+                # which uses its own handle and always falls back to CUDA-core SGEMM.
+                fused_out = F.linear(_to_float(hidden_states_bf), self._fused_wk_wp_weight)
         indexer_k, weights = fused_out.split([self.head_dim, self.n_heads], dim=-1)
-        # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)
+        # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE,
+        # FP8 quantize); a no-op when the projection already ran in the model dtype.
         indexer_k = indexer_k.to(hidden_states_bf.dtype)
 
         q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(qr, indexer_k, position_ids)

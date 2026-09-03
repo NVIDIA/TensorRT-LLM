@@ -30,6 +30,16 @@ slurm_install_setup() {
     lock_file="install_lock_job_${SLURM_JOB_ID:-local}_node_${SLURM_NODEID:-0}.lock"
 
     if [ $SLURM_LOCALID -eq 0 ]; then
+        # Authenticate github.com traffic. GITHUB_CLONE_TOKEN is exported by the sbatch launch script
+        set +x
+        if [ -n "${GITHUB_CLONE_TOKEN:-}" ]; then
+            git config --global --replace-all \
+                url."https://x-access-token:${GITHUB_CLONE_TOKEN}@github.com/".insteadOf \
+                "https://github.com/"
+            echo "Configured authenticated github.com access via git insteadOf."
+        fi
+        set -x
+
         if [ -f "$lock_file" ]; then
             rm -f "$lock_file"
         fi

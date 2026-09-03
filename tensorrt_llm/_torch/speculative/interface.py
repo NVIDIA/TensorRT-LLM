@@ -92,6 +92,11 @@ def rejection_sampling_one_model(
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
 
+# Prompt token IDs are nonnegative. Use a distinct value for positions without
+# a valid prompt lookahead token so CUDA-graph replay can select the sampled
+# token without a separate validity buffer.
+INVALID_PROMPT_LOOKAHEAD_TOKEN = -1
+
 # RNG pool configuration for the fractional (probabilistic) component of the
 # synthetic acceptance rate. Pool size MUST be a power of two so we can use
 # a bitmask (`& (pool_size - 1)`) for wrap-around — this stays cheap and
@@ -117,9 +122,14 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if spec_config._use_shared_kv_cache:
         return False
-    # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
-    # model does not read the paged draft KV cache managed by attention metadata.
-    if spec_config.spec_dec_mode.is_dspark():
+    # The embedded DSpark draft owns a dedicated rolling-window cache in
+    # DSv4DSparkWorker and never reads the paged draft KV cache that attention
+    # metadata manages. A standalone DSpark drafter runs on DSparkWorker
+    # (DFlash lineage), which does read it, so it keeps the default -- hence a
+    # form check, not a mode check
+    # (see DSparkDecodingConfig.draft_is_embedded_in_target).
+    if (spec_config.spec_dec_mode.is_dspark()
+            and spec_config.draft_is_embedded_in_target):
         return False
     return spec_config._allow_separate_draft_kv_cache
 
@@ -450,6 +460,10 @@ class SpecMetadata:
     draft_tokens: Optional[torch.Tensor] = None
     # The length of the draft tokens.
     draft_lens: Optional[torch.Tensor] = None
+    # Immediate prompt token following each context request's current chunk.
+    # Shape: [max_num_requests]. Final-chunk rows contain
+    # INVALID_PROMPT_LOOKAHEAD_TOKEN.
+    context_prompt_lookahead_tokens: Optional[torch.Tensor] = None
     # The request ID of each sequence in the batch.
     # The shape is (batch_size).
     request_ids: Optional[List[int]] = None
@@ -660,6 +674,37 @@ class SpecMetadata:
 
     def __post_init__(self):
         pass
+
+    def allocate_context_prompt_lookahead(self) -> None:
+        """Allocate a CUDA-graph-stable prompt lookahead buffer."""
+        self.context_prompt_lookahead_tokens = torch.full(
+            (self.max_num_requests, ),
+            INVALID_PROMPT_LOOKAHEAD_TOKEN,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+    def populate_context_prompt_lookahead(self,
+                                          lookahead_tokens: List[int]) -> None:
+        """Populate immediate prompt lookahead for this batch's context rows."""
+        if self.context_prompt_lookahead_tokens is None:
+            return
+
+        num_contexts = len(lookahead_tokens)
+        if num_contexts == 0:
+            return
+        assert num_contexts <= self.context_prompt_lookahead_tokens.shape[0], (
+            f"Context batch size {num_contexts} exceeds prompt lookahead "
+            f"capacity {self.context_prompt_lookahead_tokens.shape[0]}")
+
+        tokens_cpu = torch.tensor(
+            lookahead_tokens,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        self.context_prompt_lookahead_tokens[:num_contexts].copy_(
+            tokens_cpu, non_blocking=True)
 
     def _populate_request_rng_state(
             self, requests: list["LlmRequest"],
@@ -2588,8 +2633,15 @@ class SpecWorkerBase(nn.Module, ABC):
                                        dim=1)
         return next_new_tokens
 
-    def _prepare_context_input_ids(self, input_ids, num_ctx_tokens, gather_ids,
-                                   accepted_tokens, num_contexts):
+    def _prepare_context_input_ids(
+        self,
+        input_ids,
+        num_ctx_tokens,
+        gather_ids,
+        accepted_tokens,
+        num_contexts,
+        prompt_lookahead_tokens=None,
+    ):
         """
         Prepare context input IDs for draft model forward.
         Shifts input IDs left by 1 and places the first accepted token at gather positions.
@@ -2600,6 +2652,8 @@ class SpecWorkerBase(nn.Module, ABC):
             gather_ids: Indices for placing accepted tokens (last token positions)
             accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
             num_contexts: Number of context requests
+            prompt_lookahead_tokens: Optional immediate prompt token following
+                each current context chunk. Shape: [max_num_requests].
 
         Returns:
             input_ids_ctx: Prepared context input IDs
@@ -2610,8 +2664,15 @@ class SpecWorkerBase(nn.Module, ABC):
                                              dtype=torch.int32,
                                              device="cuda")
             input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
-            input_ids_ctx[
-                gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+            context_tail_tokens = accepted_tokens[:num_contexts, 0]
+            if prompt_lookahead_tokens is not None:
+                lookahead_tokens = prompt_lookahead_tokens[:num_contexts]
+                context_tail_tokens = torch.where(
+                    lookahead_tokens != INVALID_PROMPT_LOOKAHEAD_TOKEN,
+                    lookahead_tokens,
+                    context_tail_tokens,
+                )
+            input_ids_ctx[gather_ids[:num_contexts]] = context_tail_tokens
             return input_ids_ctx
         else:
             return torch.empty(0, dtype=torch.int32, device="cuda")

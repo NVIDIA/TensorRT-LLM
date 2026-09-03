@@ -13,6 +13,9 @@ Both TRTLLM and HF pipelines read boundary_ratio from the checkpoint model_index
 Model tested:
   - Wan2.2-T2V-A14B-Diffusers   (480x832, 33 frames)
 
+Also covers offloading vs HuggingFace. Offload-specific baseline and CUDA graph
+incompatibility tests are in test_wan22_t2v_offload.py.
+
 Run:
     pytest tests/unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py -v -s
 
@@ -39,6 +42,7 @@ from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, Pi
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
     CacheDiTConfig,
+    CpuOffloadConfig,
     TorchCompileConfig,
     VisualGenArgs,
 )
@@ -90,15 +94,20 @@ COS_SIM_THRESHOLD = 0.99
 # ============================================================================
 
 
-def _load_trtllm_pipeline(checkpoint_path: str):
+def _load_trtllm_pipeline(
+    checkpoint_path: str,
+    *,
+    enable_offload: bool = False,
+):
     """Load TRTLLM WanPipeline (two-stage) without torch.compile or warmup."""
     if not os.path.exists(checkpoint_path):
         pytest.skip(f"Checkpoint not found: {checkpoint_path}")
-    args = VisualGenArgs(
+    kwargs = dict(
         model=checkpoint_path,
         torch_compile_config=TorchCompileConfig(enable=False),
+        cpu_offload_config=CpuOffloadConfig(enable=enable_offload),
     )
-    return PipelineLoader(args).load(skip_warmup=True)
+    return PipelineLoader(VisualGenArgs(**kwargs)).load(skip_warmup=True)
 
 
 def _load_hf_pipeline(checkpoint_path: str):
@@ -183,10 +192,18 @@ def _assert_pipeline_matches_hf(
     num_frames: int,
     guidance_scale: float,
     model_label: str,
+    *,
+    enable_offload: bool = False,
 ) -> None:
     """Run TRTLLM and HF pipelines sequentially, compare decoded video output."""
     # --- TRTLLM ---
-    trtllm_pipe = _load_trtllm_pipeline(checkpoint_path)
+    trtllm_pipe = _load_trtllm_pipeline(
+        checkpoint_path,
+        enable_offload=enable_offload,
+    )
+    if enable_offload:
+        assert trtllm_pipe.offloader.stages(), f"{model_label}: offload stages must be configured"
+        assert trtllm_pipe.offloader.offload_pipeline is not None
 
     # Confirm two-stage denoising is active (Wan 2.2 specific sanity check)
     assert trtllm_pipe.transformer_2 is not None, (
@@ -269,6 +286,17 @@ class TestWan22_A14B_PipelineCorrectness:
             num_frames=9,
             guidance_scale=4.0,
             model_label="Wan2.2-T2V-A14B",
+        )
+
+    def test_cosine_similarity_with_offload(self):
+        _assert_pipeline_matches_hf(
+            checkpoint_path=WAN22_A14B_PATH,
+            height=480,
+            width=832,
+            num_frames=9,
+            guidance_scale=4.0,
+            model_label="Wan2.2-T2V-A14B (offload)",
+            enable_offload=True,
         )
 
 

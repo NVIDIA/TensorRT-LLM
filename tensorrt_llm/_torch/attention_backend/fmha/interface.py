@@ -85,6 +85,8 @@ class FmhaPhase(str, Enum):
 class Fmha(ABC):
     """Common runtime contract for TRT-LLM attention FMHA libraries."""
 
+    supports_skip_correction = False
+
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
 
@@ -109,7 +111,15 @@ class Fmha(ABC):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        """Return whether this library supports the request or requested phase."""
+        """Return whether this library supports the request or requested phase.
+
+        Forward-varying selection conditions must be represented in
+        ``TrtllmAttention._make_fmha_cache_key``. Conditions omitted
+        from that key must remain invariant for the attention instance. Size-
+        based conditions must also preserve the same result throughout each
+        FMHA cache grid cell or add the relevant boundary to the grid's
+        candidate list.
+        """
         return True
 
     @abstractmethod

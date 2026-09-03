@@ -110,17 +110,16 @@ from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams
 from ..model_config import ModelConfig
-from ..modules.fused_moe import ConfigurableMoE, create_moe
-from ..modules.fused_moe.interface import _compute_ep_partition
-from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
+from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.linear import TensorParallelMode, load_weight_shard
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
-from ..utils import ActivationType, ActType_TrtllmGen
+from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, create_moe
+from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -1120,6 +1119,16 @@ class KimiK3MoERuntime(nn.Module):
             layer_idx=layer_idx,
             # Let CommunicationFactory select the best available strategy.
             communication_method=None,
+            activation=SiTuActivation(
+                gate_softcap=situ_beta,
+                linear_softcap=situ_linear_beta,
+            ),
+            # A MegaMoE request that silently degraded to CUTLASS would be
+            # benchmarked as if it were MegaMoE, and the decline is easy to
+            # trigger (EP-only, own token / top-k limits). Fail in the resolver
+            # instead, which reports the rejection trail.
+            allow_backend_degradation=routed_moe_model_config.moe_backend
+            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"),
         )
         # trtllm-gen ships SiTu cubins for exactly one dtype combination
         # (``Bmm_MxE4m3_MxE2m1MxE4m3`` = MXFP8 act x MXFP4 weight) and has no
@@ -1141,82 +1150,11 @@ class KimiK3MoERuntime(nn.Module):
                 "CUTLASS or MEGAMOE_CUTEDSL."
             )
 
-        if routed_moe_model_config.moe_backend == "CUTLASS":
-            # Size the per-expert SiTU constants with the same ceil/floor
-            # partition the MoE backend uses for ``expert_size_per_partition``.
-            # A plain ``num_experts // ep_size`` is one element short on the
-            # first ``num_experts % ep_size`` ranks, which trips the
-            # ``swiglu_alpha must have num_experts_on_rank elements`` check in
-            # moeOp.cpp. K3's 384 experts divide evenly at EP8/EP16, so the
-            # mismatch is latent there but real for any uneven split.
-            local_num_experts, _, _ = _compute_ep_partition(
-                self.num_experts,
-                routed_moe_model_config.mapping.moe_ep_size,
-                routed_moe_model_config.mapping.moe_ep_rank,
-            )
-            device = torch.device("cuda", torch.cuda.current_device())
-            self.routed_situ_alpha = torch.full(
-                (local_num_experts,), float(situ_beta), dtype=torch.float32, device=device
-            )
-            self.routed_situ_beta = torch.full(
-                (local_num_experts,),
-                situ_linear_beta,
-                dtype=torch.float32,
-                device=device,
-            )
-            routed_moe_kwargs.update(
-                activation_type=ActivationType.SiTu,
-                swiglu_alpha=self.routed_situ_alpha,
-                swiglu_beta=self.routed_situ_beta,
-            )
-        elif routed_moe_model_config.moe_backend == "TRTLLM":
-            routed_moe_kwargs.update(
-                trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-                # Cubin alpha is the gate-side SiTU beta; cubin beta is the
-                # linear-side SiTU beta.
-                trtllm_gen_activation_alpha=situ_beta,
-                trtllm_gen_activation_beta=situ_linear_beta,
-            )
-        elif routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            routed_moe_kwargs.update(
-                activation="situ",
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
-        # MEGAMOE_CUTEDSL has no branch on purpose. ``MegaMoECuteDsl`` resolves
-        # SiTU from the pretrained config in ``_resolve_activation_config``
-        # (``activation=None`` -> "situ" when ``activation_situ_beta`` is
-        # present), and ``create_moe`` currently rejects the explicit
-        # ``activation``/``situ_beta``/``situ_linear_beta`` trio for anything
-        # other than ``MegaMoEDeepGemm``, so passing them here would raise.
-        # Unifying that plumbing is tracked in TRTLLM-15649.
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
                 "Kimi K3 requires ConfigurableMoE; ENABLE_CONFIGURABLE_MOE must not be disabled."
             )
-        if routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            from ..modules.fused_moe.mega_moe import MegaMoEDeepGemm
-
-            if not isinstance(self.routed_experts.backend, MegaMoEDeepGemm):
-                raise RuntimeError(
-                    "Kimi K3 explicitly requested MEGAMOE_DEEPGEMM, but the "
-                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
-                )
-        if routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL":
-            from ..modules.fused_moe.mega_moe import MegaMoECuteDsl
-
-            # Same guard as MEGAMOE_DEEPGEMM above, and for the same reason:
-            # create_moe silently falls back when a backend declines the
-            # config, and for MegaMoE the decline is easy to trigger (it is
-            # EP-only and has its own token/top-k limits), so an explicit
-            # request that quietly became CUTLASS would be measured as if it
-            # were MegaMoE.
-            if not isinstance(self.routed_experts.backend, MegaMoECuteDsl):
-                raise RuntimeError(
-                    "Kimi K3 explicitly requested MEGAMOE_CUTEDSL, but the "
-                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
-                )
         if self.routed_experts.layer_load_balancer is not None:
             raise NotImplementedError(
                 "Kimi K3 packed-checkpoint streaming does not yet support "
@@ -1548,7 +1486,8 @@ class KimiMLARuntime(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
-        out = self.mixer(hidden_states, attn_metadata)
+        # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
+        out = self.mixer(None, hidden_states, attn_metadata)
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
@@ -1682,12 +1621,20 @@ class KimiLinearDecoderLayer(nn.Module):
         block_residual: torch.Tensor,
         num_snapshots: int,
         attn_metadata: AttentionMetadata,
+        capture: Optional[Tuple[Any, int]] = None,
     ) -> Tuple[torch.Tensor, int]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
         ``block_residual`` is a preallocated snapshot bank in kernel-native
         ``[K_max, M, H]`` layout. Returns the running prefix sum and the
         number of valid bank rows.
+
+        ``capture`` is ``(spec_metadata, layer_id)`` and taps the DSpark aux
+        stream for the layer BEFORE this one: the aggregated stream for layer j
+        is by definition what its next consumer sees, so the mixture computed
+        below already is it. Reading it here beats recomputing it, and is only
+        possible because K3 asserts pp_size == 1 -- layer j+1 is always local.
+        PP support would need a recompute at the rank boundary.
         """
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
@@ -1699,6 +1646,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
             )
+        if capture is not None:
+            capture[0].maybe_capture_hidden_states(capture[1], hidden_states, None)
 
         if self.layer_idx % self.attn_res_block_size == 0:
             block_residual[num_snapshots].copy_(prefix_sum)
@@ -1813,19 +1762,52 @@ class KimiLinearModel(DecoderModel):
             hidden_states.shape[1],
         )
         num_snapshots = 0
-        for layer in self.layers:
+        capture_set = (
+            getattr(spec_metadata, "_capture_layer_set", None)
+            if spec_metadata is not None
+            else None
+        )
+        for i, layer in enumerate(self.layers):
+            # DFlash/DSpark hidden-state capture. The drafter is distilled on
+            # the aggregated stream value -- the pre-norm softmax mixture its
+            # next consumer sees -- not on the raw prefix sum a layer returns,
+            # which is SGLang's fallback for models without the
+            # attention-residual scheme. Capturing the prefix sum costs 4.5pt
+            # of draft acceptance on K3 + RadixArk DSpark (AR 66.9% -> 71.4%).
+            # The tap fires inside layer i+1, which computes that tensor
+            # anyway; see its forward docstring. Ground truth: SGLang
+            # kimi_k3.py:2697 _dspark_capture_stream, attn_residual.py:313
+            # aggregate_stream_torch.
+            capture = None
+            if (
+                spec_metadata is not None
+                and i > 0
+                and (capture_set is None or self.layers[i - 1].layer_idx in capture_set)
+            ):
+                capture = (spec_metadata, self.layers[i - 1].layer_idx)
             hidden_states, num_snapshots = layer(
-                hidden_states, block_residual, num_snapshots, attn_metadata
+                hidden_states, block_residual, num_snapshots, attn_metadata, capture=capture
             )
-            if spec_metadata is not None:
-                # DFlash hidden-state capture. K3's attn-residual scheme
-                # already folds the residual into the running prefix sum
-                # returned by each layer, so unlike Qwen3/Llama we pass the
-                # full hidden state with residual=None. Whether the drafter
-                # is trained against this prefix sum or some other tap point
-                # must be confirmed against the K3 drafter training recipe
-                # before real weights are used.
-                spec_metadata.maybe_capture_hidden_states(layer.layer_idx, hidden_states, None)
+
+        # The last layer has no successor, so this one recompute is
+        # unavoidable -- output-side score weights, matching SGLang's
+        # layer_idx + 1 >= end_layer branch. Unreachable for K3's capture set
+        # against 93 layers; kept so a set that does include the final layer
+        # gets the right tensor rather than the raw prefix sum.
+        if spec_metadata is not None and len(self.layers) > 0:
+            last = self.layers[-1]
+            if capture_set is None or last.layer_idx in capture_set:
+                tail = (
+                    _apply_attn_res(
+                        hidden_states,
+                        block_residual[:num_snapshots],
+                        self.output_attn_res_proj,
+                        self.output_attn_res_norm,
+                    )
+                    if num_snapshots > 0
+                    else hidden_states
+                )
+                spec_metadata.maybe_capture_hidden_states(last.layer_idx, tail, None)
 
         hidden_states = _apply_attn_res(
             hidden_states,
@@ -1943,6 +1925,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     (``modeling_kimi_k3_vl``). The composite ``KimiK3ForConditionalGeneration``
     architecture is registered by that wrapper, not here."""
 
+    mamba_metadata_cls = KimiK3MambaMetadata
+
     def __init__(self, model_config: ModelConfig):
         cfg = _get_text_config(model_config.pretrained_config)
         assert model_config.mapping.pp_size == 1, "Kimi K3 does not support pipeline parallelism"
@@ -1958,16 +1942,20 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         #   separate dense checkpoint (K2.7-Code-DFlash schema) consumed by
         #   the generic DFlashForCausalLM wrapper, and the target only has
         #   to expose per-layer hidden states via maybe_capture_hidden_states
-        #   (see KimiLinearModel.forward). No trained K3 drafter exists yet;
-        #   this path is exercised with synthetic weights
-        #   (examples/kimi_k3/make_synthetic_dflash_drafter.py).
+        #   (see KimiLinearModel.forward).
+        # - DSpark: the same external-drafter flow with the Markov and
+        #   confidence heads enabled (RadixArk/Kimi-K3-DSpark and friends).
+        #   The target side is identical -- the capture in
+        #   KimiLinearModel.forward is unconditional -- so this gate is the
+        #   only place the mode has to be admitted.
         # Modes needing draft heads (MTP/Eagle) are blocked until a
         # draft-head checkpoint exists.
         assert (
             spec_config is None
             or spec_config.spec_dec_mode.is_sa()
             or spec_config.spec_dec_mode.is_dflash()
-        ), "Kimi K3 supports speculative decoding only with SA or DFlash"
+            or spec_config.spec_dec_mode.is_dspark()
+        ), "Kimi K3 supports speculative decoding only with SA, DFlash or DSpark"
         super().__init__(
             KimiLinearModel(model_config),
             model_config,

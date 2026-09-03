@@ -21,8 +21,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_laguna import LagunaHfWeightMapper
-from tensorrt_llm._torch.modules.fused_moe.impl_base import MoEImplBase
-from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+from tensorrt_llm._torch.moe.fused_moe.impl_base import MoEImplBase
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEEligibility,
     MoEProblem,

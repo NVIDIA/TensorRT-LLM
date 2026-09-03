@@ -258,7 +258,7 @@ class TestAfmoeWeightMapper(unittest.TestCase):
     def test_is_special_instance_module_for_moe(self):
         from unittest.mock import MagicMock
 
-        from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+        from tensorrt_llm._torch.moe.fused_moe.interface import MoE
 
         mock_moe = MagicMock(spec=MoE)
         mock_moe.__class__ = MoE

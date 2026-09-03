@@ -19,6 +19,9 @@ l0_model_express:
       orchestrator: mpi
   tests:
   - model_express/test_model_express.py::test_mx_donor_receiver[llama-bf16-tp1]
+  - model_express/test_model_express.py::test_mx_donor_receiver[qwen2-bf16-tp1]
+  - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-bf16-tp1]
+  - model_express/test_model_express.py::test_mx_donor_receiver[mistral-bf16-tp1]
 - condition:
     ranges:
       system_gpu_count:
@@ -35,3 +38,6 @@ l0_model_express:
       orchestrator: mpi
   tests:
   - model_express/test_model_express.py::test_mx_donor_receiver[llama-bf16-tp2]
+  - model_express/test_model_express.py::test_mx_donor_receiver[qwen2-bf16-tp2]
+  - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-bf16-tp2]
+  - model_express/test_model_express.py::test_mx_donor_receiver[mistral-bf16-tp2]
