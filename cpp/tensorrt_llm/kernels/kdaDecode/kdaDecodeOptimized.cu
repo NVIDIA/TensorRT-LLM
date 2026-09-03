@@ -364,13 +364,6 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
             * bf16_load(w_q_t, (kKernelWidth - 1) * kFlat + head_column);
         k_accumulator += __bfloat162float(k_new_conv_state[kConvCacheWidth - 1])
             * bf16_load(w_k_t, (kKernelWidth - 1) * kFlat + head_column);
-        shared_q[column] = silu_fast(q_accumulator);
-        shared_k[column] = silu_fast(k_accumulator);
-
-        int64_t const gate_index = static_cast<int64_t>(batch_index) * layout.gateRowStride + head_column;
-        float const gate = bf16_load(g, gate_index) + dt_bias[head_column];
-        shared_decay[column] = __expf(lower_bound * sigmoid_fast(exp_a * gate));
-
         if constexpr (!kUseCluster)
         {
             if (update_conv_cache)
@@ -379,23 +372,12 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
                 update_conv_state(cs_k + cache_base, k_new_conv_state[0], k_new_conv_state[1], k_new_conv_state[2]);
             }
         }
-    }
+        shared_q[column] = silu_fast(q_accumulator);
+        shared_k[column] = silu_fast(k_accumulator);
 
-    if constexpr (kUseCluster)
-    {
-        if (update_conv_cache)
-        {
-            // Defer update until all ranks have consumed the old values.
-            cluster.sync();
-            if (tid < kDim && cluster_rank == 0)
-            {
-                int const head_column = head_offset + tid;
-                int64_t const cache_base
-                    = static_cast<int64_t>(conv_slot) * conv_state_slot_stride + head_column * kConvCacheWidth;
-                update_conv_state(cs_q + cache_base, q_new_conv_state[0], q_new_conv_state[1], q_new_conv_state[2]);
-                update_conv_state(cs_k + cache_base, k_new_conv_state[0], k_new_conv_state[1], k_new_conv_state[2]);
-            }
-        }
+        int64_t const gate_index = static_cast<int64_t>(batch_index) * layout.gateRowStride + head_column;
+        float const gate = bf16_load(g, gate_index) + dt_bias[head_column];
+        shared_decay[column] = __expf(lower_bound * sigmoid_fast(exp_a * gate));
     }
 
     if (tid >= kVThreadBase && tid < kVThreadBase + kLocalVThreads)
@@ -422,12 +404,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
         v_new_conv_state[kConvCacheWidth - 1] = x_v[v_index];
         v_accumulator += __bfloat162float(v_new_conv_state[kConvCacheWidth - 1])
             * bf16_load(w_v_t, (kKernelWidth - 1) * kFlat + head_row);
-        shared_v[row] = silu_fast(v_accumulator);
-
         if (update_conv_cache)
         {
             update_conv_state(cs_v + cache_base, v_new_conv_state[0], v_new_conv_state[1], v_new_conv_state[2]);
         }
+        shared_v[row] = silu_fast(v_accumulator);
 
         if constexpr (!kUseCluster)
         {
@@ -629,6 +610,21 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
         }
         cluster.sync();
         float const normalization_sum_square = *cluster.map_shared_rank(&reduction[0], 0);
+
+        if (update_conv_cache)
+        {
+            // Defer update until all ranks have consumed the old values.
+            static_assert(kDim % kClusterBlocks == 0);
+            constexpr int kColumnsPerRank = kDim / kClusterBlocks;
+            if (tid >= cluster_rank * kColumnsPerRank && tid < (cluster_rank + 1) * kColumnsPerRank)
+            {
+                int const head_column = head_offset + tid;
+                int64_t const cache_base
+                    = static_cast<int64_t>(conv_slot) * conv_state_slot_stride + head_column * kConvCacheWidth;
+                update_conv_state(cs_q + cache_base, q_new_conv_state[0], q_new_conv_state[1], q_new_conv_state[2]);
+                update_conv_state(cs_k + cache_base, k_new_conv_state[0], k_new_conv_state[1], k_new_conv_state[2]);
+            }
+        }
 
         if (tid >= kVThreadBase && tid < kVThreadBase + kLocalVThreads)
         {
