@@ -82,7 +82,7 @@ def _validate_qwen4_exp_runtime_config(
             "Qwen4-Exp Gated DeltaNet requires output_gate_type='sigmoid', "
             f"got {output_gate_type!r}"
         )
-    if getattr(config, "tie_word_embeddings", False):
+    if config.tie_word_embeddings:
         raise ValueError("Qwen4-Exp requires an untied language-model head")
     invalid_ple_layers = [
         layer_idx + 1
@@ -530,7 +530,7 @@ class Qwen4ExpModel(DecoderModel):
             # memory and copied them asynchronously. Reuse its device mirror:
             # rebuilding a CUDA tensor from the Python list here introduces a
             # pageable H2D copy and synchronizes every mixed-IFB prefill step.
-            seq_lens_cuda = getattr(attn_metadata, "seq_lens_cuda", None)
+            seq_lens_cuda = attn_metadata.seq_lens_cuda
             if seq_lens_cuda is None:
                 seq_lens = torch.tensor(sequence_lengths, device=device, dtype=torch.long)
             else:
@@ -633,7 +633,7 @@ class Qwen4ExpModel(DecoderModel):
              the cache slot capacity exposed by ``attn_metadata`` (never
              ``int(state_indices.max().item())``, so no host-device sync).
         """
-        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+        kv_cache_manager = attn_metadata.kv_cache_manager
         if kv_cache_manager is not None:
             if not hasattr(kv_cache_manager, "ple_layer_cache"):
                 raise RuntimeError("Qwen4-Exp PLE requires cache-manager-owned recurrent pools")
@@ -650,7 +650,7 @@ class Qwen4ExpModel(DecoderModel):
             self._assert_ple_pool_shape(conv_state, ngram_context, ple_module)
             return conv_state, ngram_context
 
-        max_slots = int(getattr(attn_metadata, "max_num_requests", 0) or 0)
+        max_slots = int(attn_metadata.max_num_requests or 0)
         needed = max(max_slots, num_seq, 1)
         return self._ensure_ple_pools(ple_module, needed, device)
 
@@ -753,6 +753,12 @@ class Qwen4ExpModel(DecoderModel):
                     defer_combine=self.defer_combine_mask[layer_idx],
                 )
         except Exception:
+            # `start_prefetch` leaves an async host->device copy in flight that
+            # only the PLE layer consumes. If any layer raises before that
+            # layer runs, the copy would still be pending on the next forward
+            # and would land in a reused buffer. The handler is broad because
+            # the failure mode is the same whatever went wrong; it releases the
+            # prefetch and re-raises without swallowing the error.
             if prefetched_ple_module is not None:
                 prefetched_ple_module.abort_prefetch()
             raise
@@ -772,13 +778,29 @@ class Qwen4ExpLogitsProcessor(nn.Module):
         self,
         model_config: ModelConfig[PretrainedConfig],
         hyper_connection_mixer: Qwen4ExpHyperConnection,
+        *,
+        owns_mixer: bool = False,
     ) -> None:
+        """Wrap the final Hyper-Connection mixer used before the language head.
+
+        `owns_mixer` distinguishes the two callers. The target head is handed
+        the decoder's own mixer and must only borrow it: assigning through
+        `nn.Module.__setattr__` would register the same module a second time,
+        so its parameters would appear twice in `named_parameters()` and the
+        weight loader would visit them under two names. `object.__setattr__`
+        stores a plain reference that stays out of `_modules` while keeping a
+        single attribute name for both cases. The MTP head instead builds its
+        own mixer from its own checkpoint tensors, so there it is registered
+        normally.
+        """
         super().__init__()
         self.model_config = model_config
         self.hc_count = model_config.pretrained_config.hc_count
         self.hidden_size = model_config.pretrained_config.hidden_size
-        # The target model remains the sole owner of checkpoint parameters.
-        object.__setattr__(self, "_hyper_connection_mixer", hyper_connection_mixer)
+        if owns_mixer:
+            self.hyper_connection_mixer = hyper_connection_mixer
+        else:
+            object.__setattr__(self, "hyper_connection_mixer", hyper_connection_mixer)
 
     def _collapse(self, hidden_states: torch.Tensor) -> torch.Tensor:
         expected = self.hc_count * self.hidden_size
@@ -787,7 +809,7 @@ class Qwen4ExpLogitsProcessor(nn.Module):
                 "Qwen4-Exp logits processor received an invalid residual width: "
                 f"expected {expected}, got {hidden_states.shape[-1]}"
             )
-        return self._hyper_connection_mixer.mix(hidden_states)[0]
+        return self.hyper_connection_mixer.mix(hidden_states)[0]
 
     def forward(
         self,
@@ -820,8 +842,7 @@ class Qwen4ExpMTPHead(Qwen4ExpLogitsProcessor):
             mapping=model_config.mapping,
             use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm,
         )
-        super().__init__(model_config, hyper_connection_mixer)
-        self.hyper_connection_mixer = hyper_connection_mixer
+        super().__init__(model_config, hyper_connection_mixer, owns_mixer=True)
         self.mapping_lm_head_tp = None
 
     def _prepare_hidden_states(

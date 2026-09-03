@@ -62,6 +62,10 @@ class GroupedRMSNorm(TritonRMSNorm):
         self.variance_epsilon = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # The base class is a Triton kernel and therefore CUDA-only. Serving
+        # always takes the branch above; the Torch path below keeps the module
+        # runnable on CPU, which is what lets the unit tests check this class
+        # itself rather than a stand-in defined in a fixture.
         if x.is_cuda:
             return super().forward(x)
         input_dtype = x.dtype

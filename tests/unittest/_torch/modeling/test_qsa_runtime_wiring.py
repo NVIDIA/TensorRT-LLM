@@ -302,13 +302,17 @@ def test_qsa_cache_manager_requires_sparse_config() -> None:
 
 
 @pytest.mark.parametrize("dtype", (DataType.NVFP4, DataType.FLOAT))
-def test_qsa_cache_manager_delegates_regular_kv_layout(monkeypatch, dtype) -> None:
+def test_qsa_cache_manager_delegates_regular_kv_layout(
+    monkeypatch: pytest.MonkeyPatch, dtype: DataType
+) -> None:
     manager = object.__new__(QSAMambaHybridCacheManagerV2)
     manager.dtype = dtype
     sentinel = torch.empty(0, dtype=torch.int8)
-    calls = []
+    calls: list[tuple[object, int, str]] = []
 
-    def regular_get_buffers(self, layer_idx, kv_layout):
+    def regular_get_buffers(
+        self: MambaHybridCacheManagerV2, layer_idx: int, kv_layout: str
+    ) -> torch.Tensor:
         calls.append((self, layer_idx, kv_layout))
         return sentinel
 

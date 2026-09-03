@@ -4541,8 +4541,13 @@ class PyTorchModelEngine(ModelEngine):
         top_level_model = getattr(model, "model", model)
         return getattr(top_level_model, "_orig_mod", top_level_model)
 
+    @functools.cached_property
     def _model_uses_ple_recurrent_state(self) -> bool:
-        """Detect PLE on text-only and multimodal model wrappers."""
+        """Detect PLE on text-only and multimodal model wrappers.
+
+        The answer is fixed once the model is loaded, and the CUDA-graph gate
+        below consults it on every forward that has context requests.
+        """
         top_level_model = self._get_top_level_model()
         if getattr(top_level_model, "has_ple", False):
             return True
@@ -7845,7 +7850,7 @@ class PyTorchModelEngine(ModelEngine):
                 and not self.llm_args.mm_encoder_only
                 # PLE owns recurrent n-gram and convolution state. Promoting a
                 # fresh final-context row would skip its cache-slot reset.
-                and not self._model_uses_ple_recurrent_state() and
+                and not self._model_uses_ple_recurrent_state and
                 self.mapping.cp_size == 1):
             graph_requests, promoted_context_request_ids = \
                 _make_single_token_context_graph_batch(

@@ -7,12 +7,6 @@ import torch
 
 from tensorrt_llm._torch.modules.qwen4_exp.hyper_connection import Qwen4ExpHyperConnection
 from tensorrt_llm._torch.modules.qwen4_exp.hyper_connection_kernels import hc_combine_norm
-from tensorrt_llm._utils import is_sm_100f
-
-_skip_non_sm10x = pytest.mark.skipif(
-    torch.cuda.device_count() == 0 or not is_sm_100f(),
-    reason="requires SM10x GPU (SM100/SM103)",
-)
 
 
 def _reference_mix(module, hyper_input):

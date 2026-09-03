@@ -539,9 +539,6 @@ class Attention(nn.Module):
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
         self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
         self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
-        # Model construction may defer every projection's weight allocation.
-        # Sparse hooks use this value when creating their side projections.
-        self.skip_create_weights_in_init = config.skip_create_weights_in_init
 
         qkv_shard_indices_mapping = {
             "q": (0, self.q_size * (2 if self.attn_output_gate else 1)),
@@ -1055,6 +1052,17 @@ class Attention(nn.Module):
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)
 
+        if bool(lora_params):
+            qkv = LoraLayer.forward_with_base(
+                lambda: self.qkv_proj(hidden_states),
+                (self.splitted_qkv_lora, self.fused_qkv_lora),
+                hidden_states,
+                lora_params,
+                self.layer_idx,
+            )
+        else:
+            qkv = self.qkv_proj(hidden_states)
+
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).
         if (not self.rope_fusion
@@ -1067,17 +1075,6 @@ class Attention(nn.Module):
                 and position_ids is not None):
             position_ids = self._adjust_position_ids_for_spec_dec(
                 position_ids, attn_metadata)
-
-        if bool(lora_params):
-            qkv = LoraLayer.forward_with_base(
-                lambda: self.qkv_proj(hidden_states),
-                (self.splitted_qkv_lora, self.fused_qkv_lora),
-                hidden_states,
-                lora_params,
-                self.layer_idx,
-            )
-        else:
-            qkv = self.qkv_proj(hidden_states)
 
         q, k, v, gate = self.preprocess_qkv(qkv, position_ids)
         q, k, v = self.convert_qkv(q, k, v)

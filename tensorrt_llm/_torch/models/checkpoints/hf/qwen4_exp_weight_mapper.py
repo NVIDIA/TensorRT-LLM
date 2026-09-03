@@ -15,58 +15,57 @@
 """Text-core checkpoint weight mapper for Qwen3.8-Flash-Next.
 
 Maps the composite Hugging Face checkpoint state dict onto the TensorRT-LLM
-:class:`~tensorrt_llm._torch.models.modeling_qwen4_exp.Qwen4ExpForCausalLM` text
-module tree. The checkpoint is the *composite multimodal*
-checkpoint (arch ``Qwen4ExpForConditionalGeneration``), so every text tensor is
-stored under a ``model.language_model.`` prefix; the vision tower lives under
-``model.visual.`` and a 1-layer MTP head under ``mtp.``. This mapper is selected
-for the flattened text arch ``Qwen4ExpForCausalLM`` (see
-``config_utils.load_pretrained_config``).
+`Qwen4ExpForCausalLM` text module tree. The checkpoint is the *composite multimodal*
+checkpoint (arch `Qwen4ExpForConditionalGeneration`), so every text tensor is
+stored under a `model.language_model.` prefix; the vision tower lives under
+`model.visual.` and a 1-layer MTP head under `mtp.`. This mapper is selected
+for the flattened text arch `Qwen4ExpForCausalLM` (see
+`config_utils.load_pretrained_config`).
 
 What differs from the stock HF loader (why a bespoke mapper is required):
 
-* **Namespace** — strip ``model.language_model.`` -> ``model.``; the text core is
-  the model's ``model.*`` subtree with an untied top-level ``lm_head.weight``.
-* **Optional modules** — ``model.visual.*`` is loaded by the composite wrapper.
-  The checkpoint's single ``mtp.*`` layer is mapped onto the appended runtime
+* **Namespace** — strip `model.language_model.` -> `model.`; the text core is
+  the model's `model.*` subtree with an untied top-level `lm_head.weight`.
+* **Optional modules** — `model.visual.*` is loaded by the composite wrapper.
+  The checkpoint's single `mtp.*` layer is mapped onto the appended runtime
   decoder layer only when one-model MTP is enabled; otherwise it is skipped.
 * **Gated-DeltaNet in-proj** — the checkpoint stores the linear-attention
-  input projection as four *separate, head-first dense* tensors ``in_proj_qkv``
-  ([q|k|v]=10240), ``in_proj_z`` (6144), ``in_proj_b``/``in_proj_a`` (48 each);
-  the TRT-LLM ``Qwen3NextGatedDeltaNet`` mixer consumes a single fused
-  ``in_proj_qkvz`` ([Q|K|V|Z]=16384) and ``in_proj_ba`` ([b|a]=96). Unlike the
+  input projection as four *separate, head-first dense* tensors `in_proj_qkv`
+  ([q|k|v]=10240), `in_proj_z` (6144), `in_proj_b`/`in_proj_a` (48 each);
+  the TRT-LLM `Qwen3NextGatedDeltaNet` mixer consumes a single fused
+  `in_proj_qkvz` ([Q|K|V|Z]=16384) and `in_proj_ba` ([b|a]=96). Unlike the
   grouped-interleaved Qwen3Next checkpoint, Qwen4-Exp is already dense, so the
-  fusion is a **plain concat** (``[qkv|z]`` / ``[b|a]``) with **no**
+  fusion is a **plain concat** (`[qkv|z]` / `[b|a]`) with **no**
   grouped-to-dense permutation.
-  For ``tp_size > 1`` each rank's contiguous column-parallel slice must carry its
+  For `tp_size > 1` each rank's contiguous column-parallel slice must carry its
   own q/k/v/z (resp. b/a) heads, so the fused rows are re-blocked per rank.
-* **Gated-DeltaNet conv1d / A_log / dt_bias** — depthwise ``conv1d`` weight
-  is squeezed + per-rank re-blocked ([q|k|v]); ``A_log`` / ``dt_bias`` are cast to
+* **Gated-DeltaNet conv1d / A_log / dt_bias** — depthwise `conv1d` weight
+  is squeezed + per-rank re-blocked ([q|k|v]); `A_log` / `dt_bias` are cast to
   fp32 (the SSM state dtype) and TP-split.
 * **MoE** — the checkpoint stores fused, HF-transposed expert
-  stacks ``experts.gate_up_proj`` ([E, 2*I, H]) / ``experts.down_proj``
+  stacks `experts.gate_up_proj` ([E, 2*I, H]) / `experts.down_proj`
   ([E, H, I]); they are transposed to TRT-LLM's ([E, H, 2*I] / [E, I, H]) and
-  loaded through ``MoEWeightLoadingMode.FUSED_GATE_UP_PROJ``. The shared expert
-  (``gate_proj``/``up_proj`` -> fused ``gate_up_proj``) and router ``gate`` use
+  loaded through `MoEWeightLoadingMode.FUSED_GATE_UP_PROJ`. The shared expert
+  (`gate_proj`/`up_proj` -> fused `gate_up_proj`) and router `gate` use
   the stock fusion / direct-copy paths.
 * **PLE n-gram embedding** — the n-gram table is stored as
-  ``split_ngram_parts`` equal prime-tiled shards
-  ``ple_embedding.ngram_embedding.shard_{i}.weight``; each rank streams only
-  its overlapping row range into the local ``ngram_embedding`` shard, avoiding
+  `split_ngram_parts` equal prime-tiled shards
+  `ple_embedding.ngram_embedding.shard_{i}.weight`; each rank streams only
+  its overlapping row range into the local `ngram_embedding` shard, avoiding
   a full-table concat or replication. FP8 checkpoints additionally store the scalar
-  ``ngram_embedding.weight_scale``; the table stays FP8 in device memory and
+  `ngram_embedding.weight_scale`; the table stays FP8 in device memory and
   only selected rows are dequantized after lookup. The three recurrent-hash
-  metadata buffers (``layer_multipliers`` /
-  ``ngram_heads_offsets`` / ``ngram_heads_vocab_sizes``) are copied into the
+  metadata buffers (`layer_multipliers` /
+  `ngram_heads_offsets` / `ngram_heads_vocab_sizes`) are copied into the
   module's registered buffers.
-* **QSA full attention** — ``q_proj`` (output-gated, 2x q heads) / ``k_proj``
-  / ``v_proj`` fuse to ``qkv_proj`` via the stock fusion; ``o_proj``, per-head
-  ``q_norm``/``k_norm``, and the compressed indexer
-  (``indexer.index_qk_proj``/``q_layernorm``/``k_layernorm``) map by direct name.
+* **QSA full attention** — `q_proj` (output-gated, 2x q heads) / `k_proj`
+  / `v_proj` fuse to `qkv_proj` via the stock fusion; `o_proj`, per-head
+  `q_norm`/`k_norm`, and the compressed indexer
+  (`indexer.index_qk_proj`/`q_layernorm`/`k_layernorm`) map by direct name.
 * **Hyper-Connection** — attention/MLP mixers pack the checkpoint's
-  ``input_mix_weight_down`` and ``block_inject_weight`` into one 16-row-aligned
+  `input_mix_weight_down` and `block_inject_weight` into one 16-row-aligned
   runtime projection, eliminating a skinny GEMM launch. The final mix-only
-  ``hyper_connection_mixer`` retains its direct checkpoint name. All HC weights
+  `hyper_connection_mixer` retains its direct checkpoint name. All HC weights
   are replicated across TP ranks.
 """
 
@@ -91,12 +90,12 @@ _PER_EXPERT_PROJECTION_PATTERN = re.compile(r"^\d+\.(?:gate_proj|up_proj|down_pr
 
 
 def _rank_block(components: list[torch.Tensor], tp_size: int) -> torch.Tensor:
-    """Concat ``components`` (each ``[out_i, ...]``) into the per-rank column-
-    parallel row order a contiguous ``TensorParallelMode.COLUMN`` split recovers.
+    """Concat `components` (each `[out_i, ...]`) into the per-rank column-
+    parallel row order a contiguous `TensorParallelMode.COLUMN` split recovers.
 
-    At ``tp_size == 1`` this is a plain ``[c0 | c1 | ...]`` concat. At
-    ``tp_size > 1`` each component is split across ranks and the rank-``r`` slices
-    are grouped together (``[c0_r0 c1_r0 ... | c0_r1 c1_r1 ... | ...]``), so a
+    At `tp_size == 1` this is a plain `[c0 | c1 | ...]` concat. At
+    `tp_size > 1` each component is split across ranks and the rank-`r` slices
+    are grouped together (`[c0_r0 c1_r0 ... | c0_r1 c1_r1 ... | ...]`), so a
     later contiguous per-rank row split hands each rank its own head slice of
     every component.
     """
@@ -113,23 +112,37 @@ def _rank_block(components: list[torch.Tensor], tp_size: int) -> torch.Tensor:
                 f"projection rows {component.shape[0]} are not divisible by tp_size={tp_size}"
             )
     if tp_size == 1:
-        return torch.cat(components, dim=0).contiguous()
+        return torch.cat(components, dim=0)
     rows: list[torch.Tensor] = []
     for rank in range(tp_size):
         rows.extend(split(c, tp_size, rank) for c in components)
-    return torch.cat(rows, dim=0).contiguous()
+    return torch.cat(rows, dim=0)
 
 
 def _normalize_moe_module_weights(
     module_weights: dict[str, torch.Tensor], config
 ) -> tuple[dict[str, torch.Tensor], MoEWeightLoadingMode]:
-    """Normalize fused BF16 and ModelOpt per-expert MoE checkpoints."""
+    """Normalize fused BF16 and ModelOpt per-expert MoE checkpoints.
+
+    Two checkpoint layouts reach this mapper and each selects its own
+    `MoEWeightLoadingMode`:
+
+    * ModelOpt quantized exports write one tensor per expert
+      (`<expert>.gate_proj` / `up_proj` / `down_proj`) and are loaded by the
+      `VANILLA` path, which expects the `w1` / `w3` / `w2` names.
+    * The stock BF16 release writes fused, HF-transposed expert stacks
+      (`gate_up_proj` `[E, 2*I, H]` / `down_proj` `[E, H, I]`) and is loaded by
+      `FUSED_GATE_UP_PROJ` after transposing to TRT-LLM's
+      `[E, H, 2*I]` / `[E, I, H]`.
+    """
     has_per_expert_tensors = any(
         _PER_EXPERT_PROJECTION_PATTERN.match(name) for name in module_weights
     )
     updated: dict[str, torch.Tensor] = {}
     if has_per_expert_tensors:
         for name, value in module_weights.items():
+            # A per-expert export can still carry the fused keys (empty or
+            # stale); the per-expert tensors are authoritative, so drop them.
             if name in ("gate_up_proj", "down_proj"):
                 continue
             normalized_name = name.replace("gate_proj", "w1")
@@ -140,9 +153,12 @@ def _normalize_moe_module_weights(
 
     hidden = config.hidden_size
     inter = config.moe_intermediate_size
-    num_experts = getattr(config, "num_experts", None)
+    num_experts = config.num_experts
+    # Accept either orientation: transpose the HF layout, pass an
+    # already-TRT-LLM-oriented stack through, and reject anything else rather
+    # than silently loading a mis-shaped expert stack.
     for name, value in module_weights.items():
-        if name in ("gate_up_proj", "down_proj") and getattr(value, "ndim", None) != 3:
+        if name in ("gate_up_proj", "down_proj") and value.ndim != 3:
             raise ValueError(f"MoE {name} must be three-dimensional, got {tuple(value.shape)}")
         if name == "gate_up_proj":
             expected_source = (value.shape[0], 2 * inter, hidden)
@@ -164,11 +180,7 @@ def _normalize_moe_module_weights(
                     f"MoE down_proj has shape {tuple(value.shape)}, expected "
                     f"{expected_source} or {expected_runtime}"
                 )
-        if (
-            num_experts is not None
-            and name in ("gate_up_proj", "down_proj")
-            and value.shape[0] != num_experts
-        ):
+        if name in ("gate_up_proj", "down_proj") and value.shape[0] != num_experts:
             raise ValueError(f"MoE {name} has {value.shape[0]} experts, expected {num_experts}")
         updated[name] = value
     return updated, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
@@ -183,12 +195,12 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
     _NGRAM_EMBED_MARKER = "ple_embedding.ngram_embedding"
 
     def should_skip_module(self, module_name: str) -> bool:
-        # The recurrent layer is shared with ``model.layers`` and loaded through
+        # The recurrent layer is shared with `model.layers` and loaded through
         # that canonical path; skip its duplicate draft-model alias.
         if module_name.startswith("draft_model"):
             return True
         # The large, sharded n-gram table is streamed shard-by-shard in
-        # ``preprocess_weights``; skip it in the generic per-module walk so the
+        # `preprocess_weights`; skip it in the generic per-module walk so the
         # driver does not assert on the (already-consumed) single-tensor key.
         if self._NGRAM_EMBED_MARKER in module_name:
             return True
@@ -203,9 +215,9 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
     ) -> None:
         """Load routed experts from fused or per-expert checkpoint tensors.
 
-        The checkpoint stores HF-transposed fused stacks ``gate_up_proj``
-        ([E, 2*I, H]) / ``down_proj`` ([E, H, I]); transpose to TRT-LLM's
-        ([E, H, 2*I] / [E, I, H]) and load via ``FUSED_GATE_UP_PROJ``. Non-MoE
+        The checkpoint stores HF-transposed fused stacks `gate_up_proj`
+        ([E, 2*I, H]) / `down_proj` ([E, H, I]); transpose to TRT-LLM's
+        ([E, H, 2*I] / [E, I, H]) and load via `FUSED_GATE_UP_PROJ`. Non-MoE
         special modules fall through to the base handler.
         """
         if is_moe_weight_owner(module):
@@ -222,7 +234,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
         config = self.config.pretrained_config
         tp_size = 1 if self.config.mapping.enable_attention_dp else self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank
-        spec_config = getattr(self.config, "spec_config", None)
+        spec_config = self.config.spec_config
         mtp_enabled = spec_config is not None and spec_config.spec_dec_mode.is_mtp_one_model()
         mtp_layer_offset = config.num_hidden_layers
         mtp_mapping = {
@@ -233,12 +245,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
             "mtp.hyper_connection_mixer": "shared_head.hyper_connection_mixer",
         }
         owned_layer_ids = None
-        mapping_has_pp = (
-            self.config.mapping.has_pp()
-            if hasattr(self.config.mapping, "has_pp")
-            else getattr(self.config.mapping, "pp_size", 1) > 1
-        )
-        if mapping_has_pp:
+        if self.config.mapping.has_pp():
             owned_layer_ids = set()
             layer_prefix = "model.layers."
             for module_name, module in self.model.named_modules():
@@ -262,7 +269,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
         # layer_prefix -> {shard_i / buffer_name: tensor}
         ngram: dict = {}
         # HC module prefix -> {down/inject: tensor}. Mix-only final heads only
-        # contain ``down`` and retain the checkpoint's direct parameter name.
+        # contain `down` and retain the checkpoint's direct parameter name.
         hc_down_inject: dict = {}
 
         for name, tensor in weights.items():
@@ -300,9 +307,9 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                 or ".ple.ple_embedding.ngram_heads_offsets" in key
                 or ".ple.ple_embedding.ngram_heads_vocab_sizes" in key
             ):
-                # ``.ple_embedding.<buffer>`` and ``.ngram_embedding.shard_i``
+                # `.ple_embedding.<buffer>` and `.ngram_embedding.shard_i`
                 # both start under the ple_embedding prefix; bucket by the PLE
-                # module prefix (``....ple``).
+                # module prefix (`....ple`).
                 ple_prefix = key.split(".ple_embedding.", 1)[0]
                 leaf = key.split(".ple_embedding.", 1)[1]
                 ngram.setdefault(ple_prefix, {})[leaf] = tensor
@@ -348,8 +355,8 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                         f"{key} has shape {tuple(w.shape)}, expected "
                         f"[{2 * key_dim + value_dim}, conv_kernel]"
                     )
-                conv_kernel = getattr(config, "linear_conv_kernel_dim", None)
-                if conv_kernel is not None and w.shape[1] != conv_kernel:
+                conv_kernel = config.linear_conv_kernel_dim
+                if w.shape[1] != conv_kernel:
                     raise ValueError(
                         f"{key} convolution width is {w.shape[1]}, expected {conv_kernel}"
                     )
@@ -412,7 +419,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
 
         # Pack each layer's HC down and injection projections into a single
         # aligned GEMM. Final mix-only heads have no injection projection and
-        # keep the original ``input_mix_weight_down`` parameter.
+        # keep the original `input_mix_weight_down` parameter.
         for prefix, parts in hc_down_inject.items():
             down = parts.get("down")
             inject = parts.get("inject")
@@ -479,10 +486,10 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
     # ----- PLE n-gram embedding -------------------------------------------
 
     def _ngram_module_for_prefix(self, ple_prefix: str) -> Optional[nn.Module]:
-        """Resolve the ``Qwen4ExpNGramEmbedding`` for a checkpoint PLE prefix.
+        """Resolve the `Qwen4ExpNGramEmbedding` for a checkpoint PLE prefix.
 
-        ``ple_prefix`` is e.g. ``model.layers.1.ple``; the target n-gram module
-        is ``model.layers.<L>.ple.ple_embedding``.
+        `ple_prefix` is e.g. `model.layers.1.ple`; the target n-gram module
+        is `model.layers.<L>.ple.ple_embedding`.
         """
         target_name = ple_prefix + ".ple_embedding"
         for name, module in self.model.named_modules():
@@ -494,8 +501,8 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
         """Stream each PLE prefix's shards into its table + copy its buffers.
 
         Streaming shard-by-shard avoids materialising the full table a second
-        time (a single ``torch.cat`` would double peak memory). Meta
-        tensors (name/shape accounting) fall through the same slice ``copy_``,
+        time (a single `torch.cat` would double peak memory). Meta
+        tensors (name/shape accounting) fall through the same slice `copy_`,
         which is a shape-checked no-op there.
         """
         buffer_leaves = ("layer_multipliers", "ngram_heads_offsets", "ngram_heads_vocab_sizes")
@@ -538,6 +545,11 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                     f"PLE n-gram shards for {ple_prefix} must be consecutively numbered from zero, "
                     f"got {shard_indices}"
                 )
+            # Shard-count validation is best-effort: `self.config` raises when
+            # the mapper was constructed without `init_model_and_config` (the
+            # PLE streaming helpers are exercised standalone), and
+            # `split_ngram_parts` is a qwen4_exp-only extra attribute that
+            # reduced configs omit. Probe both rather than hard-fail.
             pretrained_config = getattr(getattr(self, "_config", None), "pretrained_config", None)
             expected_shards = getattr(pretrained_config, "split_ngram_parts", None)
             if expected_shards is not None and len(shard_leaves) != expected_shards:

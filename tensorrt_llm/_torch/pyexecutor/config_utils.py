@@ -305,7 +305,7 @@ def is_qwen3_hybrid(config):
     return is_qwen3_next(config) or is_qwen3_5(config)
 
 
-def is_qwen4_exp(config):
+def is_qwen4_exp(config: transformers.PretrainedConfig) -> bool:
     """Return whether this is a Qwen4-Exp text or composite config."""
     architectures = getattr(config, "architectures", None)
     return bool(architectures) and architectures[0] in {
@@ -361,7 +361,8 @@ def get_qwen3_hybrid_num_attention_layers(config):
     return sum(layer_mask)
 
 
-def get_qwen4_exp_ple_layer_mask(config) -> List[bool]:
+def get_qwen4_exp_ple_layer_mask(
+        config: transformers.PretrainedConfig) -> list[bool]:
     """Return the decoder-layer mask for the one-based PLE layer IDs."""
     ple_layer_ids = list(getattr(config, "ple_layer_ids", None) or [])
     invalid_ids = [
@@ -391,7 +392,7 @@ def get_qwen4_exp_ple_layer_mask(config) -> List[bool]:
 class Qwen4ExpPLECacheParams:
     """Shapes and dtypes for PLE recurrent-state pools."""
 
-    ple_layer_mask: List[bool]
+    ple_layer_mask: list[bool]
     num_ple_layers: int
     short_conv_channels: int
     short_conv_state_len: int
@@ -399,7 +400,8 @@ class Qwen4ExpPLECacheParams:
     conv_state_dtype: torch.dtype
 
 
-def extract_qwen4_exp_ple_cache_params(config) -> Qwen4ExpPLECacheParams:
+def extract_qwen4_exp_ple_cache_params(
+        config: transformers.PretrainedConfig) -> Qwen4ExpPLECacheParams:
     """Derive PLE recurrent-state pool dimensions from the model config."""
     ple_layer_mask = get_qwen4_exp_ple_layer_mask(config)
     hc_count = getattr(config, "hc_count", 1) or 1

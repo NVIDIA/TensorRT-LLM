@@ -93,11 +93,10 @@ def get_trtllm_sparse_attn_attention_backend(
     from .qsa import QSATrtllmAttention
     from .rocket import RocketTrtllmAttention
 
-    if sparse_params.algorithm == "qsa":
-        return QSATrtllmAttention
-
     if sparse_params.algorithm == "rocket":
         return RocketTrtllmAttention
+    elif sparse_params.algorithm == "qsa":
+        return QSATrtllmAttention
     elif sparse_params.algorithm == "dsa":
         return DSATrtllmAttention
     elif sparse_params.algorithm == "deepseek_v4":

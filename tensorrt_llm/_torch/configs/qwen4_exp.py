@@ -6,6 +6,13 @@ The checkpoint's ``text_config`` describes a hybrid decoder with Gated-DeltaNet
 linear-attention layers, QSA full-attention layers, routed and shared experts,
 Hyper-Connection residual streams, and a PLE n-gram side path.
 
+These classes are in-tree because ``transformers`` ships no ``Qwen4Exp``
+configuration at all, and adding one upstream would not remove the need for
+them: the checkpoint nests its rope metadata under ``rope_parameters``, labels
+QSA layers ``deepseek_sparse_attention``, and omits the dense
+``intermediate_size``, none of which the shared Qwen3Next runtime accepts. The
+subclasses below normalize those three things at construction time.
+
 ``Qwen4ExpTextConfig`` subclasses ``transformers.Qwen3NextConfig``: the qwen4_exp
 text core shares Qwen3Next's hybrid layer schema (``layer_types`` /
 ``full_attention_interval``, the ``linear_*`` GDN dims, and the MoE
@@ -25,7 +32,7 @@ from typing import Optional, Union
 from transformers import PretrainedConfig, Qwen3NextConfig
 
 
-def _flatten_qwen4_exp_rope(fields: dict) -> None:
+def _flatten_qwen4_exp_rope(fields: dict[str, object]) -> None:
     """Flatten a nested ``rope_parameters`` block into top-level rope fields.
 
     Qwen4-Exp nests rope metadata under ``rope_parameters`` (``rope_theta``,
@@ -64,7 +71,7 @@ def _flatten_qwen4_exp_rope(fields: dict) -> None:
             fields["rope_scaling"] = rope_scaling
 
 
-def _normalize_qwen4_exp_layer_types(fields: dict) -> None:
+def _normalize_qwen4_exp_layer_types(fields: dict[str, object]) -> None:
     """Map the HF QSA layer alias to TRT-LLM's hybrid-layer label."""
     layer_types = fields.get("layer_types")
     if layer_types is None:
@@ -96,7 +103,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
 
     model_type = "qwen4_exp_text"
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: object) -> None:
         _flatten_qwen4_exp_rope(kwargs)
         _normalize_qwen4_exp_layer_types(kwargs)
         # qwen4_exp is MoE-only and ships no dense ``intermediate_size``;

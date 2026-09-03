@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Module-layer integration for QSA sparse attention."""
 
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._torch.modules.top_k import TopK
 from tensorrt_llm.logger import logger
 
 from ...interface import AttentionMask, PredefinedAttentionMask
@@ -16,7 +18,7 @@ from .constants import (
     QSA_SPARSE_KV_CACHE_DTYPES,
     QSA_VALUE_ROLE_INDEX,
 )
-from .indexer import QSAIndexer, qsa_sparse_gqa, select_qsa_paged_tokens
+from .indexer import _is_power_of_two, _logical_to_pages
 from .metadata import QSAAttentionMetadata
 from .params import QSASparseParams
 
@@ -72,14 +74,329 @@ def _store_paged_kv_reference(
     v_cache[pages, :, within, :] = v[valid_rows].to(v_cache.dtype)
 
 
+def expand_qsa_block_indices(
+    block_indices: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    *,
+    compress_ratio: int,
+    token_topk: int,
+) -> torch.Tensor:
+    """Expand selected complete groups and append the incomplete causal tail.
+
+    CUDA callers pass Top-K output, whose valid block IDs form a contiguous
+    prefix followed by ``-1`` padding. The fused expansion relies on that
+    layout to append the causal tail without a separate compaction launch.
+    """
+    block_topk = token_topk // compress_ratio
+    final_topk = token_topk + compress_ratio - 1
+    if block_indices.ndim != 2 or block_indices.shape[1] != block_topk:
+        raise ValueError(
+            f"Expected block indices [rows, {block_topk}], got {tuple(block_indices.shape)}"
+        )
+    rows = block_indices.shape[0]
+    if query_positions.numel() != rows or sequence_lengths.numel() != rows:
+        raise ValueError("QSA query positions and sequence lengths must match rows")
+
+    if block_indices.is_cuda:
+        from .kernels import triton_expand_qsa_block_indices
+
+        return triton_expand_qsa_block_indices(
+            block_indices.contiguous(),
+            query_positions.to(device=block_indices.device).contiguous(),
+            sequence_lengths.to(device=block_indices.device).contiguous(),
+            compress_ratio=compress_ratio,
+            token_topk=token_topk,
+        )
+
+    device = block_indices.device
+    blocks = block_indices.to(torch.long)
+    offsets = torch.arange(compress_ratio, device=device, dtype=torch.long)
+    expanded = blocks.unsqueeze(-1) * compress_ratio + offsets
+    expanded = torch.where(
+        blocks.unsqueeze(-1) >= 0,
+        expanded,
+        torch.full_like(expanded, -1),
+    ).reshape(rows, token_topk)
+
+    query_positions = query_positions.to(device=device, dtype=torch.long)
+    sequence_lengths = sequence_lengths.to(device=device, dtype=torch.long)
+    expanded = torch.where(
+        (expanded >= 0) & (expanded < sequence_lengths.unsqueeze(1)),
+        expanded,
+        torch.full_like(expanded, -1),
+    )
+
+    tail_offsets = torch.arange(
+        compress_ratio - 1,
+        device=device,
+        dtype=torch.long,
+    )
+    visible_tokens = query_positions + 1
+    tail_start = (visible_tokens // compress_ratio) * compress_ratio
+    tail_count = visible_tokens - tail_start
+    tail = tail_start.unsqueeze(1) + tail_offsets.unsqueeze(0)
+    tail_valid = (tail_offsets.unsqueeze(0) < tail_count.unsqueeze(1)) & (
+        tail < sequence_lengths.unsqueeze(1)
+    )
+    tail = torch.where(tail_valid, tail, torch.full_like(tail, -1))
+
+    result = torch.cat((expanded, tail), dim=1)
+    order = torch.arange(final_topk, device=device).unsqueeze(0).expand(rows, -1)
+    sort_key = torch.where(result >= 0, order, order + final_topk)
+    return result.gather(
+        1,
+        torch.argsort(sort_key, dim=1, stable=True),
+    ).to(torch.int32)
+
+
+def qsa_sparse_gqa(
+    *,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_tokens: torch.Tensor,
+    request_idx: int | None = None,
+    request_indices: torch.Tensor | None = None,
+    metadata: "QSAAttentionMetadata",
+    softmax_scale: float,
+    query_positions: torch.Tensor | None = None,
+    compress_ratio: int | None = None,
+) -> torch.Tensor:
+    """Run sparse GQA over V2 paged K/V, using Triton on CUDA by default."""
+    if request_indices is None:
+        if request_idx is None:
+            raise ValueError("QSA sparse GQA requires request indices")
+        request_indices = torch.full(
+            (q.shape[0],),
+            request_idx,
+            dtype=torch.int32,
+            device=q.device,
+        )
+    if request_indices.shape != (q.shape[0],):
+        raise ValueError("QSA sparse GQA request indices must match query rows")
+    if q.is_cuda and _is_power_of_two(q.shape[-1]):
+        from .kernels import triton_qsa_paged_sparse_gqa
+
+        logger.info_once(
+            "QSA fused paged sparse GQA Triton kernel is active",
+            key="qsa_fused_paged_sparse_gqa_active",
+        )
+        return triton_qsa_paged_sparse_gqa(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_table=metadata.qsa_block_table,
+            selected_tokens=selected_tokens,
+            request_indices=request_indices.contiguous(),
+            tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
+            softmax_scale=softmax_scale,
+            query_positions=query_positions,
+            compress_ratio=compress_ratio,
+        )
+    logger.info_once(
+        "QSA sparse GQA reference path is active",
+        key="qsa_sparse_gqa_reference_active",
+    )
+    return qsa_sparse_gqa_reference(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        selected_tokens=selected_tokens,
+        request_indices=request_indices,
+        metadata=metadata,
+        softmax_scale=softmax_scale,
+    )
+
+
+def qsa_sparse_gqa_reference(
+    *,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_tokens: torch.Tensor,
+    request_indices: torch.Tensor,
+    metadata: "QSAAttentionMetadata",
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Torch reference sparse GQA over V2 paged K/V."""
+    valid = selected_tokens >= 0
+    safe_tokens = selected_tokens.clamp_min(0).to(torch.long)
+    req = request_indices[:, None].expand_as(safe_tokens).to(torch.int32)
+    pages, within = _logical_to_pages(metadata, req, safe_tokens)
+    keys = k_cache[pages, :, within, :]
+    values = v_cache[pages, :, within, :]
+
+    rows, num_q_heads, head_dim = q.shape
+    num_kv_heads = keys.shape[2]
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError("QSA query heads must be divisible by local KV heads")
+    groups = num_q_heads // num_kv_heads
+    q_grouped = q.reshape(rows, num_kv_heads, groups, head_dim)
+    scores = (
+        torch.einsum(
+            "bhgd,bkhd->bhgk",
+            q_grouped.float(),
+            keys.float(),
+        )
+        * softmax_scale
+    )
+    scores.masked_fill_(~valid[:, None, None, :], -float("inf"))
+    # A padded request can have no visible token. Softmax over all -inf is NaN;
+    # such a row contributes zero attention output.
+    probabilities = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)
+    output = torch.einsum(
+        "bhgk,bkhd->bhgd",
+        probabilities,
+        values.float(),
+    )
+    return output.to(q.dtype).reshape(rows, num_q_heads, head_dim)
+
+
+def select_qsa_tokens(
+    q: torch.Tensor,
+    compressed_keys: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_length: int,
+    params: QSASparseParams,
+    *,
+    top_k: TopK | None = None,
+    top_k_output: torch.Tensor | None = None,
+    top_k_row_starts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Score complete groups and return fixed-width logical token indices."""
+    rows = q.shape[0]
+    total_blocks = compressed_keys.shape[0]
+    block_indices = torch.full(
+        (rows, params.block_topk),
+        -1,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    if total_blocks:
+        scores = torch.einsum(
+            "mhd,nd->mnh",
+            q.float(),
+            compressed_keys.float(),
+        )
+        scores = torch.relu(scores).sum(dim=-1) / math.sqrt(params.index_head_dim)
+        visible_blocks = ((query_positions + 1) // params.compress_ratio).to(torch.long)
+        if top_k is not None and scores.is_cuda:
+            if top_k_output is None or top_k_row_starts is None:
+                raise ValueError("QSA CUDA Top-K requires caller-owned output and row starts")
+            block_indices = top_k_output[:rows]
+            top_k(
+                scores,
+                block_indices,
+                is_prefill=True,
+                row_starts=top_k_row_starts[:rows],
+                row_ends=visible_blocks.to(torch.int32),
+            )
+        else:
+            columns = torch.arange(total_blocks, device=q.device).unsqueeze(0)
+            scores.masked_fill_(columns >= visible_blocks.unsqueeze(1), -float("inf"))
+            width = min(params.block_topk, total_blocks)
+            values, indices = torch.topk(scores, width, dim=-1)
+            indices = torch.where(
+                torch.isfinite(values),
+                indices,
+                torch.full_like(indices, -1),
+            )
+            block_indices[:, :width] = indices.to(torch.int32)
+    sequence_lengths = torch.full_like(query_positions, sequence_length)
+    return expand_qsa_block_indices(
+        block_indices,
+        query_positions,
+        sequence_lengths,
+        compress_ratio=params.compress_ratio,
+        token_topk=params.token_topk,
+    )
+
+
+def select_qsa_paged_tokens(
+    q: torch.Tensor,
+    index_cache: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    request_indices: torch.Tensor,
+    metadata: "QSAAttentionMetadata",
+    params: QSASparseParams,
+    *,
+    top_k: TopK | None = None,
+    top_k_output: torch.Tensor | None = None,
+    top_k_row_starts: torch.Tensor | None = None,
+    visible_blocks: torch.Tensor | None = None,
+    context_rows: bool = False,
+) -> torch.Tensor:
+    """Select tokens with packed, fixed-width paged scoring.
+
+    ``context_rows`` marks the caller that packs many consecutive query rows
+    per request; scoring can then share one gather of compressed keys across a
+    tile of rows.
+    """
+    from .kernels import triton_qsa_paged_index_scores
+
+    logits = triton_qsa_paged_index_scores(
+        q=q,
+        index_cache=index_cache,
+        block_table=metadata.qsa_block_table,
+        query_positions=query_positions,
+        request_indices=request_indices,
+        tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
+        compress_ratio=params.compress_ratio,
+        # CUDA radix Top-K scans only [row_starts, row_ends), so score tiles
+        # outside the causal boundary need not be materialized. Preserve fully
+        # initialized logits for the Torch fallback below.
+        only_visible_blocks=top_k is not None and q.is_cuda,
+        context_rows=context_rows,
+    )
+    if top_k is not None and logits.is_cuda:
+        if top_k_output is None or top_k_row_starts is None:
+            raise ValueError("QSA CUDA Top-K requires caller-owned output and row starts")
+        indices = top_k_output[: q.shape[0]]
+        if visible_blocks is None:
+            visible_blocks = ((query_positions + 1) // params.compress_ratio).to(torch.int32)
+        # QSA always has explicit per-row compressed-block bounds, including
+        # generation and speculative rows. Use TopK's row-range API rather
+        # than its request-grouped decode API; this is a layout choice, not a
+        # declaration that the request is in prefill.
+        top_k(
+            logits,
+            indices,
+            is_prefill=True,
+            row_starts=top_k_row_starts[: q.shape[0]],
+            row_ends=visible_blocks,
+        )
+    else:
+        # `triton_qsa_paged_index_scores` applies each row's causal block bound
+        # in both `only_visible_blocks` modes; the flag only decides whether
+        # out-of-range columns are left unspecified or written as -inf. So the
+        # scores reaching this Torch fallback are already causally masked, and
+        # the -inf entries below are what mark the padding slots.
+        width = min(params.block_topk, logits.shape[1])
+        values, indices = torch.topk(logits, width, dim=-1)
+        indices = torch.where(
+            torch.isfinite(values),
+            indices,
+            torch.full_like(indices, -1),
+        ).to(torch.int32)
+        if width < params.block_topk:
+            indices = torch.nn.functional.pad(
+                indices,
+                (0, params.block_topk - width),
+                value=-1,
+            )
+    return expand_qsa_block_indices(
+        indices,
+        query_positions,
+        sequence_lengths,
+        compress_ratio=params.compress_ratio,
+        token_topk=params.token_topk,
+    )
+
+
 class QSASparseHooks(AttentionSparseHooks):
     """Keep the QSA side cache current and replace dense attention when useful."""
-
-    def initialize(self, attention: "Attention") -> None:
-        params = attention.sparse_params
-        if not isinstance(params, QSASparseParams):
-            raise TypeError("QSASparseHooks requires QSASparseParams")
-        attention.indexer = QSAIndexer(attention, params)
 
     def forward(
         self,
@@ -301,4 +618,11 @@ class QSASparseHooks(AttentionSparseHooks):
 register_attention_sparse_hooks("qsa", QSASparseHooks)
 
 
-__all__ = ["QSASparseHooks"]
+__all__ = [
+    "QSASparseHooks",
+    "expand_qsa_block_indices",
+    "qsa_sparse_gqa",
+    "qsa_sparse_gqa_reference",
+    "select_qsa_paged_tokens",
+    "select_qsa_tokens",
+]

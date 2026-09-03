@@ -32,7 +32,9 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         repr=False,
     )
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        # Forwards the parent dataclass's full field set, so the signature
+        # stays open rather than restating it.
         """Allocate the fixed-shape QSA buffers updated before each graph replay."""
         sparse_attention_config = kwargs.pop("sparse_attention_config", None)
         if kwargs.get("sparse_metadata_params") is None and sparse_attention_config is not None:

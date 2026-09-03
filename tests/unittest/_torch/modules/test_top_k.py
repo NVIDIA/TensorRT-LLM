@@ -10,7 +10,7 @@ from unittest.mock import Mock, call
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+from tensorrt_llm._torch.modules.top_k import _CUTE_DSL_PREFILL_COPY_BITS, TopK, TopKImplementation
 
 
 def test_prefill_torch_masks_dirty_scores_and_pads_output() -> None:
@@ -431,10 +431,13 @@ def test_cuda_gvr_reserves_workspace_during_capture(monkeypatch) -> None:
 
 def test_cute_dsl_prefill_dispatches_to_blackwell_kernel(monkeypatch) -> None:
     prefill = Mock()
+    # The op is registered only when CUTLASS DSL is available, so patch
+    # without requiring a pre-existing attribute.
     monkeypatch.setattr(
         torch.ops.trtllm,
         "cute_dsl_indexer_topk_prefill_blackwell",
         prefill,
+        raising=False,
     )
     top_k = TopK(1, prefill_implementation=TopKImplementation.CUTE_DSL_RADIX)
     scores = torch.ones(1, 1)
@@ -457,7 +460,7 @@ def test_cute_dsl_prefill_dispatches_to_blackwell_kernel(monkeypatch) -> None:
         row_ends,
         output,
         1,
-        128,
+        _CUTE_DSL_PREFILL_COPY_BITS,
     )
 
 

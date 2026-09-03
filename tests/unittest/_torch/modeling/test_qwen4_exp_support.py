@@ -4,6 +4,7 @@
 import json
 from copy import deepcopy
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -163,7 +164,13 @@ def test_vision_attention_does_not_inherit_text_sparse_config(monkeypatch) -> No
 
     captured = {}
 
-    def mock_parent_init(self, model_config, *, layer_idx, reduce_output):
+    def mock_parent_init(
+        self: nn.Module,
+        model_config: ModelConfig,
+        *,
+        layer_idx: int,
+        reduce_output: bool,
+    ) -> None:
         captured["model_config"] = model_config
         captured["layer_idx"] = layer_idx
         captured["reduce_output"] = reduce_output
@@ -268,7 +275,13 @@ def test_multimodal_forward_uses_original_token_ids_for_ple(monkeypatch) -> None
     model.defer_combine_mask = []
     captured = {}
 
-    def capture_ple_ids(self, attn_metadata, input_ids, mamba_metadata, spec_metadata):
+    def capture_ple_ids(
+        self: nn.Module,
+        attn_metadata: object,
+        input_ids: Optional[torch.Tensor],
+        mamba_metadata: object,
+        spec_metadata: object,
+    ) -> None:
         del self, attn_metadata, mamba_metadata, spec_metadata
         captured["input_ids"] = input_ids
         return None
@@ -326,7 +339,7 @@ def test_model_forward_aborts_unconsumed_ple_prefetch(monkeypatch) -> None:
             super().__init__()
             self.ple = ple
 
-        def forward(self, **kwargs):
+        def forward(self, **kwargs: object) -> None:
             del kwargs
             raise RuntimeError("simulated layer failure")
 
@@ -459,7 +472,13 @@ def test_ple_states_use_v2_lifecycle_buffers(monkeypatch) -> None:
     conv_state = torch.zeros((12, 16, 6), dtype=torch.bfloat16)
     requested = []
 
-    def fake_get_state_buffer(self, local_layer_idx, role, dtype, state_shape):
+    def fake_get_state_buffer(
+        self: object,
+        local_layer_idx: int,
+        role: MambaRole,
+        dtype: torch.dtype,
+        state_shape: list[int],
+    ) -> torch.Tensor:
         del self
         requested.append((local_layer_idx, role, dtype, state_shape))
         if role == MambaRole.PLE_NGRAM_CONTEXT:
@@ -558,7 +577,7 @@ def test_mapper_normalizes_bf16_and_per_expert_fp8_weights() -> None:
     with pytest.raises(ValueError, match="not divisible"):
         _rank_block([torch.empty(3, 2)], tp_size=2)
 
-    config = SimpleNamespace(hidden_size=4, moe_intermediate_size=3)
+    config = SimpleNamespace(hidden_size=4, moe_intermediate_size=3, num_experts=2)
     fused, mode = _normalize_moe_module_weights(
         {
             "gate_up_proj": torch.randn(2, 6, 4),
@@ -782,6 +801,7 @@ def test_pipeline_mapper_drops_nonlocal_layer_weights() -> None:
             tp_rank=0,
             has_pp=lambda: True,
         ),
+        spec_config=None,
     )
     weights = {
         "model.language_model.layers.0.marker.weight": torch.ones(1),
@@ -974,7 +994,13 @@ def test_dynamic_tree_resource_uses_full_qwen_hc_width(monkeypatch) -> None:
 
     captured = {}
 
-    def make_manager(config, dtype, hidden_size, max_num_requests, sa_manager=None):
+    def make_manager(
+        config: object,
+        dtype: torch.dtype,
+        hidden_size: int,
+        max_num_requests: int,
+        sa_manager: object = None,
+    ) -> object:
         captured.update(
             config=config,
             dtype=dtype,
@@ -1012,6 +1038,46 @@ def test_dynamic_tree_resource_uses_full_qwen_hc_width(monkeypatch) -> None:
     assert captured["max_num_requests"] == 16
 
 
+def test_logits_processor_borrows_target_mixer_but_mtp_head_owns_one() -> None:
+    """The target head must not re-register the decoder's mixer as a child.
+
+    Both heads reach their mixer through the same attribute name, but only the
+    MTP head owns checkpoint tensors for it. If the target head registered the
+    borrowed module, its parameters would show up twice in `named_parameters()`
+    and the weight loader would visit them under two different names.
+    """
+    from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_qwen4_exp import (
+        Qwen4ExpHyperConnection,
+        Qwen4ExpLogitsProcessor,
+        Qwen4ExpMTPHead,
+    )
+    from tensorrt_llm.mapping import Mapping
+
+    config = Qwen4ExpTextConfig.from_dict(_text_config_dict())
+    model_config = ModelConfig(pretrained_config=config, mapping=Mapping())
+
+    borrowed = Qwen4ExpHyperConnection.from_config(
+        config,
+        use_mix=True,
+        use_combine=False,
+        dtype=config.torch_dtype,
+        mapping=model_config.mapping,
+        use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm,
+    )
+    target_head = Qwen4ExpLogitsProcessor(model_config, borrowed)
+    assert target_head.hyper_connection_mixer is borrowed
+    assert "hyper_connection_mixer" not in dict(target_head.named_children())
+    assert list(target_head.parameters()) == []
+
+    mtp_head = Qwen4ExpMTPHead(model_config)
+    assert "hyper_connection_mixer" in dict(mtp_head.named_children())
+    assert any(
+        name.startswith("hyper_connection_mixer.") for name, _ in mtp_head.named_parameters()
+    )
+
+
 def test_mtp_local_full_vocab_head_collapses_hc_streams(monkeypatch) -> None:
     from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -1032,7 +1098,7 @@ def test_mtp_local_full_vocab_head_collapses_hc_streams(monkeypatch) -> None:
     )
     head = Qwen4ExpMTPHead(model_config)
 
-    def unexpected_allgather(*args, **kwargs):
+    def unexpected_allgather(*args: object, **kwargs: object) -> None:
         del args, kwargs
         raise AssertionError("local full-vocabulary MTP logits must not all-gather")
 
@@ -1043,7 +1109,7 @@ def test_mtp_local_full_vocab_head_collapses_hc_streams(monkeypatch) -> None:
             super().__init__()
             self.input_shape = None
 
-        def forward(self, hidden_states):
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             self.input_shape = hidden_states.shape
             return hidden_states
 
@@ -1085,7 +1151,7 @@ def test_mtp_head_restores_lm_head_gather_output(initial_gather_output: bool, fa
             super().__init__()
             self.gather_output = initial_gather_output
 
-        def forward(self, hidden_states, **kwargs):
+        def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
             del kwargs
             assert not self.gather_output
             if fail:
@@ -1199,7 +1265,12 @@ def test_ple_prefill_reuses_prepared_device_metadata(monkeypatch) -> None:
 
     captured = {}
 
-    def fake_build(input_ids, seq_lens, state_indices, **kwargs):
+    def fake_build(
+        input_ids: torch.Tensor,
+        seq_lens: object,
+        state_indices: object,
+        **kwargs: object,
+    ) -> SimpleNamespace:
         captured["input_ids"] = input_ids
         captured["seq_lens"] = seq_lens
         captured["state_indices"] = state_indices

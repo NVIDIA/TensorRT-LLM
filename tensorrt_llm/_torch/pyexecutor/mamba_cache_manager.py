@@ -3011,9 +3011,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._num_reserved_dummy_slots = (num_cuda_graph_padding_dummy_slots +
                                           int(mapping.enable_attention_dp))
         # PLE uses the same request slots and snapshots as the GDN state.
-        self._ple_layer_ids: List[int] = []
-        self._ple_conv_state_shape: List[int] = []
-        self._ple_ngram_context_shape: List[int] = []
+        self._ple_layer_ids: list[int] = []
+        self._ple_conv_state_shape: list[int] = []
+        self._ple_ngram_context_shape: list[int] = []
         self._ple_conv_state_dtype = mamba_cache_dtype
         if qwen4_exp_ple_cache_params is not None:
             params = qwen4_exp_ple_cache_params
@@ -3047,8 +3047,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             ]
             self._ple_ngram_context_shape = [params.ngram_context_len]
             self._ple_conv_state_dtype = params.conv_state_dtype
-        self._ple_conv_states: Dict[int, torch.Tensor] = {}
-        self._ple_ngram_contexts: Dict[int, torch.Tensor] = {}
+        self._ple_conv_states: dict[int, torch.Tensor] = {}
+        self._ple_ngram_contexts: dict[int, torch.Tensor] = {}
         self.ssm_state_dtype = (mamba_ssm_cache_dtype if mamba_ssm_cache_dtype
                                 is not None else mamba_cache_dtype)
         self.conv_state_dtype = mamba_cache_dtype
@@ -3260,7 +3260,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def ple_layer_cache(
             self,
-            layer_idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+            layer_idx: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Return persistent ``(conv_state, ngram_context)`` pools for a layer."""
         conv = self._ple_conv_states.get(layer_idx)
         ngram = self._ple_ngram_contexts.get(layer_idx)
@@ -3559,7 +3559,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             math.prod(self._ple_ngram_context_shape) * torch.int64.itemsize)
         return base_bytes + local_ple_layers * ple_bytes
 
-    def _ple_buffer_configs(self) -> List[BufferConfig]:
+    def _ple_buffer_configs(self) -> list[BufferConfig]:
         if not self._ple_layer_ids:
             return []
         return [

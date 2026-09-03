@@ -15,11 +15,6 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.indexer import (
     QSAIndexer,
     _position_coordinates,
     average_pool_qsa_keys,
-    expand_qsa_block_indices,
-    qsa_sparse_gqa,
-    qsa_sparse_gqa_reference,
-    select_qsa_paged_tokens,
-    select_qsa_tokens,
 )
 from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
     _expand_launch,
@@ -32,7 +27,14 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
     triton_qsa_unscale_block_table,
 )
 from tensorrt_llm._torch.attention_backend.sparse.qsa.metadata import QSAAttentionMetadata
-from tensorrt_llm._torch.attention_backend.sparse.qsa.module import _store_paged_kv_reference
+from tensorrt_llm._torch.attention_backend.sparse.qsa.module import (
+    _store_paged_kv_reference,
+    expand_qsa_block_indices,
+    qsa_sparse_gqa,
+    qsa_sparse_gqa_reference,
+    select_qsa_paged_tokens,
+    select_qsa_tokens,
+)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 
@@ -106,6 +108,35 @@ def test_expand_launch_splits_columns_only_for_narrow_batches(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_expand_qsa_blocks_rejects_non_unit_inner_stride() -> None:
+    """Only stride(0) reaches the kernel, so the other axes must be dense."""
+    from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
+        triton_expand_qsa_block_indices,
+    )
+
+    compress_ratio, token_topk = 4, 8
+    block_topk = token_topk // compress_ratio
+    rows = 2
+    # A column-strided view: shape is right, inner stride is not.
+    strided = torch.zeros((rows, block_topk * 2), dtype=torch.int32, device="cuda")[:, ::2]
+    query_positions = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    sequence_lengths = torch.ones(rows, dtype=torch.int32, device="cuda")
+    arguments = dict(compress_ratio=compress_ratio, token_topk=token_topk)
+
+    with pytest.raises(ValueError, match="contiguous along their last dimension"):
+        triton_expand_qsa_block_indices(strided, query_positions, sequence_lengths, **arguments)
+
+    dense = strided.contiguous()
+    with pytest.raises(ValueError, match="metadata must be contiguous"):
+        triton_expand_qsa_block_indices(
+            dense,
+            torch.zeros(rows * 2, dtype=torch.int32, device="cuda")[::2],
+            sequence_lengths,
+            **arguments,
+        )
+
+
 def test_expand_qsa_blocks_column_split_matches_whole_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -620,6 +651,70 @@ def test_qsa_paged_index_scores_query_tile_matches_row_wise(
     if not only_visible_blocks:
         assert torch.equal(torch.isfinite(tiled), visible)
         assert torch.equal(torch.isfinite(row_wise), visible)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_paged_selection_torch_fallback_stays_causal() -> None:
+    """The Torch Top-K fallback must not select blocks after the query row.
+
+    This path calls ``triton_qsa_paged_index_scores`` with
+    ``only_visible_blocks`` disabled, so the scorer writes every column rather
+    than leaving the out-of-range ones unspecified. It still applies the
+    per-row causal block bound in that mode, storing ``-inf`` beyond the
+    boundary, which is what keeps the unbounded ``torch.topk`` below causal.
+    The side cache here scores later blocks highest, so a scorer that dropped
+    the bound would immediately surface as non-causal selection.
+    """
+    params = _params(index_head_dim=16)
+    tokens_per_block = 8
+    index_cache = torch.zeros(
+        2,
+        tokens_per_block,
+        1,
+        params.index_head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    block_table = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+    # Strictly increasing per-block scores: an unmasked Top-K always prefers
+    # the newest compressed blocks, which are exactly the non-causal ones.
+    for compressed_idx in range(4):
+        logical = compressed_idx * params.compress_ratio + params.compress_ratio - 1
+        page_column, within = divmod(logical, tokens_per_block)
+        page = int(block_table[0, page_column])
+        index_cache[page, within, 0] = compressed_idx + 1
+
+    q = torch.ones(
+        1,
+        params.index_n_heads,
+        params.index_head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    # Position 5 sees compressed blocks [0, 1) only: (5 + 1) // 4 == 1.
+    query_positions = torch.tensor([5], device="cuda")
+    sequence_lengths = torch.tensor([16], device="cuda")
+    request_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
+    metadata = SimpleNamespace(
+        qsa_block_table=block_table,
+        kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
+    )
+
+    selected = select_qsa_paged_tokens(
+        q,
+        index_cache,
+        query_positions,
+        sequence_lengths,
+        request_indices,
+        metadata,
+        params,
+    )
+
+    chosen = [token for token in selected[0].tolist() if token >= 0]
+    assert chosen, "the visible block must still be selected"
+    assert max(chosen) <= int(query_positions[0]), (
+        f"selected tokens {chosen} exceed the causal boundary {int(query_positions[0])}"
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

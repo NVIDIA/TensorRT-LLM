@@ -1052,6 +1052,13 @@ def triton_expand_qsa_block_indices(
         or sequence_lengths.dtype not in _INTEGER_DTYPES
     ):
         raise ValueError("QSA expansion metadata must use integer storage")
+    # Only stride(0) reaches the kernel; it walks the remaining axes with unit
+    # steps. A sliced or transposed view would otherwise read the wrong
+    # elements and silently produce wrong token indices.
+    if block_indices.stride(1) != 1:
+        raise ValueError("QSA block indices must be contiguous along their last dimension")
+    if not query_positions.is_contiguous() or not sequence_lengths.is_contiguous():
+        raise ValueError("QSA expansion metadata must be contiguous")
     _require_same_cuda_device(
         "QSA block-index expansion", block_indices, query_positions, sequence_lengths
     )
