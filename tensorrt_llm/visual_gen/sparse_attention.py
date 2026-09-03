@@ -229,7 +229,8 @@ class SolAttnAttentionConfig(BaseSparseAttentionConfig):
     (B200/GB200) only, head_dim=128, bf16, MHA.
 
     On an unsupported *shape, dtype, or architecture* the kernel falls back to
-    dense SDPA and counts the fallback, so setting this config on the wrong GPU
+    dense attention -- the configured backend's dense kernel where available,
+    torch SDPA otherwise -- and counts the fallback, so setting this config on the wrong GPU
     degrades rather than fails. Two cases are not covered by that fallback and do raise: GQA/MQA
     (num_kv_heads != num_heads) here at construction, and context parallelism
     (cp_size > 1), rejected in visual_gen/modules/attention.py.

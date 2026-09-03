@@ -16,7 +16,7 @@ lives there too, keyed off the normalized timestep forward kwarg.
 
 CuTe DSL imports and compilation are deferred to first use. Calls the kernel
 cannot serve -- wrong shape, dtype, or an architecture with no kernel --
-delegate to dense SDPA rather than failing, and increment
+delegate to dense attention rather than failing, and increment
 ``_SOL_STATS["dense_fallback_calls"]`` so the degradation is countable. Set
 ``SOL_ATTN_STRICT=1`` to raise instead of falling back.
 """
@@ -133,8 +133,9 @@ def _dense_bthd(q, k, v):
 
 # Opaque to Dynamo, like every other CuTe DSL launch boundary here (see
 # cute_dsl/fmha.py, video_sparse_attention/interface.py). Otherwise Dynamo
-# traces into the CuTe DSL JIT builder and retraces on every call: 69x slower
-# on B200 (denoise 2496.9 s vs 36.2 s), silently, as if compile just didn't help.
+# traces into the CuTe DSL JIT builder and retraces on every call: near two
+# orders of magnitude slower on B200 (2496.9 s mean denoise without it), and
+# silently, as if compile just didn't help.
 @torch.compiler.disable
 def _run_sol_attn_bthd(
     q,
@@ -170,7 +171,7 @@ def _run_sol_attn_bthd(
         if _strict():
             raise RuntimeError(f"[sol-attn] cannot run the CuTe kernel: {reason}")
         logger.warning_once(
-            f"[sol-attn] falling back to dense SDPA: {reason}. Sol-Attn will not "
+            f"[sol-attn] falling back to dense attention: {reason}. Sol-Attn will not "
             "accelerate this run. Set SOL_ATTN_STRICT=1 to raise instead.",
             key=("sol_attn_ineligible", reason),
         )
@@ -195,7 +196,7 @@ def _run_sol_attn_bthd(
             raise
         logger.warning_once(
             f"[sol-attn] kernel raised {type(exc).__name__}: {exc}; falling back to dense "
-            "SDPA for this call. Set SOL_ATTN_STRICT=1 to raise instead of silently falling "
+            "attention for this call. Set SOL_ATTN_STRICT=1 to raise instead of silently falling "
             "back.",
             key=(type(exc).__name__, str(exc)),
         )
