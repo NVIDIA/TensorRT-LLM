@@ -267,9 +267,7 @@ lora_config:
 ```
 ### Starting the Server
 ```bash
-python -m tensorrt_llm.commands.serve
-     /path/to/model \
-    --config config.yaml
+trtllm-serve /path/to/model --config config.yaml
 ```
 
 ### Client Usage
