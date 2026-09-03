@@ -228,7 +228,7 @@ class KVCacheManager:
         "_stats_excluded_kv_cache_ids",
         "_iter_suspended_requests",
         "_iter_resumed_requests",
-        "_iter_disk_prefetch_tokens",
+        "_iter_disk_prefetch_blocks",
         "_iter_cached_tokens_by_level",
         "_iter_reused_blocks_by_level",
     )
@@ -314,7 +314,7 @@ class KVCacheManager:
         self._stats_excluded_kv_cache_ids = set()
         self._iter_suspended_requests = 0
         self._iter_resumed_requests = 0
-        self._iter_disk_prefetch_tokens = 0
+        self._iter_disk_prefetch_blocks = 0
         self._iter_cached_tokens_by_level = []
         self._iter_reused_blocks_by_level = {}
 
@@ -697,17 +697,17 @@ class KVCacheManager:
         self._iter_resumed_requests = 0
         return suspended, resumed
 
-    def record_disk_prefetch_tokens(self, num_tokens: int) -> None:
-        """Count logical tokens scheduled by successful disk-to-host prefetches."""
-        assert num_tokens >= 0
+    def record_disk_prefetch_blocks(self, num_blocks: int) -> None:
+        """Count the blocks a prefetch call actually migrated from disk to host."""
+        assert num_blocks >= 0
         if self._stats_enabled:
-            self._iter_disk_prefetch_tokens += num_tokens
+            self._iter_disk_prefetch_blocks += num_blocks
 
-    def get_and_reset_iteration_disk_prefetch_tokens(self) -> int:
-        """Return and reset disk-to-host prefetch tokens for this iteration."""
-        num_tokens = self._iter_disk_prefetch_tokens
-        self._iter_disk_prefetch_tokens = 0
-        return num_tokens
+    def get_and_reset_iteration_disk_prefetch_blocks(self) -> int:
+        """Return and reset disk-to-host prefetch blocks for this iteration."""
+        num_blocks = self._iter_disk_prefetch_blocks
+        self._iter_disk_prefetch_blocks = 0
+        return num_blocks
 
     def record_cached_tokens_by_level(self, counts: CountsByLevel) -> None:
         """Accumulate a request's initial cached-token attribution, by cache level, into this

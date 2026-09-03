@@ -493,8 +493,6 @@ bool KvCache::prefetch(CacheLevel target)
     LifeCycleId const numLifeCycles = storageMgr.numLifeCycles();
     TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> allPages(
         numLifeCycles, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>(numTiers));
-    bool const trackDiskTokens = _shouldRecordManagerStats() && storageMgr.cacheTier(target) == CacheTier::HOST_MEM;
-    bool hasDiskSource = false;
 
     for (auto const& activePage : _activePages())
     {
@@ -508,31 +506,23 @@ bool KvCache::prefetch(CacheLevel target)
         {
             continue;
         }
-        hasDiskSource = hasDiskSource || (trackDiskTokens && storageMgr.cacheTier(level) == CacheTier::DISK);
         allPages.at(activePage.lcId).at(level).push_back(std::move(page));
     }
 
     try
     {
-        storageMgr.prefetch(target, allPages);
+        // StorageManager reports what it actually migrated. Blocks, the unit iterOffloadBlocks and
+        // iterOnboardBlocks use: one page per block per life cycle. Unrelated to
+        // mCachedTokensByLevel, which answers where reuse-matched tokens lived.
+        int64_t const diskBlocksMigrated = storageMgr.prefetch(target, allPages);
+        if (diskBlocksMigrated > 0 && _shouldRecordManagerStats())
+        {
+            mManager->recordDiskPrefetchBlocks(diskBlocksMigrated);
+        }
     }
     catch (OutOfPagesError const&)
     {
         return false;
-    }
-    if (hasDiskSource)
-    {
-        // The metric counts disk-to-host movement, so fold together every level the config maps
-        // to the disk tier rather than assuming a single disk level.
-        int64_t diskTokens = 0;
-        for (CacheLevel level{0}; level < mCachedTokensByLevel.size(); ++level)
-        {
-            if (storageMgr.cacheTier(level) == CacheTier::DISK)
-            {
-                diskTokens += mCachedTokensByLevel.at(level);
-            }
-        }
-        mManager->recordDiskPrefetchTokens(diskTokens);
     }
     return true;
 }

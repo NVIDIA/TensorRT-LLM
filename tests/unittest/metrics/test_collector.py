@@ -731,7 +731,7 @@ class TestLogIterationStatsKvCacheIteration:
                 }
             }
         }
-        stats["iterDiskPrefetchTokens"] = 7
+        stats["iterDiskPrefetchBlocks"] = 7
         # Two GPU levels: the split keeps them apart even though they share a tier name.
         stats["iterCachedTokensByLevel"] = [5, 2, 1]
         stats["kvCacheLevelTiers"] = ["gpu", "gpu", "host"]
@@ -741,7 +741,7 @@ class TestLogIterationStatsKvCacheIteration:
         assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.4)
         # Iter reuse rate = 5/(5+3) = 0.625
         assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(0.625)
-        assert _get_counter_value(collector, "kv_cache_disk_prefetch_tokens_total") == 7
+        assert _get_counter_value(collector, "kv_cache_disk_prefetch_blocks_total") == 7
         assert [
             _counter_value_with_labels(
                 collector.counter_tokens_cached_prompt_by_tier,
