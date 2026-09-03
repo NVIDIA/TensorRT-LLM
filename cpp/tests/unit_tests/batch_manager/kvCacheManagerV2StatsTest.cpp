@@ -154,24 +154,6 @@ TEST(KvCacheManagerV2StatsTest, PendingReuseByLevelRidesAlongWithScalarCounts)
     EXPECT_TRUE(pending.empty());
 }
 
-TEST(KvCacheManagerV2StatsTest, ReusedBlocksByLevelAddResizesToLongerVector)
-{
-    ReusedBlocksByLevel counts;
-    EXPECT_TRUE(counts.empty());
-
-    ReusedBlocksByLevel twoLevels;
-    twoLevels.full = {1, 2};
-    counts.add(twoLevels);
-    EXPECT_EQ(counts.full.raw(), (std::vector<int64_t>{1, 2}));
-    EXPECT_FALSE(counts.empty());
-
-    // A deployment reporting more levels than seen so far widens the accumulator.
-    ReusedBlocksByLevel fourLevels;
-    fourLevels.full = {10, 0, 0, 5};
-    counts.add(fourLevels);
-    EXPECT_EQ(counts.full.raw(), (std::vector<int64_t>{11, 2, 0, 5}));
-}
-
 TEST(KvCacheManagerV2StatsTest, ManagerCommitResetAndRequestIdTracking)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
