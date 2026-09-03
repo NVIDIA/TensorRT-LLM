@@ -25,6 +25,238 @@ __extra_import_path__ = ["~/tests/integration"]
 from defs.perf import test_perf_sanity as perf_sanity  # noqa: E402
 
 
+def _assignment(
+    arm: str = "auto", source: str = "randomized"
+) -> perf_sanity.CheckpointIoExperimentAssignment:
+    return perf_sanity.CheckpointIoExperimentAssignment(
+        version=perf_sanity.CHECKPOINT_IO_EXPERIMENT_VERSION,
+        bucket=(0 if arm == "native" else 1) if source == "randomized" else -1,
+        assigned_arm=arm,
+        assignment_source=source,
+        root_build_number=(100 if arm == "native" else 101) if source == "randomized" else None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("build_number", "expected_bucket", "expected_arm"),
+    [(100, 0, "native"), (101, 1, "auto"), (102, 2, "auto"), (103, 3, "auto")],
+)
+def test_checkpoint_io_experiment_uses_deterministic_75_25_split(
+    build_number: int,
+    expected_bucket: int,
+    expected_arm: str,
+) -> None:
+    configs = [{}, {}]
+
+    assignment = perf_sanity.assign_checkpoint_io_experiment(
+        configs,
+        telemetry_eligible=True,
+        environment={},
+        job_info={"s_job_id": str(build_number)},
+    )
+
+    assert assignment.bucket == expected_bucket
+    assert assignment.assigned_arm == expected_arm
+    assert assignment.assignment_source == "randomized"
+    assert configs == [
+        {"checkpoint_io_policy": expected_arm},
+        {"checkpoint_io_policy": expected_arm},
+    ]
+
+
+def test_checkpoint_io_experiment_writes_concrete_generated_config() -> None:
+    config = {"model_name": "test-model"}
+    assignment = perf_sanity.assign_checkpoint_io_experiment(
+        [config],
+        telemetry_eligible=True,
+        environment={},
+        job_info={"s_job_id": "100"},
+    )
+
+    server_config = perf_sanity.ServerConfig(config, checkpoint_io_experiment=assignment)
+    generated = perf_sanity.yaml.safe_load(server_config.generate_extra_llm_api_config())
+
+    assert generated["checkpoint_io_policy"] == "native"
+    assert server_config.checkpoint_io_experiment == assignment
+
+
+@pytest.mark.parametrize("policy", ["auto", "native"])
+def test_checkpoint_io_experiment_override_is_reproducible_without_ci(policy: str) -> None:
+    config = {}
+
+    assignment = perf_sanity.assign_checkpoint_io_experiment(
+        [config],
+        telemetry_eligible=False,
+        environment={perf_sanity.CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV: policy},
+    )
+
+    assert assignment.assigned_arm == policy
+    assert assignment.assignment_source == "override"
+    assert assignment.bucket == -1
+    assert config["checkpoint_io_policy"] == policy
+
+
+def test_checkpoint_io_experiment_preserves_explicit_policy() -> None:
+    configs = [{"checkpoint_io_policy": "rank_striped_read_ahead"}, {}]
+
+    assignment = perf_sanity.assign_checkpoint_io_experiment(
+        configs,
+        telemetry_eligible=True,
+        environment={perf_sanity.CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV: "native"},
+        job_info={"s_job_id": "100"},
+    )
+
+    assert assignment.assigned_arm == "unassigned"
+    assert assignment.assignment_source == "explicit_config"
+    assert configs == [{"checkpoint_io_policy": "rank_striped_read_ahead"}, {}]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"backend": "_autodeploy"},
+        {"checkpoint_format": "MX"},
+        {"load_format": "dummy"},
+        {"extra_llm_api_config_path": "purpose-built.yaml"},
+    ],
+)
+def test_checkpoint_io_experiment_excludes_incompatible_config(config: dict) -> None:
+    original = dict(config)
+
+    assignment = perf_sanity.assign_checkpoint_io_experiment(
+        [config],
+        telemetry_eligible=True,
+        environment={},
+        job_info={"s_job_id": "100"},
+    )
+
+    assert assignment.assigned_arm == "unassigned"
+    assert assignment.assignment_source == "ineligible_config"
+    assert config == original
+
+
+@pytest.mark.parametrize(
+    ("telemetry_eligible", "job_id", "source"),
+    [
+        (False, "100", "non_telemetry"),
+        (True, "", "missing_root_build"),
+        (True, "0", "missing_root_build"),
+        (True, "bad", "missing_root_build"),
+    ],
+)
+def test_checkpoint_io_experiment_defaults_to_auto_without_assignment(
+    telemetry_eligible: bool,
+    job_id: str,
+    source: str,
+) -> None:
+    config = {}
+
+    assignment = perf_sanity.assign_checkpoint_io_experiment(
+        [config],
+        telemetry_eligible=telemetry_eligible,
+        environment={},
+        job_info={"s_job_id": job_id},
+    )
+
+    assert assignment.assigned_arm == "unassigned"
+    assert assignment.assignment_source == source
+    assert "checkpoint_io_policy" not in config
+
+
+def test_checkpoint_io_experiment_rejects_invalid_override() -> None:
+    with pytest.raises(ValueError, match="must be 'auto' or 'native'"):
+        perf_sanity.assign_checkpoint_io_experiment(
+            [{}],
+            telemetry_eligible=True,
+            environment={perf_sanity.CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV: "random"},
+            job_info={"s_job_id": "100"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("assignment", "selected", "activated", "effective", "expected"),
+    [
+        (
+            _assignment("auto"),
+            "rank_striped_read_ahead",
+            True,
+            "rank_striped_read_ahead",
+            "rank_striped_activated",
+        ),
+        (_assignment("auto"), "native", False, "native", "auto_fallback"),
+        (
+            _assignment("auto"),
+            "rank_striped_read_ahead",
+            True,
+            "native",
+            "auto_fallback",
+        ),
+        (_assignment("native"), "native", False, "native", "randomized_control"),
+    ],
+)
+def test_checkpoint_io_experiment_classification_preserves_assigned_arm(
+    assignment: perf_sanity.CheckpointIoExperimentAssignment,
+    selected: str,
+    activated: bool,
+    effective: str,
+    expected: str,
+) -> None:
+    policies = [
+        {
+            "requested": assignment.assigned_arm,
+            "selected": selected,
+            "activated": activated,
+            "effective": effective,
+        }
+    ]
+
+    assert perf_sanity.classify_checkpoint_io_experiment(assignment, policies) == expected
+
+
+@pytest.mark.parametrize(
+    ("policies", "expected"),
+    [
+        ([{"requested": "auto", "selected": "native", "effective": "native"}], "unknown"),
+        (
+            [
+                {
+                    "requested": "auto",
+                    "selected": "native",
+                    "activated": False,
+                    "effective": "native",
+                },
+                {
+                    "requested": "auto",
+                    "selected": "rank_striped_read_ahead",
+                    "activated": True,
+                    "effective": "rank_striped_read_ahead",
+                },
+            ],
+            "mixed",
+        ),
+    ],
+)
+def test_checkpoint_io_experiment_classification_separates_incomplete_or_mixed_status(
+    policies: list[dict], expected: str
+) -> None:
+    assert perf_sanity.classify_checkpoint_io_experiment(_assignment(), policies) == expected
+
+
+def test_checkpoint_io_fallback_reason_is_bounded(tmp_path: Path) -> None:
+    server_log = tmp_path / "trtllm-serve.0.log"
+    server_log.write_text(
+        "Checkpoint I/O policy: requested=auto, selected=native, "
+        "activated=False, effective=native, fallback_reason=" + "x" * 300 + ".\n",
+        encoding="utf-8",
+    )
+
+    status = perf_sanity.parse_checkpoint_io_policies([str(server_log)])[0]
+
+    assert len(status["fallback_reason"]) == perf_sanity.CHECKPOINT_IO_FALLBACK_REASON_LIMIT
+    assert status["fallback_reason"].endswith("...")
+    assert status["fallback_category"] == "other"
+
+
 def test_make_startup_observation_combines_checkpoint_phases(
     tmp_path: Path,
 ) -> None:
@@ -38,6 +270,10 @@ def test_make_startup_observation_combines_checkpoint_phases(
     server_info = {
         "startup_metrics": {
             "model_loader": {
+                "checkpoint_loader_kind": "HfCheckpointLoader",
+                "checkpoint_weight_loader_kind": "HfWeightLoader",
+                "checkpoint_source_kind": "HF",
+                "load_format": "auto",
                 "checkpoint_preparation_seconds": 1,
                 "weight_population_seconds": 2.5,
                 "checkpoint_finalization_seconds": 0.5,
@@ -58,6 +294,12 @@ def test_make_startup_observation_combines_checkpoint_phases(
     assert observation["metrics"]["total_model_loading_seconds"] == 6.0
     assert observation["metrics"]["draft_model_checkpoint_pipeline_seconds"] == 1.0
     assert observation["metrics"]["draft_model_total_model_loading_seconds"] == 1.5
+    assert observation["metadata"] == {
+        "checkpoint_loader_kind": "HfCheckpointLoader",
+        "checkpoint_weight_loader_kind": "HfWeightLoader",
+        "checkpoint_source_kind": "HF",
+        "load_format": "auto",
+    }
     assert observation["checkpoint_io_policies"] == [
         {
             "requested": "auto",
@@ -65,6 +307,7 @@ def test_make_startup_observation_combines_checkpoint_phases(
             "activated": True,
             "effective": "rank_striped_read_ahead",
             "fallback_reason": "none",
+            "fallback_category": "none",
         }
     ]
 
@@ -90,6 +333,7 @@ def test_parse_checkpoint_io_policies_preserves_escaped_multiline_reason(
             "activated": False,
             "effective": "native",
             "fallback_reason": r"RuntimeError: first line\nsecond line",
+            "fallback_category": "other",
         }
     ]
 
@@ -129,7 +373,7 @@ def test_add_startup_metric_values_uses_slowest_disagg_worker() -> None:
     ]
     new_data = {}
 
-    perf_sanity.add_startup_metric_values(new_data, observations, role="gen")
+    perf_sanity.add_startup_metric_values(new_data, observations, _assignment(), role="gen")
 
     assert new_data["d_gen_checkpoint_pipeline_seconds"] == 8.0
     assert new_data["d_gen_total_model_loading_seconds"] == 10.0
@@ -140,6 +384,7 @@ def test_add_startup_metric_values_uses_slowest_disagg_worker() -> None:
     assert new_data["l_gen_startup_metrics_discovered_server_count"] == 2
     assert new_data["l_gen_startup_metrics_failed_server_count"] == 0
     assert new_data["b_gen_startup_metrics_collection_complete"] is True
+    assert new_data["s_gen_checkpoint_io_experiment_classification"] == ("rank_striped_activated")
 
 
 def test_add_startup_metric_values_preserves_mixed_policy_activation() -> None:
@@ -165,7 +410,7 @@ def test_add_startup_metric_values_preserves_mixed_policy_activation() -> None:
     ]
     new_data = {}
 
-    perf_sanity.add_startup_metric_values(new_data, observations)
+    perf_sanity.add_startup_metric_values(new_data, observations, _assignment())
 
     assert new_data["s_checkpoint_io_policy_effective"] == "native,rank_striped_read_ahead"
     assert new_data["l_checkpoint_io_policy_status_count"] == 2
@@ -201,7 +446,7 @@ def test_add_startup_metric_values_marks_partial_collection() -> None:
     ]
     new_data = {}
 
-    perf_sanity.add_startup_metric_values(new_data, observations, role="gen")
+    perf_sanity.add_startup_metric_values(new_data, observations, _assignment(), role="gen")
 
     assert new_data["d_gen_total_model_loading_seconds"] == 10.0
     assert new_data["l_gen_startup_metrics_expected_server_count"] == 2
@@ -213,12 +458,49 @@ def test_add_startup_metric_values_marks_partial_collection() -> None:
 def test_add_startup_metric_values_marks_missing_server() -> None:
     new_data = {}
 
-    perf_sanity.add_startup_metric_values(new_data, [], role="ctx", expected_server_count=1)
+    perf_sanity.add_startup_metric_values(
+        new_data, [], _assignment(), role="ctx", expected_server_count=1
+    )
 
     assert new_data["l_ctx_startup_metrics_expected_server_count"] == 1
     assert new_data["l_ctx_startup_metrics_discovered_server_count"] == 0
     assert new_data["l_ctx_startup_metrics_failed_server_count"] == 0
     assert new_data["b_ctx_startup_metrics_collection_complete"] is False
+    assert new_data["s_ctx_checkpoint_loader_kind"] == "unknown"
+    assert new_data["s_ctx_checkpoint_io_policy_requested"] == "unknown"
+    assert new_data["s_ctx_checkpoint_io_policy_selected"] == "unknown"
+    assert new_data["s_ctx_checkpoint_io_policy_effective"] == "unknown"
+    assert new_data["s_ctx_checkpoint_io_experiment_classification"] == "unknown"
+
+
+def test_startup_observation_bundle_and_primary_row_are_deduplicatable(
+    tmp_path: Path,
+) -> None:
+    perf_sanity.write_startup_observations(
+        str(tmp_path), 0, [{"role": "aggregate"}], observation_id="startup-observation-1"
+    )
+
+    bundle = perf_sanity.read_startup_observations(str(tmp_path), 0)
+    first_row = {}
+    second_row = {}
+    assignment = _assignment()
+    perf_sanity.add_checkpoint_io_experiment_values(
+        first_row, assignment, bundle["startup_observation_id"], True
+    )
+    perf_sanity.add_checkpoint_io_experiment_values(
+        second_row, assignment, bundle["startup_observation_id"], False
+    )
+
+    assert bundle == {
+        "startup_observation_id": "startup-observation-1",
+        "observations": [{"role": "aggregate"}],
+    }
+    assert first_row["s_startup_observation_id"] == "startup-observation-1"
+    assert second_row["s_startup_observation_id"] == "startup-observation-1"
+    assert first_row["b_startup_observation_primary_row"] is True
+    assert second_row["b_startup_observation_primary_row"] is False
+    assert first_row["s_checkpoint_io_experiment_assigned_arm"] == "auto"
+    assert first_row["l_checkpoint_io_experiment_bucket"] == 1
 
 
 def test_worker_startup_collection_handles_directory_failure(

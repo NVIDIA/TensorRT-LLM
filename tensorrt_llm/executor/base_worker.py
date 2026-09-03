@@ -1054,13 +1054,18 @@ class BaseWorker(GenerationExecutor):
         model_engine = getattr(self.engine, "model_engine", None)
         model_loader = getattr(model_engine, "model_loader", None)
         if model_loader is not None:
-            startup_metrics["model_loader"] = dict(model_loader.metrics)
+            startup_metrics["model_loader"] = {
+                **model_loader.metrics,
+                **getattr(model_loader, "startup_metadata", {}),
+            }
 
         draft_model_engine = getattr(self.engine, "draft_model_engine", None)
         draft_model_loader = getattr(draft_model_engine, "model_loader", None)
         if draft_model_loader is not None:
-            startup_metrics["draft_model_loader"] = dict(
-                draft_model_loader.metrics)
+            startup_metrics["draft_model_loader"] = {
+                **draft_model_loader.metrics,
+                **getattr(draft_model_loader, "startup_metadata", {}),
+            }
 
         return startup_metrics
 

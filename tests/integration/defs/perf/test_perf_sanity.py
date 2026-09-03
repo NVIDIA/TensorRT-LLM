@@ -43,7 +43,7 @@ from defs.trt_test_alternative import print_info, print_warning
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT
-from .perf_regression_utils import _percentile, process_and_upload_test_results
+from .perf_regression_utils import _percentile, get_job_info, process_and_upload_test_results
 
 SUPPORTED_GPU_MAPPING = {
     "GB200": "gb200",
@@ -656,6 +656,143 @@ CHECKPOINT_IO_POLICY_PATTERN = re.compile(
     r"selected=(?P<selected>[^,]+), activated=(?P<activated>True|False), "
     r"effective=(?P<effective>[^,]+), fallback_reason=(?P<fallback_reason>.*)\."
 )
+CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v1-75-auto-25-native"
+CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV = "TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY"
+CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT = 4
+CHECKPOINT_IO_EXPERIMENT_NATIVE_BUCKET = 0
+CHECKPOINT_IO_FALLBACK_REASON_LIMIT = 256
+CHECKPOINT_IO_FALLBACK_REASON_COUNT_LIMIT = 4
+STARTUP_METADATA_NAMES = (
+    "checkpoint_loader_kind",
+    "checkpoint_weight_loader_kind",
+    "checkpoint_source_kind",
+    "load_format",
+)
+
+
+class CheckpointIoExperimentAssignment(NamedTuple):
+    """One launch-wide checkpoint-I/O experiment assignment."""
+
+    version: str
+    bucket: int
+    assigned_arm: str
+    assignment_source: str
+    root_build_number: Optional[int]
+
+
+def _unassigned_checkpoint_io_experiment(
+    assignment_source: str,
+) -> CheckpointIoExperimentAssignment:
+    return CheckpointIoExperimentAssignment(
+        version=CHECKPOINT_IO_EXPERIMENT_VERSION,
+        bucket=-1,
+        assigned_arm="unassigned",
+        assignment_source=assignment_source,
+        root_build_number=None,
+    )
+
+
+def _checkpoint_io_experiment_config_eligible(config_data: dict) -> bool:
+    backend = str(config_data.get("backend", "pytorch")).lower()
+    checkpoint_format = str(config_data.get("checkpoint_format", "HF")).upper()
+    load_format = str(config_data.get("load_format", "auto")).lower()
+    return (
+        backend == "pytorch"
+        and checkpoint_format == "HF"
+        and load_format == "auto"
+        and not config_data.get("extra_llm_api_config_path")
+    )
+
+
+def assign_checkpoint_io_experiment(
+    config_data: List[dict],
+    *,
+    telemetry_eligible: bool,
+    environment: Optional[dict] = None,
+    job_info: Optional[dict] = None,
+) -> CheckpointIoExperimentAssignment:
+    """Assign one deterministic policy and write it into generated configs.
+
+    The root Jenkins build number selects one native bucket and three auto
+    buckets. Explicit config policy remains authoritative and excludes the
+    launch from randomization. A valid override is intended for reproduction.
+    """
+    environment = os.environ if environment is None else environment
+    override = environment.get(CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV, "")
+    if override and override not in ("auto", "native"):
+        raise ValueError(
+            f"{CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV} must be 'auto' or 'native', got {override!r}"
+        )
+
+    if any("checkpoint_io_policy" in config for config in config_data):
+        return _unassigned_checkpoint_io_experiment("explicit_config")
+    if not config_data or not all(
+        _checkpoint_io_experiment_config_eligible(config) for config in config_data
+    ):
+        return _unassigned_checkpoint_io_experiment("ineligible_config")
+
+    if override:
+        assignment = CheckpointIoExperimentAssignment(
+            version=CHECKPOINT_IO_EXPERIMENT_VERSION,
+            bucket=-1,
+            assigned_arm=override,
+            assignment_source="override",
+            root_build_number=None,
+        )
+    elif not telemetry_eligible:
+        return _unassigned_checkpoint_io_experiment("non_telemetry")
+    else:
+        job_info = get_job_info() if job_info is None else job_info
+        raw_build_number = str(job_info.get("s_job_id", ""))
+        if not raw_build_number.isdecimal() or int(raw_build_number) <= 0:
+            return _unassigned_checkpoint_io_experiment("missing_root_build")
+        root_build_number = int(raw_build_number)
+        bucket = root_build_number % CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT
+        assigned_arm = "native" if bucket == CHECKPOINT_IO_EXPERIMENT_NATIVE_BUCKET else "auto"
+        assignment = CheckpointIoExperimentAssignment(
+            version=CHECKPOINT_IO_EXPERIMENT_VERSION,
+            bucket=bucket,
+            assigned_arm=assigned_arm,
+            assignment_source="randomized",
+            root_build_number=root_build_number,
+        )
+
+    for config in config_data:
+        config["checkpoint_io_policy"] = assignment.assigned_arm
+    return assignment
+
+
+def checkpoint_io_fallback_category(reason: str) -> str:
+    """Map free-form fallback text to a bounded queryable category."""
+    normalized = reason.lower()
+    if not normalized or normalized == "none":
+        return "none"
+    categories = (
+        ("open_weight_session", "sessionless"),
+        ("backend", "backend"),
+        ("explicit checkpoint loader", "custom_loader"),
+        ("registered hf", "custom_loader"),
+        ("checkpoint_format", "checkpoint_format"),
+        ("load_format", "load_format"),
+        ("partial model loading", "partial_model_loading"),
+        ("lazy safetensors", "model_specific_loader"),
+        ("raw hf weight cache", "weight_cache"),
+        ("safetensors checkpoint files", "checkpoint_files"),
+        ("backing files", "checkpoint_discovery"),
+        ("discovery", "checkpoint_discovery"),
+        ("host memory", "host_memory"),
+        ("communicator", "communication"),
+        ("reader", "reader_setup"),
+        ("materialization", "materialization"),
+    )
+    return next((category for marker, category in categories if marker in normalized), "other")
+
+
+def _bounded_checkpoint_io_fallback_reason(reason: str) -> str:
+    reason = reason or "unknown"
+    if len(reason) <= CHECKPOINT_IO_FALLBACK_REASON_LIMIT:
+        return reason
+    return reason[: CHECKPOINT_IO_FALLBACK_REASON_LIMIT - 3] + "..."
 
 
 def parse_checkpoint_io_policies(log_paths: List[str]) -> List[dict]:
@@ -669,6 +806,12 @@ def parse_checkpoint_io_policies(log_paths: List[str]) -> List[dict]:
                 for match in CHECKPOINT_IO_POLICY_PATTERN.finditer(line):
                     status = match.groupdict()
                     status["activated"] = status["activated"] == "True"
+                    status["fallback_category"] = checkpoint_io_fallback_category(
+                        status["fallback_reason"]
+                    )
+                    status["fallback_reason"] = _bounded_checkpoint_io_fallback_reason(
+                        status["fallback_reason"]
+                    )
                     statuses.append(status)
     return statuses
 
@@ -679,6 +822,7 @@ def make_startup_observation(server_info: dict, log_paths: List[str], role: str)
     if not isinstance(startup_metrics, dict):
         startup_metrics = {}
     metrics = {}
+    metadata = {}
     for loader_name, metric_prefix in (
         ("model_loader", ""),
         ("draft_model_loader", "draft_model_"),
@@ -690,6 +834,10 @@ def make_startup_observation(server_info: dict, log_paths: List[str], role: str)
             value = loader_metrics.get(metric_name)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 metrics[f"{metric_prefix}{metric_name}"] = float(value)
+        for metadata_name in STARTUP_METADATA_NAMES:
+            value = loader_metrics.get(metadata_name)
+            if isinstance(value, str) and value:
+                metadata[f"{metric_prefix}{metadata_name}"] = value
 
         if all(f"{metric_prefix}{name}" in metrics for name in CHECKPOINT_PIPELINE_PHASES):
             metrics[f"{metric_prefix}checkpoint_pipeline_seconds"] = sum(
@@ -703,6 +851,7 @@ def make_startup_observation(server_info: dict, log_paths: List[str], role: str)
     return {
         "role": role,
         "metrics": metrics,
+        "metadata": metadata,
         "checkpoint_io_policies": parse_checkpoint_io_policies(log_paths),
     }
 
@@ -743,27 +892,92 @@ def collect_startup_observation(
 
 
 def write_startup_observations(
-    test_output_dir: str, server_idx: int, observations: List[dict]
+    test_output_dir: str,
+    server_idx: int,
+    observations: List[dict],
+    observation_id: Optional[str] = None,
 ) -> None:
     """Persist observations as a CI artifact for later result upload."""
     path = os.path.join(test_output_dir, f"startup_metrics.{server_idx}.json")
+    payload = {
+        "startup_observation_id": observation_id or f"startup-{secrets.token_hex(16)}",
+        "observations": observations,
+    }
     with open(path, "w", encoding="utf-8") as output_file:
-        json.dump(observations, output_file, indent=2, sort_keys=True)
+        json.dump(payload, output_file, indent=2, sort_keys=True)
 
 
-def read_startup_observations(test_output_dir: str, server_idx: int) -> List[dict]:
+def read_startup_observations(test_output_dir: str, server_idx: int) -> dict:
     """Read observations captured while the server was alive."""
     path = os.path.join(test_output_dir, f"startup_metrics.{server_idx}.json")
     if not os.path.exists(path):
-        return []
+        return {
+            "startup_observation_id": f"startup-missing-{secrets.token_hex(16)}",
+            "observations": [],
+        }
     with open(path, "r", encoding="utf-8") as input_file:
-        observations = json.load(input_file)
-    return observations if isinstance(observations, list) else []
+        payload = json.load(input_file)
+    if not isinstance(payload, dict):
+        return {
+            "startup_observation_id": f"startup-invalid-{secrets.token_hex(16)}",
+            "observations": [],
+        }
+    observation_id = payload.get("startup_observation_id")
+    observations = payload.get("observations")
+    return {
+        "startup_observation_id": (
+            observation_id if isinstance(observation_id, str) and observation_id else "unknown"
+        ),
+        "observations": observations if isinstance(observations, list) else [],
+    }
+
+
+def add_checkpoint_io_experiment_values(
+    new_data: dict,
+    assignment: CheckpointIoExperimentAssignment,
+    observation_id: str,
+    primary_row: bool,
+) -> None:
+    """Attach intent-to-treat and deduplication fields to one result row."""
+    new_data["s_checkpoint_io_experiment_version"] = assignment.version
+    new_data["l_checkpoint_io_experiment_bucket"] = assignment.bucket
+    new_data["s_checkpoint_io_experiment_assigned_arm"] = assignment.assigned_arm
+    new_data["s_checkpoint_io_experiment_assignment_source"] = assignment.assignment_source
+    new_data["s_startup_observation_id"] = observation_id
+    new_data["b_startup_observation_primary_row"] = primary_row
+
+
+def classify_checkpoint_io_experiment(
+    assignment: CheckpointIoExperimentAssignment,
+    policies: List[dict],
+) -> str:
+    """Classify execution without moving auto fallbacks into the control arm."""
+    if assignment.assigned_arm not in ("auto", "native") or not policies:
+        return "unknown"
+    required_fields = ("requested", "selected", "activated", "effective")
+    if any(policy.get(field) is None for policy in policies for field in required_fields):
+        return "unknown"
+    values = {field: {policy[field] for policy in policies} for field in required_fields}
+    if any(len(field_values) != 1 for field_values in values.values()):
+        return "mixed"
+    requested_policy = next(iter(values["requested"]))
+    effective_policy = next(iter(values["effective"]))
+    if requested_policy != assignment.assigned_arm:
+        return "mixed"
+    if assignment.assigned_arm == "auto":
+        if effective_policy == "rank_striped_read_ahead":
+            return "rank_striped_activated"
+        if effective_policy == "native":
+            return "auto_fallback"
+    elif effective_policy == "native":
+        return "randomized_control"
+    return "mixed"
 
 
 def add_startup_metric_values(
     new_data: dict,
     observations: List[dict],
+    assignment: CheckpointIoExperimentAssignment,
     role: Optional[str] = None,
     expected_server_count: Optional[int] = None,
 ) -> None:
@@ -799,6 +1013,17 @@ def add_startup_metric_values(
         if numeric_values:
             new_data[f"d_{field_prefix}{metric_name}"] = max(numeric_values)
 
+    metadata_names = {name for entry in successful for name in entry.get("metadata", {})}
+    for metadata_name in sorted(set(STARTUP_METADATA_NAMES) | metadata_names):
+        values = sorted(
+            {
+                str(entry.get("metadata", {}).get(metadata_name))
+                for entry in successful
+                if entry.get("metadata", {}).get(metadata_name)
+            }
+        )
+        new_data[f"s_{field_prefix}{metadata_name}"] = ",".join(values) or "unknown"
+
     policies = [
         policy for entry in successful for policy in entry.get("checkpoint_io_policies", [])
     ]
@@ -806,14 +1031,46 @@ def add_startup_metric_values(
         values = sorted(
             {str(policy[policy_field]) for policy in policies if policy.get(policy_field)}
         )
-        if values:
-            new_data[f"s_{field_prefix}checkpoint_io_policy_{policy_field}"] = ",".join(values)
+        new_data[f"s_{field_prefix}checkpoint_io_policy_{policy_field}"] = (
+            ",".join(values) or "unknown"
+        )
     activated = [
         policy["activated"] for policy in policies if isinstance(policy.get("activated"), bool)
     ]
+    activated_values = set(activated)
+    if not activated_values:
+        activated_status = "unknown"
+    elif len(activated_values) > 1:
+        activated_status = "mixed"
+    else:
+        activated_status = str(next(iter(activated_values))).lower()
+    new_data[f"s_{field_prefix}checkpoint_io_policy_activated"] = activated_status
     if activated:
         new_data[f"l_{field_prefix}checkpoint_io_policy_status_count"] = len(activated)
         new_data[f"l_{field_prefix}checkpoint_io_policy_activated_status_count"] = sum(activated)
+    fallback_categories = sorted(
+        {
+            str(policy.get("fallback_category"))
+            for policy in policies
+            if policy.get("fallback_category")
+        }
+    )
+    fallback_reasons = sorted(
+        {
+            _bounded_checkpoint_io_fallback_reason(str(policy.get("fallback_reason")))
+            for policy in policies
+            if policy.get("fallback_reason")
+        }
+    )[:CHECKPOINT_IO_FALLBACK_REASON_COUNT_LIMIT]
+    new_data[f"s_{field_prefix}checkpoint_io_fallback_category"] = (
+        ",".join(fallback_categories) or "unknown"
+    )
+    new_data[f"s_{field_prefix}checkpoint_io_fallback_reason"] = (
+        " | ".join(fallback_reasons) or "unknown"
+    )
+    new_data[f"s_{field_prefix}checkpoint_io_experiment_classification"] = (
+        classify_checkpoint_io_experiment(assignment, policies)
+    )
 
 
 def get_model_dir(model_name: str) -> str:
@@ -966,12 +1223,20 @@ def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) 
 class ServerConfig:
     """Configurations of trtllm-server."""
 
-    def __init__(self, server_config_data: dict, env_vars: str = ""):
+    def __init__(
+        self,
+        server_config_data: dict,
+        env_vars: str = "",
+        checkpoint_io_experiment: Optional[CheckpointIoExperimentAssignment] = None,
+    ):
         # Extract required fields
         self.concurrency = server_config_data.get("concurrency", 1)
         self.model_name = server_config_data["model_name"]
         self.model_path = ""
         self.env_vars = env_vars
+        self.checkpoint_io_experiment = checkpoint_io_experiment or (
+            _unassigned_checkpoint_io_experiment("not_assigned")
+        )
         self.force_num_accepted_tokens = force_num_accepted_tokens_from_env_str(env_vars)
         self.disagg_run_type = server_config_data.get("disagg_run_type", "aggr")
 
@@ -1599,6 +1864,7 @@ class DisaggConfig:
         ctx_router_config: dict | None = None,
         gen_router_config: dict | None = None,
         server_config_extra: dict | None = None,
+        checkpoint_io_experiment: CheckpointIoExperimentAssignment | None = None,
     ):
         self.name = name
         self.disagg_serving_type = disagg_serving_type
@@ -1614,6 +1880,9 @@ class DisaggConfig:
         self.ctx_router_config = ctx_router_config
         self.gen_router_config = gen_router_config
         self.server_config_extra = server_config_extra
+        self.checkpoint_io_experiment = checkpoint_io_experiment or (
+            _unassigned_checkpoint_io_experiment("not_assigned")
+        )
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
@@ -2595,7 +2864,12 @@ class PerfSanityTestConfig:
             # Per-config env vars: server_env_var lives on each server_config entry,
             # client_env_var lives on each client_config entry.
             server_env_var = server_config_data.get("server_env_var", "")
-            server_config = ServerConfig(server_config_data, server_env_var)
+            checkpoint_io_experiment = assign_checkpoint_io_experiment(
+                [server_config_data], telemetry_eligible=self.upload_to_db
+            )
+            server_config = ServerConfig(
+                server_config_data, server_env_var, checkpoint_io_experiment
+            )
             server_id = len(server_configs)
             server_configs.append(server_config)
 
@@ -2702,11 +2976,16 @@ class PerfSanityTestConfig:
                 "disagg_run_type": "aggr",  # Run as aggr
                 **ctx_config,
             }
+            checkpoint_io_experiment = assign_checkpoint_io_experiment(
+                [ctx_server_config_data], telemetry_eligible=self.upload_to_db
+            )
 
             # ctx_only runs the ctx worker in aggregated mode; use the merged
             # ctx-side env var so the aggregated run still gets any ctx-only
             # extras from the disagg yaml.
-            ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
+            ctx_server_config = ServerConfig(
+                ctx_server_config_data, ctx_worker_env_var, checkpoint_io_experiment
+            )
             self.server_configs = [ctx_server_config]
         else:
             # For e2e and gen_only modes - create ctx and gen server configs
@@ -2730,8 +3009,17 @@ class PerfSanityTestConfig:
                 **worker_config.get("gen", {}),
             }
 
-            ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
-            gen_server_config = ServerConfig(gen_server_config_data, gen_worker_env_var)
+            checkpoint_io_experiment = assign_checkpoint_io_experiment(
+                [ctx_server_config_data, gen_server_config_data],
+                telemetry_eligible=self.upload_to_db,
+            )
+
+            ctx_server_config = ServerConfig(
+                ctx_server_config_data, ctx_worker_env_var, checkpoint_io_experiment
+            )
+            gen_server_config = ServerConfig(
+                gen_server_config_data, gen_worker_env_var, checkpoint_io_experiment
+            )
 
             disagg_config = DisaggConfig(
                 name=f"{benchmark_mode}-{config_file_base_name}",
@@ -2748,6 +3036,7 @@ class PerfSanityTestConfig:
                 ctx_router_config=ctx_router_config,
                 gen_router_config=gen_router_config,
                 server_config_extra=server_config_extra,
+                checkpoint_io_experiment=checkpoint_io_experiment,
             )
 
             # server_configs is a list with one element (tuple of ctx, gen, disagg config)
@@ -3164,7 +3453,8 @@ class PerfSanityTestConfig:
                 server_config = self.server_configs[server_idx]
                 server_config_dict = server_config.to_db_data()
                 server_perf_results = self._perf_results.get(server_idx, [])
-                startup_observations = read_startup_observations(self.test_output_dir, server_idx)
+                startup_bundle = read_startup_observations(self.test_output_dir, server_idx)
+                startup_primary_row_pending = True
                 # Skip if server failed
                 if len(server_perf_results) != len(client_configs):
                     cmd_idx += len(client_configs)
@@ -3197,13 +3487,21 @@ class PerfSanityTestConfig:
                         server_perf_results[client_idx],
                         spec_decoding=client_config.spec_decoding,
                     )
+                    add_checkpoint_io_experiment_values(
+                        new_data,
+                        server_config.checkpoint_io_experiment,
+                        startup_bundle["startup_observation_id"],
+                        startup_primary_row_pending,
+                    )
                     add_startup_metric_values(
                         new_data,
-                        startup_observations,
+                        startup_bundle["observations"],
+                        server_config.checkpoint_io_experiment,
                         expected_server_count=1,
                     )
 
                     new_data_dict[cmd_idx] = new_data
+                    startup_primary_row_pending = False
                     cmd_idx += 1
 
         elif self.runtime == "multi_node_disagg_server":
@@ -3219,7 +3517,8 @@ class PerfSanityTestConfig:
             ):
                 client_configs = self.server_client_configs[server_idx]
                 server_perf_results = self._perf_results.get(server_idx, [])
-                startup_observations = read_startup_observations(self.test_output_dir, server_idx)
+                startup_bundle = read_startup_observations(self.test_output_dir, server_idx)
+                startup_primary_row_pending = True
                 # Skip if server failed
                 if len(server_perf_results) != len(client_configs):
                     cmd_idx += len(client_configs)
@@ -3264,20 +3563,29 @@ class PerfSanityTestConfig:
                         spec_decoding=client_config.spec_decoding,
                         benchmark_mode=disagg_config.benchmark_mode,
                     )
+                    add_checkpoint_io_experiment_values(
+                        new_data,
+                        disagg_config.checkpoint_io_experiment,
+                        startup_bundle["startup_observation_id"],
+                        startup_primary_row_pending,
+                    )
                     add_startup_metric_values(
                         new_data,
-                        startup_observations,
+                        startup_bundle["observations"],
+                        disagg_config.checkpoint_io_experiment,
                         role="ctx",
                         expected_server_count=num_ctx_servers,
                     )
                     add_startup_metric_values(
                         new_data,
-                        startup_observations,
+                        startup_bundle["observations"],
+                        disagg_config.checkpoint_io_experiment,
                         role="gen",
                         expected_server_count=num_gen_servers,
                     )
 
                     new_data_dict[cmd_idx] = new_data
+                    startup_primary_row_pending = False
                     cmd_idx += 1
 
         else:

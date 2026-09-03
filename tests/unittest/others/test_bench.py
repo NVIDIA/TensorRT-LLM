@@ -46,6 +46,7 @@ def test_format_startup_metrics() -> None:
             "executor_startup_seconds": 0.5,
             "model_loader": {
                 "checkpoint_preparation_seconds": 1.25,
+                "checkpoint_loader_kind": "HfCheckpointLoader",
                 "weight_loading": {
                     "total_model_loading_seconds": 2.5,
                 },
@@ -56,6 +57,7 @@ def test_format_startup_metrics() -> None:
     assert "= STARTUP METRICS\n" in output
     assert "executor_startup_seconds: 0.5000\n" in output
     assert "model_loader.checkpoint_preparation_seconds: 1.2500\n" in output
+    assert "model_loader.checkpoint_loader_kind: HfCheckpointLoader\n" in output
     assert "model_loader.weight_loading.total_model_loading_seconds: 2.5000\n" in output
     assert ReportUtility._format_startup_metrics({}) == ""
 
