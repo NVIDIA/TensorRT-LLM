@@ -106,7 +106,7 @@ class BaseDiffusionModel(nn.Module):
                 # already baked into each captured graph and needs no key.
                 return
 
-            # Sol-Attn switches between dense SDPA and the sparse kernel at the
+            # Sol-Attn switches between dense and sparse attention at the
             # dense-prefix boundary, again without changing tensor shapes, so
             # the two phases must not share a captured graph.
             runner.register_extra_key_fn(

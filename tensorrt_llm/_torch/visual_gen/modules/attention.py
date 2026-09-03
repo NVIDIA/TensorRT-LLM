@@ -101,16 +101,25 @@ class Attention(nn.Module):
         _is_vsa = base_backend == "CUTEDSL" and _sa_algo == "vsa"
         _is_sol_attn = base_backend == "CUTEDSL" and _sa_algo == "sol_attn"
 
-        # Cross-attention fallback: TRTLLM and CUTEDSL VSA/Sol-Attn are self-attn only.
+        # SEPARATE_QKV fallback: TRTLLM and CUTEDSL VSA/Sol-Attn cannot serve it.
         #
-        # VSA/Sol-Attn fall back within their own backend family -- the dense
-        # CuTe DSL kernel serves cross-attention fine. Falling back to VANILLA
-        # instead silently swapped cross-attention from CuTeDSL to torch SDPA in
-        # every block the moment a sparse algorithm was enabled, so a
-        # `backend: CUTEDSL` run and a `CUTEDSL + sol_attn` run differed in
-        # cross-attention regardless of any sparse setting. TRTLLM keeps VANILLA:
-        # TrtllmAttention genuinely cannot serve SEPARATE_QKV.
-        _cross_attn_fallback = "CUTEDSL" if _is_sol_attn else "VANILLA"
+        # For genuine cross-attention, Sol-Attn falls back within its own backend
+        # family -- the dense CuTe DSL kernel serves cross-attention fine. VSA still
+        # goes to VANILLA and has the same defect; see TRTLLM-16105.
+        # Falling back to VANILLA instead silently swapped cross-attention from
+        # CuTeDSL to torch SDPA in every block the moment a sparse algorithm was
+        # enabled, so a `backend: CUTEDSL` run and a `CUTEDSL + sol_attn` run
+        # differed in cross-attention regardless of any sparse setting.
+        #
+        # This branch also catches *self*-attention that merely uses SEPARATE_QKV
+        # (Qwen-Image always; WAN's attn1 under async Ulysses). Those keep
+        # VANILLA: callers such as
+        # `qwen_image/transformer_qwen_image.py::_supports_qwen_key_padding_mask`
+        # test for the literal string "VANILLA", so redirecting them changes
+        # unrelated behaviour. TRTLLM keeps VANILLA throughout -- TrtllmAttention
+        # genuinely cannot serve SEPARATE_QKV.
+        _is_true_cross_attn = not separate_qkv_is_self_attention
+        _cross_attn_fallback = "CUTEDSL" if (_is_sol_attn and _is_true_cross_attn) else "VANILLA"
         if self.qkv_mode == QKVMode.SEPARATE_QKV and (
             base_backend == "TRTLLM" or _is_vsa or _is_sol_attn
         ):
@@ -268,6 +277,7 @@ class Attention(nn.Module):
                 config.attention.model_copy(update={"sparse_attention_config": None})
                 if backend_name == "CUTEDSL"
                 and _is_sol_attn
+                and _is_true_cross_attn
                 and self.qkv_mode == QKVMode.SEPARATE_QKV
                 else config.attention
             ),

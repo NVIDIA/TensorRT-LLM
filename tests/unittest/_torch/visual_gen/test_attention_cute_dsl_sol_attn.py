@@ -213,8 +213,13 @@ def test_graph_phase_accepts_tensor_timestep():
     assert sol_attn_graph_phase(torch.tensor([0.10]), disabled_until_timestep=0.95) == 1
 
 
-def test_dense_prefix_uses_sdpa_and_skips_kernel(monkeypatch):
-    """Inside the dense prefix the sparse kernel must not be invoked at all."""
+def test_dense_prefix_skips_kernel(monkeypatch):
+    """Inside the dense prefix the sparse kernel must not be invoked at all.
+
+    CPU tensors, so `_dense` takes its SDPA branch here; that the dense path
+    routes to the CuTe kernel on CUDA is covered by
+    `test_dense_paths_use_cutedsl_backend`.
+    """
     import tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn as sol_attn_mod
 
     def _fail_if_called(*args, **kwargs):
@@ -252,7 +257,7 @@ def test_missing_timestep_fails_open_to_sparse(monkeypatch):
     assert called["n"] == 1, "expected the sparse kernel, not a silent dense fallback"
 
 
-def test_sol_attn_dense_layers_guard_skips_kernel(monkeypatch):
+def test_dense_layers_guard_skips_kernel(monkeypatch):
     """A layer_idx in dense_layers must use the dense SDPA path and never invoke the kernel."""
     import tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn as sol_attn_mod
 
@@ -447,8 +452,8 @@ def test_kernel_launch_is_opaque_to_dynamo():
     """The CuTe DSL launch boundary must be @torch.compiler.disable'd.
 
     Without it Dynamo traces into the CuTe DSL JIT builder and retraces on every
-    call: 69x slower on B200 (denoise 2496.9 s vs 36.2 s), and silent -- it looks
-    like torch.compile simply not paying off.
+    call: near two orders of magnitude slower on B200 (2496.9 s mean denoise
+    without it), and silent -- it looks like torch.compile simply not paying off.
     """
     assert _is_dynamo_disabled(_backend_mod()._run_sol_attn_bthd), (
         "_run_sol_attn_bthd must be decorated with @torch.compiler.disable"
@@ -463,3 +468,61 @@ def test_timestep_scalar_read_is_opaque_to_dynamo():
     assert _is_dynamo_disabled(SolAttnAttention._dense_by_step), (
         "SolAttnAttention._dense_by_step must be decorated with @torch.compiler.disable"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_dense_paths_use_cutedsl_backend(monkeypatch):
+    """All three dense paths must reach the configured backend's dense kernel.
+
+    Sol-Attn does dense attention on the `dense_layers` guard, the
+    `disabled_until_timestep` prefix, and kernel-ineligibility fallback. If those
+    call torch SDPA instead of `cute_dsl_fmha_fwd`, a `backend: CUTEDSL` run
+    differs from a `backend: CUTEDSL` dense baseline on those steps, and any A/B
+    against that baseline measures a backend swap rather than sparsity. Measured
+    at LPIPS 0.214 on Wan2.2-T2V-A14B before this was fixed, against a 0.25 gate.
+
+    The CPU-tensor tests above cannot see this: `_dense` falls back to SDPA when
+    `q.is_cuda` is false, so they exercise the wrong branch by construction.
+    """
+    import tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn as sol_attn_mod
+
+    device = torch.device("cuda")
+    q = k = v = torch.randn(1, 64, 2, 128, device=device, dtype=torch.bfloat16)
+
+    def _make():
+        a = SolAttnAttention(layer_idx=0, num_heads=2, head_dim=128)
+        calls = {"n": 0}
+        real = a._dense_backend.forward
+
+        def _spy(*args, **kwargs):
+            calls["n"] += 1
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(a._dense_backend, "forward", _spy)
+        return a, calls
+
+    # 1. dense prefix: timestep at/above the cutoff
+    a, calls = _make()
+    a.disabled_until_timestep = 0.9
+    a.dense_layers = frozenset()
+    a.forward(q, k, v, timestep=torch.tensor(0.95))
+    assert calls["n"] == 1, "dense prefix did not use the CuTeDSL dense kernel"
+
+    # 2. dense_layers guard
+    a, calls = _make()
+    a.disabled_until_timestep = None
+    a.dense_layers = frozenset({0})
+    a.forward(q, k, v)
+    assert calls["n"] == 1, "dense_layers guard did not use the CuTeDSL dense kernel"
+
+    # 3. ineligibility fallback, reached through `dense_fn`
+    a, calls = _make()
+    a.disabled_until_timestep = None
+    a.dense_layers = frozenset()
+    monkeypatch.setattr(
+        sol_attn_mod,
+        "_sol_attn_run",
+        lambda *args, **kw: kw["dense_fn"](*args[:3]),
+    )
+    a.forward(q, k, v)
+    assert calls["n"] == 1, "dense_fn did not route the fallback to the CuTeDSL dense kernel"
