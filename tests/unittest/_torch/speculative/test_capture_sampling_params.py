@@ -90,9 +90,9 @@ class TestAddDummyRequestsCaptureSamplingParams(unittest.TestCase):
 def _request(temperature=None, top_k=None, top_p=None, slot=0):
     return types.SimpleNamespace(
         sampling_config=types.SimpleNamespace(
-            temperature=[temperature] if temperature is not None else None,
+            temperature=temperature,
             top_k=top_k,
-            top_p=[top_p] if top_p is not None else None,
+            top_p=top_p,
         ),
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         py_seq_slot=slot,
