@@ -15,6 +15,7 @@
 
 import os
 import time
+from io import BytesIO
 from typing import List, Optional, Union
 
 import diffusers
@@ -39,7 +40,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
 )
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
@@ -424,17 +425,25 @@ class WanPipeline(BasePipeline):
     def extra_param_specs(self):
         return get_wan_extra_param_specs(self.is_wan22_14b)
 
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        # Only TI2V-5B takes a reference; the T2V variants declare no slot, so
+        # an image request fails at preflight instead of inside forward().
+        if not self.is_wan22_5b:
+            return {}
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="first_frame", min=0, max=1)],
+            )
+        }
+
     def infer(self, req):
         """Run inference with request parameters."""
         extra = req.params.extra_params or {}
         # Wan 2.2 TI2V-5B takes one conditioning image if provided
-        image = req.params.image
-        if isinstance(image, list):
-            if len(image) != 1:
-                raise ValueError(
-                    f"WanPipeline I2V expects a single image, got list of {len(image)}."
-                )
-            image = image[0]
+        refs = req.params.image_reference
+        image = refs[0].content if refs else None
 
         return self.forward(
             prompt=req.prompt,
@@ -466,7 +475,7 @@ class WanPipeline(BasePipeline):
         guidance_scale_2: Optional[float] = None,
         boundary_ratio: Optional[float] = None,
         max_sequence_length: int = 512,
-        image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -783,7 +792,7 @@ class WanPipeline(BasePipeline):
     def _prepare_latents_wan22_5B_i2v(
         self,
         batch_size: int,
-        image: Union[PIL.Image.Image, torch.Tensor, str],
+        image: Union[PIL.Image.Image, torch.Tensor, bytes],
         height: int,
         width: int,
         num_frames: int,
@@ -804,8 +813,8 @@ class WanPipeline(BasePipeline):
         latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
         # Load and preprocess image
-        if isinstance(image, str):
-            image = PIL.Image.open(image).convert("RGB")
+        if isinstance(image, bytes):
+            image = PIL.Image.open(BytesIO(image)).convert("RGB")
         image = (
             self.video_processor.preprocess(image, height=height, width=width)
             .to(self.device, dtype=self.vae.dtype)

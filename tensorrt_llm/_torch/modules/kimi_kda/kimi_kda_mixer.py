@@ -194,6 +194,8 @@ class KimiKDALinearAttention(nn.Module):
         self._projection_aux_stream = aux_stream
         self._projection_fork_event = torch.cuda.Event()
         self._projection_join_event = torch.cuda.Event()
+        # Output buffer for the inplace-only ``trtllm::kda_decode`` op.
+        self._o_dense: Optional[torch.Tensor] = None
         self._packed_conv_weight: Optional[torch.Tensor] = None
         self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
 
@@ -561,6 +563,24 @@ class KimiKDALinearAttention(nn.Module):
         H = self.num_heads
         B = x2d.shape[0]
 
+        # kda_decode writes its [B, 1, H, hd] result into this buffer. It is
+        # sized to the pool slot count on the first decode and never
+        # reallocated, because captured graphs bind this pointer.
+        if self._o_dense is None:
+            if torch.cuda.is_current_stream_capturing():
+                return self.forward_decode_fallback(
+                    x2d, conv_pool, ssm_pool, slot_indices, layer_cache, ssm_state_indices
+                )
+            self._o_dense = torch.empty(
+                max(conv_pool.shape[0], B), 1, H, hd, dtype=torch.bfloat16, device=x2d.device
+            )
+        else:
+            assert self._o_dense.shape[0] >= B, (
+                f"KDA decode output buffer holds {self._o_dense.shape[0]} rows "
+                f"but the decode batch is {B}; reallocating would corrupt "
+                f"previously captured CUDA graphs"
+            )
+
         def _project_qkvg() -> torch.Tensor:
             if self._qkvg_proj_weight is not None:
                 return torch.nn.functional.linear(x2d, self._qkvg_proj_weight)
@@ -611,7 +631,7 @@ class KimiKDALinearAttention(nn.Module):
             state=ssm_pool,
             onorm_g=x_qkvg[:, 3 * d :].unflatten(-1, (H, hd)).unsqueeze(0),
             onorm_weight=self._onorm_w_f32,
-            out=None,
+            out=self._o_dense[:B],
             ssm_state_indices=ssm_state_indices,
             cu_seqlens=mamba_metadata._arange_buffer[: B + 1],
             scale=hd**-0.5,

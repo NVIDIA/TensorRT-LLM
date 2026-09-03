@@ -56,6 +56,8 @@ _THOP_LITERALS: dict = {}
 class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
 
+    supports_skip_correction = True
+
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
         sparse_algorithm = getattr(attn.sparse_params, "algorithm", None)
@@ -204,6 +206,7 @@ class FallbackFmha(Fmha):
             rope_append=attn.rope_append,
             attention_chunk_size=attn.attention_chunk_size,
             skip_softmax_stat=attn.skip_softmax_stat,
+            skip_correction_threshold=attn.skip_correction_threshold,
             # --- Sparse runtime parameters ---
             sparse_kv_indices=forward_args.sparse_runtime_params.sparse_kv_indices,
             sparse_kv_offsets=forward_args.sparse_runtime_params.sparse_kv_offsets,

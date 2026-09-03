@@ -3972,6 +3972,18 @@ class MambaStateConfig(StrictBaseModel):
         "Offsets that do not resolve inside the prompt are ignored. These "
         "snapshots require KV cache manager V2.")
 
+    enable_branch_snapshot: bool = Field(
+        default=False,
+        status="prototype",
+        telemetry=True,
+        description=
+        "Snapshot the Mamba recurrent state where a request's content "
+        "diverges from the prefix cache, so that later requests sharing the "
+        "same prefix can reuse up to the fork instead of being truncated to "
+        "an earlier snapshot. The prompt end is always snapshotted as well. "
+        "Independent of periodic_snapshot_interval. Requires KV cache "
+        "manager V2.")
+
 
 class BlockReuseConfig(StrictBaseModel):
     """Configuration for KV cache block reuse policies."""
@@ -4386,6 +4398,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.mamba_state_config additional snapshot "
                 "offsets require kv_cache_config.use_kv_cache_manager_v2=True.")
+        if (state_config.enable_branch_snapshot
+                and self.use_kv_cache_manager_v2 is False):
+            raise ValueError(
+                "kv_cache_config.mamba_state_config.enable_branch_snapshot "
+                "requires kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @field_validator('max_attention_window')
@@ -5498,6 +5515,33 @@ class TorchLlmArgs(BaseLlmArgs):
         # Recognized values mirror get_attention_backend dispatch in
         # tensorrt_llm/_torch/attention_backend/utils.py.
         telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER"))
+
+    enable_mla_skip_correction: bool = Field(
+        default=False,
+        description=
+        ("Enable threshold-based skip-correction for trtllm-gen MLA attention "
+         "kernels on SM100 and SM103. When enabled, "
+         "mla_skip_correction_threshold controls the optimization threshold."),
+        status="prototype")
+
+    mla_skip_correction_threshold: float = Field(
+        default=8.0,
+        gt=0.0,
+        le=32.0,
+        description=
+        ("Threshold for threshold-based skip-correction. This is used only "
+         "when enable_mla_skip_correction is True. The default is 8. The maximum "
+         "supported value depends on the selected kernel's BMM2 dtype: 8 for "
+         "E4M3, 15 for FP16, and 32 for BF16."),
+        status="prototype")
+
+    @model_validator(mode="after")
+    def validate_mla_skip_correction_config(self) -> 'TorchLlmArgs':
+        if self.enable_mla_skip_correction and self.attn_backend.upper(
+        ) != "TRTLLM":
+            raise ValueError(
+                "enable_mla_skip_correction requires attn_backend='TRTLLM'.")
+        return self
 
     sampler_force_async_worker: bool = Field(
         default=False,

@@ -414,31 +414,20 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             """
         }
 
-        // Promote progress tar to final path, or fall back to direct upload.
-        // progress_upload_snapshot.sh writes the sentinel on each successful PUT.
+        // Always re-tar the local stage directory and upload it directly, rather
+        // than trusting the last progress snapshot uploaded by
+        // progress_upload_snapshot.sh to still match it (the superseded-file
+        // rename above, or other post-snapshot writes, can leave it stale). Use
+        // --transform so tar contents carry the postTag filename without
+        // touching on-disk results*.xml files.
         ensureStageResultNotUploaded("${stageName}${postTag}")
-        if (suppressTestReporting || !promoteProgressTar(stageName, postTag)) {
-            if (suppressTestReporting) {
-                echo "[PROGRESS-UPLOAD] ${stageName}: results*.xml changed on disk, re-uploading instead of promoting progress tar"
-            } else {
-                // Progress upload never succeeded (Artifactory unreachable, watcher not started, etc.).
-                echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
-            }
-            // Fall back to the original approach: tar the local stage directory
-            // and upload it directly. Use --transform so tar contents carry the
-            // postTag filename without touching on-disk results*.xml files.
-            def xmlCount = sh(script: "ls ${stageName}/results*.xml 2>/dev/null | wc -l", returnStdout: true).trim().toInteger()
-            if (suppressTestReporting || xmlCount > 0) {
-                def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
-                trtllm_utils.uploadArtifacts(
-                    "results-${stageName}${postTag}.tar.gz",
-                    "${UPLOAD_PATH}/test-results/"
-                )
-            } else {
-                println("No results xml to submit")
-            }
-        }
+        def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+        trtllm_utils.uploadArtifacts(
+            "results-${stageName}${postTag}.tar.gz",
+            "${UPLOAD_PATH}/test-results/"
+        )
+        deleteProgressArtifact(stageName, postTag)
 
         // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
         if (isCbtsStage(stageName)) {
@@ -1753,6 +1742,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         withCredentials([
             string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
+            string(credentialsId: 'github_read_public_only_token', variable: 'GITHUB_CLONE_TOKEN'),
         ]) {
             CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
@@ -2098,6 +2088,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     srunArgs.add("--container-env=S3_SECRET_KEY")
                 }
+                srunArgs.add("--container-env=GITHUB_CLONE_TOKEN")
                 envVarsToExport.each { varName, varValue ->
                     srunArgs.add("--container-env=${varName}")
                 }
@@ -2146,7 +2137,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    # Keep xtrace off around the token exports so they are not echoed into the Slurm job log.
+                    set +x
                     export HF_TOKEN=$HF_TOKEN
+                    export GITHUB_CLONE_TOKEN=$GITHUB_CLONE_TOKEN
+                    set -x
                     if [ -f "${s3SecretKeyPathNode}" ]; then
                         set +x
                         export S3_SECRET_KEY="\$(cat "${s3SecretKeyPathNode}")"
@@ -3434,16 +3429,14 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                     sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
                 }
             }
-            sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
+            // Redact credential-looking values (e.g. OPEN_SEARCH_DB_CREDENTIALS) before
+            // writing: this file gets tar'd and uploaded to Artifactory, and Jenkins
+            // credential masking only applies to console log output, not to files.
+            sh "STAGE_NAME=${stageName} && env | sort | sed -E 's/^([A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|CREDENTIAL|API_KEY|_PSW)[A-Za-z0-9_]*)=.*/\\1=***REDACTED***/' > ${stageName}/debug_env.txt"
             if (isCbtsStage(stageName)) {
                 freezeCbtsCoverage(stageName)
             }
             echo "Upload test results."
-            // promoteProgressTar is a server-side move of the already-uploaded
-            // progress snapshot. It is only valid when on-disk results*.xml are
-            // unchanged from that snapshot. After a rename (or any other local
-            // XML mutation) the snapshot is stale and must be re-tarred.
-            boolean xmlsMutated = false
             if (suppressTestReporting) {
                 // This attempt is superseded by a planned retry. Keep the tar for
                 // forensics, but move its result XMLs aside so the top-level Collect
@@ -3456,22 +3449,19 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                         [ -e "\$f" ] && mv "\$f" "superseded-\$f"
                     done || true
                 """
-                xmlsMutated = true
             }
 
-            if (xmlsMutated || !promoteProgressTar(stageName, postTag)) {
-                if (xmlsMutated) {
-                    echo "[PROGRESS-UPLOAD] ${stageName}: results*.xml changed on disk, re-uploading instead of promoting progress tar"
-                } else {
-                    echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
-                }
-                def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
-                trtllm_utils.uploadArtifacts(
-                    "results-${stageName}${postTag}.tar.gz",
-                    "${UPLOAD_PATH}/test-results/"
-                )
-            }
+            // Always re-tar and re-upload the current state of ${stageName}/,
+            // rather than trusting the last progress snapshot to still match it:
+            // debug_env.txt, CBTS coverage freeze, a rerun merge rewriting
+            // results.xml, or the superseded-file rename above can all leave the
+            // last uploaded snapshot stale.
+            def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+            trtllm_utils.uploadArtifacts(
+                "results-${stageName}${postTag}.tar.gz",
+                "${UPLOAD_PATH}/test-results/"
+            )
             deleteProgressArtifact(stageName, postTag)
             if (!suppressTestReporting) {
                 junit(testResults: "${stageName}/results*.xml")
@@ -4772,39 +4762,6 @@ REUSED_TESTS_EOF
     }
 }
 
-// Promotes the progress tar to the final results path via an Artifactory
-// server-side move (no data re-transfer). Returns true when a progress
-// snapshot existed and was promoted; false when no snapshot was uploaded or
-// the server-side move failed.
-// Virtual repo sw-tensorrt-generic does not support move; rewrite to the
-// backing local repo as we do for DELETE in deleteProgressArtifact().
-def promoteProgressTar(stageName, postTag="") {
-    def progressOkFile = "${WORKSPACE}/results-${stageName}${postTag}-progress.tar.gz.upload_ok"
-    if (!fileExists(progressOkFile)) {
-        return false
-    }
-    def localUploadPath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
-    def srcArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}-progress.tar.gz"
-    def dstArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}.tar.gz"
-    def rc
-    withCredentials([usernamePassword(
-            credentialsId: 'urm-artifactory-creds',
-            usernameVariable: 'ART_USER',
-            passwordVariable: 'ART_PASS')]) {
-        rc = sh(
-            script: """curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" -X POST \
-                'https://urm.nvidia.com/artifactory/api/move/${srcArtPath}?to=/${dstArtPath}'""",
-            returnStatus: true
-        )
-        if (rc == 0) {
-            echo "[PROGRESS-UPLOAD] ${stageName}: progress tar moved to test-results/ as results-${stageName}${postTag}.tar.gz"
-        } else {
-            echo "[PROGRESS-UPLOAD] ${stageName}: move failed (rc=${rc}); results may already be at destination or progress tar was deleted"
-        }
-    }
-    return rc == 0
-}
-
 // Removes the in-progress checkpoint tarball uploaded by the inline
 // shell watcher in runLLMTestlistOnPlatformImpl / runLLMTestlistWithSbatch.
 // Called after final-result handling in both execution paths, including when
@@ -5754,6 +5711,7 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
                 // Minus 10 minutes to avoid the Slurm job being stopped earlier.
                 timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                     docker.image(image).inside(dockerArgs) {
+                        trtllm_utils.setupGithubFetchAuth()
                         runner()
                     }
                 }
@@ -5772,6 +5730,7 @@ def runInEnrootOnNode(label, partitionTimeout)
 {
     return {
         runner -> node(label) {
+            trtllm_utils.setupGithubFetchAuth()
             // We submit the Slurm job with the Slurm partition's time spec.
             // Minus 10 minutes to avoid the Slurm job being stopped earlier.
             timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
