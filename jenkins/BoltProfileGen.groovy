@@ -463,6 +463,15 @@ def submitProfileGen(pipeline)
         def harnessMounts = params.boltHarnessMounts ?: env.boltHarnessMounts ?: "${ws}:${ws},${modelsRoot}:${modelsRoot}"
         // The merge job still uses our own slurm_merge.sh (not the harness).
         def partArgs = "${partition.additionalArgs} ${SlurmConfig.getTimeArgs(partition)} ${SlurmConfig.getPartitionArgs(partition)}"
+        // The merge job is 100% CPU (merge-fdata, .fdata->.yaml, packaging,
+        // apply_bolt.py), so submit it to the CPU partition instead of holding a GPU
+        // node idle. Not partArgs: that carries the GPU partition's --gpus* flags,
+        // and these clusters reject a zero GPU request, so a CPU job must omit them
+        // entirely. Only the partition goes on the CLI (overriding slurm_merge.sh's
+        // #SBATCH header) so boltMergePartition can retarget it; account and wall
+        // time stay in the header, which is submitted from this same commit.
+        def mergePartition = params.boltMergePartition ?: env.boltMergePartition ?: "cpu"
+        def mergeArgs = "--partition=${mergePartition}"
 
         // Wrap each branch in a stage() so Blue Ocean renders one parallel stage
         // per workload (named "Collect: <workload>").
@@ -484,7 +493,7 @@ def submitProfileGen(pipeline)
         //    Wrapped in its own stage() so it shows as a distinct marker in
         //    Blue Ocean after the parallel collect fan-out.
         stage("Merge + Package") {
-            def mid = submitMerge(pipeline, remote, ws, fdataRoot, outDir, partArgs)
+            def mid = submitMerge(pipeline, remote, ws, fdataRoot, outDir, mergeArgs)
             pipeline.echo("submitted merge job ${mid}")
             pollSlurm(pipeline, remote, mid, "merge")
             pipeline.echo("Merge COMPLETED. Bundle: ${bundle}")
@@ -818,6 +827,11 @@ pipeline {
             name: "boltHarnessTimeLimit",
             defaultValue: "",
             description: "SLURM walltime per collect job. Empty -> 04:00:00 (instrumented runs are much slower than uninstrumented ones)."
+        )
+        string(
+            name: "boltMergePartition",
+            defaultValue: "",
+            description: "SLURM CPU partition for the merge job. The merge is 100% CPU. An empty string maps to the value 'cpu'. Set this if a cluster names its CPU partition differently."
         )
     }
     options {
