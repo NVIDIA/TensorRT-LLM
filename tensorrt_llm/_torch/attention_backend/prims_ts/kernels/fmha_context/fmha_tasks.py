@@ -249,7 +249,7 @@ def create_load_task(
                         cuseqlen_q,
                         cuseqlen_k,
                         seqlen_q,
-                        _seqlen_k,
+                        seqlen_k,
                         kv_tile_start,
                     ) = gqkv.compute_coords()
                     sq.acquire()
@@ -299,6 +299,7 @@ def create_load_task(
                                     kv_head_coord=kv_head_coord,
                                     batch_coord=batch_coord,
                                     cuseqlen_k=cuseqlen_k,
+                                    seqlen_k=seqlen_k,
                                     kv_tile_start=kv_tile_start,
                                 )
                             else:
@@ -308,6 +309,7 @@ def create_load_task(
                                     kv_head_coord=kv_head_coord,
                                     batch_coord=batch_coord,
                                     cuseqlen_k=cuseqlen_k,
+                                    seqlen_k=seqlen_k,
                                     kv_tile_start=kv_tile_start,
                                 )
                             skv.commit()
@@ -412,7 +414,7 @@ def create_load_task(
                     cuseqlen_q,
                     cuseqlen_k,
                     seqlen_q,
-                    _seqlen_k,
+                    seqlen_k,
                     kv_tile_start,
                 ) = coords
                 sq.acquire()
@@ -473,6 +475,7 @@ def create_load_task(
                             kv_head_coord=kv_head_coord,
                             batch_coord=batch_coord,
                             cuseqlen_k=cuseqlen_k,
+                            seqlen_k=seqlen_k,
                             kv_tile_start=kv_tile_start,
                         )
                         skv.commit()
@@ -491,6 +494,7 @@ def create_load_task(
                         kv_head_coord=kv_head_coord,
                         batch_coord=batch_coord,
                         cuseqlen_k=cuseqlen_k,
+                        seqlen_k=seqlen_k,
                         kv_tile_start=kv_tile_start,
                     )
                     skv.commit()
@@ -569,7 +573,7 @@ def create_load_task(
                         cuseqlen_q,
                         cuseqlen_k,
                         seqlen_q,
-                        _seqlen_k,
+                        seqlen_k,
                         kv_tile_start,
                     ) = gqkv.compute_coords()
                     # Load Q0 for the first Q tile in this work tile.
@@ -614,6 +618,7 @@ def create_load_task(
                     kv_head_coord=kv_head_coord,
                     batch_coord=batch_coord,
                     cuseqlen_k=cuseqlen_k,
+                    seqlen_k=seqlen_k,
                     kv_tile_start=kv_tile_start,
                 )
                 skv.commit()

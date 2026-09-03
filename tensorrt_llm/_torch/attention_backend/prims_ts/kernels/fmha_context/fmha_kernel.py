@@ -2688,8 +2688,9 @@ class FmhaTs:
             # Q/O use the packed sequence axis as a ragged TMA dimension.
             # Dense TMA bounds only see the full sum_seqlen tensor and cannot
             # prevent a partial final tile from crossing into the next packed
-            # sequence.  K/V can keep dense descriptors because invalid K/V
-            # lanes are masked out before softmax/PV consumes them.
+            # sequence. K can keep a dense descriptor because invalid scores
+            # are masked before softmax. Paged V uses its own ragged descriptor
+            # below because zero probabilities do not suppress NaNs in PV MMA.
             tma_q_desc = create_tensor_map_ragged_from_tensor(
                 q_cute,
                 box_dims=q_box_dims,
@@ -2708,12 +2709,14 @@ class FmhaTs:
             )
 
         if cutlass.const_expr(cfg.use_paged_kv):
-            # Paged-KV path: K/V are pool tensors with shape
+            # Paged-KV path: K/V are compact pool tensors with shape
             # (total_pages, h_kv, num_tokens_per_page, d). The TMA box covers
             # one page × one d-fragment; the loader stitches pages and d-halves
-            # together via per-fragment coords. Inner d-tile must equal
-            # tma_copy_kv_granu_inner (64 fp16 = 128 B) to match the s128b
-            # swizzle the contiguous path uses.
+            # together via per-fragment coords. K uses the native rank-4 view.
+            # V flattens head and page-token modes so the logical final-page
+            # extent fits in a rank-5 ragged tensor map after the helper adds
+            # its two synthetic dimensions. Numeric-zero OOB fill is required:
+            # V must remain finite without relying on special-NaN FMA handling.
             paged_kv_box_dims = (
                 1,
                 1,
@@ -2727,12 +2730,33 @@ class FmhaTs:
                 swizzle=tma_qkv_swizzle,
                 l2_promotion=tma_kv_l2_promotion,
             )
-            tma_v_desc = cuda.create_tensor_map_tiled_from_view(
-                v_cute,
-                box_dims=paged_kv_box_dims,
-                stride_order=kv_stride_order,
+            v_paged_tma = cute.make_tensor(
+                v_cute.iterator,
+                cute.make_layout(
+                    (
+                        v_cute.shape[0],
+                        v_cute.shape[1] * v_cute.shape[2],
+                        v_cute.shape[3],
+                    ),
+                    stride=(
+                        v_cute.stride[0],
+                        v_cute.stride[2],
+                        v_cute.stride[3],
+                    ),
+                ),
+            )
+            tma_v_desc = create_tensor_map_ragged_from_tensor(
+                v_paged_tma,
+                box_dims=(
+                    1,
+                    cfg.num_tokens_per_page,
+                    cfg.tma_copy_kv_granu_inner,
+                ),
+                ragged_dim=1,
+                stride_order=(2, 1, 0),
                 swizzle=tma_qkv_swizzle,
                 l2_promotion=tma_kv_l2_promotion,
+                oob_fill=cuda.TensorMapFloatOOBFill.none,
             )
         else:
             tma_k_desc = cuda.create_tensor_map_tiled_from_view(

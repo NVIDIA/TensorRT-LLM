@@ -101,6 +101,69 @@ def test_prims_ts_qwen2_gqa(
     run_case(case)
 
 
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+def test_prims_ts_context_zero_fills_nan_v_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    use_kv_cache_manager_v2: bool,
+) -> None:
+    from tensorrt_llm._torch.attention_backend.prims_ts.context import BatchPrefillPagedTSWrapper
+
+    original_run = BatchPrefillPagedTSWrapper.run
+    poisoned_tails: list[tuple[int, int]] = []
+
+    def run_with_nan_v_tail(
+        self: BatchPrefillPagedTSWrapper,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        logical_kv_indptr: torch.Tensor,
+        dense_page_idx_kv: torch.Tensor,
+        seq_lens_kv: torch.Tensor,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        # Poison after TRT-LLM writes valid KV and immediately before PrimTS
+        # launches, so only the kernel's handling of unused V rows is tested.
+        page_size = v_cache.shape[2]
+        seq_lens = seq_lens_kv.cpu().tolist()
+        v_page_indices = dense_page_idx_kv[:, 1].cpu()
+        for batch_idx, seq_len in enumerate(seq_lens):
+            logical_last_page = (seq_len - 1) // page_size
+            tail_start = (seq_len - 1) % page_size + 1
+            if tail_start == page_size:
+                continue
+            physical_page = int(v_page_indices[batch_idx, logical_last_page].item())
+            v_cache[physical_page, :, tail_start:, :].fill_(float("nan"))
+            poisoned_tails.append((batch_idx, tail_start))
+
+        return original_run(
+            self,
+            q,
+            k_cache,
+            v_cache,
+            qo_indptr,
+            logical_kv_indptr,
+            dense_page_idx_kv,
+            seq_lens_kv,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(BatchPrefillPagedTSWrapper, "run", run_with_nan_v_tail)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    case = BackendCase(
+        **_QWEN2_7B,
+        seq_lens=[65, 37],
+        num_cached_tokens=[0, 0],
+        num_contexts=2,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+    )
+
+    results = run_case(case)
+
+    assert "TRTLLM" in results
+    assert poisoned_tails == [(0, 1), (1, 5)]
+
+
 def test_prims_ts_fp16_dense_context_with_alternate_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
