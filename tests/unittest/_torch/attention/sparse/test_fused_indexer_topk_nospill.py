@@ -252,3 +252,41 @@ def test_fused_indexer_topk_nospill_cuda_graph(batch, k_top):
         assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
             f"row {i}: replay value set diverged, max err {float(dv.max()):.4f}"
         )
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("n_comp", [65536, 131072, 262144])
+@pytest.mark.parametrize("k_top", [512, 1024])
+def test_fused_indexer_topk_nospill_long_context(batch, n_comp, k_top):
+    # Rows longer than one CTA's key budget are split across a cluster whose
+    # size follows the row length (up to 16 CTAs = 1M-token context at
+    # compress ratio 4); each CTA stages only its own tiles' page-table slice.
+    device = torch.device("cuda")
+    inp = _build_inputs(batch, n_comp, k_top, "signed", seed=4321, device=device)
+    indices = torch.full((batch, k_top), -3, dtype=torch.int32, device=device)
+    values = torch.full((batch, k_top), float("nan"), dtype=torch.float32, device=device)
+    fused_indexer_topk_nospill.run(
+        inp["q_fp4"],
+        inp["sf_q"],
+        inp["kv_cache"],
+        inp["weights"],
+        inp["context_lens"],
+        inp["block_table"],
+        None,
+        indices,
+        values,
+    )
+    torch.cuda.synchronize()
+    ref_vals = _reference(inp, k_top)
+    for i in range(batch):
+        row = indices[i]
+        assert int(row.min()) >= 0
+        assert int(row.max()) < int(inp["context_lens"][i])
+        assert row.unique().numel() == k_top, "duplicate indices"
+        got, _ = torch.sort(values[i], descending=True)
+        want, _ = torch.sort(ref_vals[i], descending=True)
+        dv = (got - want).abs()
+        assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
+            f"row {i}: max value err {float(dv.max()):.4f}"
+        )

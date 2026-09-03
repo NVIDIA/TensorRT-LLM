@@ -152,7 +152,8 @@ def _mla_dsa_attn_inplace_fake(
 maybe_bcg_mla_dsa_attn_inplace = eager_on_graph(mla_dsa_attn_inplace)
 
 
-_FUSED_TOPK_NCOMP_GRID = (8192, 16384, 32768)
+_FUSED_TOPK_NCOMP_MIN = 8192
+_FUSED_TOPK_NCOMP_MAX = 262144  # 1M-token context at compress ratio 4
 
 
 @torch.library.custom_op(
@@ -180,10 +181,10 @@ def dsa_fused_indexer_topk_decode(
     selected scores.
     """
     n_comp = block_table.shape[1] * 32
-    assert n_comp in _FUSED_TOPK_NCOMP_GRID, (
+    assert n_comp % 128 == 0 and _FUSED_TOPK_NCOMP_MIN <= n_comp <= _FUSED_TOPK_NCOMP_MAX, (
         f"dsa_fused_indexer_topk_decode: block_table width {n_comp} tokens "
-        f"is outside the validated grid {_FUSED_TOPK_NCOMP_GRID}; pad the "
-        "block table (or route longer contexts to the unfused path)."
+        f"is outside the validated range [{_FUSED_TOPK_NCOMP_MIN}, {_FUSED_TOPK_NCOMP_MAX}] "
+        "(multiple of 128); pad the block table (or route longer contexts to the unfused path)."
     )
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
         fused_indexer_topk_nospill as _kernel,

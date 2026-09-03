@@ -84,6 +84,7 @@ M_WARP = 14
 NTHREADS = 480  # 15 warps => 136 regs/thread, enough to keep all 64
 # per-head weights resident in registers for the scan
 NACC = 3
+MAX_NLOC = 256  # tiles per CTA whose 16-bit keys fit next to a >=14-stage pipeline
 
 
 @cute.jit
@@ -226,7 +227,7 @@ def _dsv4_kernel(
     sPart = smem.allocate_tensor(I32, cute.make_layout(NBINS // 8), byte_alignment=128)
     sCtl = smem.allocate_tensor(I32, cute.make_layout(32), byte_alignment=128)
     sFine = smem.allocate_tensor(I32, cute.make_layout(NFINE), byte_alignment=128)
-    sBT = smem.allocate_tensor(I32, cute.make_layout(MAXB), byte_alignment=128)
+    sBT = smem.allocate_tensor(I32, cute.make_layout(NLOC * 4), byte_alignment=128)
     sCand = smem.allocate_tensor(I32, cute.make_layout(CAP), byte_alignment=128)
     tmem_hold = smem.allocate_array(I32, 1, byte_alignment=16)
     mbar = smem.allocate_array(cutlass.Int64, 2 * STAGES + 2 * NACC, byte_alignment=16)
@@ -304,11 +305,15 @@ def _dsv4_kernel(
     if ntile > crk:
         ntl = (ntile - crk + CS - 1) // CS
 
+    # Only the pages of this CTA's own tiles (crk, crk+CS, ...) are staged,
+    # so the SMEM page table stays NLOC*4 entries however long the row is.
     gBT = cute.make_tensor(bt_ptr + cutlass.Int64(b) * MAXB, cute.make_layout(MAXB))
     if tidx >= 128:
         ii = tidx - 128
-        for i in cutlass.range(ii, MAXB, NTHREADS - 128, unroll=1):
-            sBT[i] = gBT[i]
+        for jj in cutlass.range(ii, NLOC * 4, NTHREADS - 128, unroll=1):
+            gi = (crk + (jj >> 2) * CS) * 4 + (jj & 3)
+            if gi < MAXB:
+                sBT[jj] = gBT[gi]
 
     if tidx < 64:
         sW[tidx] = cute.make_tensor(w_ptr, cute.make_layout(1 << 20))[b * 64 + tidx]
@@ -389,17 +394,17 @@ def _dsv4_kernel(
                 cute.arch.mbarrier_wait(ab_empty + s, ((j // STAGES) - 1) & 1)
             if cutlass.const_expr(_ASM):
                 jf = j + PFD
-                if cutlass.const_expr(NCOMP == 32768):
+                if cutlass.const_expr(NCOMP >= 32768):
                     jf = j + 2
                 if jf < ntl:
-                    pgf = sBT[(crk + jf * CS) * 4 + pgt]
+                    pgf = sBT[jf * 4 + pgt]
                     base = kv_ptr.toint() + cutlass.Int64(pgf) * PGB
                     _pfl2(base + tkt * 128)
                     if tkt == 0:
                         _pfl2(base + 2048)
             # scale plane keeps the per-half-warp page; data plane is per warp
-            pg0 = cute.arch.make_warp_uniform(sBT[i * 4 + pgw])
-            pg1 = cute.arch.make_warp_uniform(sBT[i * 4 + pgw + 1])
+            pg0 = cute.arch.make_warp_uniform(sBT[j * 4 + pgw])
+            pg1 = cute.arch.make_warp_uniform(sBT[j * 4 + pgw + 1])
             pg = pg0
             if pgt != pgw:
                 pg = pg1
@@ -828,7 +833,7 @@ def _launch(
         + 2 * NFINE * 4
         + 64
         + (2 * STAGES + 2 * NACC) * 8
-        + MAXB * 4
+        + NLOC * 4 * 4
         + CAP * 4
         + 2048
     )
@@ -879,7 +884,7 @@ def _stages(NLOC, MAXB):
         + 32 * 4
         + 2 * NFINE * 4
         + 64
-        + MAXB * 4
+        + NLOC * 4 * 4
         + CAP * 4
         + 2048
     )
@@ -899,10 +904,17 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
     KTOP = indices.shape[1]
     # split one row across a cluster of CTAs when the batch cannot fill the GPU;
     # scores stay in each CTA's SMEM and the top-K is reduced through DSMEM.
+    assert NCOMP % TOK == 0, f"block_table width {NCOMP} must be a multiple of {TOK}"
     CS = 1
     while CS < 16 and (B * CS * 2) <= 148:
         CS *= 2
+    # long rows: each CTA keeps at most MAX_NLOC tiles of 16-bit keys in SMEM
+    while CS < 16 and (NCOMP // TOK + CS - 1) // CS > MAX_NLOC:
+        CS *= 2
     NLOC = (NCOMP // TOK + CS - 1) // CS
+    assert NLOC <= MAX_NLOC, (
+        f"row of {NCOMP} tokens exceeds the supported length (16 CTAs x {MAX_NLOC * TOK})"
+    )
     STAGES = _stages(NLOC, MAXB)
     key = (B, NCOMP, KTOP, MAXB, NPAGES, STAGES, CS, NLOC)
     kv_ptr = make_ptr(U8, kv_cache.data_ptr(), GMEM, assumed_align=16)
