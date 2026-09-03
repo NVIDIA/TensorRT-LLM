@@ -1208,15 +1208,16 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
         update_kv_cache=True,
     )
 
-    supported, reason = fmha._is_supported_with_reason(
-        q,
-        None,
-        None,
-        attn,
-        metadata,
-        forward_args,
-        phase=FmhaPhase.CONTEXT,
-    )
+    for phase in (None, FmhaPhase.CONTEXT):
+        supported, reason = fmha._is_supported_with_reason(
+            q,
+            None,
+            None,
+            attn,
+            metadata,
+            forward_args,
+            phase=phase,
+        )
 
-    assert supported, reason
-    assert reason == ""
+        assert supported, reason
+        assert reason == ""
