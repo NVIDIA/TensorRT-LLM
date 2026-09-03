@@ -2052,6 +2052,54 @@ def _get_local_mamba_cache_layout(
     return params, local_mamba_layers, local_attention_layers
 
 
+# --- Qwen4-Exp PLE ---------------------------------------------------------
+# PLE (the n-gram side path) is a Qwen4-Exp-only feature that rides on the
+# hybrid manager's Mamba slots. It is kept in dedicated helpers so it can be
+# lifted into a model-owned cache manager wholesale later on.
+
+
+def _qwen4_exp_ple_state_bytes_per_rank(
+    model_config,
+    params,
+    mapping,
+    *,
+    spec_config,
+    use_separate_draft_kv_cache: bool,
+) -> int:
+    """Bytes this rank needs for Qwen4-Exp PLE recurrent state; 0 otherwise."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        extract_qwen4_exp_ple_cache_params, is_qwen4_exp)
+
+    # The estimator is also called with minimal model-config stubs that carry no
+    # `pretrained_config`; such a config is definitionally not Qwen4-Exp.
+    pretrained_config = getattr(model_config, "pretrained_config", None)
+    if pretrained_config is None or not is_qwen4_exp(pretrained_config):
+        return 0
+    ple_params = extract_qwen4_exp_ple_cache_params(pretrained_config)
+    mamba_layer_mask, full_attention_layer_mask = params.get_layer_masks(
+        is_draft=False,
+        use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+    )
+    combined_layer_mask = [
+        is_mamba or is_attention for is_mamba, is_attention in zip(
+            mamba_layer_mask, full_attention_layer_mask)
+    ]
+    local_layer_indices, _ = get_pp_layers(
+        sum(combined_layer_mask),
+        mapping,
+        spec_config=spec_config,
+        layer_mask=combined_layer_mask,
+    )
+    local_ple_layers = sum(layer_id < len(ple_params.ple_layer_mask)
+                           and ple_params.ple_layer_mask[layer_id]
+                           for layer_id in local_layer_indices)
+    ple_bytes_per_layer = (
+        ple_params.short_conv_channels * ple_params.short_conv_state_len *
+        ple_params.conv_state_dtype.itemsize +
+        ple_params.ngram_context_len * torch.int64.itemsize)
+    return local_ple_layers * ple_bytes_per_layer
+
+
 def _estimate_mamba_hybrid_cache_cost(
     model_config,
     mapping: Mapping,
@@ -2085,34 +2133,13 @@ def _estimate_mamba_hybrid_cache_cost(
     state_bytes_per_rank = (local_mamba_layers *
                             params.get_states_bytes_per_layer(mapping))
     if not is_draft:
-        from tensorrt_llm._torch.pyexecutor.config_utils import (
-            extract_qwen4_exp_ple_cache_params, is_qwen4_exp)
-
-        pretrained_config = model_config.pretrained_config
-        if is_qwen4_exp(pretrained_config):
-            ple_params = extract_qwen4_exp_ple_cache_params(pretrained_config)
-            mamba_layer_mask, full_attention_layer_mask = params.get_layer_masks(
-                is_draft=False,
-                use_separate_draft_kv_cache=use_separate_draft_kv_cache,
-            )
-            combined_layer_mask = [
-                is_mamba or is_attention for is_mamba, is_attention in zip(
-                    mamba_layer_mask, full_attention_layer_mask)
-            ]
-            local_layer_indices, _ = get_pp_layers(
-                sum(combined_layer_mask),
-                mapping,
-                spec_config=spec_config,
-                layer_mask=combined_layer_mask,
-            )
-            local_ple_layers = sum(layer_id < len(ple_params.ple_layer_mask)
-                                   and ple_params.ple_layer_mask[layer_id]
-                                   for layer_id in local_layer_indices)
-            ple_bytes_per_layer = (
-                ple_params.short_conv_channels * ple_params.short_conv_state_len
-                * ple_params.conv_state_dtype.itemsize +
-                ple_params.ngram_context_len * torch.int64.itemsize)
-            state_bytes_per_rank += local_ple_layers * ple_bytes_per_layer
+        state_bytes_per_rank += _qwen4_exp_ple_state_bytes_per_rank(
+            model_config,
+            params,
+            mapping,
+            spec_config=spec_config,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+        )
     max_resident_sequences = max_batch_size * mapping.pp_size
 
     if include_explicit_snapshots:
@@ -2917,6 +2944,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     _supports_additional_snapshot_offsets = True
 
+    # Qwen4-Exp PLE state is opt-in. These class-level defaults keep every other
+    # model — and any partially-constructed instance that sets only the fields it
+    # needs — out of the PLE branches without carrying PLE geometry.
+    # `_init_qwen4_exp_ple_geometry` rebinds all of them per instance.
+    _ple_layer_ids: list[int] = []
+    _ple_conv_state_shape: list[int] = []
+    _ple_ngram_context_shape: list[int] = []
+
     def __init__(
         self,
         # mamba cache parameters
@@ -3011,44 +3046,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._num_reserved_dummy_slots = (num_cuda_graph_padding_dummy_slots +
                                           int(mapping.enable_attention_dp))
         # PLE uses the same request slots and snapshots as the GDN state.
-        self._ple_layer_ids: list[int] = []
-        self._ple_conv_state_shape: list[int] = []
-        self._ple_ngram_context_shape: list[int] = []
-        self._ple_conv_state_dtype = mamba_cache_dtype
-        if qwen4_exp_ple_cache_params is not None:
-            params = qwen4_exp_ple_cache_params
-            if len(params.ple_layer_mask) != total_layers:
-                raise ValueError(
-                    "PLE layer mask length must match the hybrid layer mask: "
-                    f"got {len(params.ple_layer_mask)}, expected {total_layers}"
-                )
-            self._ple_layer_ids = [
-                layer_id
-                for layer_id, active in enumerate(params.ple_layer_mask)
-                if active
-            ]
-            if len(self._ple_layer_ids) != params.num_ple_layers:
-                raise ValueError(
-                    "PLE layer mask count does not match num_ple_layers: "
-                    f"got {len(self._ple_layer_ids)}, expected "
-                    f"{params.num_ple_layers}")
-            if any(not self._mamba_layer_mask[layer_id]
-                   for layer_id in self._ple_layer_ids):
-                raise ValueError(
-                    "PLE lifecycle state must belong to Mamba layers")
-            if (params.short_conv_channels <= 0
-                    or params.short_conv_state_len <= 0
-                    or params.ngram_context_len <= 0):
-                raise ValueError(
-                    "PLE recurrent-state dimensions must be positive")
-            self._ple_conv_state_shape = [
-                params.short_conv_channels,
-                params.short_conv_state_len,
-            ]
-            self._ple_ngram_context_shape = [params.ngram_context_len]
-            self._ple_conv_state_dtype = params.conv_state_dtype
-        self._ple_conv_states: dict[int, torch.Tensor] = {}
-        self._ple_ngram_contexts: dict[int, torch.Tensor] = {}
+        self._init_qwen4_exp_ple_geometry(qwen4_exp_ple_cache_params,
+                                          total_layers, mamba_cache_dtype)
         self.ssm_state_dtype = (mamba_ssm_cache_dtype if mamba_ssm_cache_dtype
                                 is not None else mamba_cache_dtype)
         self.conv_state_dtype = mamba_cache_dtype
@@ -3221,6 +3220,51 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.all_ssm_states = []
             self.all_conv_states = []
             self._setup_replay_buffers(spec_config)
+
+    def _init_qwen4_exp_ple_geometry(
+        self,
+        params: Optional["Qwen4ExpPLECacheParams"],
+        total_layers: int,
+        default_state_dtype: torch.dtype,
+    ) -> None:
+        """Validate and record the Qwen4-Exp PLE pool geometry.
+
+        A no-op for every other model: the fields stay empty and
+        `_ple_buffer_configs` then contributes nothing.
+        """
+        self._ple_layer_ids: list[int] = []
+        self._ple_conv_state_shape: list[int] = []
+        self._ple_ngram_context_shape: list[int] = []
+        self._ple_conv_state_dtype = default_state_dtype
+        self._ple_conv_states: dict[int, torch.Tensor] = {}
+        self._ple_ngram_contexts: dict[int, torch.Tensor] = {}
+        if params is None:
+            return
+        if len(params.ple_layer_mask) != total_layers:
+            raise ValueError(
+                "PLE layer mask length must match the hybrid layer mask: "
+                f"got {len(params.ple_layer_mask)}, expected {total_layers}")
+        self._ple_layer_ids = [
+            layer_id for layer_id, active in enumerate(params.ple_layer_mask)
+            if active
+        ]
+        if len(self._ple_layer_ids) != params.num_ple_layers:
+            raise ValueError(
+                "PLE layer mask count does not match num_ple_layers: "
+                f"got {len(self._ple_layer_ids)}, expected "
+                f"{params.num_ple_layers}")
+        if any(not self._mamba_layer_mask[layer_id]
+               for layer_id in self._ple_layer_ids):
+            raise ValueError("PLE lifecycle state must belong to Mamba layers")
+        if (params.short_conv_channels <= 0 or params.short_conv_state_len <= 0
+                or params.ngram_context_len <= 0):
+            raise ValueError("PLE recurrent-state dimensions must be positive")
+        self._ple_conv_state_shape = [
+            params.short_conv_channels,
+            params.short_conv_state_len,
+        ]
+        self._ple_ngram_context_shape = [params.ngram_context_len]
+        self._ple_conv_state_dtype = params.conv_state_dtype
 
     def _setup_ple_states(self, num_state_slots: int) -> None:
         """Bind each local PLE layer to V2-managed recurrent-state views."""
