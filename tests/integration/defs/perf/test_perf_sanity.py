@@ -322,15 +322,41 @@ DEVICE_STEP_TIME_MODES = ("gen_only", "e2e")
 # so an unconditional entry would add one parametrised id per config (~90) that
 # nothing ever runs, and every one of them would still have to be waived,
 # durations-seeded, and mapped to a Jenkins stage.
+#
+# The four entries are every DeepSeek-V4-Pro fp4 8k1k shape perf sanity runs
+# disaggregated, i.e. the whole concurrency sweep from single-user latency to max
+# throughput: con8 (ctx1/gen4), con180 (ctx3/gen1 dep32), con666 (ctx6/gen1
+# dep16), con4301 (ctx12/gen1 dep8). e2e is one of the two modes whose
+# regressions land in host overhead (the other is ctx_only), so the breakdown is
+# worth its own lane on each shape rather than on one representative -- the host
+# work per request is what changes with concurrency, and a single shape cannot
+# show that. Each lives in a different multi-node lane list, so each costs one
+# additional split in its own Jenkins stage and none of them lengthens another.
+#
+# Cost scales with requests x decode steps per request, not with nodes: a
+# measured con666 run (6660 requests, 1.54M steps) wrote a 386 MB gen-worker
+# JSONL that compute_time_breakdown_metrics reduced in 11 s at 1.2 GB peak RSS.
+# con4301 is 43010 requests at mtp1 (~2x the steps per request), i.e. ~14x that
+# -- order 5 GB on disk and 15-20 GB resident on the benchmark node for a couple
+# of minutes. Fine on a GB300, but a config an order of magnitude larger again
+# would need the reduction to stream instead of materialising every sample.
 E2E_TIME_BREAKDOWN_CONFIGS = (
+    "gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL",
+    "gb300_deepseek-v4-pro-fp4_8k1k_con180_ctx3_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL",
     "gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL",
+    "gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL",
 )
 
 # Same allowlist discipline for ctx_only. Kept separate from
 # E2E_TIME_BREAKDOWN_CONFIGS rather than reused: ctx_only runs on the aggregated
 # runtime with a single server on a fraction of the nodes, so whether a config is
-# worth a time_breakdown lane is a different question per mode, and the two lists
-# are expected to diverge as lanes are added.
+# worth a time_breakdown lane is a different question per mode -- and the two
+# lists already differ. All four disagg shapes get an e2e lane (they are four
+# separate Jenkins stages, so each is one extra split in its own stage), while
+# ctx_only has one: every ctx_only case shares the single
+# l0_gb300_multi_gpus_perf_sanity stage, where each addition lengthens the same
+# serial lane, and a prefill-only run's per-chunk spans vary far less across the
+# concurrency sweep than a full e2e run's request lifecycle does.
 CTX_ONLY_TIME_BREAKDOWN_CONFIGS = (
     "gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL",
 )
