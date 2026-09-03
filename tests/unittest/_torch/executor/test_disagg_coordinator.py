@@ -47,18 +47,24 @@ def test_every_coordinator_method_has_a_delegate() -> None:
     assert _public_methods(DisaggTransferCoordinator) == delegate_names
 
 
-def test_real_coordinator_forwards_arguments_and_results() -> None:
+@pytest.mark.parametrize("name", [f.name for f in fields(DisaggLoopDelegates)])
+def test_real_coordinator_forwards_each_method_to_its_delegate(name: str) -> None:
+    """Each entry point must reach exactly its own delegate with the arguments
+    unchanged; a cross-wired or dropped call changes loop behavior and may break
+    rank symmetry for collective-sensitive entry points."""
     delegates = DisaggLoopDelegates(**{f.name: Mock() for f in fields(DisaggLoopDelegates)})
-    delegates.admit.return_value = (["admitted"], True)
     coordinator = DisaggTransferCoordinator(delegates)
+    method = getattr(coordinator, name)
+    args = [object() for _ in inspect.signature(method).parameters]
 
-    assert coordinator.admit(["fitting"]) == (["admitted"], True)
-    coordinator.reap_context_sends(1)
-    coordinator.revert_deferred_gen_init(["a"], ["b"])
+    result = method(*args)
 
-    delegates.admit.assert_called_once_with(["fitting"])
-    delegates.reap_context_sends.assert_called_once_with(1)
-    delegates.revert_deferred_gen_init.assert_called_once_with(["a"], ["b"])
+    getattr(delegates, name).assert_called_once_with(*args)
+    for other in fields(DisaggLoopDelegates):
+        if other.name != name:
+            getattr(delegates, other.name).assert_not_called()
+    expected = getattr(delegates, name).return_value if name == "admit" else None
+    assert result is expected
 
 
 def test_noop_coordinator_admits_everything_unchanged() -> None:
