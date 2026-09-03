@@ -26,6 +26,7 @@ l0_cpu:
   # Kimi K3 disagg parity harness self-test (comparison logic only, no GPUs).
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   - unittest/_torch/attention
+  - unittest/_torch/custom_ops/test_fast_custom_op.py
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
   - unittest/_torch/distributed
   - unittest/_torch/executor

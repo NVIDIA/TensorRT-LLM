@@ -26,6 +26,7 @@ from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
 from .cutedsl_matmul_heuristics import (NVFP4_PRECISION,
                                         nvmmh_enabled_for_nvfp4, nvmmh_fields,
                                         nvmmh_max_tactics, rank_configs)
+from .fast_custom_op import fast_custom_op
 
 try:
     from cuda.bindings import driver as cuda
@@ -1013,9 +1014,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c_tensor
 
     # a/b: fp4, scale: fp8, output: bf16
-    @torch.library.custom_op("trtllm::cute_dsl_nvfp4_gemm_blackwell",
-                             mutates_args=(),
-                             device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_nvfp4_gemm_blackwell",
+                    mutates_args=(),
+                    device_types="cuda")
     def cute_dsl_nvfp4_gemm_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -1474,10 +1475,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c_tensor
 
     # a/b: fp4, scale: fp8, output: bf16, fused SwiGLU activation
-    @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_blackwell",
-        mutates_args=(),
-        device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_blackwell",
+                    mutates_args=(),
+                    device_types="cuda")
     def cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -1561,9 +1561,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return (self.output_dtype, self.use_tvm_ffi, 'gelu')
 
     # a/b: fp4, scale: fp8, output: bf16, fused non-gated GELU(tanh)
-    @torch.library.custom_op("trtllm::cute_dsl_nvfp4_dense_gemm_gelu_blackwell",
-                             mutates_args=(),
-                             device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_nvfp4_dense_gemm_gelu_blackwell",
+                    mutates_args=(),
+                    device_types="cuda")
     def cute_dsl_nvfp4_dense_gemm_gelu_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -2004,10 +2004,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c_tensor, c_sf_tensor
 
     # a/b: fp4, scale: fp8, output: fp4 + sfc, fused SwiGLU activation
-    @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell",
-        mutates_args=(),
-        device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell",
+                    mutates_args=(),
+                    device_types="cuda")
     def cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -2100,10 +2099,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return (self.use_tvm_ffi, 'gelu_fp4out')
 
     # a/b: fp4, scale: fp8, output: fp4 + sfc, fused non-gated GELU(tanh)
-    @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell",
-        mutates_args=(),
-        device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell",
+                    mutates_args=(),
+                    device_types="cuda")
     def cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -2424,9 +2422,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             return c
 
-    @torch.library.custom_op("trtllm::cute_dsl_nvfp4_grouped_gemm_blackwell",
-                             mutates_args=(),
-                             device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_nvfp4_grouped_gemm_blackwell",
+                    mutates_args=(),
+                    device_types="cuda")
     def cute_dsl_nvfp4_grouped_gemm_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -3139,10 +3137,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             return c, c_sf
 
-    @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_grouped_gemm_swiglu_blackwell",
-        mutates_args=(),
-        device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_nvfp4_grouped_gemm_swiglu_blackwell",
+                    mutates_args=(),
+                    device_types="cuda")
     def cute_dsl_nvfp4_grouped_gemm_swiglu_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -3545,7 +3542,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return c, c_sf
 
-    @torch.library.custom_op(
+    @fast_custom_op(
         "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
         mutates_args=(),
         device_types="cuda")
@@ -3919,7 +3916,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             return packed.view(torch.int8), output_scale.view(torch.int32)
 
-    @torch.library.custom_op(
+    @fast_custom_op(
         "trtllm::cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell",
         mutates_args=(),
         device_types="cuda",
@@ -4223,9 +4220,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c_tensor
 
     # a/b: fp8, scale: fp32, output: bf16
-    @torch.library.custom_op("trtllm::cute_dsl_fp8_gemm_blackwell",
-                             mutates_args=(),
-                             device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_fp8_gemm_blackwell",
+                    mutates_args=(),
+                    device_types="cuda")
     def cute_dsl_fp8_gemm_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -4878,7 +4875,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return c, c_sf
 
-    @torch.library.custom_op(
+    @fast_custom_op(
         "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_moe_blackwell",
         mutates_args=(),
         device_types="cuda",
@@ -5267,7 +5264,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return c
 
-    @torch.library.custom_op(
+    @fast_custom_op(
         "trtllm::cute_dsl_nvfp4_dense_gemm_fc2_blackwell",
         mutates_args=(),
         device_types="cuda",

@@ -201,7 +201,7 @@ class MoERunner(TunableRunner):
         )
 
 
-@torch.library.custom_op("trtllm::fused_moe", mutates_args=())
+@fast_custom_op("trtllm::fused_moe", mutates_args=(), device_types=None)
 def fused_moe(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -510,7 +510,7 @@ class FP8RowwiseGemmRunner(TunableRunner):
         )
 
 
-@torch.library.custom_op("trtllm::fp8_rowwise_gemm", mutates_args=())
+@fast_custom_op("trtllm::fp8_rowwise_gemm", mutates_args=(), device_types=None)
 def fp8_rowwise_gemm(
     act: torch.Tensor,
     weight: torch.Tensor,
@@ -656,7 +656,9 @@ class MXFP8GemmRunner(TunableRunner):
         )
 
 
-@torch.library.custom_op("trtllm::mxfp8_mxfp8_gemm_autotuned", mutates_args=())
+@fast_custom_op("trtllm::mxfp8_mxfp8_gemm_autotuned",
+                mutates_args=(),
+                device_types=None)
 def mxfp8_mxfp8_gemm_autotuned(
     act: torch.Tensor,
     act_scale: torch.Tensor,
@@ -1012,7 +1014,9 @@ class MarlinNVFP4Runner(TunableRunner):
         return result
 
 
-@torch.library.custom_op("trtllm::nvfp4_gemm_cublaslt", mutates_args=())
+@fast_custom_op("trtllm::nvfp4_gemm_cublaslt",
+                mutates_args=(),
+                device_types=None)
 def nvfp4_gemm_cublaslt(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
@@ -1072,7 +1076,9 @@ def _(
                              dtype=output_dtype)
 
 
-@torch.library.custom_op("trtllm::nvfp4_gemm_cutlass", mutates_args=())
+@fast_custom_op("trtllm::nvfp4_gemm_cutlass",
+                mutates_args=(),
+                device_types=None)
 def nvfp4_gemm_cutlass(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
@@ -1603,7 +1609,9 @@ class FP8BatchedGemmRunner(TunableRunner):
         return tuning_config
 
 
-@torch.library.custom_op("trtllm::fp8_batched_gemm_trtllmgen", mutates_args=())
+@fast_custom_op("trtllm::fp8_batched_gemm_trtllmgen",
+                mutates_args=(),
+                device_types=None)
 def fp8_batched_gemm_trtllmgen(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
@@ -1673,7 +1681,9 @@ def _(
     return (fake_out, fake_dq_sfs_c)
 
 
-@torch.library.custom_op("trtllm::w4a8_mxfp4_fp8_gemm", mutates_args=())
+@fast_custom_op("trtllm::w4a8_mxfp4_fp8_gemm",
+                mutates_args=(),
+                device_types=None)
 def w4a8_mxfp4_fp8_gemm(
         act_fp8: torch.Tensor,
         weight: torch.Tensor,
@@ -1766,7 +1776,9 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
         )
 
 
-@torch.library.custom_op("trtllm::weight_only_quant_gemm", mutates_args=())
+@fast_custom_op("trtllm::weight_only_quant_gemm",
+                mutates_args=(),
+                device_types=None)
 def weight_only_quant_gemm(
         activation: torch.Tensor,
         weight: torch.Tensor,
@@ -1865,8 +1877,9 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
             kwargs["bias"], kwargs["zeros"], alpha)
 
 
-@torch.library.custom_op("trtllm::finegrained_mixed_dtype_gemm",
-                         mutates_args=())
+@fast_custom_op("trtllm::finegrained_mixed_dtype_gemm",
+                mutates_args=(),
+                device_types=None)
 def finegrained_mixed_dtype_gemm(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -2050,7 +2063,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         return output
 
 
-@torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
+@fast_custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=(), device_types=None)
 def fp8_swap_ab_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -2158,7 +2171,9 @@ def get_fp8_block_scaling_gemm_constraint_spec() -> Tuple[ConstraintSpec, ...]:
     return _get_fp8_block_scaling_gemm_constraint_spec(get_sm_version())
 
 
-@torch.library.custom_op("trtllm::fp8_block_scaling_gemm", mutates_args=())
+@fast_custom_op("trtllm::fp8_block_scaling_gemm",
+                mutates_args=(),
+                device_types=None)
 def fp8_block_scaling_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2481,7 +2496,7 @@ def _(input: torch.Tensor, group: List[int]) -> bool:
         "custom op runtime implementation, not from fake/tracing execution.")
 
 
-@torch.library.custom_op("trtllm::tunable_allreduce", mutates_args=())
+@fast_custom_op("trtllm::tunable_allreduce", mutates_args=(), device_types=None)
 def tunable_allreduce(
     input: torch.Tensor,
     residual: Optional[torch.Tensor],
@@ -2849,7 +2864,9 @@ class QuantizeE4M3PerTensorRunner(TunableRunner):
         return quantized_data, scale
 
 
-@torch.library.custom_op("trtllm::quantize_e4m3_per_tensor", mutates_args=())
+@fast_custom_op("trtllm::quantize_e4m3_per_tensor",
+                mutates_args=(),
+                device_types=None)
 def quantize_e4m3_per_tensor(
     input: torch.Tensor, ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
