@@ -267,11 +267,13 @@ if args.replay_file_path:
         # otherwise surfaces as a KeyError thousands of lines into an interleaved
         # multi-rank log. Membership, not bounds -- a calibration with a hole
         # satisfies a first/last comparison and still dies at that KeyError.
-        missing = calibrator.get_missing_replay_iterations(replay_start_iter, replay_stop_iter)
-        if missing:
-            shown = ", ".join(str(i) for i in missing[:8])
-            if len(missing) > 8:
-                shown += f", ... ({len(missing):d} in total)"
+        missing_count, missing = calibrator.get_missing_replay_iterations(
+            replay_start_iter, replay_stop_iter
+        )
+        if missing_count:
+            shown = ", ".join(str(i) for i in missing)
+            if missing_count > len(missing):
+                shown += f", ... ({missing_count:d} in total)"
             parser.error(
                 f"--replay-start-iter/--replay-stop-iter ask for iterations "
                 f"[{replay_start_iter}, {replay_stop_iter}], but "

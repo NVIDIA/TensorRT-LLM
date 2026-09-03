@@ -20,6 +20,23 @@ import pytest
 
 from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Calibrator, Mode
 
+pytestmark = pytest.mark.cpu_only
+
+
+class _ScanCapped(dict):
+    """A replay database that raises once it has been probed `cap` times."""
+
+    def __init__(self, entries: dict, cap: int) -> None:
+        super().__init__(entries)
+        self._cap = cap
+        self._probes = 0
+
+    def __contains__(self, key: object) -> bool:
+        self._probes += 1
+        if self._probes > self._cap:
+            raise AssertionError(f"scanned more than {self._cap} times")
+        return super().__contains__(key)
+
 
 def _replay_calibrator(
     iterations: Iterable[int],
@@ -47,14 +64,14 @@ def _replay_calibrator(
 
 def test_missing_replay_iterations_none_when_the_window_fits() -> None:
     calibrator = _replay_calibrator(range(100, 126))
-    assert calibrator.get_missing_replay_iterations(105, 125) == []
-    assert calibrator.get_missing_replay_iterations(100, 125) == []
+    assert calibrator.get_missing_replay_iterations(105, 125) == (0, [])
+    assert calibrator.get_missing_replay_iterations(100, 125) == (0, [])
 
 
 def test_missing_replay_iterations_past_the_end() -> None:
     calibrator = _replay_calibrator(range(100, 126))
-    assert calibrator.get_missing_replay_iterations(124, 128) == [126, 127, 128]
-    assert calibrator.get_missing_replay_iterations(0, 3) == [0, 1, 2, 3]
+    assert calibrator.get_missing_replay_iterations(124, 128) == (3, [126, 127, 128])
+    assert calibrator.get_missing_replay_iterations(0, 3) == (4, [0, 1, 2, 3])
 
 
 def test_missing_replay_iterations_sees_a_hole() -> None:
@@ -65,8 +82,45 @@ def test_missing_replay_iterations_sees_a_hole() -> None:
     A window that stays inside one contiguous run is still legal and must pass.
     """
     calibrator = _replay_calibrator(list(range(100, 111)) + list(range(113, 126)))
-    assert calibrator.get_missing_replay_iterations(113, 125) == []
-    assert calibrator.get_missing_replay_iterations(105, 125) == [111, 112]
+    assert calibrator.get_missing_replay_iterations(113, 125) == (0, [])
+    assert calibrator.get_missing_replay_iterations(105, 125) == (2, [111, 112])
+
+
+def test_missing_replay_iterations_counts_more_than_it_names() -> None:
+    """The count is the whole answer; the examples are capped at `limit`."""
+    calibrator = _replay_calibrator(range(100, 126))
+    assert calibrator.get_missing_replay_iterations(126, 200) == (
+        75,
+        [126, 127, 128, 129, 130, 131, 132, 133],
+    )
+    assert calibrator.get_missing_replay_iterations(126, 200, limit=2) == (75, [126, 127])
+
+
+def test_missing_replay_iterations_is_bounded_by_the_pack() -> None:
+    """A fat-fingered window has to stay cheap.
+
+    --replay-stop-iter is a bare `type=int`, so 1000000000 is one keystroke away.
+    Enumerating that window costs tens of gigabytes and takes the box down before
+    run.py can print the error this check exists to give.
+    """
+    calibrator = _replay_calibrator(range(100, 126))
+    # Refuses to be scanned rather than counting the scans and asserting afterwards:
+    # letting an unbounded scan run to completion to measure it is the failure.
+    calibrator._replay_db = _ScanCapped(calibrator._replay_db, cap=100)
+    assert calibrator.get_missing_replay_iterations(105, 10**9) == (
+        10**9 - 105 + 1 - 21,
+        [126, 127, 128, 129, 130, 131, 132, 133],
+    )
+
+
+def test_missing_replay_iterations_of_an_inverted_window() -> None:
+    """An inverted window holds nothing and misses nothing, not a negative count.
+
+    run.py rejects one before it reaches here, but a count below zero is not an
+    answer to give a caller that asks directly.
+    """
+    calibrator = _replay_calibrator(range(100, 126))
+    assert calibrator.get_missing_replay_iterations(125, 100) == (0, [])
 
 
 def test_missing_replay_iterations_requires_replay_mode() -> None:

@@ -755,15 +755,27 @@ class Calibrator:
             )
         return next(iter(shapes))[0]
 
-    def get_missing_replay_iterations(self, start_iter: int, stop_iter: int) -> list[int]:
-        """Get the iterations in [start_iter, stop_iter] this rank does not hold.
+    def get_missing_replay_iterations(
+        self, start_iter: int, stop_iter: int, limit: int = 8
+    ) -> tuple[int, list[int]]:
+        """Get how many iterations in [start_iter, stop_iter] this rank does not hold.
+
+        The work is bounded by the calibration, not by the window asked for. Both
+        flags behind this are a bare `type=int` with no upper bound, so
+        `--replay-stop-iter 1000000000` is one keystroke away; enumerating that window
+        costs tens of gigabytes and takes the box down before the caller's error
+        message is ever printed. The count is arithmetic instead, and the scan for
+        examples stops at `limit` of them -- at most `limit` plus the number of
+        iterations the range does hold.
 
         Args:
             start_iter: First iteration of the requested window, inclusive.
             stop_iter: Last iteration of the requested window, inclusive.
+            limit: How many of the missing iterations to return.
 
         Returns:
-            list[int]: The missing iterations, ascending; empty when all are present.
+            tuple[int, list[int]]: How many iterations are missing, and the first
+                `limit` of them in ascending order. (0, []) when none are.
 
         Raises:
             ValueError: If mode is not REPLAY.
@@ -773,7 +785,17 @@ class Calibrator:
                 f"get_missing_replay_iterations() is only valid in REPLAY mode, "
                 f"current mode is {self.mode.name}"
             )
-        return [i for i in range(start_iter, stop_iter + 1) if i not in self._replay_db]
+        # max(): an inverted window holds nothing and misses nothing, rather than
+        # reporting a negative count.
+        width = max(0, stop_iter - start_iter + 1)
+        held = sum(1 for i in self._replay_db if start_iter <= i <= stop_iter)
+        examples = []
+        for i in range(start_iter, stop_iter + 1):
+            if len(examples) == limit:
+                break
+            if i not in self._replay_db:
+                examples.append(i)
+        return width - held, examples
 
     def get_replay_iteration_range(self):
         """Get the valid iteration range for REPLAY mode.
