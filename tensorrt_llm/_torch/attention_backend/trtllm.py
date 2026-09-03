@@ -295,6 +295,28 @@ def _describe_fmha_cache_value(fmha: Optional[Fmha]) -> str:
     return type(fmha).__name__
 
 
+_SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
+
+
+def _resolve_skip_correction_threshold(threshold: float,
+                                       sm_version: int,
+                                       *,
+                                       is_mla: bool = True) -> float:
+    if not is_mla:
+        return 0.0
+    threshold = float(threshold)
+    if threshold <= 0.0:
+        return 0.0
+    if sm_version in _SKIP_CORRECTION_SUPPORTED_SMS:
+        return threshold
+    logger.warning_once(
+        "Skip-correction is supported only on SM100 and SM103; "
+        f"disabling it on SM{sm_version}.",
+        key="skip_correction_unsupported_sm",
+    )
+    return 0.0
+
+
 @functools.cache
 def generate_spec_decoding_position_offsets(max_num_requests: int,
                                             draft_len: int) -> torch.Tensor:
@@ -1639,6 +1661,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sparse_params: Optional[SparseParams] = None,
         kv_cache_dtype: str = "auto",
         flashinfer_mla_backend: Optional[str] = None,
+        skip_correction_threshold: float = 0.0,
         **kwargs,
     ) -> None:
         """
@@ -1662,6 +1685,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                     selected for this attention instance.
                                                     None preserves the ordered FMHA-library
                                                     dispatch.
+            skip_correction_threshold (float): Runtime MLA threshold. Zero disables
+                skip-correction.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -1691,6 +1716,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.q_scaling = q_scaling or 1.0
         self.predicted_tokens_per_seq = self.mla_params.predicted_tokens_per_seq
         self.attention_chunk_size = attention_chunk_size
+        self.skip_correction_threshold = _resolve_skip_correction_threshold(
+            skip_correction_threshold,
+            get_sm_version(),
+            is_mla=self.is_mla_enable)
 
         if self.is_mla_enable:
             self.q_lora_rank = self.mla_params.q_lora_rank
@@ -2151,43 +2180,50 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         context_fmha = None
         generation_fmha = None
         for fmha in self.fmha_libs:
-            if isinstance(fmha, PhasedFmha):
-                if (has_context and context_fmha is None and fmha.is_supported(
+            if fmha.is_supported(q, k, v, metadata, forward_args):
+                return fmha
+
+            if not isinstance(fmha, PhasedFmha):
+                continue
+
+            if has_context and context_fmha is None:
+                if fmha.is_supported(
                         q,
                         k,
                         v,
                         metadata,
                         forward_args,
                         phase=FmhaPhase.CONTEXT,
-                )):
+                ):
                     context_fmha = fmha
-                if (has_generation and generation_fmha is None
-                        and fmha.is_supported(
-                            q,
-                            k,
-                            v,
-                            metadata,
-                            forward_args,
-                            phase=FmhaPhase.GENERATION,
-                        )):
+            if has_generation and generation_fmha is None:
+                if fmha.is_supported(
+                        q,
+                        k,
+                        v,
+                        metadata,
+                        forward_args,
+                        phase=FmhaPhase.GENERATION,
+                ):
                     generation_fmha = fmha
 
-                if (has_context and context_fmha is None) or (
-                        has_generation and generation_fmha is None):
-                    continue
-                if context_fmha is None:
-                    return generation_fmha
-                if generation_fmha is None or context_fmha is generation_fmha:
-                    return context_fmha
+            if has_context and context_fmha is None:
+                continue
+            if has_generation and generation_fmha is None:
+                continue
+            if context_fmha is None:
+                return generation_fmha
+            if generation_fmha is None:
+                return context_fmha
+            if context_fmha is generation_fmha:
+                continue
 
-                combined_fmha = CombinedFmha(self)
-                combined_fmha.set_fmha_impls(
-                    context_fmha,
-                    generation_fmha,
-                )
-                return combined_fmha
-            if fmha.is_supported(q, k, v, metadata, forward_args):
-                return fmha
+            combined_fmha = CombinedFmha(self)
+            combined_fmha.set_fmha_impls(
+                context_fmha,
+                generation_fmha,
+            )
+            return combined_fmha
         return None
 
     def _select_mla_fmha(

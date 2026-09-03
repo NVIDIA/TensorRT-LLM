@@ -26,7 +26,7 @@ from unittest import mock
 import pytest
 import torch
 import torch.nn.functional as F
-from utils.util import skip_pre_blackwell
+from utils.util import skip_pre_blackwell, skip_rubin
 
 from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.utils import swizzle_sf, unswizzle_sf
@@ -230,6 +230,7 @@ def _sf_match(c_sf, ref_sf, m, n):
 # GELU (non-gated, optional bias)
 # ---------------------------------------------------------------------------
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("use_bias", [False, True])
 @pytest.mark.parametrize("m, k, n", [(64, 256, 512), (128, 256, 512), (256, 512, 2048)])
 def test_dense_gemm_gelu_bf16out(m: int, k: int, n: int, use_bias: bool):
@@ -255,6 +256,7 @@ def test_dense_gemm_gelu_bf16out(m: int, k: int, n: int, use_bias: bool):
 
 
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("use_bias", [False, True])
 @pytest.mark.parametrize("m, k, n", [(128, 256, 512), (256, 512, 2048)])
 def test_dense_gemm_gelu_fp4out(m: int, k: int, n: int, use_bias: bool):
@@ -307,6 +309,7 @@ def _swiglu_ref(a, b, a_sf, b_sf, alpha):
 
 
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("m, k, inter", [(64, 256, 512), (128, 256, 512), (256, 512, 1024)])
 def test_dense_gemm_swiglu_bf16out(m: int, k: int, inter: int):
     """bf16-out fused gate-up GEMM + SwiGLU. m=64 < _FP4OUT_MIN_M (fallback)."""
@@ -328,6 +331,7 @@ def test_dense_gemm_swiglu_bf16out(m: int, k: int, inter: int):
 
 
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("m, k, inter", [(128, 256, 512), (256, 512, 1024)])
 def test_dense_gemm_swiglu_fp4out(m: int, k: int, inter: int):
     """fp4-out fused gate-up GEMM + SwiGLU + NVFP4 quant (m >= _FP4OUT_MIN_M)."""
@@ -396,6 +400,47 @@ def test_mlp_fp4out_min_m_switch():
         assert seen["fp4_out"] == expected, (
             f"m={m}: expected fp4_out={expected}, got {seen['fp4_out']}"
         )
+
+
+@pytest.mark.parametrize(
+    "sm_version, partitioned, expected",
+    [
+        (100, False, True),
+        (103, False, True),
+        (100, True, False),
+        (107, False, False),
+    ],
+)
+# TODO: drop this skip when the locality-domain wiring PR lands.
+@pytest.mark.skip(reason="requires locality-domain wiring from a later PR in this series")
+def test_nvfp4_swiglu_blackwell_capability(monkeypatch, sm_version, partitioned, expected):
+    """SM107 and locality domain shards must keep gate/up weights in the Rubin layout."""
+    import types
+
+    from tensorrt_llm._torch.modules import linear as linear_module
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    layer = Linear.__new__(Linear)
+    torch.nn.Module.__init__(layer)
+    layer.use_cute_dsl_blockscaling_mm = True
+    layer.use_cute_dsl_nvfp4_swiglu_blackwell = True
+    layer.has_bias = False
+    layer.partition_plan = types.SimpleNamespace(enabled=partitioned)
+    layer._weights_created = True
+    layer.quant_config = types.SimpleNamespace(
+        layer_quant_mode=types.SimpleNamespace(has_nvfp4=lambda: True),
+    )
+
+    monkeypatch.setattr(linear_module, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(linear_module, "get_sm_version", lambda: sm_version)
+
+    mlp = GatedMLP.__new__(GatedMLP)
+    torch.nn.Module.__init__(mlp)
+    mlp.gate_up_proj = layer
+
+    assert layer.can_use_cute_dsl_nvfp4_swiglu_blackwell() is expected
+    assert mlp._can_fuse_gate_up_swiglu() is expected
 
 
 # ---------------------------------------------------------------------------

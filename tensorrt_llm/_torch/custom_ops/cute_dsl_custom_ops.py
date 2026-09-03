@@ -8636,6 +8636,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             #   B stride  = a_tensor.stride(0)
             a_stride_m = a_tensor.stride(1)
             a_stride_batch = a_tensor.stride(0)
+            b_stride_n = b_tensor.stride(1)
+            b_stride_batch = b_tensor.stride(0)
 
             if not self.use_tvm_ffi:
                 a_ptr = make_ptr(
@@ -8701,6 +8703,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     a_stride_m,
                     a_stride_batch,
+                    b_stride_n,
+                    b_stride_batch,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
                     options="--opt-level 2 --enable-tvm-ffi"
@@ -8722,6 +8726,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_tmp,
                     a_stride_m,
                     a_stride_batch,
+                    b_stride_n,
+                    b_stride_batch,
                 )
             else:
                 compiled_gemm(
@@ -8734,6 +8740,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     a_stride_m,
                     a_stride_batch,
+                    b_stride_n,
+                    b_stride_batch,
                     stream=stream,
                 )
 

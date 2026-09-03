@@ -85,6 +85,8 @@ class FmhaPhase(str, Enum):
 class Fmha(ABC):
     """Common runtime contract for TRT-LLM attention FMHA libraries."""
 
+    supports_skip_correction = False
+
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
 

@@ -14,6 +14,7 @@ from typing_extensions import Self
 
 if TYPE_CHECKING:
     from ..model_config import ModelConfig
+    from ..modules.mamba.mamba2_metadata import Mamba2Metadata
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -173,6 +174,7 @@ class AttentionMetadata:
 
     mamba_metadata: Optional[Any] = None
     mamba_chunk_size: int = 128
+    mamba_metadata_cls: Optional[Type["Mamba2Metadata"]] = None
 
     # The number of tokens in the padded sequence.
     padded_num_tokens: Optional[int] = None
@@ -347,9 +349,14 @@ class AttentionMetadata:
 
         if self.mamba_metadata is None:
             if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
-                from ..modules.mamba.mamba2_metadata import Mamba2Metadata
-                self.mamba_metadata = Mamba2Metadata(self.max_num_requests,
-                                                     self.mamba_chunk_size)
+                metadata_cls = self.mamba_metadata_cls
+                if metadata_cls is None:
+                    from ..modules.mamba.mamba2_metadata import Mamba2Metadata
+                    metadata_cls = Mamba2Metadata
+                self.mamba_metadata = metadata_cls(
+                    self.max_num_requests,
+                    self.mamba_chunk_size,
+                    max_num_tokens=self.max_num_tokens)
             else:
                 self.mamba_metadata = False
                 return
