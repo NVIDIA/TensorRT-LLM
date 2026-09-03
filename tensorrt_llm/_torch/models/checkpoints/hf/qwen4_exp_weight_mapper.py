@@ -152,6 +152,8 @@ def _normalize_moe_module_weights(
         return updated, MoEWeightLoadingMode.VANILLA
 
     hidden = config.hidden_size
+    # `gate_up_proj` packs the gate and up projections, each `inter` wide, into
+    # one tensor, hence the `2 * inter` axis below; `down_proj` keeps one.
     inter = config.moe_intermediate_size
     num_experts = config.num_experts
     # Accept either orientation: transpose the HF layout, pass an
@@ -464,6 +466,20 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                     f"Hyper-Connection {prefix} source shapes {tuple(down.shape)} and "
                     f"{tuple(inject.shape)} do not fit runtime shape "
                     f"{tuple(packed_projection.weight.shape)}"
+                )
+            # The packed rows are [down | inject | alignment padding], and the
+            # runtime slices the injection logits at the fixed offset
+            # `input_mix_injection_offset`. A short `down` would still fit inside
+            # `expected_rows` (the padding absorbs it) but would silently shift
+            # the injection rows, so pin both counts exactly.
+            if (
+                down.shape[0] != target.input_mix_injection_offset
+                or inject.shape[0] != target.hc_count
+            ):
+                raise ValueError(
+                    f"Hyper-Connection {prefix} expects {target.input_mix_injection_offset} "
+                    f"down rows and {target.hc_count} injection rows, got "
+                    f"{down.shape[0]} and {inject.shape[0]}"
                 )
             components = [down, inject]
             padding = expected_rows - down.shape[0] - inject.shape[0]

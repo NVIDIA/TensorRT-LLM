@@ -108,7 +108,6 @@ def test_expand_launch_splits_columns_only_for_narrow_batches(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_expand_qsa_blocks_rejects_non_unit_inner_stride() -> None:
     """Only stride(0) reaches the kernel, so the other axes must be dense."""
     from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
@@ -137,6 +136,7 @@ def test_expand_qsa_blocks_rejects_non_unit_inner_stride() -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_expand_qsa_blocks_column_split_matches_whole_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

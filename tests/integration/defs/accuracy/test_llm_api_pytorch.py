@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+from typing import Optional
 from unittest import mock
 
 import pytest
@@ -7606,8 +7607,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         chat_template_kwargs=dict(enable_thinking=False),
     )
 
-    def _build_llm(self, model_path, tensor_parallel_size, moe_backend,
-                   max_draft_len):
+    def _build_llm(self, model_path: str, tensor_parallel_size: int,
+                   moe_backend: str, max_draft_len: Optional[int]) -> LLM:
         """Construct the engine shared by both evaluation tasks."""
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                         enable_block_reuse=False,
@@ -7628,8 +7629,10 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    moe_config=MoeConfig(backend=moe_backend),
                    speculative_config=mtp_config)
 
-    def _run_evals(self, model_path, tensor_parallel_size, moe_backend,
-                   max_draft_len, expected_quant_algo, monkeypatch, mocker):
+    def _run_evals(self, model_path: str, tensor_parallel_size: int,
+                   moe_backend: str, max_draft_len: Optional[int],
+                   expected_quant_algo: Optional[QuantAlgo],
+                   monkeypatch: pytest.MonkeyPatch, mocker) -> None:
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
@@ -7651,7 +7654,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(142000)
     @pytest.mark.skip_less_host_memory(131072)
-    def test_bf16_tp2_cutlass(self, monkeypatch, mocker):
+    def test_bf16_tp2_cutlass(self, monkeypatch: pytest.MonkeyPatch,
+                              mocker) -> None:
         """BF16 TP2, no MTP, PLE offloaded to pinned host memory."""
         self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next",
                         tensor_parallel_size=2,
@@ -7664,7 +7668,9 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(145000)
     @pytest.mark.skip_less_host_memory(98304)
-    def test_fp8_1gpu_mtp3_trtllm_ple_offload(self, monkeypatch, mocker):
+    def test_fp8_1gpu_mtp3_trtllm_ple_offload(self,
+                                              monkeypatch: pytest.MonkeyPatch,
+                                              mocker) -> None:
         """Block-FP8 on one GPU with MTP3 and the PLE table offloaded to host."""
         self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
                         tensor_parallel_size=1,
@@ -7677,7 +7683,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(100000)
     @pytest.mark.skip_less_host_memory(131072)
-    def test_nvfp4_1gpu_mtp3_cutedsl_ple_offload(self, monkeypatch, mocker):
+    def test_nvfp4_1gpu_mtp3_cutedsl_ple_offload(
+            self, monkeypatch: pytest.MonkeyPatch, mocker) -> None:
         """NVFP4 on one GPU with MTP3 and the PLE table offloaded to host."""
         self._run_evals(
             f"{llm_models_root()}/Inferact-Qwen3.8-Flash-Next-NVFP4",

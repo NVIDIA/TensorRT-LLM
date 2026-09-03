@@ -825,6 +825,9 @@ def test_mapper_packs_hc_down_and_injection_with_alignment() -> None:
     layer = nn.Module()
     layer.attn_hyper_connection = nn.Module()
     layer.attn_hyper_connection.input_mix_weight_down_block_inject = nn.Linear(4, 16, bias=False)
+    # The runtime module carries the offsets the mapper validates against.
+    layer.attn_hyper_connection.input_mix_injection_offset = 6
+    layer.attn_hyper_connection.hc_count = 2
     fake_model.model.layers = nn.ModuleList((layer,))
     fake_model.model.hyper_connection_mixer = nn.Module()
     fake_model.model.hyper_connection_mixer.input_mix_weight_down = nn.Linear(4, 6, bias=False)
@@ -878,6 +881,9 @@ def test_mapper_rejects_partial_packed_hc_projection() -> None:
     layer = nn.Module()
     layer.attn_hyper_connection = nn.Module()
     layer.attn_hyper_connection.input_mix_weight_down_block_inject = nn.Linear(4, 16, bias=False)
+    # The runtime module carries the offsets the mapper validates against.
+    layer.attn_hyper_connection.input_mix_injection_offset = 6
+    layer.attn_hyper_connection.hc_count = 2
     fake_model.model.layers = nn.ModuleList((layer,))
     mapper._model = fake_model
     mapper._config = SimpleNamespace(
@@ -1361,6 +1367,16 @@ def test_pp2_stage_ownership_and_handoff_width(
     for layer_index, layer in enumerate(model.model.layers[: config.num_hidden_layers]):
         has_parameters = any(True for _ in layer.parameters())
         assert has_parameters is (layer_index in owned_layers)
+
+    if not model_config.mapping.is_last_pp_rank():
+        # A non-last stage hands the widened bundle to the next stage instead of
+        # collapsing it, and `__pp_init__` has already swapped `lm_head.forward`
+        # for `skip_forward`, which returns a placeholder of logits shape without
+        # reading the input width. So passing the bundle through cannot raise.
+        assert model.lm_head.forward.__name__ == "skip_forward"
+        wide = torch.zeros(3, model.model.hc_dim, dtype=config.torch_dtype, device="cuda:0")
+        placeholder = model.logits_processor.forward(wide, model.lm_head, None, False)
+        assert placeholder.shape == (3, config.vocab_size)
 
     if rank == 1:
         skipped_embedding = model.model.embed_tokens.skip_forward(torch.arange(3, device="cuda:0"))

@@ -31,6 +31,8 @@ from ...inputs import (
     register_input_processor,
 )
 from ..attention_backend import AttentionMetadata
+from ..attention_backend.sparse.qsa.indexer import QSAIndexer
+from ..attention_backend.sparse.qsa.params import QSASparseParams
 from ..distributed import AllReduce, AllReduceParams, allgather
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -47,6 +49,7 @@ from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types, get_qwen4_ex
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .checkpoints.base_weight_mapper import BaseWeightMapper
+from .modeling_qwen3 import Qwen3Attention
 from .modeling_qwen3_5 import _normalize_qwen35_exclude_modules
 from .modeling_qwen3_next import Qwen3NextSparseMoeBlock
 from .modeling_qwen3vl import (
@@ -55,7 +58,6 @@ from .modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     Qwen3VLModelBase,
 )
-from .modeling_qwen4_exp_attention import Qwen4ExpAttention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
     DecoderModel,
@@ -122,6 +124,75 @@ class Qwen4ExpGatedDeltaNet(Qwen3NextGatedDeltaNet):
             gate_activation="sigmoid",
         ).reshape(-1, self.value_dim_per_tp)
         return self.out_proj(out, all_reduce_params=all_reduce_params)
+
+
+class Qwen4ExpAttention(Qwen3Attention):
+    """Qwen4-Exp full-attention (QSA) module.
+
+    Reuses the Qwen3 QK-norm attention stack for projection, partial RoPE,
+    output gating, and output projection. This module owns the QSA indexer
+    (a checkpoint-defined submodule); the registered QSA sparse hook drives
+    the compressed index cache and exact paged sparse-GQA path.
+    """
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        layer_idx: int,
+        *,
+        reduce_output: bool = False,
+    ) -> None:
+        super().__init__(
+            model_config,
+            layer_idx=layer_idx,
+            fuse_qk_norm_rope=True,
+            attn_output_gate=True,
+            use_gemma_rms_norm=True,
+            reduce_output=reduce_output,
+        )
+        # Enable the fused split-gate + Gemma qk-norm + RoPE kernel (matches
+        # Qwen3Next's full-attention path).
+        self._fuse_qk_norm_rope_gate = True
+
+        # The indexer carries checkpoint weights, so it has to be a submodule
+        # of this nn.Module rather than of the (plain-object) attention
+        # backend.  Building it here keeps `skip_create_weights_in_init`
+        # sourced from the model config instead of an extra Attention field.
+        # Layers configured without sparse attention stay dense and simply
+        # never get an indexer (see `is_qsa`).
+        if self.sparse_attn_hooks is not None:
+            params = self.sparse_params
+            if not isinstance(params, QSASparseParams):
+                raise TypeError(
+                    f"Qwen4ExpAttention requires QSASparseParams, got {type(params).__name__}"
+                )
+            self.indexer = QSAIndexer(
+                self,
+                params,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            )
+
+    def forward(
+        self,
+        position_ids: Optional[torch.IntTensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Forward the pre-projection inputs required by the QSA indexer."""
+        return super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            qsa_index_hidden_states=hidden_states,
+            qsa_position_ids=position_ids,
+            **kwargs,
+        )
+
+    @property
+    def is_qsa(self) -> bool:
+        """Whether this layer carries a QSA compressed sparse indexer."""
+        return getattr(self, "indexer", None) is not None
 
 
 class Qwen4ExpDecoderLayer(DecoderLayer):
@@ -389,6 +460,9 @@ class Qwen4ExpModel(DecoderModel):
             and not ple_layer_mask[layer_idx + 1]
             for layer_idx in range(self.num_hidden_layers)
         ]
+        # `eos_token_id` is not a declared `PretrainedConfig` field and
+        # `Qwen3NextConfig` leaves it None, so both the probe and the `or 0`
+        # are load-bearing. It only seeds the n-gram context padding.
         self.eos_token_id = int(getattr(config, "eos_token_id", 0) or 0)
 
         # Fallback per-slot PLE recurrent state (short-conv state + n-gram
@@ -589,7 +663,7 @@ class Qwen4ExpModel(DecoderModel):
             ctx_slots = state_indices[:num_contexts]
             has_init = getattr(mamba_metadata, "has_initial_states", None)
             if has_init is not None:
-                has_init = has_init[:num_contexts].to(device=device).bool()
+                has_init = has_init[:num_contexts].to(device=device, dtype=torch.bool)
                 # Keep the update fixed-shape. Boolean-indexing ``ctx_slots``
                 # launches ``nonzero`` to determine a dynamic result size and
                 # synchronizes the host once per mixed-IFB prefill iteration.
