@@ -174,7 +174,7 @@ class SolAttention(AttentionBackend):
         # switched off entirely, against a 0.25 gate.
         from .fmha import CuTeDSLAttention
 
-        self._dense_backend = CuTeDSLAttention(
+        self._inner = CuTeDSLAttention(
             layer_idx=layer_idx,
             num_heads=num_heads,
             head_dim=head_dim,
@@ -226,13 +226,13 @@ class SolAttention(AttentionBackend):
 
     @staticmethod
     def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Dense attention via torch SDPA, for architectures CuTe DSL cannot serve."""
+        """Dense attention via torch SDPA, for devices CuTe DSL cannot serve."""
         return torch.nn.functional.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         ).transpose(1, 2)
 
-    def _dense(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Dense attention on the configured backend, or SDPA where unavailable.
+    def _delegate(self, q, k, v, **kwargs) -> torch.Tensor:
+        """Hand the call to the dense backend of the same family.
 
         ``_cute_dense_ok`` answers "can this *device* run the kernel", decided at
         construction; ``q.is_cuda`` answers "is this *tensor* on it". Both are
@@ -240,8 +240,28 @@ class SolAttention(AttentionBackend):
         it says yes on a GPU host even when a caller passes CPU tensors.
         """
         if self._cute_dense_ok and q.is_cuda:
-            return self._dense_backend.forward(q, k, v)
+            return self._inner.forward(q, k, v, **kwargs)
         return self._sdpa(q, k, v)
+
+    def _can_serve(self, q: torch.Tensor, k: torch.Tensor, **kwargs) -> bool:
+        """Whether the sparse kernel applies to this particular call.
+
+        Everything false here is delegated to ``_inner``. Deciding it from the
+        tensors, per call, is deliberate: ``qkv_mode`` describes how Q/K/V are
+        *projected*, not whether K/V come from another sequence, so a
+        construction-time rule keyed on ``SEPARATE_QKV`` mistakes self-attention
+        for cross-attention wherever that mode is chosen for other reasons --
+        Qwen-Image always, and WAN's ``attn1`` under async Ulysses.
+        """
+        # Cross-attention: K/V come from another sequence. Sol-Attn's routing
+        # assumes one self-attending sequence.
+        if k.shape[1] != q.shape[1]:
+            return False
+        if self.layer_idx in self.dense_layers:
+            return False
+        if self.disabled_until_timestep is not None and self._dense_by_step(kwargs.get("timestep")):
+            return False
+        return True
 
     def forward(
         self,
@@ -251,12 +271,8 @@ class SolAttention(AttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         """q, k, v: [B, S, H, D] (NHD), same original token order in and out."""
-        dense_by_layer = self.layer_idx in self.dense_layers
-        dense_by_step = False
-        if self.disabled_until_timestep is not None:
-            dense_by_step = self._dense_by_step(kwargs.get("timestep"))
-        if dense_by_layer or dense_by_step:
-            return self._dense(q, k, v)
+        if not self._can_serve(q, k, **kwargs):
+            return self._delegate(q, k, v, **kwargs)
         return _sol_attn_run(
             q,
             k,
@@ -264,7 +280,9 @@ class SolAttention(AttentionBackend):
             tau=self.tau,
             thresh_type=self.thresh_type,
             kv_splits=self.kv_splits,
-            dense_fn=self._dense,
+            # Shape/dtype/arch ineligibility is only detectable inside the
+            # wrapper, so that last delegation happens through this hook.
+            dense_fn=lambda a, b, c: self._delegate(a, b, c, **kwargs),
         )
 
     @classmethod
