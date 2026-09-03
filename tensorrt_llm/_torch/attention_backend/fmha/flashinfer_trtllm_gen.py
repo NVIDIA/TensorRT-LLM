@@ -492,6 +492,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
+        if (
+            getattr(attn, "skip_correction_threshold", 0.0) > 0.0
+            and not cls.supports_skip_correction
+        ):
+            logger.debug(
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: skip-correction is "
+                "enabled and unsupported."
+            )
+            return False
+
         if not IS_FLASHINFER_AVAILABLE:
             logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
             return False
@@ -681,11 +691,39 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         else:
             return False, f"invalid FMHA phase: {phase}."
 
-        if has_context_phase and q.dtype == torch.bfloat16 and 0 < meta.num_contexts <= 4:
+        has_fused_qkv = False
+        has_q_only = False
+        if not is_mla_enable and not meta.is_cross:
+            q_hidden_size = attn.num_heads * attn.head_dim
+            qkv_hidden_size = q_hidden_size + 2 * attn.num_kv_heads * attn.head_dim
+            has_fused_qkv = (
+                fwd.is_fused_qkv and k is None and v is None and q.size(-1) == qkv_hidden_size
+            )
+            has_q_only = (
+                not fwd.is_fused_qkv
+                and not fwd.update_kv_cache
+                and k is None
+                and v is None
+                and q.size(-1) == q_hidden_size
+            )
+
+        kv_cache_dtype = self._get_kv_cache_dtype(meta)
+        # FP8/NVFP4 KV caches use a low-precision context kernel even when the
+        # projection output is FP16/BF16, so the FP16/BF16 fallbacks do not apply.
+        has_low_precision_kv_cache = kv_cache_dtype in (DataType.FP8, DataType.NVFP4)
+
+        if (
+            phase in (None, FmhaPhase.CONTEXT)
+            and not has_low_precision_kv_cache
+            and q.dtype == torch.bfloat16
+            and 0 < meta.num_contexts <= 4
+            and attn.head_dim != 512
+            and not has_q_only
+        ):
             # NVBug 6579626: the per-layer host overhead of the FlashInfer
             # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
-            # Let the FMHA selector choose the fallback implementation only
-            # for that affected regime.
+            # Let the FMHA selector choose the fallback implementation. H512
+            # and Q-only cached-KV requests cannot use that fallback.
             return False, (
                 "small-batch BF16 context attention uses the fallback FMHA for "
                 "performance because the FlashInfer TRTLLM-Gen context path "
@@ -694,6 +732,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         if (
             has_context_phase
+            and not has_low_precision_kv_cache
             and q.dtype in (torch.float16, torch.bfloat16)
             and meta.num_contexts > 0
             and get_sm_version() == 103
@@ -757,18 +796,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             tokens_per_block = 0
 
         if not is_mla_enable and not meta.is_cross:
-            q_hidden_size = attn.num_heads * attn.head_dim
-            qkv_hidden_size = q_hidden_size + 2 * attn.num_kv_heads * attn.head_dim
-            has_fused_qkv = (
-                fwd.is_fused_qkv and k is None and v is None and q.size(-1) == qkv_hidden_size
-            )
-            has_q_only = (
-                not fwd.is_fused_qkv
-                and not fwd.update_kv_cache
-                and k is None
-                and v is None
-                and q.size(-1) == q_hidden_size
-            )
             if not has_fused_qkv and not has_q_only:
                 return False, "self attention requires fused QKV or Q-only cached-KV input."
             if has_q_only and q.dtype == torch.float8_e4m3fn:
@@ -780,7 +807,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if q_dtype not in self.SUPPORTED_INPUT_DTYPES:
             return False, f"input dtype {q_dtype}. Supported: FP16, BF16, FP8 (E4M3)."
 
-        kv_cache_dtype = self._get_kv_cache_dtype(meta)
         if kv_cache_dtype is None:
             kv_cache_dtype = torch_dtype_to_binding(q_dtype)
         if meta.is_cross:

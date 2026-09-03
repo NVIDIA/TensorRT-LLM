@@ -327,6 +327,7 @@ def _estimate_swa_cache_size(
     *,
     context: bool,
     scratch: bool,
+    generation_capacity_headroom: Optional[int] = None,
 ) -> tuple[int, int]:
     tokens_per_block = int(tokens_per_block)
     size_per_token = 0
@@ -334,7 +335,16 @@ def _estimate_swa_cache_size(
     scratch_keys = set()
     for layer_size, window_size in zip(layer_sizes, attention_windows):
         if window_size is not None and window_size > 0:
-            window_tokens = math.ceil(window_size / tokens_per_block) * tokens_per_block
+            if generation_capacity_headroom is None:
+                window_blocks = math.ceil(window_size / tokens_per_block)
+            else:
+                # Match DFlash's retained boundary page and capacity reserved
+                # ahead of committed history for the next draft step.
+                window_blocks = (
+                    math.ceil((window_size + generation_capacity_headroom - 1) / tokens_per_block)
+                    + 1
+                )
+            window_tokens = window_blocks * tokens_per_block
             if not context:
                 size_per_request += window_tokens * layer_size
             elif not scratch:
@@ -349,15 +359,42 @@ def _estimate_swa_cache_size(
     return size_per_token, size_per_request
 
 
+def _get_dflash_generation_kv_capacity_headroom(spec_config) -> Optional[int]:
+    """DFlash KV capacity reserved ahead of committed history."""
+    from ..speculative.interface import SpeculativeDecodingMode
+
+    if spec_config is None or spec_config.spec_dec_mode != SpeculativeDecodingMode.DFLASH:
+        return None
+
+    from ..speculative import get_num_extra_kv_tokens
+
+    return get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step
+
+
+def _get_single_swa_pool_slot_bytes(
+    layer_sizes: Sequence[int],
+    attention_windows: Sequence[Optional[int]],
+    tokens_per_block: int,
+) -> Optional[int]:
+    """Return the slot size when all local layers share one SWA pool."""
+    windows = set(attention_windows)
+    if not layer_sizes or len(windows) != 1:
+        return None
+    window = next(iter(windows))
+    if window is None or window <= 0:
+        return None
+    return sum(layer_sizes) * int(tokens_per_block)
+
+
 def _get_static_cache_size_layer_components(
     model_config: ModelConfigPython,
     mapping: Mapping,
     num_layers: Optional[int] = None,
-    **kwargs,
+    *,
+    max_seq_len: Optional[int] = None,
+    kv_cache_config: Optional[KvCacheConfig] = None,
 ) -> tuple[List[int], List[Optional[int]]]:
     config = model_config.pretrained_config
-    max_seq_len = kwargs.get("max_seq_len")
-    kv_cache_config = kwargs.get("kv_cache_config")
 
     num_key_value_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
     if isinstance(num_key_value_heads, Iterable):
@@ -2555,11 +2592,19 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return self._prepare_context_impl(req)
 
+    def _record_branch_snapshot_point(
+        self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
+    ) -> None:
+        """Hook for recurrent-state managers; attention-only caches have no snapshots."""
+
     def _prepare_context_impl(self, req: LlmRequest) -> bool:
         if req.is_first_context_chunk:
             if self.conversation_manager is not None:
                 self.conversation_manager.prepare_request(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
+            # Stays None when the cache was resumed rather than freshly
+            # matched, which is also the case where no branch point applies.
+            num_lookup_tokens = None
             if kv_cache is None:
                 all_tokens = self._reuse_token_source(req)
                 # Last token cannot be recovered, so we don't include it in
@@ -2570,6 +2615,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                 else:
                     tokens = None
+                # Taken from the augmented sequence rather than derived as
+                # prompt_len - 1, because augmentation can change the length
+                # for multimodal requests.
+                num_lookup_tokens = len(tokens) if tokens is not None else None
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -2593,6 +2642,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.set_prepopulated_prompt_len(
                     kv_cache.num_committed_tokens, self.tokens_per_block
                 )
+                self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
@@ -3917,25 +3967,60 @@ class KVCacheManagerV2(BaseResourceManager):
         model_config: ModelConfigPython,
         mapping: Mapping,
         num_layers: Optional[int] = None,
+        *,
+        tokens_per_block: int,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+        max_seq_len: Optional[int] = None,
+        max_batch_size: int = 0,
+        max_num_tokens: int = 0,
+        spec_config=None,
+        is_draft: bool = False,
         **kwargs,
     ):
         layer_sizes, attention_windows = _get_static_cache_size_layer_components(
-            model_config, mapping, num_layers=num_layers, **kwargs
+            model_config,
+            mapping,
+            num_layers=num_layers,
+            max_seq_len=max_seq_len,
+            kv_cache_config=kv_cache_config,
         )
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows
         )
+        dflash_headroom = _get_dflash_generation_kv_capacity_headroom(spec_config)
+        is_dflash_draft = is_draft and dflash_headroom is not None
+        generation_capacity_headroom = dflash_headroom if is_dflash_draft else None
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
             layer_sizes,
             attention_windows,
-            kwargs["tokens_per_block"],
+            tokens_per_block,
             context=False,
             scratch=False,
+            generation_capacity_headroom=generation_capacity_headroom,
         )
-        max_batch_size = int(kwargs.get("max_batch_size") or 0)
+        context_swa_size_per_token = 0
+        if is_dflash_draft:
+            context_swa_size_per_token, _ = _estimate_swa_cache_size(
+                layer_sizes,
+                attention_windows,
+                tokens_per_block,
+                context=True,
+                scratch=False,
+            )
+        fixed_cost = (
+            swa_size_per_request * max_batch_size + context_swa_size_per_token * max_num_tokens
+        )
+        cache_size_per_token = full_attn_size_per_token + swa_size_per_token
+        bytes_per_slot = _get_single_swa_pool_slot_bytes(
+            layer_sizes, attention_windows, tokens_per_block
+        )
+        if is_dflash_draft and bytes_per_slot is not None:
+            required_slots = math.ceil(fixed_cost / bytes_per_slot)
+            resume_util = float(np.float32(kv_cache_config.max_util_for_resume))
+            fixed_cost = math.ceil(required_slots / resume_util) * bytes_per_slot
         return (
-            full_attn_size_per_token + swa_size_per_token,
-            swa_size_per_request * max_batch_size,
+            cache_size_per_token,
+            fixed_cost,
         )
 
     def update_context_resources(self, scheduled_batch: ScheduledRequests):

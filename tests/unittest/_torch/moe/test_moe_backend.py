@@ -60,6 +60,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     materialize_activation_params,
 )
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
@@ -69,7 +70,9 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEEnvironment,
     MoEProblem,
+    MoERejection,
     MoERejectReason,
+    MoEResolutionReport,
     MoERunContext,
     MoEStaticCapability,
 )
@@ -336,9 +339,9 @@ def create_test_backend(
     return backend
 
 
-# ============================================================================
+# =====================================================================
 # Staged post-load hook lifecycle tests
-# ============================================================================
+# =====================================================================
 # These tests cover staged hook contracts rather than the common backend matrix
 # below. Keep them grouped so they can move to a dedicated file if the MoE test
 # layout is split later.
@@ -526,9 +529,9 @@ def test_marlin_override_quant_config_degrades_per_layer():
     assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
 
 
-# ============================================================================
+# =====================================================================
 # TRTLLM-Gen SiTu backend contract
-# ============================================================================
+# =====================================================================
 # SiTu rides the generic SwiGLU geometry, so the host-side wiring is easy to
 # get wrong in ways no shape check catches: it reaches the cubin through the
 # same ``gemm1_alpha`` / ``gemm1_beta`` slots SwiGLU's constants use, and only
@@ -1142,9 +1145,9 @@ def run_backend_moe(
     return backend.run_moe(MoERunContext(**args), workspace=workspace)
 
 
-# ============================================================================
+# =====================================================================
 # Test Parameters
-# ============================================================================
+# =====================================================================
 
 # Quantization algorithms to test
 QUANT_ALGOS_TO_TEST = [
@@ -1437,23 +1440,23 @@ def generate_element_wise_test_params() -> List:
 TEST_PARAMS += generate_element_wise_test_params()
 
 
-# ============================================================================
+# =====================================================================
 # Test Implementation
-# ============================================================================
+# =====================================================================
 #
 # This file provides a UNIFIED TEST FRAMEWORK for testing all MoE backend
 # implementations through their backend-level interfaces.
 #
-# =============================================================================
+# ======================================================================
 # Purpose & Scope
-# =============================================================================
+# ======================================================================
 # - Test MoE backends via: routing_method.apply -> quantize_input -> run_moe
 # - Single GPU execution (no multi-GPU/distributed testing)
 # - Accuracy validation against reference implementations
 #
-# =============================================================================
+# ======================================================================
 # Test Coverage Matrix
-# =============================================================================
+# ======================================================================
 # 1. BACKENDS: CUTLASS, TRTLLM, CUTEDSL, DEEPGEMM
 #    - When using element wise activations (Relu2, Silu), only CUTLASS and TRTLLM
 #      are supported
@@ -1486,16 +1489,16 @@ TEST_PARAMS += generate_element_wise_test_params()
 #    - Real models: Mixtral, DeepSeek, Grok, GPT-OSS
 #    - Boundary cases: prime num_experts, small sizes, top_k=1, top_k=num_experts
 #
-# =============================================================================
+# ======================================================================
 # Skip Logic
-# =============================================================================
+# ======================================================================
 # Tests are automatically skipped for unsupported configurations using:
 # - backend.can_implement(p, d): declared quant / dtype / SM / dependency support
 # - should_skip_trtllm(): TRTLLM-specific constraints (num_experts % 4, etc.)
 # - should_skip_cutedsl(): CuteDSL-specific accuracy issues
 # - 128-alignment requirements for quantization
 #
-# =============================================================================
+# ======================================================================
 @pytest.mark.parametrize(
     "dtype_activation,backend_type,quant_algo,seq_len,model_config,"
     "routing_method_cls,activation_type,swiglu_alpha,swiglu_beta,swiglu_limit,"
@@ -1789,9 +1792,9 @@ def test_moe_backend(
                 ref_fused_moe.check_accuracy(output, ref_output)
 
 
-# ============================================================================
+# =====================================================================
 # BF16 (unquantized) TRTLLM-Gen MoE: DeepSeekV3 / Renormalize routing
-# ============================================================================
+# =====================================================================
 # The main test_moe_backend skips TRTLLM + quant_algo=None, so cover the BF16
 # FlashInfer path here (Nemotron-H enablement): DeepSeekV3/Renormalize routing
 # x Relu2/Swiglu, via both fused and separated routing.
@@ -1962,10 +1965,10 @@ def test_trtllm_bf16_dsv3_routing_kimi_k3_shape(seq_len):
     )
 
 
-# ============================================================================
+# =====================================================================
 # TRTLLM-Gen shared-expert fusion (migrated from deprecated
 # tests/unittest/_torch/thop/serial/test_moe.py::TestMoeFP8 fusion coverage)
-# ============================================================================
+# =====================================================================
 # TRTLLMGenFusedMoE can fold n_shared_experts into the routed grouped GEMM as
 # always-selected experts (opt-in via TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION=1;
 # requires FP8_BLOCK_SCALES + dp_size==1 + DeepSeekV3 routing). The fused
@@ -2428,3 +2431,84 @@ def test_build_moe_deployment_carries_finalize_and_locality_domain():
         num_experts=8,
     )
     assert requested.locality_domain_requested is True
+
+
+def _nvfp4_problem(intermediate_size: Optional[int], activation: str) -> MoEProblem:
+    return MoEProblem(
+        quant=QuantAlgo.NVFP4.value,
+        dtype_act=torch.bfloat16,
+        hidden_size=7168,
+        intermediate_size=intermediate_size,
+        num_experts=256,
+        top_k=8,
+        activation=activation,
+    )
+
+
+def _deployment_at_moe_tp(moe_tp_size: int) -> MoEDeployment:
+    return MoEDeployment(
+        ep_size=1,
+        tp_size=moe_tp_size,
+        parallel_size=moe_tp_size,
+        use_dp=False,
+        num_slots=256,
+        env=MoEEnvironment(sm=100),
+    )
+
+
+@pytest.mark.parametrize(
+    "backend_cls", [CutlassFusedMoE, CuteDslFusedMoE], ids=["cutlass", "cutedsl"]
+)
+@pytest.mark.parametrize(
+    "intermediate_size,activation,moe_tp_size,rejected",
+    [
+        # DeepSeek-R1-0528 NVFP4. moe_tp_size=64 is what tp_size=8 + cp_size=8
+        # HELIX resolves to, and it shards FC1 to 64 rows: CuteDSL dies in
+        # unswizzle_sf, Cutlass returns an all-zero output. NVBUG 5859751.
+        (2048, "Swiglu", 32, False),
+        (2048, "Swiglu", 64, True),
+        # Unknown is not false: an absent shape must abstain, not reject.
+        (None, "Swiglu", 64, False),
+        # Nemotron-3 Nano NVFP4: 128-unaligned, but non-gated FC1 has no
+        # gate/up split so the padding is a zero tail and it loads fine.
+        (1856, "Relu2", 1, False),
+    ],
+    ids=["gated_aligned", "gated_unaligned", "unknown_shape", "non_gated"],
+)
+def test_nvfp4_fc1_row_alignment_gate(
+    backend_cls, intermediate_size, activation, moe_tp_size, rejected
+):
+    """A gated NVFP4 FC1 buffer rounded up to the 128-row block-scale tile
+    splits gate/up on padding, so those layers must be turned down here.
+    """
+    verdict = backend_cls.can_implement(
+        _nvfp4_problem(intermediate_size, activation), _deployment_at_moe_tp(moe_tp_size)
+    )
+    if rejected:
+        assert not verdict.eligible
+        assert verdict.reject_reason is MoERejectReason.SHAPE_UNALIGNED
+        assert "moe_expert_parallel_size" in verdict.detail
+    else:
+        # Other gates may still turn the layer down; this one must not.
+        assert verdict.reject_reason is not MoERejectReason.SHAPE_UNALIGNED
+
+
+def test_unresolvable_layer_error_carries_rejection_details():
+    """describe() prints reason codes only, so impl_class_for has to add the
+    details -- without them a shape rejection reaches the operator as a bare
+    ``shape_unaligned`` with no shapes and no way forward.
+    """
+    report = MoEResolutionReport(
+        problem=_nvfp4_problem(2048, "Swiglu"),
+        deployment=_deployment_at_moe_tp(64),
+        winner=None,
+        selected_by="failed",
+        rejected=(
+            MoERejection(
+                "CUTLASS", MoERejectReason.SHAPE_UNALIGNED, "raise moe_expert_parallel_size"
+            ),
+        ),
+        requested="CUTLASS",
+    )
+    with pytest.raises(ValueError, match="raise moe_expert_parallel_size"):
+        impl_class_for(report)

@@ -45,7 +45,9 @@ from .activation import (DEFAULT_MOE_ACTIVATION, ActivationParamShape,
 from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
-                            MoEStaticCapability, require_comm_plan)
+                            MoEStaticCapability,
+                            nvfp4_fc1_row_alignment_rejection,
+                            require_comm_plan)
 from .impl_environment import MoEDep
 from .interface import _reject
 from .quantization import (BF16CuteDslFusedMoEMethod, MoEWeightLoadingMode,
@@ -732,6 +734,12 @@ class CuteDslFusedMoE(MoEImplBase):
                     MoERejectReason.DEP_MISSING,
                     "NVFP4 CuteDSL MoE on SM107 requires Rubin support in CuTe DSL"
                 )
+            # process_weights_after_loading() unswizzles the FC1 block scales,
+            # which asserts 128-row tiles; without this gate an unaligned shard
+            # dies mid weight load with a bare swizzle error.
+            rejection = nvfp4_fc1_row_alignment_rejection(p, d)
+            if rejection is not None:
+                return rejection
             return MoEEligibility.ok()
 
         # FP8_BLOCK_SCALES lands here on purpose. ``run_moe_fp8_block_scales``

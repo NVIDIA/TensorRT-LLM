@@ -325,6 +325,46 @@ class MoEEligibility:
         return cls(eligible=False, reject_reason=reason, detail=detail)
 
 
+def nvfp4_fc1_row_alignment_rejection(
+    p: "MoEProblem", d: "MoEDeployment"
+) -> Optional[MoEEligibility]:
+    """NVFP4 block scales swizzle in 128x4 tiles, so a gated FC1 buffer rounded
+    up to that tile splits gate/up at the wrong row. Returns the rejection when
+    this shard would be rounded up, else None (unknown shapes abstain).
+    """
+    from tensorrt_llm._torch.utils import is_gated_activation
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    if p.quant_algo != QuantAlgo.NVFP4 or p.intermediate_size is None:
+        return None
+    # Non-gated FC1 is one block with no gate/up split, so the rows the loader
+    # adds stay a zero tail that the kernel never reads as an operand.
+    if not is_gated_activation(p.activation_type):
+        return None
+    tp_size = max(d.tp_size, 1)
+    if p.intermediate_size % tp_size != 0:
+        # Uneven shards are a different concern; do not answer for them.
+        return None
+    fc1_rows_full = p.intermediate_size * 2
+    fc1_rows = fc1_rows_full // tp_size
+    if fc1_rows % 128 == 0:
+        return None
+    if fc1_rows_full % 128 == 0:
+        hint = (
+            f"moe_tp_size must divide {fc1_rows_full // 128}; raise "
+            f"moe_expert_parallel_size to shrink moe_tp_size, which "
+            f"non-ULYSSES CP multiplies by cp_size"
+        )
+    else:
+        hint = "no moe_tp_size satisfies this for this intermediate_size"
+    return MoEEligibility.no(
+        MoERejectReason.SHAPE_UNALIGNED,
+        f"NVFP4 MoE requires gated FC1 rows "
+        f"(2 * intermediate_size_per_partition) to be a multiple of 128, but "
+        f"moe_tp_size={tp_size} gives {fc1_rows}. {hint}.",
+    )
+
+
 @dataclass(frozen=True)
 class MoERejection:
     """One candidate that did not win, and why."""

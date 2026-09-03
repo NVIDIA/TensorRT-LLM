@@ -243,6 +243,9 @@ class ModelConfig(Generic[TConfig]):
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
+    # Effective threshold requested for trtllm-gen MLA skip-correction. Zero
+    # disables the optimization; hardware support is resolved by the backend.
+    skip_correction_threshold: float = 0.0
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
