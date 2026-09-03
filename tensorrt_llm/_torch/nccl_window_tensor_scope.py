@@ -93,12 +93,7 @@ class _NCCLWindowTensorScope:
             return
 
         failed = exc_type is not None
-        scope_outputs = self._inputs if failed else self._outputs
-        if not scope_outputs:
-            raise RuntimeError(
-                "A successful NCCL window tensor scope must escape at least one CUDA tensor"
-            )
-        torch.ops.trtllm.end_nccl_window_tensor_scope(scope_outputs, failed)
+        torch.ops.trtllm.end_nccl_window_tensor_scope(self._inputs, self._outputs, failed)
 
 
 def nccl_window_tensor_scope(inputs: Any) -> _NCCLWindowTensorScope:
