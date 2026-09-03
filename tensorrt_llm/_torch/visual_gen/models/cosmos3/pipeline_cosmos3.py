@@ -19,6 +19,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Any, Iterable, List, Optional, Union
 
 import PIL.Image
@@ -38,7 +39,7 @@ except ImportError:  # pragma: no cover - tqdm is optional at runtime.
 
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import load_wan_vae
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import (
     classify_worker_error,
@@ -46,7 +47,7 @@ from tensorrt_llm._torch.visual_gen.utils import (
     synchronize_media_prepare_status,
 )
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.inputs.utils import load_image
+from tensorrt_llm.inputs.media_io import convert_image_mode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.decoding import decode_video_reference_window, video_stream_info
 
@@ -179,7 +180,7 @@ def _validate_request_compatibility(
         if has_image:
             raise ValueError(
                 "Cosmos3 transfer inference cannot be combined with an image reference; "
-                "pass the conditioning clip as the 'video' extra param instead."
+                "pass the conditioning clip through video_reference instead."
             )
     if is_t2i and has_image:
         raise ValueError(
@@ -196,7 +197,7 @@ def _validate_request_compatibility(
     if do_action and (isinstance(image, torch.Tensor) or isinstance(video, torch.Tensor)):
         raise ValueError(
             "Cosmos3 action generation does not support tensor image/video inputs; "
-            "pass a PIL image or image path, or encoded MP4/AVI video bytes."
+            "pass a PIL image or encoded image bytes, or encoded MP4/AVI video bytes."
         )
     if (
         action_mode == ACTION_MODE_INVERSE_DYNAMICS
@@ -205,17 +206,17 @@ def _validate_request_compatibility(
     ):
         raise ValueError(
             "Cosmos3 inverse_dynamics requires encoded MP4/AVI bytes "
-            f"(the 'video' extra-param contract), got {type(video).__name__}."
+            f"from video_reference, got {type(video).__name__}."
         )
     is_v2v = has_video and not is_t2i and not do_action and not do_transfer
     if is_v2v and not isinstance(video, bytes):
         raise ValueError(
             "Cosmos3 V2V reference must be encoded MP4/AVI bytes "
-            f"(the 'video' extra-param contract), got {type(video).__name__}."
+            f"from video_reference, got {type(video).__name__}."
         )
-    if image is not None and not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
+    if image is not None and not isinstance(image, (PIL.Image.Image, torch.Tensor, bytes)):
         raise ValueError(
-            f"`image` must be a PIL.Image, torch.Tensor, or file path string, "
+            f"`image` must be a PIL.Image, torch.Tensor, or encoded bytes, "
             f"got {type(image)}. Batch of different images is not supported; "
             f"use a single image with multiple prompts instead."
         )
@@ -339,7 +340,7 @@ def _condition_pixel_frame_count(
     return max(condition_video_latent_indexes) * int(temporal_compression) + 1
 
 
-def _load_reference_image(path: str):
+def _load_reference_image(data: bytes):
     """Load an I2V reference, reporting unreadable content as a client error.
 
     The worker's load is the acceptance check — the serve boundary only
@@ -349,7 +350,9 @@ def _load_reference_image(path: str):
     upload would be reported as a server fault.
     """
     try:
-        return load_image(path, format="pil")
+        image = PIL.Image.open(BytesIO(data))
+        image.load()
+        return convert_image_mode(image, "RGB")
     except OSError as exc:
         raise ValueError(
             f"Image reference could not be decoded; it may be truncated, "
@@ -805,6 +808,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
         return specs
 
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="first_frame", min=0, max=1)],
+            ),
+            "video_reference": RefSlotSpec(
+                modality="video",
+                roles=[RoleSpec(role="reference", min=0, max=1)],
+            ),
+        }
+
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;
         # base defaults leave it None ("by mode") — warmup runs the video mode.
@@ -950,7 +966,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             value = getattr(req.params, field_name)
             return value if field_name in specified else None
 
-        video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
+        refs_v = req.params.video_reference
+        video = refs_v[0].content if refs_v else None
         action_mode = extra_params.get("action_mode")
         if action_mode is None and getattr(self, "checkpoint_policy_defaults", {}):
             # A checkpoint with a policy manifest has one supported action
@@ -1021,10 +1038,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             num_inference_steps = resolved["num_inference_steps"]
             guidance_scale = resolved["guidance_scale"]
 
+        refs_i = req.params.image_reference
+
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
-            image=req.params.image,
+            image=refs_i[0].content if refs_i else None,
             height=height,
             width=width,
             num_frames=req.params.num_frames,
@@ -1522,6 +1541,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         points produce the same conditioning for the same picture.
         """
         if image is not None:
+            if isinstance(image, bytes):
+                image = _load_reference_image(image)
             return self._preprocess_action_image(pil_to_rgb(image), target_h, target_w)
         if not isinstance(video, bytes):
             raise ValueError(
@@ -2108,7 +2129,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             prepare_error = None
             try:
                 image = request.image
-                if isinstance(image, str):
+                if isinstance(image, bytes):
                     image = _load_reference_image(image)
                 if isinstance(image, PIL.Image.Image):
                     image = image.convert("RGB")
@@ -2447,7 +2468,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self,
         prompt: Union[str, List[str]],
         negative_prompt: Optional[str] = None,
-        image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_frames: Optional[int] = None,

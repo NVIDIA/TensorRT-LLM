@@ -478,6 +478,43 @@ def test_indexer_configures_one_top_k_module(
     assert indexer.top_k.decode_implementation == expected_decode
 
 
+@skip_pre_hopper
+@pytest.mark.parametrize(
+    "flag_value,expected_dtype",
+    [
+        (None, torch.float32),
+        ("0", torch.float32),
+        ("1", torch.bfloat16),
+    ],
+)
+def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, expected_dtype):
+    """wk/weights_proj dtype follows TRTLLM_DSA_INDEXER_BF16.
+
+    Unset or "0" keeps the projection in fp32 (default); "1" runs it in the
+    model dtype. create_indexer builds the Indexer with dtype=torch.bfloat16.
+    """
+    if flag_value is None:
+        monkeypatch.delenv("TRTLLM_DSA_INDEXER_BF16", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DSA_INDEXER_BF16", flag_value)
+
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=128,
+    )
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
+        return_value=100,
+    ):
+        indexer = create_indexer(sparse_config)
+
+    assert indexer._indexer_bf16 is (flag_value == "1")
+    assert indexer.wk.dtype == expected_dtype
+    assert indexer.weights_proj.dtype == expected_dtype
+
+
 def _ceil_to_ue8m0(x: torch.Tensor):
     """Round tensor values up to the nearest power of two (UE8M0 format)."""
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
@@ -1498,14 +1535,14 @@ def _create_mock_metadata(
 
             self.runtime_features = RuntimeFeatures()
 
-            # Add expanded buffers for MTP support
-            # DSL kernel supports arbitrary next_n natively, so it never needs expansion.
-            self.use_expanded_buffers_for_mtp = not use_cute_dsl_paged_mqa_logits and (
-                (self.max_draft_tokens > 1 and get_sm_version() == 90)
-                or (
-                    (self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                    and get_sm_version() >= 100
-                )
+            # Add expanded buffers for MTP support. Mirrors the production gate in
+            # DSAtrtllmAttentionMetadata.prepare_for_spec_decode: sm100+ DeepGEMM
+            # runs a native next_n for any MTP depth, so only sm90 expands. The DSL
+            # kernel supports arbitrary next_n natively, so it never needs expansion.
+            self.use_expanded_buffers_for_mtp = (
+                not use_cute_dsl_paged_mqa_logits
+                and self.max_draft_tokens > 1
+                and get_sm_version() == 90
             )
             self.kv_lens_expanded_cuda = torch.zeros(
                 (self.num_seqs * (1 + self.max_draft_tokens),), device="cuda", dtype=torch.int32
@@ -1950,7 +1987,10 @@ def test_fp8_k_cache_roundtrip():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4)])
+# next_n=5 (MTP-4) exercises the native paged-MQA path on sm100+ (no buffer
+# expansion); on sm90 it falls back to the expanded buffers. See
+# DSAtrtllmAttentionMetadata.prepare_for_spec_decode.
+@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4), (2, 5)])
 @pytest.mark.parametrize(
     "backend",
     [

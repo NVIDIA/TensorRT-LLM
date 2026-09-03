@@ -15,11 +15,13 @@ Override checkpoint:
 """
 
 import gc
+import io
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import PIL.Image
 import pytest
 import torch
 from diffusers import UniPCMultistepScheduler
@@ -782,6 +784,34 @@ def _bare_pipeline(family: str) -> Cosmos3OmniMoTPipeline:
     pipeline.has_action_weights = family == NEMOTRON_DENSE_RECIPE.name
     pipeline.use_native_flow_schedule = family == NEMOTRON_DENSE_RECIPE.name
     return pipeline
+
+
+class TestEdgePolicyReferenceInput:
+    def test_encoded_image_bytes_reach_action_preprocessing_as_rgb(self):
+        """L1: worker-side PNG decoding preserves the Policy input pixels."""
+        source = PIL.Image.new("RGB", (7, 5), (11, 22, 33))
+        encoded = io.BytesIO()
+        source.save(encoded, format="PNG")
+
+        pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+        seen = {}
+        expected = object()
+
+        def record_image(image, target_h, target_w):
+            seen["image"] = image
+            seen["target"] = (target_h, target_w)
+            return expected
+
+        pipeline._preprocess_action_image = record_image
+
+        actual = pipeline._preprocess_action_first_frame(
+            encoded.getvalue(), None, target_h=544, target_w=736
+        )
+
+        assert actual is expected
+        assert seen["target"] == (544, 736)
+        assert seen["image"].mode == "RGB"
+        np.testing.assert_array_equal(np.asarray(seen["image"]), np.asarray(source))
 
 
 class TestEdgeDefaults:

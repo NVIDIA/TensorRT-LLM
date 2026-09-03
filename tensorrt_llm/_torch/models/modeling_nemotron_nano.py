@@ -4,7 +4,18 @@ import math
 import re
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -434,6 +445,138 @@ class SquaredReLU(nn.Module):
         return torch.pow(torch.nn.functional.relu(x), 2)
 
 
+_RADIO_BLOCKS = "vision_model.radio_model.model.blocks."
+_RADIO_PATCH_GEN = "vision_model.radio_model.model.patch_generator."
+
+# ModelOpt names tensors after the module attribute path; ``RADIOVisionModel``
+# loads the release checkpoint's hand-built layout. This table maps one onto the
+# other.
+_MODELOPT_VISION_RENAMES = {
+    "vision_projector.mlp1.norm.weight": "mlp1.0.weight",
+    "vision_projector.mlp1.linear1.weight": "mlp1.1.weight",
+    # Index 2 of the mlp1 Sequential is SquaredReLU, which has no parameters.
+    "vision_projector.mlp1.linear2.weight": "mlp1.3.weight",
+    "vision_model.embeddings.patch_projection.weight": _RADIO_PATCH_GEN + "embedder.weight",
+    "vision_model.embeddings.video_patch_projection.weight": (
+        _RADIO_PATCH_GEN + "video_embedder.weight"
+    ),
+    "vision_model.embeddings.position_embedding": _RADIO_PATCH_GEN + "pos_embed",
+    "vision_model.embeddings.cls_register_token": _RADIO_PATCH_GEN + "cls_token.token",
+}
+
+# Per-block leaf renames. ``mlp.fc{1,2}`` and ``norm{1,2}`` already agree.
+_MODELOPT_BLOCK_RENAMES = {
+    "attention.output.dense": "attn.proj",
+    "mlp.fc1": "mlp.fc1",
+    "mlp.fc2": "mlp.fc2",
+    "norm1": "norm1",
+    "norm2": "norm2",
+}
+
+_MODELOPT_QKV_PARTS = {"query": 0, "key": 1, "value": 2}
+_MODELOPT_FUSION_ORDER = sorted(_MODELOPT_QKV_PARTS, key=_MODELOPT_QKV_PARTS.get)
+
+_MODELOPT_BLOCK_RE = re.compile(r"^vision_model\.encoder\.layer\.(\d+)\.(.+)$")
+
+
+def _normalize_vision_weights(weights: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Return the vision subset of ``weights`` in the BF16 release's key spelling.
+
+    A no-op for release-format checkpoints; ModelOpt ones get their encoder,
+    embeddings and projector namespaces rewritten and their Q/K/V re-fused. The
+    result aliases ``weights``, which still holds every tensor, so a caller
+    freeing by prefix must free ``vision_projector`` as well as ``mlp1``.
+    """
+    # The two layouts share no key, so any ModelOpt spelling present identifies
+    # the format. Probing the rename table keeps the check and the mapping it
+    # selects from drifting apart.
+    is_modelopt = any(key in weights for key in _MODELOPT_VISION_RENAMES)
+    if not is_modelopt:
+        return {k: v for k, v in weights.items() if k.startswith(("mlp1.", "vision_model."))}
+
+    remapped: Dict[str, torch.Tensor] = {}
+    # layer index -> part ("query"/"key"/"value") -> suffix -> tensor
+    qkv_parts: Dict[str, Dict[str, Dict[str, torch.Tensor]]] = {}
+
+    for key, value in weights.items():
+        if key in _MODELOPT_VISION_RENAMES:
+            remapped[_MODELOPT_VISION_RENAMES[key]] = value
+            continue
+        if not key.startswith(("vision_model.", "vision_projector.")):
+            continue
+        # Summary-token indices are derived at runtime, not loaded.
+        if key == "vision_model.summary_idxs":
+            continue
+        if key.startswith("vision_projector.vision_final_layernorm."):
+            # No counterpart module exists, so these are dropped, not renamed.
+            continue
+
+        match = _MODELOPT_BLOCK_RE.match(key)
+        if match is None:
+            raise ValueError(
+                f"Unrecognized vision weight in ModelOpt-exported checkpoint: {key}. "
+                "The vision key layout changed; extend _MODELOPT_VISION_RENAMES."
+            )
+        layer, rest = match.group(1), match.group(2)
+
+        # There is no LayerScale module to load these into, so dropping them is
+        # only sound while they are the identity.
+        if rest in ("layer_scale1.lambda1", "layer_scale2.lambda1"):
+            if not torch.allclose(value.float(), torch.ones_like(value, dtype=torch.float32)):
+                raise ValueError(
+                    f"{key} is not all-ones, so LayerScale is not the identity for this "
+                    "checkpoint. The RADIO port has no LayerScale and would silently drop it."
+                )
+            continue
+
+        leaf, _, suffix = rest.rpartition(".")
+        qkv_match = re.match(r"^attention\.attention\.(query|key|value)$", leaf)
+        if qkv_match is not None:
+            part = qkv_match.group(1)
+            qkv_parts.setdefault(layer, {}).setdefault(part, {})[suffix] = value
+            continue
+
+        renamed_leaf = _MODELOPT_BLOCK_RENAMES.get(leaf)
+        if renamed_leaf is None:
+            raise ValueError(
+                f"Unrecognized vision block weight in ModelOpt-exported checkpoint: {key}. "
+                "Extend _MODELOPT_BLOCK_RENAMES."
+            )
+        remapped[f"{_RADIO_BLOCKS}{layer}.{renamed_leaf}.{suffix}"] = value
+
+    # Fuse in the order ``split_fused_qkv`` splits them back apart.
+    for layer, parts in qkv_parts.items():
+        missing = set(_MODELOPT_QKV_PARTS) - set(parts)
+        if missing:
+            raise ValueError(
+                f"vision encoder layer {layer} is missing {sorted(missing)} of the Q/K/V "
+                "projections; cannot re-fuse the attention weights."
+            )
+        # Only weights and biases can be concatenated row-wise, and all three
+        # parts must carry the same set. Anything else -- a per-tensor scale, or
+        # a bias on q but not k -- would fuse into a silently wrong tensor.
+        suffixes = set(parts["query"])
+        for part in ("key", "value"):
+            if set(parts[part]) != suffixes:
+                raise ValueError(
+                    f"vision encoder layer {layer}: {part} carries {sorted(parts[part])} "
+                    f"but query carries {sorted(suffixes)}; cannot re-fuse the "
+                    "attention weights."
+                )
+        unfusable = suffixes - {"weight", "bias"}
+        if unfusable:
+            raise ValueError(
+                f"vision encoder layer {layer} attaches {sorted(unfusable)} to its Q/K/V "
+                "projections. Row-wise concatenation is only correct for weights and "
+                "biases; extend this branch before loading such a checkpoint."
+            )
+        for suffix in sorted(suffixes):
+            tensors = [parts[p][suffix] for p in _MODELOPT_FUSION_ORDER]
+            remapped[f"{_RADIO_BLOCKS}{layer}.attn.qkv.{suffix}"] = torch.cat(tensors, dim=0)
+
+    return remapped
+
+
 # Source codes are from NemotronH_Nano_VL_V2 modeling.py.
 class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
     _supports_flash_attn = True
@@ -517,6 +660,8 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         )
 
     def load_weights(self, weights):
+        weights = _normalize_vision_weights(weights)
+
         # Load mlp1 weights.
         mlp1_weights = {
             k.replace("mlp1.", ""): v for k, v in weights.items() if k.startswith("mlp1.")
@@ -1029,8 +1174,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         self.img_context_token = self.config.img_context_token
         self.video_context_token = self.config.video_context_token
         self.video_context_token_id = self.config.video_context_token_id
-        self.img_start_token = self.config.img_start_token
-        self.img_end_token = self.config.img_end_token
+        # Nemotron 3.5 Super VL carries only `img_context_token`; fall back to the
+        # InternVL `<img>`/`</img>` pair its processor uses.
+        self.img_start_token = getattr(self.config, "img_start_token", "<img>")
+        self.img_end_token = getattr(self.config, "img_end_token", "</img>")
         # Pre-tokenize special tokens for video EVS processing (following vLLM).
         # These may be multi-token under BPE, so we store the full ID list.
         self._img_start_token_ids = self.tokenizer.encode(
@@ -1068,8 +1215,13 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                     "Dynamic resolution (enabled via `vision_config.min_num_patches`) only supports "
                     f"`config.ps_version='v2'. Got {pixel_shuffle_version=}."
                 )
+            # Nemotron 3.5 Super VL states the context length only on the inner
+            # `llm_config`, with no top-level `max_sequence_length`.
+            max_model_len = getattr(config, "max_sequence_length", None)
+            if max_model_len is None:
+                max_model_len = config.llm_config.max_position_embeddings
             self.dynamic_tiler = DynamicResolutionImageTiler(
-                max_model_len=config.max_sequence_length,
+                max_model_len=max_model_len,
                 patch_size=self.patch_size,
                 downsample_ratio=self.downsample_ratio,
                 min_num_patches=vision_args["min_num_patches"],
@@ -1082,12 +1234,17 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # Video temporal compression and sizing config.
         vision_config = getattr(config, "vision_config", config)
         self.video_temporal_patch_size = getattr(vision_config, "video_temporal_patch_size", 1)
+        # Tile-based (InternVL-style) checkpoints state the video sizing on
+        # `vision_config`. Patch-based ones (Nemotron 3.5 Super VL) state it on the
+        # image processor instead, and that processor has no `max_num_tiles`, so the
+        # tile fallback in `_process_videos_frames` cannot serve them.
+        video_sizing = vision_config if hasattr(self.processor, "max_num_tiles") else self.processor
         self.video_maintain_aspect_ratio = getattr(
-            vision_config, "video_maintain_aspect_ratio", False
+            video_sizing, "video_maintain_aspect_ratio", False
         )
         # Resolve video target size: video_target_num_patches or video_target_img_size.
-        target_num_patches = getattr(vision_config, "video_target_num_patches", None)
-        target_img_size = getattr(vision_config, "video_target_img_size", None)
+        target_num_patches = getattr(video_sizing, "video_target_num_patches", None)
+        target_img_size = getattr(video_sizing, "video_target_img_size", None)
         if target_num_patches is not None and target_img_size is not None:
             raise ValueError(
                 "Exactly one of video_target_num_patches or "
@@ -2613,6 +2770,9 @@ _NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 @register_vision_encoder(NanoV2VLMultimodalEncoder)
 @register_auto_model("NemotronH_Nano_Omni_Reasoning_V3")
 @register_auto_model("NemotronH_Nano_VL_V2")
+# Nemotron 3.5 Super VL: same class, no "Nano" infix, and vision-only (its
+# `sound_config` is null) despite the "Omni" in the architecture name.
+@register_auto_model("NemotronH_Omni_Reasoning_V3")
 @register_input_processor(
     NanoV2VLInputProcessor,
     model_type="NemotronH_Nano_VL_V2",
@@ -2621,6 +2781,13 @@ _NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 @register_input_processor(
     NanoV2VLInputProcessor,
     model_type="NemotronH_Nano_Omni_Reasoning_V3",
+    placeholder_metadata=_NANO_VL_PLACEHOLDER_METADATA,
+)
+# `model_type`, not architecture: the Nano checkpoints set both to the same
+# string, this one does not.
+@register_input_processor(
+    NanoV2VLInputProcessor,
+    model_type="nemotron_h_omni",
     placeholder_metadata=_NANO_VL_PLACEHOLDER_METADATA,
 )
 class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
@@ -2713,6 +2880,7 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         if hasattr(weights, "mark_consumed"):
             weights.mark_consumed("vision_model")
             weights.mark_consumed("mlp1")
+            weights.mark_consumed("vision_projector")
 
         # Load sound encoder weights.
         if self.sound_encoder is not None:

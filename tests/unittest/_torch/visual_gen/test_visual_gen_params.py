@@ -54,7 +54,9 @@ class TestVisualGenParamsValidation:
         assert params.num_frames is None
         assert params.frame_rate is None
         assert params.negative_prompt is None
-        assert params.image is None
+        assert params.image_reference is None
+        assert params.video_reference is None
+        assert params.audio_reference is None
         # ``image_cond_strength`` moved to per-pipeline ``extra_params``
         # (only LTX-2 consumes it). It is no longer a top-level field.
         assert not hasattr(params, "image_cond_strength")
@@ -99,23 +101,22 @@ class TestVisualGenParamsValidation:
         assert params.extra_params["stg_scale"] == 0.5
         assert params.extra_params["enhance_prompt"] is True
 
-    def test_image_accepts_str(self):
-        from tensorrt_llm.visual_gen import VisualGenParams
+    def test_image_reference_accepts_str(self):
+        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
 
-        params = VisualGenParams(image="/path/to/image.png")
-        assert params.image == "/path/to/image.png"
+        params = VisualGenParams(
+            image_reference=MediaRef(content="/path/to/image.png", format="path")
+        )
+        assert params.image_reference[0].content == "/path/to/image.png"
+        assert params.image_reference[0].format == "path"
+        assert params.image_reference[0].role is None
 
-    def test_image_accepts_bytes(self):
-        from tensorrt_llm.visual_gen import VisualGenParams
+    def test_image_reference_accepts_bytes(self):
+        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
 
-        params = VisualGenParams(image=b"\x89PNG")
-        assert params.image == b"\x89PNG"
-
-    def test_image_accepts_list(self):
-        from tensorrt_llm.visual_gen import VisualGenParams
-
-        params = VisualGenParams(image=["/path/a.png", b"\x89PNG"])
-        assert len(params.image) == 2
+        params = VisualGenParams(image_reference=MediaRef(content=b"\x89PNG", format="bytes"))
+        assert params.image_reference[0].content == b"\x89PNG"
+        assert params.image_reference[0].format == "bytes"
 
     def test_model_dump(self):
         from tensorrt_llm.visual_gen import VisualGenParams
@@ -142,6 +143,90 @@ class TestVisualGenParamsValidation:
         assert VisualGenParams(seed=0).seed == 0
         # Above the UINT32 boundary — accepted at the Python API.
         assert VisualGenParams(seed=2**40).seed == 2**40
+
+
+# =============================================================================
+# MediaRef — wire form is declared, never guessed
+# =============================================================================
+
+
+class TestMediaRefValidation:
+    """Every reference declares its ``format``; the bare shorthand is gone."""
+
+    @pytest.mark.parametrize("bare", ["a.png", b"\x89PNG"])
+    def test_bare_reference_rejected_with_actionable_message(self, bare):
+        """A bare str/bytes has nowhere to declare its wire form, and the
+        rejection must say what to pass instead."""
+        from pydantic import ValidationError
+
+        from tensorrt_llm.visual_gen import VisualGenParams
+
+        with pytest.raises(ValidationError, match="must declare its wire form"):
+            VisualGenParams(image_reference=bare)
+
+    def test_bare_reference_in_list_rejected(self):
+        from pydantic import ValidationError
+
+        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
+
+        with pytest.raises(ValidationError, match="must declare its wire form"):
+            VisualGenParams(
+                image_reference=[MediaRef(content="a.png", format="path"), "b.png"],
+            )
+
+    def test_format_is_required(self):
+        from pydantic import ValidationError
+
+        from tensorrt_llm.visual_gen import MediaRef
+
+        with pytest.raises(ValidationError, match=r"format\s+Field required"):
+            MediaRef(content="a.png")
+
+    @pytest.mark.parametrize(
+        "content,content_format",
+        [("not-bytes", "bytes"), (b"\x89PNG", "base64"), (b"\x89PNG", "path"), (b"x", "url")],
+    )
+    def test_content_type_must_match_format(self, content, content_format):
+        """The pairing is enforced at construction, not deep in the engine."""
+        from pydantic import ValidationError
+
+        from tensorrt_llm.visual_gen import MediaRef
+
+        with pytest.raises(ValidationError, match="requires (bytes|string) content"):
+            MediaRef(content=content, format=content_format)
+
+    def test_engine_rewrite_is_not_blocked_by_the_pairing_check(self):
+        """``prepare_reference_slots`` rewrites content then format, so the
+        intermediate state contradicts the pairing; assignment must not
+        re-validate or that rewrite would be impossible."""
+        from tensorrt_llm.visual_gen import MediaRef
+
+        ref = MediaRef(content="aGk=", format="base64")
+        ref.content = "/tmp/ref.png"  # contradicts format for one statement
+        ref.format = "path"
+        assert (ref.content, ref.format) == ("/tmp/ref.png", "path")
+
+    def test_unknown_format_rejected(self):
+        from pydantic import ValidationError
+
+        from tensorrt_llm.visual_gen import MediaRef
+
+        with pytest.raises(
+            ValidationError, match="Input should be 'path', 'url', 'base64' or 'bytes'"
+        ):
+            MediaRef(content="a.png", format="filepath")
+
+    def test_single_ref_normalized_to_list_and_list_preserved(self):
+        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
+
+        single = VisualGenParams(video_reference=MediaRef(content="v.mp4", format="path"))
+        assert single.video_reference == [MediaRef(content="v.mp4", format="path")]
+
+        refs = [
+            MediaRef(content="https://example.com/a.png", format="url"),
+            MediaRef(content="Zm9v", format="base64"),
+        ]
+        assert VisualGenParams(image_reference=refs).image_reference == refs
 
 
 # =============================================================================
@@ -299,9 +384,9 @@ class TestPipelineExtraParamSpecs:
         specs = WanImageToVideoPipeline.extra_param_specs.fget(
             _wan_mock(is_wan22_14b=True, is_wan22_5b=False)
         )
-        assert "last_image" in specs
+        # ``last_image`` moved to the typed image_reference 'last_frame' role.
+        assert "last_image" not in specs
         assert "guidance_scale_2" in specs
-        assert specs["last_image"].type == "str"
 
     def test_flux_no_extra_specs(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
@@ -391,10 +476,11 @@ class TestDefaultMerging:
 
     def test_flux2_reference_dimensions_remain_unset_for_pipeline_resolution(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
+        from tensorrt_llm.visual_gen.params import MediaRef
 
         executor = self._make_mock_executor(Flux2Pipeline)
         executor.pipeline.derive_output_size_from_reference = True
-        req = self._make_request(image=b"encoded image")
+        req = self._make_request(image_reference=MediaRef(content=b"encoded image", format="bytes"))
 
         self._merge(executor, req)
 
@@ -404,10 +490,15 @@ class TestDefaultMerging:
 
     def test_flux2_reference_dimensions_preserve_explicit_values(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
+        from tensorrt_llm.visual_gen.params import MediaRef
 
         executor = self._make_mock_executor(Flux2Pipeline)
         executor.pipeline.derive_output_size_from_reference = True
-        req = self._make_request(image=b"encoded image", height=768, width=512)
+        req = self._make_request(
+            image_reference=MediaRef(content=b"encoded image", format="bytes"),
+            height=768,
+            width=512,
+        )
 
         self._merge(executor, req)
 
@@ -828,8 +919,6 @@ class TestRequestValidation:
     def test_spec_validator_runs_at_preflight(self):
         """Per-param validators turn deterministic client errors into 400s at
         the boundary instead of worker-side failures (Cosmos3 conditioning)."""
-        import torch
-
         from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
         from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
 
@@ -842,16 +931,6 @@ class TestRequestValidation:
 
         # Valid values pass.
         _validate({"condition_video_latent_indexes": [0, 1], "condition_video_keep": "last"})
-        # ``video`` carries encoded MP4/AVI bytes: a video signature passes,
-        # empty / non-video bytes are client errors, and anything that is not
-        # bytes (e.g. a decoded tensor) fails the type check.
-        _validate({"video": b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"})
-        with pytest.raises(ValueError, match="empty"):
-            _validate({"video": b""})
-        with pytest.raises(ValueError, match="not a recognized video container"):
-            _validate({"video": b"\x89PNG\r\n\x1a\n and not a video"})
-        with pytest.raises(ValueError, match="expected type 'bytes'"):
-            _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.uint8)})
 
         with pytest.raises(ValueError, match="non-negative"):
             _validate({"condition_video_latent_indexes": [0, -1]})
@@ -897,8 +976,6 @@ class TestRequestValidation:
         specs = pickle.loads(pickle.dumps(COSMOS3_EXTRA_SPECS))
         with pytest.raises(ValueError, match="first or last"):
             specs["condition_video_keep"].validator("middle")
-        with pytest.raises(ValueError, match="not a recognized video container"):
-            specs["video"].validator(b"garbage bytes")
 
     # --- unsupported universal fields ---
 
@@ -939,13 +1016,17 @@ class TestRequestValidation:
         with pytest.raises(ValueError, match="Unknown extra_params"):
             self._validate(executor, req)
 
-    def test_image_not_checked_by_validator(self):
-        """image is a conditioning input — validated at runtime by infer(), not here."""
+    def test_image_reference_not_checked_without_ref_specs(self):
+        """Without ``ref_slot_specs``, image_reference is not role/arity checked
+        here — the pipeline's infer() consumes it at runtime."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+        from tensorrt_llm.visual_gen.params import MediaRef
 
         executor = self._make_mock_executor(WanPipeline, _wan_mock(num_heads=12))
-        req = self._make_request(image="/path/to/img.png")
-        # Should not raise — image validation is the pipeline's responsibility
+        req = self._make_request(
+            image_reference=MediaRef(content="/path/to/img.png", format="path")
+        )
+        # Should not raise — ``_validate`` here passes no ref_slot_specs.
         self._merge_and_validate(executor, req)
 
     def test_num_frames_on_video_pipeline_ok(self):
@@ -956,15 +1037,117 @@ class TestRequestValidation:
         req = self._make_request(num_frames=81)
         self._merge_and_validate(executor, req)
 
-    def test_image_on_i2v_pipeline_ok(self):
-        """image is declared by WanImageToVideoPipeline, should not raise."""
-        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import (
-            WanImageToVideoPipeline,
+    def test_ref_slot_required_vs_optional(self):
+        """``min >= 1`` marks a required reference (clean error when absent);
+        ``min == 0`` leaves the slot optional; an undeclared slot is fine while
+        absent but rejected when sent, as is a role the slot never declared."""
+        from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
+        from tensorrt_llm.visual_gen.params import (
+            MediaRef,
+            VisualGenParams,
+            validate_visual_gen_params,
         )
 
-        executor = self._make_mock_executor(WanImageToVideoPipeline, _wan_mock(num_heads=12))
-        req = self._make_request(image="/path/to/img.png")
-        self._merge_and_validate(executor, req)
+        required = {
+            "image_reference": RefSlotSpec(
+                modality="image", roles=[RoleSpec(role="reference", min=1, max=1)]
+            )
+        }
+        optional = {
+            "image_reference": RefSlotSpec(
+                modality="image", roles=[RoleSpec(role="first_frame", min=0, max=1)]
+            )
+        }
+
+        def run(params, spec):
+            validate_visual_gen_params(
+                params, declared_defaults=None, extra_param_specs={}, ref_slot_specs=spec
+            )
+
+        # Required slot, no image -> clean 400 here instead of a worker crash.
+        with pytest.raises(ValueError, match=r"expected 1\.\.1, got 0"):
+            run(VisualGenParams(), required)
+        # Optional slot, no image -> allowed (e.g. text-to-video).
+        run(VisualGenParams(), optional)
+        # Required slot with the image present -> allowed.
+        run(VisualGenParams(image_reference=MediaRef(content="a.png", format="path")), required)
+        # Undeclared slot actually sent -> rejected.
+        with pytest.raises(ValueError, match=r"video_reference.*not accepted"):
+            run(VisualGenParams(video_reference=MediaRef(content="v.mp4", format="path")), optional)
+        # A role the slot never declared -> rejected here, not carried to a worker
+        # that has no conditioning input to put it in.
+        with pytest.raises(ValueError, match=r"role 'last_frame' not supported"):
+            run(
+                VisualGenParams(
+                    image_reference=MediaRef(content="a.png", format="path", role="last_frame")
+                ),
+                required,
+            )
+
+    def test_multi_role_slot_infers_single_required_role(self):
+        """A role-less ref against a multi-role slot is inferred when only one
+        role is required (e.g. i2v first_frame required, last_frame optional),
+        matching the pipeline's own default; a genuinely ambiguous slot (two
+        required roles) still demands an explicit role."""
+        from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
+        from tensorrt_llm.visual_gen.params import (
+            MediaRef,
+            VisualGenParams,
+            validate_visual_gen_params,
+        )
+
+        def run(params, spec):
+            validate_visual_gen_params(
+                params, declared_defaults=None, extra_param_specs={}, ref_slot_specs=spec
+            )
+
+        # i2v shape: first_frame required, last_frame optional. A single
+        # role-less upload fills first_frame -> allowed (no explicit role).
+        i2v = {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[
+                    RoleSpec(role="first_frame", min=1, max=1),
+                    RoleSpec(role="last_frame", min=0, max=1),
+                ],
+            )
+        }
+        run(VisualGenParams(image_reference=MediaRef(content="a.png", format="path")), i2v)
+
+        # Two required roles -> ambiguous, role stays mandatory.
+        ambiguous = {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[
+                    RoleSpec(role="first_frame", min=1, max=1),
+                    RoleSpec(role="last_frame", min=1, max=1),
+                ],
+            )
+        }
+        with pytest.raises(ValueError, match="'role' is required"):
+            run(
+                VisualGenParams(image_reference=MediaRef(content="a.png", format="path")), ambiguous
+            )
+
+    def test_empty_ref_slot_specs_rejects_references(self):
+        """An empty (non-None) ref_slot_specs means the pipeline declares no
+        slots, so a reference is rejected; only ``None`` skips validation."""
+        from tensorrt_llm.visual_gen.params import (
+            MediaRef,
+            VisualGenParams,
+            validate_visual_gen_params,
+        )
+
+        def run(params, spec):
+            validate_visual_gen_params(
+                params, declared_defaults=None, extra_param_specs={}, ref_slot_specs=spec
+            )
+
+        ref = MediaRef(content="a.png", format="path")
+        with pytest.raises(ValueError, match="not accepted"):
+            run(VisualGenParams(image_reference=ref), {})
+        run(VisualGenParams(image_reference=ref), None)  # None -> skipped
+        run(VisualGenParams(), {})  # no reference -> allowed
 
     def test_none_fields_not_flagged(self):
         """Fields left as None should never trigger unsupported-field errors."""
@@ -1019,15 +1202,10 @@ class TestRequestValidation:
         self._merge_and_validate(executor, req)
 
     def test_wrong_type_str_extra_param(self):
-        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import (
-            WanImageToVideoPipeline,
-        )
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        executor = self._make_mock_executor(WanImageToVideoPipeline, _wan_mock(num_heads=12))
-        req = self._make_request(
-            image="/img.png",
-            extra_params={"last_image": 123},
-        )
+        executor = self._make_mock_executor(LTX2Pipeline)
+        req = self._make_request(extra_params={"output_type": 123})
         with pytest.raises(ValueError, match="expected type 'str'"):
             self._merge_and_validate(executor, req)
 
@@ -1126,21 +1304,6 @@ class TestRequestValidation:
             declared_defaults=None,
             extra_param_specs=COSMOS3_EXTRA_SPECS,
         )
-
-    def test_video_reference_must_be_bytes(self):
-        """A server-local path must not reach the worker: the ``video`` contract
-        is encoded bytes, so a string (or anything else) fails preflight."""
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
-
-        req = self._make_request(extra_params={"video": "/server/local/path.mp4"})
-        with pytest.raises(ValueError, match="expected type 'bytes'"):
-            from tensorrt_llm.visual_gen.params import validate_visual_gen_params
-
-            validate_visual_gen_params(
-                req.params,
-                declared_defaults=None,
-                extra_param_specs=COSMOS3_EXTRA_SPECS,
-            )
 
 
 # =============================================================================
@@ -1359,7 +1522,7 @@ class TestEngineFailureTransport:
     def test_reference_size_is_prepared_before_warmup_lookup(self):
         from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor, DiffusionRequest
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
-        from tensorrt_llm.visual_gen.params import VisualGenParams
+        from tensorrt_llm.visual_gen.params import MediaRef, VisualGenParams
 
         events = []
         executor = self._make_executor(Flux2Pipeline)
@@ -1385,7 +1548,9 @@ class TestEngineFailureTransport:
         req = DiffusionRequest(
             request_id=8,
             prompt=["test"],
-            params=VisualGenParams(image=b"encoded image"),
+            params=VisualGenParams(
+                image_reference=MediaRef(content=b"encoded image", format="bytes")
+            ),
         )
 
         DiffusionExecutor.process_request(executor, req)
@@ -1393,3 +1558,24 @@ class TestEngineFailureTransport:
         assert events == ["prepare", "warmup_cache_key", "infer"]
         executor.pipeline.request_warmup_cache_key.assert_called_once_with(req)
         executor.pipeline.run_inference.assert_called_once_with(req)
+
+
+class TestDeprecatedInputReferenceStaysCompatible:
+    """The deprecated field takes a bare string, the typed ones never do.
+
+    Old callers sent base64 with nothing declaring it, and that has to keep
+    working; a typed reference has somewhere to say what it is, so it must.
+    """
+
+    def test_a_bare_string_is_still_accepted(self):
+        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
+
+        assert VideoGenerationRequest(prompt="x", input_reference="aGk=").input_reference == "aGk="
+
+    def test_the_typed_field_still_requires_a_format(self):
+        from pydantic import ValidationError
+
+        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
+
+        with pytest.raises(ValidationError):
+            VideoGenerationRequest(prompt="x", image_reference="aGk=")
