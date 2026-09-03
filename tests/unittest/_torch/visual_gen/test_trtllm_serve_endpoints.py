@@ -36,6 +36,7 @@ from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
+from tensorrt_llm.visual_gen.params import prepare_reference_slots, validate_visual_gen_params
 
 pytestmark = pytest.mark.cpu_only
 
@@ -187,6 +188,7 @@ class MockVisualGen:
         extra_param_specs: Optional[dict] = None,
         model: str = "test-model",
         supports_image_edit: bool = False,
+        ref_slot_specs: Optional[dict] = None,
     ):
         from types import SimpleNamespace
 
@@ -209,6 +211,8 @@ class MockVisualGen:
         # used by tests to assert forwarded VisualGenParams fields.
         self.last_inputs = None
         self.last_params = None
+        # Resolved reference bytes per slot, recorded at generation time.
+        self.last_ref_bytes = {}
         # Stand-in for the coordinator-side executor proxy. The async video
         # route reads ``default_generation_params`` / ``extra_param_specs``
         # directly off this attribute when running synchronous pre-flight
@@ -217,6 +221,8 @@ class MockVisualGen:
         # reject legitimate width/height/num_frames/... requests;
         # ``extra_param_specs`` lists a single known key so tests can
         # exercise both the accept-known and reject-unknown paths.
+        from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
+
         self.executor = SimpleNamespace(
             default_generation_params={
                 "height": 64,
@@ -230,6 +236,16 @@ class MockVisualGen:
             extra_param_specs=extra_param_specs
             or {"stg_scale": ExtraParamSchema(type="float", default=1.0)},
             supports_image_edit=supports_image_edit,
+            ref_slot_specs=ref_slot_specs
+            if ref_slot_specs is not None
+            else {
+                "image_reference": RefSlotSpec(
+                    modality="image", roles=[RoleSpec(role="first_frame", min=0, max=1)]
+                ),
+                "video_reference": RefSlotSpec(
+                    modality="video", roles=[RoleSpec(role="reference", min=0, max=1)]
+                ),
+            },
         )
 
     def _maybe_batch(self, tensor, n):
@@ -240,36 +256,44 @@ class MockVisualGen:
 
     # --- VisualGen interface ---
 
+    def _snapshot_refs(self, params) -> None:
+        # Record what each slot resolved to, so tests can assert byte-identity
+        # against the payload the client sent.
+        self.last_ref_bytes = {}
+        for field in ("image_reference", "video_reference", "audio_reference"):
+            refs = getattr(params, field, None) or []
+            self.last_ref_bytes[field] = [ref.content for ref in refs]
+
     def generate(self, inputs=None, params=None) -> VisualGenOutput:
-        self.last_inputs = inputs
-        self.last_params = params
-        if self._validation_error is not None:
-            raise self._validation_error
-        if self._generate_error is not None:
-            raise self._generate_error
-        if self._should_fail:
-            raise RuntimeError("Generation intentionally failed")
-        n = getattr(params, "num_images_per_prompt", 1) if params else 1
-        return VisualGenOutput(
-            request_id=self._next_request_id(),
-            image=self._maybe_batch(self._image, n),
-            video=self._maybe_batch(self._video, n),
-            audio=self._audio,
-            metrics=_make_dummy_metrics(),
-        )
+        return self.generate_async(inputs=inputs, params=params).result()
 
     def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
         self.last_inputs = inputs
         self.last_params = params
         if self._validation_error is not None:
             raise self._validation_error
+        # Mirror the real engine entry: validate against the pipeline metadata
+        # (unknown extra_params / undeclared fields / ref arity) before doing any
+        # work, so the route's synchronous 400 path is exercised end-to-end.
+        if params is not None:
+            validate_visual_gen_params(
+                params,
+                declared_defaults=self.executor.default_generation_params,
+                extra_param_specs=self.executor.extra_param_specs,
+                ref_slot_specs=self.executor.ref_slot_specs,
+            )
+        # Mirror the engine: resolve every reference to bytes at the coordinator.
+        req_id = self._next_request_id()
+        prepare_reference_slots(params)
+        self._snapshot_refs(params)
         n = getattr(params, "num_images_per_prompt", 1) if params else 1
         return MockVisualGenResult(
-            request_id=self._next_request_id(),
+            request_id=req_id,
             image=self._maybe_batch(self._image, n),
             video=self._maybe_batch(self._video, n),
             audio=self._audio,
             should_fail=self._should_fail,
+            generate_error=self._generate_error,
         )
 
     def _next_request_id(self) -> int:
@@ -323,37 +347,38 @@ class MockVisualGenResult:
         video: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
         should_fail: bool = False,
+        generate_error: Optional[BaseException] = None,
     ):
         self.request_id = request_id
         self._image = image
         self._video = video
         self._audio = audio
         self._should_fail = should_fail
+        # Engine-side failure surfaced through the result (capacity/client),
+        # distinct from a coordinator preflight rejection.
+        self._generate_error = generate_error
+
+    def _resolve(self) -> VisualGenOutput:
+        if self._generate_error is not None:
+            raise self._generate_error
+        if self._should_fail:
+            raise RuntimeError("Async generation intentionally failed")
+        return VisualGenOutput(
+            request_id=self.request_id,
+            image=self._image,
+            video=self._video,
+            audio=self._audio,
+            metrics=_make_dummy_metrics(),
+        )
 
     def __await__(self):
         return self.aresult().__await__()
 
     async def aresult(self, timeout=None):
-        if self._should_fail:
-            raise RuntimeError("Async generation intentionally failed")
-        return VisualGenOutput(
-            request_id=self.request_id,
-            image=self._image,
-            video=self._video,
-            audio=self._audio,
-            metrics=_make_dummy_metrics(),
-        )
+        return self._resolve()
 
     def result(self, timeout=None):
-        if self._should_fail:
-            raise RuntimeError("Async generation intentionally failed")
-        return VisualGenOutput(
-            request_id=self.request_id,
-            image=self._image,
-            video=self._video,
-            audio=self._audio,
-            metrics=_make_dummy_metrics(),
-        )
+        return self._resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -971,12 +996,21 @@ class TestImageEdit:
         should_fail: bool = False,
         supports_image_edit: bool = True,
     ):
+        from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
+
         gen = MockVisualGen(
             image_output=image_output if image_output is not None else _make_dummy_image_tensor(),
             extra_param_specs=extra_param_specs,
             model=model,
             should_fail=should_fail,
             supports_image_edit=supports_image_edit,
+            # Edit pipelines take joint conditioning images, not a first frame;
+            # mirrors Qwen-Image-Edit's own slot declaration.
+            ref_slot_specs={
+                "image_reference": RefSlotSpec(
+                    modality="image", roles=[RoleSpec(role="reference", min=1, max=None)]
+                ),
+            },
         )
         monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
         return _create_server(gen, model_name=model), gen
@@ -1034,8 +1068,8 @@ class TestImageEdit:
         )
 
         assert resp.status_code == 200
-        assert str(gen.last_params.image).startswith(str(tmp_path))
-        assert not os.path.exists(gen.last_params.image)
+        assert gen.last_params.image_reference[0].format == "bytes"
+        assert isinstance(gen.last_params.image_reference[0].content, bytes)
         assert gen.last_params.num_images_per_prompt == 2
         body = resp.json()
         assert body["output_format"] == "webp"
@@ -1084,8 +1118,8 @@ class TestImageEdit:
         body = resp.json()
         url = body["data"][0]["url"]
         assert "/v1/images/" in url and "/content" in url
-        assert str(gen.last_params.image).startswith(str(tmp_path))
-        assert not os.path.exists(gen.last_params.image)
+        assert gen.last_params.image_reference[0].format == "bytes"
+        assert isinstance(gen.last_params.image_reference[0].content, bytes)
 
         path = url.split("//", 1)[-1].split("/", 1)[1]
         content = client.get("/" + path)
@@ -1306,7 +1340,7 @@ class TestImageEdit:
         )
 
         assert resp.status_code == 200
-        assert len(gen.last_params.image) == 16
+        assert len(gen.last_params.image_reference) == 16
         assert len(resp.json()["data"]) == 1
         assert list(tmp_path.iterdir()) == []
 
@@ -1551,7 +1585,7 @@ class TestVideoGenerationSync:
         assert params.num_frames == int(2.0 * 8)
 
     def test_sync_video_generation_multipart(self, video_client, tmp_path):
-        """Multipart sync request with a real ``input_reference`` file."""
+        """Multipart sync request with a real ``image_reference`` file."""
         ref_path = tmp_path / "ref.png"
         Image.new("RGB", (4, 4), (64, 64, 64)).save(str(ref_path))
         with open(ref_path, "rb") as f:
@@ -1563,7 +1597,7 @@ class TestVideoGenerationSync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.png", f, "image/png")},
+                files={"image_reference": ("ref.png", f, "image/png")},
             )
         assert resp.status_code == 200
         assert len(resp.content) > 0
@@ -1582,25 +1616,20 @@ class TestVideoGenerationSync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.png", f, "image/png")},
+                files={"image_reference": ("ref.png", f, "image/png")},
             )
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # input_reference should have been written to media storage and passed
-        # through as params.image (a filesystem path).
+        # image_reference reaches the engine as a MediaRef carrying raw bytes.
         params = video_client.mock_gen.last_params
-        assert isinstance(params.image, str)
-        assert params.image.endswith("_reference")
-        assert os.path.exists(params.image)
+        assert params.image_reference[0].content == ref_path.read_bytes()
+        assert params.image_reference[0].format == "bytes"
 
     def test_sync_video_generation_multipart_with_video_reference(self, video_client):
-        """A video ``input_reference`` rides through as the encoded payload on
-        the model-specific ``video`` extra param (V2V), byte-identical — the
-        serve never decodes video; the worker demuxes/NVDEC-decodes it.
-
-        Routed by container signature, so a checked-in H.264/MP4 fixture drives
-        the boundary directly.
+        """A ``video_reference`` upload reaches the engine byte-identical (V2V) —
+        serve never decodes video; the worker demuxes/NVDEC-decodes it. A
+        checked-in H.264/MP4 fixture drives the boundary directly.
         """
         payload = _V2V_FIXTURE_MP4.read_bytes()
         with open(_V2V_FIXTURE_MP4, "rb") as f:
@@ -1612,17 +1641,17 @@ class TestVideoGenerationSync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.mp4", f, "video/mp4")},
+                files={"video_reference": ("ref.mp4", f, "video/mp4")},
             )
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # Video content must NOT land on params.image; it rides the
-        # model-specific ``video`` extra param as the untouched encoded bytes
-        # (the same intake the offline example's --video_path uses).
+        # Video conditioning reaches the engine as raw bytes, byte-identical to
+        # the upload, and no image_reference is set.
         params = video_client.mock_gen.last_params
-        assert params.image is None
-        assert params.extra_params["video"] == payload
+        assert params.image_reference is None
+        assert params.video_reference[0].format == "bytes"
+        assert video_client.mock_gen.last_ref_bytes["video_reference"] == [payload]
 
     def test_sync_video_generation_undecodable_reference_400(self, video_client):
         """Content matching no image or video container signature is rejected
@@ -1630,10 +1659,10 @@ class TestVideoGenerationSync:
         resp = video_client.post(
             "/v1/videos/sync",
             data={"prompt": "x"},
-            files={"input_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
+            files={"image_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
         )
         assert resp.status_code == 400
-        assert "not a recognized media container" in resp.text
+        assert "not a recognized image" in resp.text
 
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(
@@ -1883,7 +1912,7 @@ class TestVideoGenerationAsync:
         )
 
     def test_async_video_multipart(self, video_client, tmp_path):
-        """Multipart async request with a real ``input_reference`` file."""
+        """Multipart async request with a real ``image_reference`` file."""
         ref_path = tmp_path / "ref.png"
         Image.new("RGB", (4, 4), (16, 16, 16)).save(str(ref_path))
         with open(ref_path, "rb") as f:
@@ -1895,7 +1924,7 @@ class TestVideoGenerationAsync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.png", f, "image/png")},
+                files={"image_reference": ("ref.png", f, "image/png")},
             )
         assert resp.status_code == 202
 

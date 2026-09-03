@@ -108,8 +108,8 @@ from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
-from tensorrt_llm.serve.visual_gen_utils import (
-    cleanup_materialized_conditioning_inputs, parse_visual_gen_params)
+from tensorrt_llm.serve.visual_gen_utils import (local_media_path_is_disallowed,
+                                                 parse_visual_gen_params)
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -3056,14 +3056,16 @@ class OpenAIServer(_VideoRoutesMixin):
             # through to the outer ``except Exception`` → 500 so the
             # client doesn't get blamed for a server-internal failure.
             try:
-                params = parse_visual_gen_params(request, image_id,
-                                                 self.generator)
+                params = parse_visual_gen_params(request, self.generator)
                 logger.info(
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
                 image_gen_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt,
-                                                 params=params)
+                # Offload the blocking resolve/enqueue off the event loop but
+                # await it (bad params → 400 here); then await generation.
+                handle = await asyncio.to_thread(self.generator.generate_async,
+                                                 request.prompt, params)
+                output = await handle.aresult()
             except ValueError as exc:
                 logger.error(f"Image request error: {exc}")
                 return self.create_error_response(
@@ -3211,20 +3213,12 @@ class OpenAIServer(_VideoRoutesMixin):
             self, response_format: Optional[str]) -> Optional[Response]:
         """Return a 400 when ``response_format='path'`` but it is disabled.
 
-        ``path`` discloses absolute server-side filesystem paths, so it can be
-        turned off via ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1`` on shared /
-        untrusted deployments (enabled by default). Returns ``None`` when
-        allowed.
+        Shares the switch with ``format='path'`` on the request side; see
+        :func:`local_media_path_is_disallowed`. Returns ``None`` when allowed.
         """
         if response_format != "path":
             return None
-        raw = os.environ.get("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "0")
-        if raw not in ("0", "1"):
-            logger.warning(
-                "Unrecognized value for TRTLLM_DISALLOW_LOCAL_MEDIA_PATH: "
-                f"{raw!r}. Expected '0' or '1'. Treating as '0' "
-                "(response_format='path' enabled).")
-        if raw == "1":
+        if local_media_path_is_disallowed():
             return self.create_error_response(
                 "response_format='path' is disabled on this server "
                 "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "
@@ -3314,29 +3308,19 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             image_id = f"image_{uuid.uuid4().hex}"
-            input_paths = None
 
             try:
                 request = await self._parse_image_edit_request(raw_request)
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                params = parse_visual_gen_params(
-                    request,
-                    image_id,
-                    self.generator,
-                    media_storage_path=str(self.media_storage_path),
-                )
-                input_paths = params.image
+                params = parse_visual_gen_params(request, self.generator)
                 logger.info(
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
                 image_edit_start = time.perf_counter()
-                try:
-                    output = self.generator.generate(inputs=request.prompt,
-                                                     params=params)
-                finally:
-                    cleanup_materialized_conditioning_inputs(input_paths)
+                output = self.generator.generate(inputs=request.prompt,
+                                                 params=params)
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)
             except ValueError as exc:
