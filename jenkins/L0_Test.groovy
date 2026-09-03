@@ -4397,8 +4397,12 @@ def getSSHConnectionPorts(portConfigFile, stageName)
 // Return true means the test rerun also fails. Return false otherwise.
 def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
-        echo "There is no ${resultFileName} file, skip the rerun step"
-        return true
+        // No results were ever flushed (e.g. the process was killed before any
+        // test finished reporting). test_rerun.py treats a missing xml as "no
+        // tests ran" and falls back to unfinished_test.txt / the original test
+        // list to classify each test, so keep going instead of assuming a
+        // rerun already failed.
+        echo "There is no ${resultFileName} file; falling back to unfinished/not-run classification for ${testType}"
     }
 
     // Create rerun directory structure to avoid conflicts
