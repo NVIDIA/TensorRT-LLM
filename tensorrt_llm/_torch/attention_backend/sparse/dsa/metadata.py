@@ -139,6 +139,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._pool_cache_valid = False
         self._cached_kv_mgr_id = 0
         self._cached_pool_view = None
+        self._cached_num_pool_tokens = 0
         self._cached_tokens_per_block = 0
         self._cached_block_table_ctx = None
         self._cached_block_table_gen = None
@@ -151,6 +152,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._group_remap_struct = None
         self._group_remap_struct_kv_id = 0
         self._group_remap_batched = {}
+        self.num_ctx_mla_kv_tokens = 0
+        self.nvfp4_mla_context_fp8_scratch = None
         super().__init__(*args, **kwargs)
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -203,6 +206,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
+        self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
     def prepare(self):
         super().prepare()
@@ -714,6 +718,38 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pin_memory=prefer_pinned(),
         )
 
+    def _create_nvfp4_mla_generation_buffers(self, capture_graph=False):
+        """Allocate stable NVFP4 gather outputs for all MTP generation rows."""
+        self.nvfp4_mla_fp8_scratch = None
+        self.nvfp4_mla_compact_indices = None
+        if getattr(self.kv_cache_manager, "dtype", None) != tensorrt_llm.bindings.DataType.NVFP4:
+            return
+
+        # MTP verifies the current token and max_draft_tokens draft tokens for
+        # every generation request. Each query row has its own TopK selection,
+        # so the dequantized FP8 rows and compact offsets must cover the full
+        # verification window. The buffers have stable addresses for CUDA
+        # graphs and are reused sequentially by every attention layer.
+        max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
+        self.nvfp4_mla_fp8_scratch = self.get_empty(
+            self.cuda_graph_buffers,
+            (
+                max_gen_tokens,
+                self.num_sparse_topk,
+                self.kv_cache_manager.head_dim,
+            ),
+            cache_name="nvfp4_mla_fp8_scratch",
+            dtype=torch.float8_e4m3fn,
+            capture_graph=capture_graph,
+        )
+        self.nvfp4_mla_compact_indices = self.get_empty(
+            self.cuda_graph_buffers,
+            (max_gen_tokens, self.num_sparse_topk),
+            cache_name="nvfp4_mla_compact_indices",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
     def create_buffers_for_indexer(self, capture_graph=False):
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -1040,6 +1076,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self.max_draft_tokens = max_draft_len
         capture_graph = self.is_cuda_graph
+        max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
+        if (
+            self.nvfp4_mla_fp8_scratch is not None
+            and self.nvfp4_mla_fp8_scratch.shape[0] != max_gen_tokens
+        ):
+            self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
         if self.kv_lens_cuda_2d.shape[1] != 1 + self.max_draft_tokens:
             self._create_kv_lens_2d_buffer(capture_graph=capture_graph)
         init_shape = self.kv_lens_expanded_host.shape[0]
@@ -1090,6 +1132,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # retained across idle steps. Python-only -> safe under graph replay
         # (replay does not re-run this).
         self._group_remap_batched.clear()
+        self.nvfp4_mla_context_fp8_scratch = None
 
     def _ensure_pool_view_cached(self):
         """Compute and cache values used by
@@ -1109,9 +1152,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         pool = self.kv_cache_manager.get_unique_primary_pool()
         kv_cache_manager = self.kv_cache_manager
+        num_blocks, num_layers = pool.shape[:2]
         self._cached_tokens_per_block = kv_cache_manager.tokens_per_block
         head_dim = kv_cache_manager.head_dim
-        self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
+        self._cached_num_pool_tokens = num_blocks * num_layers * self._cached_tokens_per_block
+        if kv_cache_manager.dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            # FP4 packs two values per byte and therefore cannot use the
+            # ordinary [token, head_dim] view. Its gather op reads the raw
+            # data/scale pools through their stable host pointers instead.
+            self._cached_pool_view = None
+        else:
+            self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
         self._cached_block_table_ctx = self.block_table[: self.num_contexts]
         self._cached_block_table_gen = self.block_table[self.num_contexts : self.num_seqs]
         self._cached_req_idx_ctx = self.req_idx_per_token[: self.num_ctx_tokens]
@@ -1418,6 +1469,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare_for_mla_rope_append(self, cached_token_lens: torch.Tensor, kv_lens: torch.Tensor):
         if self.num_contexts > 0:
             self.num_ctx_cached_tokens = cached_token_lens[: self.num_contexts].sum().item()
+            self.num_ctx_mla_kv_tokens = kv_lens[: self.num_contexts].sum().item()
             self.max_ctx_kv_len = kv_lens[: self.num_contexts].max().item()
             self.max_ctx_seq_len = self.seq_lens[: self.num_contexts].max().item()
             # context cached token indptr
@@ -1442,6 +1494,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         else:
             self.num_ctx_cached_tokens = 0
+            self.num_ctx_mla_kv_tokens = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
 
