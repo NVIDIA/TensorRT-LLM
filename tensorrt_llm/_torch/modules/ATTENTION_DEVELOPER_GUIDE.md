@@ -298,7 +298,8 @@ The main differences across backends:
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
-libraries. `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
+libraries. `TritonCustomMaskFmha` provides Triton context attention for custom
+masks, `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
 `FlashInferSparseMlaFmha` integrates SM120/SM121 sparse MLA kernels for
 DeepSeek-V4 and DSA,
 `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
@@ -306,9 +307,9 @@ the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
 runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`cute_dsl_mla,msa_sparse_gqa,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
+`triton_custom_mask,cute_dsl_mla,msa_sparse_gqa,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
 use `TLLM_FMHA_LIBS=fallback` or
-`TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_sparse_mla,-flashinfer_trtllm_gen`
+`TLLM_FMHA_LIBS=-triton_custom_mask,-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_sparse_mla,-flashinfer_trtllm_gen`
 to force the fallback
 path. Each FMHA library exposes `is_available()` for module/static environment
 checks and `is_supported()` for per-forward request checks.
@@ -337,9 +338,12 @@ cache (override with `TLLM_K3_MLA_GEN_BACKEND=trtllm-gen`; other values are
 rejected at model build). FP8 KV cache forces `trtllm-gen`. K3 also installs a
 per-batch policy that falls back to `trtllm-gen` for mixed
 context/generation batches and multi-token generation (speculative
-verification), keeping `cute-dsl` for plain one-token-per-request decode. A
-mixed H=96 batch remains on `cute-dsl`: TRTLLM-Gen may select a 64-head Q tile,
-which does not divide 96 after K3's head padding removal.
+verification), keeping `cute-dsl` for plain one-token-per-request decode.
+Any H=96 batch (K3's attention-DP shape) remains on `cute-dsl` regardless of
+batch composition: TRTLLM-Gen may select a 64-head Q tile, which does not
+divide 96 after K3's head padding removal, and its decode gate rejects
+`64 < num_heads_q < 128` — so falling back there would fail engine
+initialization (this covers attention-DP speculative verification).
 
 The FMHA package is split by role:
 
@@ -348,6 +352,10 @@ The FMHA package is split by role:
   context/generation and MHA/MLA entry points.
 - `fmha/combined.py` composes different context and generation implementations
   for non-MLA mixed batches.
+- `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
+  Custom-mask data applies to context requests; for mixed batches,
+  `TrtllmAttention` can pair it with a later causal-generation provider through
+  `CombinedFmha`.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.

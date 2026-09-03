@@ -308,27 +308,35 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         min_length=1,
         description=
         "List of total token counts (sum of all per-request sequence lengths "
-        "in a batch) to create encoder CUDA graphs for.")
+        "in a batch) to create encoder CUDA graphs for. Required for an "
+        "encoder that packs a variable number of tokens per request; ignored "
+        "by an encoder whose input is a fixed-shape per-request feature "
+        "tensor, which derives this from the model.")
 
     max_num_token: NonNegativeInt = Field(
         default=0,
         description="Maximum total number of tokens for encoder CUDA graphs. If "
         "`num_tokens` is provided, must equal max(num_tokens); otherwise "
-        "`num_tokens` is generated from this value.")
+        "`num_tokens` is generated from this value. Ignored by a fixed-shape "
+        "feature encoder.")
 
     seq_lens: Optional[List[PositiveInt]] = Field(
         default=None,
         min_length=1,
         description=
         "List of max per-request sequence lengths to create encoder CUDA "
-        "graphs for.")
+        "graphs for. Required for an encoder that packs a variable number of "
+        "tokens per request; ignored by an encoder whose input is a "
+        "fixed-shape per-request feature tensor, which derives this from the "
+        "model.")
 
     max_seq_len: NonNegativeInt = Field(
         default=0,
         description=
         "Maximum per-request sequence length for encoder CUDA graphs. If "
         "`seq_lens` is provided, must equal max(seq_lens); otherwise "
-        "`seq_lens` is generated from this value.")
+        "`seq_lens` is generated from this value. Ignored by a fixed-shape "
+        "feature encoder.")
 
     @model_validator(mode='after')
     def validate_encoder_cuda_graph_config(self) -> 'EncodeCudaGraphConfig':
@@ -444,6 +452,36 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
             sizes.append(max_seq_len)
 
         return sizes
+
+
+def validate_token_encoder_bucket_config(
+        num_tokens: Optional[List[int]],
+        seq_lens: Optional[List[int]],
+        *,
+        stays_eager: bool = False) -> Optional[str]:
+    """Why a packed-token encoder cannot capture with these buckets, or None.
+
+    Answers for token encoders (T5, BART) only; a fixed-shape feature encoder
+    derives both dimensions from the model, so the caller establishes which
+    kind it has first. Returned rather than raised because callers differ:
+    encode-only warns and stays eager (`stays_eager`), the rest raise.
+    """
+    missing = []
+    if not num_tokens:
+        missing.append("num_tokens/max_num_token")
+    if not seq_lens:
+        missing.append("seq_lens/max_seq_len")
+    if not missing:
+        return None
+    head = (f"Encoder CUDA graph configuration has {' and '.join(missing)} "
+            "unset. This model's encoder consumes packed tokens, so it needs "
+            "both dimensions")
+    if stays_eager:
+        return f"{head}; the encode step stays eager."
+    return (f"{head}: specify e.g. EncodeCudaGraphConfig(max_batch_size=64, "
+            "num_tokens=[128, 256, 512], max_seq_len=128, "
+            "enable_padding=True), or drop encoder_cuda_graph_config to run "
+            "the encoder eagerly.")
 
 
 # For CudaGraphConfig's backward compatibility
@@ -2965,6 +3003,19 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
+    attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
+        default="VANILLA",
+        description=
+        "Attention backend for the pooled-context cross-attention of a "
+        "standalone DSpark drafter (one shipped as its own checkpoint rather "
+        "than inside the target's mtp.* namespace). Ignored by the embedded "
+        "DeepSeek-V4-Pro draft, which uses its own captured-context attention. "
+        "This is independent of the backend used to construct the drafter's "
+        "standard attention modules. TRTLLM requires FlashInfer and an NVIDIA "
+        "Blackwell GPU with SM100 or SM103, and uses generated FMHA kernels "
+        "with a private paged context cache; VANILLA uses FlashAttention with "
+        "a contiguous cache.")
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len
@@ -2981,6 +3032,62 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    @functools.cached_property
+    def draft_is_embedded_in_target(self) -> bool:
+        """True for the embedded (DeepSeek-V4-Pro) flavour of the DSpark draft.
+
+        DSpark ships in two shapes, and they need different runtime plumbing:
+
+        - embedded: the draft is the ``mtp.*`` namespace of the *target*
+          checkpoint, built from full target decoder blocks, and served by
+          ``DSv4DSparkWorker`` with its own rolling captured-context window.
+        - standalone: the draft is its own checkpoint with a registry-resolved
+          backbone, served by ``DFlashWorker`` and its paged draft KV cache.
+
+        Both are ``decoding_type: DSpark``, so every dispatch that must tell
+        them apart -- draft-model builder, worker, spec metadata, and the
+        separate-draft-KV-cache decision -- reads this one flag instead of
+        re-deriving it. That is what keeps those decisions from drifting apart:
+        a builder and a worker that disagree produce a draft model whose
+        attributes the worker does not have.
+
+        The probe is the weight index rather than a config field because the
+        index is authoritative and cannot be left unset; ``model_type`` is the
+        fallback for a checkpoint whose index file is absent. Resolution is
+        memoized here and warmed during ``TorchLlmArgs`` validation, so the
+        filesystem probe happens once in the main process -- not per rank, and
+        never at forward or CUDA-graph-capture time.
+        """
+        ckpt_dir = self.speculative_model
+        if ckpt_dir is None:
+            return False
+        ckpt_dir = str(ckpt_dir)
+
+        for name in ("model.safetensors.index.json",
+                     "pytorch_model.bin.index.json"):
+            index = os.path.join(ckpt_dir, name)
+            if not os.path.isfile(index):
+                continue
+            try:
+                with open(index, encoding="utf-8") as f:
+                    weight_map = json.load(f).get("weight_map", {})
+            except (OSError, ValueError):
+                break
+            # An index that parsed is authoritative both ways. Falling through
+            # to model_type here would classify a standalone V4-shaped drafter
+            # as embedded, and that only surfaces much later, inside
+            # count_dspark_stages.
+            return any(re.match(r"^mtp\.\d+\.", key) for key in weight_map)
+
+        config_path = os.path.join(ckpt_dir, "config.json")
+        if os.path.isfile(config_path):
+            try:
+                with open(config_path, encoding="utf-8") as f:
+                    return json.load(f).get("model_type") == "deepseek_v4"
+            except (OSError, ValueError):
+                return False
+        return False
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -3678,9 +3785,10 @@ class KvCacheCompressionConfig(StrictBaseModel):
     algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
 
     Kept separate from SparseAttentionConfig by design -- compression changes
-    which KV is stored, not the attention computation. The manager is registered
-    as a resource manager in create_py_executor (_util.py), like the KV cache
-    manager itself. Concrete algorithms subclass this and add their parameters.
+    which KV is stored, not the attention computation. Iteration-driven methods
+    use the resource-manager cycle; storage-bound managers provide a native
+    codec that KVCacheManagerV2 retains and invokes. Concrete algorithms
+    subclass this and add their parameters.
     """
 
     changes_physical_kv_length: ClassVar[bool] = False
@@ -3699,6 +3807,37 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
+_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY = TelemetryField.categorical(
+    "quantization_for_cold_page", "triattention")
+
+
+class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
+    """Quantize Host and Disk KV pages without changing the active GPU cache."""
+
+    algorithm: Literal["quantization_for_cold_page"] = Field(
+        default="quantization_for_cold_page",
+        telemetry=False,
+    )
+    quant: Literal["nvfp4"] = Field(
+        default="nvfp4",
+        description="Quantization format stored in the compressed cache tier.")
+    scale_checkpoint_path: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        telemetry=False,
+        description=
+        "Optional local ModelOpt NVFP4 checkpoint directory supplying per-layer "
+        "K/V global scales. Omit it to use identity global scales.")
+
+    def supports_block_reuse(self) -> bool:
+        """Block reuse is unchanged because token identity is preserved."""
+        return True
+
+    def supports_speculative_decoding(self) -> bool:
+        """Target and draft KVCMs encode their own cold pages independently."""
+        return True
+
+
 class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     """TriAttention KV-cache compression: periodic decode-time eviction.
 
@@ -3709,7 +3848,10 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
     changes_physical_kv_length: ClassVar[bool] = True
 
-    algorithm: Literal["triattention"] = "triattention"
+    algorithm: Literal["triattention"] = Field(
+        default="triattention",
+        telemetry=_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY,
+    )
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
         description=
@@ -3751,7 +3893,8 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
 
 KvCacheCompressionConfigType: TypeAlias = Annotated[
-    Union[TriAttentionKvCacheCompressionConfig],
+    Union[ColdPageQuantizationCompressionConfig,
+          TriAttentionKvCacheCompressionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -3967,7 +4110,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "The data type for the KV cache. 'auto' (default) leaves the checkpoint's "
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
         "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
-        "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM120/SM121. Resolved at "
+        "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "
+        "Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
@@ -4333,12 +4477,17 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default="auto",
         description=
         "The runtime implementation. 'auto' (default) adopts the model's "
-        "preferred runtime when the effective backend supports it, and falls "
-        "back to the C++ transceiver otherwise. 'CPP' selects the C++ "
-        "transceiver, 'PYTHON' the Python transceiver. None is equivalent to "
-        "'CPP'. The model preference is only consulted on the PyTorch "
-        "backend's standard model-loading path; other paths (e.g. AutoDeploy) "
-        "fall back to the C++ transceiver under 'auto'.")
+        "preferred runtime when it declares one; otherwise it selects the "
+        "Python transceiver, falling back to the C++ transceiver only when "
+        "this config itself rules it out (non-NIXL backend or a null "
+        "kv_transfer_timeout_ms) — any other incompatibility fails at "
+        "transceiver creation. The fallback is decided independently on "
+        "each server and is only logged, not surfaced, so keep context and "
+        "generation server configurations consistent. 'CPP' selects the C++ "
+        "transceiver, 'PYTHON' the Python transceiver. None is equivalent "
+        "to 'CPP'. 'auto' is only resolved on the PyTorch backend's "
+        "standard model-loading path; other paths (e.g. AutoDeploy) fall "
+        "back to the C++ transceiver.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
@@ -4373,6 +4522,16 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
     )
 
+    enable_pipelined_transfer: bool = Field(
+        default=False,
+        description=
+        "Transfer each completed prefill chunk's KV cache while later chunks "
+        "compute. Requires Python NIXL, generation-first scheduling, chunked "
+        "prefill, pipeline_parallel_size=1, context_parallel_size=1 on both "
+        "peers, beam_width=1, no bounce buffer or Mamba/hybrid cache, and block "
+        "reuse disabled or set to all_reusable. Invalid static settings fail at "
+        "startup; per-request constraints reject the request.")
+
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
 
@@ -4388,6 +4547,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         return "NIXL", None
 
     def _to_pybind(self):
+        # Python-transceiver-only option.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
@@ -5133,13 +5293,6 @@ class GmsConfig(StrictBaseModel):
         return self
 
 
-class SamplerType(StrEnum):
-    """Enum for sampler type options."""
-    TRTLLMSampler = "TRTLLMSampler"
-    TorchSampler = "TorchSampler"
-    auto = "auto"
-
-
 class PrefillCudaGraphBackend(StrEnum):
     """CUDA graph implementation used for prefill requests."""
 
@@ -5331,15 +5484,11 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.encoder_max_batch_size is None:
             raise ValueError(
                 "encoder_cuda_graph_config requires encoder_max_batch_size.")
-        missing = []
-        if not self.encoder_cuda_graph_config.num_tokens:
-            missing.append("num_tokens/max_num_token")
-        if not self.encoder_cuda_graph_config.seq_lens:
-            missing.append("seq_lens/max_seq_len")
-        if missing:
-            raise ValueError("encoder_cuda_graph_config requires "
-                             f"{' and '.join(missing)}.")
-
+        # `num_tokens` / `seq_lens` are checked by the model engine rather than
+        # here: an encoder whose input is a fixed-shape per-request feature
+        # tensor derives both from the model, and only the engine knows which
+        # kind of encoder the model has. It still raises for the token encoders
+        # that require them.
         return self
 
     attn_backend: str = Field(
@@ -5349,17 +5498,6 @@ class TorchLlmArgs(BaseLlmArgs):
         # Recognized values mirror get_attention_backend dispatch in
         # tensorrt_llm/_torch/attention_backend/utils.py.
         telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER"))
-
-    sampler_type: Union[str, SamplerType] = Field(
-        default=SamplerType.auto,
-        description=
-        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler. "
-        "TRTLLMSampler is deprecated and will be removed in release 1.4.",
-        status="deprecated",
-        deprecated=
-        "This parameter will be removed in release 1.4. TorchSampler will be the default sampler.",
-        telemetry=TelemetryField.categorical('TRTLLMSampler', 'TorchSampler',
-                                             'auto'))
 
     sampler_force_async_worker: bool = Field(
         default=False,
@@ -5457,6 +5595,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
         status="prototype")
 
+    use_fine_grained_sync: bool = Field(
+        default=False,
+        description=
+        "Enable fine-grained synchronization for MoE kernels on SM107. The FC1 producer kernel signals "
+        "per-tile completion flags in device memory and the FC2 consumer kernel waits on them, so the "
+        "two GEMMs overlap instead of serializing at kernel launch boundaries.",
+        status="prototype")
+
     enable_layerwise_nvtx_marker: bool = Field(
         default=False,
         description="If true, enable layerwise nvtx marker.",
@@ -5524,6 +5670,31 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    checkpoint_io_policy: Literal[
+        "auto", "native", "rank_striped_read_ahead"] = Field(
+            default="auto",
+            description=
+            "Controls checkpoint storage I/O independently of checkpoint format. "
+            "'auto' selects rank-striped read-ahead for compatible built-in "
+            "PyTorch/HF loads and selects native I/O otherwise. "
+            "'native' preserves the existing loader. "
+            "'rank_striped_read_ahead' lets node-local ranks read disjoint "
+            "SafeTensors extents while native mapping, materialization, and H2D "
+            "continue. Incompatible configurations select native I/O before "
+            "optimized reader or collective setup. Runtime-ineligible loads fall "
+            "back to native before model mutation.",
+            status="prototype",
+            json_schema_extra={
+                "type": "Literal['auto', 'native', 'rank_striped_read_ahead']"
+            },
+        )
+
+    @property
+    def is_partial_model_loading(self) -> bool:
+        """Whether model overrides request loading only part of the model."""
+        return (self.model_kwargs is not None
+                and "num_hidden_layers" in self.model_kwargs)
+
     mx_config: ModelExpressConfig = Field(
         default_factory=ModelExpressConfig,
         description="ModelExpress (MX) P2P checkpoint loading config.",
@@ -5556,7 +5727,8 @@ class TorchLlmArgs(BaseLlmArgs):
         "encoder's GPU memory (enlarging the KV cache pool) for workloads "
         "that never send image/video/audio inputs; such requests are "
         "rejected. Only takes effect for model implementations that support "
-        "it (currently the Qwen3-VL / Qwen3.5-VL family); a no-op otherwise. "
+        "it (currently Mistral3 and the Qwen3-VL / Qwen3.5-VL family); a "
+        "no-op otherwise. "
         "Defaults to False.",
         status="prototype")
 
@@ -5721,6 +5893,20 @@ class TorchLlmArgs(BaseLlmArgs):
                 "disable_mm_encoder and mm_encoder_only are mutually "
                 "exclusive: one skips the multimodal encoder, the other runs "
                 "only the multimodal encoder.")
+        return self
+
+    @model_validator(mode="after")
+    def normalize_disabled_mm_encoder_cache(self) -> 'TorchLlmArgs':
+        if (self.disable_mm_encoder
+                and self.multimodal_config.encoder_cache_max_bytes != 0):
+            logger.info(
+                "Setting multimodal_config.encoder_cache_max_bytes to 0 "
+                "because disable_mm_encoder=True.")
+            # The cache defaults to enabled, so disabling the encoder must override it to also
+            # disable an unused cache. Although `multimodal_config` is unlikely to be used
+            # standalone outside of a `TorchLlmArgs` instance, we make a copy to be safe.
+            self.multimodal_config = self.multimodal_config.model_copy(
+                update={"encoder_cache_max_bytes": 0})
         return self
 
     @model_validator(mode="after")
@@ -5970,34 +6156,55 @@ class TorchLlmArgs(BaseLlmArgs):
                 if not spec_cfg.max_draft_len:
                     raise ValueError("DSpark max_draft_len must be > 0; got "
                                      f"{spec_cfg.max_draft_len}")
-                # The DSpark draft weights live in the ``mtp.*`` namespace of a
-                # local checkpoint directory; without ``speculative_model``
-                # neither the draft weights nor the ``dspark_*`` config
-                # defaults can be located, and engine construction would fail
-                # much later with an opaque error.
+                # Same convention as MTP (see resolve_mtp_checkpoint_source):
+                # an unset speculative_model means "the draft lives in the
+                # target checkpoint". For DSpark that is the embedded
+                # DeepSeek-V4-Pro flavour, whose draft is the target's mtp.*
+                # namespace. Defaulting rather than rejecting keeps the
+                # spec-dec API consistent across algorithms; pointing
+                # speculative_model at the target explicitly is equivalent.
                 if spec_cfg.speculative_model is None:
-                    raise ValueError(
-                        "DSpark requires speculative_config.speculative_model "
-                        "to point at the checkpoint directory containing the "
-                        "mtp.* draft weights (for DeepSeek-V4-Pro-DSpark this "
-                        "is the target checkpoint directory itself).")
+                    spec_cfg.speculative_model = self.model
+                    if not spec_cfg.draft_is_embedded_in_target:
+                        raise ValueError(
+                            "speculative_config.speculative_model is unset, "
+                            "which means 'load the draft from the target "
+                            "checkpoint', but the target has no mtp.* draft "
+                            "weights. Point speculative_model at a standalone "
+                            "DSpark drafter checkpoint directory.")
+                # Warm the embedded-vs-standalone probe here, while we are in
+                # the main process and the checkpoint path is known local. The
+                # flag then travels with the config, so no rank repeats the
+                # filesystem read and nothing probes at forward time.
+                _ = spec_cfg.draft_is_embedded_in_target
                 # Resolve target_layer_ids / mask_token_id / block_size /
                 # markov_rank from the draft (or main) model config if not set.
-                # DSpark ships these as top-level ``dspark_*`` keys in the
-                # DeepSeek-V4-Pro config.json; also accept a nested
-                # ``dspark_config`` dict for forward compatibility.
+                # Three checkpoint spellings are in the wild for the same knobs
+                # and all are accepted here, because a key the reader misses is
+                # not an error -- it silently falls back to a default and the
+                # drafter degrades (a markov_rank read as 0 skips the Markov
+                # head entirely, costing acceptance with no warning):
+                #   - top-level ``dspark_*``  (DeepSeek-V4-Pro)
+                #   - nested ``dflash_config``  (SpecForge / RadixArk drafters)
+                #   - nested ``dspark_config``  (forward compatibility)
+                #   - plain top-level keys  (TorchSpec drafters)
                 draft_config_path = os.path.join(spec_cfg.speculative_model,
                                                  "config.json")
                 if os.path.exists(draft_config_path):
                     with open(draft_config_path) as f:
                         draft_cfg = json.load(f)
-                    dspark_cfg = draft_cfg.get("dspark_config", {})
+                    dspark_cfg = draft_cfg.get("dspark_config") or {}
+                    dflash_cfg = draft_cfg.get("dflash_config") or {}
 
                     def _dspark_get(key, top_level_key):
-                        value = dspark_cfg.get(key)
-                        if value is None:
-                            value = draft_cfg.get(top_level_key)
-                        return value
+                        for source, name in ((dspark_cfg, key), (dflash_cfg,
+                                                                 key),
+                                             (draft_cfg,
+                                              top_level_key), (draft_cfg, key)):
+                            value = source.get(name)
+                            if value is not None:
+                                return value
+                        return None
 
                     # The checkpoint's ``dspark_target_layer_ids`` is
                     # authoritative: it fixes both which target hidden states
@@ -6128,6 +6335,20 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
+        return self
+
+    @model_validator(mode="after")
+    def warn_non_pytorch_checkpoint_io_policy_fallback(self) -> 'TorchLlmArgs':
+        # AutoDeploy does not construct a checkpoint loader. Preserve the
+        # requested policy for telemetry while reporting its native selection.
+        # PyTorch requests are resolved at loader construction, where the actual
+        # format and registered loader implementations are known.
+        if (self.checkpoint_io_policy == "rank_striped_read_ahead"
+                and self.backend != "pytorch"):
+            logger.warning(
+                "Checkpoint I/O policy resolved before loading: "
+                "requested=rank_striped_read_ahead, selected=native, "
+                "reason=rank-striped read-ahead requires the PyTorch backend.")
         return self
 
     @model_validator(mode="after")

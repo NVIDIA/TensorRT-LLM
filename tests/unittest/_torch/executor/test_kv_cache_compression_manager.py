@@ -1,26 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for the KV-cache compression manager framework
-(``KVCacheCompressionManager`` in ``resource_manager.py``) — the
-``BaseResourceManager``-based single-manager design.
-
-Covers:
-- :class:`KVCacheCompressionManager` contract: the four lifecycle hooks
-  default to no-op, zero resource counts, and it inherits
-  :class:`BaseResourceManager` (so PyExecutor auto-drives it once registered).
-- The resource-manager API -> lifecycle-hook translation, gated on PyExecutor's
-  own signals: ``prepare_resources`` fires ``on_request_init`` on each
-  request's first prefill chunk (``is_first_context_chunk``);
-  ``update_resources`` fires ``on_context_step_end`` once with the
-  ``context_requests_last_chunk`` list + one ``on_generation_step_end`` per
-  iteration; ``free_resources`` fires ``on_request_finish``.
-- :func:`create_kv_cache_compression_manager` factory.
-
-The base class lives in ``resource_manager.py`` (it is a resource manager, not a
-sparse-attention backend); the ``create_kv_cache_compression_manager`` factory
-lives in ``_util.py`` next to ``_create_kv_cache_manager``.
-"""
+"""Tests for the KV-cache compression manager lifecycle and factory."""
 
 from types import SimpleNamespace
 from typing import ClassVar
@@ -36,7 +17,12 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    ColdPageQuantizationCompressionConfig,
+    KvCacheCompressionConfig,
+    TriAttentionKvCacheCompressionConfig,
+)
+from tensorrt_llm.quantization import QuantAlgo
 
 # ---------------------------------------------------------------------- #
 # Mock infra: in-memory managers / requests (avoid touching V2 / model).  #
@@ -48,7 +34,8 @@ class _RecordingMixin:
     translation without real algorithm side-effects."""
 
     def __init__(self, kv_cache_manager, record_list, name="m"):
-        super().__init__(_compression_config(), kv_cache_manager)
+        super().__init__(_compression_config())
+        self.bind_kv_cache_managers(kv_cache_manager)
         self._record_list = record_list
         self._name = name
 
@@ -57,7 +44,7 @@ class _RecordingMixin:
 
 
 class _MockCompressionManager(_RecordingMixin, KVCacheCompressionManager):
-    """Mock manager that records the four lifecycle hooks."""
+    """Mock manager that records iteration lifecycle hooks."""
 
     def on_request_init(self, request):
         self._record("on_request_init")
@@ -83,6 +70,25 @@ class _BlockReuseCompatibleConfig(KvCacheCompressionConfig):
 
 def _compression_config() -> KvCacheCompressionConfig:
     return KvCacheCompressionConfig(algorithm="test")
+
+
+def _factory_model_engine(
+    *,
+    pretrained_config: object | None = None,
+    quant_config: object | None = None,
+    spec_config: object | None = None,
+    helix: bool = False,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        mapping=SimpleNamespace(has_cp_helix=lambda: helix),
+        spec_config=spec_config,
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                pretrained_config=pretrained_config,
+                quant_config=quant_config,
+            )
+        ),
+    )
 
 
 def _v2_manager(*, is_draft: bool):
@@ -126,8 +132,9 @@ class TestBaseABC:
         # So PyExecutor's main loop auto-invokes prepare/update/free_resources.
         assert issubclass(KVCacheCompressionManager, BaseResourceManager)
 
-    def test_four_hooks_default_noop(self, fake_kv_cache_manager):
-        m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
+    def test_lifecycle_hooks_default_noop(self, fake_kv_cache_manager):
+        m = KVCacheCompressionManager(_compression_config())
+        m.bind_kv_cache_managers(fake_kv_cache_manager)
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end([MagicMock()]) is None
         assert m.on_generation_step_begin(MagicMock()) is None
@@ -137,12 +144,14 @@ class TestBaseABC:
     def test_hooks_accept_extra_kwargs(self, fake_kv_cache_manager):
         # **kwargs lets the framework pass new args later without breaking
         # existing overrides.
-        m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
+        m = KVCacheCompressionManager(_compression_config())
+        m.bind_kv_cache_managers(fake_kv_cache_manager)
         assert m.on_request_init(MagicMock(), future_arg=1) is None
         assert m.on_generation_step_end(MagicMock(), future_arg=1) is None
 
     def test_resource_counts_are_zero(self, fake_kv_cache_manager):
-        m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
+        m = KVCacheCompressionManager(_compression_config())
+        m.bind_kv_cache_managers(fake_kv_cache_manager)
         # The manager owns no physical resources (the V2 cache manager does),
         # so it must not gate the scheduler.
         assert m.get_max_resource_count() == 0
@@ -155,7 +164,8 @@ class TestBaseABC:
         draft = _v2_manager(is_draft=True)
 
         config = _PhysicalLengthChangingConfig(algorithm="test")
-        manager = KVCacheCompressionManager(config, target, draft)
+        manager = KVCacheCompressionManager(config)
+        manager.bind_kv_cache_managers(target, draft)
 
         assert manager.kv_cache_manager is target
         assert manager.draft_kv_cache_manager is draft
@@ -166,9 +176,11 @@ class TestBaseABC:
     def test_rejects_non_v2_ownership(self):
         config = _compression_config()
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
-            KVCacheCompressionManager(config, MagicMock())
+            KVCacheCompressionManager(config).bind_kv_cache_managers(MagicMock())
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
-            KVCacheCompressionManager(config, _v2_manager(is_draft=False), MagicMock())
+            KVCacheCompressionManager(config).bind_kv_cache_managers(
+                _v2_manager(is_draft=False), MagicMock()
+            )
 
     def test_request_field_defaults_to_zero(self):
         """LlmRequest carries the compression count (the manager's only
@@ -276,42 +288,41 @@ class TestResourceManagerAPI:
 
 
 class TestFactory:
-    def test_returns_none_when_no_algorithm_registered(self, fake_kv_cache_manager):
-        # Framework-only: no concrete algorithm ships, so any config -> None.
+    def test_returns_none_when_no_algorithm_registered(self) -> None:
         cfg = MagicMock()
         cfg.algorithm = "made_up_method"
-        assert create_kv_cache_compression_manager(cfg, fake_kv_cache_manager) is None
-
-    def test_warns_for_unregistered_algorithm(self, fake_kv_cache_manager):
-        cfg = MagicMock()
-        cfg.algorithm = "made_up_method"
-        with patch.object(util_mod, "logger") as mock_logger:
-            create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
-            mock_logger.warning.assert_called_once()
-
-    def test_factory_accepts_independent_draft_manager(self):
-        cfg = MagicMock()
-        cfg.algorithm = "made_up_method"
-        target = _v2_manager(is_draft=False)
-        draft = _v2_manager(is_draft=True)
-
         assert (
             create_kv_cache_compression_manager(
                 cfg,
-                target,
-                draft_kv_cache_manager=draft,
+                model_engine=_factory_model_engine(),
+                kv_cache_config=SimpleNamespace(enable_block_reuse=False),
             )
             is None
         )
 
-    def test_triattention_requires_sm100_family(self, fake_kv_cache_manager):
+    def test_warns_for_unregistered_algorithm(self) -> None:
+        cfg = MagicMock()
+        cfg.algorithm = "made_up_method"
+        with patch.object(util_mod, "logger") as mock_logger:
+            create_kv_cache_compression_manager(
+                cfg,
+                model_engine=_factory_model_engine(),
+                kv_cache_config=SimpleNamespace(enable_block_reuse=False),
+            )
+            mock_logger.warning.assert_called_once()
+
+    def test_triattention_requires_sm100_family(self):
         cfg = MagicMock()
         cfg.algorithm = "triattention"
         with (
             patch.object(util_mod, "is_sm_100f", return_value=False),
             pytest.raises(RuntimeError, match="SM100-family"),
         ):
-            create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
+            util_mod.validate_kv_cache_compression_compatibility(
+                cfg,
+                SimpleNamespace(enable_block_reuse=False),
+                None,
+            )
 
     def test_capabilities_default_false(self):
         config = KvCacheCompressionConfig(algorithm="offload")
@@ -319,7 +330,8 @@ class TestFactory:
         assert config.changes_physical_kv_length is False
         assert config.supports_block_reuse() is False
         assert config.supports_speculative_decoding() is False
-        m = KVCacheCompressionManager(config, target)
+        m = KVCacheCompressionManager(config)
+        m.bind_kv_cache_managers(target)
         assert target.kv_compression_manages_history is False
         assert not hasattr(m, "spec_config")
 
@@ -341,6 +353,185 @@ class TestFactory:
             kv_cache_config,
             None,
         )
+
+
+@pytest.mark.cpu_only
+class TestKvCacheCreatorLifecycle:
+    def test_estimation_still_creates_triattention_manager(self) -> None:
+        config = SimpleNamespace(algorithm="triattention")
+        pretrained_config = object()
+        expected_manager = MagicMock(
+            provides_cold_page_codec=False,
+            uses_iteration_lifecycle=True,
+        )
+        creator = object.__new__(util_mod.KvCacheCreator)
+        creator._skip_est = False
+        creator._max_seq_len = 1024
+        creator._kv_cache_config = SimpleNamespace(host_cache_size=None, disk_cache_size=None)
+        creator._llm_args = SimpleNamespace(kv_cache_compression_config=config)
+        creator._model_engine = _factory_model_engine(pretrained_config=pretrained_config)
+        creator._draft_model_engine = None
+        creator._is_encoder_decoder = MagicMock(return_value=False)
+        creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
+        target_manager = object()
+        creator._create_kv_cache_manager = MagicMock(return_value=target_manager)
+
+        with patch.object(
+            util_mod,
+            "create_kv_cache_compression_manager",
+            return_value=expected_manager,
+        ) as factory:
+            resources = {}
+            creator.build_managers(resources, estimating_kv_cache=True)
+
+        factory.assert_called_once_with(
+            config,
+            model_engine=creator._model_engine,
+            kv_cache_config=creator._kv_cache_config,
+            estimating_kv_cache=True,
+        )
+        assert resources[ResourceManagerType.KV_CACHE_MANAGER] is target_manager
+        assert resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] is expected_manager
+        expected_manager.bind_kv_cache_managers.assert_not_called()
+
+    def test_teardown_pops_and_shuts_down_compression_manager(self) -> None:
+        creator = object.__new__(util_mod.KvCacheCreator)
+        compression_manager = MagicMock()
+        resources = {
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression_manager,
+            ResourceManagerType.KV_CACHE_MANAGER: MagicMock(),
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER: None,
+        }
+
+        creator.teardown_managers(resources)
+
+        compression_manager.shutdown.assert_called_once_with()
+        assert ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in resources
+
+
+@pytest.mark.cpu_only
+def test_executor_binds_iteration_manager_after_extra_resource_registration() -> None:
+    class _StopAfterBind(Exception):
+        pass
+
+    target_manager = object()
+    draft_manager = object()
+    compression_manager = MagicMock()
+    resources = {
+        ResourceManagerType.KV_CACHE_MANAGER: target_manager,
+        ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft_manager,
+    }
+    llm_args = SimpleNamespace(
+        enable_low_latency_host_dispatch=False,
+        extra_resource_managers={
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression_manager,
+        },
+    )
+    model_engine = SimpleNamespace(spec_config=None)
+
+    with (
+        patch.object(util_mod, "set_low_latency_dispatch"),
+        patch.object(util_mod, "ResourceManager", side_effect=_StopAfterBind),
+        pytest.raises(_StopAfterBind),
+    ):
+        util_mod.create_py_executor_instance(
+            dist=None,
+            resources=resources,
+            mapping=SimpleNamespace(),
+            llm_args=llm_args,
+            ctx_chunk_config=None,
+            model_engine=model_engine,
+            start_worker=False,
+            sampler=None,
+            drafter=None,
+            max_num_sequences=1,
+        )
+
+    compression_manager.bind_kv_cache_managers.assert_called_once_with(
+        target_manager, draft_manager
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "provides_cold_page_codec",
+    (True, False),
+    ids=("cold-codec", "iteration-manager"),
+)
+def test_build_routes_compression_manager_by_capabilities(
+    provides_cold_page_codec: bool,
+) -> None:
+    creator = object.__new__(util_mod.KvCacheCreator)
+    creator._skip_est = False
+    creator._max_seq_len = 1024
+    creator._kv_cache_config = SimpleNamespace()
+    compression_config = SimpleNamespace(algorithm="triattention")
+    pretrained_config = object()
+    creator._llm_args = SimpleNamespace(kv_cache_compression_config=compression_config)
+    creator._model_engine = _factory_model_engine(pretrained_config=pretrained_config)
+    creator._draft_model_engine = None
+    creator._kv_connector_manager = None
+    creator._is_kv_cache_manager_v2 = True
+    creator._fp8_ctx_mla_kv_len_cap = None
+    creator._is_encoder_decoder = MagicMock(return_value=False)
+    creator._should_create_separate_draft_kv_cache = MagicMock(return_value=True)
+    creator._needs_gpu_kv_cache_budget_split = MagicMock(return_value=False)
+
+    build_order = []
+    compression_manager = SimpleNamespace(
+        provides_cold_page_codec=provides_cold_page_codec,
+        uses_iteration_lifecycle=not provides_cold_page_codec,
+        bind_kv_cache_managers=MagicMock(side_effect=lambda *_args: build_order.append("bind")),
+    )
+    target_config = object()
+    draft_config = object()
+    target_manager = SimpleNamespace()
+    draft_manager = object()
+    creator._split_kv_cache_budget_for_draft = MagicMock(
+        side_effect=[(target_config, draft_config), (target_config, draft_config)]
+    )
+    creator._create_kv_cache_manager = MagicMock(
+        side_effect=lambda *_args, **_kwargs: build_order.append("target") or target_manager
+    )
+    creator._create_one_model_draft_kv_cache_manager = MagicMock(
+        side_effect=lambda *_args, **_kwargs: build_order.append("draft") or draft_manager
+    )
+
+    resources = {}
+    with patch.object(
+        util_mod,
+        "create_kv_cache_compression_manager",
+        side_effect=lambda *_args, **_kwargs: build_order.append("factory") or compression_manager,
+    ) as factory:
+        creator.build_managers(resources)
+
+    expected_codec_provider = compression_manager if provides_cold_page_codec else None
+    factory.assert_called_once_with(
+        compression_config,
+        model_engine=creator._model_engine,
+        kv_cache_config=target_config,
+        estimating_kv_cache=False,
+    )
+    assert (
+        creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
+        is expected_codec_provider
+    )
+    assert (
+        creator._create_one_model_draft_kv_cache_manager.call_args.kwargs[
+            "cold_page_codec_provider"
+        ]
+        is expected_codec_provider
+    )
+    assert resources[ResourceManagerType.KV_CACHE_MANAGER] is target_manager
+    assert resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER] is draft_manager
+    if provides_cold_page_codec:
+        assert ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in resources
+        compression_manager.bind_kv_cache_managers.assert_not_called()
+        assert build_order == ["factory", "target", "draft"]
+    else:
+        assert resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] is compression_manager
+        compression_manager.bind_kv_cache_managers.assert_not_called()
+        assert build_order == ["factory", "target", "draft"]
 
 
 # ---------------------------------------------------------------------- #
@@ -372,6 +563,48 @@ class TestCanonicalImports:
 
 
 class TestCompressionCompatibility:
+    @pytest.mark.cpu_only
+    @pytest.mark.parametrize(
+        "config",
+        (
+            ColdPageQuantizationCompressionConfig(),
+            TriAttentionKvCacheCompressionConfig(calibration_path="triattention-calibration.pt"),
+        ),
+    )
+    def test_helix_is_rejected(
+        self,
+        config: KvCacheCompressionConfig,
+    ) -> None:
+        model_engine = SimpleNamespace(
+            mapping=SimpleNamespace(has_cp_helix=lambda: True),
+            spec_config=None,
+            model=SimpleNamespace(model_config=SimpleNamespace(quant_config=None)),
+        )
+        with pytest.raises(ValueError, match="HELIX"):
+            create_kv_cache_compression_manager(
+                config,
+                model_engine=model_engine,
+                kv_cache_config=SimpleNamespace(enable_block_reuse=False),
+            )
+
+    @pytest.mark.cpu_only
+    def test_helix_is_rejected_before_redundant_cold_quantization(self) -> None:
+        model_engine = SimpleNamespace(
+            mapping=SimpleNamespace(has_cp_helix=lambda: True),
+            spec_config=None,
+            model=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
+                )
+            ),
+        )
+        with pytest.raises(ValueError, match="HELIX"):
+            create_kv_cache_compression_manager(
+                ColdPageQuantizationCompressionConfig(),
+                model_engine=model_engine,
+                kv_cache_config=SimpleNamespace(enable_block_reuse=False),
+            )
+
     def test_raises_when_reuse_on(self):
         config = _compression_config()
         with pytest.raises(ValueError, match="block reuse"):

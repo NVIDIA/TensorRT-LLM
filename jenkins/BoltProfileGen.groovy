@@ -27,12 +27,12 @@
 // (scripts/bolt/internal/slurm_merge.sh) gathers every workload's .fdata, merges
 // + packages the promotable bundle.
 //
-// Run on-demand today (manual / bot-triggered); there is no auto-trigger.
+// Launched from the postmerge pipeline's SBSA branch with promote=true, so it
+// runs on that pipeline's cadence; also runnable on demand with explicit params.
 // APPLY_PROFILES (default on) re-BOLTs that tarball in the same run
-// ("consume immediately after generating"); PROMOTE (opt-in) publishes the
-// packaged bundle to the branch-keyed Artifactory path so premerge can pull
-// `latest` (apply_latest.sh). Wiring the postmerge trigger is the remaining
-// deployment step; see promoteBundle().
+// ("consume immediately after generating"); PROMOTE (set by the postmerge launch,
+// opt-in elsewhere) publishes the packaged bundle to the branch-keyed Artifactory
+// path so premerge can pull `latest` (apply_latest.sh).
 // =============================================================================
 
 import groovy.transform.Field
@@ -55,7 +55,9 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 LLM_DOCKER_IMAGE = env.dockerImage
 AGENT_IMAGE = env.dockerImage ? env.dockerImage.replace("aarch64", "x86_64") : env.dockerImage
 
-// ---- bolt-specific params (passed by launchJob additionalParameters) --------
+// ---- bolt-specific params ---------------------------------------------------
+// Declared in the parameters{} block below and/or passed by launchJob; each
+// resolves as `params.X ?: env.X ?: default`, so empty keeps the default here.
 // targetArch        : aarch64-linux-gnu | x86_64-linux-gnu
 // boltRef           : source ref/commit the tarball was built from
 // branch            : branch name for the branch-keyed promote path
@@ -67,14 +69,10 @@ TARGET_ARCH   = params.targetArch   ?: env.targetArch ?: AARCH64_TRIPLE
 BOLT_REF      = params.boltRef      ?: (env.artifactCommit ?: env.gitlabCommit ?: "unknown")
 BRANCH        = params.branch       ?: (env.gitlabTargetBranch ?: "main")
 // SBSA multi-node: flexible node count (sbatch sets --nodes itself).
-// gb300-flex-aws-cmh -> gb300-aws-trtllm-cmh (clusterName aws-cmh). We default to
-// aws-cmh (GB300): in cross-cluster comparison it had the best disagg completion
-// rate (7/8), vs GB200/aws-dfw and oci-aga (whose disagg all failed the
-// cache-transceiver network precheck -- a cluster infra issue, not ours). The
-// intermittent GEN IPC-spawn hang is hardware-independent (seen on both GB200 and
-// GB300), so this is about picking the healthiest cluster, not fixing the hang.
-// Override via params.slurmPlatform for a different cluster.
-SLURM_PLATFORM= params.slurmPlatform?: (TARGET_ARCH == AARCH64_TRIPLE ? "gb300-flex-aws-cmh" : "")
+// Default aarch64 platform: gb300-flex-oci-jhb. Override via params.slurmPlatform
+// for a different cluster; the parent postmerge launch does not pass
+// slurmPlatform, so this default governs every run.
+SLURM_PLATFORM= params.slurmPlatform?: (TARGET_ARCH == AARCH64_TRIPLE ? "gb300-flex-oci-jhb" : "")
 BOLT_TARNAME  = params.boltTarName  ?: (TARGET_ARCH == AARCH64_TRIPLE ? "TensorRT-LLM-GH200.tar.gz" : "TensorRT-LLM.tar.gz")
 NUM_NODES     = params.numNodes     ?: "2"   // legacy single-workload wiring (unused by fan-out)
 // promote: publish the packaged bundle to the branch-keyed Artifactory path
@@ -294,59 +292,158 @@ def submitProfileGen(pipeline)
         Utils.exec(pipeline, timeout: false, numRetries: 2,
             script: Utils.sshUserCmd(remote, "\"mkdir -p ${ws}/builds ${ws}/runs\""))
 
-        // Download the tarball from Artifactory to the cluster frontend.
-        // curl (not wget): --speed-time/--speed-limit aborts a STALLED transfer
-        // (< ~10KB/s for 120s) and --retry restarts it, so a flaky cross-region
-        // link can't hang the job (Utils.exec runs with timeout:false). NO -C -:
-        // a resumed/appended transfer is a corruption vector; a clean restart on
-        // retry is safer. gzip -t verifies integrity so a truncated/corrupt
-        // download fails fast rather than poisoning the extract step.
+        // Download the build tarball (Artifactory) and, later, llvm-bolt (GitHub)
+        // to the cluster frontend. A single curl stream is throughput-capped by RTT
+        // on a high-latency cross-region link (one TCP window can't fill a fat, far
+        // pipe) -- in practice the llvm-bolt pull alone took ~15 min. aria2c would
+        // fix this with segmented range downloads but isn't installed on these
+        // clusters, so fetch_verified() does the same with stock tools only (curl +
+        // xargs + coreutils): HEAD-probe for size + range support, fan out PARTS
+        // ranged `curl -r` GETs via `xargs -P`, reassemble, verify. Falls back to a
+        // single-stream curl when the server doesn't advertise byte ranges or on
+        // ANY failure, so nothing regresses. Defined once here, reused for BOTH
+        // downloads. NO resume on retry (append is a corruption vector); the
+        // per-file verify (gzip -t / tar -tJf) catches truncation/corruption.
+        def boltFetchLib = '''
+            _verify_txz() { tar -tJf "$1" >/dev/null 2>&1; }
+            # _bolt_range_download URL DEST PARTS -> 0 if the whole file was fetched
+            # via parallel byte ranges (size-verified), else 1 (nothing usable).
+            _bolt_range_download() {
+                local url="$1" dest="$2" parts="$3"
+                local hdr total accept
+                # HEAD (not a ranged GET) so a server that ignores Range can't make
+                # us stream the whole file just to probe; -L follows the redirect to
+                # the storage/CDN backend; || true so a probe miss doesn't trip set -e.
+                hdr=$(curl -fsSL -I --retry 5 --retry-all-errors "$url" 2>/dev/null | tr -d '\\r' || true)
+                total=$(printf '%s\\n' "$hdr" | awk 'tolower($1)=="content-length:"{v=$2} END{print v}')
+                accept=$(printf '%s\\n' "$hdr" | awk 'tolower($1)=="accept-ranges:"{v=tolower($2)} END{print v}')
+                case "$total" in ''|*[!0-9]*) return 1 ;; esac
+                [ "$total" -gt 0 ] || return 1
+                [ "$accept" = "bytes" ] || return 1
+                local chunk=$(( (total + parts - 1) / parts ))
+                local ranges; ranges=$(mktemp)
+                local i start end
+                for i in $(seq 0 $((parts - 1))); do
+                    start=$(( i * chunk ))
+                    [ "$start" -ge "$total" ] && break
+                    end=$(( start + chunk - 1 ))
+                    [ "$end" -ge "$total" ] && end=$(( total - 1 ))
+                    printf '%s %s %s\\n' "$i" "$start" "$end" >> "$ranges"
+                done
+                # One ranged curl per chunk, PARTS at a time. $0/$1/$2 = i/start/end
+                # (xargs -n 3); URL/DEST come from the inline-exported environment.
+                if ! BOLT_FETCH_URL="$url" BOLT_FETCH_DEST="$dest" \\
+                     xargs -P "$parts" -n 3 bash -c '
+                         curl -fsSL --retry 10 --retry-all-errors --retry-delay 5 \\
+                              -r "$1-$2" -o "$BOLT_FETCH_DEST.part.$0" "$BOLT_FETCH_URL"
+                     ' < "$ranges"; then
+                    rm -f "$ranges" "$dest".part.*
+                    return 1
+                fi
+                : > "$dest"
+                while read -r i start end; do
+                    local part="$dest.part.$i"
+                    local want=$(( end - start + 1 ))
+                    [ -f "$part" ] || { rm -f "$ranges" "$dest".part.*; return 1; }
+                    local got; got=$(stat -c %s "$part" 2>/dev/null || echo 0)
+                    [ "$got" -eq "$want" ] || { rm -f "$ranges" "$dest".part.*; return 1; }
+                    cat "$part" >> "$dest"; rm -f "$part"
+                done < "$ranges"
+                rm -f "$ranges"
+                local final; final=$(stat -c %s "$dest" 2>/dev/null || echo 0)
+                [ "$final" -eq "$total" ] || return 1
+                return 0
+            }
+            # fetch_verified URL DEST VERIFY... : parallel fetch then `VERIFY DEST`;
+            # single-stream curl fallback on any failure. Reads PARTS (default 16).
+            fetch_verified() {
+                local url="$1" dest="$2"; shift 2
+                local parts="${PARTS:-16}"
+                if _bolt_range_download "$url" "$dest" "$parts" && "$@" "$dest"; then
+                    echo "[INFO] fetched via ${parts}-way parallel: $dest"
+                    return 0
+                fi
+                echo "[INFO] parallel fetch unavailable/failed; single-stream curl: $dest"
+                rm -f "$dest"
+                curl -fSL --retry 10 --retry-all-errors --retry-delay 15 \\
+                     --connect-timeout 60 --speed-time 120 --speed-limit 10000 \\
+                     -o "$dest" "$url" || { rm -f "$dest"; return 1; }
+                "$@" "$dest" || { echo "[ERROR] verification failed: $dest"; rm -f "$dest"; return 1; }
+                return 0
+            }
+        '''.stripIndent()
         def tarStage = """
+            URL='${llmTarfile}'
+            DEST='${ws}/builds/${BOLT_TARNAME}'
+            PARTS=16
+        """.stripIndent() + boltFetchLib + '''
             set -e
-            curl -fSL --retry 10 --retry-all-errors --retry-delay 15 \
-                 --connect-timeout 60 --speed-time 120 --speed-limit 10000 \
-                 -o ${ws}/builds/${BOLT_TARNAME} ${llmTarfile}
-            if ! gzip -t ${ws}/builds/${BOLT_TARNAME}; then
-                echo '[ERROR] downloaded tarball failed gzip -t (corrupt/truncated)'
-                rm -f ${ws}/builds/${BOLT_TARNAME}
-                exit 1
-            fi
-        """.stripIndent()
-        // bashWrappedRemoteCmd: not all clusters default to bash, so wrap the
-        // multi-line script instead of relying on the login shell.
-        Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, b64BashRemoteCmd(tarStage)))
-
-        // Extract the full source tree + wheel from the tarball (which packs the
-        // build commit's TensorRT-LLM/src). The perf harness runs from this
-        // checkout (jenkins/scripts/perf + tests/scripts/perf-sanity), and
-        // install_mode=wheel uses the bundled TensorRT-LLM/tensorrt_llm-*.whl;
-        // scripts/bolt (TOOLKIT_HOST for the merge job) lives under src/ too.
-        Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, "\"tar -xf ${ws}/builds/${BOLT_TARNAME} -C ${ws} TensorRT-LLM\""))
-
-        // Stage llvm-bolt ONCE here (shared ${ws}/builds/llvm), before the fan-out.
-        // The per-node instrument hook (perf_instrument_hook.sh, via BOLT_LLVM_DIR)
-        // and the merge job both reuse it, so no worker re-downloads llvm and
-        // parallel runs can't race extracting into the same dir.
+            fetch_verified "$URL" "$DEST" gzip -t
+        '''.stripIndent()
+        // Stage llvm-bolt into the shared ${ws}/builds/llvm (the per-node instrument
+        // hook via BOLT_LLVM_DIR and the merge job both reuse it). The GitHub
+        // download is amortized by a PERSISTENT version-keyed cache on lustre:
+        // llvm-bolt is pinned + immutable, so -- unlike the per-commit build tarball
+        // -- it's safe to cache forever. Pull from GitHub once per version/arch,
+        // then every later run just does a local lustre extract from the cached
+        // .tar.xz (no WAN). The one-time fetch reuses fetch_verified().
         def llvmArch = (TARGET_ARCH == AARCH64_TRIPLE) ? "ARM64" : "X64"
         def llvmVer  = "21.1.5"   // keep in sync with internal/slurm_merge.sh LLVM_BOLT_VERSION
         def llvmTb   = "LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz"
+        // Cache lives OUTSIDE the bolt-ci retention root (purged at depth 4 after 7
+        // days) so the per-run workspace reaper can't delete it.
+        def llvmCacheDir = "${scratch}/users/svc_tensorrt/bolt-cache/llvm"
         def llvmStage = """
+            LLVM_URL='https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/${llvmTb}'
+            LLVM_CACHE_DIR='${llvmCacheDir}'
+            LLVM_CACHE_TB='${llvmCacheDir}/${llvmTb}'
+            LLVM_DIR='${ws}/builds/llvm'
+            PARTS=16
+        """.stripIndent() + boltFetchLib + '''
             set -e
-            if [ ! -x ${ws}/builds/llvm/bin/llvm-bolt ]; then
-                echo '[INFO] staging llvm-bolt ${llvmVer} once (shared by all workloads)'
-                mkdir -p ${ws}/builds/llvm
-                curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
-                     -o /tmp/${llvmTb} https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/${llvmTb}
-                tar -xJf /tmp/${llvmTb} -C ${ws}/builds/llvm --strip-components=1
-                rm -f /tmp/${llvmTb}
+            if [ -x "$LLVM_DIR/bin/llvm-bolt" ]; then
+                echo '[INFO] llvm-bolt already staged this run'
             else
-                echo '[INFO] llvm-bolt already staged'
+                mkdir -p "$LLVM_DIR" "$LLVM_CACHE_DIR"
+                if [ -f "$LLVM_CACHE_TB" ] && tar -tJf "$LLVM_CACHE_TB" >/dev/null 2>&1; then
+                    echo "[INFO] llvm-bolt cache HIT: $LLVM_CACHE_TB"
+                else
+                    echo "[INFO] llvm-bolt cache MISS; one-time parallel fetch from GitHub"
+                    tmp=$(mktemp "$LLVM_CACHE_DIR/.llvm.XXXXXX")
+                    fetch_verified "$LLVM_URL" "$tmp" _verify_txz
+                    # Atomic publish on the same FS: concurrent first-runs may both
+                    # fetch, but rename is atomic so readers never see a partial file.
+                    mv -f "$tmp" "$LLVM_CACHE_TB"
+                fi
+                echo "[INFO] extracting llvm-bolt from cache -> $LLVM_DIR"
+                tar -xJf "$LLVM_CACHE_TB" -C "$LLVM_DIR" --strip-components=1
             fi
-        """.stripIndent()
-        Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, b64BashRemoteCmd(llvmStage)))
+        '''.stripIndent()
+
+        // Bootstrap SEQUENTIALLY, each its own stage() for per-phase Blue Ocean
+        // durations. Kept sequential rather than a second parallel{} block: Blue
+        // Ocean renders only one parallel per declarative stage, so a parallel
+        // bootstrap (a second parallel alongside the collect fan-out) dropped later
+        // stages from the UI. The real transfer wins (parallel chunked downloads +
+        // the llvm cache) live INSIDE these stages; only the tarball<->llvm overlap
+        // is lost -- marginal, especially on a cache HIT (a quick local extract).
+        // bashWrappedRemoteCmd: not all clusters default to bash, so wrap the scripts.
+        stage("Bootstrap: download tarball") {
+            Utils.exec(pipeline, timeout: false, numRetries: 2,
+                script: Utils.sshUserCmd(remote, b64BashRemoteCmd(tarStage)))
+        }
+        // Extract the full source tree + wheel (packs the build commit's
+        // TensorRT-LLM/src). The perf harness runs from this checkout
+        // (jenkins/scripts/perf + tests/scripts/perf-sanity), install_mode=wheel
+        // uses the bundled wheel, and scripts/bolt (merge TOOLKIT_HOST) is here.
+        stage("Bootstrap: extract tarball") {
+            Utils.exec(pipeline, timeout: false, numRetries: 2,
+                script: Utils.sshUserCmd(remote, "\"tar -xf ${ws}/builds/${BOLT_TARNAME} -C ${ws} TensorRT-LLM\""))
+        }
+        stage("Bootstrap: stage llvm-bolt") {
+            Utils.exec(pipeline, timeout: false, numRetries: 2,
+                script: Utils.sshUserCmd(remote, b64BashRemoteCmd(llvmStage)))
+        }
 
         // 2) Fan-out: ONE perf-sanity run per workload (Jenkins parallel{}).
         //    Each drives the perf harness (run_disagg.sh) for its test id, with
@@ -366,6 +463,15 @@ def submitProfileGen(pipeline)
         def harnessMounts = params.boltHarnessMounts ?: env.boltHarnessMounts ?: "${ws}:${ws},${modelsRoot}:${modelsRoot}"
         // The merge job still uses our own slurm_merge.sh (not the harness).
         def partArgs = "${partition.additionalArgs} ${SlurmConfig.getTimeArgs(partition)} ${SlurmConfig.getPartitionArgs(partition)}"
+        // The merge job is 100% CPU (merge-fdata, .fdata->.yaml, packaging,
+        // apply_bolt.py), so submit it to the CPU partition instead of holding a GPU
+        // node idle. Not partArgs: that carries the GPU partition's --gpus* flags,
+        // and these clusters reject a zero GPU request, so a CPU job must omit them
+        // entirely. Only the partition goes on the CLI (overriding slurm_merge.sh's
+        // #SBATCH header) so boltMergePartition can retarget it; account and wall
+        // time stay in the header, which is submitted from this same commit.
+        def mergePartition = params.boltMergePartition ?: env.boltMergePartition ?: "cpu"
+        def mergeArgs = "--partition=${mergePartition}"
 
         // Wrap each branch in a stage() so Blue Ocean renders one parallel stage
         // per workload (named "Collect: <workload>").
@@ -387,7 +493,7 @@ def submitProfileGen(pipeline)
         //    Wrapped in its own stage() so it shows as a distinct marker in
         //    Blue Ocean after the parallel collect fan-out.
         stage("Merge + Package") {
-            def mid = submitMerge(pipeline, remote, ws, fdataRoot, outDir, partArgs)
+            def mid = submitMerge(pipeline, remote, ws, fdataRoot, outDir, mergeArgs)
             pipeline.echo("submitted merge job ${mid}")
             pollSlurm(pipeline, remote, mid, "merge")
             pipeline.echo("Merge COMPLETED. Bundle: ${bundle}")
@@ -531,6 +637,41 @@ def pollSlurm(pipeline, remote, String jobId, String label)
         }
         return true
     }
+    // The waitUntil wall-clock (what Blue Ocean shows for this stage) lumps SLURM
+    // queue wait + actual run time together -- Jenkins can't see inside the
+    // scheduler. Split them from sacct so an oversubscribed cluster (long queue)
+    // is distinguishable from a genuinely slow job. Diagnostic only.
+    logSlurmJobTiming(pipeline, remote, jobId, label)
+}
+
+// Best-effort SLURM timing breakdown for a COMPLETED job: queue wait
+// (Start-Submit) vs run time (End-Start). Emitted as a single [TIMING] line so
+// runs are easy to grep/compare across regions and clusters. NEVER fails the
+// caller -- timing is diagnostic, so any sacct/date hiccup is swallowed.
+def logSlurmJobTiming(pipeline, remote, String jobId, String label)
+{
+    try {
+        def script = """
+            set -o pipefail
+            row=\$(sacct -j ${jobId} --format=Submit,Start,End -Pn --allocations | head -1)
+            sub=\$(echo "\$row" | cut -d'|' -f1)
+            beg=\$(echo "\$row" | cut -d'|' -f2)
+            end=\$(echo "\$row" | cut -d'|' -f3)
+            ss=\$(date -d "\$sub" +%s 2>/dev/null || echo "")
+            bs=\$(date -d "\$beg" +%s 2>/dev/null || echo "")
+            es=\$(date -d "\$end" +%s 2>/dev/null || echo "")
+            if [ -n "\$ss" ] && [ -n "\$bs" ] && [ -n "\$es" ]; then
+                echo "queue=\$((bs-ss))s run=\$((es-bs))s total=\$((es-ss))s"
+            else
+                echo "unavailable (\$row)"
+            fi
+        """.stripIndent()
+        def t = Utils.exec(pipeline, returnStdout: true, numRetries: 1, timeout: false,
+            script: Utils.sshUserCmd(remote, b64BashRemoteCmd(script))).trim()
+        pipeline.echo("[TIMING] ${label} job ${jobId}: ${t}")
+    } catch (Throwable e) {
+        pipeline.echo("[TIMING] ${label} job ${jobId}: timing unavailable (${e.message})")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +737,102 @@ pipeline {
     agent {
         // Lightweight x86 CPU dispatcher pod; the heavy work runs on SLURM nodes.
         kubernetes createKubernetesPodConfig(AGENT_IMAGE, "amd64")
+    }
+    // "" default wherever the real default is derived at run time (from targetArch,
+    // the resolved partition, or parent env) and so can't be a static value: the
+    // resolution chains above handle those, and "" is falsy, so empty == default.
+    // gitlabSourceRepoHttpUrl/gitlabCommit are declared because this block REPLACES
+    // the job's parameter list on every run, and an undeclared parameter is dropped
+    // even when the parent sends it -- so the job config's ${gitlabSourceRepoHttpUrl}
+    // SCM URL, which fetches this file, would never resolve. The remaining
+    // pass-throughs (artifactCommit, gitlabTargetBranch, boltModelsRoot) are optional
+    // and stay undeclared.
+    parameters {
+        string(
+            name: "gitlabSourceRepoHttpUrl",
+            defaultValue: "",
+            description: "Repo the job config's SCM step clones to read this Jenkinsfile. Passed by the parent, already resolved via its default-llm-repo credential; set explicitly for a standalone run. Left empty here so no repo is hardcoded and the per-instance credential stays authoritative."
+        )
+        string(
+            name: "gitlabCommit",
+            defaultValue: "",
+            description: "Commit the SCM step checks out, and the boltRef fallback recorded in the bundle manifest. Passed by the parent; empty lets boltRef fall through to \"unknown\"."
+        )
+        string(
+            name: "targetArch",
+            defaultValue: "",
+            description: "Build triple to profile. Empty -> aarch64-linux-gnu; also selects the boltTarName and slurmPlatform defaults."
+        )
+        string(
+            name: "artifactPath",
+            defaultValue: "",
+            description: "Artifactory directory holding the input tarball, e.g. sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/<build>. Passed by the parent pipeline; set explicitly for a standalone run."
+        )
+        string(
+            name: "dockerImage",
+            defaultValue: "",
+            description: "Container image the SLURM collect and merge jobs run in; must match targetArch (LLM_SBSA_DOCKER_IMAGE for aarch64). Passed by the parent pipeline."
+        )
+        string(
+            name: "boltRef",
+            defaultValue: "",
+            description: "Provenance ref recorded in the bundle manifest and versioned bundle name. Empty -> artifactCommit, then gitlabCommit, then \"unknown\"."
+        )
+        string(
+            name: "branch",
+            defaultValue: "",
+            description: "Branch key of the promote path (.../bolt-profiles/<branch>/<triple>/). Empty -> gitlabTargetBranch, then main."
+        )
+        string(
+            name: "boltTarName",
+            defaultValue: "",
+            description: "Name of the tarball to profile under artifactPath. Empty -> TensorRT-LLM-GH200.tar.gz for aarch64, TensorRT-LLM.tar.gz for x86_64."
+        )
+        choice(
+            name: "promote",
+            choices: ["false", "true"],
+            description: "Publish the bundle to the branch-keyed Artifactory path, as a versioned copy and latest.tar.gz. false still builds a bundle, but repoints nothing."
+        )
+        choice(
+            name: "applyProfiles",
+            choices: ["true", "false"],
+            description: "Re-BOLT the input tarball with the just-generated bundle in the merge job, as a same-commit check that the profiles apply. No extra GPU allocation."
+        )
+        string(
+            name: "slurmPlatform",
+            defaultValue: "",
+            description: "SlurmConfig platform for the collect and merge jobs. Empty -> gb300-flex-oci-jhb for aarch64, unset for x86_64."
+        )
+        string(
+            name: "numNodes",
+            defaultValue: "2",
+            description: "Legacy single-workload node count. UNUSED by the fan-out, which sizes each allocation from the workload's own config."
+        )
+        string(
+            name: "boltIterMult",
+            defaultValue: "",
+            description: "Multiplier on each workload's client iterations (num_requests = concurrency * iterations * mult), for a steady-state profile. Empty -> 64."
+        )
+        string(
+            name: "boltHarnessPartition",
+            defaultValue: "",
+            description: "SLURM partition for the perf-harness collect jobs. Empty -> the partition of the resolved slurmPlatform."
+        )
+        string(
+            name: "boltHarnessMounts",
+            defaultValue: "",
+            description: "Container bind mounts for the harness. Empty -> the run workspace plus the models root."
+        )
+        string(
+            name: "boltHarnessTimeLimit",
+            defaultValue: "",
+            description: "SLURM walltime per collect job. Empty -> 04:00:00 (instrumented runs are much slower than uninstrumented ones)."
+        )
+        string(
+            name: "boltMergePartition",
+            defaultValue: "",
+            description: "SLURM CPU partition for the merge job. The merge is 100% CPU. An empty string maps to the value 'cpu'. Set this if a cluster names its CPU partition differently."
+        )
     }
     options {
         skipDefaultCheckout()

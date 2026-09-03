@@ -1223,6 +1223,7 @@ class KVCacheManager(BaseResourceManager):
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
+        capture_sampling_params: Optional[SamplingParams] = None,
     ):
         _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         available_blocks = self.get_num_free_blocks()
@@ -1238,9 +1239,17 @@ class KVCacheManager(BaseResourceManager):
         draft_batch_llm_requests = []
         for i, req_id in enumerate(request_ids):
             # exact choice of n can be ignored for dummy requests
-            sampling_params = SamplingParams(n=beam_width,
-                                             best_of=beam_width,
-                                             use_beam_search=beam_width > 1)
+            sampling_params = SamplingParams(
+                n=beam_width,
+                best_of=beam_width,
+                use_beam_search=beam_width > 1,
+                temperature=capture_sampling_params.temperature
+                if capture_sampling_params is not None else None,
+                top_k=capture_sampling_params.top_k
+                if capture_sampling_params is not None else None,
+                top_p=capture_sampling_params.top_p
+                if capture_sampling_params is not None else None,
+            )
             # Here 1+max_num_draft_tokens is used to extend the prompt length to
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
@@ -2764,30 +2773,28 @@ class BlockManager:
 
 
 class KVCacheCompressionManager(BaseResourceManager):
-    """Framework-level base class for all KV-cache compression managers.
+    """Framework base for KV-cache compression methods in PyExecutor.
 
-    Inherits :class:`BaseResourceManager` so PyExecutor's main loop
-    auto-invokes ``prepare_resources`` / ``update_resources`` /
-    ``free_resources`` each iteration without any PyExecutor code changes; the
-    base implementations below translate those callbacks into the lifecycle
-    hooks.
-
-    Concrete compression methods subclass this directly. The hooks default to
-    no-op; subclasses override what they need. The manager never inherits from
-    any cache manager because this layer decides *how* the physical KV is used,
-    not *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
-
-    A subclass compacts through the ``KVCacheManagerV2`` it holds and records
-    the evicted count on ``LlmRequest.py_num_compressed_tokens``; the model
-    engine subtracts that count when building ``num_cached_tokens_per_seq``.
+    Iteration-driven methods receive ResourceManager callbacks, while
+    storage-bound methods provide a cold-page codec during cache construction.
+    Subclasses coordinate through KVCacheManagerV2 without owning its pools,
+    mappings, or migration lifecycle.
     """
 
-    def __init__(
+    uses_iteration_lifecycle = True
+    provides_cold_page_codec = False
+
+    def __init__(self, config: "KvCacheCompressionConfig") -> None:
+        self.config = config
+        self.kv_cache_manager: Optional["KVCacheManagerV2"] = None
+        self.draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None
+
+    def bind_kv_cache_managers(
         self,
-        config: "KvCacheCompressionConfig",
         kv_cache_manager: "KVCacheManagerV2",
         draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
-    ):
+    ) -> None:
+        """Bind the target and optional draft KVCMs after their construction."""
         from .kv_cache_manager_v2 import KVCacheManagerV2
 
         if not isinstance(kv_cache_manager, KVCacheManagerV2):
@@ -2799,15 +2806,51 @@ class KVCacheCompressionManager(BaseResourceManager):
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
         kv_cache_manager.kv_compression_manages_history = (
-            config.changes_physical_kv_length)
+            self.config.changes_physical_kv_length)
         if draft_kv_cache_manager is not None:
-            # The draft cache is compacted together with the target.
             draft_kv_cache_manager.kv_compression_manages_history = (
-                config.changes_physical_kv_length)
+                self.config.changes_physical_kv_length)
 
     @property
     def has_independent_draft_kv_cache(self) -> bool:
         return self.draft_kv_cache_manager is not None
+
+    def create_cold_page_codec(
+        self,
+        cache_config: object,
+        *,
+        runtime_dtype: DataType,
+        pp_layers: Sequence[int],
+        num_kv_heads_per_layer: Sequence[int],
+        head_dim_per_layer: Sequence[int],
+        is_draft: bool = False,
+    ) -> Optional[object]:
+        """Create a native cold-page codec when the algorithm provides one."""
+        return None
+
+    def encode_cold_pages(
+        self,
+        codec_state: object,
+        lifecycle_index: int,
+        cold_base: int,
+        page_indices: int,
+        num_pages: int,
+        stream: int,
+    ) -> None:
+        """Encode one complete KVCM migration batch into cold storage."""
+        raise NotImplementedError
+
+    def decode_cold_pages(
+        self,
+        codec_state: object,
+        lifecycle_index: int,
+        cold_base: int,
+        page_indices: int,
+        num_pages: int,
+        stream: int,
+    ) -> None:
+        """Decode one complete KVCM migration batch from cold storage."""
+        raise NotImplementedError
 
     # ================================================================== #
     # KV-cache lifecycle hooks (5, in temporal order).                   #
