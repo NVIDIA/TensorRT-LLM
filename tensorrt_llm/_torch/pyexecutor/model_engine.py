@@ -3949,11 +3949,28 @@ class PyTorchModelEngine(ModelEngine):
                 and self._prefill_cuda_graph_num_tokens):
             max_captured_num_tokens = self._prefill_cuda_graph_num_tokens[-1]
             if attn_all_rank_num_tokens is not None:
-                has_ctx_requests = num_ctx_requests != 0 or (
-                    all_rank_ctx_requests is not None
-                    and any(ctx_requests != 0
-                            for ctx_requests in all_rank_ctx_requests))
-                can_run_prefill_cuda_graph = (has_ctx_requests
+                # Every rank is padded to bucket(max(all_rank_num_tokens))
+                # below, so a rank with no context work of its own still
+                # replays the prefill graph at the busiest rank's token count.
+                # Requiring context work everywhere keeps that amplification
+                # off generation-only ranks; previously one context request
+                # anywhere was enough, which in aggregate serving turned a
+                # one-token generation step into a full prefill replay.
+                #
+                # Disaggregated serving still qualifies: an otherwise idle
+                # rank receives a context dummy from
+                # `PyExecutor._pad_attention_dp_dummy_request`, which runs
+                # before `_schedule()` and so is counted here. Aggregate
+                # serving keeps a generation dummy instead
+                # (`_update_adp_dummy_role` returns early with no cache
+                # transceiver), which is what separates the two paths.
+                if all_rank_ctx_requests is not None:
+                    every_rank_has_ctx_requests = all(
+                        ctx_requests != 0
+                        for ctx_requests in all_rank_ctx_requests)
+                else:
+                    every_rank_has_ctx_requests = num_ctx_requests != 0
+                can_run_prefill_cuda_graph = (every_rank_has_ctx_requests
                                               and max(attn_all_rank_num_tokens)
                                               <= max_captured_num_tokens)
                 all_ranks_can_run_prefill_cuda_graph = list(
