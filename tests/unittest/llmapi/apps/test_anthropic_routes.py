@@ -263,6 +263,7 @@ def _batch_client(runner=None):
         return "succeeded", {"type": "message", "role": "assistant", "content": []}
 
     app = FastAPI()
+    _anthropic_validation_handler(app)
     server = object.__new__(OpenAIServer)
     server.model = MODEL
     server._anthropic_batch_store = AnthropicBatchStore(runner=runner or ok)
@@ -556,8 +557,28 @@ class _FakeTokenizer:
         return text.split()
 
 
+def _anthropic_validation_handler(app):
+    """Mirror the server's handler so boundary rejections keep the envelope.
+
+    Model-level validation fails before the route function runs, so without
+    this a bare test app answers with FastAPI's 422 shape while the real
+    server answers 400 with the Anthropic envelope -- the test would pin the
+    fixture's behaviour instead of the product's.
+    """
+    from fastapi.exceptions import RequestValidationError
+
+    from tensorrt_llm.serve.anthropic_adapter import anthropic_error_response
+
+    @app.exception_handler(RequestValidationError)
+    async def _handler(request, exc):  # noqa: ANN001
+        if request.url.path.startswith("/v1/messages"):
+            return anthropic_error_response(str(exc), "invalid_request_error", 400)
+        raise exc
+
+
 def _count_tokens_client():
     app = FastAPI()
+    _anthropic_validation_handler(app)
     server = object.__new__(OpenAIServer)
     server.model = MODEL
     server.tokenizer = _FakeTokenizer()
@@ -756,7 +777,7 @@ def test_count_tokens_without_context_workers_is_an_error_not_a_zero():
         pytest.param(
             "Bad Request: {truncated",
             "context worker rejected the request with status 400",
-            id="unparseable_body_reports_status_only",
+            id="unparsable_body_reports_status_only",
         ),
     ],
 )
@@ -817,3 +838,48 @@ def test_create_batch_at_capacity_is_429_not_400():
     # The message has to say what to do about it; an "invalid request" shape
     # would send the client editing a body that was never the problem.
     assert "retry" in body["error"]["message"].lower()
+
+
+def test_await_disconnected_returns_immediately_for_a_synthetic_request():
+    """A batched request has no socket, so the watchdog must not poll on it.
+
+    is_disconnected() can never become true for a synthesised request, so
+    without an explicit opt-out this coroutine loops at 1Hz for the life of
+    the process -- one live task per batched request, each holding its Request
+    and RequestOutput.
+    """
+    server = object.__new__(OpenAIServer)
+    raw_request = OpenAIServer._synthetic_request(
+        {
+            "model": MODEL,
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    promise = SimpleNamespace(finished=False, request_id="req", abort=Mock())
+
+    async def run():
+        # A real socket-backed request would never let this return; a bounded
+        # wait keeps the failure a clear timeout rather than a hung suite.
+        await asyncio.wait_for(
+            OpenAIServer.await_disconnected(server, raw_request, promise),
+            timeout=5.0,
+        )
+
+    asyncio.run(run())
+    # Returning early must not be mistaken for a disconnect.
+    promise.abort.assert_not_called()
+
+
+@pytest.mark.parametrize("limit", [0, -1, 101])
+def test_list_batches_rejects_out_of_range_limit(limit):
+    """Clamping hid both a client error and a surprising page size.
+
+    limit=0 became 1 rather than an error, and the page was bounded by the
+    retention limit -- how many batches are kept, which has nothing to do with
+    how many fit on a page.
+    """
+    response = _batch_client().get(f"/v1/messages/batches?limit={limit}")
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["type"] == "invalid_request_error"

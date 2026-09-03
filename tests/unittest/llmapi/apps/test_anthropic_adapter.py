@@ -22,6 +22,7 @@ import asyncio
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError,
@@ -123,8 +124,15 @@ def test_thinking_controls_reach_the_chat_template(
     ],
 )
 def test_invalid_thinking_config_rejected(thinking):
-    with pytest.raises(AnthropicRequestError):
-        convert_anthropic_request(make_request(max_tokens=4096, thinking=thinking))
+    """Rejected by the model, so it surfaces as a field-level 400.
+
+    The discriminated union covers the unknown type, the budget floor, and
+    budget_tokens on a variant that does not accept one. Only the cross-field
+    rule against max_tokens is left to the converter, since it spans two
+    models.
+    """
+    with pytest.raises(ValidationError):
+        make_request(max_tokens=4096, thinking=thinking)
 
 
 def test_thinking_budget_must_be_less_than_max_tokens():
@@ -527,8 +535,9 @@ def test_tool_choice_mappings():
             make_request(tools=tools, tool_choice={"type": anthropic_type})
         )
         assert chat.tool_choice == expected
-        if anthropic_type == "none":
-            assert chat.tools is None
+        # Definitions survive "none": the prohibition rides on tool_choice, so
+        # the rendered prefix does not change when a client flips auto->none.
+        assert chat.tools and chat.tools[0].function.name == "f"
 
 
 def test_tool_choice_tool_rejected_instead_of_crashing_later():
@@ -574,7 +583,9 @@ def test_tool_choice_none_does_not_require_server_tool_execution():
         )
     )
 
-    assert chat.tools is None
+    # The server tool is dropped rather than rejected: under "none" it can
+    # never be invoked, so its presence is harmless.
+    assert not chat.tools
     assert chat.tool_choice == "none"
 
 
@@ -598,14 +609,17 @@ def test_disable_parallel_tool_use_rejected():
         )
 
 
-def test_tool_choice_without_client_tools_rejected():
-    with pytest.raises(AnthropicRequestError, match="server tool.*not supported"):
-        convert_anthropic_request(
-            make_request(
-                tools=[{"name": "web_search", "type": "web_search_20260209"}],
-                tool_choice={"type": "any"},
-            )
-        )
+@pytest.mark.parametrize("choice", [{"type": "any"}, {"type": "tool", "name": "f"}])
+def test_tool_choice_requiring_a_call_without_any_tool_is_rejected(choice):
+    """A forced choice needs something to force.
+
+    _convert_tools returns None for an empty list, so _convert_tool_choice has
+    nothing to point at. Reaching this needs tools absent entirely: with a
+    server tool present, _convert_tools raises first and the message is about
+    the server tool, not about the choice.
+    """
+    with pytest.raises(AnthropicRequestError, match="client-executable tool"):
+        convert_anthropic_request(make_request(tools=[], tool_choice=choice))
 
 
 def test_base64_image_converted_to_data_uri():
@@ -958,6 +972,112 @@ def test_stream_parallel_tool_calls_get_separate_blocks():
     assert starts[1]["id"] == "c2"
 
 
+def tool_use_blocks(events):
+    """Collect the tool_use blocks of a stream with their accumulated arguments.
+
+    Returns one dict per block, in emission order, holding the block's id, its
+    tool name and the concatenation of its input_json_delta fragments - i.e.
+    exactly what a client reconstructs and then feeds to json.loads.
+    """
+    blocks = {}
+    order = []
+    for name, payload in events:
+        if name == "content_block_start" and payload["content_block"]["type"] == "tool_use":
+            index = payload["index"]
+            blocks[index] = {
+                "id": payload["content_block"]["id"],
+                "name": payload["content_block"]["name"],
+                "partial_json": "",
+            }
+            order.append(index)
+        elif name == "content_block_delta" and payload["delta"]["type"] == "input_json_delta":
+            blocks[payload["index"]]["partial_json"] += payload["delta"]["partial_json"]
+    return [blocks[index] for index in order]
+
+
+def test_stream_interleaved_parallel_tool_calls_keep_every_fragment():
+    """Fragments of two calls arriving out of order must not be dropped.
+
+    A single upstream chunk can carry deltas for several tool calls at once -
+    postprocess_handlers appends one DeltaToolCall per parsed call - and the
+    calls' argument fragments can then alternate across chunks. The Anthropic
+    protocol has only one block open at a time, so the reframer has to
+    serialise them; anything it cannot forward immediately must be buffered.
+    Losing a single fragment leaves that call's partial_json unparsable, and
+    the client executes the tool with truncated arguments.
+    """
+    first = '{"city": "sf"}'
+    second = '{"city": "beijing", "unit": "c"}'
+    events = run_reframer(
+        [
+            # Both calls announced in one chunk, as the parsed-call loop emits them.
+            chunk(
+                {
+                    "tool_calls": [
+                        {"index": 0, "id": "c1", "function": {"name": "f1", "arguments": ""}},
+                        {"index": 1, "id": "c2", "function": {"name": "f2", "arguments": ""}},
+                    ]
+                }
+            ),
+            chunk({"tool_calls": [{"index": 0, "function": {"arguments": first[:7]}}]}),
+            chunk({"tool_calls": [{"index": 1, "function": {"arguments": second[:9]}}]}),
+            chunk({"tool_calls": [{"index": 0, "function": {"arguments": first[7:]}}]}),
+            chunk({"tool_calls": [{"index": 1, "function": {"arguments": second[9:]}}]}),
+            chunk({}, finish_reason="tool_calls"),
+        ]
+    )
+    assert_event_invariants(events)
+
+    blocks = tool_use_blocks(events)
+    assert len(blocks) == 2, f"expected one block per call, got {len(blocks)}"
+    assert [b["name"] for b in blocks] == ["f1", "f2"]
+    assert [b["id"] for b in blocks] == ["c1", "c2"]
+    assert json.loads(blocks[0]["partial_json"]) == json.loads(first)
+    assert json.loads(blocks[1]["partial_json"]) == json.loads(second)
+
+    message_delta = [p for n, p in events if n == "message_delta"][0]
+    assert message_delta["delta"]["stop_reason"] == "tool_use"
+
+
+def test_stream_sequential_parallel_tool_calls_keep_every_fragment():
+    """The ordinary parallel case: the second call starts after the first ends.
+
+    Each call is still spread over several chunks, so the per-call arguments
+    have to survive the switch from one block to the next.
+    """
+    events = run_reframer(
+        [
+            chunk(
+                {
+                    "tool_calls": [
+                        {"index": 0, "id": "c1", "function": {"name": "f1", "arguments": '{"a"'}}
+                    ]
+                }
+            ),
+            chunk({"tool_calls": [{"index": 0, "function": {"arguments": ": 1}"}}]}),
+            chunk(
+                {
+                    "tool_calls": [
+                        {"index": 1, "id": "c2", "function": {"name": "f2", "arguments": '{"b"'}}
+                    ]
+                }
+            ),
+            chunk({"tool_calls": [{"index": 1, "function": {"arguments": ": 2}"}}]}),
+            chunk({}, finish_reason="tool_calls"),
+        ]
+    )
+    assert_event_invariants(events)
+
+    blocks = tool_use_blocks(events)
+    assert [b["name"] for b in blocks] == ["f1", "f2"]
+    assert [b["id"] for b in blocks] == ["c1", "c2"]
+    assert json.loads(blocks[0]["partial_json"]) == {"a": 1}
+    assert json.loads(blocks[1]["partial_json"]) == {"b": 2}
+
+    message_delta = [p for n, p in events if n == "message_delta"][0]
+    assert message_delta["delta"]["stop_reason"] == "tool_use"
+
+
 def test_stream_thinking_then_text():
     events = run_reframer(
         [
@@ -1192,44 +1312,147 @@ def test_stop_reason_of_a_response_carrying_a_tool_use_block(
     assert resp.stop_sequence is None
 
 
-def test_stream_dropped_before_done_is_an_error_not_a_clean_stop():
-    """A truncated upstream must not look like a finished answer.
+@pytest.mark.parametrize(
+    "overrides,field",
+    [
+        # ge=1 on max_tokens: it is forwarded to max_completion_tokens, where a
+        # non-positive value is meaningless.
+        pytest.param({"max_tokens": 0}, "max_tokens", id="zero_max_tokens"),
+        # min_length on messages. The system variant is the one that matters:
+        # _convert_messages prepends the system message, so any emptiness check
+        # running after conversion sees a non-empty list and lets it through.
+        pytest.param(
+            {"messages": [], "system": "terse"}, "messages", id="empty_messages_with_system"
+        ),
+        pytest.param({"temperature": 5.0}, "temperature", id="temperature_too_high"),
+        pytest.param({"top_p": -0.1}, "top_p", id="top_p_negative"),
+        pytest.param({"top_k": -1}, "top_k", id="top_k_negative"),
+    ],
+)
+def test_request_bounds_are_enforced_by_the_model(overrides, field):
+    """These reach the sampler or the engine unchecked otherwise.
 
-    Both streaming producers emit [DONE] only after the response is complete,
-    so its absence means the stream was cut short. Closing the message with
-    message_stop / end_turn there would hand the client a partial answer
-    labelled as complete -- it would neither retry nor warn, and the user would
-    silently receive truncated output. An error event is recoverable; a
-    plausible wrong answer is not.
+    max_tokens is forwarded to max_completion_tokens, where 0 or negative is
+    meaningless. The empty-conversation case matters most with `system` set:
+    _convert_messages prepends the system message, so any emptiness check that
+    runs after conversion sees a non-empty list and lets the request through.
     """
+    body = {
+        "model": MODEL,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    body.update(overrides)
 
-    async def source():
-        yield f"data: {chunk({'role': 'assistant', 'content': 'par'}).model_dump_json()}\n\n"
-        yield f"data: {chunk({'content': 'tial'}).model_dump_json()}\n\n"
-        # Upstream disconnects here: no finish_reason chunk, no [DONE].
+    with pytest.raises(ValidationError) as excinfo:
+        AnthropicMessagesRequest(**body)
 
-    async def collect():
-        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+    assert field in str(excinfo.value)
 
-    events = parse_frames(asyncio.run(collect()))
-    names = [name for name, _ in events]
 
-    assert "error" in names, f"expected an error event, got {names}"
-    assert "message_stop" not in names, (
-        f"a truncated stream must not report a clean stop; got {names}"
+def test_unknown_content_block_is_named_in_the_error():
+    """The union has a catch-all so this branch is reachable.
+
+    A closed union rejects an unmodelled block at the FastAPI boundary, and the
+    client gets an error listing every failed union member instead of one
+    naming the block it sent.
+    """
+    request = AnthropicMessagesRequest(
+        model=MODEL,
+        max_tokens=16,
+        messages=[{"role": "user", "content": [{"type": "document", "source": {}}]}],
     )
 
-    error_payload = next(payload for name, payload in events if name == "error")
-    assert error_payload["error"]["type"] == "api_error"
-    # The message has to name the actual failure: "internal server error" would
-    # send whoever debugs this looking at the wrong layer.
-    assert "[DONE]" in error_payload["error"]["message"]
+    with pytest.raises(AnthropicRequestError, match="document"):
+        convert_anthropic_request(request)
 
-    # The partial text is still delivered -- the client can show what arrived,
-    # it just must not be told the turn ended normally.
-    text = "".join(
-        payload["delta"]["text"]
-        for name, payload in events
-        if name == "content_block_delta" and payload["delta"]["type"] == "text_delta"
+
+def test_image_block_without_url_or_data_is_rejected():
+    """Url and data are both Optional, so a source can validate yet carry none.
+
+    Dropping it would send the model a prompt missing content the client
+    believes it attached.
+    """
+    request = AnthropicMessagesRequest(
+        model=MODEL,
+        max_tokens=16,
+        messages=[
+            {
+                "role": "user",
+                "content": [{"type": "image", "source": {"type": "base64"}}],
+            }
+        ],
     )
-    assert text == "partial"
+
+    with pytest.raises(AnthropicRequestError, match="no url or data"):
+        convert_anthropic_request(request)
+
+
+def test_assistant_tool_use_beside_an_image_is_rejected():
+    """The assembled chat message carries text plus tool_calls only.
+
+    An image alongside them has nowhere to go and would vanish silently.
+    """
+    request = AnthropicMessagesRequest(
+        model=MODEL,
+        max_tokens=16,
+        messages=[
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "image", "source": {"type": "url", "url": "http://example/i.png"}},
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}},
+                ],
+            },
+        ],
+    )
+
+    with pytest.raises(AnthropicRequestError, match="combining tool_use"):
+        convert_anthropic_request(request)
+
+
+def test_tool_use_outside_an_assistant_message_is_rejected():
+    """Only an assistant turn can carry tool_use.
+
+    Anywhere else the accumulated calls have no destination in the chat
+    message and were previously discarded without a diagnostic.
+    """
+    request = AnthropicMessagesRequest(
+        model=MODEL,
+        max_tokens=16,
+        messages=[
+            {
+                "role": "user",
+                "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}],
+            }
+        ],
+    )
+
+    with pytest.raises(AnthropicRequestError, match="only valid in assistant"):
+        convert_anthropic_request(request)
+
+
+def test_cached_tokens_exceeding_prompt_tokens_is_logged(monkeypatch):
+    """The clamp keeps the response well-formed but must not hide the cause.
+
+    input_tokens=0 next to a large cache_read_input_tokens is only reachable
+    through an upstream accounting error, and nothing else would surface it.
+
+    The warning is asserted on the logger directly rather than through caplog:
+    tensorrt_llm.logger does not propagate to the stdlib root, so caplog sees
+    nothing and the test would pass without the warning existing.
+    """
+    import tensorrt_llm.serve.anthropic_adapter as adapter
+
+    warnings = []
+    monkeypatch.setattr(adapter.logger, "warning", warnings.append)
+
+    usage = UsageInfo(prompt_tokens=5, completion_tokens=1, total_tokens=6)
+    usage.prompt_tokens_details = PromptTokensDetails(cached_tokens=99)
+
+    converted = adapter.convert_usage(usage)
+
+    assert converted.input_tokens == 0
+    assert converted.cache_read_input_tokens == 99
+    assert any("exceeds prompt_tokens" in str(w) for w in warnings), warnings

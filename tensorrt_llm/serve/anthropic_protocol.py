@@ -25,7 +25,7 @@ models emit only the fields this server populates.
 
 import time
 import uuid
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -81,6 +81,19 @@ class AnthropicRedactedThinkingBlock(AnthropicBaseModel):
     data: Optional[str] = None
 
 
+class AnthropicUnknownBlock(AnthropicBaseModel):
+    """Catch-all so an unrecognised block reaches the adapter.
+
+    Without a permissive last member the union is closed, and a block type this
+    server does not model fails validation at the FastAPI boundary: the client
+    gets an error listing every failed union member instead of a message naming
+    the block, and the adapter's own handling for unsupported blocks is
+    unreachable.
+    """
+
+    type: str
+
+
 AnthropicContentBlock = Union[
     AnthropicTextBlock,
     AnthropicImageBlock,
@@ -88,6 +101,8 @@ AnthropicContentBlock = Union[
     AnthropicToolResultBlock,
     AnthropicThinkingBlock,
     AnthropicRedactedThinkingBlock,
+    # Last: pydantic tries members in order, so the typed ones win.
+    AnthropicUnknownBlock,
 ]
 
 AnthropicToolResultBlock.model_rebuild()
@@ -149,21 +164,67 @@ class AnthropicToolChoice(AnthropicBaseModel):
 # ---------------------------------------------------------------------------
 
 
+class AnthropicThinkingEnabled(AnthropicBaseModel):
+    """Extended thinking with an explicit budget.
+
+    Anthropic's documented floor is 1024; below that the budget cannot hold a
+    usable reasoning trace. Enforced here so the client gets a field-level 400
+    rather than a message assembled by hand in the adapter.
+    """
+
+    type: Literal["enabled"] = "enabled"
+    budget_tokens: int = Field(ge=1024)
+
+
+class AnthropicThinkingAdaptive(AnthropicBaseModel):
+    """Thinking on, budget left to the server.
+
+    extra="forbid" overrides the permissive base: these variants take no
+    budget, and accepting one silently would let a client believe it had set a
+    budget that is in fact ignored.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    type: Literal["adaptive"] = "adaptive"
+
+
+class AnthropicThinkingDisabled(AnthropicBaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    type: Literal["disabled"] = "disabled"
+
+
+AnthropicThinkingConfig = Annotated[
+    Union[AnthropicThinkingEnabled, AnthropicThinkingAdaptive, AnthropicThinkingDisabled],
+    Field(discriminator="type"),
+]
+
+
 class AnthropicMessagesRequest(AnthropicBaseModel):
     model: str
-    messages: List[AnthropicMessage]
-    max_tokens: int
+    # min_length is the only guard that catches an empty conversation. The
+    # check in convert_anthropic_request runs after _convert_messages, which
+    # prepends a system message when `system` is set -- so the converted list
+    # is non-empty and the request reaches the engine with nothing to answer.
+    messages: List[AnthropicMessage] = Field(min_length=1)
+    # Forwarded to max_completion_tokens, where 0 or a negative is meaningless.
+    max_tokens: int = Field(ge=1)
     system: Optional[Union[str, List[AnthropicTextBlock]]] = None
     tools: Optional[List[AnthropicTool]] = None
     tool_choice: Optional[AnthropicToolChoice] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
+    # Anthropic's documented ranges. Rejecting here turns a sampler-level
+    # failure deep in the engine into a 400 naming the offending field.
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    top_k: Optional[int] = Field(default=None, ge=0)
     stop_sequences: Optional[List[str]] = None
     stream: Optional[bool] = False
     metadata: Optional[Dict[str, Any]] = None
-    # Extended-thinking control; consumed on a best-effort basis.
-    thinking: Optional[Dict[str, Any]] = None
+    # Extended-thinking control. A discriminated union, so an unknown type or
+    # a budget below the floor is rejected by the model and surfaces through
+    # the Anthropic error envelope like any other field.
+    thinking: Optional[AnthropicThinkingConfig] = None
     # Claude Code attaches output_config (effort, format) and betas.
     output_config: Optional[Dict[str, Any]] = None
     betas: Optional[List[str]] = None
@@ -184,11 +245,11 @@ class AnthropicCountTokensRequest(AnthropicBaseModel):
     """
 
     model: str
-    messages: List[AnthropicMessage]
+    messages: List[AnthropicMessage] = Field(min_length=1)
     system: Optional[Union[str, List[AnthropicTextBlock]]] = None
     tools: Optional[List[AnthropicTool]] = None
     tool_choice: Optional[AnthropicToolChoice] = None
-    thinking: Optional[Dict[str, Any]] = None
+    thinking: Optional[AnthropicThinkingConfig] = None
     output_config: Optional[Dict[str, Any]] = None
     betas: Optional[List[str]] = None
     context_management: Optional[Dict[str, Any]] = None
@@ -394,10 +455,6 @@ class AnthropicMessageDeltaEvent(AnthropicBaseModel):
 
 class AnthropicMessageStopEvent(AnthropicBaseModel):
     type: Literal["message_stop"] = "message_stop"
-
-
-class AnthropicPingEvent(AnthropicBaseModel):
-    type: Literal["ping"] = "ping"
 
 
 class AnthropicErrorEvent(AnthropicBaseModel):

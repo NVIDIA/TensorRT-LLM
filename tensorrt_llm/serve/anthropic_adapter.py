@@ -28,6 +28,7 @@ import json
 import re
 import traceback
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from fastapi.responses import JSONResponse
@@ -136,7 +137,7 @@ def _system_text_parts(system: Optional[Union[str, List[Any]]]) -> List[str]:
     return parts
 
 
-def _image_part(block: Any) -> Optional[Dict[str, Any]]:
+def _image_part(block: Any) -> Dict[str, Any]:
     source = block.source
     if source.type == "url" and source.url:
         return {"type": "image_url", "image_url": {"url": source.url}}
@@ -146,8 +147,10 @@ def _image_part(block: Any) -> Optional[Dict[str, Any]]:
             "type": "image_url",
             "image_url": {"url": f"data:{media_type};base64,{source.data}"},
         }
-    logger.warning("Anthropic image block with empty source dropped")
-    return None
+    # url and data are both Optional, so a source can validate yet carry no
+    # image. Dropping it would send the model a prompt missing content the
+    # client believes it attached.
+    raise AnthropicRequestError(f"image block with source type {source.type!r} has no url or data")
 
 
 def _tool_result_text(content: Any) -> str:
@@ -222,9 +225,7 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
             if block_type == "text":
                 parts.append({"type": "text", "text": block.text})
             elif block_type == "image":
-                image_part = _image_part(block)
-                if image_part is not None:
-                    parts.append(image_part)
+                parts.append(_image_part(block))
             elif block_type == "tool_use":
                 tool_calls.append(
                     {
@@ -259,9 +260,24 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
                     "redacted_thinking history is not supported by this server"
                 )
             else:
-                logger.warning(f"Unsupported Anthropic content block {block_type!r} skipped")
+                # Reachable via AnthropicUnknownBlock. Refusing beats dropping:
+                # a silently discarded block changes what the model is asked
+                # without the client ever learning the content did not arrive.
+                raise AnthropicRequestError(
+                    f"Anthropic content block type {block_type!r} is not supported by this server"
+                )
 
         if message.role == "assistant" and tool_calls:
+            non_text = [p for p in parts if p.get("type") != "text"]
+            if non_text:
+                # The chat message being built here carries text plus
+                # tool_calls; an image alongside them has nowhere to go and
+                # would be dropped without a trace.
+                kinds = sorted({p.get("type", "?") for p in non_text})
+                raise AnthropicRequestError(
+                    f"assistant messages combining tool_use with {kinds} content "
+                    "are not supported by this server"
+                )
             text_content = "".join(p["text"] for p in parts if p.get("type") == "text")
             assistant_message: Dict[str, Any] = {
                 "role": "assistant",
@@ -274,6 +290,13 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
             converted.append(assistant_message)
             parts.clear()
         else:
+            if tool_calls:
+                # Only an assistant turn can carry tool_use; anywhere else the
+                # accumulated calls have no destination in the chat message.
+                raise AnthropicRequestError(
+                    f"tool_use content blocks are only valid in assistant messages, "
+                    f"not {message.role!r}"
+                )
             flush_parts()
             if message.role == "assistant" and reasoning_parts:
                 converted.append(
@@ -292,11 +315,21 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
 def _convert_tools(request: AnthropicMessagesRequest) -> Optional[List[ChatCompletionToolsParam]]:
     if not request.tools:
         return None
-    if request.tool_choice is not None and request.tool_choice.type == "none":
-        return None
+    # tool_choice "none" forbids *calling* a tool, not knowing about one: the
+    # definitions stay in the rendered prompt. Dropping them would leave the
+    # model unable to interpret a later tool_result, and would change the
+    # rendered prefix on the turn a client switches auto -> none, discarding
+    # the KV prefix _convert_messages preserves. _convert_tool_choice carries
+    # the prohibition instead.
+    # "none" forbids calling anything, so a server tool listed under it can
+    # never be invoked and is not an error -- it is simply dropped. Client
+    # tools are still converted, so the rendered prefix stays stable.
+    forbids_calls = request.tool_choice is not None and request.tool_choice.type == "none"
     tools = []
     for tool in request.tools:
         if tool.is_server_tool():
+            if forbids_calls:
+                continue
             raise AnthropicRequestError(
                 f"Anthropic server tool {tool.name!r} (type={tool.type!r}) "
                 "is not supported by this server"
@@ -452,36 +485,16 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
     # mode from these template kwargs; without them, configuring the V4
     # reasoning parser alone leaves it in identity mode.
     chat_template_kwargs: Dict[str, Any] = {}
-    if request.thinking:
-        thinking_type = request.thinking.get("type")
-        if thinking_type == "enabled":
-            chat_template_kwargs["enable_thinking"] = True
-            budget_tokens = request.thinking.get("budget_tokens")
-            if (
-                isinstance(budget_tokens, bool)
-                or not isinstance(budget_tokens, int)
-                or budget_tokens < 1024
-            ):
-                raise AnthropicRequestError(
-                    "thinking.type='enabled' requires budget_tokens >= 1024"
-                )
-            if budget_tokens >= request.max_tokens:
+    if request.thinking is not None:
+        # The union already rejected an unknown type, a budget below the floor,
+        # and budget_tokens on a variant that does not take one. What remains
+        # is the cross-field rule, which spans two models and so cannot live
+        # on either of them.
+        chat_template_kwargs["enable_thinking"] = request.thinking.type != "disabled"
+        if request.thinking.type == "enabled":
+            if request.thinking.budget_tokens >= request.max_tokens:
                 raise AnthropicRequestError("thinking budget_tokens must be less than max_tokens")
-            chat_request["thinking_token_budget"] = budget_tokens
-        elif thinking_type == "adaptive":
-            if request.thinking.get("budget_tokens") is not None:
-                raise AnthropicRequestError(
-                    "thinking.type='adaptive' does not accept budget_tokens"
-                )
-            chat_template_kwargs["enable_thinking"] = True
-        elif thinking_type == "disabled":
-            if request.thinking.get("budget_tokens") is not None:
-                raise AnthropicRequestError(
-                    "thinking.type='disabled' does not accept budget_tokens"
-                )
-            chat_template_kwargs["enable_thinking"] = False
-        else:
-            raise AnthropicRequestError(f"Unsupported thinking type {thinking_type!r}")
+            chat_request["thinking_token_budget"] = request.thinking.budget_tokens
 
     if request.output_config:
         reasoning_effort = request.output_config.get("effort")
@@ -525,11 +538,12 @@ def convert_anthropic_count_tokens_request(
     that sizes its context against a stale number will either overflow the
     window or compact when it did not need to.
     """
+    # max_tokens only has to clear the thinking budget: convert_anthropic_request
+    # rejects a budget that is not strictly smaller, and counting must not fail
+    # on a request that would have been accepted.
     max_tokens = 1
-    if request.thinking and request.thinking.get("type") == "enabled":
-        budget_tokens = request.thinking.get("budget_tokens")
-        if isinstance(budget_tokens, int) and not isinstance(budget_tokens, bool):
-            max_tokens = budget_tokens + 1
+    if request.thinking is not None and request.thinking.type == "enabled":
+        max_tokens = request.thinking.budget_tokens + 1
     messages_request = AnthropicMessagesRequest(
         model=request.model,
         messages=request.messages,
@@ -576,6 +590,15 @@ def convert_usage(usage: Optional[UsageInfo]) -> AnthropicUsage:
     cached = 0
     if usage.prompt_tokens_details is not None:
         cached = usage.prompt_tokens_details.cached_tokens or 0
+    if cached > usage.prompt_tokens:
+        # Only reachable through an upstream accounting error. Clamping keeps
+        # the response well-formed, but silently reporting input_tokens=0 next
+        # to a large cache_read_input_tokens would hide the inconsistency from
+        # anyone reconciling token counts.
+        logger.warning(
+            f"cached_tokens ({cached}) exceeds prompt_tokens "
+            f"({usage.prompt_tokens}); reporting input_tokens=0"
+        )
     input_tokens = max(usage.prompt_tokens - cached, 0)
     anthropic_usage = AnthropicUsage(
         input_tokens=input_tokens,
@@ -644,6 +667,27 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _ToolCallStream:
+    """Everything known about one upstream tool call, keyed by its index.
+
+    Upstream tells parallel calls apart with ``tool_call.index`` and may emit
+    fragments of several of them in a single chunk (see the loop over parsed
+    calls in ``postprocess_handlers``), while the Anthropic protocol only ever
+    has one content block open. Each call therefore needs its own record, so
+    fragments arriving while another call owns the open block can be buffered
+    in ``pending`` instead of dropped.
+    """
+
+    key: Any
+    id: str
+    name: Optional[str] = None
+    #: Argument fragments received while this call did not own the open block.
+    pending: List[str] = field(default_factory=list)
+    #: Whether a content_block_start was already emitted for this call.
+    started: bool = False
+
+
 class AnthropicStreamReframer:
     """Stateful reframer from OpenAI chat chunks to Anthropic SSE events.
 
@@ -661,6 +705,13 @@ class AnthropicStreamReframer:
     block of another type (or another tool call) is opened; block indices are
     monotonically increasing; the delta type always matches the open block
     type.
+
+    Because blocks are strictly sequential, upstream tool calls that interleave
+    are *serialised* here rather than passed through: the call that owns the
+    open block keeps streaming its arguments, and every other call accumulates
+    in :class:`_ToolCallStream.pending` until its own block is opened. No
+    argument fragment is ever discarded, so each call's concatenated
+    ``partial_json`` is exactly what upstream sent for it.
     """
 
     def __init__(self, model: str):
@@ -669,7 +720,13 @@ class AnthropicStreamReframer:
         self.message_started = False
         self.block_index = -1
         self.open_block_type: Optional[str] = None
-        self.open_tool_index: Optional[int] = None
+        # Upstream index of the tool call whose block is currently open.
+        self.open_tool_key: Optional[Any] = None
+        # Per-upstream-index tool call state. Insertion order is preserved and
+        # is the order the tool_use blocks are emitted in.
+        self.tool_calls: Dict[Any, _ToolCallStream] = {}
+        # Counter for calls that arrive without an index; see _tool_call_state.
+        self.unindexed_calls = 0
         # Whether this stream emitted any tool_use block, which decides the
         # terminating stop_reason; see finish().
         self.emitted_tool_use = False
@@ -684,16 +741,13 @@ class AnthropicStreamReframer:
             return []
         event = AnthropicContentBlockStopEvent(index=self.block_index)
         self.open_block_type = None
-        self.open_tool_index = None
+        self.open_tool_key = None
         return [anthropic_sse(event)]
 
-    def _open_block(
-        self, block: Any, block_type: str, tool_index: Optional[int] = None
-    ) -> List[str]:
+    def _open_block(self, block: Any, block_type: str) -> List[str]:
         frames = self._close_block()
         self.block_index += 1
         self.open_block_type = block_type
-        self.open_tool_index = tool_index
         if block_type == "tool_use":
             self.emitted_tool_use = True
         frames.append(
@@ -706,11 +760,120 @@ class AnthropicStreamReframer:
     def _ensure_block(self, block_type: str) -> List[str]:
         if self.open_block_type == block_type:
             return []
+        # A block cannot receive deltas once another block opens, so any tool
+        # call still holding buffered arguments has to be emitted before text
+        # or thinking takes the open slot.
+        frames = self._flush_pending_tool_calls()
         if block_type == "text":
-            return self._open_block(AnthropicTextBlock(text=""), "text")
-        if block_type == "thinking":
-            return self._open_block(AnthropicThinkingBlock(thinking=""), "thinking")
-        raise ValueError(f"unexpected block type {block_type}")
+            frames.extend(self._open_block(AnthropicTextBlock(text=""), "text"))
+        elif block_type == "thinking":
+            frames.extend(self._open_block(AnthropicThinkingBlock(thinking=""), "thinking"))
+        else:
+            raise ValueError(f"unexpected block type {block_type}")
+        return frames
+
+    # -- tool call bookkeeping ------------------------------------------------
+
+    def _tool_call_state(self, tool_call: Any) -> Optional[_ToolCallStream]:
+        """Return the record for ``tool_call``, creating it on first sight.
+
+        ``None`` means the fragment cannot be attributed to any call and the
+        caller has to skip it.
+        """
+        function = tool_call.function
+        key = tool_call.index
+        if key is None:
+            # Without an index, a name is the only signal that a new call
+            # started; unnamed fragments belong to the call currently being
+            # streamed, or failing that to the most recently seen one.
+            if function.name:
+                self.unindexed_calls += 1
+                key = f"unindexed-{self.unindexed_calls}"
+            elif self.open_tool_key is not None:
+                key = self.open_tool_key
+            elif self.tool_calls:
+                key = next(reversed(self.tool_calls))
+            else:
+                logger.warning(
+                    "Dropping tool argument fragment that belongs to no known "
+                    "tool call (upstream sent neither an index nor a name)"
+                )
+                return None
+
+        state = self.tool_calls.get(key)
+        if state is None:
+            state = _ToolCallStream(
+                key=key,
+                id=tool_call.id or f"toolu_{uuid.uuid4().hex}",
+                name=function.name,
+            )
+            self.tool_calls[key] = state
+            return state
+        # Some producers repeat the id and name on every fragment of one call -
+        # the forced tool_choice path in postprocess_handlers does - so a
+        # repeat must not start a second call. Late values only fill in what
+        # was missing, and never after the block start announced them.
+        if not state.started:
+            if function.name and not state.name:
+                state.name = function.name
+            if tool_call.id:
+                state.id = tool_call.id
+        return state
+
+    def _tool_argument_deltas(self, fragments: List[str]) -> List[str]:
+        return [
+            anthropic_sse(
+                AnthropicContentBlockDeltaEvent(
+                    index=self.block_index,
+                    delta=AnthropicInputJsonDelta(partial_json=fragment),
+                )
+            )
+            for fragment in fragments
+            if fragment
+        ]
+
+    def _open_tool_call_block(self, state: _ToolCallStream) -> List[str]:
+        """Give ``state`` the open block and flush everything buffered for it."""
+        block = AnthropicToolUseBlock(id=state.id, name=state.name, input={})
+        frames = self._open_block(block, "tool_use")
+        self.open_tool_key = state.key
+        state.started = True
+        frames.extend(self._tool_argument_deltas(state.pending))
+        state.pending.clear()
+        return frames
+
+    def _flush_pending_tool_calls(self) -> List[str]:
+        """Emit a complete block for every call still holding buffered arguments."""
+        frames: List[str] = []
+        for state in list(self.tool_calls.values()):
+            if state.key == self.open_tool_key:
+                # Fragments for the open call stream immediately, so this is
+                # only defensive.
+                frames.extend(self._tool_argument_deltas(state.pending))
+                state.pending.clear()
+                continue
+            if state.started and not state.pending:
+                continue
+            if not state.name:
+                # A tool_use block has no way to say which tool to run.
+                logger.warning(
+                    f"Dropping tool call arguments for index {state.key!r}: "
+                    "upstream never sent a tool name"
+                )
+                state.pending.clear()
+                continue
+            if state.started:
+                # Arguments arrived after this call's block was already closed
+                # by non-tool content. No known producer resumes a call that
+                # way; emitting the remainder under the same tool_use id at
+                # least keeps it recoverable, whereas dropping it hands the
+                # client silently truncated arguments.
+                logger.warning(
+                    f"Tool call {state.name!r} (index {state.key!r}) continued after its "
+                    "content block closed; emitting the remaining arguments in a second block"
+                )
+            frames.extend(self._open_tool_call_block(state))
+        return frames
 
     # -- chunk handling -------------------------------------------------------
 
@@ -784,48 +947,25 @@ class AnthropicStreamReframer:
                 function = tool_call.function
                 if function is None:
                     continue
-                # A named fragment starts a new tool call only when it is
-                # not the call already open. Some producers repeat the name on
-                # every chunk - the forced tool_choice path in
-                # postprocess_handlers does - and reopening on each one splits
-                # a single call into one block per fragment, so the
-                # accumulated partial_json is never valid JSON. Parallel calls
-                # still get their own block because they carry distinct
-                # indices; when no index is available a named fragment still
-                # opens a block, since that is the only way to keep parallel
-                # calls apart.
-                same_call_already_open = (
-                    self.open_block_type == "tool_use"
-                    and tool_call.index is not None
-                    and self.open_tool_index is not None
-                    and tool_call.index == self.open_tool_index
-                )
-                if function.name and not same_call_already_open:
-                    block = AnthropicToolUseBlock(
-                        id=tool_call.id or f"toolu_{uuid.uuid4().hex}",
-                        name=function.name,
-                        input={},
-                    )
-                    frames.extend(self._open_block(block, "tool_use", tool_index=tool_call.index))
+                state = self._tool_call_state(tool_call)
+                if state is None:
+                    continue
+                if not state.started and state.name and self.open_block_type != "tool_use":
+                    # Nothing else is streaming, so this call can take the open
+                    # block right away and have its arguments forwarded
+                    # incrementally - the single-call case, and the first of a
+                    # parallel batch.
+                    frames.extend(self._open_tool_call_block(state))
                 if function.arguments:
-                    if self.open_block_type != "tool_use" or (
-                        tool_call.index is not None
-                        and self.open_tool_index is not None
-                        and tool_call.index != self.open_tool_index
-                    ):
-                        logger.warning(
-                            "Dropping tool argument fragment without a matching "
-                            f"open tool_use block (index={tool_call.index})"
-                        )
-                        continue
-                    frames.append(
-                        anthropic_sse(
-                            AnthropicContentBlockDeltaEvent(
-                                index=self.block_index,
-                                delta=AnthropicInputJsonDelta(partial_json=function.arguments),
-                            )
-                        )
-                    )
+                    if state.key == self.open_tool_key:
+                        frames.extend(self._tool_argument_deltas([function.arguments]))
+                    else:
+                        # Another call owns the open block. Buffer rather than
+                        # drop: this call gets its own block once the open one
+                        # closes, and the fragments are replayed there in
+                        # order, so its partial_json still concatenates to
+                        # exactly what upstream sent.
+                        state.pending.append(function.arguments)
             if choice.finish_reason:
                 self.stop_reason, self.stop_sequence = _map_stop_result(
                     choice.finish_reason, choice.stop_reason
@@ -834,8 +974,13 @@ class AnthropicStreamReframer:
         return frames
 
     def finish(self) -> List[str]:
-        frames = self._close_block()
-        frames.extend(self._start_message(None))  # degenerate empty stream
+        frames = self._start_message(None)  # degenerate empty stream
+        # Tool calls that never got the open block are emitted here as complete
+        # blocks. This also has to run before the stop_reason is computed, so
+        # that a stream whose only tool call was buffered still reports
+        # stop_reason="tool_use".
+        frames.extend(self._flush_pending_tool_calls())
+        frames.extend(self._close_block())
         stop_reason = self.stop_reason
         stop_sequence = self.stop_sequence
         if self.emitted_tool_use and stop_reason != "max_tokens":

@@ -22,7 +22,7 @@ from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
                     AsyncIterator, Dict, List, Optional, Tuple, Union)
 
 import uvicorn
-from fastapi import Body, Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
@@ -1187,6 +1187,12 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:
+            return
+        # A batched request is synthesised without a client socket, so
+        # is_disconnected() can never become true and this poll would run at
+        # 1Hz for the life of the process, holding the Request and its
+        # RequestOutput -- one leaked task per batched request.
+        if getattr(raw_request.state, "no_client_connection", False):
             return
         while not await raw_request.is_disconnected():
             await asyncio.sleep(1)
@@ -2578,7 +2584,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def anthropic_list_batches(
             self,
-            limit: int = 20,
+            # Validated here rather than clamped in the store: clamping turned
+            # limit=0 into 1 instead of a 400, and bounded the page against the
+            # retention limit, which is an unrelated quantity.
+            limit: int = Query(20, ge=1, le=100),
             after_id: Optional[str] = None,
             before_id: Optional[str] = None) -> Response:
         try:

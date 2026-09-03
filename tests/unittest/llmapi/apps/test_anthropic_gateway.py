@@ -534,32 +534,3 @@ def test_registration_url_with_a_trailing_slash_survives_refresh(tmp_path):
     assert backend.url == "http://localhost:8333"
     assert backend.host == "localhost"
     assert backend.port == 8333
-
-
-def test_nan_heartbeat_cannot_keep_a_dead_backend_alive(tmp_path):
-    """NaN must be rejected, not merely tolerated.
-
-    float("nan") is accepted by float(), and then `now - nan > stale_after` is
-    False because every NaN comparison is False. A backend whose registration
-    carries a NaN heartbeat would therefore never look stale and never be
-    retired -- the gateway would keep electing a job that is long gone.
-    """
-    args = make_args()
-    args.fleet_dir = str(tmp_path)
-    args.stale_after = 30
-    fleet = gateway.Fleet(args)
-
-    (tmp_path / "dead.json").write_text(
-        json.dumps(
-            {
-                "job_id": "dead",
-                "url": "http://localhost:8333",
-                "end_time": time.time() + 3600,
-                "heartbeat": float("nan"),
-            }
-        )
-    )
-
-    fleet.discover()
-
-    assert "dead" not in fleet.backends

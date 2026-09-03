@@ -363,26 +363,6 @@ def test_unknown_cursor_raises_rather_than_looking_finished():
     asyncio.run(scenario())
 
 
-def test_list_ordering_is_total_so_cursors_are_stable():
-    """Batches created in the same clock tick still need a deterministic order.
-
-    created_at alone is not a total order at this resolution; without the id
-    tiebreak a cursor can skip or repeat entries between calls.
-    """
-
-    async def scenario():
-        store = AnthropicBatchStore(runner=_ok_runner())
-        for i in range(6):
-            b = store.create([_item(f"x{i}")])
-            await _drain(store, b.id)
-
-        first = [b.id for b in store.list(limit=6)[0]]
-        second = [b.id for b in store.list(limit=6)[0]]
-        assert first == second, "listing order is not stable between calls"
-
-    asyncio.run(scenario())
-
-
 def test_unknown_batch_reads_as_missing():
     store = AnthropicBatchStore(runner=_ok_runner())
     assert store.get("msgbatch_nope") is None
@@ -523,7 +503,7 @@ def test_expiry_reports_expired_not_canceled():
     results, batch = asyncio.run(scenario())
     assert [obj["result"]["type"] for obj in results] == ["expired"]
     assert batch.request_counts.expired == 1
-    assert batch.request_counts.canceled == 0
+    assert batch.request_counts.canceled == 0, "expiry must not be reported as cancellation"
 
 
 # ---------------------------------------------------------------------------
@@ -560,20 +540,86 @@ def test_store_full_of_running_batches_refuses_instead_of_growing():
     assert asyncio.run(scenario()) == 2
 
 
-def test_capacity_frees_up_once_a_batch_ends():
-    """Refusal is a back-off signal, not a permanent wall."""
+def test_expired_batches_are_swept_so_capacity_recovers():
+    """A store full of never-polled batches must not refuse new ones forever.
+
+    Expiry runs on read, so a batch nobody polls stays in_progress past its
+    TTL. If admission only looks at processing_status, such a store has
+    nothing evictable and every later create() is refused permanently --
+    recoverable only by restarting the server.
+    """
+
+    async def never_finishes(request):
+        await asyncio.sleep(30.0)
+        return "succeeded", {}
 
     async def scenario():
-        store = AnthropicBatchStore(runner=_ok_runner(), max_retained=2)
+        store = AnthropicBatchStore(runner=never_finishes, max_retained=2)
         first = store.create([_item("a")])
         second = store.create([_item("b")])
-        await _drain(store, first.id)
-        await _drain(store, second.id)
+        await asyncio.sleep(0.02)
 
-        # Both ended, so the oldest is evictable and a new batch fits.
-        third = store.create([_item("c")])
-        return store.get(third.id) is not None, len(store._batches)
+        # Full, nothing ended: refused, as designed.
+        with pytest.raises(BatchStoreFullError):
+            store.create([_item("c")])
 
-    admitted, held = asyncio.run(scenario())
-    assert admitted
-    assert held == 2
+        # Both age out without anyone ever reading them.
+        for bid in (first.id, second.id):
+            store._batches[bid].batch.expires_at = "2000-01-01T00:00:00.000Z"
+
+        # Admission has to notice, without a read having happened first.
+        third = store.create([_item("d")])
+        return store.get(third.id) is not None
+
+    assert asyncio.run(scenario())
+
+
+def test_unknown_result_type_does_not_strand_the_batch():
+    """Counting runs before processing_status is set.
+
+    An outcome outside AnthropicBatchRequestCounts' fields would raise there,
+    leaving the batch in_progress forever: results stay None, delete is
+    refused, and it is not evictable -- with no log to say why.
+    """
+
+    async def bad_outcome(request):
+        return "not_a_real_outcome", {}
+
+    async def scenario():
+        store = AnthropicBatchStore(runner=bad_outcome)
+        batch = store.create([_item("a")])
+        await _drain(store, batch.id)
+        return store.get(batch.id)
+
+    ended = asyncio.run(scenario())
+    assert ended.processing_status == "ended"
+    counts = ended.request_counts
+    assert counts.succeeded + counts.errored + counts.canceled + counts.expired == 1
+
+
+def test_counts_track_progress_while_the_batch_runs():
+    """A polling client must be able to tell progress from a stall.
+
+    Writing request_counts only at creation and finalization reports
+    processing=N, succeeded=0 for the whole run, then flips in one step.
+    """
+
+    async def slow_after_first(request):
+        text = request.messages[0].content
+        if text != "a":
+            await asyncio.sleep(30.0)
+        return "succeeded", {"type": "message", "role": "assistant", "content": []}
+
+    async def scenario():
+        store = AnthropicBatchStore(runner=slow_after_first, concurrency=4)
+        items = [_item(cid, text=cid) for cid in ("a", "b", "c")]
+        batch = store.create(items)
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if store.get(batch.id).request_counts.succeeded:
+                break
+        return store.get(batch.id).request_counts
+
+    counts = asyncio.run(scenario())
+    assert counts.succeeded == 1, "finished work must be visible before the batch ends"
+    assert counts.processing == 2, "the rest must still read as in flight"

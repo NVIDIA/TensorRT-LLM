@@ -477,8 +477,15 @@ class OpenAIDisaggServer:
             logger.error(
                 f"Upstream HTTP error {status} {exception.message}: ",
                 traceback.format_exc())
-            raise HTTPException(status_code=status,
-                                detail=exception.message) from exception
+            # exception.message is the worker's raw response body (up to 2048
+            # chars, built in openai_client.post_json/_send_request). Forwarding
+            # it verbatim publishes the worker's URL and internals to every
+            # caller, so it goes through the same unwrapping the Anthropic
+            # route uses. This branch is shared with /v1/completions and
+            # /v1/chat/completions, so those get the same treatment.
+            raise HTTPException(
+                status_code=status,
+                detail=_upstream_error_message(exception)) from exception
         elif isinstance(exception, HTTPException):
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())

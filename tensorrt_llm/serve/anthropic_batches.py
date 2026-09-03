@@ -38,7 +38,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.anthropic_protocol import (
@@ -135,7 +135,14 @@ class _BatchRecord:
 
 # Runs one Messages request and returns (result_type, payload). Supplied by the
 # server so this module stays free of engine and HTTP concerns.
-BatchItemRunner = Callable[[AnthropicMessagesRequest], Awaitable[Tuple[str, Dict[str, Any]]]]
+# Only these two outcomes come from the runner; canceled and expired are
+# recorded by _finalize's padding. Typing it keeps an unexpected value from
+# reaching the counter in _finalize, where setattr on a field that does not
+# exist would raise and strand the batch.
+BatchItemOutcome = Literal["succeeded", "errored"]
+BatchItemRunner = Callable[
+    [AnthropicMessagesRequest], Awaitable[Tuple[BatchItemOutcome, Dict[str, Any]]]
+]
 
 
 class BatchStoreFullError(RuntimeError):
@@ -202,8 +209,19 @@ class AnthropicBatchStore:
         record = _BatchRecord(batch=batch, items=list(items))
         self._batches[batch.id] = record
         record.task = asyncio.create_task(self._run(record))
+        # Nothing awaits this task, so without a callback an exception escaping
+        # _run is never retrieved and the batch stalls with no diagnostic.
+        record.task.add_done_callback(lambda task, bid=batch.id: self._log_task_outcome(task, bid))
         logger.info(f"Anthropic batch {batch.id} created with {len(items)} request(s)")
         return batch
+
+    @staticmethod
+    def _log_task_outcome(task: asyncio.Task, batch_id: str) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(f"Anthropic batch {batch_id} worker died: {exc!r}")
 
     def get(self, batch_id: str) -> Optional[AnthropicMessageBatch]:
         record = self._batches.get(batch_id)
@@ -225,7 +243,10 @@ class AnthropicBatchStore:
         # Clamp before slicing: a negative limit would turn batches[:limit]
         # into "all but the last N", silently hiding the newest batches from a
         # client that asked for fewer.
-        limit = max(1, min(int(limit), self._max_retained))
+        # The route validates the range; this only guards direct callers.
+        # Deliberately not bounded by _max_retained: retention is how many
+        # batches are kept, not how many fit on a page.
+        limit = max(1, int(limit))
         records = list(self._batches.values())
         for record in records:
             self._expire_if_due(record)
@@ -320,6 +341,11 @@ class AnthropicBatchStore:
         """Make room for one more batch. False if the store is full of live work."""
         if len(self._batches) < self._max_retained:
             return True
+        # Expiry is lazy -- it runs on read. A batch nobody polls therefore
+        # stays in_progress past its TTL, and without this sweep a store full
+        # of such batches has nothing evictable and refuses new ones forever.
+        for record in list(self._batches.values()):
+            self._expire_if_due(record)
         # Drop the oldest ended batch. Never evict one that is still running:
         # losing a live batch would strand the client polling it.
         ended = [
@@ -399,11 +425,38 @@ class AnthropicBatchStore:
             # a cancelled task keeps the results it already earned; _finalize
             # pads only what never ran.
             record.results.append(_ItemResult(item.custom_id, result_type, payload))
+            self._recount(record)
 
+        # A queue with a fixed worker pool, not one task per item: gather()
+        # would allocate a coroutine frame and a Task for every request before
+        # any work starts, which at the admission limit is 100k of them.
+        #
+        # Two limits stack here and both are load-bearing. The pool caps how
+        # much of THIS batch runs at once; the semaphore inside run_one caps
+        # the total across ALL batches, which the pool cannot do -- N batches
+        # each with a full pool would otherwise put N * concurrency requests
+        # in flight against an engine that is also serving interactive traffic.
+        queue: asyncio.Queue = asyncio.Queue()
+        for item in record.items:
+            queue.put_nowait(item)
+
+        async def worker() -> None:
+            while True:
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                await run_one(item)
+
+        workers = [
+            asyncio.create_task(worker()) for _ in range(min(self._concurrency, len(record.items)))
+        ]
         try:
-            await asyncio.gather(*(run_one(item) for item in record.items))
+            await asyncio.gather(*workers)
         except asyncio.CancelledError:
-            # Expiry cancels the task; whatever finished is already recorded.
+            # Expiry cancels the batch task; whatever finished is recorded.
+            for task in workers:
+                task.cancel()
             raise
         finally:
             self._finalize(record)
@@ -424,12 +477,32 @@ class AnthropicBatchStore:
                 for item in record.items
                 if item.custom_id not in done
             )
-        counts = AnthropicBatchRequestCounts()
-        for result in record.results:
-            setattr(counts, result.result_type, getattr(counts, result.result_type) + 1)
-        record.batch.request_counts = counts
+        self._recount(record, remaining_as_processing=False)
         record.batch.processing_status = "ended"
         record.batch.ended_at = _rfc3339(_now())
+
+    def _recount(self, record: _BatchRecord, remaining_as_processing: bool = True) -> None:
+        """Recompute request_counts from the results recorded so far.
+
+        Called as each result lands as well as at finalization, so a polling
+        client sees progress instead of `processing=N, succeeded=0` for the
+        whole run followed by a single jump.
+        """
+        counts = AnthropicBatchRequestCounts()
+        for result in record.results:
+            if not hasattr(counts, result.result_type):
+                # Counting runs before processing_status is set, so raising
+                # here would leave the batch in_progress forever: results stay
+                # None, delete is refused, and it is not evictable.
+                logger.error(
+                    f"Anthropic batch {record.batch.id} produced unknown result type "
+                    f"{result.result_type!r} for {result.custom_id}; counting it as errored"
+                )
+                result.result_type = "errored"
+            setattr(counts, result.result_type, getattr(counts, result.result_type) + 1)
+        if remaining_as_processing:
+            counts.processing = len(record.items) - len(record.results)
+        record.batch.request_counts = counts
         # Relative rather than absolute: the server does not reliably know the
         # scheme/host a client reached it by, and a wrong absolute URL is worse
         # than a relative one the client can resolve itself.
