@@ -8,15 +8,21 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.mapping import Mapping
 
 from ..linear import Linear
+from ..low_m_gemm import low_m_gemm_fused_epilogue_enabled
 from ..mamba.layernorm_gated import RMSNorm as TritonRMSNorm
 from .hyper_connection_kernels import hc_combine, hc_combine_norm, hc_gate_mix, hc_silu
 
 __all__ = ["GroupedRMSNorm", "HCResidual", "Qwen4ExpHyperConnection"]
 
 _PACKED_PROJECTION_ALIGNMENT = 16
+_TMA_STRIDE_ALIGNMENT_BYTES = 16
+# M=8 is supported by both kernels but does not beat the ordinary per-layer
+# graph path. Keep capability in the primitives and policy here evidence-bound.
+_FUSED_MIX_ROWS = frozenset((1, 2, 4))
 
 
 class GroupedRMSNorm(TritonRMSNorm):
@@ -132,6 +138,7 @@ class Qwen4ExpHyperConnection(nn.Module):
         self.params_dtype = dtype
         self.use_mix = use_mix
         self.use_combine = use_combine
+        self._fused_mix_requested = use_mix and low_m_gemm_fused_epilogue_enabled()
 
         norm_dim = hidden_size * hc_count if hc_per_branch_norm else hidden_size
         norm_group_size = hidden_size if hc_per_branch_norm else None
@@ -177,6 +184,11 @@ class Qwen4ExpHyperConnection(nn.Module):
                 mapping=mapping,
                 reduce_output=False,
                 use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            )
+            self.register_buffer(
+                "_input_mix_weight_up_interleaved",
+                None,
+                persistent=False,
             )
             if device is not None:
                 self.input_mix_weight_up.to(device=device)
@@ -268,6 +280,13 @@ class Qwen4ExpHyperConnection(nn.Module):
     ) -> Tuple[torch.Tensor, HCResidual]:
         """Project a normalized HC bundle and retain its combine logits."""
         hc, hs = self.hc_count, self.hidden_size
+        # Graph batches use exact power-of-two rows. Keep all other calls off
+        # the eligibility helper so the ordinary eager path does not pay for it.
+        if self._fused_mix_requested and normed.ndim == 2 and normed.shape[0] in _FUSED_MIX_ROWS:
+            fused = self._fused_mix_normed(normed)
+            if fused is not None:
+                mixed, injection_logits = fused
+                return mixed, (hyper_input, injection_logits)
         if self.use_combine:
             packed = self._packed_down_and_injection(normed)
             down = packed[..., : self.hc_lowrank]
@@ -290,6 +309,150 @@ class Qwen4ExpHyperConnection(nn.Module):
             mixed = (gate * normed.unflatten(-1, (hc, hs))).mean(dim=-2)
 
         return mixed.to(self.params_dtype), (hyper_input, injection_logits)
+
+    def _interleaved_up_weight(self) -> torch.Tensor | None:
+        """Lazily cache the grouped-reduction output-row layout."""
+        weight = self._input_mix_weight_up_interleaved
+        if weight is None:
+            # Allocating or reordering a parameter during capture would give
+            # replay the wrong lifetime; the caller keeps the unfused path.
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            from ...cute_dsl_kernels.blackwell.low_m_bf16_splitk import (
+                interleave_grouped_output_rows,
+            )
+
+            weight = interleave_grouped_output_rows(
+                self.input_mix_weight_up.weight.detach(),
+                self.hc_count,
+            )
+            self._input_mix_weight_up_interleaved = weight
+        return weight
+
+    def _fused_mix_normed(
+        self,
+        normed: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+        """Fuse the two adjacent GEMM epilogues for a small graph batch."""
+        if not self._fused_mix_requested or torch.is_grad_enabled():
+            return None
+
+        hc_count = self.hc_count
+        hidden_size = self.hidden_size
+        lowrank = self.hc_lowrank
+        rows = int(normed.shape[0]) if normed.ndim == 2 else 0
+        packed_weight = (
+            self.input_mix_weight_down_block_inject.weight
+            if self.use_combine
+            else self.input_mix_weight_down.weight
+        )
+        up_weight = self.input_mix_weight_up.weight
+        hc_size = hc_count * hidden_size
+        logical_rows = lowrank + (hc_count if self.use_combine else 0)
+        if not (
+            hc_count >= 2
+            and self.params_dtype == torch.bfloat16
+            and normed.ndim == 2
+            and rows in _FUSED_MIX_ROWS
+            and normed.shape == (rows, hc_size)
+            and packed_weight.ndim == 2
+            and packed_weight.shape[0] >= logical_rows
+            and packed_weight.shape[0] % _PACKED_PROJECTION_ALIGNMENT == 0
+            and packed_weight.shape[1] == hc_size
+            and up_weight.shape == (hc_size, lowrank)
+            and normed.is_cuda
+            and packed_weight.is_cuda
+            and up_weight.is_cuda
+            and normed.device == packed_weight.device == up_weight.device
+            and normed.dtype == torch.bfloat16
+            and packed_weight.dtype == torch.bfloat16
+            and up_weight.dtype == torch.bfloat16
+            and normed.is_contiguous()
+            and packed_weight.is_contiguous()
+            and up_weight.is_contiguous()
+            and up_weight.stride(0) * up_weight.element_size() % _TMA_STRIDE_ALIGNMENT_BYTES == 0
+            and not any(tensor.data_ptr() % 32 for tensor in (normed, packed_weight, up_weight))
+        ):
+            return None
+        major, minor = torch.cuda.get_device_capability(normed.device)
+        if not is_sm_100f(major * 10 + minor):
+            return None
+
+        from ...cute_dsl_kernels.blackwell.low_m_bf16_direct import (
+            default_tactic as default_direct_tactic,
+        )
+        from ...cute_dsl_kernels.blackwell.low_m_bf16_direct import get_direct_dense_epilogue_runner
+        from ...cute_dsl_kernels.blackwell.low_m_bf16_direct import (
+            validate_tactic as validate_direct_tactic,
+        )
+        from ...cute_dsl_kernels.blackwell.low_m_bf16_splitk import (
+            default_tactic,
+            get_splitk_dense_epilogue_runner,
+            validate_sigmoid_grouped_reduce_tactic,
+        )
+        from ...flashinfer_utils import get_env_enable_pdl
+
+        packed_size = int(packed_weight.shape[0])
+        try:
+            direct_tactic = default_direct_tactic(rows, packed_size, hc_size)
+            validate_direct_tactic(direct_tactic, rows, packed_size, hc_size)
+            grouped_tactic = default_tactic(rows, hc_size, lowrank)
+            validate_sigmoid_grouped_reduce_tactic(
+                grouped_tactic,
+                rows,
+                hc_size,
+                lowrank,
+                hc_count,
+            )
+        except ValueError:
+            return None
+
+        run_direct_epilogue = get_direct_dense_epilogue_runner("silu_prefix")
+        run_splitk_epilogue = get_splitk_dense_epilogue_runner("sigmoid_grouped_reduce")
+        interleaved_weight = self._interleaved_up_weight()
+        if interleaved_weight is None:
+            return None
+
+        pdl = get_env_enable_pdl()
+        packed = torch.empty(
+            (rows, packed_size),
+            dtype=normed.dtype,
+            device=normed.device,
+        )
+        run_direct_epilogue(
+            normed,
+            packed_weight.t(),
+            packed,
+            pdl,
+            direct_tactic,
+            scale=1.0 / hc_count,
+            prefix=lowrank,
+        )
+
+        mixed = torch.empty(
+            (rows, hidden_size),
+            dtype=normed.dtype,
+            device=normed.device,
+        )
+        run_splitk_epilogue(
+            packed[:, :lowrank],
+            interleaved_weight.t(),
+            normed,
+            mixed,
+            pdl,
+            grouped_tactic,
+            reduction_scale=1.0 / hc_count,
+            group_count=hc_count,
+        )
+        injection_logits = (
+            packed[
+                ...,
+                self.input_mix_injection_offset : self.input_mix_injection_offset + hc_count,
+            ]
+            if self.use_combine
+            else None
+        )
+        return mixed, injection_logits
 
     def mix(self, hyper_input: torch.Tensor) -> Tuple[torch.Tensor, HCResidual]:
         """10240 -> 2560. Returns ``(mixed_input, residual_state)`` where
