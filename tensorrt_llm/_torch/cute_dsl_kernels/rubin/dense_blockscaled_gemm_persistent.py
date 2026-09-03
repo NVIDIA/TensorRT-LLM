@@ -54,10 +54,7 @@ if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, ".."))
 
-from ..blackwell.dense_blockscaled_gemm_persistent import (
-    Sm100BlockScaledPersistentDenseGemmKernel,
-    scaled_mm,
-)
+from ..blackwell.dense_blockscaled_gemm_persistent import Sm100BlockScaledPersistentDenseGemmKernel
 
 """
 This example provides an implementation of the SM107 batched dense blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
@@ -3795,16 +3792,22 @@ def run_scaled_mm_with_emulated_dtype(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
 
-    # Compile gemm kernel with fake tensors
-    compiled_gemm = scaled_mm(
+    # Compile against the SM107 __call__ signature (alpha is a runtime tensor).
+    alpha_torch = torch.ones(1, dtype=torch.float32, device="cuda")
+    alpha_tensor = from_dlpack(alpha_torch, assumed_align=16)
+    a_major_mode = OperandMajorMode.K if a_major == "k" else OperandMajorMode.MN
+    b_major_mode = OperandMajorMode.K if b_major == "k" else OperandMajorMode.MN
+    c_layout = utils.LayoutEnum.ROW_MAJOR if c_major == "n" else utils.LayoutEnum.COL_MAJOR
+    compiled_gemm = cute.compile(
         gemm_obj,
-        a_dtype,
-        b_dtype,
-        c_dtype,
-        sf_dtype,
-        a_major,
-        b_major,
-        c_major,
+        make_ptr(a_dtype, 0, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(b_dtype, 0, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32),
+        make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32),
+        make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16),
+        alpha_tensor,
+        (a_major_mode, b_major_mode, c_layout),
+        (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0)),
         max_active_clusters,
         current_stream,
     )
@@ -3846,6 +3849,7 @@ def run_scaled_mm_with_emulated_dtype(
             sfa_reordered.iterator,
             sfb_reordered.iterator,
             c_ptr,
+            alpha_tensor,
             (m, n, k, l),
             current_stream,
         )
@@ -3866,6 +3870,7 @@ def run_scaled_mm_with_emulated_dtype(
             sfa_ptr,
             sfb_ptr,
             c_ptr,
+            alpha,
             problem_mnkl,
             stream,
             c_tensor,
@@ -3879,6 +3884,7 @@ def run_scaled_mm_with_emulated_dtype(
                 sfa_ptr,
                 sfb_ptr,
                 c_ptr,
+                alpha,
                 problem_mnkl,
                 stream,
             )
@@ -3918,6 +3924,7 @@ def run_scaled_mm_with_emulated_dtype(
             sfa_reordered.iterator,
             sfb_reordered.iterator,
             c_ptr,
+            alpha_tensor,
             (m, n, k, l),
             current_stream,
         ]
@@ -3926,7 +3933,7 @@ def run_scaled_mm_with_emulated_dtype(
         jit_args = cute.testing.JitArguments(*kernel_args)
         # Keep references to external variables (e.g., Torch tensors when taking a view)
         jit_args.add_to_scope(
-            [a_f32_ref, b_f32_ref, sfa_reordered, sfb_reordered, c, a_cute, b_cute]
+            [a_f32_ref, b_f32_ref, sfa_reordered, sfb_reordered, c, a_cute, b_cute, alpha_torch]
         )
         return jit_args
 

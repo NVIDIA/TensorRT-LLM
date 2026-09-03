@@ -869,9 +869,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
         iket.range_push("prologue")
         m, n, batch_size, rope_positions = problem_info
-        # sCuSeqlens/sKvLengths are sized by max_batch at compile time; a larger
-        # runtime batch must be rejected by the host wrapper, this only keeps the
-        # metadata staging inside its shared-memory allocation.
+        # sCuSeqlens/sKvLengths are sized by max_batch at compile time. The
+        # compiled handle rejects larger batches on the host; the clamp only keeps
+        # the metadata staging inside its shared-memory allocation.
         batch_size = cutlass.min(batch_size, cutlass.Int32(self.max_batch))
 
         (
@@ -1690,6 +1690,28 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         return position
 
 
+class _CompiledHandle:
+    """Compiled kernel plus the host-side batch check.
+
+    The kernel stages ``cu_q_seqlens``/``kv_cache_lengths`` into shared memory
+    sized by ``max_batch`` at compile time, so a larger batch is rejected here
+    instead of being clamped silently on the device.
+    """
+
+    def __init__(self, compiled, max_batch: int):
+        self.compiled = compiled
+        self.max_batch = max_batch
+
+    def __call__(self, *args):
+        kv_cache_lengths = args[7]
+        batch_size = int(kv_cache_lengths.shape[0])
+        if batch_size > self.max_batch:
+            raise ValueError(
+                f"batch_size {batch_size} exceeds max_batch {self.max_batch} of the compiled kernel"
+            )
+        return self.compiled(*args)
+
+
 _COMPILE_CACHE: dict = {}
 
 
@@ -1703,6 +1725,7 @@ def compile(
     raster_along_m: bool = True,
     with_quant_scale: bool = True,
     tma_prefetch_dist: int = 0,
+    max_batch: int = 128,
 ):
     """Compile ONE handle serving every (M, N, K) problem shape.
 
@@ -1721,6 +1744,7 @@ def compile(
         swizzle_size=swizzle_size,
         raster_along_m=raster_along_m,
         tma_prefetch_dist=tma_prefetch_dist,
+        max_batch=max_batch,
     )
     key = (
         tuple(mma_inst_tile),
@@ -1731,6 +1755,7 @@ def compile(
         op.raster_along_m,
         bool(with_quant_scale),
         op.tma_prefetch_dist,
+        op.max_batch,
     )
     if key in _COMPILE_CACHE:
         return _COMPILE_CACHE[key]
@@ -1804,5 +1829,6 @@ def compile(
         options="--enable-tvm-ffi",
     )
     print("OK", flush=True)
-    _COMPILE_CACHE[key] = compiled
-    return compiled
+    handle = _CompiledHandle(compiled, op.max_batch)
+    _COMPILE_CACHE[key] = handle
+    return handle

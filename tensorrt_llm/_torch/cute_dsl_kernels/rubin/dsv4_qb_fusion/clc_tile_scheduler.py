@@ -85,14 +85,6 @@ class ClcDynamicPersistentTileSchedulerParams:
             raise ValueError(f"unsupported cluster_shape_k {cluster_shape_mnk[2]}")  # type: ignore[index]
         if swizzle_size < 1:
             raise ValueError(f"expect swizzle_size >= 1, but get {swizzle_size}")
-        if swizzle_size > 1:
-            # The swizzled cluster layout is padded to whole swizzle groups, but
-            # get_grid_shape launches the unpadded cluster count, so the linear
-            # index space and the padded layout disagree and the trailing real
-            # tiles are never issued when the count is not a swizzle multiple.
-            raise NotImplementedError(
-                "swizzle_size > 1 is not supported by ClcDynamicPersistentTileScheduler"
-            )
 
         self.problem_shape_ntile_mnl = problem_shape_ntile_mnl
         # cluster_shape_mnk is kept for reconstruction
@@ -116,44 +108,7 @@ class ClcDynamicPersistentTileSchedulerParams:
             ip=ip,
         )
 
-        # Apply swizzle if swizzle_size > 1
-        if swizzle_size > 1:
-            problem_shape_ncluster_mnl = cute.round_up(
-                self.problem_layout_ncluster_mnl.shape,
-                (1, swizzle_size, 1) if raster_along_m else (swizzle_size, 1, 1),
-            )
-
-            if raster_along_m:
-                self.problem_layout_ncluster_mnl = cute.make_layout(
-                    (
-                        problem_shape_ncluster_mnl[0],  # type: ignore[index]
-                        (swizzle_size, problem_shape_ncluster_mnl[1] // swizzle_size),  # type: ignore[index, operator]
-                        problem_shape_ncluster_mnl[2],  # type: ignore[index]
-                    ),
-                    stride=(
-                        swizzle_size,
-                        (1, swizzle_size * problem_shape_ncluster_mnl[0]),  # type: ignore[index]
-                        problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],  # type: ignore[index, operator]
-                    ),
-                    loc=loc,
-                    ip=ip,
-                )
-            else:
-                self.problem_layout_ncluster_mnl = cute.make_layout(
-                    (
-                        (swizzle_size, problem_shape_ncluster_mnl[0] // swizzle_size),  # type: ignore[index, operator]
-                        problem_shape_ncluster_mnl[1],  # type: ignore[index]
-                        problem_shape_ncluster_mnl[2],  # type: ignore[index]
-                    ),
-                    stride=(
-                        (1, swizzle_size * problem_shape_ncluster_mnl[1]),  # type: ignore[index]
-                        swizzle_size,
-                        problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],  # type: ignore[index, operator]
-                    ),
-                    loc=loc,
-                    ip=ip,
-                )
-        elif not raster_along_m:
+        if swizzle_size == 1 and not raster_along_m:
             cluster_count_major = self.problem_layout_ncluster_mnl.shape[1]
             cluster_count_minor = self.problem_layout_ncluster_mnl.shape[0]
             self.cluster_shape_major_fdd = cute.fast_divmod_create_divisor(
@@ -480,13 +435,32 @@ class ClcDynamicPersistentTileScheduler:
                     batch_l,
                 )
         else:
-            cluster_coord = self.params.problem_layout_ncluster_mnl.get_flat_coord(
-                z_idx, loc=loc, ip=ip
-            )
+            # Swizzled raster over the exact cluster count: groups of
+            # swizzle_size clusters along the swizzled dimension are visited in
+            # turn and the last group is narrower when the count is not a
+            # swizzle multiple. Decoding through a layout padded to whole groups
+            # would leave the trailing real tiles beyond the launched grid.
+            num_cluster_m, num_cluster_n, _ = self.params.problem_layout_ncluster_mnl.shape
+            swizzle = Int32(self.params.swizzle_size)
+            clusters_per_batch = num_cluster_m * num_cluster_n
+            batch_l = z_idx // clusters_per_batch
+            linear = z_idx - batch_l * clusters_per_batch
+            if cutlass.const_expr(self.params._raster_along_m):
+                group = linear // (swizzle * num_cluster_m)
+                width = cutlass.min(swizzle, num_cluster_n - group * swizzle)
+                local = linear - group * swizzle * num_cluster_m
+                cluster_m = local // width
+                cluster_n = group * swizzle + local - cluster_m * width
+            else:
+                group = linear // (swizzle * num_cluster_n)
+                width = cutlass.min(swizzle, num_cluster_m - group * swizzle)
+                local = linear - group * swizzle * num_cluster_n
+                cluster_n = local // width
+                cluster_m = group * swizzle + local - cluster_n * width
             return (
-                cluster_coord[0] * self.params.cluster_shape_mn[0] + x_idx,
-                cluster_coord[1] * self.params.cluster_shape_mn[1] + y_idx,
-                cluster_coord[2],
+                cluster_m * self.params.cluster_shape_mn[0] + x_idx,
+                cluster_n * self.params.cluster_shape_mn[1] + y_idx,
+                batch_l,
             )
 
     @dsl_user_op

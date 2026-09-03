@@ -170,6 +170,17 @@ def epilogue_smem_copy_and_partition(
     return tiled_copy_r2s, tRS_rC, tRS_sC
 
 
+def _check_tile_scheduler(tile_sched, clc_pipeline, clc_consumer_state) -> None:
+    # Plain Python, so it runs at trace time: the staged dispatch in the
+    # epilogues cannot raise, and an unmatched scheduler would otherwise never
+    # advance work_tile.
+    if isinstance(tile_sched, ClcDynamicPersistentTileScheduler):
+        if clc_pipeline is None or clc_consumer_state is None:
+            raise ValueError("a CLC scheduler requires clc_pipeline and clc_consumer_state")
+    elif not isinstance(tile_sched, StaticPersistentTileScheduler):
+        raise TypeError(f"unsupported tile scheduler type: {type(tile_sched)}")
+
+
 @cute.jit
 def epilogue_tma_store(
     gemm_kernel,
@@ -195,6 +206,7 @@ def epilogue_tma_store(
     """Persistent TMA-store epilogue: drains every tile the scheduler hands out,
     staging TMEM accumulators through shared memory to global memory.
     """
+    _check_tile_scheduler(tile_sched, clc_pipeline, clc_consumer_state)
     # Layout transformation for tCgC_base
     # ((MMA_ATOM_M, MMA_ATOM_N), MMA_M, MMA_N, TILE_M, TILE_N, TILE_K)
     # -> ((MMA_ATOM_M, MMA_M), (MMA_ATOM_N, MMA_N), TILE_M, TILE_N, TILE_K)
@@ -336,15 +348,10 @@ def epilogue_tma_store(
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
         elif const_expr(isinstance(tile_sched, ClcDynamicPersistentTileScheduler)):
-            assert clc_pipeline is not None and clc_consumer_state is not None, (
-                "a CLC scheduler requires clc_pipeline and clc_consumer_state"
-            )
             clc_pipeline.consumer_wait(clc_consumer_state)
             work_tile = tile_sched.get_current_work()
             clc_pipeline.consumer_release(clc_consumer_state)
             clc_consumer_state.advance()
-        else:
-            raise TypeError(f"unsupported tile scheduler type: {type(tile_sched)}")
 
     # Wait for C store complete
     c_pipeline.producer_tail()
@@ -406,6 +413,7 @@ def epilogue(
     :param b_scale: Optional per-tensor scale applied to the accumulator
     :type b_scale: Optional[cute.Tensor]
     """
+    _check_tile_scheduler(tile_sched, clc_pipeline, clc_consumer_state)
 
     # Layout transformation for tCgC_base
     # ((MMA_ATOM_M, MMA_ATOM_N), MMA_M, MMA_N, TILE_M, TILE_N, TILE_K)
@@ -569,15 +577,10 @@ def epilogue(
         if const_expr(isinstance(tile_sched, StaticPersistentTileScheduler)):
             work_tile = next_work_tile
         elif const_expr(isinstance(tile_sched, ClcDynamicPersistentTileScheduler)):
-            assert clc_pipeline is not None and clc_consumer_state is not None, (
-                "a CLC scheduler requires clc_pipeline and clc_consumer_state"
-            )
             clc_pipeline.consumer_wait(clc_consumer_state)
             work_tile = tile_sched.get_current_work()
             clc_pipeline.consumer_release(clc_consumer_state)
             clc_consumer_state.advance()
-        else:
-            raise TypeError(f"unsupported tile scheduler type: {type(tile_sched)}")
 
     # Synchronize before TMEM dealloc (done by the caller)
     tmem_dealloc_barrier.arrive_and_wait()
