@@ -55,9 +55,7 @@ def _metadata(
     # the real runtime.  The focused fixture intentionally bypasses that much
     # larger initializer, so provide the one buffer the device-layout path
     # consumes explicitly.
-    meta.gen_token_repeats_cuda = torch.empty(
-        max_seqs, dtype=torch.int64, device="cuda"
-    )
+    meta.gen_token_repeats_cuda = torch.empty(max_seqs, dtype=torch.int64, device="cuda")
     meta.prompt_lens_cpu = torch.zeros(max_seqs, dtype=torch.int32)
     return meta
 
