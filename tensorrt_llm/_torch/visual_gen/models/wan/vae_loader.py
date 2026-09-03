@@ -121,12 +121,12 @@ def _validate_dynamic_weight_request(
         return
     if checkpoint_is_fp4 and dynamic_weight_quant:
         raise ValueError(
-            "vae_quant_config weights.dynamic=true requires high-precision VAE weights, "
+            "vae_config.quant_conv_config weights.dynamic=true requires high-precision VAE weights, "
             "but the selected checkpoint layers contain only packed NVFP4 weights"
         )
     if not checkpoint_is_fp4 and not dynamic_weight_quant:
         raise ValueError(
-            "vae_quant_config weights.dynamic=false requires packed NVFP4 VAE weights, "
+            "vae_config.quant_conv_config weights.dynamic=false requires packed NVFP4 VAE weights, "
             "but the selected checkpoint layers contain high-precision weights"
         )
 
@@ -146,7 +146,7 @@ def _resolve_input_scales(
         missing = sorted(selected - valid_input_scales.keys())
         if missing:
             raise ValueError(
-                "vae_quant_config input_activations.dynamic=false requires calibrated "
+                "vae_config.quant_conv_config input_activations.dynamic=false requires calibrated "
                 "finite positive input scales for every selected FP4 convolution; "
                 f"missing or invalid: {missing}"
             )
@@ -291,7 +291,7 @@ def _load_nvfp4_wan_vae(
         logger.info(
             f"Loaded NVFP4 Wan VAE: {len(quantized)} quantized convs; "
             f"{n} run on the FP4 kernel ({n_static} static, {n - n_static} dynamic); "
-            f"{len(quantized) - len(selected)} excluded by vae_quant_config."
+            f"{len(quantized) - len(selected)} excluded by vae_config.quant_conv_config."
         )
     else:
         logger.info("Loaded the NVFP4 Wan VAE checkpoint as dequantized BF16 modules.")
@@ -414,7 +414,7 @@ def load_wan_vae(
         n, n_static = swap_wan_convs_to_fp4(wan_vae, only_names=selected)
         if n != len(selected):
             raise ValueError(
-                f"vae_quant_config selected {len(selected)} convolutions, "
+                f"vae_config.quant_conv_config selected {len(selected)} convolutions, "
                 f"but only {n} were replaced"
             )
         logger.info(

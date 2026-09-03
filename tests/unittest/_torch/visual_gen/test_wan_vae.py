@@ -348,7 +348,7 @@ def test_dynamic_fp4_selection_uses_geometry_and_config_exclusions():
     assert isinstance(model.image, WanConv2d)
 
 
-def test_vae_quant_config_enables_dynamic_fp4_from_bf16(monkeypatch):
+def test_vae_conv_quant_config_enables_dynamic_fp4_from_bf16(monkeypatch):
     model = torch.nn.Sequential(WanResidualBlock(64, 64).eval())
     monkeypatch.setattr(vae_loader, "_use_native_wan_vae", lambda: True)
     monkeypatch.setattr(vae_loader, "_is_nvfp4_vae_ckpt", lambda _: False)
@@ -369,7 +369,7 @@ def test_vae_quant_config_enables_dynamic_fp4_from_bf16(monkeypatch):
     assert isinstance(model[0].conv2, NVFP4WanCausalConv3d)
 
 
-def test_vae_quant_config_rejects_unsupported_device(monkeypatch):
+def test_vae_conv_quant_config_rejects_unsupported_device(monkeypatch):
     model = torch.nn.Sequential(WanResidualBlock(64, 64).eval())
     monkeypatch.setattr(vae_loader, "_use_native_wan_vae", lambda: True)
     monkeypatch.setattr(vae_loader, "_is_nvfp4_vae_ckpt", lambda _: False)
