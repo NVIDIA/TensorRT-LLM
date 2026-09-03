@@ -48,16 +48,25 @@ _MINIMAX_M3_EVAL_CONFIG = {
         "enable_block_reuse": False,
     },
     "max_seq_len": 4096,
-    # Diagnostic control for https://nvbugs/6656598: MiniMax-M3 always uses
-    # KVCM V2, so disable overlap to isolate their interaction.
-    "disable_overlap_scheduler": True,
+    # Diagnostic control for https://nvbugs/6656598: preserve mandatory KVCM
+    # V2 and overlap while disabling only the eager layer-boundary fusion.
+    "disable_overlap_scheduler": False,
+    "env_overrides": {
+        "TLLM_MINIMAX_M3_FORWARD_DIAGNOSTICS": "1",
+        "TRTLLM_MINIMAX_M3_EAGER_FUSION_DISABLED": "1",
+    },
     "print_iter_log": True,
 }
 
 _KIMI_K2_EVAL_DIAGNOSTIC_CONFIG = {
     # Diagnostic control for https://nvbugs/6656598: preserve the inherited
-    # 262K context, re-enable overlap, and switch only KVCM from V2 to V1.
+    # 262K context, KVCM V1, and overlap while disabling only the eager
+    # layer-boundary fusion.
     "disable_overlap_scheduler": False,
+    "env_overrides": {
+        "TLLM_DEEPSEEKV3_FORWARD_DIAGNOSTICS": "1",
+        "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED": "1",
+    },
     "kv_cache_config": {
         "use_kv_cache_manager_v2": False,
     },

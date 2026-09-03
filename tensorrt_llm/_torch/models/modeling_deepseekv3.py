@@ -1963,11 +1963,10 @@ class DeepseekV3Model(DecoderModel):
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
         self.mapping_with_cp = mapping_with_cp
-        # Keep the temporary NVBug diagnostic narrowly scoped to Kimi-K2. The
-        # previous environment gate was set inside the pytest process, after
-        # MGMN workers had already imported this module, so it never enabled
-        # their logs.
-        self._forward_diagnostics_enabled = config.model_type == "kimi_k2"
+        # Read this at model construction rather than module import so an
+        # env_overrides value propagated to MGMN workers takes effect.
+        self._forward_diagnostics_enabled = os.environ.get(
+            "TLLM_DEEPSEEKV3_FORWARD_DIAGNOSTICS") == "1"
         self._diagnostic_forward_id = 0
         aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
         self.aux_stream_dict = {
@@ -1991,6 +1990,16 @@ class DeepseekV3Model(DecoderModel):
                                    mapping_with_cp=mapping_with_cp)
             for layer_idx in range(config.num_hidden_layers)
         ])
+        if self._forward_diagnostics_enabled:
+            first_layer = self.layers[0]
+            mnnvl_enabled = (first_layer.allreduce is not None and
+                             first_layer.allreduce.mnnvl_allreduce is not None)
+            logger.info(
+                f"[DeepseekV3 forward diagnostic] phase=model initialized, "
+                f"model_type={config.model_type}, "
+                f"eager_fusion_enabled={first_layer.enable_fusion}, "
+                f"mnnvl_allreduce_enabled={mnnvl_enabled}, "
+                f"allreduce_strategy={model_config.allreduce_strategy}")
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)

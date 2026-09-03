@@ -2044,6 +2044,9 @@ class MiniMaxM3Model(DecoderModel):
             model_config.pretrained_config.torch_dtype = torch.bfloat16
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
+        self._forward_diagnostics_enabled = (
+            os.environ.get("TLLM_MINIMAX_M3_FORWARD_DIAGNOSTICS") == "1"
+        )
         self._diagnostic_forward_id = 0
         # Aux streams shared across layers, matching the DeepSeekV3 convention:
         # one for attention branch overlap, one for MoE shared/routed parallel
@@ -2067,6 +2070,19 @@ class MiniMaxM3Model(DecoderModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
+        if self._forward_diagnostics_enabled:
+            first_layer = self.layers[0]
+            mnnvl_enabled = (
+                first_layer.allreduce is not None
+                and first_layer.allreduce.mnnvl_allreduce is not None
+            )
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] phase=model initialized, "
+                f"model_type={config.model_type}, "
+                f"eager_fusion_enabled={first_layer.enable_fusion}, "
+                f"mnnvl_allreduce_enabled={mnnvl_enabled}, "
+                f"allreduce_strategy={model_config.allreduce_strategy}"
+            )
         # The executor owns the authoritative CUDA-graph configuration. Mark
         # this model as eligible here and let the executor enable the automatic
         # FlashInfer MXFP8 path only when its decode graph runner is active.
@@ -2101,7 +2117,7 @@ class MiniMaxM3Model(DecoderModel):
 
         residual = None
         diagnostic_forward_id = None
-        if not attn_metadata.is_cuda_graph:
+        if self._forward_diagnostics_enabled and not attn_metadata.is_cuda_graph:
             next_diagnostic_forward_id = self._diagnostic_forward_id
             self._diagnostic_forward_id += 1
             if next_diagnostic_forward_id < _MAX_DIAGNOSTIC_FORWARDS:
