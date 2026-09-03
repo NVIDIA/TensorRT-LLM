@@ -387,8 +387,48 @@ def test_config_role_comes_from_environment(store_config, monkeypatch):
 
 def test_config_requires_the_env_var(monkeypatch):
     monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("TRTLLM_MOONCAKE_RUN_DIR", raising=False)
     with pytest.raises(ValueError, match="MOONCAKE_CONFIG_PATH"):
         MooncakeStoreConnectorConfig.from_env()
+
+
+def test_config_falls_back_to_the_run_directory(tmp_path, monkeypatch):
+    # A rank the launcher started was already running when its leader
+    # provisioned the pool, so it never inherited the exported path and reads
+    # the rendered config out of the shared run directory instead.
+    monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("TRTLLM_MOONCAKE_RUN_DIR", str(tmp_path))
+    (tmp_path / "mooncake.json").write_text(
+        json.dumps({"master_server_address": "10.0.0.1:50051", "global_segment_size": "8GiB"})
+    )
+
+    config = MooncakeStoreConnectorConfig.from_env()
+
+    assert config.master_server_address == "10.0.0.1:50051"
+    assert config.global_segment_size == 8 * 1024**3
+
+
+def test_config_run_directory_without_a_rendered_config_still_asks(tmp_path, monkeypatch):
+    # An empty run directory means no leader provisioned anything, which is a
+    # missing pool rather than a default one.
+    monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("TRTLLM_MOONCAKE_RUN_DIR", str(tmp_path))
+    with pytest.raises(ValueError, match="MOONCAKE_CONFIG_PATH"):
+        MooncakeStoreConnectorConfig.from_env()
+
+
+def test_config_env_var_wins_over_the_run_directory(tmp_path, monkeypatch):
+    # An externally managed pool stays reachable: the run directory is only
+    # consulted when nothing was passed in.
+    named = tmp_path / "external.json"
+    named.write_text(json.dumps({"master_server_address": "external:50051"}))
+    (tmp_path / "mooncake.json").write_text(
+        json.dumps({"master_server_address": "provisioned:50051"})
+    )
+    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(named))
+    monkeypatch.setenv("TRTLLM_MOONCAKE_RUN_DIR", str(tmp_path))
+
+    assert MooncakeStoreConnectorConfig.from_env().master_server_address == "external:50051"
 
 
 def test_config_model_key_defaults_to_basename(store_config, tmp_path, monkeypatch):

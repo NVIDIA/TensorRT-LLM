@@ -31,14 +31,22 @@ from enum import Enum
 from typing import Any, Optional
 
 __all__ = [
+    "CLIENT_CONFIG_NAME",
     "CONFIG_PATH_ENV",
     "MooncakeStoreConnectorConfig",
     "ROLE_ENV",
+    "RUN_DIR_ENV",
     "STAGE_THROUGH_HOST_ENV",
     "StoreRole",
+    "provisioned_config_path",
 ]
 
 CONFIG_PATH_ENV = "MOONCAKE_CONFIG_PATH"
+#: Where a server keeps the client config it renders and the master's log. Set
+#: it to keep them after shutdown; otherwise they live in a temporary directory.
+RUN_DIR_ENV = "TRTLLM_MOONCAKE_RUN_DIR"
+#: Name the rendered client config takes in the run directory.
+CLIENT_CONFIG_NAME = "mooncake.json"
 ROLE_ENV = "TRTLLM_MOONCAKE_STORE_ROLE"
 CACHE_PREFIX_ENV = "TRTLLM_MOONCAKE_STORE_PREFIX"
 MODEL_KEY_ENV = "TRTLLM_MOONCAKE_STORE_MODEL_KEY"
@@ -110,6 +118,27 @@ def parse_size(value: Any) -> int:
     if scale is None:
         raise ValueError(f"unknown size unit {unit!r} in {value!r}")
     return int(float(magnitude) * scale)
+
+
+def provisioned_config_path() -> Optional[str]:
+    """The client config a server on this node rendered, if there is one.
+
+    ``provision_pool`` writes one and exports ``MOONCAKE_CONFIG_PATH``, which
+    reaches the ranks the LLM constructor spawns, since they inherit that
+    environment. Ranks the launcher started instead -- one task per rank, which
+    is how a server spanning several GPUs is launched under a scheduler -- were
+    already running by then and never see it. Reading the config back from the
+    run directory is what lets those ranks join the pool their own leader
+    provisioned.
+
+    Only possible when the deployment named that directory: it otherwise
+    defaults to a per-process temporary one, which no other rank could read.
+    """
+    run_dir = os.getenv(RUN_DIR_ENV)
+    if not run_dir:
+        return None
+    path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
+    return path if os.path.exists(path) else None
 
 
 @dataclass(frozen=True)
@@ -186,12 +215,15 @@ class MooncakeStoreConnectorConfig:
     @staticmethod
     def from_env() -> "MooncakeStoreConnectorConfig":
         """Load the JSON config, then apply the TensorRT-LLM env overrides."""
-        path = os.getenv(CONFIG_PATH_ENV)
+        path = os.getenv(CONFIG_PATH_ENV) or provisioned_config_path()
         if not path:
             raise ValueError(
                 f"The mooncake-store connector needs {CONFIG_PATH_ENV} set to a "
                 "Mooncake JSON config (metadata_server, master_server_address, "
-                "protocol, device_name, global_segment_size, local_buffer_size)."
+                "protocol, device_name, global_segment_size, local_buffer_size), "
+                "or kv_connector_config.mooncake_store set so the server renders "
+                f"one -- into ${RUN_DIR_ENV} if this rank was started by the "
+                "launcher rather than spawned by the server."
             )
         config = MooncakeStoreConnectorConfig.from_file(path)
         return config.with_env_overrides()

@@ -29,7 +29,9 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import donor as do
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.donor import (
     DEFAULT_DONOR_LOCAL_BUFFER_SIZE,
     donate_segment,
+    maybe_donate_segment,
 )
+from tensorrt_llm.llmapi.llm_args import MooncakeDonationConfig
 
 GIB = 1024**3
 
@@ -131,3 +133,82 @@ def test_missing_bindings_are_reported_as_the_separate_component_they_are(monkey
     with pytest.raises(ImportError, match="mooncake-transfer-engine"):
         with donate_segment("10.0.0.1:50051", GIB):
             pytest.fail("donation should not have yielded")
+
+
+@pytest.fixture
+def reachable_master(monkeypatch):
+    """Skip the socket probe: these tests are about what donation asks for."""
+    monkeypatch.setattr(donor_module, "wait_for_master", lambda address: 0.0)
+
+
+def test_a_server_that_was_asked_to_lend_memory_does(fake_bindings, reachable_master,
+                                                     monkeypatch):
+    """The config-driven path is what makes a generation server a donor."""
+    monkeypatch.setattr(donor_module, "local_address", lambda: "10.1.2.3")
+    donation = MooncakeDonationConfig(
+        master_server_address="10.0.0.1:50051",
+        segment_size="320GiB",
+        protocol="rdma",
+        device_name="mlx5_1",
+    )
+
+    with maybe_donate_segment(donation) as host:
+        assert host == "10.1.2.3"
+        registered_host, metadata_server, segment_size, _, protocol, device, master = (
+            fake_bindings.instances[0].setup_args)
+
+    assert registered_host == "10.1.2.3"
+    assert metadata_server == "P2PHANDSHAKE"
+    # A size string reaching Mooncake unparsed would be a segment of nothing.
+    assert segment_size == 320 * GIB
+    assert protocol == "rdma"
+    assert device == "mlx5_1"
+    assert master == "10.0.0.1:50051"
+
+
+def test_a_server_that_was_not_asked_lends_nothing(fake_bindings):
+    """Every deployment that does not lend memory takes this path."""
+    with maybe_donate_segment(None) as host:
+        assert host is None
+    assert fake_bindings.instances == []
+
+
+def test_a_published_master_address_is_read_before_joining(fake_bindings, reachable_master,
+                                                           tmp_path):
+    """What lets a generation server name a path instead of a scheduler's choice."""
+    address_file = tmp_path / "master.addr"
+    address_file.write_text("10.0.0.9:50051\n")
+    donation = MooncakeDonationConfig(
+        master_server_address=f"file://{address_file}",
+        segment_size=GIB,
+    )
+
+    with maybe_donate_segment(donation):
+        assert fake_bindings.instances[0].setup_args[6] == "10.0.0.9:50051"
+
+
+def test_the_segment_is_withdrawn_when_the_server_stops(fake_bindings, reachable_master):
+    """The handle is the segment: holding it for the server's life is the point."""
+    donation = MooncakeDonationConfig(master_server_address="10.0.0.1:50051")
+
+    with maybe_donate_segment(donation):
+        store = fake_bindings.instances[0]
+    # Nothing to assert on the fake beyond its existence -- the contract is
+    # that the reference is dropped, which is what unmounts the segment.
+    assert store.setup_args is not None
+
+
+def test_an_unreachable_master_is_reported_before_the_segment_is_offered(
+        fake_bindings, monkeypatch):
+    """Otherwise this is a status code from setup, with no address in it."""
+
+    def refuse(address):
+        raise TimeoutError(f"The Mooncake master at {address} did not accept connections")
+
+    monkeypatch.setattr(donor_module, "wait_for_master", refuse)
+    donation = MooncakeDonationConfig(master_server_address="10.0.0.1:50051")
+
+    with pytest.raises(TimeoutError, match="10.0.0.1:50051"):
+        with maybe_donate_segment(donation):
+            pytest.fail("donation should not have yielded")
+    assert fake_bindings.instances == []

@@ -47,14 +47,25 @@ Three ways to get there, in increasing order of how much you have to arrange:
 
 | Deployment | Master |
 |---|---|
-| One `trtllm-serve`, own pool | `mooncake_store: {launch_master: true}` — the server starts it |
+| One `trtllm-serve`, own pool — **including the SLURM harness** | `mooncake_store: {launch_master: true}` — the server starts it |
 | Several engines, or a pool that outlives them | `trtllm-serve mooncake_master --address_file P`, then `mooncake_store: {master_server_address: file://P}` |
-| SLURM benchmark harness | Nothing: `disaggr_torch.slurm` starts the master and writes the JSON per job |
+| An externally provisioned pool | Nothing in the config: an inherited `MOONCAKE_CONFIG_PATH` wins over `mooncake_store` and says so in the log |
 
 The first two make `trtllm-serve` render the client config and export
-`MOONCAKE_CONFIG_PATH` itself. An inherited `MOONCAKE_CONFIG_PATH` wins over
-both and says so in the log, which is why the harness path is unaffected.
-`mooncake_disagg/README.md` §4 covers running a master as its own SLURM job.
+`MOONCAKE_CONFIG_PATH` itself. Nothing outside `trtllm-serve` starts a master,
+writes a JSON config or picks an HCA — the SLURM harness included, which is why
+`disaggr_torch.slurm` now only installs the bindings and tells the configs which
+directory the run is in. `mooncake_disagg/README.md` §4 covers running a master
+as its own SLURM job, for the second row.
+
+One thing a scheduler-launched server does need: `TRTLLM_MOONCAKE_RUN_DIR`
+pointing somewhere all its ranks can read. Provisioning happens in the server
+process and reaches the ranks it spawns through the environment, but under
+`trtllm-llmapi-launch` each rank is its own task and was already running, so
+those ranks read the rendered config back from that directory instead. Without
+it they fail during bringup naming `MOONCAKE_CONFIG_PATH`. `start_worker.sh`
+sets it to the job's log directory, which is also where the master's log and
+published address land.
 
 A launched master dies with the server, so use it only for a single engine:
 two context servers that each launch one get two disjoint pools, and the
@@ -108,19 +119,37 @@ Per-process environment, on the workers that open a handle:
 
 Pool capacity comes only from processes that open a store handle, so a
 prefill-only connector gives a prefill-only pool — which caches prefill's GPUs
-in prefill's own DRAM, largely duplicating the native host offload.
-`trtllm-serve mooncake_donor` contributes host memory from a node without any
-traffic, leaving that engine connector-free:
+in prefill's own DRAM, largely duplicating the native host offload. Ask the
+generation servers to lend their memory and the pool spans both sides while
+their engines stay connector-free:
+
+```yaml
+# generation worker — no connector, memory only
+mooncake_donation:
+  master_server_address: file:///$WORK_DIR/master.addr
+  segment_size: 320GiB            # per server process, not per rank
+  protocol: rdma
+  device_name: mlx5_1
+```
+
+The context worker publishes the address this reads by adding
+`master_address_file: $WORK_DIR/master.addr` next to its `launch_master: true`;
+one is written to the run directory regardless. Startup order stops mattering,
+because a server lending memory waits for the master rather than needing to
+follow it.
+
+Note the granularity: `global_segment_size` is charged per *rank*,
+`segment_size` per *server process*. Two generation servers on one node lend
+`segment_size` each. It is charged to the process, so it competes with that
+node's own `kv_cache_config.host_cache_size` — size the two together.
+
+A node running no server can lend as its own command, which is also how the
+pool gets memory from a machine with no GPUs at all:
 
 ```bash
 trtllm-serve mooncake_donor --master_server_address file://$WORK_DIR/master.addr \
     --segment_size 160GiB --protocol rdma --device_name mlx5_0
 ```
-
-`disaggr_torch.slurm` starts one per generation node already
-(`MOONCAKE_DONOR_SEGMENT_SIZE`, default `32GiB`, `0` to skip). Donated memory
-is charged to the donor process, so it competes with that node's own
-`kv_cache_config.host_cache_size` — size the two together.
 
 ## 3. Partial reuse must be off — now enforced
 
@@ -162,9 +191,9 @@ have aborted startup).
 Then check that the pool spans the hosts you expect.
 `disaggr_torch.slurm` writes the per-segment breakdown to
 `<log_dir>/9_mooncake_summary.log`; a single host means a prefill-only pool.
-Pool occupancy and eviction come from `<log_dir>/2_mooncake_master.log`, or
-from `$TRTLLM_MOONCAKE_RUN_DIR/mooncake_master.log` when `trtllm-serve`
-launched the master — the startup line reports the path either way.
+Pool occupancy and eviction come from the master's own log,
+`$TRTLLM_MOONCAKE_RUN_DIR/mooncake_master.log` — under the harness that is
+`<log_dir>/mooncake_master.log`. The startup line reports the path either way.
 
 **Which reuse number counts store hits:** per-request stats
 (`reused_blocks_per_request`, `kv_cache_hit_rate_per_request`) **do**;
@@ -234,6 +263,7 @@ unattributed, with cumulative and per-window reporting. That is what produced
 §5's split. They are kept off this branch because they cost a store probe on
 lookups the connector would otherwise decline.
 
-Enable with `MOONCAKE_DEBUG_COVERAGE=1`, which must be set via
-`environment.ctx_worker_env_var` — the SLURM harness consumes `MOONCAKE_*`
-itself to build the pool config and does not forward it to workers.
+Enable with `MOONCAKE_DEBUG_COVERAGE=1`, set via
+`environment.ctx_worker_env_var`: `slurm.extra_args` reaches the harness rather
+than the worker processes, so a flag the connector reads has to go where the
+worker environment is built.

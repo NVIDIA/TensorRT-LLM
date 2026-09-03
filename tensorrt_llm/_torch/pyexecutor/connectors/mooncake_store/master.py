@@ -41,37 +41,58 @@ import subprocess  # nosec B404
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from tensorrt_llm.logger import logger
 
 from ..registry import uses_connector
-from .config import CONFIG_PATH_ENV
+from .config import CLIENT_CONFIG_NAME, CONFIG_PATH_ENV, RUN_DIR_ENV
 
 __all__ = [
     "local_address",
     "maybe_provision_pool",
     "master_timeout",
     "provision_pool",
+    "resolve_device_name",
     "resolve_master_address",
     "running_master",
+    "wait_for_master",
 ]
 
 #: Override the binary that ``launch_master`` runs.
 MASTER_BINARY_ENV = "TRTLLM_MOONCAKE_MASTER_BINARY"
 #: How long to wait for a master to accept connections, in seconds.
 MASTER_TIMEOUT_ENV = "TRTLLM_MOONCAKE_MASTER_TIMEOUT"
-#: Where to keep the generated client config and the master's log. Set it to
-#: keep them after shutdown; otherwise they live in a temporary directory.
-RUN_DIR_ENV = "TRTLLM_MOONCAKE_RUN_DIR"
-
 DEFAULT_MASTER_BINARY = "mooncake_master"
 DEFAULT_MASTER_TIMEOUT = 60.0
-CLIENT_CONFIG_NAME = "mooncake.json"
 MASTER_LOG_NAME = "mooncake_master.log"
+#: Name a launched master's address is always published under in the run
+#: directory, so "which master is this pool on" is answerable from the logs of
+#: a run that named no address file.
+MASTER_ADDRESS_NAME = "master.addr"
 #: Prefix that makes ``master_server_address`` name a file holding the address
 #: rather than the address itself.
 ADDRESS_FILE_SCHEME = "file://"
+#: Lines of the master's log to quote when startup fails. Its last words are
+#: usually the whole diagnosis -- a port in use, a bad flag -- and they are
+#: otherwise in a file the reader has to be told exists.
+LOG_TAIL_LINES = 20
+
+
+def _log_tail(path: str, lines: int = LOG_TAIL_LINES) -> str:
+    """The end of the master's log, ready to append to a failure message."""
+    try:
+        with open(path, errors="replace") as handle:
+            tail = handle.read().splitlines()[-lines:]
+    except OSError as exc:
+        return f" Its log at {path} could not be read: {exc}."
+    if not tail:
+        return (
+            f" Its log at {path} is empty, which usually means it failed "
+            "before glog opened; check that the binary runs at all."
+        )
+    quoted = "\n  ".join(tail)
+    return f" The last {len(tail)} lines of {path}:\n  {quoted}"
 
 
 def local_address() -> str:
@@ -122,7 +143,10 @@ def resolve_master_address(address: str, timeout: float) -> str:
         return address
 
     path = address[len(ADDRESS_FILE_SCHEME):]
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
+    announced = started
+    logger.info(f"mooncake-store: reading the master's address from {path}")
     while True:
         # Written whole by the master command, so a non-empty file is a
         # complete address rather than a prefix of one.
@@ -133,7 +157,17 @@ def resolve_master_address(address: str, timeout: float) -> str:
         if published:
             logger.info(f"mooncake-store: {path} names the master at {published}")
             return published
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if now - announced >= 5.0:
+            announced = now
+            # Waiting for a master in another job is the normal case here, so
+            # this is progress rather than trouble -- but only if it is said.
+            logger.info(
+                f"mooncake-store: no master address in {path} yet "
+                f"({now - started:.0f}s of {timeout:g}s); waiting for the "
+                "master to start and publish it"
+            )
+        if now >= deadline:
             raise TimeoutError(
                 f"No Mooncake master address appeared in {path} within "
                 f"{timeout:g}s. Start one with 'trtllm-serve mooncake_master "
@@ -149,35 +183,157 @@ def _wait_until_accepting(
     port: int,
     timeout: float,
     process: Optional[subprocess.Popen] = None,
-    hint: str = "",
-) -> None:
-    """Block until the master accepts connections.
+    log_path: Optional[str] = None,
+) -> float:
+    """Block until the master accepts connections, and say how long it took.
 
     A worker that opens its store handle before the master is listening fails
     outright, so the port -- not the presence of a process -- is what the
     ordering has to wait on. When the master is ours, its exit is checked first
     each pass, so a master that died is reported as that rather than as a
     timeout.
+
+    The wait is narrated while it happens: silence here is indistinguishable
+    from a hang somewhere else in bringup, and this is one of the two places a
+    Mooncake deployment stalls.
     """
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
+    announced = started
     while True:
         if process is not None and (code := process.poll()) is not None:
-            raise RuntimeError(f"mooncake_master exited with code {code} during startup.{hint}")
+            raise RuntimeError(
+                f"mooncake_master exited with code {code} after "
+                f"{time.monotonic() - started:.1f}s, before it accepted "
+                f"connections on {host}:{port}."
+                f"{_log_tail(log_path) if log_path else ''}"
+            )
         try:
             with socket.create_connection((host, port), timeout=1.0):
-                return
+                return time.monotonic() - started
         except OSError as exc:
             last_error = exc
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if now >= deadline:
             raise TimeoutError(
                 f"The Mooncake master at {host}:{port} did not accept "
                 f"connections within {timeout:g}s ({last_error}). Raise "
-                f"{MASTER_TIMEOUT_ENV} if it is only slow to start.{hint}"
+                f"{MASTER_TIMEOUT_ENV} if it is only slow to start."
+                f"{_log_tail(log_path) if log_path else ''}"
+            )
+        if now - announced >= 5.0:
+            announced = now
+            logger.info(
+                f"mooncake-store: still waiting for the master at {host}:{port}"
+                f" ({now - started:.0f}s of {timeout:g}s, {last_error})"
             )
         time.sleep(0.5)
 
 
-def _client_config(pool: Any, master_address: str) -> Dict[str, Any]:
+#: Where the InfiniBand devices of a host are described.
+IB_SYSFS_ROOT = "/sys/class/infiniband"
+
+
+def _highest_rate_ib_devices(sysfs_root: Optional[str] = None) -> List[str]:
+    """The active InfiniBand devices on the compute fabric, fastest first.
+
+    A node's HCAs are not interchangeable. On GB300 six are exposed, of which
+    four run at 800Gb/s -- two per NUMA node, one per GPU -- while the rest
+    share a PCI device with an Ethernet port and are the storage or management
+    adapter. Taking every device at the highest rate picks the compute fabric
+    on any node type, where a hardcoded name would be wrong on the next one.
+    """
+    sysfs_root = sysfs_root or IB_SYSFS_ROOT
+    rated: Dict[str, int] = {}
+    try:
+        devices = sorted(os.listdir(sysfs_root))
+    except OSError:
+        return []
+    for device in devices:
+        port = os.path.join(sysfs_root, device, "ports", "1")
+
+        def attribute(name: str) -> str:
+            try:
+                with open(os.path.join(port, name)) as handle:
+                    return handle.read().strip()
+            except OSError:
+                return ""
+
+        if attribute("link_layer") != "InfiniBand":
+            continue
+        if "ACTIVE" not in attribute("state"):
+            continue
+        # "800 Gb/sec (4X XDR)"
+        rate = attribute("rate").split()
+        if not rate or not rate[0].isdigit():
+            continue
+        rated[device] = int(rate[0])
+
+    if not rated:
+        return []
+    fastest = max(rated.values())
+    return [device for device, rate in sorted(rated.items()) if rate == fastest]
+
+
+def resolve_device_name(protocol: str,
+                        configured: str,
+                        sysfs_root: Optional[str] = None) -> str:
+    """The RDMA devices to transfer over, detected if the config left it open.
+
+    Which HCAs a node has is a property of the node, not of the deployment, so
+    requiring it in a config makes that config specific to one machine type.
+    Detecting it keeps ``protocol: rdma`` portable, and leaving ``device_name``
+    set overrides this for a node where the choice has to be made by hand.
+    """
+    if configured or protocol != "rdma":
+        return configured
+    detected = _highest_rate_ib_devices(sysfs_root)
+    if not detected:
+        logger.warning(
+            "mooncake-store: protocol is rdma but no active InfiniBand device "
+            f"was found under {sysfs_root or IB_SYSFS_ROOT}, so device_name is "
+            "left empty for Mooncake's own discovery. Set device_name to "
+            "choose explicitly."
+        )
+        return ""
+    joined = ",".join(detected)
+    logger.info(
+        f"mooncake-store: transferring over the fastest active InfiniBand "
+        f"devices on this host: {joined}"
+    )
+    return joined
+
+
+def wait_for_master(master_address: str, timeout: Optional[float] = None) -> Optional[float]:
+    """Block until the master at ``master_address`` accepts connections.
+
+    Every user of a pool it did not start wants this: reaching a master that
+    is not there otherwise fails deep inside ``store.setup``, in every rank,
+    after the model has loaded, as a status code. One socket beforehand turns
+    that into a line that names the address and the wait.
+
+    Returns how long it took, or ``None`` if the address was not in
+    ``host:port`` form and could not be checked.
+    """
+    timeout = master_timeout() if timeout is None else timeout
+    endpoint = _split_address(master_address)
+    if endpoint is None:
+        logger.warning(
+            f"mooncake-store: cannot parse master_server_address="
+            f"{master_address!r} as host:port, so its reachability is left "
+            "for the workers to discover."
+        )
+        return None
+    elapsed = _wait_until_accepting(*endpoint, timeout)
+    logger.info(
+        f"mooncake-store: the master at {master_address} answered in {elapsed:.1f}s"
+    )
+    return elapsed
+
+
+def _client_config(pool: Any,
+                   master_address: str,
+                   device_name: Optional[str] = None) -> Dict[str, Any]:
     """Render the Mooncake client config for a pool.
 
     The schema is vLLM's, so one pool can serve both engines. ``role`` is
@@ -189,7 +345,7 @@ def _client_config(pool: Any, master_address: str) -> Dict[str, Any]:
         "metadata_server": pool.metadata_server,
         "master_server_address": master_address,
         "protocol": pool.protocol,
-        "device_name": pool.device_name,
+        "device_name": pool.device_name if device_name is None else device_name,
         "global_segment_size": pool.global_segment_size,
         "local_buffer_size": pool.local_buffer_size,
         "role": "both",
@@ -239,7 +395,6 @@ def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
 
     host = local_address()
     log_path = os.path.join(run_dir, MASTER_LOG_NAME)
-    hint = f" See {log_path}."
 
     # mooncake_master logs through glog, which writes files under /tmp unless
     # told otherwise, so without GLOG_logtostderr the log below stays empty.
@@ -263,17 +418,65 @@ def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
     master = LaunchedMaster(
         process=process, address=f"{host}:{pool.master_port}", log_path=log_path
     )
+    logger.info(
+        f"mooncake-store: master pid={process.pid} logging to {log_path} "
+        f"(GLOG_v={env['GLOG_v']}); waiting for it to accept connections"
+    )
     try:
-        _wait_until_accepting(host, pool.master_port, master_timeout(), process=process, hint=hint)
+        elapsed = _wait_until_accepting(
+            host, pool.master_port, master_timeout(), process=process, log_path=log_path
+        )
     except BaseException:
         master.stop()
         raise
 
     logger.info(
-        f"mooncake-store: master ready at {master.address} "
+        f"mooncake-store: master ready at {master.address} after {elapsed:.1f}s "
         f"(metrics http://{host}:{pool.master_metrics_port}, log {log_path})"
     )
     return master
+
+
+@contextlib.contextmanager
+def _published_address(address: str, paths: Sequence[str]) -> Iterator[None]:
+    """Write ``address`` to every path for the life of the context.
+
+    Publishing is how anything else finds this master: a donor or a second
+    server names the path in ``master_server_address`` as ``file://<path>``
+    and reads it back. Retracting on the way out is as important as writing,
+    since an address that outlives its master sends the next run's workers to
+    a port with nothing behind it.
+    """
+    for path in paths:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        # Renamed into place so a reader sees either nothing or the whole
+        # address. A half-written one would be dialed as if it were real.
+        staging = f"{path}.partial"
+        with open(staging, "w") as handle:
+            handle.write(f"{address}\n")
+        os.replace(staging, path)
+        logger.info(f"mooncake-store: published master {address} to {path}")
+    try:
+        yield
+    finally:
+        for path in paths:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+                logger.info(f"mooncake-store: withdrew the master address at {path}")
+
+
+def _address_files(run_dir: str, extra: Optional[str] = None) -> List[str]:
+    """Where a master this process starts should publish its address.
+
+    Always the run directory, so a reader who was told nothing can still find
+    out which master a run used, plus wherever the deployment asked for.
+    """
+    paths = [os.path.join(run_dir, MASTER_ADDRESS_NAME)]
+    if extra and os.path.abspath(extra) not in {os.path.abspath(p) for p in paths}:
+        paths.append(extra)
+    return paths
 
 
 @contextlib.contextmanager
@@ -288,27 +491,17 @@ def running_master(
 
     ``address_file`` receives ``host:port`` once the master answers, so the
     workers can name the file instead of an address nobody knows until the
-    scheduler has placed this process.
+    scheduler has placed this process. One is written to ``run_dir`` either
+    way.
     """
     os.makedirs(run_dir, exist_ok=True)
     master = _launch_master(pool, run_dir)
     try:
-        if address_file:
-            # Renamed into place so a reader sees either nothing or the whole
-            # address. A half-written one would be dialed as if it were real.
-            staging = f"{address_file}.partial"
-            with open(staging, "w") as handle:
-                handle.write(f"{master.address}\n")
-            os.replace(staging, address_file)
-            logger.info(f"mooncake-store: published {master.address} to {address_file}")
-        yield master
+        with _published_address(master.address, _address_files(run_dir, address_file)):
+            yield master
     finally:
-        if address_file:
-            # The address outliving the master would send the next run's
-            # workers to a port with nothing behind it.
-            with contextlib.suppress(OSError):
-                os.remove(address_file)
         master.stop()
+        logger.info(f"mooncake-store: master at {master.address} stopped")
 
 
 @contextlib.contextmanager
@@ -337,50 +530,71 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
     keep_run_dir = bool(run_dir or os.getenv(RUN_DIR_ENV))
     run_dir = run_dir or os.getenv(RUN_DIR_ENV) or tempfile.mkdtemp(prefix="trtllm-mooncake-")
     os.makedirs(run_dir, exist_ok=True)
+    if keep_run_dir:
+        logger.info(f"mooncake-store: provisioning the pool, run directory {run_dir}")
+    else:
+        logger.info(
+            f"mooncake-store: provisioning the pool in {run_dir}, which is "
+            f"removed at shutdown along with the master's log; set "
+            f"{RUN_DIR_ENV} to keep them"
+        )
 
     master: Optional[LaunchedMaster] = None
     exported = False
-    try:
-        if pool.launch_master:
-            master = _launch_master(pool, run_dir)
-            master_address = master.address
-        else:
-            master_address = resolve_master_address(
-                pool.master_server_address, master_timeout()
-            )
-            # Reaching a master that is not there fails inside store.setup on
-            # every rank, after the model has been loaded. Spend a socket now.
-            if (endpoint := _split_address(master_address)) is None:
-                logger.warning(
-                    f"mooncake-store: cannot parse master_server_address="
-                    f"{master_address!r} as host:port, so its reachability is "
-                    "left for the workers to discover."
+    with contextlib.ExitStack() as stack:
+        try:
+            if pool.launch_master:
+                master = _launch_master(pool, run_dir)
+                master_address = master.address
+                # Even a master that only this server uses publishes: it is
+                # how its donors reach it, and how the log of a finished run
+                # still says which pool it was.
+                stack.enter_context(
+                    _published_address(
+                        master_address, _address_files(run_dir, pool.master_address_file)
+                    )
                 )
             else:
-                _wait_until_accepting(*endpoint, master_timeout())
-            logger.info(f"mooncake-store: using the master at {master_address}")
+                master_address = resolve_master_address(
+                    pool.master_server_address, master_timeout()
+                )
+                wait_for_master(master_address)
+                logger.info(f"mooncake-store: using the master at {master_address}")
 
-        config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
-        config = _client_config(pool, master_address)
-        with open(config_path, "w") as handle:
-            json.dump(config, handle, indent=2)
-        # The ranks that open store handles are spawned by the LLM constructor,
-        # inheriting this environment; that is the only reason exporting it
-        # here reaches them.
-        os.environ[CONFIG_PATH_ENV] = config_path
-        exported = True
-        logger.info(
-            f"mooncake-store: {CONFIG_PATH_ENV}={config_path} "
-            f"({json.dumps(config, sort_keys=True)})"
-        )
-        yield config_path
-    finally:
-        if exported:
-            os.environ.pop(CONFIG_PATH_ENV, None)
-        if master is not None:
-            master.stop()
-        if not keep_run_dir:
-            shutil.rmtree(run_dir, ignore_errors=True)
+            config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
+            config = _client_config(
+                pool, master_address,
+                resolve_device_name(pool.protocol, pool.device_name))
+            with open(config_path, "w") as handle:
+                json.dump(config, handle, indent=2)
+            # This reaches the ranks the LLM constructor spawns, which
+            # inherit it. A rank the launcher started instead was already
+            # running, and reads the config out of the run directory -- see
+            # provisioned_config_path.
+            os.environ[CONFIG_PATH_ENV] = config_path
+            exported = True
+            logger.info(
+                f"mooncake-store: {CONFIG_PATH_ENV}={config_path} "
+                f"({json.dumps(config, sort_keys=True)})"
+            )
+            # Capacity is the pool's least obvious property and the one that
+            # explains a low hit rate, so state the arithmetic rather than
+            # leaving it to be done from global_segment_size later.
+            logger.info(
+                "mooncake-store: this server's ranks will each contribute "
+                f"global_segment_size={pool.global_segment_size} to the pool; "
+                "total capacity is that times the number of ranks that open a "
+                "handle, plus whatever any mooncake_donation adds"
+            )
+            yield config_path
+        finally:
+            if exported:
+                os.environ.pop(CONFIG_PATH_ENV, None)
+            if master is not None:
+                master.stop()
+                logger.info(f"mooncake-store: master at {master.address} stopped")
+            if not keep_run_dir:
+                shutil.rmtree(run_dir, ignore_errors=True)
 
 
 @contextlib.contextmanager

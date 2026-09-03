@@ -6,6 +6,22 @@
 #
 # Because no connector runs here, three of the context worker's constraints
 # do NOT apply, and this file keeps the production values instead.
+#
+# It does lend the pool this node's host memory. Capacity comes only from
+# processes that open a store handle, so without this every byte of the pool
+# would be prefill-node DRAM caching prefill's own GPUs -- which is what the
+# native host tier already does. Lending is not a connector: this engine still
+# never reads or writes the store, and keeps its cache transceiver for the
+# prefill-to-decode handoff.
+mooncake_donation:
+    # The master the context server started and published. A server lending
+    # memory waits for it, so the two can start in any order.
+    master_server_address: file://__LOG_DIR__/master.addr
+    # Charged per server process, not per rank as global_segment_size is. Two
+    # servers on one node lend twice this, and it competes with this node's own
+    # kv_cache_config.host_cache_size -- size the two together.
+    segment_size: 640GiB
+    protocol: rdma
 
 max_seq_len: 1048576
 max_num_tokens: 16384

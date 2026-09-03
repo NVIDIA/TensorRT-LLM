@@ -54,14 +54,46 @@ fi
 
 echo "config_file: ${config_file}"
 
-# The mooncake-store KV connector reads its pool topology from
-# MOONCAKE_CONFIG_PATH. disaggr_torch.slurm generates one per job in the log
-# directory, whose path is not known when submit.py builds the worker
-# environment; an explicit setting still wins, so pointing at an externally
-# managed pool remains possible.
-if [ -z "${MOONCAKE_CONFIG_PATH:-}" ] && [ -f "${log_dir}/mooncake.json" ]; then
-    export MOONCAKE_CONFIG_PATH="${log_dir}/mooncake.json"
-    echo "MOONCAKE_CONFIG_PATH: ${MOONCAKE_CONFIG_PATH}"
+# The mooncake-store pool is described in the worker config and provisioned by
+# trtllm-serve during bringup. Anchoring its run directory here is what puts the
+# master's log, the client config it renders and the address it publishes in the
+# job's log directory rather than in a temporary directory that shutdown
+# removes -- and it is how the ranks the launcher started, which never inherited
+# the leader's environment, find that client config. An inherited
+# MOONCAKE_CONFIG_PATH still wins, so an externally managed pool stays reachable.
+export TRTLLM_MOONCAKE_RUN_DIR="${log_dir}"
+
+# The generation servers wait for a master the context server starts. Both are
+# launched together and the master comes up before its model loads, but the wait
+# spans container start on another node, so it is given far more than the 60s
+# default: too short fails the job, too long costs nothing when the master is
+# there.
+export TRTLLM_MOONCAKE_MASTER_TIMEOUT="${TRTLLM_MOONCAKE_MASTER_TIMEOUT:-900}"
+
+# MiniMax-M3's MSA sparse attention JIT-compiles its FMHA kernels on first use,
+# from inside the attention forward pass: one TP rank runs ninja while the others
+# block on a file lock, so an uncached variant stalls the whole executor loop for
+# ~8s (and ~70s when an iteration needs several). The cache defaults to
+# ~/.cache, which is thrown away here because the container is started with
+# --no-container-mount-home, making every job pay the compiles again during
+# serving. Anchor it next to this script instead: that path is on the mounted
+# filesystem and identical across jobs, so only the first run compiles.
+if [ -z "${MINFER_FMHA_CACHE_DIR:-}" ]; then
+    export MINFER_FMHA_CACHE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.cache/minfer/fmha_sm100"
+    mkdir -p "${MINFER_FMHA_CACHE_DIR}"
+    echo "MINFER_FMHA_CACHE_DIR: ${MINFER_FMHA_CACHE_DIR}"
+fi
+
+# Per-transfer KV timings (size, queue/transfer latency, throughput) as CSV next
+# to the worker logs. This is what tells apart "prefill is slow" from "the
+# prefill->decode handoff is slow", which the aggregate benchmark numbers
+# cannot. Same rationale as above for defaulting the path here: an explicit
+# setting wins, and it can be turned off with KV_TRANSFER_PERF_LOG=false.
+if [ "${KV_TRANSFER_PERF_LOG:-true}" = "true" ] \
+    && [ -z "${TLLM_KV_TRANSFER_PERF_LOG_FILE:-}" ]; then
+    export TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1
+    export TLLM_KV_TRANSFER_PERF_LOG_FILE="${log_dir}/kv_transfer_perf"
+    echo "TLLM_KV_TRANSFER_PERF_LOG_FILE: ${TLLM_KV_TRANSFER_PERF_LOG_FILE}"
 fi
 
 nsys_prefix=""

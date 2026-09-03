@@ -297,28 +297,38 @@ tier that largely duplicates TensorRT-LLM's native host offload. Confirm this on
 any run by grouping the master's `allocation_succeeded ... segment=<ip>:<port>`
 lines by host: a single host means a prefill-only pool.
 
-`trtllm-serve mooncake_donor` closes that gap. One donor per generation node
-opens a handle, contributes memory, and then idles forever without a single put
-or get, so the pool spans both sides while the generation engine stays
-connector-free and keeps its cache transceiver for the KV handoff. Donation is
-deliberately not a `StoreRole`: the roles describe traffic (`producer` writes,
-`consumer` reads, `both`), and none of them means "contribute memory only", so
-capacity and traffic have to be separate processes.
+`mooncake_donation` on the generation worker closes that gap. The server opens
+a handle, contributes memory, and then holds it without a single put or get for
+as long as it runs, so the pool spans both sides while its engine stays
+connector-free and keeps its cache transceiver for the KV handoff:
 
-Being a subcommand rather than a script, it is also how a deployment outside
-this harness lends memory:
+```yaml
+# gen worker config -- no kv_connector_config anywhere near it
+mooncake_donation:
+  master_server_address: file:///$WORK_DIR/master.addr
+  segment_size: 640GiB
+  protocol: rdma
+```
+
+Donation is deliberately outside `kv_connector_config`, and not a `StoreRole`
+either: the roles describe traffic (`producer` writes, `consumer` reads,
+`both`), none of them means "contribute memory only", and configuring capacity
+there would start this server using the store. The size is charged **per server
+process, not per rank** — unlike `global_segment_size` — so two servers on one
+node lend twice this.
+
+The server is ready only once its segment is mounted, which makes readiness the
+signal that the pool has the capacity, and means the first blocks prefill writes
+can already land on a decode node. Set `segment_size: 0`, or leave the section
+out, to keep the pool prefill-only.
+
+A node running no server lends as its own command instead, which is also how a
+machine with no GPUs contributes:
 
 ```bash
 trtllm-serve mooncake_donor --master_server_address 10.0.0.1:50051 \
     --segment_size 160GiB --protocol rdma --device_name mlx5_0
 ```
-
-`disaggr_torch.slurm` starts the donors automatically, reading the generation
-nodes off the generated worker commands and waiting for each segment to mount
-before any worker starts — so the first blocks prefill writes can already land
-on a decode node. Tune with `MOONCAKE_DONOR_SEGMENT_SIZE` (default `32GiB`, set
-`0` to keep the pool prefill-only) and `MOONCAKE_DONOR_NODES` to override node
-selection.
 
 The donated memory is charged to the donor process and competes with the
 generation worker's own `kv_cache_config.host_cache_size` on that node, so size
@@ -340,17 +350,21 @@ what `m3_agg_mooncake.yaml` now does; `mooncake_usage.md` §2 has the table. The
 rest of this section is about the master the experiments below need, which
 outlives any one server and therefore cannot be owned by one.
 
-**For a single-job experiment you can skip this section.**
-`disaggr_torch.slurm` now starts a `mooncake_master` on the first node of the
-allocation, waits for its port to accept connections, and writes
-`<log_dir>/mooncake.json` naming it; `start_worker.sh` then resolves
-`MOONCAKE_CONFIG_PATH` from the log directory, which is why the harness config
-does not set it. Defaults are the bring-up ones (TCP, 16GiB per worker);
-`MOONCAKE_PROTOCOL`, `MOONCAKE_DEVICE_NAME`, `MOONCAKE_GLOBAL_SEGMENT_SIZE` and
-`MOONCAKE_LOCAL_BUFFER_SIZE` in the submitting environment override them. The
-master itself is `trtllm-serve mooncake_master`, so its own log lands in
-`<log_dir>/mooncake_master.log` and the launching command's output in
-`<log_dir>/2_mooncake_master.log`.
+**For a single-job experiment you can skip this section.** The harness starts
+no master and writes no client config: the context worker's `launch_master:
+true` does both, on the context node, and publishes the address the generation
+workers' `mooncake_donation` reads. `disaggr_torch.slurm` contributes exactly
+two things — it installs the bindings on every node, and it substitutes
+`__LOG_DIR__` in the worker configs, since the run directory is the one value a
+config written before submission cannot know. Everything else, the pool sizes
+and the HCA included, is in the config; no `MOONCAKE_*` variable is read from
+the submitting environment any more.
+
+The master's log lands in `<log_dir>/mooncake_master.log` and its address in
+`<log_dir>/master.addr` while it runs, because `start_worker.sh` sets
+`TRTLLM_MOONCAKE_RUN_DIR` to the log directory. That is also what lets the
+context server's other ranks read the rendered `mooncake.json`: they are
+separate srun tasks that never inherited the leader's environment.
 
 That master dies with the job, so read on if you need a pool that outlives one
 allocation -- which experiment 3 does, by construction. Run it as its own
@@ -493,8 +507,8 @@ environment:
   work_dir: "<work_dir>"
   worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0"
   # Only the context workers open a store handle. MOONCAKE_CONFIG_PATH is
-  # deliberately absent: the harness generates the file per job in the log
-  # directory, whose path is not known when submit.py builds this environment.
+  # deliberately absent: the context server renders that file itself, into the
+  # log directory, and its own ranks read it back from there.
   ctx_worker_env_var: "TRTLLM_MOONCAKE_STORE_ROLE=both TRTLLM_MOONCAKE_STORE_PREFIX=trtllm-m3-run1"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 
@@ -775,7 +789,7 @@ offload tier could not. For that, group the master's allocations by segment host
 node the block physically lives on:
 
 ```bash
-grep -o "allocation_succeeded size=[0-9]* segment=[0-9.]*:[0-9]*" 2_mooncake_master.log \
+grep -o "allocation_succeeded size=[0-9]* segment=[0-9.]*:[0-9]*" mooncake_master.log \
   | awk '{sub(/size=/,"",$2); sub(/segment=/,"",$3); split($3,p,":");
           n[p[1]]++; b[p[1]]+=$2}
          END {for (h in n) printf "%-16s pages=%-7d %.2f GiB\n", h, n[h], b[h]/1073741824}'

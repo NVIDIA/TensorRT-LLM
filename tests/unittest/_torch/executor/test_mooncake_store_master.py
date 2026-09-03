@@ -60,6 +60,7 @@ class FakeMasterProcess:
     def __init__(self, command, env, listen_on=None, exit_code=None):
         self.command = command
         self.env = env
+        self.pid = 4242
         self.terminated = False
         self.killed = False
         self._exit_code = exit_code
@@ -114,9 +115,14 @@ def fake_master(monkeypatch):
         def __init__(self):
             self.process = None
 
-        def arm(self, listen_on=None, exit_code=None):
+        def arm(self, listen_on=None, exit_code=None, log_text=None):
 
-            def popen(command, env=None, **_kwargs):
+            def popen(command, env=None, stdout=None, **_kwargs):
+                # A real master writes its own log through glog, and what it
+                # says there is the diagnosis when it fails to start.
+                if log_text is not None and stdout is not None:
+                    stdout.write(log_text.encode())
+                    stdout.flush()
                 self.process = FakeMasterProcess(
                     command, env, listen_on=listen_on, exit_code=exit_code
                 )
@@ -162,6 +168,15 @@ def test_pool_needs_exactly_one_master():
         MooncakeStoreConfig(launch_master=True, master_server_address="host:50051")
     with pytest.raises(ValueError, match="needs a master"):
         MooncakeStoreConfig()
+
+
+def test_publishing_an_address_needs_a_master_to_publish():
+    """Reading a published address is master_server_address, not this."""
+    with pytest.raises(ValueError, match="needs launch_master"):
+        MooncakeStoreConfig(
+            master_server_address="host:50051",
+            master_address_file="/shared/master.addr",
+        )
 
 
 def test_pool_is_rejected_on_another_connector():
@@ -528,3 +543,140 @@ def test_provisioning_joins_a_master_it_was_never_given_the_address_of(fake_mast
             # has to be the address it resolved to.
             written = json.loads(open(config_path).read())
             assert written["master_server_address"] == master.address
+
+
+# ---- a master a server launched, made findable ----
+
+
+def test_a_launched_master_publishes_where_its_run_left_its_logs(fake_master, tmp_path):
+    """So a finished run's logs still say which pool it used."""
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    run_dir = tmp_path / "run"
+    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+
+    with provision_pool(pool, run_dir=str(run_dir)):
+        address = (run_dir / master_module.MASTER_ADDRESS_NAME).read_text().strip()
+        assert address.endswith(f":{port}")
+
+    assert not (run_dir / master_module.MASTER_ADDRESS_NAME).exists()
+
+
+def test_a_launched_master_can_be_published_where_the_donors_look(fake_master, tmp_path):
+    """The whole reason a server launching a master can still have donors."""
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    shared = tmp_path / "shared" / "master.addr"
+    pool = MooncakeStoreConfig(
+        launch_master=True, master_port=port, master_address_file=str(shared)
+    )
+
+    with provision_pool(pool, run_dir=str(tmp_path / "run")):
+        assert resolve_master_address(f"file://{shared}", timeout=5.0).endswith(f":{port}")
+
+    # Retracted, so the next run's donors wait for a live master rather than
+    # joining a pool that no longer exists.
+    assert not shared.exists()
+
+
+def test_a_half_written_address_is_never_read(tmp_path):
+    """A reader sees the whole address or nothing, never a prefix of one."""
+    target = tmp_path / "master.addr"
+
+    with master_module._published_address("10.0.0.7:50051", [str(target)]):
+        assert not (tmp_path / "master.addr.partial").exists()
+        assert target.read_text().strip() == "10.0.0.7:50051"
+
+
+# ---- saying why bringup is stuck ----
+
+
+def test_an_absent_master_is_named_rather_than_left_to_store_setup(monkeypatch):
+    """Otherwise this is a status code, in every rank, after the model loads."""
+    monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "1")
+    address = f"127.0.0.1:{free_port()}"
+
+    with pytest.raises(TimeoutError, match=address):
+        master_module.wait_for_master(address)
+
+
+def test_a_master_that_answers_is_reported_with_the_wait_it_cost(running_master):
+    assert master_module.wait_for_master(running_master) is not None
+
+
+def test_an_address_of_a_shape_we_cannot_probe_is_not_fatal():
+    """Mooncake may accept addresses this cannot dial; leave them to it."""
+    assert master_module.wait_for_master("unix:///var/run/mooncake") is None
+
+
+def test_a_master_that_died_starting_is_reported_with_its_last_words(fake_master, tmp_path):
+    """The reason is in its log, which nobody reads unless it is quoted."""
+    run_dir = tmp_path / "run"
+    fake_master.arm(
+        exit_code=1, log_text="E0903 bind(50051) failed: Address already in use\n")
+    pool = MooncakeStoreConfig(launch_master=True, master_port=free_port())
+
+    with pytest.raises(RuntimeError, match="Address already in use"):
+        with provision_pool(pool, run_dir=str(run_dir)):
+            pytest.fail("provisioning should not have yielded")
+
+
+# ---- choosing the fabric without naming it in a config ----
+
+
+def fake_hca(root, device, link_layer="InfiniBand", state="4: ACTIVE", rate="800 Gb/sec"):
+    port = root / device / "ports" / "1"
+    port.mkdir(parents=True)
+    (port / "link_layer").write_text(f"{link_layer}\n")
+    (port / "state").write_text(f"{state}\n")
+    (port / "rate").write_text(f"{rate}\n")
+
+
+def test_the_compute_fabric_is_picked_over_the_management_adapter(tmp_path):
+    """A node's HCAs are not interchangeable: only some are the fast fabric."""
+    fake_hca(tmp_path, "mlx5_0")
+    fake_hca(tmp_path, "mlx5_1")
+    fake_hca(tmp_path, "mlx5_2", rate="400 Gb/sec")
+    fake_hca(tmp_path, "mlx5_3", state="1: DOWN")
+    fake_hca(tmp_path, "mlx5_4", link_layer="Ethernet")
+
+    assert master_module.resolve_device_name(
+        "rdma", "", sysfs_root=str(tmp_path)) == "mlx5_0,mlx5_1"
+
+
+def test_a_named_device_is_not_second_guessed(tmp_path):
+    fake_hca(tmp_path, "mlx5_0")
+    assert master_module.resolve_device_name(
+        "rdma", "mlx5_7", sysfs_root=str(tmp_path)) == "mlx5_7"
+
+
+def test_tcp_needs_no_device_and_looks_for_none(tmp_path):
+    assert master_module.resolve_device_name("tcp", "", sysfs_root=str(tmp_path)) == ""
+
+
+def test_a_node_without_infiniband_is_left_to_mooncake_s_own_discovery(tmp_path):
+    """Better than failing: Mooncake may still find something usable."""
+    assert master_module.resolve_device_name(
+        "rdma", "", sysfs_root=str(tmp_path / "absent")) == ""
+
+
+def test_the_detected_device_is_what_the_workers_are_told(fake_master, tmp_path,
+                                                          monkeypatch):
+    sysfs = tmp_path / "sysfs"
+    fake_hca(sysfs, "mlx5_0")
+    monkeypatch.setattr(master_module, "IB_SYSFS_ROOT", str(sysfs))
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    pool = MooncakeStoreConfig(launch_master=True, master_port=port, protocol="rdma")
+
+    with provision_pool(pool, run_dir=str(tmp_path / "run")) as config_path:
+        assert json.loads(open(config_path).read())["device_name"] == "mlx5_0"
+
+
+def test_an_empty_master_log_says_what_that_means(tmp_path):
+    """Empty means it failed before glog opened, which reads as no log at all."""
+    empty = tmp_path / "mooncake_master.log"
+    empty.write_text("")
+
+    assert "empty" in master_module._log_tail(str(empty))
+    assert "could not be read" in master_module._log_tail(str(tmp_path / "absent.log"))

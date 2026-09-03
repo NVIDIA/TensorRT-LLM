@@ -66,3 +66,31 @@ enable_attention_dp: false
 
 kv_connector_config:
     connector: mooncake-store
+    # The pool, provisioned by this server during its own bringup: it starts
+    # the master, renders the client config and exports MOONCAKE_CONFIG_PATH
+    # before the ranks that open store handles exist. Nothing outside
+    # trtllm-serve prepares any of it.
+    #
+    # Only right because there is one context server. Two that each launch a
+    # master get two disjoint pools, which is what 'trtllm-serve
+    # mooncake_master' plus master_server_address: file://<path> is for.
+    mooncake_store:
+        launch_master: true
+        # Where the master's address is published, for the generation
+        # workers to lend the pool memory. One also goes to the run
+        # directory regardless; under the SLURM harness that is the job's
+        # log directory, and __LOG_DIR__ is substituted there.
+        master_address_file: __LOG_DIR__/master.addr
+        protocol: rdma
+        # device_name omitted on purpose: the fastest active HCAs on this
+        # node are detected, which keeps one config portable across node
+        # types. Name them to pin it.
+        #
+        # Charged per rank, so a TP=2 server contributes twice this.
+        global_segment_size: 160GiB
+        # Registering the KV pools with the HCA needs nvidia_peermem; without
+        # it registration fails on every range, and staging registers only
+        # host memory instead. 1GiB holds a full transfer_batch_size of
+        # pages -- less silently reduces the batch rather than failing.
+        stage_through_host: true
+        staging_buffer_bytes: 1GiB

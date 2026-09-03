@@ -192,163 +192,18 @@ client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
 replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"
 
-# Bring up the Mooncake store's pool: a master process plus the client config
-# that names it. Both are per job and land in the log directory, so nothing has
-# to be prepared by hand and concurrent jobs do not share state.
+# The pool is described in the worker configs and provisioned by trtllm-serve
+# during its own bringup: the context server starts the master, renders the
+# client config and publishes the master's address, and the generation servers
+# read that address to lend the pool their memory. Nothing here starts, waits
+# for or configures any of it.
 #
-# The master lives inside this job, which means the pool dies with it. That is
-# the right default for the single-job experiments, but it makes the
-# survival-across-restarts case impossible to test, so set
-# MOONCAKE_MASTER_ADDRESS in the submitting environment to reuse a master
-# running as its own longer-lived job (mooncake_disagg/README.md section 4);
-# this block then only writes the client config.
+# The one value a config written before submission cannot know is where this
+# job's log directory is, and the master's address is published into it, so a
+# __LOG_DIR__ placeholder in either worker config is filled in here.
 if [ "${mooncake_enabled}" = "true" ]; then
-    mooncake_master_port=50051
-    mooncake_master_metrics_port=9004
-    mooncake_master_addr="${MOONCAKE_MASTER_ADDRESS:-}"
-
-    if [ -z "${mooncake_master_addr}" ]; then
-        mooncake_master_node="${all_nodes[0]}"
-        mooncake_addr_file="${full_logdir}/mooncake_master.addr"
-        rm -f "${mooncake_addr_file}"
-        echo "Starting mooncake_master on ${mooncake_master_node}..."
-        # --overlap because every GPU on this node is already claimed by a
-        # worker; the master is a CPU-only process sharing the node with them.
-        #
-        # The command owns the glog settings the master needs to log at all,
-        # the wait for its port, and the address file, so none of that is
-        # repeated here. --run_dir keeps the master's own log next to the job's
-        # rather than in a temporary directory removed at shutdown.
-        srun -l --container-name=${container_name} \
-            --container-mounts=${container_mount} --no-container-mount-home \
-            --mpi=pmix --overlap --nodelist=${mooncake_master_node} -N 1 -n 1 \
-            trtllm-serve mooncake_master \
-                --rpc_port ${mooncake_master_port} \
-                --metrics_port ${mooncake_master_metrics_port} \
-                --address_file ${mooncake_addr_file} \
-                --run_dir ${full_logdir} \
-            &> ${full_logdir}/2_mooncake_master.log &
-
-        # The address is published only once the master accepts connections,
-        # so this is the readiness wait as well. A worker that opens its store
-        # handle before then fails outright.
-        for _ in $(seq 1 120); do
-            if [ -s "${mooncake_addr_file}" ]; then
-                break
-            fi
-            sleep 1
-        done
-        if [ ! -s "${mooncake_addr_file}" ]; then
-            cleanup_on_failure "mooncake_master did not publish an address to ${mooncake_addr_file} within 120s. Check ${full_logdir}/2_mooncake_master.log for details"
-        fi
-        # Published as host:port, so the port is not appended here.
-        mooncake_master_addr="$(tr -d '[:space:]' < ${mooncake_addr_file})"
-        echo "mooncake_master ready at ${mooncake_master_addr} on node ${mooncake_master_node}"
-        echo "mooncake_master metrics: http://${mooncake_master_addr%:*}:${mooncake_master_metrics_port}"
-        echo "mooncake_master log: ${full_logdir}/mooncake_master.log"
-    else
-        echo "Using externally managed mooncake_master at ${mooncake_master_addr}"
-    fi
-
-    # The schema is vLLM's, so one pool can serve both engines. Defaults are
-    # the first-bring-up ones: TCP removes RDMA from the variable list, at the
-    # cost of any performance conclusion. Set MOONCAKE_PROTOCOL=rdma with a
-    # MOONCAKE_DEVICE_NAME from ibv_devinfo for a run worth quoting.
-    # global_segment_size is contributed per worker process, so the pool is
-    # this value times (ctx instances x world size).
-    cat > "${full_logdir}/mooncake.json" <<EOF
-{
-  "metadata_server": "P2PHANDSHAKE",
-  "master_server_address": "${mooncake_master_addr}",
-  "protocol": "${MOONCAKE_PROTOCOL:-tcp}",
-  "device_name": "${MOONCAKE_DEVICE_NAME:-}",
-  "global_segment_size": "${MOONCAKE_GLOBAL_SEGMENT_SIZE:-16GiB}",
-  "local_buffer_size": "${MOONCAKE_LOCAL_BUFFER_SIZE:-1GiB}",
-  "role": "both",
-  "cache_prefix": "trtllm",
-  "transfer_batch_size": 64
-}
-EOF
-    echo "Wrote Mooncake client config to ${full_logdir}/mooncake.json:"
-    cat "${full_logdir}/mooncake.json"
-
-    # Give the pool some decode-side capacity. Only processes that open a store
-    # handle contribute memory to it, and only the context workers configure the
-    # connector -- so by default every byte of the pool is prefill-node DRAM and
-    # the store is just another way to do what TensorRT-LLM's native host offload
-    # already does. One donor process per generation node puts decode-side memory
-    # into the same pool, so blocks written by prefill can live there, while the
-    # generation engine stays connector-free: it never reads or writes the store
-    # and keeps its cache transceiver for the prefill-to-decode KV handoff.
-    #
-    # A donor is a separate process rather than a connector role because the
-    # roles describe traffic, not capacity: producer/consumer/both all read or
-    # write, and none of them means "contribute memory only". It is a
-    # subcommand of trtllm-serve rather than a script, so a deployment outside
-    # this harness can lend memory the same way.
-    #
-    # The donated memory is charged to the donor process and competes with the
-    # generation worker's own kv_cache_config.host_cache_size on that node, so
-    # size the two together. Set MOONCAKE_DONOR_SEGMENT_SIZE=0 to skip donation
-    # and keep the pool prefill-only.
-    mooncake_donor_size="${MOONCAKE_DONOR_SEGMENT_SIZE:-32GiB}"
-    if [ "${mooncake_donor_size}" = "0" ]; then
-        echo "MOONCAKE_DONOR_SEGMENT_SIZE=0: pool is prefill-node memory only"
-    else
-        # Read the generation nodes off the already-generated worker commands
-        # rather than recomputing submit.py's node assignment here.
-        if [ -n "${MOONCAKE_DONOR_NODES:-}" ]; then
-            IFS=',' read -r -a mooncake_donor_nodes <<< "${MOONCAKE_DONOR_NODES}"
-        else
-            mooncake_donor_nodes=($(awk '/start_worker.sh GEN/ {
-                    for (i = 1; i <= NF; i++) {
-                        if ($i == "--nodelist") { print $(i + 1) }
-                        else if ($i ~ /^--nodelist=/) { sub(/^--nodelist=/, "", $i); print $i }
-                    }
-                }' "${start_server_cmds_file}" | tr ',' '\n' | sort -u))
-        fi
-
-        if [ ${#mooncake_donor_nodes[@]} -eq 0 ]; then
-            cleanup_on_failure "Could not determine the generation nodes to donate memory from. Set MOONCAKE_DONOR_NODES to a comma-separated list, or MOONCAKE_DONOR_SEGMENT_SIZE=0 to keep the pool prefill-only"
-        fi
-
-        mooncake_donor_ready_files=()
-        for donor_node in "${mooncake_donor_nodes[@]}"; do
-            donor_ready_file="${full_logdir}/mooncake_donor_${donor_node}.ready"
-            rm -f "${donor_ready_file}"
-            mooncake_donor_ready_files+=("${donor_ready_file}")
-            echo "Donating ${mooncake_donor_size} of host memory on ${donor_node} to the pool..."
-            srun -l --container-name=${container_name} \
-                --container-mounts=${container_mount} --no-container-mount-home \
-                --mpi=pmix --overlap --nodelist=${donor_node} -N 1 -n 1 \
-                trtllm-serve mooncake_donor \
-                    --config ${full_logdir}/mooncake.json \
-                    --segment_size ${mooncake_donor_size} \
-                    --ready_file ${donor_ready_file} \
-                &> ${full_logdir}/2_mooncake_donor_${donor_node}.log &
-        done
-
-        # Wait for the segments before any worker starts, so that the first
-        # blocks prefill writes can already be placed on a decode node. A donor
-        # that never mounts is a hard failure: the run would otherwise quietly
-        # fall back to the prefill-only pool this is meant to replace.
-        for donor_ready_file in "${mooncake_donor_ready_files[@]}"; do
-            for _ in $(seq 1 120); do
-                if [ -s "${donor_ready_file}" ]; then
-                    break
-                fi
-                sleep 1
-            done
-            if [ ! -s "${donor_ready_file}" ]; then
-                donor_node="$(basename "${donor_ready_file}" .ready)"
-                donor_node="${donor_node#mooncake_donor_}"
-                cleanup_on_failure "The memory donor on ${donor_node} did not mount its segment within 120s. Check ${full_logdir}/2_mooncake_donor_${donor_node}.log; if the node is short on memory, lower MOONCAKE_DONOR_SEGMENT_SIZE or the generation worker's kv_cache_config.host_cache_size"
-            fi
-        done
-        echo "Pool capacity: ${MOONCAKE_GLOBAL_SEGMENT_SIZE:-16GiB} per context worker process" \
-             "+ ${mooncake_donor_size} per generation node (${#mooncake_donor_nodes[@]} donor(s):" \
-             "${mooncake_donor_nodes[*]})"
-    fi
+    sed -i "s|__LOG_DIR__|${full_logdir}|g" \
+        "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"
 fi
 
 # Per-worker hostfile / gpu_map files for srun --distribution=arbitrary.
@@ -404,7 +259,12 @@ done 3< "${client_cmds_file}"
 if [ "${mooncake_enabled}" = "true" ]; then
     mooncake_summary="${full_logdir}/9_mooncake_summary.log"
     {
-        echo "master: ${mooncake_master_addr}"
+        # The address file is retracted when the master stops, so a stale
+        # address is never dialed; the context server's log still says which
+        # master the run used.
+        echo "master: $(tr -d '[:space:]' < "${full_logdir}/master.addr" 2>/dev/null \
+            || grep -hoE "master at [0-9.]+:[0-9]+" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null \
+               | head -n 1 | awk '{print $3}' || echo unknown)"
         echo
         echo "== startup =="
         grep -h "mooncake-store.*\(ready\|registered layout\)" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null || echo "(none)"
@@ -423,7 +283,9 @@ if [ "${mooncake_enabled}" = "true" ]; then
         # rather than on the prefill node that computed it. Without a donor this
         # section shows a single host, which is the prefill node.
         echo "== block placement by segment host =="
-        echo "(donor hosts: $(cat "${full_logdir}"/mooncake_donor_*.ready 2>/dev/null | awk '{print $1}' | paste -sd, - || echo none))"
+        echo "(lending hosts: $(grep -hoE "GiB of [0-9.]+ is now part of the pool" \
+            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null \
+            | awk '{print $3}' | sort -u | paste -sd, - || echo none))"
         grep -o "allocation_succeeded size=[0-9]* segment=[0-9.]*:[0-9]*" \
             "${full_logdir}/mooncake_master.log" 2>/dev/null \
             | awk '{
@@ -446,15 +308,17 @@ if [ "${mooncake_enabled}" = "true" ]; then
                     printf "%-16s pages=%-7d %8.2f GiB\n", "TOTAL", total_allocs, total_bytes / 1073741824;
                 }' || echo "(could not parse master log)"
         echo
-        echo "== donors =="
-        for donor_log in "${full_logdir}"/2_mooncake_donor_*.log; do
-            [ -f "${donor_log}" ] || continue
-            echo "--- $(basename "${donor_log}") ---"
-            grep -h "donating\|part of the pool\|withdrew\|failed" "${donor_log}" 2>/dev/null || tail -n 5 "${donor_log}"
-        done
+        # Lending memory happens inside the generation servers, so their own
+        # logs are where a segment that never mounted shows up.
+        echo "== lent segments =="
+        grep -h "mooncake-store: .*\(lending memory\|part of the pool\|withdrew\)" \
+            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null || echo "(none)"
         echo
-        # The master's own log, which is glog and separate from the launching
-        # command's output in 2_mooncake_master.log.
+        echo "== pool bringup (context server) =="
+        grep -h "mooncake-store:" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null \
+            | head -n 30 || echo "(none)"
+        echo
+        # The master's own log, glog rather than anything TensorRT-LLM writes.
         echo "== master =="
         tail -n 50 "${full_logdir}/mooncake_master.log" 2>/dev/null || echo "(no master log)"
     } > "${mooncake_summary}" 2>&1

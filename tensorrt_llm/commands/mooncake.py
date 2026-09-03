@@ -82,8 +82,14 @@ def _until_signalled() -> threading.Event:
               default=None,
               help="Where to keep the master's log. Defaults to "
               "$TRTLLM_MOONCAKE_RUN_DIR, else a temporary directory.")
+@click.option("--heartbeat_seconds",
+              type=int,
+              default=300,
+              show_default=True,
+              help="Interval between liveness lines. 0 disables them.")
 def mooncake_master(rpc_port: int, metrics_port: int, eviction_ratio: float,
-                    address_file: Optional[str], run_dir: Optional[str]):
+                    address_file: Optional[str], run_dir: Optional[str],
+                    heartbeat_seconds: int):
     """Run a mooncake_master for as long as this command runs.
 
     For a pool that must not belong to any one engine: several servers sharing
@@ -109,6 +115,12 @@ def mooncake_master(rpc_port: int, metrics_port: int, eviction_ratio: float,
 
     stopping = _until_signalled()
     with running_master(pool, run_dir, address_file=address_file) as master:
+        logger.info(
+            f"mooncake-store: this master owns the pool until this command "
+            f"stops; address {master.address}, log {master.log_path}, metrics "
+            f"http://{master.address.rsplit(':', 1)[0]}:{metrics_port}/metrics")
+        started = time.monotonic()
+        announced = started
         while not stopping.is_set():
             if (code := master.process.poll()) is not None:
                 # Its own death is the interesting outcome: the pool is gone
@@ -117,6 +129,14 @@ def mooncake_master(rpc_port: int, metrics_port: int, eviction_ratio: float,
                     f"mooncake_master exited with code {code}. See "
                     f"{master.log_path}")
             stopping.wait(1.0)
+            now = time.monotonic()
+            # Says the pool is still there, which is the question asked of
+            # this log when clients start failing: master or fabric?
+            if heartbeat_seconds > 0 and now - announced >= heartbeat_seconds:
+                announced = now
+                logger.info(
+                    f"mooncake-store: master at {master.address} alive after "
+                    f"{(now - started) / 60:.0f}m")
 
 
 @click.command("mooncake_donor")
@@ -177,7 +197,7 @@ def mooncake_donor(master_server_address: Optional[str], segment_size: str,
     """
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import (
         DEFAULT_DONOR_LOCAL_BUFFER_SIZE, donate_segment, master_timeout,
-        parse_size, resolve_master_address)
+        parse_size, resolve_master_address, wait_for_master)
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
         CONFIG_PATH_ENV
 
@@ -194,9 +214,14 @@ def mooncake_donor(master_server_address: Optional[str], segment_size: str,
             f"naming one (or set {CONFIG_PATH_ENV}).")
 
     donating = parse_size(segment_size)
+    resolved = resolve_master_address(master, master_timeout())
+    # Before setup, so "the master is not up yet" is reported as that and not
+    # as the status code setup returns for every kind of failure.
+    wait_for_master(resolved)
+
     stopping = _until_signalled()
     with donate_segment(
-            resolve_master_address(master, master_timeout()),
+            resolved,
             donating,
             protocol=protocol or raw.get("protocol", "rdma"),
             device_name=device_name or raw.get("device_name", "") or "",
@@ -208,6 +233,9 @@ def mooncake_donor(master_server_address: Optional[str], segment_size: str,
         if ready_file:
             with open(ready_file, "w") as handle:
                 handle.write(f"{host} {donating}\n")
+            logger.info(f"mooncake-store: announced this segment in "
+                        f"{ready_file}, so a launcher waiting on the pool's "
+                        "capacity can proceed")
 
         # Idle by design. A put or get here would make this node a client in
         # the traffic sense, which is the thing keeping the generation engine
@@ -218,5 +246,7 @@ def mooncake_donor(master_server_address: Optional[str], segment_size: str,
                 stopping.wait()
                 continue
             if not stopping.wait(heartbeat_seconds):
-                logger.info("mooncake-store: still donating after "
-                            f"{(time.monotonic() - started) / 60:.0f}m")
+                logger.info(
+                    f"mooncake-store: {host} still lending "
+                    f"{donating / 1024 ** 3:.1f}GiB to the pool at {master} "
+                    f"after {(time.monotonic() - started) / 60:.0f}m")

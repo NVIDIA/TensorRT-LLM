@@ -1977,6 +1977,14 @@ class MooncakeStoreConfig(StrictBaseModel):
         "and use it. The pool then dies with the server, so this is only "
         "correct for a single engine: several engines sharing a pool, or a "
         "pool that must outlive a restart, need master_server_address.")
+    master_address_file: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="Where a master started by launch_master should publish "
+        "its host:port, for donors and other servers to read back as "
+        "file://<path>. One is always written to the run directory; set this "
+        "to put a second copy somewhere the rest of the deployment already "
+        "names, such as a shared filesystem. Removed when the master stops.")
     master_port: int = Field(
         50051,
         telemetry=False,
@@ -2044,7 +2052,69 @@ class MooncakeStoreConfig(StrictBaseModel):
                 "mooncake_store: needs a master. Set master_server_address to "
                 "join an existing pool, or launch_master: true to start one "
                 "for this server alone.")
+        if self.master_address_file and not self.launch_master:
+            raise ValueError(
+                "mooncake_store: master_address_file publishes the address of "
+                "a master this server starts, so it needs launch_master: "
+                "true. To read an address a master elsewhere published, set "
+                "master_server_address: file://<path>.")
         return self
+
+
+class MooncakeDonationConfig(StrictBaseModel):
+    """Host memory this server lends to a Mooncake pool it does not use.
+
+    Pool capacity comes only from processes that open a store handle, and in a
+    disaggregated deployment only the context servers configure the connector.
+    The pool is then entirely prefill-node memory: prefill's DRAM caching
+    prefill's GPUs, which largely duplicates what
+    ``kv_cache_config.host_cache_size`` already does. Setting this on the
+    generation servers puts their memory into the same pool, so prefill writes
+    blocks that land on decode-side DRAM, while the generation engine stays
+    free of any connector and keeps its cache transceiver for the handoff.
+
+    Lending memory is deliberately separate from
+    ``kv_connector_config``. That config attaches a connector, and a connector
+    reads and writes; there is no setting on it that means "contribute memory
+    only", so expressing capacity there would start this server using the
+    store. Capacity and traffic are different things and are configured
+    separately.
+
+    The memory is charged to this process and competes with everything else on
+    the node, ``kv_cache_config.host_cache_size`` above all, so size the two
+    together.
+
+    Every field opts out of telemetry: they describe one site's pool and how
+    much of this node was given to it, not which features are in use.
+    """
+    master_server_address: str = Field(
+        ...,
+        telemetry=False,
+        description="Master of the pool to lend memory to, as host:port or "
+        "file://<path> naming a file that holds one. The file is what a "
+        "context server's launch_master publishes, so the generation servers "
+        "can name a path instead of a host chosen by a scheduler, and they "
+        "wait for the master rather than having to start after it.")
+    segment_size: Union[int, str] = Field(
+        "32GiB",
+        telemetry=False,
+        description="Host memory this server contributes. Charged once per "
+        "server process, not per rank, so a node running several servers "
+        "contributes this much for each of them.")
+    protocol: str = Field(
+        "rdma",
+        telemetry=False,
+        description="Transport the pool's traffic reaches this memory over: "
+        "'rdma' or 'tcp'. Must match the pool's.")
+    device_name: str = Field(
+        "",
+        telemetry=False,
+        description="RDMA device to serve the segment over, from ibv_devinfo. "
+        "Empty with protocol 'tcp'.")
+    metadata_server: str = Field(
+        "P2PHANDSHAKE",
+        telemetry=False,
+        description="Mooncake metadata service. Must match the pool's.")
 
 
 class KvCacheConnectorConfig(StrictBaseModel):
@@ -5330,6 +5400,17 @@ class TorchLlmArgs(BaseLlmArgs):
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
+        status="prototype",
+    )
+
+    mooncake_donation: Optional[MooncakeDonationConfig] = Field(
+        default=None,
+        description="Host memory to lend to a Mooncake pool this server does "
+        "not otherwise use. Separate from kv_connector_config because it adds "
+        "capacity without attaching a connector, which is what lets a "
+        "generation server hold pages for a pool only prefill reads and "
+        "writes. Honored by trtllm-serve, which holds the segment for the "
+        "server's lifetime.",
         status="prototype",
     )
 

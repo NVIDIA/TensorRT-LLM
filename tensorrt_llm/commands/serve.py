@@ -15,8 +15,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import (Any, ContextManager, Dict, NamedTuple, Optional, Sequence,
-                    Set)
+from typing import Any, Dict, Iterator, NamedTuple, Optional, Sequence, Set
 
 import click
 import torch
@@ -42,6 +41,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
 from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig,
+                                          MooncakeDonationConfig,
                                           MultimodalConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
@@ -518,25 +518,33 @@ def _terminate_attached_frontends(children: list) -> None:
             child.kill()
 
 
-def _provision_kv_connector_pool(llm_args: dict,
-                                 owns_engine: bool = True) -> ContextManager:
-    """Bring up the shared cache a KV connector needs, for its lifetime.
+@contextlib.contextmanager
+def _provision_kv_cache_pool(llm_args: dict,
+                             owns_engine: bool = True) -> Iterator[None]:
+    """Bring up the shared cache this server needs or feeds, for its lifetime.
 
-    Connectors backed by a cluster-wide pool need it reachable before any rank
-    opens a handle to it, and the ranks are spawned by the LLM constructor.
-    Entering this around that construction is what makes the pool part of
-    `trtllm-serve` bringup rather than something a launch script has to
-    arrange; a deployment that arranges it anyway is detected and left alone.
+    Two things the engine cannot produce for itself. A connector backed by a
+    cluster-wide pool needs it reachable before any rank opens a handle, and
+    the ranks are spawned by the LLM constructor; entering this around that
+    construction is what makes the pool part of `trtllm-serve` bringup rather
+    than something a launch script has to arrange. A deployment that arranges
+    it anyway is detected and left alone.
 
-    Only the process that owns the engine provisions anything: an attached
-    frontend re-execs this command line but shares the launcher's executor,
-    so it would otherwise stand up a second, private pool.
+    Separately, a server may lend the pool host memory without using it, which
+    is how a pool spans nodes whose engines have no connector. That segment
+    has to be mounted before traffic arrives, and held for as long as the
+    pages placed in it are expected to be there -- so, this context.
+
+    Only the process that owns the engine does either: an attached frontend
+    re-execs this command line but shares the launcher's executor, so it would
+    otherwise stand up a second, private pool and lend a second segment.
     """
     if not owns_engine:
-        return contextlib.nullcontext()
+        yield
+        return
 
-    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import \
-        maybe_provision_pool
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import (
+        maybe_donate_segment, maybe_provision_pool)
 
     connector_config = llm_args.get("kv_connector_config")
     if isinstance(connector_config, dict):
@@ -545,7 +553,14 @@ def _provision_kv_connector_pool(llm_args: dict,
         # and hand the validated model on so it is not parsed twice.
         connector_config = KvCacheConnectorConfig(**connector_config)
         llm_args["kv_connector_config"] = connector_config
-    return maybe_provision_pool(connector_config)
+
+    donation = llm_args.get("mooncake_donation")
+    if isinstance(donation, dict):
+        donation = MooncakeDonationConfig(**donation)
+        llm_args["mooncake_donation"] = donation
+
+    with maybe_provision_pool(connector_config), maybe_donate_segment(donation):
+        yield
 
 
 def launch_server(
@@ -604,7 +619,7 @@ def launch_server(
             raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
                                f"Port holder(s): {holder}")
 
-        with _provision_kv_connector_pool(
+        with _provision_kv_cache_pool(
                 llm_args, owns_engine=not multi_frontend.is_attached_frontend):
             if backend == 'pytorch':
                 llm_args.pop("build_config", None)
@@ -775,7 +790,7 @@ def launch_grpc_server(host: str,
 
             logger.info("Shutdown complete")
 
-    with _provision_kv_connector_pool(llm_args):
+    with _provision_kv_cache_pool(llm_args):
         uvloop.run(serve_grpc_async())
 
 
