@@ -112,8 +112,8 @@ def _cute_dense_available() -> bool:
     return True
 
 
-def _parse_dense_layers(spec: Optional[str]) -> frozenset:
-    layers: set = set()
+def _parse_dense_layers(spec: Optional[str]) -> frozenset[int]:
+    layers: set[int] = set()
     for item in str(spec or "").split(","):
         item = item.strip()
         if not item:
@@ -154,11 +154,15 @@ class SolAttention(AttentionBackend):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or num_heads
-        assert self.num_kv_heads == self.num_heads, (
-            f"Sol-Attn is MHA-only (num_kv_heads == num_heads), got "
-            f"num_kv_heads={self.num_kv_heads}, num_heads={self.num_heads}. "
-            f"GQA/MQA is not supported."
-        )
+        if self.num_kv_heads != self.num_heads:
+            # Not an assert: `python -O` strips those, and the kernel wrapper
+            # would then see unequal Q/K shapes and quietly take its dense
+            # fallback instead of rejecting an unsupported configuration.
+            raise ValueError(
+                f"Sol-Attn is MHA-only (num_kv_heads == num_heads), got "
+                f"num_kv_heads={self.num_kv_heads}, num_heads={self.num_heads}. "
+                f"GQA/MQA is not supported."
+            )
         self.dtype = dtype
         cfg = sparse_attention_config
         self.tau = getattr(cfg, "tau", 1.0)
@@ -203,7 +207,7 @@ class SolAttention(AttentionBackend):
     # `_get_vsa_inputs` do). Returns a host-side bool, so the dense and sparse
     # phases still compile as separate graphs -- they run different kernels.
     @torch.compiler.disable
-    def _dense_by_step(self, timestep) -> bool:
+    def _dense_by_step(self, timestep: Any) -> bool:
         phase = sol_attn_graph_phase(
             timestep,
             disabled_until_timestep=self.disabled_until_timestep,
@@ -231,7 +235,9 @@ class SolAttention(AttentionBackend):
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         ).transpose(1, 2)
 
-    def _delegate(self, q, k, v, **kwargs) -> torch.Tensor:
+    def _delegate(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
         """Hand the call to the dense backend of the same family.
 
         ``_cute_dense_ok`` answers "can this *device* run the kernel", decided at
@@ -243,7 +249,7 @@ class SolAttention(AttentionBackend):
             return self._inner.forward(q, k, v, **kwargs)
         return self._sdpa(q, k, v)
 
-    def _can_serve(self, q: torch.Tensor, k: torch.Tensor, **kwargs) -> bool:
+    def _can_serve(self, q: torch.Tensor, k: torch.Tensor, **kwargs: Any) -> bool:
         """Whether the sparse kernel applies to this particular call.
 
         Everything false here is delegated to ``_inner``. Deciding it from the

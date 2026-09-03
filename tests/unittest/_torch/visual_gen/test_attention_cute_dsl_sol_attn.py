@@ -142,10 +142,11 @@ def test_sol_attn_self_attention_is_served_under_separate_qkv():
     Qwen-Image uses it unconditionally. Both are self-attention; both must still
     get the sparse kernel.
     """
-    device = torch.device("cuda")
     attn = SolAttention(layer_idx=1, num_heads=2, head_dim=128)
     attn.disabled_until_timestep = None
-    q = k = torch.randn(1, 64, 2, 128, device=device, dtype=torch.bfloat16)
+    # CPU tensors on purpose: `_can_serve` compares shapes and the layer index
+    # and never touches the device, so this runs on CPU-only hosts too.
+    q = k = torch.randn(1, 64, 2, 128, dtype=torch.bfloat16)
     assert attn._can_serve(q, k), "equal q/k sequence lengths must reach the sparse kernel"
 
 
@@ -182,7 +183,7 @@ def test_sol_attn_with_context_parallelism_raises():
 
 def test_sol_attn_rejects_gqa_mqa():
     """Sol-Attn is MHA-only; num_kv_heads != num_heads must fail fast at construction."""
-    with pytest.raises(AssertionError, match="MHA-only"):
+    with pytest.raises(ValueError, match="MHA-only"):
         SolAttention(layer_idx=0, num_heads=8, head_dim=128, num_kv_heads=2)
 
 
@@ -434,6 +435,32 @@ def test_zero_cutoff_rejected():
     with pytest.raises(ValueError):
         SolAttentionConfig(tau=2.0, disabled_until_timestep=0.0)
     assert SolAttentionConfig(tau=2.0).disabled_until_timestep is None
+
+
+@pytest.mark.parametrize(
+    "spec,reason",
+    [
+        ("4-2", "descending"),
+        ("abc", "not a layer index"),
+        ("0,x", "not a layer index"),
+        ("-1", "not a layer index"),
+    ],
+    ids=["descending_range", "non_numeric", "non_numeric_in_list", "negative"],
+)
+def test_dense_layers_rejects_malformed_spec(spec, reason):
+    """Malformed dense_layers must fail at config time, not silently or late.
+
+    A descending range is the dangerous one: `_parse_dense_layers('4-2')`
+    yields an empty set, so the layers the user asked to force dense would
+    quietly stay sparse with no error anywhere.
+    """
+    with pytest.raises(ValueError, match=reason):
+        SolAttentionConfig(tau=2.0, dense_layers=spec)
+
+
+@pytest.mark.parametrize("spec", [None, "0", "0,2-4", " 0 , 2 ", "0-0"])
+def test_dense_layers_accepts_valid_spec(spec):
+    assert SolAttentionConfig(tau=2.0, dense_layers=spec).dense_layers == spec
 
 
 @pytest.mark.skip(
