@@ -179,9 +179,9 @@ class AutoPipeline:
             else None
         )
 
-        vae_quant_config = config.vae_quant_config
-        if vae_quant_config is not None:
-            quant_algo = vae_quant_config.quant_algo
+        vae_conv_quant_config = config.vae_conv_quant_config
+        if vae_conv_quant_config is not None:
+            quant_algo = vae_conv_quant_config.quant_algo
             if quant_algo not in (None, QuantAlgo.NVFP4):
                 raise ValueError(
                     f"VAE quantization supports only NVFP4, got {quant_algo}. "
@@ -200,7 +200,7 @@ class AutoPipeline:
         if not entry.supports_nvfp4_vae:
             raise ValueError(
                 f"NVFP4 VAE is not supported by {class_name}. "
-                "Remove vae_quant_config or use a supported Wan pipeline."
+                "Remove vae_config.quant_conv_config or use a supported Wan pipeline."
             )
 
     @staticmethod

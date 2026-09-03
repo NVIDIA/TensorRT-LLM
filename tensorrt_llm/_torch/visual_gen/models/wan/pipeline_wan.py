@@ -301,9 +301,9 @@ class WanPipeline(BasePipeline):
                 checkpoint_dir,
                 vae_device,
                 dtype=self.pipeline_config.torch_dtype,
-                quant_config=self.pipeline_config.vae_quant_config,
-                dynamic_weight_quant=self.pipeline_config.vae_dynamic_weight_quant,
-                dynamic_activation_quant=self.pipeline_config.vae_dynamic_activation_quant,
+                quant_config=self.pipeline_config.vae_conv_quant_config,
+                dynamic_weight_quant=self.pipeline_config.vae_conv_dynamic_weight_quant,
+                dynamic_activation_quant=self.pipeline_config.vae_conv_dynamic_activation_quant,
             )
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)

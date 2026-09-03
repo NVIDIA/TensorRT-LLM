@@ -20,6 +20,7 @@ from tensorrt_llm.visual_gen.args import (
     RuntimeLoRAConfig,
     TeaCacheConfig,
     TorchCompileConfig,
+    VAEConfig,
     VisualGenArgs,
 )
 
@@ -47,6 +48,10 @@ class TestVisualGenArgsStrictValidation:
     def test_nested_attention_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             AttentionConfig(backend="VANILLA", extra_key="bad")
+
+    def test_nested_vae_unknown_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            VisualGenArgs(model="/tmp/model", vae_config={"unknown_field": True})
 
     def test_nested_teacache_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
@@ -245,6 +250,12 @@ class TestVisualGenArgsCacheBackend:
 class TestVisualGenArgsFromDict:
     """VisualGenArgs construction from dicts enforces strict validation."""
 
+    def test_vae_config_defaults_to_checkpoint_driven_quantization(self):
+        args = VisualGenArgs(model="/tmp/model")
+
+        assert isinstance(args.vae_config, VAEConfig)
+        assert args.vae_config.quant_conv_config is None
+
     def test_valid_dict(self):
         args = VisualGenArgs(
             **{
@@ -269,11 +280,15 @@ class TestVisualGenArgsFromDict:
             **{
                 "model": "/tmp/model",
                 "attention_config": {"backend": "TRTLLM"},
+                "vae_config": {"quant_conv_config": {"quant_algo": "NVFP4", "dynamic": True}},
                 "cache_config": {"cache_backend": "teacache", "teacache_thresh": 0.3},
             }
         )
         assert isinstance(args.attention_config, AttentionConfig)
         assert args.attention_config.backend == "TRTLLM"
+        assert isinstance(args.vae_config, VAEConfig)
+        assert isinstance(args.vae_config.quant_conv_config, dict)
+        assert args.vae_config.quant_conv_config["dynamic"] is True
         assert isinstance(args.cache_config, TeaCacheConfig)
         assert args.teacache.teacache_thresh == 0.3
 

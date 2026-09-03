@@ -185,10 +185,10 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
     # VAE quantization is component-scoped. None preserves checkpoint-driven
     # selection, while QuantConfig(quant_algo=None) explicitly disables it.
-    vae_quant_config: Optional[QuantConfig] = None
-    # VAE-only ModelOpt overrides. None lets the checkpoint determine the mode.
-    vae_dynamic_weight_quant: Optional[bool] = None
-    vae_dynamic_activation_quant: Optional[bool] = None
+    vae_conv_quant_config: Optional[QuantConfig] = None
+    # VAE Conv-only ModelOpt overrides. None lets the checkpoint determine the mode.
+    vae_conv_dynamic_weight_quant: Optional[bool] = None
+    vae_conv_dynamic_activation_quant: Optional[bool] = None
     # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
@@ -347,7 +347,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         return quant_config, layer_quant_config, dynamic_weight_quant, dynamic_activation_quant
 
     @staticmethod
-    def load_vae_quant_config(
+    def load_vae_conv_quant_config(
         quant_config_dict: dict,
         checkpoint_quant_config_dict: Optional[dict] = None,
     ) -> Tuple[QuantConfig, Optional[bool], Optional[bool]]:
@@ -365,7 +365,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         has_groups = "config_groups" in quant_config_dict
         if has_shorthand and has_groups:
             raise ValueError(
-                "vae_quant_config cannot specify both top-level 'dynamic' and "
+                "vae_config.quant_conv_config cannot specify both top-level 'dynamic' and "
                 "'config_groups' dynamic settings"
             )
 
@@ -375,28 +375,34 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         if has_shorthand:
             dynamic = quant_config_dict["dynamic"]
             if type(dynamic) is not bool:
-                raise ValueError("vae_quant_config 'dynamic' must be a boolean")
+                raise ValueError("vae_config.quant_conv_config 'dynamic' must be a boolean")
             dynamic_weight = dynamic_activation = dynamic
         elif has_groups:
             config_groups = quant_config_dict["config_groups"]
             if not isinstance(config_groups, dict) or len(config_groups) != 1:
-                raise ValueError("vae_quant_config supports exactly one ModelOpt config group")
+                raise ValueError(
+                    "vae_config.quant_conv_config supports exactly one ModelOpt config group"
+                )
             group_name, group_config = next(iter(config_groups.items()))
             if not isinstance(group_config, dict):
-                raise ValueError(f"vae_quant_config group {group_name!r} must contain a dictionary")
+                raise ValueError(
+                    f"vae_config.quant_conv_config group {group_name!r} must contain a dictionary"
+                )
 
             def _dynamic_value(section_name: str) -> Optional[bool]:
                 section = group_config.get(section_name, {})
                 if not isinstance(section, dict):
                     raise ValueError(
-                        f"vae_quant_config group {group_name!r} section "
+                        f"vae_config.quant_conv_config group {group_name!r} section "
                         f"{section_name!r} must contain a dictionary"
                     )
                 if "dynamic" not in section:
                     return None
                 value = section["dynamic"]
                 if type(value) is not bool:
-                    raise ValueError(f"vae_quant_config {section_name}.dynamic must be a boolean")
+                    raise ValueError(
+                        f"vae_config.quant_conv_config {section_name}.dynamic must be a boolean"
+                    )
                 return value
 
             dynamic_weight = _dynamic_value("weights")
@@ -709,23 +715,23 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         # established QuantConfig schema and ModelOpt ``ignore`` parser, but do
         # not reuse the transformer instance: component routing by name pattern
         # cannot represent BF16 transformer + FP4 VAE (or the reverse).
-        user_vae_quant = args.vae_quant_config if args else None
+        user_vae_quant = args.vae_config.quant_conv_config if args else None
         vae_component_config = component_config_dicts.get(PipelineComponent.VAE.value, {})
         checkpoint_vae_quant = vae_component_config.get("quantization_config")
         if isinstance(user_vae_quant, dict):
             (
-                vae_quant_config,
-                vae_dynamic_weight_quant,
-                vae_dynamic_activation_quant,
-            ) = cls.load_vae_quant_config(user_vae_quant, checkpoint_vae_quant)
+                vae_conv_quant_config,
+                vae_conv_dynamic_weight_quant,
+                vae_conv_dynamic_activation_quant,
+            ) = cls.load_vae_conv_quant_config(user_vae_quant, checkpoint_vae_quant)
         elif isinstance(user_vae_quant, QuantConfig):
-            vae_quant_config = user_vae_quant
-            vae_dynamic_weight_quant = None
-            vae_dynamic_activation_quant = None
+            vae_conv_quant_config = user_vae_quant
+            vae_conv_dynamic_weight_quant = None
+            vae_conv_dynamic_activation_quant = None
         else:
-            vae_quant_config = None
-            vae_dynamic_weight_quant = None
-            vae_dynamic_activation_quant = None
+            vae_conv_quant_config = None
+            vae_conv_dynamic_weight_quant = None
+            vae_conv_dynamic_activation_quant = None
 
         # Enable tunable FP4 quantize for visual gen: larger activation
         # tensors (full image/video latents) amortize the AutoTuner overhead.
@@ -747,9 +753,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
         pipeline_config = cls(
             quant_config=quant_config,
-            vae_quant_config=vae_quant_config,
-            vae_dynamic_weight_quant=vae_dynamic_weight_quant,
-            vae_dynamic_activation_quant=vae_dynamic_activation_quant,
+            vae_conv_quant_config=vae_conv_quant_config,
+            vae_conv_dynamic_weight_quant=vae_conv_dynamic_weight_quant,
+            vae_conv_dynamic_activation_quant=vae_conv_dynamic_activation_quant,
             quant_config_dict=quant_config_dict,
             dynamic_weight_quant=dynamic_weight_quant,
             force_dynamic_quantization=dynamic_activation_quant,

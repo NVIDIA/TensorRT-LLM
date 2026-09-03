@@ -220,6 +220,19 @@ class AttentionConfig(StrictBaseModel):
         return self
 
 
+class VAEConfig(StrictBaseModel):
+    """Configuration for the variational autoencoder."""
+
+    quant_conv_config: Optional[Union[QuantConfig, Dict[str, Any]]] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Quantization config for VAE convolution operators, independent "
+            "from transformer linear-layer and attention quantization."
+        ),
+    )
+
+
 class ParallelConfig(StrictBaseModel):
     """Configuration for distributed parallelism across DiT-shaped models.
 
@@ -676,14 +689,6 @@ class VisualGenArgs(StrictBaseModel):
             "DiffusionPipelineConfig.from_pretrained."
         ),
     )
-    vae_quant_config: Optional[Union[QuantConfig, Dict[str, Any]]] = Field(
-        None,
-        status="prototype",
-        description=(
-            "Quantization config for VAE Conv3d operators, independent of "
-            "transformer linear-layer and attention quantization."
-        ),
-    )
     compilation_config: CompilationConfig = Field(
         default_factory=CompilationConfig,
         status="prototype",
@@ -703,6 +708,11 @@ class VisualGenArgs(StrictBaseModel):
     attention_config: AttentionConfig = Field(
         default_factory=AttentionConfig,
         status="prototype",
+    )
+    vae_config: VAEConfig = Field(
+        default_factory=VAEConfig,
+        status="prototype",
+        description="Configuration for VAE execution.",
     )
     parallel_config: ParallelConfig = Field(
         default_factory=ParallelConfig,
@@ -798,6 +808,7 @@ __all__ = [
     "SkipSoftmaxAttentionConfig",
     "VideoSparseAttentionConfig",
     "AttentionConfig",
+    "VAEConfig",
     "ParallelConfig",
     "BaseCacheConfig",
     "TeaCacheConfig",
