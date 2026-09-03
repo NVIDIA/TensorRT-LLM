@@ -311,12 +311,13 @@ def test_fused_indexer_topk_nospill_long_context(batch, n_comp, k_top):
 
 @skip_not_sm100
 @pytest.mark.parametrize("pattern", ["random", "monotone", "allequal", "giantbin"])
-@pytest.mark.parametrize("batch", [2, 16, 64])
+@pytest.mark.parametrize("batch", [2, 16, 64, 80])
 @pytest.mark.parametrize("k_top", [512, 1024])
 def test_fused_indexer_topk_nospill_filtered(pattern, batch, k_top, monkeypatch):
     # Force the safe-line filter path on short rows: an 8-tile dense prefix,
     # everything after it filtered/compacted. Adversarial score shapes make
     # every chunk trigger a compaction (monotone) or a single giant tie class.
+    # batch 80 runs one CTA per row (CS=1), so the local and final K-th bins coincide.
     monkeypatch.setenv("TRTLLM_FUSED_TOPK_NDENSE", "8")
     device = torch.device("cuda")
     weight_mode = "nonneg" if pattern != "random" else "signed"
@@ -376,7 +377,7 @@ def _reference_indices(inp, k_top):
 @pytest.mark.parametrize("n_comp", [8192, 16384])
 @pytest.mark.parametrize("k_top", [512, 1024])
 def test_fused_indexer_topk_nospill_fp32_boundary(batch, n_comp, k_top, monkeypatch):
-    # Opt-in fp32 boundary refinement: the selected INDEX set equals the fp32
+    # fp32 boundary refinement (default on): the selected INDEX set equals the fp32
     # top-K set; members may differ only inside a genuine fp32 tie class at the
     # boundary (scores equal to within 1e-6 relative).
     monkeypatch.setenv("TRTLLM_FUSED_TOPK_FP32_EXACT", "1")
@@ -396,13 +397,26 @@ def test_fused_indexer_topk_nospill_fp32_boundary(batch, n_comp, k_top, monkeypa
         values,
     )
     torch.cuda.synchronize()
+    _check_fp32_boundary(inp, indices, k_top)
+
+
+def _check_fp32_boundary(inp, indices, k_top, tie_cap=256):
     scores = _reference_indices(inp, k_top)
-    for i in range(batch):
+    for i in range(indices.shape[0]):
         s = scores[i]
         ref = torch.topk(s, k_top).indices
         kth = s[ref[-1]]
         got = indices[i].long()
         assert got.unique().numel() == k_top
+        if int((s.half() == kth.half()).sum()) > tie_cap:
+            # a boundary tie class above the cap keeps the fp16 fill: exact at fp16 granularity
+            assert int((s[got].half() < kth.half()).sum()) == 0, (
+                f"row {i}: token below the fp16 K-th value"
+            )
+            gh, _ = torch.sort(s[got].half(), descending=True)
+            rh, _ = torch.sort(s[ref].half(), descending=True)
+            assert bool((gh == rh).all()), f"row {i}: fp16 value multiset differs"
+            continue
         # every selected token must score >= the fp32 K-th value (within 1e-6 rel)
         tol = 1e-6 * kth.abs() + 1e-6
         below = (s[got] < kth - tol).sum().item()
@@ -413,3 +427,31 @@ def test_fused_indexer_topk_nospill_fp32_boundary(batch, n_comp, k_top, monkeypa
         assert bool(((gs - rs).abs() <= 1e-6 * rs.abs() + 1e-6).all()), (
             f"row {i}: fp32 score multiset differs"
         )
+
+
+@pytest.mark.parametrize("pattern", ["random", "monotone", "giantbin"])
+@pytest.mark.parametrize("k_top", [512, 1024])
+def test_fused_indexer_topk_nospill_fp32_boundary_filtered(pattern, k_top, monkeypatch):
+    # fp32 exactness on filtered rows at CS=1 (batch 80, 8-tile dense prefix):
+    # compaction must keep every member of a tie class the refinement rescores
+    monkeypatch.setenv("TRTLLM_FUSED_TOPK_NDENSE", "8")
+    monkeypatch.setenv("TRTLLM_FUSED_TOPK_FP32_EXACT", "1")
+    device = torch.device("cuda")
+    batch = 80
+    weight_mode = "nonneg" if pattern != "random" else "signed"
+    inp = _build_inputs(batch, 16384, k_top, weight_mode, seed=4242, device=device, pattern=pattern)
+    indices = torch.full((batch, k_top), -3, dtype=torch.int32, device=device)
+    values = torch.full((batch, k_top), float("nan"), dtype=torch.float32, device=device)
+    fused_indexer_topk_nospill.run(
+        inp["q_fp4"],
+        inp["sf_q"],
+        inp["kv_cache"],
+        inp["weights"],
+        inp["context_lens"],
+        inp["block_table"],
+        None,
+        indices,
+        values,
+    )
+    torch.cuda.synchronize()
+    _check_fp32_boundary(inp, indices, k_top)

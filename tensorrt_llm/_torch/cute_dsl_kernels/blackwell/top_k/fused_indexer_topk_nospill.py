@@ -86,7 +86,10 @@ M_WARP = 14
 NTHREADS = 480  # 15 warps => 136 regs/thread, enough to keep all 64
 # per-head weights resident in registers for the scan
 NACC = 3
-MAX_NLOC = 512  # tiles per CTA (dense prefix + filtered survivors; page-table slice is NLOC*16 B)
+MAX_NLOC = 2048  # tiles per CTA (dense prefix + filtered survivors; 1M tokens at CS=1)
+RBT_MAX = (
+    256  # page-table ring: tiles resident in SMEM (two 128-tile halves, refilled by the producers)
+)
 NDENSE_MAX = 256  # tiles whose keys are stored densely; later tiles are safe-line filtered
 CHUNK = 24  # filtered tiles between two consumer rendezvous (multiple of NACC)
 LP = 96  # safe-line refresh period in tiles after the dense prefix (multiple of NACC)
@@ -246,14 +249,18 @@ def _compact(
     CS,
 ):
     """Consumer-only (384 threads, named barrier 1) exact shrink of the
-    survivor buffer to <= KTOP entries: keep everything above the K-th value
-    seen so far, plus exactly the tie quota at that value. sHist is quiescent
-    and exact here, so the result is the CTA-local top-K-so-far."""
+    survivor buffer to <= KTOP + TIECAP entries: keep everything above the K-th
+    value seen so far, plus the tie quota at that value extended by TIECAP so a
+    tie class the fp32 refinement can rescore never loses a member. sHist also
+    counts the keys still parked in the window, so the fine descent may find no
+    hit; the whole K-th bin is kept then (fs = -1)."""
     if tidx < 32:
         sFine[tidx] = I32(0)
     if tidx == 0:
         sCtl[6] = I32(0)
         sCtl[7] = I32(0)
+        sCtl[14] = I32(-1)
+        sCtl[15] = I32(0)
     if warp_idx == 0:
         f, bs, ca = _pick_warp(sHist, wl, I32(KTOP))
         if wl == 0:
@@ -284,7 +291,7 @@ def _compact(
         _pick32(sFine, sCtl, tidx, warp_idx, r1s, 14)
         cute.arch.barrier(barrier_id=1, number_of_threads=C_THREADS)
         fs = sCtl[14]
-        r2s = r1s - sCtl[15]
+        r2s = r1s - sCtl[15] + TIECAP
         nr = (n + C_THREADS - 1) // C_THREADS
         for r in cutlass.range(nr, unroll=1):
             q = r * C_THREADS + tidx
@@ -371,82 +378,6 @@ def _st_dsmem_u32(addr, val):
     )
 
 
-@cute.jit
-def _fp4(c):
-    """FP4 E2M1 code -> value ({0, .5, 1, 1.5, 2, 3, 4, 6}, bit 3 = sign) by arithmetic."""
-    m = c & 7
-    e = m >> 1
-    man = F32(1.0) + F32(0.5) * (m & 1).to(F32)  # 1.0 or 1.5
-    v = man * ((I32(126) + e) << 23).bitcast(F32)  # * 2^(e-1)
-    if m == 0:
-        v = F32(0.0)
-    if m == 1:
-        v = F32(0.5)
-    if (c & 8) != 0:
-        v = -v
-    return v
-
-
-@cute.jit
-def _score_fp32(kv_ptr, q_ptr, sfq_ptr, bt_ptr, b, MAXB, t, lane, sW):
-    """fp32 indexer score of token t for request b (same math as the scan:
-    relu per head, weighted sum; UE8M0 block scales per 32 dims). Lane owns
-    heads 2*lane, 2*lane+1; the warp-reduced score is returned on every lane.
-    Operand words are preloaded (16 + 16 registers); nibbles are decoded on
-    the fly in a runtime loop to keep code size and register use small."""
-    pg = cute.make_tensor(bt_ptr + cutlass.Int64(b) * MAXB, cute.make_layout(MAXB))[t >> 5]
-    toff = t & 31
-    kw = cute.make_tensor(
-        cute.make_ptr(
-            U32, kv_ptr.toint() + cutlass.Int64(pg) * PGB + toff * 64, GMEM, assumed_align=4
-        ),
-        cute.make_layout(16),
-    )
-    kr = [I32(0) for _ in range(16)]
-    for w in cutlass.range_constexpr(16):
-        kr[w] = I32(kw[w])
-    ksw = I32(
-        cute.make_tensor(
-            cute.make_ptr(
-                U32,
-                kv_ptr.toint() + cutlass.Int64(pg) * PGB + 2048 + toff * 4,
-                GMEM,
-                assumed_align=4,
-            ),
-            cute.make_layout(1),
-        )[0]
-    )
-    acc = F32(0.0)
-    for hh in cutlass.range_constexpr(2):
-        h = 2 * lane + hh
-        qw = cute.make_tensor(
-            cute.make_ptr(
-                U32, q_ptr.toint() + cutlass.Int64(b) * 4096 + h * 64, GMEM, assumed_align=4
-            ),
-            cute.make_layout(16),
-        )
-        qr = [I32(0) for _ in range(16)]
-        for w in cutlass.range_constexpr(16):
-            qr[w] = I32(qw[w])
-        qsw = I32(cute.make_tensor(sfq_ptr + b * 64 + h, cute.make_layout(1))[0])
-        dot = F32(0.0)
-        for blk in cutlass.range_constexpr(4):
-            part = F32(0.0)
-            for w in cutlass.range_constexpr(4):
-                kx = kr[blk * 4 + w]
-                qx = qr[blk * 4 + w]
-                for n in cutlass.range(8, unroll=1):
-                    sh = 4 * n
-                    part = part + _fp4((kx >> sh) & 15) * _fp4((qx >> sh) & 15)
-            sk = (((ksw >> (8 * blk)) & 255) << 23).bitcast(F32)
-            sq = (((qsw >> (8 * blk)) & 255) << 23).bitcast(F32)
-            dot = dot + part * sk * sq
-        acc = acc + sW[h] * cute.arch.fmax(dot, F32(0.0))
-    for d in cutlass.range_constexpr(5):
-        acc = acc + cute.arch.shuffle_sync_bfly(acc, 1 << d)
-    return acc
-
-
 @cute.kernel
 def _dsv4_kernel(
     tiled_mma: cute.TiledMma,
@@ -472,6 +403,7 @@ def _dsv4_kernel(
     NDENSE: cutlass.Constexpr,
     SCAP: cutlass.Constexpr,
     REFINE: cutlass.Constexpr,
+    RBT: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -503,7 +435,7 @@ def _dsv4_kernel(
     sPart = smem.allocate_tensor(I32, cute.make_layout(NBINS // 8), byte_alignment=128)
     sCtl = smem.allocate_tensor(I32, cute.make_layout(32), byte_alignment=128)
     sFine = smem.allocate_tensor(I32, cute.make_layout(NFINE), byte_alignment=128)
-    sBT = smem.allocate_tensor(I32, cute.make_layout(NLOC * 4), byte_alignment=128)
+    sBT = smem.allocate_tensor(I32, cute.make_layout(RBT * 4), byte_alignment=128)
     sCand = smem.allocate_tensor(I32, cute.make_layout(CAP), byte_alignment=128)
     sSPos = smem.allocate_tensor(I32, cute.make_layout(max(SCAP, 4)), byte_alignment=128)
     sSKey = smem.allocate_tensor(U16, cute.make_layout(max(SCAP, 8)), byte_alignment=128)
@@ -591,7 +523,7 @@ def _dsv4_kernel(
     gBT = cute.make_tensor(bt_ptr + cutlass.Int64(b) * MAXB, cute.make_layout(MAXB))
     if tidx >= 128:
         ii = tidx - 128
-        for jj in cutlass.range(ii, NLOC * 4, NTHREADS - 128, unroll=1):
+        for jj in cutlass.range(ii, RBT * 4, NTHREADS - 128, unroll=1):
             gi = (crk + (jj >> 2) * CS) * 4 + (jj & 3)
             if gi < MAXB:
                 sBT[jj] = gBT[gi]
@@ -673,19 +605,31 @@ def _dsv4_kernel(
             s = j % STAGES
             if j >= STAGES:
                 cute.arch.mbarrier_wait(ab_empty + s, ((j // STAGES) - 1) & 1)
+            if cutlass.const_expr(NLOC > RBT):
+                # refill the ring half that fell dead 64 tiles ago with tiles
+                # [j+64, j+192); its first reader (the L2 prefetch) is >= 60
+                # tiles away. Both producer warps take the same branch.
+                if ((j & 127) == 64) and (j + 64 < ntl):
+                    for r in cutlass.range_constexpr(8):
+                        e = lt * 8 + r
+                        jj = j + 64 + (e >> 2)
+                        gi = (crk + jj * CS) * 4 + (e & 3)
+                        if (jj < ntl) and (gi < MAXB):
+                            sBT[(jj & (RBT - 1)) * 4 + (e & 3)] = gBT[gi]
+                    cute.arch.barrier(barrier_id=2, number_of_threads=P_THREADS)
             if cutlass.const_expr(_ASM):
                 jf = j + PFD
                 if cutlass.const_expr(NCOMP >= 32768):
                     jf = j + 2
                 if jf < ntl:
-                    pgf = sBT[jf * 4 + pgt]
+                    pgf = sBT[(jf & (RBT - 1)) * 4 + pgt]
                     base = kv_ptr.toint() + cutlass.Int64(pgf) * PGB
                     _pfl2(base + tkt * 128)
                     if tkt == 0:
                         _pfl2(base + 2048)
             # scale plane keeps the per-half-warp page; data plane is per warp
-            pg0 = cute.arch.make_warp_uniform(sBT[j * 4 + pgw])
-            pg1 = cute.arch.make_warp_uniform(sBT[j * 4 + pgw + 1])
+            pg0 = cute.arch.make_warp_uniform(sBT[(j & (RBT - 1)) * 4 + pgw])
+            pg1 = cute.arch.make_warp_uniform(sBT[(j & (RBT - 1)) * 4 + pgw + 1])
             pg = pg0
             if pgt != pgw:
                 pg = pg1
@@ -980,8 +924,9 @@ def _dsv4_kernel(
     if cutlass.const_expr(CS > 1):
         cute.arch.cluster_arrive()
     cute.arch.barrier()
-    if warp_idx == 0:
-        cute.arch.dealloc_tmem(tmem_ptr, 512)
+    if cutlass.const_expr(REFINE == 0):
+        if warp_idx == 0:
+            cute.arch.dealloc_tmem(tmem_ptr, 512)
 
     gI = cute.make_tensor(oi_ptr + cutlass.Int64(b) * KTOP, cute.make_layout(KTOP))
     gV = cute.make_tensor(ov_ptr + cutlass.Int64(b) * KTOP, cute.make_layout(KTOP))
@@ -1201,72 +1146,174 @@ def _dsv4_kernel(
     elif cutlass.const_expr(REFINE == 1):
         cute.arch.barrier()
 
-    # ---------------- fp32 boundary refinement (opt-in) ----------------------
-    # The fp16 key is exact for everything above the boundary; only the tie
-    # class at the K-th fp16 value can differ from an fp32 top-K. Rank 0 (or
-    # the single CTA) rescores the recorded tie members in fp32 straight from
-    # the fp4 pages and rewrites the r2 tie slots in exact fp32 order.
-    # ntie <= r2 (all ties selected anyway) or ntie > TIECAP keeps the fill.
+    # ---------------- fp32 boundary refinement ------------------------------
+    # The fp16 key is exact above the boundary; only the tie class at the K-th
+    # fp16 value can differ from an fp32 top-K. The recorded tie members are
+    # rescored through the scan's own TMA -> MMA -> epilogue path: a virtual
+    # tile stages the 32-token pages of four members, so the fp32 score is the
+    # one that produced the key. ntie <= r2 or ntie > TIECAP keeps the fill.
     if cutlass.const_expr(REFINE == 1):
-        _refine_boundary(
-            sPart,
-            sHist,
-            sCtl,
-            sW,
-            gI,
-            gV,
-            kv_ptr,
-            q_ptr,
-            sfq_ptr,
-            bt_ptr,
-            b,
-            MAXB,
-            crk,
-            tidx,
-            lane,
-            warp_idx,
-            r2,
-            base2,
-            b1,
-            b2,
-        )
-
-
-@cute.jit
-def _refine_boundary(
-    sPart,
-    sHist,
-    sCtl,
-    sW,
-    gI,
-    gV,
-    kv_ptr,
-    q_ptr,
-    sfq_ptr,
-    bt_ptr,
-    b,
-    MAXB,
-    crk,
-    tidx,
-    lane,
-    warp_idx,
-    r2,
-    base2,
-    b1,
-    b2,
-):
-    if crk == 0:
         ntie = sCtl[10]
-        if (ntie > r2) and (ntie <= TIECAP):
-            sTS = cute.make_tensor(
-                cute.recast_ptr(sHist.iterator, dtype=F32), cute.make_layout(TIECAP)
-            )
-            for ti in cutlass.range(warp_idx, ntie, NTHREADS // 32, unroll=1):
-                tt = sPart[ti]
-                sc = _score_fp32(kv_ptr, q_ptr, sfq_ptr, bt_ptr, b, MAXB, tt, lane, sW)
-                if lane == 0:
-                    sTS[ti] = sc
-            cute.arch.barrier()
+        nvt = I32(0)
+        if crk == 0:
+            if (ntie > r2) and (ntie <= TIECAP):
+                nvt = (ntie + 3) // 4
+        sTS = cute.make_tensor(cute.recast_ptr(sCand.iterator, dtype=F32), cute.make_layout(CAP))
+        sPG = cute.make_tensor(sCand.iterator + TIECAP, cute.make_layout(TIECAP))
+        if warp_idx >= 12 and warp_idx < M_WARP:
+            lt = tidx - C_THREADS
+            pgt = lt // PPP
+            tkt = lt % PPP
+            pgw = 2 * (warp_idx - 12)
+            gBT = cute.make_tensor(bt_ptr + cutlass.Int64(b) * MAXB, cute.make_layout(MAXB))
+            for ti in cutlass.range(lt, nvt * 4, P_THREADS, unroll=1):
+                tm = ti
+                if tm >= ntie:
+                    tm = ntie - 1
+                sPG[ti] = gBT[sPart[tm] >> 5]
+            cute.arch.barrier(barrier_id=2, number_of_threads=P_THREADS)
+            for v in cutlass.range(nvt, unroll=1):
+                j = ntl + v
+                s = j % STAGES
+                if j >= STAGES:
+                    cute.arch.mbarrier_wait(ab_empty + s, ((j // STAGES) - 1) & 1)
+                pg0 = cute.arch.make_warp_uniform(sPG[v * 4 + pgw])
+                pg1 = cute.arch.make_warp_uniform(sPG[v * 4 + pgw + 1])
+                pg = pg0
+                if pgt != pgw:
+                    pg = pg1
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_expect_tx(ab_full + s, 2 * PAGE * DIMB)
+                cute.copy(
+                    tma_atom_k,
+                    gK_tma[(None, pg0)],
+                    sK_tma[(None, pgw, s)],
+                    tma_bar_ptr=ab_full + s,
+                )
+                cute.copy(
+                    tma_atom_k,
+                    gK_tma[(None, pg1)],
+                    sK_tma[(None, pgw + 1, s)],
+                    tma_bar_ptr=ab_full + s,
+                )
+                for r in cutlass.range_constexpr(PAGE // PPP):
+                    tk = tkt + PPP * r
+                    gsf = cute.make_tensor(
+                        cute.make_ptr(
+                            U32,
+                            kv_ptr.toint() + cutlass.Int64(pg) * PGB + 2048 + tk * 4,
+                            GMEM,
+                            assumed_align=4,
+                        ),
+                        cute.make_layout(1),
+                    )
+                    dsf = cute.make_tensor(sSFA_raw + (s * 128 + tk * 4 + pgt), cute.make_layout(1))
+                    cute.copy(g2s_u32, gsf, dsf)
+                cute.arch.cp_async_mbarrier_arrive_noinc(ab_full + s)
+        elif warp_idx == M_WARP:
+            for v in cutlass.range(nvt, unroll=1):
+                j = ntl + v
+                s = j % STAGES
+                a = j % NACC
+                cute.arch.mbarrier_wait(ab_full + s, (j // STAGES) & 1)
+                if j >= NACC:
+                    cute.arch.mbarrier_wait(acc_empty + a, ((j // NACC) - 1) & 1)
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                if a == 0:
+                    cute.copy(tc_sfa0, sfa_src0[(None, None, None, None, s)], sfa_dst0)
+                    cute.gemm(
+                        tiled_mma,
+                        tAcc0,
+                        [tCrA[(None, None, None, s)], tSFA0],
+                        [tCrB[(None, None, None, 0)], tSFB],
+                        tAcc0,
+                    )
+                elif a == 1:
+                    cute.copy(tc_sfa1, sfa_src1[(None, None, None, None, s)], sfa_dst1)
+                    cute.gemm(
+                        tiled_mma,
+                        tAcc1,
+                        [tCrA[(None, None, None, s)], tSFA1],
+                        [tCrB[(None, None, None, 0)], tSFB],
+                        tAcc1,
+                    )
+                else:
+                    cute.copy(tc_sfa2, sfa_src2[(None, None, None, None, s)], sfa_dst2)
+                    cute.gemm(
+                        tiled_mma,
+                        tAcc2,
+                        [tCrA[(None, None, None, s)], tSFA2],
+                        [tCrB[(None, None, None, 0)], tSFB],
+                        tAcc2,
+                    )
+                with cute.arch.elect_one():
+                    tcgen05.commit(acc_full + a)
+                    tcgen05.commit(ab_empty + s)
+        elif warp_idx < 12:
+            op = tcgen05.Ld32x32bOp(tcgen05.Repetition.x32, tcgen05.Pack.NONE)
+            atom_t2r = cute.make_copy_atom(op, F32)
+            lane = tidx % 128
+            gwg = tidx // 128
+            lay32 = cute.make_layout(((TOK, 32), 1, 1), stride=((65536, 1), 0, 0))
+            a0 = cute.make_tensor(tmem_ptr, lay32)
+            tt = tcgen05.make_tmem_copy(atom_t2r, a0)
+            thr = tt.get_slice(lane)
+            s00 = thr.partition_S(cute.make_tensor(tmem_ptr, lay32))
+            s01 = thr.partition_S(cute.make_tensor(tmem_ptr + 32, lay32))
+            s10 = thr.partition_S(cute.make_tensor(tmem_ptr + HD, lay32))
+            s11 = thr.partition_S(cute.make_tensor(tmem_ptr + HD + 32, lay32))
+            s20 = thr.partition_S(cute.make_tensor(tmem_ptr + 2 * HD, lay32))
+            s21 = thr.partition_S(cute.make_tensor(tmem_ptr + 2 * HD + 32, lay32))
+            tD = thr.partition_D(cute.make_identity_tensor(a0.shape))
+            frg = cute.make_rmem_tensor(tD.shape, F32)
+            wr = cute.make_rmem_tensor(cute.make_layout(64), F32)
+            cute.autovec_copy(sW, wr)
+            z = F32(0.0)
+            j0 = ntl + ((gwg - (ntl % NACC) + NACC) % NACC)
+            for j in cutlass.range(j0, ntl + nvt, NACC, unroll=1):
+                cute.arch.mbarrier_wait(acc_full + gwg, (j // NACC) & 1)
+                if gwg == 0:
+                    cute.copy(tt, s00, frg)
+                elif gwg == 1:
+                    cute.copy(tt, s10, frg)
+                else:
+                    cute.copy(tt, s20, frg)
+                cute.arch.fence_view_async_tmem_load()
+                acc = [[z, z], [z, z], [z, z], [z, z]]
+                for jj in cutlass.range_constexpr(16):
+                    kq = jj & 3
+                    m0 = cute.arch.fmax(frg[2 * jj], z)
+                    m1 = cute.arch.fmax(frg[2 * jj + 1], z)
+                    acc[kq][0], acc[kq][1] = cute.arch.fma_packed_f32x2(
+                        (wr[2 * jj], wr[2 * jj + 1]), (m0, m1), (acc[kq][0], acc[kq][1])
+                    )
+                if gwg == 0:
+                    cute.copy(tt, s01, frg)
+                elif gwg == 1:
+                    cute.copy(tt, s11, frg)
+                else:
+                    cute.copy(tt, s21, frg)
+                cute.arch.fence_view_async_tmem_load()
+                cute.arch.mbarrier_arrive(acc_empty + gwg)
+                for jj in cutlass.range_constexpr(16):
+                    kq = jj & 3
+                    m0 = cute.arch.fmax(frg[2 * jj], z)
+                    m1 = cute.arch.fmax(frg[2 * jj + 1], z)
+                    acc[kq][0], acc[kq][1] = cute.arch.fma_packed_f32x2(
+                        (wr[32 + 2 * jj], wr[33 + 2 * jj]), (m0, m1), (acc[kq][0], acc[kq][1])
+                    )
+                q0 = cute.arch.add_packed_f32x2((acc[0][0], acc[0][1]), (acc[1][0], acc[1][1]))
+                q1 = cute.arch.add_packed_f32x2((acc[2][0], acc[2][1]), (acc[3][0], acc[3][1]))
+                q2 = cute.arch.add_packed_f32x2(q0, q1)
+                sc = q2[0] + q2[1]
+                ti = (j - ntl) * 4 + lane // 32
+                if ti < ntie:
+                    if (lane % 32) == (sPart[ti] & 31):
+                        sTS[ti] = sc
+        cute.arch.barrier()
+        if warp_idx == 0:
+            cute.arch.dealloc_tmem(tmem_ptr, 512)
+        if nvt > 0:
             tv = (
                 U16(
                     (
@@ -1312,6 +1359,7 @@ def _launch(
     NDENSE: cutlass.Constexpr,
     SCAP: cutlass.Constexpr,
     REFINE: cutlass.Constexpr,
+    RBT: cutlass.Constexpr,
 ):
     tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
         FP4, FP4, OperandMajorMode.K, OperandMajorMode.K, SF, 32, tcgen05.CtaGroup.ONE, (TOK, HD)
@@ -1376,7 +1424,7 @@ def _launch(
         + 2 * NFINE * 4
         + 64
         + (2 * STAGES + 2 * NACC) * 8
-        + NLOC * 4 * 4
+        + RBT * 4 * 4
         + CAP * 4
         + SCAP * 6
         + (2 * CHUNK * TOK * 2 if SCAP > 0 else 16)
@@ -1407,6 +1455,7 @@ def _launch(
         NDENSE,
         SCAP,
         REFINE,
+        RBT,
     ).launch(
         grid=[B * CS, 1, 1],
         block=[NTHREADS, 1, 1],
@@ -1421,7 +1470,7 @@ _cache = {}
 SMEM_CAP = 231424
 
 
-def _stages(NDENSE, NLOC, SCAP):
+def _stages(NDENSE, NLOC, SCAP, RBT):
     fixed = (
         HD * DIMB
         + 512
@@ -1434,7 +1483,7 @@ def _stages(NDENSE, NLOC, SCAP):
         + 32 * 4
         + 2 * NFINE * 4
         + 64
-        + NLOC * 4 * 4
+        + RBT * 4 * 4
         + CAP * 4
         + 2048
     )
@@ -1458,10 +1507,10 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
     CS = 1
     while CS < 16 and (B * CS * 2) <= 148:
         CS *= 2
-    # long rows: each CTA keeps at most MAX_NLOC tiles of 16-bit keys in SMEM
     while CS < 16 and (NCOMP // TOK + CS - 1) // CS > MAX_NLOC:
         CS *= 2
     NLOC = (NCOMP // TOK + CS - 1) // CS
+    RBT = NLOC if NLOC <= RBT_MAX else RBT_MAX
     assert NLOC <= MAX_NLOC, (
         f"row of {NCOMP} tokens exceeds the supported length (16 CTAs x {MAX_NLOC * TOK})"
     )
@@ -1474,12 +1523,12 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
     NDENSE = NLOC if NLOC <= ndense_max else min(ndense_max, 128)
     SCAP = 0
     if NLOC > NDENSE:
-        SCAP = ((KTOP + CHUNK * TOK + 511) // 512) * 512
-    STAGES = _stages(NDENSE, NLOC, SCAP)
-    # fp32-exact boundary (rescoring the K-th fp16 tie class): opt-in until the
-    # rescoring is fast; default contract is exact at fp16 granularity
-    REFINE = 1 if os.environ.get("TRTLLM_FUSED_TOPK_FP32_EXACT", "0") == "1" else 0
-    key = (B, NCOMP, KTOP, MAXB, NPAGES, STAGES, CS, NLOC, NDENSE, SCAP, REFINE)
+        SCAP = ((KTOP + TIECAP + CHUNK * TOK + 511) // 512) * 512
+    STAGES = _stages(NDENSE, NLOC, SCAP, RBT)
+    # fp32-exact boundary: the K-th fp16 tie class is rescored through the MMA
+    # path (on by default); TRTLLM_FUSED_TOPK_FP32_EXACT=0 keeps the fp16 fill
+    REFINE = 0 if os.environ.get("TRTLLM_FUSED_TOPK_FP32_EXACT", "1") == "0" else 1
+    key = (B, NCOMP, KTOP, MAXB, NPAGES, STAGES, CS, NLOC, NDENSE, SCAP, REFINE, RBT)
     kv_ptr = make_ptr(U8, kv_cache.data_ptr(), GMEM, assumed_align=16)
     q_ptr = make_ptr(U8, q_fp4.data_ptr(), GMEM, assumed_align=16)
     sfq_ptr = make_ptr(U32, sf_q.data_ptr(), GMEM, assumed_align=16)
@@ -1513,6 +1562,7 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
             NDENSE,
             SCAP,
             REFINE,
+            RBT,
         )
         _cache[key] = fn
     fn(kv_ptr, q_ptr, sfq_ptr, w_ptr, clen_ptr, bt_ptr, oi_ptr, ov_ptr, stream)
