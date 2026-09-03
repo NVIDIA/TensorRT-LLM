@@ -314,6 +314,28 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # Qwen3.6-35B-A3B NVFP4 one-model MTP drafting
+        {
+            'patterns': ['qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming'],
+            'config': {
+                'trust_remote_code': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'dtype': 'fp8',
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 1,
+                },
+            }
+        },
         # MiniMax-M3 MXFP8 block-sparse MoE: sparse backend, no KV reuse, trust_remote_code, capped max_seq_len to avoid the 1M-default CUDA-graph OOM.
         {
             'patterns': ['minimax_m3_mxfp8'],

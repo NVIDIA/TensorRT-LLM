@@ -31,6 +31,7 @@ llm_spark_func:
   - test_e2e.py::test_ptp_quickstart_advanced[Llama-4-Scout-17B-16E-FP4-llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4]
   - test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-9B-v2-nvfp4-NVIDIA-Nemotron-Nano-9B-v2-NVFP4]
   - test_e2e.py::test_ptp_quickstart_advanced_eagle3[GPT-OSS-120B-Eagle3-gpt_oss/gpt-oss-120b-gpt_oss/gpt-oss-120b-Eagle3]
+  - test_e2e.py::test_ptp_quickstart_advanced[Qwen3.6-35B-A3B-nvfp4-Qwen3.6-35B-A3B-NVFP4]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
   - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma3_27BInstruct::test_fp8_prequantized
@@ -38,6 +39,8 @@ llm_spark_func:
   - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma3_12BInstruct::test_auto_dtype
   - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma3_12BInstruct::test_fp8_prequantized
   - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma3_12BInstruct::test_nvfp4_prequantized
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_26B_A4B::test_nvfp4_no_mtp
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_26B_A4B::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
   - test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]

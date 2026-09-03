@@ -958,6 +958,9 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Nemotron-Nano-9B-v2-nvfp4',
                  'NVIDIA-Nemotron-Nano-9B-v2-NVFP4',
                  marks=skip_pre_blackwell),
+    pytest.param('Qwen3.6-35B-A3B-nvfp4',
+                 'Qwen3.6-35B-A3B-NVFP4',
+                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
@@ -985,6 +988,10 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
         ]
         if "Qwen3" in model_name:
             cmds.append("--kv_cache_fraction=0.6")
+        if "Qwen3.6-35B-A3B" in model_name:
+            # Hybrid linear-attention model: the Mamba cache preallocates a
+            # recurrent state per sequence slot, so cap the batch size.
+            cmds.append("--max_batch_size=1")
         if "Llama3.3-70B" in model_name:
             cmds.append("--max_num_tokens=1024")
         if "Llama-4" in model_name:
