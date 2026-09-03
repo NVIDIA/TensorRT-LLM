@@ -46,6 +46,7 @@ from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
                             MoEStaticCapability, require_comm_plan)
+from .impl_environment import MoEDep
 from .interface import _reject
 from .quantization import (BF16CuteDslFusedMoEMethod, MoEWeightLoadingMode,
                            NVFP4CuteDslFusedMoEMethod)
@@ -684,16 +685,38 @@ class CuteDslFusedMoE(MoEImplBase):
                 "CuteDslFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
 
+        # Localized weight shards are built once from the loaded weights, so
+        # they cannot follow EPLB expert migration.
+        if (d.locality_domain_requested
+                and d.env.has_dep(MoEDep.LOCALITY_DOMAIN) and d.eplb_enabled):
+            return _reject(
+                MoERejectReason.EPLB_UNSUPPORTED,
+                "locality domain MoE cannot follow EPLB expert migration")
+
+        # SM107 has no unfused FC2: NVFP4 has no plain grouped GEMM there, and
+        # the BF16 op always fuses finalize.
+        if sm_version == 107 and not d.fused_finalize_enabled:
+            return _reject(
+                MoERejectReason.FINALIZE_FUSION_REQUIRED,
+                "CuteDslFusedMoE on SM107 only has a fused-finalize FC2")
+
         if quant_algo is None:
             if sm_version != 107:
                 return _reject(
                     MoERejectReason.SM_UNSUPPORTED,
                     f"Unquantized CuteDSL MoE requires SM107, got SM{sm_version}"
                 )
-            if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            if not d.env.has_dep(MoEDep.CUTEDSL_RUBIN):
                 return _reject(
                     MoERejectReason.DEP_MISSING,
                     "Unquantized CuteDSL MoE on SM107 requires Rubin support in CuTe DSL"
+                )
+            # The BF16 FC1 op fuses SwiGLU by name and takes no activation
+            # argument, unlike its NVFP4 counterpart.
+            if p.activation != "Swiglu":
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    f"Unquantized CuteDSL MoE fuses SwiGLU only, got {p.activation}"
                 )
             return MoEEligibility.ok()
 
@@ -704,7 +727,7 @@ class CuteDslFusedMoE(MoEImplBase):
                     MoERejectReason.SM_UNSUPPORTED,
                     f"NVFP4 requires SM100, SM103, or SM107, got SM{sm_version}"
                 )
-            if sm_version == 107 and not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            if sm_version == 107 and not d.env.has_dep(MoEDep.CUTEDSL_RUBIN):
                 return _reject(
                     MoERejectReason.DEP_MISSING,
                     "NVFP4 CuteDSL MoE on SM107 requires Rubin support in CuTe DSL"
@@ -793,10 +816,6 @@ class CuteDslFusedMoE(MoEImplBase):
             dtype_activation=self.dtype,
         )
         if self._locality_domain_plan.enabled:
-            if self._using_load_balancer():
-                raise ValueError(
-                    "locality domain MoE does not support EPLB because localized weight "
-                    "shards cannot follow runtime expert migration.")
             self._locality_domain_runtime = LocalityDomainRuntime(
                 self._locality_domain_plan.num_partitions)
         if not model_config.skip_create_weights_in_init:
@@ -820,18 +839,9 @@ class CuteDslFusedMoE(MoEImplBase):
             slot_start=self.slot_start,
         )
 
-    def validate_configurable_moe(self, moe) -> None:
-        """Reject runtime weight owners that cannot update localized shards."""
-        if not self._locality_domain_plan.enabled:
-            return
-        if moe.enable_dwdp:
-            raise ValueError(
-                "locality domain MoE does not support DWDP because DWDP rebinds the "
-                "backend parameters after localized weight shards are created.")
-        if moe._using_load_balancer():
-            raise ValueError(
-                "locality domain MoE does not support EPLB because localized weight "
-                "shards cannot follow runtime expert migration.")
+    @property
+    def uses_locality_domain(self) -> bool:
+        return self._locality_domain_plan.enabled
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -840,7 +850,12 @@ class CuteDslFusedMoE(MoEImplBase):
                 return NVFP4CuteDslFusedMoEMethod()
         elif get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             # Unquantized on SM107: the BF16 method interleaves FC1 weights for
-            # the fused gather + grouped GEMM + SwiGLU kernel.
+            # the fused gather + grouped GEMM + SwiGLU kernel, which serves no
+            # other activation.
+            if self.activation_type != ActivationType.Swiglu:
+                raise ValueError(
+                    "Unquantized CuteDslFusedMoE fuses SwiGLU only, got "
+                    f"{ActivationType(self.activation_type).name}")
             return BF16CuteDslFusedMoEMethod()
         # ``can_implement`` admits NVFP4, plus unquantized BF16 on SM107, so
         # selection never lands here. Raise rather than fall back: any other
@@ -1169,6 +1184,10 @@ class CuteDslFusedMoE(MoEImplBase):
     ) -> torch.Tensor:
         """Autotuner wrapper for BF16/FP16 MoE on Rubin (SM107)."""
         assert not self.has_any_quant
+        # The FC2 op below always fuses finalize; ``can_implement`` declines
+        # SM107 when the caller disabled it, so honor that rather than ignore it.
+        assert self.use_fused_finalize, (
+            "BF16 CuteDSL MoE has no unfused FC2 path")
         output_dtype = x.dtype
         effective_top_k = token_selected_experts.size(-1)
 

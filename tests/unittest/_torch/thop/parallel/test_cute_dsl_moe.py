@@ -2039,26 +2039,87 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
         assert kwargs["overlap_moe_output_memset"] is False
 
 
-@pytest.mark.parametrize(
-    "enable_dwdp,enable_load_balancer,error_match",
-    [
-        (True, False, "does not support DWDP"),
-        (False, True, "does not support EPLB"),
-    ],
-)
-def test_cute_dsl_locality_domain_rejects_runtime_weight_rebinding(
-    enable_dwdp: bool,
-    enable_load_balancer: bool,
-    error_match: str,
-):
-    backend = SimpleNamespace(_locality_domain_plan=SimpleNamespace(enabled=True))
-    moe = SimpleNamespace(
-        enable_dwdp=enable_dwdp,
-        _using_load_balancer=lambda: enable_load_balancer,
+def _cute_dsl_eligibility(**deployment_kwargs):
+    """``can_implement`` verdict for NVFP4 on an SM107 machine with Rubin DSL."""
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
+        MoEDeployment,
+        MoEEnvironment,
+        MoEProblem,
+    )
+    from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
+
+    problem = MoEProblem(quant="NVFP4", dtype_act=torch.bfloat16)
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=MoEEnvironment(
+            sm=107,
+            available_deps=(MoEDep.CUTEDSL_RUBIN.value, MoEDep.LOCALITY_DOMAIN.value),
+        ),
+        **deployment_kwargs,
+    )
+    return CuteDslFusedMoE.can_implement(problem, deployment)
+
+
+def test_cute_dsl_locality_domain_rejects_eplb():
+    """Localized shards cannot follow EPLB migration, so selection declines."""
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoERejectReason
+
+    verdict = _cute_dsl_eligibility(locality_domain_requested=True, eplb_enabled=True)
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.EPLB_UNSUPPORTED
+    assert _cute_dsl_eligibility(locality_domain_requested=True).eligible
+    assert _cute_dsl_eligibility(eplb_enabled=True).eligible
+
+
+def test_cute_dsl_sm107_requires_fused_finalize():
+    """SM107 has no unfused FC2, so disabling finalize fusion declines."""
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoERejectReason
+
+    verdict = _cute_dsl_eligibility(fused_finalize_enabled=False)
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.FINALIZE_FUSION_REQUIRED
+
+
+def test_cute_dsl_unquantized_rejects_non_swiglu():
+    """The BF16 FC1 op fuses SwiGLU by name; NVFP4 serves both activations."""
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
+        MoEDeployment,
+        MoEEnvironment,
+        MoEProblem,
+        MoERejectReason,
+    )
+    from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
+
+    env = MoEEnvironment(sm=107, available_deps=(MoEDep.CUTEDSL_RUBIN.value,))
+    deployment = MoEDeployment(
+        ep_size=1, tp_size=1, parallel_size=1, use_dp=False, num_slots=8, env=env
     )
 
-    with pytest.raises(ValueError, match=error_match):
-        CuteDslFusedMoE.validate_configurable_moe(backend, moe)
+    def verdict(quant):
+        return CuteDslFusedMoE.can_implement(
+            MoEProblem(quant=quant, dtype_act=torch.bfloat16, activation="Relu2"), deployment
+        )
+
+    assert not verdict(None).eligible
+    assert verdict(None).reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+    assert verdict("NVFP4").eligible
+
+
+def test_cute_dsl_locality_domain_disables_dwdp():
+    """DWDP rebinds parameters, so it stays off rather than raising."""
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+
+    moe = SimpleNamespace(
+        backend=SimpleNamespace(
+            capabilities=SimpleNamespace(supports_dwdp=True),
+            uses_locality_domain=True,
+        )
+    )
+    assert ConfigurableMoE._should_enable_dwdp(moe) is False
 
 
 @pytest.mark.parametrize("quantized", [True, False], ids=["nvfp4", "bf16"])
