@@ -20,6 +20,7 @@ from ...utils import (
     swizzle_sf,
     unswizzle_sf,
 )
+from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation, MoEActivationSupport
 from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (
     MoEDeployment,
@@ -28,6 +29,7 @@ from .impl_contract import (
     MoEProblem,
     MoERejectReason,
     MoERunContext,
+    MoEStaticCapability,
     require_comm_plan,
 )
 from .interface import MoEWeightLoadingMode, _reject
@@ -123,7 +125,14 @@ class DenseGEMMFusedMoE(MoEImplBase):
         model_config (ModelConfig): Configuration object for the model.
     """
 
+    # Declared because the default is conservative: this backend registers its
+    # weights with the load balancer, matching ``_supports_load_balancer``.
+    capabilities = MoEStaticCapability(supports_eplb=True)
+
     input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
+
+    # The dense-GEMM epilogue fuses plain SwiGLU and takes no constants.
+    activation_support = MoEActivationSupport(kinds=frozenset({ActivationType.Swiglu}))
 
     # Memory buffer pool for CUDA graph compatibility
     buffers = get_memory_buffers()
@@ -194,8 +203,8 @@ class DenseGEMMFusedMoE(MoEImplBase):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
         init_load_balancer: bool = False,
-        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         # Eligibility (SM / quant / SwiGLU / EP / intermediate alignment) is
         # owned by ``can_implement``; do not re-assert it here.
@@ -225,8 +234,8 @@ class DenseGEMMFusedMoE(MoEImplBase):
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
+            activation=activation,
             init_load_balancer=init_load_balancer,
-            activation_type=activation_type,
         )
 
         # Environment variable to control fc2_alpha fusion into FC1's alpha_post.

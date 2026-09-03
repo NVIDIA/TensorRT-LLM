@@ -28,12 +28,15 @@ from typing import Callable, Dict, Optional
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import CftMnnvlMemory, MnnvlMemory
+from tensorrt_llm._mnnvl_utils import (CftMnnvlMemory,
+                                       MnnvlCheckpointCommunicator, MnnvlMemory)
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S, ActiveRankMaskSnapshot,
     AlltoAllWatchdog, AlltoAllWatchdogCoordinator, AlltoAllWatchdogTimeout,
     EPGroupHealthLike, reject_rank_mask_cuda_graph_capture)
+from tensorrt_llm._torch.mnnvl_alltoall_workspace import \
+    _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -370,48 +373,67 @@ class MoeAlltoAll:
             assert workspace_entry[
                 "can_use_cft_counted_writes"] == self.can_use_cft_counted_writes, "reuse workspace with different CFT mode"
 
+        workspace_state = workspace_entry
         self.mnnvl_mem = workspace_entry["mnnvl_mem"]
         self.workspace = workspace_entry["workspace"]
-        self.metainfo = workspace_entry["metainfo"]
         # Internal state
         self._state: _A2AState = _A2AState()
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
-        workspace_state = workspace_entry
         self._workspace_state = workspace_state
-        metainfo_index = self._METAINFO_INDEX
-        assert metainfo_index is not None
-        self._watchdog_coordinator = AlltoAllWatchdogCoordinator(
-            workspace_state=workspace_state,
-            workspace=self.workspace,
-            metainfo=self.metainfo,
-            metainfo_index=metainfo_index,
-            ep_rank=self.ep_rank,
-            health=self.ep_group_health,
-        )
-        self._destroyed = False
-        self._alltoall_watchdog: AlltoAllWatchdog | None = None
         if (alltoall_watchdog_timeout_s is None
                 and self.ep_group_health is not None):
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
-        if alltoall_watchdog_timeout_s is not None:
-            self._alltoall_watchdog = self._watchdog_coordinator.acquire_watchdog(
+        metainfo_index = self._METAINFO_INDEX
+        assert metainfo_index is not None
+        self._workspace_lifecycle = (
+            _MnnvlAlltoAllWorkspaceLifecycle.get_or_create(
+                workspace_state=workspace_state,
+                memory=self.mnnvl_mem,
+                workspace=self.workspace,
+                metainfo=workspace_state["metainfo"],
+                metainfo_index=metainfo_index,
+                ep_rank=self.ep_rank,
                 ep_size=self.ep_size,
-                timeout_s=alltoall_watchdog_timeout_s,
-                poll_interval_s=alltoall_watchdog_poll_interval_s,
-                on_timeout=alltoall_watchdog_on_timeout,
-            )
+                health=self.ep_group_health,
+            ))
+        self._destroyed = False
+        self._workspace_registered = False
+        self._workspace_lifecycle.register(
+            self,
+            watchdog_timeout_s=alltoall_watchdog_timeout_s,
+            watchdog_poll_interval_s=alltoall_watchdog_poll_interval_s,
+            watchdog_on_timeout=alltoall_watchdog_on_timeout,
+        )
+        self._workspace_registered = True
+
+    @property
+    def metainfo(self) -> torch.Tensor:
+        return self._workspace_lifecycle.metainfo
+
+    @property
+    def _watchdog_coordinator(self) -> AlltoAllWatchdogCoordinator:
+        return self._workspace_lifecycle.coordinator
+
+    @property
+    def _alltoall_watchdog(self) -> AlltoAllWatchdog | None:
+        return self._workspace_lifecycle.watchdog_for(self)
+
+    def checkpoint_resource_key(self) -> int:
+        """Identify wrappers sharing the same MNNVL workspace lifecycle."""
+        return id(self._workspace_lifecycle)
 
     def destroy(self) -> None:
         """Stop background watchdog resources owned by this wrapper."""
         if getattr(self, "_destroyed", False):
             return
         self._destroyed = True
-        watchdog = getattr(self, "_alltoall_watchdog", None)
-        if watchdog is not None:
-            self._watchdog_coordinator.release_watchdog(watchdog)
-            self._alltoall_watchdog = None
+        lifecycle = getattr(self, "_workspace_lifecycle", None)
+        if lifecycle is not None and getattr(self, "_workspace_registered",
+                                             False):
+            lifecycle.unregister(self)
+            self._workspace_registered = False
 
     def __del__(self) -> None:
         if not sys.is_finalizing():
@@ -446,6 +468,55 @@ class MoeAlltoAll:
             f"CFT LE initialized (workspace-bound): ep_rank={self.ep_rank}, ep_size={self.ep_size}"
         )
 
+    def _require_mapped(self) -> None:
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError(
+                "Native MoE All-to-All workspace handles are unmapped")
+
+    def checkpoint_prepare(self) -> None:
+        """Collectively detach handles after every shared owner is idle."""
+        if self.can_use_cft_counted_writes:
+            raise RuntimeError(
+                "Checkpointing a CFT-backed MoE All-to-All workspace is not supported"
+            )
+        self._workspace_lifecycle.checkpoint_prepare()
+
+    def checkpoint_restore(
+        self,
+        comm: MnnvlCheckpointCommunicator | None = None,
+    ) -> None:
+        """Collectively restore handles and all shared frontend state.
+
+        Args:
+            comm: An mpi4py-like communicator exposing ``Get_rank()``,
+                ``Get_size()``, ``allgather()``, and ``barrier()``. Its local
+                rank and size must match the communicator used for the
+                original allocation. Every rank must call this method
+                symmetrically.
+        """
+        if comm is None:
+            comm = self.mnnvl_mem.comm
+        if comm is None:
+            raise RuntimeError(
+                "MNNVL workspace communicator is not initialized")
+        self._workspace_lifecycle.checkpoint_restore(
+            comm,
+            lambda: torch.ops.trtllm.moe_a2a_initialize(
+                self.workspace,
+                self.ep_rank,
+                self.ep_size,
+                self.max_num_tokens,
+                self.eplb_stats_num_experts,
+                self.can_use_cft_counted_writes,
+            ),
+        )
+
+    def _mnnvl_checkpoint_is_idle(self) -> bool:
+        return self._state.phase == "idle"
+
+    def _mnnvl_checkpoint_reset(self) -> None:
+        self.reset_state()
+
     def dispatch(self,
                  token_selected_experts: torch.Tensor,
                  input_payloads: list[torch.Tensor],
@@ -472,6 +543,7 @@ class MoeAlltoAll:
         Returns:
             recv_tensors: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
         """
+        self._require_mapped()
         assert self._state.phase == "idle", "dispatch called twice without an intervening combine"
         reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
@@ -570,6 +642,7 @@ class MoeAlltoAll:
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
         """
+        self._require_mapped()
         assert self._state.phase == "dispatched", "combine called before a successful dispatch"
         reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
@@ -617,6 +690,7 @@ class MoeAlltoAll:
         Return the combine payload tensor in the workspace, which could be used as the output of MoE kernel to avoid extra copy.
         Passing the returned tensor to combine lets the C++ op detect workspace ownership.
         """
+        self._require_mapped()
         if self._state.phase != "dispatched":
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before a successful dispatch"

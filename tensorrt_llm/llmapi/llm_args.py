@@ -4522,6 +4522,16 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
     )
 
+    enable_pipelined_transfer: bool = Field(
+        default=False,
+        description=
+        "Transfer each completed prefill chunk's KV cache while later chunks "
+        "compute. Requires Python NIXL, generation-first scheduling, chunked "
+        "prefill, pipeline_parallel_size=1, context_parallel_size=1 on both "
+        "peers, beam_width=1, no bounce buffer or Mamba/hybrid cache, and block "
+        "reuse disabled or set to all_reusable. Invalid static settings fail at "
+        "startup; per-request constraints reject the request.")
+
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
 
@@ -4537,6 +4547,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         return "NIXL", None
 
     def _to_pybind(self):
+        # Python-transceiver-only option.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
@@ -5659,6 +5670,31 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    checkpoint_io_policy: Literal[
+        "auto", "native", "rank_striped_read_ahead"] = Field(
+            default="auto",
+            description=
+            "Controls checkpoint storage I/O independently of checkpoint format. "
+            "'auto' selects rank-striped read-ahead for compatible built-in "
+            "PyTorch/HF loads and selects native I/O otherwise. "
+            "'native' preserves the existing loader. "
+            "'rank_striped_read_ahead' lets node-local ranks read disjoint "
+            "SafeTensors extents while native mapping, materialization, and H2D "
+            "continue. Incompatible configurations select native I/O before "
+            "optimized reader or collective setup. Runtime-ineligible loads fall "
+            "back to native before model mutation.",
+            status="prototype",
+            json_schema_extra={
+                "type": "Literal['auto', 'native', 'rank_striped_read_ahead']"
+            },
+        )
+
+    @property
+    def is_partial_model_loading(self) -> bool:
+        """Whether model overrides request loading only part of the model."""
+        return (self.model_kwargs is not None
+                and "num_hidden_layers" in self.model_kwargs)
+
     mx_config: ModelExpressConfig = Field(
         default_factory=ModelExpressConfig,
         description="ModelExpress (MX) P2P checkpoint loading config.",
@@ -6299,6 +6335,20 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
+        return self
+
+    @model_validator(mode="after")
+    def warn_non_pytorch_checkpoint_io_policy_fallback(self) -> 'TorchLlmArgs':
+        # AutoDeploy does not construct a checkpoint loader. Preserve the
+        # requested policy for telemetry while reporting its native selection.
+        # PyTorch requests are resolved at loader construction, where the actual
+        # format and registered loader implementations are known.
+        if (self.checkpoint_io_policy == "rank_striped_read_ahead"
+                and self.backend != "pytorch"):
+            logger.warning(
+                "Checkpoint I/O policy resolved before loading: "
+                "requested=rank_striped_read_ahead, selected=native, "
+                "reason=rank-striped read-ahead requires the PyTorch backend.")
         return self
 
     @model_validator(mode="after")

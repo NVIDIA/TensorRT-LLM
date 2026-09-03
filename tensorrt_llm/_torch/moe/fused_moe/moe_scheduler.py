@@ -54,7 +54,6 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
-from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .impl_contract import MoECommPlan, MoERunContext
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
 
@@ -384,13 +383,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
         supports_post_quant = moe.comm is None or moe.comm.supports_post_quant_dispatch()
         used_fused_route_quant = False
         if requires_separated_routing:
+            # ``MoEImplBase`` declines a fused route+quant path by default. The
+            # conditions are the scheduler's: a fused result skips the separate
+            # dispatch and carries no per-token scale to fold a router weight or
+            # an EPLB layout into.
             if (
                 supports_post_quant
-                and isinstance(moe.backend, TRTLLMGenFusedMoE)
                 and not moe._using_load_balancer()
                 and not moe.apply_router_weight_on_input
             ):
-                fused_result = moe.backend.try_fused_kimi_route_quant(x, router_logits)
+                fused_result = moe.backend.try_fused_route_quant(x, router_logits)
             else:
                 fused_result = None
 
@@ -399,8 +401,6 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 token_selected_experts, token_final_scales = moe.routing_method.apply(
                     router_logits, input_ids
                 )
-                if token_final_scales is not None and isinstance(moe.backend, TRTLLMGenFusedMoE):
-                    token_final_scales = token_final_scales.to(torch.bfloat16)
             else:
                 token_selected_experts, token_final_scales, x, x_sf = fused_result
                 used_fused_route_quant = True

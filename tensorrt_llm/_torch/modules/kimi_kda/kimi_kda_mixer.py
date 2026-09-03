@@ -194,9 +194,6 @@ class KimiKDALinearAttention(nn.Module):
         self._projection_aux_stream = aux_stream
         self._projection_fork_event = torch.cuda.Event()
         self._projection_join_event = torch.cuda.Event()
-        # Persistent batch-row-dense staging for the fused decode kernel's
-        # W - 1 convolution windows. It is allocated once and never reallocated.
-        self._cs_dense: Optional[torch.Tensor] = None
         self._packed_conv_weight: Optional[torch.Tensor] = None
         self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
 
@@ -533,15 +530,12 @@ class KimiKDALinearAttention(nn.Module):
         * one wide fused qkvg GEMV on the main stream, overlapped with the
           fused [f_a | b] GEMV and f_b GEMV on the auxiliary stream for
           CUDA-graph batches up to 128 tokens;
-        * conv windows gathered and repacked into a persistent dense
-          per-section buffer;
-        * conv-pool write-back with one cat + one index_copy_;
+        * live packed conv and recurrent pools updated directly by slot;
         * constant tensors (transposed conv weights, fp32 A_log/dt_bias/
           o_norm weight) reused instead of rebuilt per step.
 
-        When stable int32 slot indices are supplied, the recurrent-state
-        pool is passed directly and the CUDA wrapper selects its indexed-state
-        launch; otherwise the state uses the batch-row-dense static layout.
+        The direct path requires stable int32 slot indices. Static or
+        unsupported layouts route to ``forward_decode_fallback``.
         """
         if self._dispatch.decode_kernel_path != "optimized":
             ssm_state_indices = None
@@ -552,6 +546,7 @@ class KimiKDALinearAttention(nn.Module):
             or self._bfa_proj_weight is None
             or mamba_metadata is None
             or ssm_pool.dtype != torch.float32
+            or ssm_state_indices is None
         ):
             return self.forward_decode_fallback(
                 x2d,
@@ -565,31 +560,6 @@ class KimiKDALinearAttention(nn.Module):
         hd = self.head_dim
         H = self.num_heads
         B = x2d.shape[0]
-        W = self.conv_size
-
-        # Allocated once at the pool slot count and never reallocated:
-        # captured CUDA graphs retain this pointer.
-        buf = self._cs_dense
-        if buf is None:
-            if torch.cuda.is_current_stream_capturing():
-                return self.forward_decode_fallback(
-                    x2d, conv_pool, ssm_pool, slot_indices, layer_cache, ssm_state_indices
-                )
-            buf = torch.empty(
-                3,
-                max(conv_pool.shape[0], B),
-                d,
-                W - 1,
-                dtype=torch.bfloat16,
-                device=x2d.device,
-            )
-            self._cs_dense = buf
-        else:
-            assert buf.shape[1] >= B, (
-                f"KDA decode staging buffer holds {buf.shape[1]} rows but the "
-                f"decode batch is {B}; reallocating would corrupt previously "
-                f"captured CUDA graphs"
-            )
 
         def _project_qkvg() -> torch.Tensor:
             if self._qkvg_proj_weight is not None:
@@ -613,40 +583,33 @@ class KimiKDALinearAttention(nn.Module):
             projection_aux_stream,
             disable_on_compile=True,
         )
-        x_qkv = qkvg[:, : 3 * d]
-        onorm_g = qkvg[:, 3 * d : 4 * d]
-        slot_indices_long = slot_indices.long()
+        x_qkvg = qkvg[:, : 4 * d]
 
-        # Gather the live W - 1 windows once, then repack them into the
-        # kernel's dense per-section [B, d, W - 1] layout.
-        cs = conv_pool.index_select(0, slot_indices_long)
-        cs_dense = buf[:, :B]
-        cs_dense.copy_(cs.view(B, 3, d, W - 1).permute(1, 0, 2, 3))
-        state = (
-            ssm_pool
-            if ssm_state_indices is not None
-            else ssm_pool.index_select(0, slot_indices_long)
-        )
+        # Section views retain the live pool's slot stride, including V2
+        # manager padding. The kernel uses ssm_state_indices for both pools.
+        cs_q = conv_pool[:, :d]
+        cs_k = conv_pool[:, d : 2 * d]
+        cs_v = conv_pool[:, 2 * d :]
 
         o = self._dispatch.decode_kda(
-            x_q=x_qkv[:, :d].unflatten(-1, (H, hd)).unsqueeze(0),
-            x_k=x_qkv[:, d : 2 * d].unflatten(-1, (H, hd)).unsqueeze(0),
-            x_v=x_qkv[:, 2 * d :].unflatten(-1, (H, hd)).unsqueeze(0),
+            x_q=x_qkvg[:, :d].unflatten(-1, (H, hd)).unsqueeze(0),
+            x_k=x_qkvg[:, d : 2 * d].unflatten(-1, (H, hd)).unsqueeze(0),
+            x_v=x_qkvg[:, 2 * d : 3 * d].unflatten(-1, (H, hd)).unsqueeze(0),
             w_q_t=self._w_q_t,
             w_k_t=self._w_k_t,
             w_v_t=self._w_v_t,
             bias_q=None,
             bias_k=None,
             bias_v=None,
-            cs_q=cs_dense[0],
-            cs_k=cs_dense[1],
-            cs_v=cs_dense[2],
+            cs_q=cs_q,
+            cs_k=cs_k,
+            cs_v=cs_v,
             A_log=self._A_log_f32,
             g=g.unflatten(-1, (H, hd)).unsqueeze(0),
             dt_bias=self._dt_bias_f32,
             beta=beta.unsqueeze(0),
-            state=state,
-            onorm_g=onorm_g.unflatten(-1, (H, hd)).unsqueeze(0),
+            state=ssm_pool,
+            onorm_g=x_qkvg[:, 3 * d :].unflatten(-1, (H, hd)).unsqueeze(0),
             onorm_weight=self._onorm_w_f32,
             out=None,
             ssm_state_indices=ssm_state_indices,
@@ -656,15 +619,8 @@ class KimiKDALinearAttention(nn.Module):
             lower_bound=self.gate_lower_bound,
             use_beta_sigmoid_in_kernel=True,
             verbose=False,
-            update_conv_cache=False,
+            update_conv_cache=True,
         )
-        if ssm_state_indices is None:
-            ssm_pool.index_copy_(0, slot_indices_long, state)
-
-        new_win = torch.cat([cs[:, :, 1:], x_qkv.unsqueeze(-1)], dim=-1)
-        if new_win.dtype != conv_pool.dtype:
-            new_win = new_win.to(conv_pool.dtype)
-        conv_pool.index_copy_(0, slot_indices_long, new_win)
         # Fused-verify replay caches (spec decoding only): keep the
         # committed conv window in sync with the plain-decode advance.
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)

@@ -338,9 +338,15 @@ class Mamba2Metadata:
         finally:
             cls._warmup_force_initial_states = prev
 
-    def __init__(self, max_batch_size: int, chunk_size: int):
+    def __init__(
+        self,
+        max_batch_size: int,
+        chunk_size: int,
+        max_num_tokens: int | None = None,
+    ) -> None:
         self.max_batch_size = max_batch_size
         self.chunk_size = chunk_size
+        self.max_num_tokens = max_num_tokens
 
         # cumulative sequence lengths for prefill requests [batch_size+1]
         self.cu_seqlens = torch.zeros(max_batch_size + 1,

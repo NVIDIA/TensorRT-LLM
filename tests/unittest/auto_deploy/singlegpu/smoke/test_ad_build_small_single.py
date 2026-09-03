@@ -127,27 +127,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             },
         ),
         (
-            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "flashinfer"},
-                    "compile_model": {
-                        "backend": "torch-simple",
-                        "piecewise_enabled": False,
-                    },
-                },
-            },
-        ),
-        (
-            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
-                },
-                "mode": "transformers",
-            },
-        ),
-        (
             "deepseek-ai/DeepSeek-V3",
             {
                 "transforms": {

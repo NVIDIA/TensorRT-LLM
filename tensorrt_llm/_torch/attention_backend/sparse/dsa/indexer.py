@@ -720,6 +720,16 @@ class Indexer(nn.Module):
             decode_implementation=decode_top_k_implementation,
             compress_ratio=self.compress_ratio,
         )
+        # GVR emission-assisted decode (opt-in, experimental): the FP4/FP8
+        # indexer epilogue emits candidates the GVR Top-K consumes (see
+        # gvr_emission / gvr_routing; state lives on the TopK module)
+        # only the FP4 scoring op accepts emission kwargs
+        self.use_gvr_emission = (
+            os.environ.get("TRTLLM_GVR_EMISSION", "0") == "1"
+            and decode_top_k_implementation == TopKImplementation.CUTE_DSL_GVR
+            and self.use_cute_dsl_paged_mqa_logits
+            and self.use_fp4
+        )
 
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
         # (populated in cache_derived_state; maps to TF32 tensor cores on Ampere+)
@@ -1596,6 +1606,13 @@ class Indexer(nn.Module):
                 gvr_prior_indices,
                 request_offset=num_generations,
             )
+            if self.use_gvr_emission:
+                # reused slots cold-start the emission closed loop; stale
+                # lines only mis-place cuts - counts are re-measured
+                # in-kernel, so exactness never rides on this reset
+                self.top_k.reset_gvr_emission_rows(
+                    slice(num_generations, num_generations + num_contexts)
+                )
 
         reuse_topk = (
             self.mtp_index_share
@@ -1688,6 +1705,25 @@ class Indexer(nn.Module):
                     metadata.dsl_expand_factor > 1
                     and next_n == metadata.dsl_expand_factor * metadata.dsl_atom
                 )
+                gvr_emit_kwargs: dict = {}
+                # emitting for a step the Top-K cannot consume only churns
+                # the closed-loop state, so gate on the consumable shape
+                if (
+                    self.use_gvr_emission
+                    and gvr_prior_indices is not None
+                    and next_n == 1
+                    and not dsl_atom_split
+                    and num_gen_tokens <= 256
+                    # ext tiers are single-CTA/sort-path only; row reordering
+                    # routes the Top-K through order_row, which excludes them
+                    and metadata.kv_lens_row_reorder is None
+                ):
+                    gvr_emit_kwargs = self.top_k.prepare_gvr_emission(
+                        num_generations,
+                        indexer_max_seq_len,
+                        torch.cuda.get_device_properties(q_decode.device).multi_processor_count,
+                        gvr_prior_indices,
+                    )
                 if self.use_fp4:
                     # FP4 DSL signature splits DG's (q, sf_q) tuple into two
                     # separate args and requires q.dtype == uint8 (q_decode
@@ -1720,6 +1756,7 @@ class Indexer(nn.Module):
                         dsl_block_table,
                         dsl_schedule_meta,
                         indexer_max_seq_len,
+                        **gvr_emit_kwargs,
                     )
                 else:
                     # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
@@ -1747,6 +1784,7 @@ class Indexer(nn.Module):
                         fp8_block_table,
                         fp8_schedule_meta,
                         indexer_max_seq_len,
+                        **gvr_emit_kwargs,
                     )
             else:
                 decode_q_scale = (

@@ -11,7 +11,8 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple, Type,
+                    Union)
 
 import torch
 import torch._dynamo.config
@@ -93,7 +94,7 @@ from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
                           get_multimodal_embedding_lengths)
-from .mamba_cache_manager import MambaHybridCacheManager
+from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
@@ -110,6 +111,11 @@ def _get_context_prompt_lookahead_token(request: LlmRequest,
     if chunk_end >= request.py_prompt_len:
         return INVALID_PROMPT_LOOKAHEAD_TOKEN
     return request.get_token(0, chunk_end)
+
+
+def resolve_mamba_metadata_cls(model: torch.nn.Module) -> Type[Mamba2Metadata]:
+    """Resolve the model-specific Mamba metadata class with a default."""
+    return getattr(model, 'mamba_metadata_cls', None) or Mamba2Metadata
 
 
 def _make_single_token_context_graph_batch(
@@ -417,6 +423,9 @@ class PyTorchModelEngine(ModelEngine):
                 llm_args.checkpoint_format,
                 mx_config=llm_args.mx_config,
                 mx_model_name=llm_args.model,
+                checkpoint_io_policy=llm_args.checkpoint_io_policy,
+                load_format=llm_args.load_format,
+                partial_model_loading=llm_args.is_partial_model_loading,
             )
 
         self.mapping = mapping
@@ -1353,6 +1362,26 @@ class PyTorchModelEngine(ModelEngine):
         # Deduplicate the warmup_configs while keeping the order.
         return list(dict.fromkeys(warmup_configs))
 
+    @contextmanager
+    def maybe_autotune_lora(self):
+        """Enable autotuning while warming up CUDA-graph LoRA kernels."""
+        if not (self.llm_args.enable_autotuner
+                and self.cuda_graph_lora_manager is not None):
+            yield
+            return
+
+        cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+        with autotune(cache_path=cache_path):
+            try:
+                yield
+            finally:
+                # Complete the PP cache hand-off even on ranks without a
+                # CUDA-graph-only tunable op.
+                autotuner = AutoTuner.get()
+                autotuner.cache_pp_recv()
+                autotuner.cache_pp_send()
+                autotuner.clean_pp_flag()
+
     @with_warmup_flag
     @warmup_with_kv_cache_cleanup
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -1453,7 +1482,8 @@ class PyTorchModelEngine(ModelEngine):
             with self.cuda_graph_runner.allow_capture():
                 self.cuda_graph_runner.is_warmup_only = True
                 try:
-                    self._run_cuda_graph_warmup(resource_manager)
+                    with self.maybe_autotune_lora():
+                        self._run_cuda_graph_warmup(resource_manager)
                 finally:
                     self.cuda_graph_runner.is_warmup_only = False
                 self.cuda_graph_runner.padding_dummy_requests = {}
@@ -3501,6 +3531,11 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
         )
+        if isinstance(kv_cache_manager, BaseMambaCacheManager):
+            self.attn_metadata.mamba_chunk_size = getattr(
+                config, 'chunk_size', self.attn_metadata.mamba_chunk_size)
+        self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(
+            self.model)
 
         return self.attn_metadata
 
