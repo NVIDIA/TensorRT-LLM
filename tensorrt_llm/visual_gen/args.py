@@ -32,7 +32,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .sparse_attention import (
     SkipSoftmaxAttentionConfig,
-    SolAttnAttentionConfig,
+    SolAttentionConfig,
     VideoSparseAttentionConfig,
 )
 
@@ -93,7 +93,7 @@ class QuantAttentionConfig(StrictBaseModel):
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
-    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig, SolAttnAttentionConfig],
+    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig, SolAttentionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -791,7 +791,7 @@ __all__ = [
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
     "VideoSparseAttentionConfig",
-    "SolAttnAttentionConfig",
+    "SolAttentionConfig",
     "AttentionConfig",
     "ParallelConfig",
     "BaseCacheConfig",

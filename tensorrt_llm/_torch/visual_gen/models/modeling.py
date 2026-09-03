@@ -22,10 +22,7 @@ import torch.nn as nn
 from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxScheduler
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import sol_attn_graph_phase
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-from tensorrt_llm.visual_gen.sparse_attention import (
-    SkipSoftmaxAttentionConfig,
-    SolAttnAttentionConfig,
-)
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner
@@ -99,7 +96,7 @@ class BaseDiffusionModel(nn.Module):
             )
             return
 
-        if isinstance(sparse_config, SolAttnAttentionConfig):
+        if isinstance(sparse_config, SolAttentionConfig):
             disabled_until_timestep = sparse_config.disabled_until_timestep
             if disabled_until_timestep is None:
                 # dense_layers is fixed per layer at construction, so it is

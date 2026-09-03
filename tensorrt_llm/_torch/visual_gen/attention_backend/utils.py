@@ -134,9 +134,9 @@ def create_attention(
             attn_cls = VSAAttention
             kwargs["sparse_attention_config"] = attention_config.sparse_attention_config
         elif sparse_algo == "sol_attn":
-            from .cute_dsl.sol_attn import SolAttnAttention
+            from .cute_dsl.sol_attn import SolAttention
 
-            attn_cls = SolAttnAttention
+            attn_cls = SolAttention
             kwargs["sparse_attention_config"] = attention_config.sparse_attention_config
 
     return attn_cls(

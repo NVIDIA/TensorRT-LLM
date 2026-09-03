@@ -21,7 +21,7 @@ Sparse attention in VisualGen is configured through `VisualGenArgs.attention_con
 |---|---|---|
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Supported |
 | VSA | TBD | TODO |
-| `sol_attn` | `SolAttnAttentionConfig` | Supported (CUTEDSL, sm100) |
+| `sol_attn` | `SolAttentionConfig` | Supported (CUTEDSL, sm100) |
 
 ### Sol-Attn
 
