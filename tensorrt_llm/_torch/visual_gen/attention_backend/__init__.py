@@ -24,7 +24,7 @@ from .cudnn import CuDNNAttention
 from .cute_dsl import (
     VSA_TILE_SIZE,
     CuTeDSLAttention,
-    SolAttnAttention,
+    SolAttention,
     VSAAttention,
     VSAMetadata,
     VSAMetadataBuilder,
@@ -49,7 +49,7 @@ __all__ = [
     "FlashAttn4Attention",
     "FlashInferAttention",
     "RingAttention",
-    "SolAttnAttention",
+    "SolAttention",
     "TrtllmAttention",
     "TrtllmAttentionMetadata",
     "UlyssesAttention",
