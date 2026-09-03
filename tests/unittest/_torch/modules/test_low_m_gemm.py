@@ -14,7 +14,13 @@ import torch
 
 import tensorrt_llm._torch.modules.low_m_gemm as _mod
 from tensorrt_llm._torch.modules import linear as linear_module
-from tensorrt_llm._torch.modules.low_m_gemm import _BACKEND_ENV, LowMGemmDispatcher, _parse_enabled
+from tensorrt_llm._torch.modules.low_m_gemm import (
+    _BACKEND_ENV,
+    _FUSED_EPILOGUE_ENV,
+    LowMGemmDispatcher,
+    _parse_enabled,
+    low_m_gemm_fused_epilogue_enabled,
+)
 from tensorrt_llm._utils import is_sm_100f
 
 # ---------------------------------------------------------------------------
@@ -70,6 +76,19 @@ def test_parse_direct_enabled(value: str | None, expected: bool, monkeypatch) ->
     else:
         monkeypatch.setenv(_BACKEND_ENV, value)
     assert _mod._parse_direct_enabled() is expected
+
+
+def test_fused_epilogue_env_is_explicit_and_strict(monkeypatch) -> None:
+    monkeypatch.delenv(_FUSED_EPILOGUE_ENV, raising=False)
+    assert not low_m_gemm_fused_epilogue_enabled()
+    for enabled in ("auto", "on", "true", "1"):
+        monkeypatch.setenv(_FUSED_EPILOGUE_ENV, enabled)
+        assert low_m_gemm_fused_epilogue_enabled()
+    monkeypatch.setenv(_FUSED_EPILOGUE_ENV, "off")
+    assert not low_m_gemm_fused_epilogue_enabled()
+    monkeypatch.setenv(_FUSED_EPILOGUE_ENV, "qwen-only")
+    with pytest.raises(ValueError, match=_FUSED_EPILOGUE_ENV):
+        low_m_gemm_fused_epilogue_enabled()
 
 
 # ---------------------------------------------------------------------------

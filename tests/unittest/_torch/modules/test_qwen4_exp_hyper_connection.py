@@ -298,3 +298,87 @@ def test_combine_norm_rejects_a_reshaped_norm_weight():
             1e-6,
             4,
         )
+
+
+@_skip_non_sm10x
+@pytest.mark.parametrize("use_combine", [True, False])
+@torch.inference_mode()
+def test_low_m_fused_mix_matches_fallback_and_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    use_combine: bool,
+) -> None:
+    monkeypatch.setenv("TRTLLM_LOW_M_GEMM_FUSED_EPILOGUE", "auto")
+    torch.manual_seed(42)
+    hc_count, hidden_size, lowrank = 4, 2560, 320
+    module = Qwen4ExpHyperConnection(
+        hc_count,
+        hidden_size,
+        lowrank,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+        use_combine=use_combine,
+    ).eval()
+    _initialize_test_weights(module)
+
+    control_input = torch.randn(
+        8,
+        hc_count * hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected_control, expected_control_residual = _reference_mix(module, control_input)
+    actual_control, actual_control_residual = module.mix(control_input)
+    torch.testing.assert_close(actual_control, expected_control, rtol=1e-2, atol=5e-3)
+    if use_combine:
+        torch.testing.assert_close(
+            actual_control_residual[1],
+            expected_control_residual[1],
+            rtol=1e-2,
+            atol=5e-3,
+        )
+    else:
+        assert actual_control_residual[1] is expected_control_residual[1] is None
+    assert module._input_mix_weight_up_interleaved is None
+
+    with monkeypatch.context() as capture:
+        capture.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        assert module._interleaved_up_weight() is None
+    assert module._input_mix_weight_up_interleaved is None
+
+    for rows in (1, 2, 4):
+        decode_input = torch.randn(
+            rows,
+            hc_count * hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        expected_mixed, expected_residual = _reference_mix(module, decode_input)
+        actual_mixed, actual_residual = module.mix(decode_input)
+        torch.testing.assert_close(actual_mixed, expected_mixed, rtol=1e-2, atol=5e-3)
+        if use_combine:
+            torch.testing.assert_close(
+                actual_residual[1],
+                expected_residual[1],
+                rtol=1e-2,
+                atol=5e-3,
+            )
+        else:
+            assert actual_residual[1] is expected_residual[1] is None
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_mixed, graph_residual = module.mix(decode_input)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_mixed, actual_mixed, rtol=0.0, atol=0.0)
+        if use_combine:
+            torch.testing.assert_close(
+                graph_residual[1],
+                actual_residual[1],
+                rtol=0.0,
+                atol=0.0,
+            )
+        else:
+            assert graph_residual[1] is actual_residual[1] is None
+
+    assert module._input_mix_weight_up_interleaved.shape == (hc_count * hidden_size, lowrank)
