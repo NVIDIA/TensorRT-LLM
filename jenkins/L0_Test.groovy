@@ -547,9 +547,14 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
             } else {
                 // unfinished_test.txt is shared across the whole stage, so match
                 // by this test's own name instead of just checking file presence.
+                // isolateTestName may still carry a " TIMEOUT (N)" / " ISOLATION"
+                // suffix (processShardTestList only strips the ISOLATION token,
+                // not a chained TIMEOUT one), but unfinished_test.txt stores the
+                // bare pytest nodeid, so strip it the same way test_rerun.py does.
+                def bareTestName = isolateTestName.split(/ TIMEOUT | ISOLATION/)[0]
                 def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
                 def isTestUnfinished = fileExists(unfinishedTestFile) &&
-                    sh(script: "grep -qF -- '${isolateTestName}' ${unfinishedTestFile}", returnStatus: true) == 0
+                    sh(script: "grep -qF -- '${bareTestName}' ${unfinishedTestFile}", returnStatus: true) == 0
                 if (isTestUnfinished) {
                     // Record this crash as a JUnit <testcase> like the regular-test
                     // path does. hasUnrerunFailure stays untouched here: it drives
