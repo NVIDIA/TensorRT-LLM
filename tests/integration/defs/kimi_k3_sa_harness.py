@@ -46,7 +46,10 @@ Environment:
   KIMI_K3_SPEC_PARITY          0 (off) | 1/text (bit-identical outputs;
                                full model) | logits (tolerance logprob
                                comparison along shared prefix + near-tie
-                               check at divergence; truncated models)
+                               check at divergence; truncated models).
+                               Note that we have no log probs when spec
+                               dec is enabled (the sampler does not support it),
+                               so only the baseline side is scored for that case.
   KIMI_K3_OUTPUT_JSON          dump this run's outputs (text/token_ids/
                                logprobs) to a JSON file
   KIMI_K3_BASELINE_JSON        load the parity baseline from a prior run's
@@ -295,7 +298,9 @@ def _dump_completions(path, completions, want_logprobs):
     payload = []
     for comp in completions:
         entry = {"text": comp.text, "token_ids": list(comp.token_ids)}
-        if want_logprobs and comp.logprobs is not None:
+        # Use truthiness instead of `is not None`; empty lists should
+        # not be added to `entry`.
+        if want_logprobs and comp.logprobs:
             entry["logprobs"] = [
                 {str(tid): float(getattr(lp, "logprob", lp)) for tid, lp in pos.items()}
                 for pos in comp.logprobs
@@ -455,6 +460,15 @@ def main() -> int:
     )
 
     want_logprobs = spec_parity == "logits" or os.environ.get("KIMI_K3_DUMP_LOGPROBS", "0") == "1"
+
+    # Spec dec does not support returning logprobs
+    run_want_logprobs = want_logprobs and spec_mode == "off"
+    if want_logprobs and not run_want_logprobs:
+        print(
+            "[sanity] NOTE: logprobs not requested for the spec run "
+            f"(spec_mode={spec_mode} samples in-worker and cannot return them); "
+            "parity is one-sided"
+        )
     # Cross-process parity: a prior baseline run dumps its outputs via
     # KIMI_K3_OUTPUT_JSON; this run loads them via KIMI_K3_BASELINE_JSON
     # instead of loading a second in-process model (the full model does
@@ -499,10 +513,10 @@ def main() -> int:
             llm.shutdown()
 
     llm = _build_llm(ckpt, tp, spec_mode, adp)
-    completions = _generate(llm, prompt_texts, max_tokens, want_logprobs)
+    completions = _generate(llm, prompt_texts, max_tokens, run_want_logprobs)
     llm.shutdown()
     if output_json:
-        _dump_completions(output_json, completions, want_logprobs)
+        _dump_completions(output_json, completions, run_want_logprobs)
 
     failures = []
     for comp, (prompt, expected) in zip(completions, prompt_set):
