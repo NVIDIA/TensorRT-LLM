@@ -50,7 +50,7 @@
 #if ENABLE_MULTI_DEVICE
 
 #ifndef TLLM_NCCL_WINDOW_LIFECYCLE_ASSERT
-#define TLLM_NCCL_WINDOW_LIFECYCLE_ASSERT 0
+#define TLLM_NCCL_WINDOW_LIFECYCLE_ASSERT 1
 #endif
 
 // TLLM_NCCL_CHECK (throw on failure) is provided by multiDeviceUtils.h.
