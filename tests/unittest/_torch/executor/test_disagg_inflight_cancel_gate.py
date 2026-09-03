@@ -148,7 +148,7 @@ def test_flag_unset_generation_timeout_peer_enters_cleanup():
         charge_budget=False,
     )
     assert executor._timeout_cleanup_order.mock_calls == [
-        call.vote(False, small_payload=True),
+        call.vote([0]),
         call.handle(
             error_msg="Request timed out (KV transfer)",
             requests=[],

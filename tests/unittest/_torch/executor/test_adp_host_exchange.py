@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Per-iteration attention-DP host exchanges: one int64 collective per
-exchange, and the cuda-graph batch agreement gathered once per iteration."""
+"""Per-iteration attention-DP host exchanges use one int64 collective each,
+and every TP rank enters the same collectives regardless of its local batch."""
 
 import types
 from types import SimpleNamespace
@@ -19,25 +19,40 @@ from tensorrt_llm.mapping import Mapping
 pytestmark = pytest.mark.cpu_only
 
 
-class _CountingDist:
-    """Returns scripted rows for tp_allgather_int64 and counts the calls."""
+class _TwoRankDist:
+    """Scripted TP communicator for two ranks driven from one test.
 
-    def __init__(self, rows):
-        self.rows = rows
-        self.calls = []
+    Each rank gets a proxy whose tp_allgather_int64 records the call and
+    returns the rows scripted for that call index, so the test can check
+    that both ranks issue the same sequence of collectives.
+    """
 
-    def tp_allgather_int64(self, values):
-        self.calls.append(list(values))
-        return np.array(self.rows, dtype=np.int64)
+    def __init__(self, scripted_rows):
+        self.scripted_rows = scripted_rows
+        self.calls = {0: [], 1: []}
+
+    def for_rank(self, rank):
+        dist = self
+
+        class _Proxy:
+            def tp_allgather_int64(self, values):
+                idx = len(dist.calls[rank])
+                dist.calls[rank].append(list(values))
+                return np.array(dist.scripted_rows[idx], dtype=np.int64)
+
+        return _Proxy()
 
 
-def _make_batch(num_generation):
+def _make_batch(num_generation, num_context=0):
     batch = ScheduledRequests()
     batch.generation_requests = [SimpleNamespace(py_request_id=i) for i in range(num_generation)]
+    batch.context_requests_last_chunk = [
+        SimpleNamespace(py_request_id=100 + i) for i in range(num_context)
+    ]
     return batch
 
 
-def _make_runner(dist, tp_size=2, max_batch=64):
+def _make_runner(dist, max_batch=64, dummy_ok=True):
     runner = object.__new__(CUDAGraphRunner)
     runner.enabled = True
     runner.padding_enabled = True
@@ -45,110 +60,88 @@ def _make_runner(dist, tp_size=2, max_batch=64):
     runner.enable_encoder_decoder_mixed_cuda_graph = False
     runner.config = SimpleNamespace(
         enable_attention_dp=True,
-        mapping=SimpleNamespace(tp_size=tp_size),
+        mapping=SimpleNamespace(tp_size=2),
         dist=dist,
         batch_size=max_batch,
         use_mrope=False,
     )
     runner._round_up_batch_size_with_draft_len = lambda bs, draft_len: 4 if bs <= 4 else 8
-    runner._get_or_create_padding_dummy = lambda rm, draft_len: SimpleNamespace(py_request_id=-1)
+    dummy = SimpleNamespace(py_request_id=-1) if dummy_ok else None
+    runner._get_or_create_padding_dummy = lambda rm, draft_len: dummy
+    runner._is_mixed_encoder_decoder_batch = Mock(return_value=False)
+    runner.get_graph_key = Mock(return_value=None)
     return runner
 
 
-def test_pad_batch_reuses_rows_offered_by_executor():
-    # Rows as gathered in _can_queue: [batch_size, can_run] per rank.
-    dist = _CountingDist([[3, 1], [4, 1]])
-    runner = _make_runner(dist)
-    batch = _make_batch(3)
-
-    runner.offer_adp_batch_info(3, True, np.array([[3, 1], [4, 1]]))
+def _run_iteration(runner, batch):
     padding = CUDAGraphRunner._get_padded_batch(runner, batch, Mock(), 0)
-
-    assert dist.calls == []
-    assert padding == 1
-    assert batch.batch_size == 4
-    assert runner._adp_post_pad == (batch, 4, True, True)
-
-
-def test_pad_batch_falls_back_when_offer_does_not_match():
-    dist = _CountingDist([[2, 1], [2, 1]])
-    runner = _make_runner(dist)
-    batch = _make_batch(2)
-
-    runner.offer_adp_batch_info(3, True, np.array([[3, 1], [4, 1]]))
-    CUDAGraphRunner._get_padded_batch(runner, batch, Mock(), 0)
-
-    # Stale offer discarded; a fresh exchange carries [can_run, batch_size].
-    assert dist.calls == [[1, 2]]
-    assert runner._adp_offer is None
-
-
-def test_maybe_get_cuda_graph_reuses_pad_batch_verdict():
-    dist = _CountingDist([[1, 4], [1, 4]])
-    runner = _make_runner(dist)
-    runner.get_graph_key = Mock(return_value="key")
-    runner.graph_metadata = {}
-    runner._capture_allowed = False
-    runner._get_seq_len_mode = Mock(return_value=False)
-    runner._is_mixed_encoder_decoder_batch = Mock(return_value=False)
-    batch = _make_batch(4)
-
-    runner._adp_post_pad = (batch, 4, True, True)
     result = CUDAGraphRunner.maybe_get_cuda_graph(
         runner, batch, enable_spec_decode=False, attn_metadata=object()
     )
-
-    assert dist.calls == []
-    assert runner._adp_post_pad is None
-    assert result == (None, None, None)  # no captured graph in this stub
+    return padding, result
 
 
-def test_maybe_get_cuda_graph_returns_none_when_a_peer_cannot_run():
-    dist = _CountingDist([[1, 4], [0, 4]])
-    runner = _make_runner(dist)
-    runner._is_mixed_encoder_decoder_batch = Mock(return_value=False)
-    batch = _make_batch(4)
-
-    runner._adp_post_pad = (batch, 4, False, True)
-    result = CUDAGraphRunner.maybe_get_cuda_graph(
-        runner, batch, enable_spec_decode=False, attn_metadata=object()
-    )
-
-    assert result == (None, None, None)
-    assert dist.calls == []
+def _rows(*pairs):
+    """Rows as gathered by the runner: [can_run, batch_size] per rank."""
+    return [[int(can_run), size] for can_run, size in pairs]
 
 
-def test_maybe_get_cuda_graph_gathers_when_no_verdict():
-    dist = _CountingDist([[1, 4], [1, 3]])
-    runner = _make_runner(dist)
-    runner._is_mixed_encoder_decoder_batch = Mock(return_value=False)
-    batch = _make_batch(4)
+def test_pad_batch_pads_to_the_largest_eligible_rank():
+    dist = _TwoRankDist([_rows((True, 3), (True, 4)), _rows((True, 4), (True, 4))])
+    rank0 = _make_runner(dist.for_rank(0))
+    rank1 = _make_runner(dist.for_rank(1))
+    batch0, batch1 = _make_batch(3), _make_batch(4)
 
-    result = CUDAGraphRunner.maybe_get_cuda_graph(
-        runner, batch, enable_spec_decode=False, attn_metadata=object()
-    )
+    padding0, _ = _run_iteration(rank0, batch0)
+    padding1, _ = _run_iteration(rank1, batch1)
 
-    assert dist.calls == [[1, 4]]
-    assert result == (None, None, None)  # sizes differ across ranks
+    assert (padding0, padding1) == (1, 0)
+    assert (batch0.batch_size, batch1.batch_size) == (4, 4)
+    assert dist.calls[0] == [[1, 3], [1, 4]]
+    assert dist.calls[1] == [[1, 4], [1, 4]]
 
 
-def test_can_queue_offers_gathered_rows_to_runner():
+def test_ineligible_peer_does_not_skip_any_collective():
+    # Rank 1 still has a context request, so only rank 0 pads its batch;
+    # both ranks must still enter the pad and graph-lookup gathers.
+    dist = _TwoRankDist([_rows((True, 3), (False, 2)), _rows((True, 4), (False, 2))])
+    rank0 = _make_runner(dist.for_rank(0))
+    rank1 = _make_runner(dist.for_rank(1))
+    batch0, batch1 = _make_batch(3), _make_batch(1, num_context=1)
+
+    padding0, result0 = _run_iteration(rank0, batch0)
+    padding1, result1 = _run_iteration(rank1, batch1)
+
+    assert (padding0, padding1) == (1, 0)
+    assert result0 == result1 == (None, None, None)
+    assert len(dist.calls[0]) == len(dist.calls[1]) == 2
+    assert dist.calls[0] == [[1, 3], [1, 4]]
+    assert dist.calls[1] == [[0, 2], [0, 2]]
+
+
+def test_local_padding_dummy_failure_does_not_skip_any_collective():
+    dist = _TwoRankDist([_rows((True, 3), (True, 4)), _rows((True, 3), (True, 4))])
+    rank0 = _make_runner(dist.for_rank(0), dummy_ok=False)
+    rank1 = _make_runner(dist.for_rank(1))
+    batch0, batch1 = _make_batch(3), _make_batch(4)
+
+    padding0, result0 = _run_iteration(rank0, batch0)
+    padding1, result1 = _run_iteration(rank1, batch1)
+
+    assert (padding0, padding1) == (0, 0)
+    assert result0 == result1 == (None, None, None)
+    assert len(dist.calls[0]) == len(dist.calls[1]) == 2
+    assert dist.calls[0] == [[1, 3], [1, 3]]
+
+
+def test_can_queue_gathers_only_the_batch_size():
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = True
-    gathered = np.array([[2, 1], [0, 1]])
-    executor.dist = SimpleNamespace(tp_allgather_int64=Mock(return_value=gathered))
-    offer = Mock()
-    executor.model_engine = SimpleNamespace(
-        cuda_graph_runner=SimpleNamespace(offer_adp_batch_info=offer)
-    )
+    executor.dist = SimpleNamespace(tp_allgather_int64=Mock(return_value=np.array([[2], [0]])))
 
-    can_queue, this_rank = PyExecutor._can_queue(
-        executor, types.SimpleNamespace(batch_size=2, can_run_cuda_graph=True)
-    )
+    can_queue, this_rank = PyExecutor._can_queue(executor, types.SimpleNamespace(batch_size=2))
 
-    executor.dist.tp_allgather_int64.assert_called_once_with([2, 1])
-    offer.assert_called_once()
-    assert offer.call_args.args[0] == 2 and offer.call_args.args[1] is True
+    executor.dist.tp_allgather_int64.assert_called_once_with([2])
     assert can_queue is False and this_rank is True
 
 
@@ -158,6 +151,10 @@ class _ObjectPathDist(Distributed):
     def __init__(self, mapping, peers):
         super().__init__(mapping)
         self.peers = peers
+
+    @property
+    def local_world_size(self):
+        return len(self.peers)
 
     def barrier(self):
         pass

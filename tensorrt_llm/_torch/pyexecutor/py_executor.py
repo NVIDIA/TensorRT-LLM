@@ -3502,21 +3502,10 @@ class PyExecutor:
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
         # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
         if self.enable_attention_dp:
-            # Gather batch size and cuda-graph eligibility together; the
-            # graph runner reuses these rows for the same batch.
-            can_run_cuda_graph = bool(
-                getattr(scheduled_batch, "can_run_cuda_graph", False))
-            gathered = self.dist.tp_allgather_int64(
-                [scheduled_batch.batch_size,
-                 int(can_run_cuda_graph)])
-            tp_batch_sizes = gathered[:, 0].tolist()
+            tp_batch_sizes = self.dist.tp_allgather_int64(
+                [scheduled_batch.batch_size])[:, 0].tolist()
             can_queue = 0 not in tp_batch_sizes
             can_queue_this_rank = scheduled_batch.batch_size > 0
-            runner = getattr(getattr(self, "model_engine", None),
-                             "cuda_graph_runner", None)
-            offer = getattr(runner, "offer_adp_batch_info", None)
-            if offer is not None:
-                offer(scheduled_batch.batch_size, can_run_cuda_graph, gathered)
         else:
             can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
 

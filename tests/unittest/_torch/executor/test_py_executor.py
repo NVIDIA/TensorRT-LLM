@@ -2161,7 +2161,7 @@ def test_generic_disagg_adp_mixed_rank_states_stay_queueable():
 
     for stub, batch_size in zip((busy_rank, terminal_rank), rank_batch_sizes, strict=True):
         stub.dist.tp_allgather_int64 = Mock(
-            return_value=np.array([[size, 1] for size in rank_batch_sizes])
+            return_value=np.array([[size] for size in rank_batch_sizes])
         )
         can_queue, can_queue_this_rank = PyExecutor._can_queue(
             stub, types.SimpleNamespace(batch_size=batch_size)
@@ -2281,7 +2281,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     first_dummy = stub._pending_adp_dummy_request
     assert first_dummy is not None
 
-    stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1, 1], [0, 1]]))
+    stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1], [0]]))
     can_queue, _ = PyExecutor._can_queue(stub, types.SimpleNamespace(batch_size=1))
     assert can_queue is False
     PyExecutor._finalize_adp_dummy_allocation(stub, can_queue)
@@ -2290,7 +2290,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
 
-    stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1, 1], [1, 1]]))
+    stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1], [1]]))
     _run_pad(stub)
     second_dummy = stub._pending_adp_dummy_request
     assert second_dummy is not None
@@ -3302,6 +3302,6 @@ class TestAdpBalanceExcludesPadDummies:
             ],
         )
 
-        gathered = executor.dist.tp_allgather.call_args[0][0]
+        gathered = executor.dist.tp_allgather_int64.call_args[0][0]
         assert gathered[1] == 2, "scheduled count keeps counting the dummy"
         assert gathered[3] == 1, "real count must exclude the dummy"
