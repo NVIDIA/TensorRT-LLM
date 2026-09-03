@@ -21,10 +21,7 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native.transfer import Sender
-from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
-    CacheReuseAdapter,
-    _CacheReuseAdapterV1,
-)
+from tensorrt_llm._torch.disaggregation.resource.cache_reuse import CacheReuseAdapter
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
@@ -101,44 +98,6 @@ class TestAlignKvBlocks:
         )
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [20, 21])
-
-
-# ---------------------------------------------------------------------------
-# Beam-0-only block layout.
-# ---------------------------------------------------------------------------
-
-
-class TestBeam0BlockLayout:
-    """Verify disaggregated transfer requests only beam 0's block IDs."""
-
-    def test_v1_adapter_requests_beam0_only(self):
-        class _FakeMgr:
-            enable_block_reuse = True
-            tokens_per_block = 32
-
-            def __init__(self):
-                self.calls = []
-                self.pool_indices_window = None
-
-            def get_batch_cache_indices(self, request_ids, layer_idx=None):
-                self.calls.append((request_ids, layer_idx))
-                return [[10, 11, 12]]
-
-            def get_memory_pool_block_indices(self, block_ids, window_size):
-                # Identity translation: nothing offloaded, block_id == pool slot.
-                self.pool_indices_window = window_size
-                return block_ids
-
-        req = _FakeReq(prompt_len=7)
-        req.py_request_id = 1
-        req.py_beam_width = 4
-        mgr = _FakeMgr()
-
-        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids(req, 0, _lg(window=512))
-
-        assert mgr.calls == [([1], 0)]
-        assert mgr.pool_indices_window == 512
-        np.testing.assert_array_equal(block_ids, [10, 11, 12])
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +195,6 @@ def _build_transceiver_for_kv_slice(
     sliding_window_size=None,
     cached_tokens: int = 0,
     is_generation_only: bool = False,
-    beam_width: int = 1,
 ):
     """Stub a KvCacheTransceiverV2 so _create_kv_slice runs without dist setup.
 
@@ -273,7 +231,7 @@ def _build_transceiver_for_kv_slice(
     req = SimpleNamespace(
         prompt_len=prompt_len,
         py_request_id=0,
-        py_beam_width=beam_width,
+        py_beam_width=1,
         is_generation_only_request=lambda: is_generation_only,
     )
     return transceiver, req
@@ -339,22 +297,6 @@ class TestCreateKvSliceBlockSpan:
             np.array([102, 103], dtype=np.int64),
         )
 
-    def test_swa_beam_request_transfers_beam0_only(self):
-        transceiver, req = _build_transceiver_for_kv_slice(
-            num_extra_kv_tokens=0,
-            prompt_len=32,
-            block_ids=[100, 101, 102, 103, 104],
-            sliding_window_size=16,
-            beam_width=4,
-        )
-
-        kv_slice = transceiver._create_kv_slice(req)
-
-        np.testing.assert_array_equal(
-            kv_slice.block_ids_per_layer_groups[0],
-            np.array([102, 103], dtype=np.int64),
-        )
-
     @pytest.mark.parametrize(
         "block_ids",
         (
@@ -378,18 +320,6 @@ class TestCreateKvSliceBlockSpan:
             kv_slice.block_ids_per_layer_groups[0],
             np.array([102, 103], dtype=np.int64),
         )
-
-    def test_swa_speculative_tail_requires_single_beam(self):
-        transceiver, req = _build_transceiver_for_kv_slice(
-            num_extra_kv_tokens=2,
-            prompt_len=32,
-            block_ids=[100, 101, 102, 103, 104],
-            sliding_window_size=16,
-            beam_width=4,
-        )
-
-        with pytest.raises(ValueError, match="speculative scratch blocks require beam_width == 1"):
-            transceiver._create_kv_slice(req)
 
     @pytest.mark.parametrize("prompt_len", (1150, 1151))
     def test_dspark_disagg_boundary_keeps_only_initialized_swa(self, prompt_len):

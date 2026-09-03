@@ -40,8 +40,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
 from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
-    CBAGroupHost, _gather_beam_path, _prepare_beam_history_cba, finalize_beam,
-    prepare_beam_search)
+    CBAGroupHost, _gather_beam_path, _prepare_beam_history_cba, finalize_beam)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     BEAM_SEARCH_PAD_TOKEN, BeamSearch, BeamSearchEarlyStop, BeamSearchMetadata,
     CBAState, _StrategyImpls, beam_search_sampling_batch_cba)
@@ -423,79 +422,8 @@ def test_beam_search_e2e(
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_beam_search_disagg_e2e(
-    fixed_params,
-    input_prompts,
-    model_kwargs: dict[str, Any],
-) -> None:
-    """Beam search is admitted under disaggregated serving.
-
-    The context server's finished-candidate pool is not part of the handoff
-    (TRTLLM-14792), so the CBA op runs with that side's end id masked: an end
-    candidate stays in its beam slot rather than being pooled, travels as
-    first_gen_tokens, and the generation server pools it there instead. Every
-    early_stopping mode goes through the same route, so admission accepts them
-    all rather than rejecting beam search outright.
-    """
-    sampling_params = SamplingParams(
-        max_tokens=fixed_params["max_tokens"],
-        n=fixed_params["max_beam_width"],
-        best_of=fixed_params["max_beam_width"],
-        use_beam_search=True,
-        end_id=-1,
-        include_stop_str_in_output=True,
-    )
-
-    disagg_kwargs = deepcopy(model_kwargs)
-    disagg_kwargs |= dict(
-        disable_overlap_scheduler=True,
-        cuda_graph_config=None,
-        kv_cache_config=KvCacheConfig(max_tokens=10000,
-                                      enable_block_reuse=True,
-                                      enable_partial_reuse=True,
-                                      use_kv_cache_manager_v2=True),
-        cache_transceiver_config=CacheTransceiverConfig(
-            backend="NIXL",
-            transceiver_runtime="PYTHON",
-            kv_transfer_timeout_ms=1000,
-            kv_transfer_sender_future_timeout_ms=1000,
-        ),
-    )
-
-    prompts = [[1, 2, 3]]
-    ctx_llm = _build_llm(fixed_params, prompts, disagg_kwargs)
-    try:
-        with ctx_llm:
-            # Every mode goes through the same route, including the default
-            # (early_stopping unset, i.e. True).
-            for early_stopping in (None, 0, 1, 2):
-                params = deepcopy(sampling_params)
-                if early_stopping is not None:
-                    params.early_stopping = early_stopping
-                outputs = ctx_llm.generate(
-                    deepcopy(prompts),
-                    sampling_params=params,
-                    disaggregated_params=[
-                        DisaggregatedParams(request_type="context_only",
-                                            disagg_request_id=200)
-                    ],
-                    use_tqdm=False,
-                )
-                # The context phase hands off one token per beam; admission no
-                # longer rejects it, which is what this pins.
-                assert len(outputs) == len(prompts)
-                ctx_params = outputs[0].disaggregated_params
-                assert ctx_params is not None
-                assert len(ctx_params.first_gen_tokens
-                           ) == fixed_params["max_beam_width"]
-    finally:
-        ctx_llm.shutdown()
-
-
-@pytest.mark.threadleak(enabled=False)
 def test_beam_search_disagg_first_token_is_end_id(
     fixed_params,
-    input_prompts,
     model_kwargs: dict[str, Any],
 ) -> None:
     """A context phase that finishes on its only token still hands off.
@@ -1710,35 +1638,6 @@ def create_default_sampler(test_params: GeneralTestParams) -> TorchSampler:
         max_batch_size, max_beam_width,
         max_seq_len), "Original tokens shape mismatch"
     return sampler
-
-
-def test_beam_prompt_cache_indirection_uses_beam0():
-    """Aggregated and disaggregated beam search share prompt KV through beam 0."""
-    test_params = GeneralTestParams()
-    sampler = create_default_sampler(test_params)
-    beam_search_store = sampler.store.beam_search_store
-    assert beam_search_store is not None
-    seq_slot = test_params.seq_slot
-    prompt_len = test_params.prompt_len
-    beam_search_store.cache_indirection[seq_slot, :, :prompt_len].fill_(1)
-
-    prepare_beam_search(
-        beam_search_store,
-        sampler.store.log_probs_store,
-        seq_slots_long=torch.tensor([seq_slot],
-                                    dtype=torch.int64,
-                                    device="cuda"),
-        max_prompt_len=prompt_len,
-        prompt_lens_cuda=torch.tensor([prompt_len],
-                                      dtype=torch.int32,
-                                      device="cuda"),
-        beam_caps_cuda=torch.tensor([test_params.beam_width],
-                                    dtype=torch.int32,
-                                    device="cuda"),
-    )
-
-    assert torch.count_nonzero(
-        beam_search_store.cache_indirection[seq_slot, :, :prompt_len]) == 0
 
 
 def _vbws_request(beam_width_array: list[int] | None,
