@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from torch import nn
-from transformers import LlamaConfig, Qwen2Config, Qwen3Config
+from transformers import LlamaConfig, MistralConfig, Qwen2Config, Qwen3Config
 from utils.post_transform_qualification import (
     PostTransformQualificationCase,
     assert_post_transform_lifecycle_equivalent,
@@ -23,9 +23,11 @@ import tensorrt_llm.mapping as mapping_mod
 from tensorrt_llm._torch import distributed as distributed_mod
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_llama as modeling_llama_mod
+from tensorrt_llm._torch.models import modeling_mistral as modeling_mistral_mod
 from tensorrt_llm._torch.models import modeling_qwen as modeling_qwen_mod
 from tensorrt_llm._torch.models import modeling_qwen3 as modeling_qwen3_mod
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.modules import mla as mla_mod
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mla import MLA
@@ -150,6 +152,10 @@ class _UnqualifiedQwen2ForCausalLM(modeling_qwen_mod.Qwen2ForCausalLM):
 
 
 class _UnqualifiedQwen3ForCausalLM(modeling_qwen3_mod.Qwen3ForCausalLM):
+    pass
+
+
+class _UnqualifiedMistralForCausalLM(modeling_mistral_mod.MistralForCausalLM):
     pass
 
 
@@ -322,6 +328,58 @@ def _tiny_qwen3_model(
     return model
 
 
+def _tiny_mistral_model(
+    *,
+    model_class: type[nn.Module] = modeling_mistral_mod.MistralForCausalLM,
+    tp_size: int = 1,
+    rank: int = 0,
+    sliding_window: int | None = None,
+    layer_types: tuple[str, ...] | None = None,
+) -> nn.Module:
+    # transformers defaults `MistralConfig.sliding_window` to a positive window,
+    # so the full-attention fixture has to request `None` explicitly.
+    mistral_config = MistralConfig(
+        architectures=["MistralForCausalLM"],
+        head_dim=4,
+        hidden_act="silu",
+        hidden_size=16,
+        intermediate_size=32,
+        max_position_embeddings=16,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-5,
+        sliding_window=sliding_window,
+        tie_word_embeddings=False,
+        torch_dtype=torch.bfloat16,
+        vocab_size=32,
+    )
+    if layer_types is not None:
+        # Ministral-style checkpoints mark sliding and full-attention layers.
+        mistral_config.layer_types = list(layer_types)
+    model = model_class(
+        ModelConfig(
+            pretrained_config=mistral_config,
+            mapping=mapping_mod.Mapping(
+                world_size=tp_size,
+                rank=rank,
+                tp_size=tp_size,
+            ),
+            max_num_tokens=16,
+            max_seq_len=16,
+        )
+    )
+    with torch.no_grad():
+        for index, parameter in enumerate(model.parameters()):
+            values = torch.arange(
+                parameter.numel(),
+                dtype=torch.float32,
+                device=parameter.device,
+            ).reshape(parameter.shape)
+            parameter.copy_(((values + index) % 17).to(parameter.dtype) / 17)
+    return model
+
+
 def _bf16_dense_runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
     values = {
         "dtype": "bfloat16",
@@ -345,6 +403,9 @@ def _bf16_dense_runtime_config(**overrides: object) -> PostTransformRuntimeConfi
         "tied_word_embeddings": False,
         "rope_type": "default",
         "rope_fusion": True,
+        # Llama and Qwen attention modules expose no window state, so their real
+        # tiny models realize `None`; Mistral tests override this to `"none"`.
+        "sliding_window": None,
     }
     values.update(overrides)
     return PostTransformRuntimeConfig(**values)
@@ -383,7 +444,23 @@ def _qwen3_layout_state(model: nn.Module) -> dict[str, object]:
     }
 
 
-def _dense_qwen_input_embeddings(model: nn.Module) -> torch.Tensor:
+def _mistral_layout_state(model: nn.Module) -> dict[str, object]:
+    layer = model.model.layers[0]
+    return {
+        "attention_type": type(layer.self_attn).__name__,
+        "qkv_weight_mode": layer.self_attn.qkv_proj.weights_loading_config.weight_mode,
+        "qkv_weight_shape": tuple(layer.self_attn.qkv_proj.weight.shape),
+        "gate_up_weight_mode": layer.mlp.gate_up_proj.weights_loading_config.weight_mode,
+        "gate_up_weight_shape": tuple(layer.mlp.gate_up_proj.weight.shape),
+        "qkv_bias": layer.self_attn.qkv_proj.bias is not None,
+        "rope_fusion": layer.self_attn.rope_fusion,
+        "rotary_embedding_present": layer.self_attn.rotary_emb is not None,
+        "attention_window_size": layer.self_attn.attention_window_size,
+        "tied_lm_head": model.lm_head.weight is model.model.embed_tokens.weight,
+    }
+
+
+def _dense_input_embeddings(model: nn.Module) -> torch.Tensor:
     input_ids = torch.tensor(
         [0, 1, 2],
         dtype=torch.long,
@@ -392,11 +469,11 @@ def _dense_qwen_input_embeddings(model: nn.Module) -> torch.Tensor:
     return model.model.embed_tokens(input_ids)
 
 
-def _dense_qwen_embedding_logits(model: nn.Module) -> torch.Tensor:
-    return model.lm_head(_dense_qwen_input_embeddings(model))
+def _dense_embedding_logits(model: nn.Module) -> torch.Tensor:
+    return model.lm_head(_dense_input_embeddings(model))
 
 
-def _dense_qwen_hidden_states(model: nn.Module) -> torch.Tensor:
+def _dense_hidden_states(model: nn.Module) -> torch.Tensor:
     qkv_weight = model.model.layers[0].self_attn.qkv_proj.weight
     values = torch.arange(
         3 * model.config.hidden_size,
@@ -406,12 +483,12 @@ def _dense_qwen_hidden_states(model: nn.Module) -> torch.Tensor:
     return (values % 17).to(qkv_weight.dtype) / 17
 
 
-def _dense_qwen_fused_qkv_output(model: nn.Module) -> torch.Tensor:
-    return model.model.layers[0].self_attn.qkv_proj(_dense_qwen_hidden_states(model))
+def _dense_fused_qkv_output(model: nn.Module) -> torch.Tensor:
+    return model.model.layers[0].self_attn.qkv_proj(_dense_hidden_states(model))
 
 
-def _dense_qwen_fused_gate_up_output(model: nn.Module) -> torch.Tensor:
-    return model.model.layers[0].mlp.gate_up_proj(_dense_qwen_hidden_states(model))
+def _dense_fused_gate_up_output(model: nn.Module) -> torch.Tensor:
+    return model.model.layers[0].mlp.gate_up_proj(_dense_hidden_states(model))
 
 
 def _tiny_profile_registry(*, speculative_mode: str | None = None) -> PostTransformProfileRegistry:
@@ -540,6 +617,8 @@ def _documented_dense_constraints(profile: PostTransformProfile) -> str:
     assert constraints.rope_types == frozenset({"default"})
     qwen3_profile = profile.model_type == "qwen3"
     assert constraints.rope_fusion == frozenset({not qwen3_profile})
+    mistral_profile = profile.model_type == "mistral"
+    assert constraints.sliding_windows == (frozenset({"none"}) if mistral_profile else None)
     assert constraints.moe_backends is None
     assert constraints.moe_tp_sizes is None
     assert constraints.moe_ep_sizes is None
@@ -557,10 +636,11 @@ def _documented_dense_constraints(profile: PostTransformProfile) -> str:
     tp_sizes = _format_documented_values(constraints.tp_sizes)
     pp_cp_sizes = _format_documented_values(constraints.pp_sizes)
     rope_description = "default fused QK-norm/RoPE" if qwen3_profile else "default fused RoPE"
+    sliding_window_description = ", no sliding window" if mistral_profile else ""
     return (
         f"Single-node dense {dtypes}, unquantized weights and KV cache, "
-        f"{attention_backends} attention, {rope_description}, untied embeddings, "
-        f"TP={tp_sizes}, PP/CP={pp_cp_sizes}, no LoRA, sparse attention, "
+        f"{attention_backends} attention, {rope_description}{sliding_window_description}, "
+        f"untied embeddings, TP={tp_sizes}, PP/CP={pp_cp_sizes}, no LoRA, sparse attention, "
         "attention DP, speculative mode, or separately loaded draft model"
     )
 
@@ -841,9 +921,9 @@ def test_qwen2_dense_profile_qualifies_full_staged_lifecycle() -> None:
         ),
         state_probes=(("layout", _qwen2_layout_state),),
         output_probes=(
-            ("embedding-logits", _dense_qwen_embedding_logits),
-            ("fused-qkv", _dense_qwen_fused_qkv_output),
-            ("fused-gate-up", _dense_qwen_fused_gate_up_output),
+            ("embedding-logits", _dense_embedding_logits),
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("fused-gate-up", _dense_fused_gate_up_output),
         ),
     )
 
@@ -905,8 +985,8 @@ def test_qwen2_dense_profile_qualifies_tp2_rank_lifecycle(
         ),
         state_probes=(("layout", _qwen2_layout_state),),
         output_probes=(
-            ("fused-qkv", _dense_qwen_fused_qkv_output),
-            ("fused-gate-up", _dense_qwen_fused_gate_up_output),
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("fused-gate-up", _dense_fused_gate_up_output),
         ),
     )
 
@@ -940,9 +1020,9 @@ def test_qwen3_dense_profile_qualifies_full_staged_lifecycle(
         ),
         state_probes=(("layout", _qwen3_layout_state),),
         output_probes=(
-            ("embedding-logits", _dense_qwen_embedding_logits),
-            ("fused-qkv", _dense_qwen_fused_qkv_output),
-            ("fused-gate-up", _dense_qwen_fused_gate_up_output),
+            ("embedding-logits", _dense_embedding_logits),
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("fused-gate-up", _dense_fused_gate_up_output),
         ),
     )
 
@@ -994,8 +1074,8 @@ def test_qwen3_dense_profile_qualifies_tp2_rank_lifecycle(
         ),
         state_probes=(("layout", _qwen3_layout_state),),
         output_probes=(
-            ("fused-qkv", _dense_qwen_fused_qkv_output),
-            ("fused-gate-up", _dense_qwen_fused_gate_up_output),
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("fused-gate-up", _dense_fused_gate_up_output),
         ),
     )
 
@@ -1011,6 +1091,176 @@ def test_qwen3_dense_profile_qualifies_tp2_rank_lifecycle(
     )
     assert _qwen3_layout_state(producer)["qkv_weight_shape"] == (16, 16)
     assert _qwen3_layout_state(producer)["gate_up_weight_shape"] == (32, 16)
+
+
+def test_mistral_dense_profile_qualifies_full_staged_lifecycle() -> None:
+    case = PostTransformQualificationCase(
+        profile_id="mistral-for-causal-lm-bf16-target-v1",
+        model_factory=_tiny_mistral_model,
+        unqualified_model_factory=lambda: _tiny_mistral_model(
+            model_class=_UnqualifiedMistralForCausalLM
+        ),
+        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+            model,
+            speculative_mode=None,
+            loads_draft_weights=False,
+        ),
+        state_probes=(("layout", _mistral_layout_state),),
+        output_probes=(
+            ("embedding-logits", _dense_embedding_logits),
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("fused-gate-up", _dense_fused_gate_up_output),
+        ),
+    )
+
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    assert PostTransformRuntimeConfig.from_model_config(
+        producer.model_config, model=producer
+    ) == _bf16_dense_runtime_config(sliding_window="none")
+    assert _mistral_layout_state(producer) == {
+        "attention_type": modeling_mistral_mod.MistralAttention.__name__,
+        "qkv_weight_mode": WeightMode.FUSED_QKV_LINEAR,
+        "qkv_weight_shape": (32, 16),
+        "gate_up_weight_mode": WeightMode.FUSED_GATE_UP_LINEAR,
+        "gate_up_weight_shape": (64, 16),
+        "qkv_bias": False,
+        "rope_fusion": True,
+        "rotary_embedding_present": False,
+        "attention_window_size": None,
+        "tied_lm_head": False,
+    }
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_mistral_dense_profile_qualifies_tp2_rank_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+) -> None:
+    monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(distributed_mod, "AllReduce", _AllReduceStub)
+    case = PostTransformQualificationCase(
+        profile_id="mistral-for-causal-lm-bf16-target-v1",
+        model_factory=lambda: _tiny_mistral_model(tp_size=2, rank=rank),
+        unqualified_model_factory=lambda: _tiny_mistral_model(
+            model_class=_UnqualifiedMistralForCausalLM,
+            tp_size=2,
+            rank=rank,
+        ),
+        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+            model,
+            speculative_mode=None,
+            loads_draft_weights=False,
+        ),
+        state_probes=(("layout", _mistral_layout_state),),
+        output_probes=(
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("fused-gate-up", _dense_fused_gate_up_output),
+        ),
+    )
+
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    assert PostTransformRuntimeConfig.from_model_config(
+        producer.model_config, model=producer
+    ) == _bf16_dense_runtime_config(
+        tp_size=2,
+        moe_tp_size=2,
+        attention_tp_size=2,
+        sliding_window="none",
+    )
+    assert _mistral_layout_state(producer)["qkv_weight_shape"] == (16, 16)
+    assert _mistral_layout_state(producer)["gate_up_weight_shape"] == (32, 16)
+
+
+@pytest.mark.parametrize(
+    "sliding_window, layer_types, expected_window_sizes",
+    [
+        pytest.param(4096, None, (4096, 4096), id="uniform-window"),
+        pytest.param(
+            4096,
+            ("sliding_attention", "full_attention"),
+            (4096, None),
+            id="layer-types-window",
+        ),
+    ],
+)
+def test_mistral_dense_profile_rejects_sliding_window_models(
+    sliding_window: int,
+    layer_types: tuple[str, ...] | None,
+    expected_window_sizes: tuple[int | None, ...],
+) -> None:
+    model = _tiny_mistral_model(sliding_window=sliding_window, layer_types=layer_types)
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        model,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert (
+        tuple(layer.self_attn.attention_window_size for layer in model.model.layers)
+        == expected_window_sizes
+    )
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert decision.unsupported_runtime_dimensions == frozenset({"sliding_window"})
+
+
+def test_mistral_dense_profile_qualifies_full_attention_layer_types() -> None:
+    model = _tiny_mistral_model(
+        sliding_window=4096,
+        layer_types=("full_attention", "full_attention"),
+    )
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        model,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert all(layer.self_attn.attention_window_size is None for layer in model.model.layers)
+    assert decision.qualified
+    assert decision.profile is not None
+    assert decision.profile.profile_id == "mistral-for-causal-lm-bf16-target-v1"
+
+
+@pytest.mark.cpu_only
+def test_legacy_llama_file_mistral_root_is_not_qualified() -> None:
+    legacy_root = modeling_llama_mod.MistralForCausalLM
+    assert legacy_root is not modeling_mistral_mod.MistralForCausalLM
+    assert (
+        get_registered_model_class("MistralForCausalLM") is modeling_mistral_mod.MistralForCausalLM
+    )
+
+    decision = ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=legacy_root,
+        architecture="MistralForCausalLM",
+        model_type="mistral",
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_bf16_dense_runtime_config(sliding_window="none"),
+    )
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
+
+
+@pytest.mark.cpu_only
+def test_mistral_dense_profile_rejects_native_format_model_type() -> None:
+    decision = ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=modeling_mistral_mod.MistralForCausalLM,
+        architecture="MistralForCausalLM",
+        model_type="mistral_common",
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_bf16_dense_runtime_config(sliding_window="none"),
+    )
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.MODEL_TYPE_NOT_REGISTERED
 
 
 @pytest.mark.cpu_only
@@ -1077,13 +1327,14 @@ def test_qwen3_dense_profile_qualifies_tp2_rank_lifecycle(
     ],
 )
 @pytest.mark.parametrize(
-    "root_model_class, architecture, model_type, supported_rope_fusion",
+    "root_model_class, architecture, model_type, supported_rope_fusion, supported_sliding_window",
     [
         pytest.param(
             modeling_llama_mod.LlamaForCausalLM,
             "LlamaForCausalLM",
             "llama",
             True,
+            None,
             id="llama",
         ),
         pytest.param(
@@ -1091,6 +1342,7 @@ def test_qwen3_dense_profile_qualifies_tp2_rank_lifecycle(
             "Qwen2ForCausalLM",
             "qwen2",
             True,
+            None,
             id="qwen2",
         ),
         pytest.param(
@@ -1098,7 +1350,16 @@ def test_qwen3_dense_profile_qualifies_tp2_rank_lifecycle(
             "Qwen3ForCausalLM",
             "qwen3",
             False,
+            None,
             id="qwen3",
+        ),
+        pytest.param(
+            modeling_mistral_mod.MistralForCausalLM,
+            "MistralForCausalLM",
+            "mistral",
+            True,
+            "none",
+            id="mistral",
         ),
     ],
 )
@@ -1109,6 +1370,7 @@ def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
     architecture: str,
     model_type: str,
     supported_rope_fusion: bool,
+    supported_sliding_window: str | None,
 ) -> None:
     decision = ModelLoader._post_transform_profile_registry().qualify(
         root_model_class=root_model_class,
@@ -1119,6 +1381,7 @@ def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(
             rope_fusion=supported_rope_fusion,
+            sliding_window=supported_sliding_window,
             **overrides,
         ),
     )
@@ -1130,36 +1393,56 @@ def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "root_model_class, architecture, model_type, unsupported_rope_fusion",
+    "root_model_class, architecture, model_type, realized_overrides, expected_dimension",
     [
         pytest.param(
             modeling_llama_mod.LlamaForCausalLM,
             "LlamaForCausalLM",
             "llama",
-            False,
-            id="llama",
+            {"rope_fusion": False},
+            "rope_fusion",
+            id="llama-unfused-rope",
         ),
         pytest.param(
             modeling_qwen_mod.Qwen2ForCausalLM,
             "Qwen2ForCausalLM",
             "qwen2",
-            False,
-            id="qwen2",
+            {"rope_fusion": False},
+            "rope_fusion",
+            id="qwen2-unfused-rope",
         ),
         pytest.param(
             modeling_qwen3_mod.Qwen3ForCausalLM,
             "Qwen3ForCausalLM",
             "qwen3",
-            True,
-            id="qwen3",
+            {"rope_fusion": True},
+            "rope_fusion",
+            id="qwen3-fused-rope",
+        ),
+        pytest.param(
+            modeling_mistral_mod.MistralForCausalLM,
+            "MistralForCausalLM",
+            "mistral",
+            {"rope_fusion": False, "sliding_window": "none"},
+            "rope_fusion",
+            id="mistral-unfused-rope",
+        ),
+        pytest.param(
+            modeling_mistral_mod.MistralForCausalLM,
+            "MistralForCausalLM",
+            "mistral",
+            {"rope_fusion": True, "sliding_window": "uniform"},
+            "sliding_window",
+            id="mistral-sliding-window",
         ),
     ],
 )
-def test_bf16_dense_profiles_reject_wrong_realized_rope_fusion(
+def test_bf16_dense_profiles_reject_wrong_realized_dimension(
     root_model_class: type[nn.Module],
     architecture: str,
     model_type: str,
-    unsupported_rope_fusion: bool,
+    realized_overrides: dict[str, object],
+    expected_dimension: str,
 ) -> None:
     decision = ModelLoader._post_transform_profile_registry().qualify(
         root_model_class=root_model_class,
@@ -1168,14 +1451,12 @@ def test_bf16_dense_profiles_reject_wrong_realized_rope_fusion(
         speculative_mode=None,
         protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-        runtime_config=_bf16_dense_runtime_config(
-            rope_fusion=unsupported_rope_fusion,
-        ),
+        runtime_config=_bf16_dense_runtime_config(**realized_overrides),
     )
 
     assert not decision.qualified
     assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
-    assert decision.unsupported_runtime_dimensions == frozenset({"rope_fusion"})
+    assert decision.unsupported_runtime_dimensions == frozenset({expected_dimension})
 
 
 @pytest.mark.cpu_only
@@ -1195,13 +1476,14 @@ def test_bf16_dense_profiles_reject_wrong_realized_rope_fusion(
     ],
 )
 @pytest.mark.parametrize(
-    "root_model_class, architecture, model_type, supported_rope_fusion",
+    "root_model_class, architecture, model_type, supported_rope_fusion, supported_sliding_window",
     [
         pytest.param(
             modeling_llama_mod.LlamaForCausalLM,
             "LlamaForCausalLM",
             "llama",
             True,
+            None,
             id="llama",
         ),
         pytest.param(
@@ -1209,6 +1491,7 @@ def test_bf16_dense_profiles_reject_wrong_realized_rope_fusion(
             "Qwen2ForCausalLM",
             "qwen2",
             True,
+            None,
             id="qwen2",
         ),
         pytest.param(
@@ -1216,7 +1499,16 @@ def test_bf16_dense_profiles_reject_wrong_realized_rope_fusion(
             "Qwen3ForCausalLM",
             "qwen3",
             False,
+            None,
             id="qwen3",
+        ),
+        pytest.param(
+            modeling_mistral_mod.MistralForCausalLM,
+            "MistralForCausalLM",
+            "mistral",
+            True,
+            "none",
+            id="mistral",
         ),
     ],
 )
@@ -1226,6 +1518,7 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
     architecture: str,
     model_type: str,
     supported_rope_fusion: bool,
+    supported_sliding_window: str | None,
 ) -> None:
     decision = ModelLoader._post_transform_profile_registry().qualify(
         root_model_class=root_model_class,
@@ -1236,6 +1529,7 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(
             rope_fusion=supported_rope_fusion,
+            sliding_window=supported_sliding_window,
             **overrides,
         ),
     )

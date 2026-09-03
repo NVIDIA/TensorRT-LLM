@@ -8604,10 +8604,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      periodic_snapshot_interval, attention_dp,
-                                     use_mtp, monkeypatch):
-        # WAR https://nvbugs/6525008: FlashInfer <=0.6.16 races on shared JIT
-        # workspaces across ranks; remove once fixed upstream.
-        monkeypatch.setenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1")
+                                     use_mtp):
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
             mtp_eagle_one_model=True,
