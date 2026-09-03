@@ -15,12 +15,12 @@
 # yapf: disable
 import asyncio
 import json
-import os
 import traceback
 from abc import ABC, abstractmethod
 from typing import Any, AsyncGenerator, Awaitable, Callable, List, Optional, Tuple, Type
 
 import aiohttp
+import msgspec
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
@@ -52,21 +52,10 @@ from tensorrt_llm.serve.router import Router
 
 # yapf: enable
 
-# msgspec msgpack is an opt-in transport for the orchestrator->worker request
-# body (alternative to the JSON path). Enable with TRTLLM_SERVE_ENABLE_MSGSPEC=1;
-# the orchestrator encodes the forwarded body as msgpack and flags it with the
-# X-TRTLLM-Msgpack header (Content-Type stays application/json so FastAPI still
-# routes it through Request.json()). Fails loudly at import if msgspec is missing.
-_MSGSPEC_ENABLED = os.getenv("TRTLLM_SERVE_ENABLE_MSGSPEC", "0") == "1"
-if _MSGSPEC_ENABLED:
-    try:
-        import msgspec
-    except ImportError as exc:
-        raise ImportError(
-            "TRTLLM_SERVE_ENABLE_MSGSPEC=1 requires the msgspec package "
-            "(listed in requirements.txt)."
-        ) from exc
-    _msgpack_encoder = msgspec.msgpack.Encoder()
+# The forwarded orchestrator->worker request body is encoded as msgspec
+# msgpack and flagged with the X-TRTLLM-Msgpack header.
+_msgpack_encoder = msgspec.msgpack.Encoder()
+MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
 
 
 def _metrics_phase(role: ServerRole) -> str:
@@ -242,17 +231,10 @@ class OpenAIHttpClient(OpenAIClient):
                     if hooks:
                         hooks.on_disagg_request_id(dp.disagg_request_id)
             # Serialize once on the orchestrator's single event-loop thread.
-            if _MSGSPEC_ENABLED:
-                # msgspec msgpack: encode the request dict to msgpack bytes. Keep
-                # Content-Type application/json so FastAPI still routes the body
-                # through Request.json() (it only does that for json/+json content
-                # subtypes); the X-TRTLLM-Msgpack header tells the worker's
-                # Request.json() to decode with msgspec instead of stdlib json.
-                body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
-                headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
-            else:
-                body = request.model_dump_json(exclude_unset=True)
-                headers = {"Content-Type": "application/json"}
+            # Content-Type stays application/json so FastAPI still routes the
+            # body through Request.json(); the header picks the decoder.
+            body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+            headers = dict(MSGPACK_HEADERS)
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"
             headers.update(self._get_request_headers(request))

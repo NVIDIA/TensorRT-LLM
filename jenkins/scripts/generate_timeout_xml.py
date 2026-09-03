@@ -71,8 +71,8 @@ def timeout_data_sort_key(path):
     return (1, 0, 0, path)
 
 
-def load_timeout_map(paths, expected_nodeids=None):
-    """Load NDJSON files and return a ``{nodeid: snippet}`` mapping.
+def load_timeout_data(paths, expected_nodeids=None):
+    """Load timeout snippets and configured durations from NDJSON files.
 
     Args:
         paths: Paths to rank-specific or per-invocation timeout-data files.
@@ -80,17 +80,16 @@ def load_timeout_map(paths, expected_nodeids=None):
             other tests are ignored before their snippets are retained.
 
     Returns:
-        Timeout records keyed by nodeid. For rank-specific files, the first
-        record by numeric step and rank order wins deterministically. For a
-        non-rank local file, later records overwrite earlier ones so the most
-        recent rerun supplies the displayed snippet. Unreadable files and
-        corrupt lines are reported and skipped.
+        A tuple of ``({nodeid: snippet}, {nodeid: timeout})``. For rank-specific
+        files, the first timeout record by numeric step and rank order wins.
+        For a non-rank local file, later records overwrite earlier ones.
     """
     if not paths:
-        return {}
+        return {}, {}
     if isinstance(paths, (str, os.PathLike)):
         paths = [paths]
     timeout_map = {}
+    test_timeouts = {}
     for path in sorted(map(os.fspath, paths), key=timeout_data_sort_key):
         is_rank_file = _RANK_TIMEOUT_DATA_FILE_RE.search(os.path.basename(path)) is not None
         try:
@@ -101,74 +100,26 @@ def load_timeout_map(paths, expected_nodeids=None):
                         continue
                     try:
                         rec = json.loads(raw)
-                        if isinstance(rec, dict) and rec.get("type") in {
-                            "start",
-                            "end",
-                            "timeout_config",
-                        }:
-                            continue
-                        if (
-                            not isinstance(rec, dict)
-                            or not isinstance(rec.get("nodeid"), str)
-                            or not isinstance(rec.get("snippet"), str)
-                        ):
-                            raise ValueError(
-                                f'expected {{"nodeid": str, "snippet": str}}, '
-                                f"got {type(rec).__name__} with keys "
-                                f"{list(rec.keys()) if isinstance(rec, dict) else 'N/A'}"
-                            )
-                        nodeid = rec["nodeid"]
-                        if expected_nodeids is not None and nodeid not in expected_nodeids:
-                            continue
-                        if is_rank_file:
-                            timeout_map.setdefault(nodeid, rec["snippet"])
-                        else:
-                            timeout_map[nodeid] = rec["snippet"]
-                    except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                        print(
-                            f"WARNING: generate_timeout_xml: skipping corrupt line "
-                            f"{lineno} in {path}: {exc}",
-                            file=sys.stderr,
-                        )
-        except OSError as exc:
-            print(
-                f"WARNING: generate_timeout_xml: cannot read {path}: {exc}",
-                file=sys.stderr,
-            )
-    return timeout_map
-
-
-def load_test_timeouts(paths, expected_nodeids=None):
-    """Load the effective pytest timeout recorded for each test nodeid."""
-    if not paths:
-        return {}
-    if isinstance(paths, (str, os.PathLike)):
-        paths = [paths]
-
-    test_timeouts = {}
-    for path in sorted(map(os.fspath, paths)):
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                for lineno, raw in enumerate(f, 1):
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    try:
-                        record = json.loads(raw)
-                        if isinstance(record, dict) and (
-                            record.get("type") == "timeout" or "snippet" in record
-                        ):
-                            continue
-                        nodeid = record.get("nodeid") if isinstance(record, dict) else None
-                        timeout = record.get("timeout") if isinstance(record, dict) else None
+                        nodeid = rec.get("nodeid") if isinstance(rec, dict) else None
                         if not isinstance(nodeid, str):
                             raise ValueError("expected nodeid string")
-                        if timeout is not None and not isinstance(timeout, (int, float)):
-                            raise ValueError("expected timeout to be numeric or null")
-                        if timeout is not None and (
-                            expected_nodeids is None or nodeid in expected_nodeids
-                        ):
-                            test_timeouts.setdefault(nodeid, float(timeout))
+                        if expected_nodeids is not None and nodeid not in expected_nodeids:
+                            continue
+                        record_type = rec.get("type")
+                        if record_type == "timeout_config":
+                            timeout = rec.get("timeout")
+                            if timeout is not None and not isinstance(timeout, (int, float)):
+                                raise ValueError("expected timeout to be numeric or null")
+                            if timeout is not None:
+                                test_timeouts.setdefault(nodeid, float(timeout))
+                        elif record_type == "timeout" or "snippet" in rec:
+                            snippet = rec.get("snippet")
+                            if not isinstance(snippet, str):
+                                raise ValueError("expected snippet string")
+                            if is_rank_file:
+                                timeout_map.setdefault(nodeid, snippet)
+                            else:
+                                timeout_map[nodeid] = snippet
                     except (json.JSONDecodeError, ValueError) as exc:
                         print(
                             f"WARNING: generate_timeout_xml: skipping corrupt line "
@@ -180,7 +131,7 @@ def load_test_timeouts(paths, expected_nodeids=None):
                 f"WARNING: generate_timeout_xml: cannot read {path}: {exc}",
                 file=sys.stderr,
             )
-    return test_timeouts
+    return timeout_map, test_timeouts
 
 
 def test_duration(test, timeout_map, test_timeouts):
@@ -261,7 +212,7 @@ def generate_timeout_xml(
             ``unfinished_test.txt``, including the stage prefix).
         outputFilePath: Path where the XML report will be written.
         timeout_map: Optional mapping of ``{nodeid: snippet}`` produced by
-            ``load_timeout_map()``.  A nodeid present in this map is classified
+            ``load_timeout_data()``.  A nodeid present in this map is classified
             as ``pytest_timeout`` and its snippet is embedded in
             ``<system-out>``. All other nodeids are classified as
             ``terminated_unexpectedly``. When *None* or empty every test falls
@@ -369,8 +320,7 @@ def main():
         print(f"No timeout tests found for {stageName}, skipping timeout XML generation")
         return
 
-    timeout_map = load_timeout_map(args.timeout_data_file, set(timeoutTests))
-    test_timeouts = load_test_timeouts(args.timeout_data_file, set(timeoutTests))
+    timeout_map, test_timeouts = load_timeout_data(args.timeout_data_file, set(timeoutTests))
     classified_count = sum(test in timeout_map for test in timeoutTests)
     print(
         f"Timeout classification summary for {stageName}: {len(timeoutTests)} unfinished, "

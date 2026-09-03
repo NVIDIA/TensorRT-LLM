@@ -22,10 +22,12 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...utils import ActivationType, Fp4QuantizedTensor
+from .activation import MoEActivationSupport
 from .fused_moe_cutlass import CutlassFusedMoE
 from .impl_contract import (
     MoEDeployment,
     MoEEligibility,
+    MoEInputRequirement,
     MoEProblem,
     MoERejectReason,
     MoERunContext,
@@ -58,32 +60,49 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
 
     Large prefill chunks use CUTLASS; decode uses FlashInfer's b12x kernel.
 
-    Inherits ``CutlassFusedMoE`` rather than only the shared blocks -- the same
-    shortcut its siblings (CuteDsl, DeepGemm, Marlin) take, but here it is a
-    real dependency: ``_route_to_cutlass`` sends every
-    NVFP4 prefill chunk through ``CutlassFusedMoE.quantize_input`` /
+    The only subclass of ``CutlassFusedMoE``, and the only backend for which
+    that is a real dependency rather than a shortcut: ``_route_to_cutlass``
+    sends every NVFP4 prefill chunk through ``CutlassFusedMoE.quantize_input`` /
     ``CutlassFusedMoE.run_moe``, which read the whole Cutlass execution state
     (chunking stream and events, ``use_fused_finalize``, the tuner flags, the
     LoRA slot helpers, ``_tuner_shapes``, ``_run_moe_w4a16_nvfp4``).
 
-    Two ``CuteDslFusedMoE.__init__`` side effects are deliberately dropped, not
-    restated: the ``AuxStreamType.MoeOutputMemset`` / ``EventType`` entries, and
-    the ``swiglu_limit_scalar or inf`` fallback. Both are read only by
-    ``CuteDslFusedMoE.run_moe_nvfp4*``, which the ``run_moe`` override below
-    never reaches. Restate them before routing any CuteDSL path through this
-    class -- ``event_dict`` can now be None and ``swiglu_limit_scalar`` unset.
+    ``CuteDslFusedMoE.run_moe_nvfp4*`` is never reached from here, so the
+    ``AuxStreamType.MoeOutputMemset`` / ``EventType`` entries it needs are not
+    set up and ``event_dict`` can be None. Restate them, and
+    ``limit_when_absent`` below, before routing any CuteDSL path through this
+    class.
     """
 
-    # Restated rather than inherited: the LoRA gate this replaces compared the
-    # exact class and answered False here, while the DWDP gate used isinstance
-    # and answered True through CuteDslFusedMoE.
-    capabilities = MoEStaticCapability(supports_moe_lora=False, supports_dwdp=True)
+    # Inherited wholesale from CutlassFusedMoE, so every field is restated.
+    # No code path here reads ``w3_w1_bias`` / ``w2_bias`` or fuses LoRA, and
+    # ``supports_eplb`` stays False -- which is why ``can_implement`` has to
+    # decline ``d.eplb_enabled`` explicitly, since the inherited
+    # ``_supports_load_balancer()`` answers True.
+    # ``supports_apply_router_weight_on_input`` is False where the parent says
+    # True: only the NVFP4 prefill chunk reaches ``CutlassFusedMoE.run_moe``,
+    # while the decode path hands ``token_final_scales`` straight to the
+    # flashinfer b12x wrapper, which has no declared behaviour for the ``None``
+    # the scheduler's fold leaves there.
+    capabilities = MoEStaticCapability(
+        supports_moe_lora=False,
+        supports_dwdp=True,
+        supports_expert_bias=False,
+        supports_apply_router_weight_on_input=False,
+    )
 
-    # This and ``supports_moe_output_in_alltoall_workspace`` came through
-    # ``CuteDslFusedMoE`` before the reparent and Cutlass answers differently on
-    # both, so both are restated to keep the declared values unchanged. Read by
-    # ``ConfigurableMoE._reject_non_divisible_ep_backend()``; moot for this class
-    # in practice because ``can_implement`` rejects ``ep_size != 1`` outright.
+    # Same value the parent declares, pinned so a change there cannot silently
+    # retarget this backend.
+    input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
+
+    # The kinds ``_ACTIVATION_MAP`` above gates on. The b12x decode kernel takes
+    # no activation constants, so none are declared.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.Relu2})
+    )
+
+    # Read by ``ConfigurableMoE._reject_non_divisible_ep_backend()``; moot in
+    # practice because ``can_implement`` rejects ``ep_size != 1`` outright.
     _supports_non_divisible_ep: bool = True
 
     def supports_moe_output_in_alltoall_workspace(self) -> bool:
@@ -138,6 +157,15 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
             return _reject(
                 MoERejectReason.DEP_MISSING,
                 "CuteDslB12xFusedMoE requires the flashinfer package",
+            )
+        # The only backend the construction-time allow-list turned down that
+        # never said so during selection, so an EPLB run resolved to b12x and
+        # then died in the factory. Declining here degrades with the usual
+        # warning instead, matching VanillaMoE / TritonFusedMoE / MarlinFusedMoE.
+        if d.eplb_enabled:
+            return _reject(
+                MoERejectReason.EPLB_UNSUPPORTED,
+                "CuteDslB12xFusedMoE does not support the MoE load balancer",
             )
         # No expert-parallel dispatch/combine kernel: EP must stay at 1.
         if d.ep_size != 1:

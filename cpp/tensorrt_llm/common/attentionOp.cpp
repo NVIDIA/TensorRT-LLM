@@ -1215,6 +1215,7 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = stream;
         tllmRunnerParams.mSfStartTokenIdx = generation_params.start_token_idx_sf;
+        tllmRunnerParams.mSkipCorrThreshold = mSkipCorrectionThreshold;
 
         // Scales for quantization
         if (mFP8GenerationMLA)
@@ -2107,6 +2108,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         // Skip-softmax attention parameters
         fmhaParams.skipSoftmaxThresholdScaleFactor = mSkipSoftmaxThresholdScaleFactorPrefill;
+        fmhaParams.skipCorrectionThreshold = mSkipCorrectionThreshold;
 #ifdef SKIP_SOFTMAX_STAT
         fmhaParams.skipSoftmaxTotalBlocks = mSkipSoftmaxTotalBlocks;
         fmhaParams.skipSoftmaxSkippedBlocks = mSkipSoftmaxSkippedBlocks;

@@ -66,7 +66,8 @@ source "$llmSrcNode/jenkins/scripts/slurm_env_setup.sh"
 slurm_setup_runtime_env
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
-env | sort
+# Redact secret values here so they do not leak into the job log
+env | sort | sed -E 's/^([^=]*(TOKEN|SECRET|PASSWORD|CREDENTIALS)[^=]*)=.*/\1=<redacted>/'
 
 echo "Full Command: $pytestCommand"
 
@@ -167,24 +168,7 @@ slurm_wait_all_ranks
 PYTEST_LOG="/tmp/pytest_output_job${saved_slurm_job_id}_step${saved_slurm_step_id}_rank${SLURM_PROCID}.log"
 TIMEOUT_DATA_RANK="${jobWorkspace}/timeout_data_step${saved_slurm_step_id}_rank${SLURM_PROCID}.jsonl"
 UNFINISHED_FILE="${jobWorkspace}/unfinished_test.txt"
-CLASSIFY_SCRIPT="${llmSrcNode}/jenkins/scripts/classify_timeout.py"
-
-# The normal post-processing path removes this node-local log explicitly.
-# Keep an EXIT trap as well so normal early exits do not leave it behind.
-cleanup_pytest_log() {
-    rm -f "${PYTEST_LOG}" || true
-}
-
-cleanup_and_exit() {
-    cleanup_pytest_log
-    trap - EXIT
-    exit "$1"
-}
-
-trap cleanup_pytest_log EXIT
-trap 'cleanup_and_exit 129' HUP
-trap 'cleanup_and_exit 130' INT
-trap 'cleanup_and_exit 143' TERM
+PYTEST_WRAPPER="${llmSrcNode}/jenkins/scripts/run_pytest_with_log.sh"
 
 # Turn off "exit on error" so the following lines always run
 set +e
@@ -193,31 +177,17 @@ pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
-# Every rank captures its own stdout+stderr via tee for post-run timeout
-# classification.
-export TRTLLM_TIMEOUT_DATA_FILE="${TIMEOUT_DATA_RANK}"
-if eval "$pytestCommand" 2>&1 | tee "${PYTEST_LOG}"; then
-    pytest_exit_code=0
-else
-    pytest_exit_code=${PIPESTATUS[0]}
-fi
+# The shared wrapper preserves the pytest status while each rank captures and
+# classifies its own output.
+bash "${PYTEST_WRAPPER}" \
+    "${PYTEST_LOG}" "${TIMEOUT_DATA_RANK}" "${UNFINISHED_FILE}" \
+    -- bash -c "${pytestCommand}"
+pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
     python3 "$llmSrcNode/tests/test_common/s3_output.py" \
         --drain-spool "$jobWorkspace" || true
 fi
-
-# Every rank scans its own captured log for pytest-timeout banners and
-# writes records to its own per-rank JSONL. All steps are best-effort: a
-# classify failure must not change pytest_exit_code.
-python3 "${CLASSIFY_SCRIPT}" \
-    --log        "${PYTEST_LOG}" \
-    --out        "${TIMEOUT_DATA_RANK}" \
-    --unfinished "${UNFINISHED_FILE}" || \
-    echo "WARNING: slurm_run.sh: classify_timeout.py failed for rank" \
-         "${SLURM_PROCID}; timed-out tests in this invocation may be" \
-         "reported as 'terminated_unexpectedly' instead of 'pytest_timeout'." >&2
-cleanup_pytest_log
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved

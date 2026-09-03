@@ -19,34 +19,25 @@
 #
 # Usage:
 #   bash run_pytest_with_log.sh \
-#       <cmd-script>       # bash script containing "cd ... && pytest ..."
-#       <out-dir>          # directory for per-invocation pytest output logs
-#       <timeout-data>     # path to timeout_data.jsonl (appended, dir auto-created)
-#       <invocation-idx>   # integer index used to name the temporary log
-#       <unfinished>       # path to unfinished_test.txt
+#       <log> <timeout-data> <unfinished> -- <command> [args...]
 #
 # Exit code: always equals pytest's own exit code regardless of whether
 # post-processing steps succeed.
 
 set -o pipefail  # propagate pipeline failures; we override with PIPESTATUS below
 
-if [ "$#" -ne 5 ]; then
-    echo "ERROR: run_pytest_with_log.sh requires exactly 5 arguments." >&2
-    echo "Usage: bash run_pytest_with_log.sh <cmd-script> <out-dir> <timeout-data> <invocation-idx> <unfinished>" >&2
+if [ "$#" -lt 5 ] || [ "$4" != "--" ]; then
+    echo "Usage: bash run_pytest_with_log.sh <log> <timeout-data> <unfinished> -- <command> [args...]" >&2
     exit 1
 fi
 
-CMD_SCRIPT="$1"
-OUT_DIR="$2"
-TIMEOUT_DATA="$3"
-INVOCATION_IDX="$4"
-UNFINISHED="$5"
-
-LOG="${OUT_DIR}/pytest_output_inv${INVOCATION_IDX}.log"
+LOG="$1"
+TIMEOUT_DATA="$2"
+UNFINISHED="$3"
+shift 4
 CLASSIFY="$(dirname "$0")/classify_timeout.py"
 
-# Ensure the output directory exists before writing the log.
-mkdir -p "${OUT_DIR}"
+mkdir -p "$(dirname "${LOG}")"
 
 # The normal post-processing path removes this log explicitly.  Keep an EXIT
 # trap as well so an early shell exit does not leave a potentially large log
@@ -66,18 +57,14 @@ trap 'cleanup_and_exit 129' HUP
 trap 'cleanup_and_exit 130' INT
 trap 'cleanup_and_exit 143' TERM
 
-# ---------------------------------------------------------------------------
 # Run pytest, capturing stdout+stderr to LOG while still streaming to the
 # Jenkins console.  tee's exit code is discarded; we read pytest's via
 # PIPESTATUS immediately after the pipeline completes.
-# ---------------------------------------------------------------------------
-TRTLLM_TIMEOUT_DATA_FILE="${TIMEOUT_DATA}" bash "${CMD_SCRIPT}" 2>&1 | tee "${LOG}"
+TRTLLM_TIMEOUT_DATA_FILE="${TIMEOUT_DATA}" "$@" 2>&1 | tee "${LOG}"
 PYTEST_RC=${PIPESTATUS[0]}
 
-# ---------------------------------------------------------------------------
 # Post-processing — all steps are best-effort.  A failure here must not
 # change PYTEST_RC or prevent the caller from seeing pytest's exit code.
-# ---------------------------------------------------------------------------
 python3 "${CLASSIFY}" \
     --log        "${LOG}" \
     --out        "${TIMEOUT_DATA}" \
