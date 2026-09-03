@@ -14,29 +14,20 @@
 # limitations under the License.
 
 # Give the test pod a short, resolvable hostname so that a singleton
-# MPI_Comm_spawn works under the Open MPI 5 that ships in the DLFW 26.08 base
-# image.
+# MPI_Comm_spawn works under the Open MPI 5 of the DLFW 26.08 base image.
 #
-# In the Kubernetes test pods the hostname is the pod name: 63 characters,
-# exactly the DNS label limit and one short of HOST_NAME_MAX. Under that name a
-# singleton MPI_Comm_spawn -- which is what MPIPoolSession does for every
-# worker -- fails after 0.1s with MPI_ERR_UNKNOWN: the process forks a prte DVM,
-# connects to it, sends the PMIx CONNECT ACK, and the DVM closes the socket.
-# mpi4py.futures swallows that exception in its manager thread, so the future
-# never resolves and the worker identity barrier only gives up 300s later with
-# 0/N workers. The same image on a bare-metal node, where the hostname is short,
-# spawns in 1.3s.
+# The Kubernetes hostname is the pod name, 63 characters. Under it a singleton
+# spawn -- what MpiPoolSession does per worker -- fails with MPI_ERR_UNKNOWN as
+# the prte DVM drops the connection. mpi4py.futures swallows that in its manager
+# thread, so the worker identity barrier only gives up 300s later with 0/N.
 #
-# Renaming the node and keeping the new name resolvable is enough. Note that
-# only changes to system state survive this script: it runs in its own shell, so
-# exporting MPI variables here would have no effect on later Jenkins steps (put
-# those in docker/common/install_base.sh instead). For the same reason the
-# original name is handed to later steps through a file rather than a variable --
-# getHostNodeName() in jenkins/L0_Test.groovy reads it so that its fallback
-# cannot degenerate into the shared short name.
+# Only system state survives this script: it runs in its own shell, so MPI
+# variables belong in docker/common/install_base.sh instead. The replaced name
+# likewise reaches later steps through a file, which getHostNodeName() in
+# jenkins/L0_Test.groovy reads so its fallback stays unique per pod.
 #
-# Single-node pods only. On a multi-node Slurm allocation every node would
-# answer to the same name, which would break real distributed runs.
+# Single-node pods only: on a multi-node Slurm allocation every node would
+# answer to the same name.
 #
 # Optional env var:
 #   MPI_POD_HOSTNAME  name to use instead of the default mpi-node0
