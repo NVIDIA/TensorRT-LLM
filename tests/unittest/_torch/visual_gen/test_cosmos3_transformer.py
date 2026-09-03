@@ -31,7 +31,9 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
     PRETRAINED_CONFIG_COMPAT_DEFAULTS,
+    Cosmos3CrossAttention,
     Cosmos3VFMTransformer,
+    _normalize_control_weights,
     apply_pretrained_config_compat_defaults,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
@@ -210,6 +212,7 @@ class TestCosmos3Unit:
         assert hasattr(model, "time_embedder")
         linear_names = [n for n, m in model.named_modules() if isinstance(m, Linear)]
         assert any("to_q" in n or "qkv_proj" in n for n in linear_names)
+        assert all(layer.cross_attention.multi_control_attn is None for layer in model.gen_layers)
 
     @pytest.mark.high_cuda_memory
     def test_sanity_forward(self, cosmos3_model_config):
@@ -227,6 +230,47 @@ class TestCosmos3Unit:
                 text_mask=text_mask,
                 video_shape=video_shape,
             )
+        _assert_finite_output(out.video, hs.shape)
+
+    @pytest.mark.high_cuda_memory
+    def test_sanity_forward_multi_control(self, cosmos3_model_config: DiffusionModelConfig) -> None:
+        cfg = cosmos3_model_config.pretrained_config
+        model = _build_random_weight_model(cosmos3_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        control_latents = [torch.zeros_like(hs), torch.full_like(hs, 0.05)]
+        layer_sequence_lengths = []
+        hooks = [
+            layer.register_forward_pre_hook(
+                lambda _module, args: layer_sequence_lengths.append(args[0].shape[1])
+            )
+            for layer in model.gen_layers
+        ]
+        try:
+            with torch.inference_mode():
+                out = model(
+                    hidden_states=hs,
+                    timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                    raw_timestep=ts,
+                    text_ids=text_ids,
+                    text_mask=text_mask,
+                    video_shape=video_shape,
+                    control_latents=control_latents,
+                )
+        finally:
+            for hook in hooks:
+                hook.remove()
+
+        target_tokens = (
+            video_shape[0]
+            * ((video_shape[1] + model.latent_patch_size - 1) // model.latent_patch_size)
+            * ((video_shape[2] + model.latent_patch_size - 1) // model.latent_patch_size)
+        )
+        assert layer_sequence_lengths == [3 * target_tokens] * len(model.gen_layers)
+        assert all(
+            layer.cross_attention.multi_control_attn is not None for layer in model.gen_layers
+        )
         _assert_finite_output(out.video, hs.shape)
 
     @pytest.mark.high_cuda_memory
@@ -758,6 +802,226 @@ class TestCosmos3TransformerCheckpoint:
 
 
 # --- CPU-only coverage: checkpoint config schema compatibility ---
+
+
+_AttentionCall = dict[str, torch.Tensor]
+
+
+class _RecordingMultiControlBackend:
+    def __init__(self, control_ids: tuple[int, ...] = (1, 2)) -> None:
+        self.calls: list[_AttentionCall] = []
+        self.control_ids = iter(control_ids)
+
+    def forward(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        **_kwargs: object,
+    ) -> torch.Tensor:
+        self.calls.append({"q": q.clone(), "k": k.clone(), "v": v.clone()})
+        control_id = next(self.control_ids)
+        result = torch.empty_like(q)
+        result[:, :, :1] = 100 + control_id
+        result[:, :, 1:] = 10 if control_id == 1 else 30
+        return result
+
+
+class _FailingMultiControlBackend:
+    def forward(self, **_kwargs: object) -> None:
+        raise AssertionError("single-control fast path used multi-control attention")
+
+
+def _mock_cross_attention(
+    backend: _RecordingMultiControlBackend | _FailingMultiControlBackend,
+    *,
+    num_attention_heads: int = 2,
+    head_dim: int = 2,
+) -> Cosmos3CrossAttention:
+    attention = Cosmos3CrossAttention.__new__(Cosmos3CrossAttention)
+    torch.nn.Module.__init__(attention)
+    attention.local_num_attention_heads = num_attention_heads
+    attention.local_num_key_value_heads = num_attention_heads
+    attention.head_dim = head_dim
+    attention.multi_control_attn = backend
+    return attention
+
+
+class TestCosmos3MultiControlAttention:
+    def test_ulysses_rank_segments_preserve_global_ranges(self) -> None:
+        # Post-A2A KV is rank-packed as [text_0, gen_0, text_1, gen_1].
+        packed = torch.arange(10.0).reshape(1, 10, 1, 1)
+        segments = Cosmos3CrossAttention._ulysses_rank_segments(
+            packed,
+            batch_idx=0,
+            global_start=2,
+            global_end=5,
+            local_sequence_length=3,
+            rank_stride=5,
+            rank_offset=2,
+            world_size=2,
+        )
+        torch.testing.assert_close(
+            torch.cat(segments, dim=1).flatten(), torch.tensor([4.0, 7.0, 8.0])
+        )
+
+    def _run_two_controls(self) -> tuple[torch.Tensor, list[_AttentionCall]]:
+        backend = _RecordingMultiControlBackend()
+        attention = _mock_cross_attention(backend)
+        q = torch.arange(1.0, 13.0).reshape(1, 3, 2, 2)
+        k = q + 20
+        v = q + 40
+        k_und = torch.arange(101.0, 105.0).reshape(1, 1, 2, 2)
+        v_und = torch.arange(201.0, 205.0).reshape(1, 1, 2, 2)
+        output = attention._forward_multi_control(
+            q,
+            k,
+            v,
+            k_und,
+            v_und,
+            control_token_sizes=(1, 1),
+            control_weights=(0.5, 0.5),
+            timestep=None,
+            real_text_lens=[1],
+        )
+        return output, backend.calls
+
+    def test_uniform_target_equation(self) -> None:
+        output, calls = self._run_two_controls()
+        assert len(calls) == 2
+        expected = torch.tensor([[[101.0] * 4, [102.0] * 4, [20.0] * 4]])
+        torch.testing.assert_close(output, expected)
+
+    def test_control_attention_isolation(self) -> None:
+        _, calls = self._run_two_controls()
+        expected_q = [
+            torch.tensor([[[[1.0, 2.0], [9.0, 10.0]], [[3.0, 4.0], [11.0, 12.0]]]]),
+            torch.tensor([[[[5.0, 6.0], [9.0, 10.0]], [[7.0, 8.0], [11.0, 12.0]]]]),
+        ]
+        expected_k = [
+            torch.tensor(
+                [
+                    [
+                        [[101.0, 102.0], [21.0, 22.0], [29.0, 30.0]],
+                        [[103.0, 104.0], [23.0, 24.0], [31.0, 32.0]],
+                    ]
+                ]
+            ),
+            torch.tensor(
+                [
+                    [
+                        [[101.0, 102.0], [25.0, 26.0], [29.0, 30.0]],
+                        [[103.0, 104.0], [27.0, 28.0], [31.0, 32.0]],
+                    ]
+                ]
+            ),
+        ]
+        expected_v = [
+            torch.tensor(
+                [
+                    [
+                        [[201.0, 202.0], [41.0, 42.0], [49.0, 50.0]],
+                        [[203.0, 204.0], [43.0, 44.0], [51.0, 52.0]],
+                    ]
+                ]
+            ),
+            torch.tensor(
+                [
+                    [
+                        [[201.0, 202.0], [45.0, 46.0], [49.0, 50.0]],
+                        [[203.0, 204.0], [47.0, 48.0], [51.0, 52.0]],
+                    ]
+                ]
+            ),
+        ]
+        for call, query, key, value in zip(calls, expected_q, expected_k, expected_v, strict=True):
+            torch.testing.assert_close(call["q"], query)
+            torch.testing.assert_close(call["k"], key)
+            torch.testing.assert_close(call["v"], value)
+
+    def test_per_batch_text_lengths(self) -> None:
+        backend = _RecordingMultiControlBackend(control_ids=(1, 1, 2, 2))
+        attention = _mock_cross_attention(backend)
+        q = torch.arange(1.0, 25.0).reshape(2, 3, 2, 2)
+        k = q + 30
+        v = q + 60
+        k_und = torch.arange(101.0, 117.0).reshape(2, 2, 2, 2)
+        v_und = torch.arange(201.0, 217.0).reshape(2, 2, 2, 2)
+
+        output = attention._forward_multi_control(
+            q,
+            k,
+            v,
+            k_und,
+            v_und,
+            control_token_sizes=(1, 1),
+            control_weights=(0.5, 0.5),
+            timestep=None,
+            real_text_lens=[1, 2],
+        )
+
+        assert [call["k"].shape[2] for call in backend.calls] == [3, 4, 3, 4]
+        torch.testing.assert_close(backend.calls[0]["k"][:, :, 0], k_und[0:1, 0])
+        torch.testing.assert_close(backend.calls[1]["k"][:, :, :2], k_und[1:2].transpose(1, 2))
+        expected = torch.tensor([[[101.0] * 4, [102.0] * 4, [20.0] * 4]] * 2)
+        torch.testing.assert_close(output, expected)
+
+    def test_control_weight_defaults_and_normalization(self) -> None:
+        assert _normalize_control_weights(2, None) == (0.5, 0.5)
+        assert _normalize_control_weights(2, [1.0, 3.0]) == (0.25, 0.75)
+
+    @pytest.mark.parametrize(
+        ("weights", "match"),
+        [
+            ([1.0], "length must match"),
+            ([-1.0, 2.0], "finite and non-negative"),
+            ([float("nan"), 1.0], "finite and non-negative"),
+            ([float("inf"), 1.0], "finite and non-negative"),
+            ([0.0, 0.0], "positive sum"),
+        ],
+    )
+    def test_rejects_invalid_control_weights(self, weights: list[float], match: str) -> None:
+        with pytest.raises(ValueError, match=match):
+            _normalize_control_weights(2, weights)
+
+    def test_single_control_uses_existing_attention_path(self) -> None:
+        attention = _mock_cross_attention(
+            _FailingMultiControlBackend(), num_attention_heads=1, head_dim=1
+        )
+        q = torch.ones(1, 1, 1)
+        attention.get_qkv = lambda _hidden_states: (q, q, q)
+        attention.apply_qk_norm = lambda query, key: (query, key)
+        calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+        def _existing_attention(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            **_kwargs: object,
+        ) -> torch.Tensor:
+            calls.append((query.clone(), key.clone(), value.clone()))
+            return query.flatten(2)
+
+        attention._attn_impl = _existing_attention
+        attention.to_out = torch.nn.ModuleList([torch.nn.Identity()])
+        hidden_states = torch.ones(1, 1, 1)
+        k_und = torch.zeros(1, 1, 1, 1)
+        v_und = torch.zeros(1, 1, 1, 1)
+        freqs_cos = torch.ones(1, 1, 1, 1)
+        freqs_sin = torch.zeros(1, 1, 1, 1)
+
+        output = attention(
+            hidden_states,
+            k_und,
+            v_und,
+            freqs_cos,
+            freqs_sin,
+        )
+
+        assert len(calls) == 1
+        assert calls[0][1].shape[1] == 2
+        torch.testing.assert_close(output, hidden_states)
 
 
 # Distinguishes "attribute absent" from "attribute present and None".

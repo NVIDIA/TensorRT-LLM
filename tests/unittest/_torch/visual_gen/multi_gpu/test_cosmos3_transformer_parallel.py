@@ -27,6 +27,7 @@ try:
     import sys
     from pathlib import Path
 
+    from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
     from tensorrt_llm._torch.visual_gen.config import (
         AttentionConfig,
         DiffusionModelConfig,
@@ -499,6 +500,29 @@ def _forward_with_action(
     return out.video, out.action
 
 
+def _forward_multi_control(
+    model: Cosmos3VFMTransformer, device: torch.device, text_seed: int
+) -> torch.Tensor:
+    channels = _COSMOS3_TEST_CONFIG["latent_channel"]
+    hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+        device, channels=channels, text_seed=text_seed
+    )
+    control_latents = [torch.full_like(hs, -0.05), torch.full_like(hs, 0.05)]
+    model.reset_cache()
+    with torch.inference_mode():
+        return model(
+            hidden_states=hs,
+            timestep=ts / _NUM_TRAIN_TIMESTEPS,
+            raw_timestep=ts,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            video_shape=video_shape,
+            fps=_FPS,
+            control_latents=control_latents,
+            control_weights=[1.0, 3.0],
+        ).video
+
+
 def _build_ref_and_parallel(
     *,
     tp_size: int = 1,
@@ -557,6 +581,42 @@ def _assert_parity(actual: torch.Tensor, expected: torch.Tensor, *, msg: str) ->
     assert not torch.isnan(actual_f).any(), msg
     assert not torch.isinf(actual_f).any(), msg
     torch.testing.assert_close(actual_f, expected_f, rtol=RTOL, atol=ATOL, msg=msg)
+
+
+class _RejectReplicatedMultiControlBackend:
+    def forward(self, **_kwargs: object) -> None:
+        raise AssertionError("multi-control bypassed the Ulysses attention backend")
+
+
+def _record_multi_control_ulysses_layout(
+    model: Cosmos3VFMTransformer, ulysses_size: int
+) -> tuple[list[int], torch.utils.hooks.RemovableHandle]:
+    cross_attention = model.gen_layers[0].cross_attention
+    assert isinstance(cross_attention.attn, UlyssesAttention)
+    assert cross_attention.attn.inner_backend.num_heads == (
+        cross_attention.local_num_attention_heads // ulysses_size
+    )
+    for layer in model.gen_layers:
+        layer.cross_attention.multi_control_attn = _RejectReplicatedMultiControlBackend()
+
+    sequence_lengths: list[int] = []
+
+    def _record_sequence_length(_module: torch.nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+        sequence_lengths.append(args[0].shape[1])
+
+    handle = model.gen_layers[0].register_forward_pre_hook(_record_sequence_length)
+    return sequence_lengths, handle
+
+
+def _assert_multi_control_sequence_shard(sequence_lengths: list[int], ulysses_size: int) -> None:
+    tokens_per_item = (
+        _LATENT_T
+        * (_LATENT_H // _COSMOS3_TEST_CONFIG["latent_patch_size"])
+        * (_LATENT_W // _COSMOS3_TEST_CONFIG["latent_patch_size"])
+    )
+    full_sequence_length = 3 * tokens_per_item
+    expected_local_length = (full_sequence_length + ulysses_size - 1) // ulysses_size
+    assert sequence_lengths == [expected_local_length]
 
 
 # =============================================================================
@@ -631,6 +691,26 @@ def _logic_cosmos3_ulysses_vs_single_gpu(rank, world_size):
         ulysses_out,
         ref_out,
         msg=f"Rank {rank}: Ulysses output differs from single-GPU reference",
+    )
+
+
+def _logic_cosmos3_multi_control_ulysses_vs_single_gpu(rank: int, world_size: int) -> None:
+    ref_model, ulysses_model, _, device = _build_ref_and_parallel(ulysses_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+    sequence_lengths, hook = _record_multi_control_ulysses_layout(ulysses_model, world_size)
+
+    ref_out = _forward_multi_control(ref_model, device, text_seed)
+    try:
+        ulysses_out = _forward_multi_control(ulysses_model, device, text_seed)
+    finally:
+        hook.remove()
+
+    _assert_multi_control_sequence_shard(sequence_lengths, world_size)
+
+    _assert_parity(
+        ulysses_out,
+        ref_out,
+        msg=f"Rank {rank}: multi-control Ulysses output differs from single-GPU reference",
     )
 
 
@@ -719,6 +799,30 @@ def _logic_cosmos3_tp_ulysses_vs_single_gpu(rank, world_size):
         combined_out,
         ref_out,
         msg=f"Rank {rank}: TP+Ulysses output differs from single-GPU reference",
+    )
+
+
+def _logic_cosmos3_multi_control_tp_ulysses_vs_single_gpu(rank: int, world_size: int) -> None:
+    tp_size = 2
+    ulysses_size = 2
+    ref_model, combined_model, _, device = _build_ref_and_parallel(
+        tp_size=tp_size, ulysses_size=ulysses_size
+    )
+    text_seed = _cfg_text_seed(rank, tp_size=tp_size, ulysses_size=ulysses_size, cfg_size=1)
+    sequence_lengths, hook = _record_multi_control_ulysses_layout(combined_model, ulysses_size)
+
+    ref_out = _forward_multi_control(ref_model, device, text_seed)
+    try:
+        combined_out = _forward_multi_control(combined_model, device, text_seed)
+    finally:
+        hook.remove()
+
+    _assert_multi_control_sequence_shard(sequence_lengths, ulysses_size)
+
+    _assert_parity(
+        combined_out,
+        ref_out,
+        msg=f"Rank {rank}: multi-control TP+Ulysses output differs from single-GPU reference",
     )
 
 
@@ -839,6 +943,13 @@ class TestCosmos3TransformerParallel:
         self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_vs_single_gpu)
 
+    def test_multi_control_ulysses2_vs_single_gpu(self) -> None:
+        """Multi-control shards the generator sequence and attention heads with Ulysses."""
+        self._skip_if_unavailable()
+        run_test_in_distributed(
+            world_size=2, test_fn=_logic_cosmos3_multi_control_ulysses_vs_single_gpu
+        )
+
     def test_edge_tp2_vs_single_gpu(self):
         """Edge's non-gated relu² MLP shards without the gate_up fusion the
         Qwen recipe uses, so column/row splitting takes a different path."""
@@ -866,6 +977,13 @@ class TestCosmos3TransformerParallel:
     def test_tp2_ulysses2_vs_single_gpu(self):
         self._skip_if_unavailable()
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_tp_ulysses_vs_single_gpu)
+
+    @pytest.mark.gpu4
+    def test_multi_control_tp2_ulysses2_vs_single_gpu(self) -> None:
+        self._skip_if_unavailable()
+        run_test_in_distributed(
+            world_size=4, test_fn=_logic_cosmos3_multi_control_tp_ulysses_vs_single_gpu
+        )
 
     @pytest.mark.gpu4
     def test_cfg2_ulysses2_vs_single_gpu(self):

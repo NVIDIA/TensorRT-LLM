@@ -159,6 +159,29 @@ class UlyssesAttention(AttentionBackend):
             return self._forward_fused(q, k, v, **kwargs)
         return self._forward_unfused(q, k, v, **kwargs)
 
+    def sequence_to_head(self, tensor: torch.Tensor, *, name: str = "tensor") -> torch.Tensor:
+        """Exchange a sequence shard for a head shard in NHD layout."""
+        if tensor.shape[2] % self.world_size != 0:
+            raise ValueError(
+                f"UlyssesAttention: {name} num_heads ({tensor.shape[2]}) must be divisible "
+                f"by world_size ({self.world_size})."
+            )
+        return all_to_all_4d(
+            tensor,
+            scatter_dim=2,
+            gather_dim=1,
+            process_group=self.process_group,
+        )
+
+    def head_to_sequence(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Exchange a full-sequence head shard for a sequence shard in NHD layout."""
+        return all_to_all_4d(
+            tensor.contiguous(),
+            scatter_dim=1,
+            gather_dim=2,
+            process_group=self.process_group,
+        )
+
     def _forward_fused(
         self,
         q: torch.Tensor,
@@ -211,9 +234,9 @@ class UlyssesAttention(AttentionBackend):
         gate_fine = kwargs.pop("gate_fine", None)
 
         batch_size = q.shape[0]
-        q = all_to_all_4d(q, scatter_dim=2, gather_dim=1, process_group=self.process_group)
-        k = all_to_all_4d(k, scatter_dim=2, gather_dim=1, process_group=self.process_group)
-        v = all_to_all_4d(v, scatter_dim=2, gather_dim=1, process_group=self.process_group)
+        q = self.sequence_to_head(q, name="q")
+        k = self.sequence_to_head(k, name="k")
+        v = self.sequence_to_head(v, name="v")
         if gate_compress is not None:
             gate_compress = all_to_all_4d(
                 gate_compress, scatter_dim=2, gather_dim=1, process_group=self.process_group
@@ -386,10 +409,7 @@ class UlyssesAttention(AttentionBackend):
                 )
             output = output.contiguous()
 
-        output = all_to_all_4d(
-            output, scatter_dim=1, gather_dim=2, process_group=self.process_group
-        )
-        return output
+        return self.head_to_sequence(output)
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
