@@ -59,6 +59,32 @@ def reporter_session(enable_telemetry):
     assert usage_lib.apply_usage_session_config()
 
 
+def _visual_gen_args():
+    """Return the small validated-config surface consumed by the reporter."""
+    parallel = SimpleNamespace(
+        cfg_size=1,
+        ulysses_size=1,
+        async_ulysses=False,
+        ring_size=1,
+        attn2d_size=(1, 1),
+        tp_size=1,
+        parallel_vae_size=1,
+        parallel_vae_split_dim="width",
+    )
+    attention = SimpleNamespace(
+        backend="VANILLA",
+        sparse_attention_config=None,
+        quant_attention_config=None,
+    )
+    return SimpleNamespace(
+        parallel_config=parallel,
+        attention_config=attention,
+        cache_config=None,
+        cuda_graph_config=SimpleNamespace(enable=False),
+        torch_compile_config=SimpleNamespace(enable=False),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Console notification tests
 # ---------------------------------------------------------------------------
@@ -161,6 +187,108 @@ class TestReportUsage:
         """_get_trtllm_version returns a string."""
         result = usage_lib._get_trtllm_version()
         assert isinstance(result, str)
+
+    def test_report_visual_gen_usage_spawns_visual_gen_reporter(
+        self, monkeypatch, enable_telemetry
+    ):
+        """VisualGen starts its dedicated initial/heartbeat reporter."""
+        usage_lib._NOTIFICATION_SHOWN.set()
+        mock_thread = MagicMock()
+
+        with patch.object(usage_lib.threading, "Thread", return_value=mock_thread) as thread_cls:
+            usage_lib.report_visual_gen_usage(_visual_gen_args())
+
+        assert thread_cls.call_args.kwargs["target"] is usage_lib._visual_gen_background_reporter
+        assert thread_cls.call_args.kwargs["name"] == "trtllm-visual-gen-usage-stats"
+        assert thread_cls.call_args.kwargs["daemon"] is True
+        mock_thread.start.assert_called_once()
+
+    def test_visual_gen_background_reporter_sends_bounded_initial_event(self, reporter_session):
+        """Resolved worker metadata appears in the VisualGen initial event."""
+        usage_lib._REPORTER_STOP.set()
+        sent = []
+        metadata = {
+            "model_id": "nvidia/test-model",
+            "pipeline_class_name": "TestPipeline",
+            "resolved_pipeline_class": "ResolvedPipeline",
+            "modality": "image",
+            "launch_mode": "local_spawn",
+            "node_count": 1,
+            "n_workers": 2,
+            "quantization_algo": "NVFP4",
+            "dynamic_weight_quant": True,
+            "quantized_components": ["transformer"],
+        }
+
+        with (
+            patch.object(usage_lib, "_collect_system_info", return_value={}),
+            patch.object(usage_lib, "_collect_gpu_info", return_value={"gpu_count": 2}),
+            patch.object(
+                usage_lib,
+                "_collect_visual_gen_config_payloads",
+                return_value=("{}", "{}"),
+            ),
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+        ):
+            usage_lib._visual_gen_background_reporter(
+                _visual_gen_args(), metadata, "visual_gen_class"
+            )
+
+        parameters = sent[0]["events"][0]["parameters"]
+        assert sent[0]["events"][0]["name"] == "trtllm_visual_gen_initial_report"
+        assert parameters["modelId"] == "nvidia/test-model"
+        assert parameters["modality"] == "image"
+        assert parameters["nWorkers"] == 2
+        assert parameters["quantizedComponentsJson"] == '["transformer"]'
+
+    def test_visual_gen_heartbeat_reports_runtime_and_current_counters(
+        self, monkeypatch
+    ):
+        """VisualGen heartbeat carries topology and the latest lifecycle snapshot."""
+
+        class _OneHeartbeat:
+            def __init__(self):
+                self.wait_count = 0
+
+            def wait(self, timeout):
+                del timeout
+                self.wait_count += 1
+                return self.wait_count > 1
+
+        monkeypatch.setenv("TRTLLM_USAGE_FORCE_ENABLED", "1")
+        assert usage_lib.record_visual_gen_initialization_attempt()
+        assert usage_lib.record_visual_gen_initialized()
+        sent = []
+
+        with (
+            patch.object(usage_lib, "_collect_system_info", return_value={}),
+            patch.object(usage_lib, "_collect_gpu_info", return_value={"gpu_count": 4}),
+            patch.object(
+                usage_lib,
+                "_collect_visual_gen_config_payloads",
+                return_value=("{}", "{}"),
+            ),
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+            patch.object(usage_lib, "_REPORTER_STOP", _OneHeartbeat()),
+        ):
+            usage_lib._visual_gen_background_reporter(
+                _visual_gen_args(), {"n_workers": 3}, "visual_gen_class"
+            )
+
+        assert [payload["events"][0]["name"] for payload in sent] == [
+            "trtllm_visual_gen_initial_report",
+            "trtllm_visual_gen_heartbeat",
+        ]
+        heartbeat = sent[1]["events"][0]["parameters"]
+        assert heartbeat["seq"] == 0
+        assert heartbeat["runtimeKind"] == "visual_gen"
+        assert heartbeat["ingressPoint"] == "visual_gen_class"
+        assert heartbeat["nWorkers"] == 3
+        assert heartbeat["gpuCount"] == 4
+        assert heartbeat["visualGenInitializationAttempts"] == 1
+        assert heartbeat["visualGenInstancesCreated"] == 1
+        assert heartbeat["activeVisualGenInstances"] == 1
+        assert heartbeat["visualGenInitializationFailures"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -876,6 +1004,44 @@ class TestProcessTelemetrySession:
         assert snapshot["llmInitializationFailures"] == 1
         assert snapshot["llmInstancesCreated"] == 0
         assert snapshot["activeLlmInstances"] == 0
+
+    def test_visual_gen_lifecycle_updates_separate_counters(self, enable_telemetry):
+        """VisualGen lifecycle state is independent from LLM lifecycle state."""
+        assert usage_lib.record_visual_gen_initialization_attempt()
+        assert usage_lib.record_visual_gen_initialized()
+
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["runtimeKind"] == "visual_gen"
+        assert snapshot["visualGenInitializationAttempts"] == 1
+        assert snapshot["visualGenInstancesCreated"] == 1
+        assert snapshot["activeVisualGenInstances"] == 1
+        assert snapshot["llmInitializationAttempts"] == 0
+
+        usage_lib.record_visual_gen_shutdown()
+        assert usage_lib._SESSION.snapshot()["activeVisualGenInstances"] == 0
+
+    def test_mixed_session_exit_contains_both_runtime_counters(self, enable_telemetry):
+        """A shared process exit snapshot identifies mixed LLM/VisualGen use."""
+        assert usage_lib.record_llm_initialization_attempt()
+        assert usage_lib.record_llm_initialized()
+        assert usage_lib.record_visual_gen_initialization_attempt()
+        assert usage_lib.record_visual_gen_initialized()
+        sent = []
+
+        with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
+            assert usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="clean",
+                    component="server",
+                    exit_code_known=True,
+                    exit_code=0,
+                )
+            )
+
+        parameters = sent[0]["events"][0]["parameters"]
+        assert parameters["runtimeKind"] == "mixed"
+        assert parameters["llmInstancesCreated"] == 1
+        assert parameters["visualGenInstancesCreated"] == 1
 
     def test_monotonic_counters_saturate_at_uint32(self, enable_telemetry):
         """Cumulative counters never exceed the SMS PositiveInt bound."""

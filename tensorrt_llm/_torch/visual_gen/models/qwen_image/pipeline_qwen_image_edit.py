@@ -76,6 +76,8 @@ _EDIT_DEFAULT_GENERATION_PARAMS = {
     "QwenImageEditPlusPipeline",
     hf_ids=["Qwen/Qwen-Image-Edit-2511"],
     doc="Qwen-Image-Edit image editing pipeline.",
+    modality="image",
+    telemetry_safe=True,
 )
 class QwenImageEditPlusPipeline(QwenImagePipeline):
     """Qwen-Image-Edit pipeline using the existing Qwen-Image transformer.

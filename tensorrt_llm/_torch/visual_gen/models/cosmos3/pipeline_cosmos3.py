@@ -273,6 +273,8 @@ def _load_reference_image(data: bytes):
         "nvidia/Cosmos3-Edge",
     ],
     doc="Cosmos3 Omnimodal world models.",
+    modality="mixed",
+    telemetry_safe=True,
 )
 class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, pipeline_config):

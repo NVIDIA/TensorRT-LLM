@@ -1,12 +1,12 @@
 # TRT-LLM Telemetry Schema Reference
 
-Schema version: **0.7** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
+Schema version: **0.8** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
 
 ## Overview
 
 TRT-LLM collects anonymous, session-level deployment telemetry to understand
-how the library is used in production (GPU types, parallelism configs, model
-architectures). No PII, model weights, prompts, outputs, model paths, tokenizer
+how the library is used in production (GPU types, LLM and VisualGen parallelism,
+and bounded model or pipeline categories). No PII, model weights, prompts, outputs, model paths, tokenizer
 paths, or raw free-form configuration strings are collected.
 
 **Opt-out** (any one of these disables telemetry):
@@ -31,7 +31,7 @@ these top-level fields in Kibana alongside the event parameters.
 | `clientType` | string | Always `"Native"`. |
 | `clientVer` | string | TRT-LLM version, e.g. `"1.3.0rc9"`. |
 | `eventProtocol` | string | Always `"1.6"`. |
-| `eventSchemaVer` | string | Schema version, currently `"0.7"`. |
+| `eventSchemaVer` | string | Schema version, currently `"0.8"`. |
 | `eventSysVer` | string | Always `"trtllm-telemetry/1.0"`. |
 | `sessionId` | string | Unique hex UUID per telemetry session. Use this to correlate initial, heartbeat, and terminal events. |
 | `sentTs` | string | ISO 8601 UTC timestamp of when the payload was sent. |
@@ -94,7 +94,7 @@ fails earlier can send a terminal report without an initial report.
 |-------|------|-------------|---------|
 | `ingressPoint` | ShortString | How TRT-LLM was invoked. See [Ingress point values](#ingress-point-values). | `"cli_serve"` |
 | `featuresJson` | string | Legacy JSON-serialized summary of feature flags. See [featuresJson keys](#featuresjson-keys). | `'{"lora":false,...}'` |
-| `llmApiConfigJson` | string | JSON-serialized sanitized, type-driven effective LLM API configuration. See [LLM API config capture](#llm-api-config-capture). | `'{"tensor_parallel_size":2,...}'` |
+| `llmApiConfigJson` | string | JSON-serialized sanitized, type-driven effective LLM API configuration. See [runtime config capture](#runtime-config-capture). | `'{"tensor_parallel_size":2,...}'` |
 | `llmApiConfigMetaJson` | string | JSON-serialized metadata for LLM API configuration capture. | `'{"capture_succeeded":true,...}'` |
 | `disaggRole` | ShortString | Disaggregated serving role. Empty if not disaggregated. | `""`, `"context"`, `"generation"`, `"coordinator"`, `"server_coordinator"`, `"ctx0"`, `"gen0"` |
 | `deploymentId` | ShortString | Shared ID across disaggregated workers. Empty if not disaggregated. | `""`, `"dep-abc123"` |
@@ -127,6 +127,37 @@ heartbeats per session.
 
 Every heartbeat also contains the five aggregate LLM lifecycle counters above.
 
+### `trtllm_visual_gen_initial_report`
+
+Sent once after the first successful VisualGen pipeline initialization. It
+contains the system and GPU fields listed above plus bounded, effective runtime
+metadata received from the ready worker.
+
+| Field group | Fields | Description |
+|-------------|--------|-------------|
+| Identity | `runtimeKind`, `ingressPoint`, `modelId`, `pipelineClassName`, `resolvedPipelineClass`, `modality` | Runtime and explicitly allowlisted built-in pipeline identity. Custom and unrecognized model IDs and classes use `other` or `unknown`; local paths are never sent. `modality` is pipeline capability, not a request's input type. |
+| Deployment | `launchMode`, `nodeCount`, `nWorkers`, `gpuCount` | Bounded launch topology. `gpuCount` is local process visibility; `nWorkers` is total VisualGen workers. |
+| Quantization | `quantizationAlgo`, `dynamicWeightQuant`, `quantizedComponentsJson`, `quantizedWeights` | Quantization resolved after loading. Components are restricted to `transformer` and `transformer_2`. |
+| Parallelism | `cfgSize`, `ulyssesSize`, `asyncUlysses`, `ringSize`, `attn2dRowSize`, `attn2dColSize`, `tensorParallelSize`, `parallelVaeSize`, `parallelVaeSplitDim` | Effective VisualGen parallelism settings. Attention 2D topology is represented by separate row and column sizes. |
+| Features | `parallelVae`, `stepCaching`, `cacheBackend`, `sparseAttention`, `sparseAttentionAlgorithm`, `sparseAttentionSparsity`, `quantizedAttention`, `attentionBackend`, `cudaGraphs`, `torchCompile` | Bounded feature flags and categories. |
+| Safe config | `visualGenConfigJson`, `visualGenConfigMetaJson` | Type-driven, sanitized `VisualGenArgs` fields and capture diagnostics. |
+
+The event also contains these process-local VisualGen counters:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `visualGenInitializationAttempts` | PositiveInt | Number of entries into `VisualGen.__init__`. |
+| `visualGenInstancesCreated` | PositiveInt | Number of VisualGen objects initialized successfully. |
+| `activeVisualGenInstances` | PositiveInt | Successfully initialized objects not yet shut down. |
+| `visualGenInitializationFailures` | PositiveInt | Initialization attempts that raised a handled Python exception. |
+
+### `trtllm_visual_gen_heartbeat`
+
+Sent periodically on the same cadence as the LLM heartbeat. It contains `seq`,
+`runtimeKind`, `ingressPoint`, `nWorkers`, `gpuCount`, and the four VisualGen
+lifecycle counters above. The heartbeat sequence provides approximate session
+duration; this version does not send an exact duration field.
+
 ### `trtllm_exit_report`
 
 Sent at most once when TRT-LLM or a surviving observer can classify the session
@@ -139,14 +170,16 @@ outcome. Missing terminal events remain unknown; they are not confirmed crashes.
 | `signalNumber` | PositiveInt | Signal number, or `0` when not applicable or unknown. |
 | `terminationKind` | enum | `clean`, `exception`, `signal`, `worker_failure`, `timeout`, or `unknown`. |
 | `lifecyclePhase` | enum | Last known phase reached before termination: `cli_parsing`, `config_validation`, `model_initialization`, `serving`, or `unknown`. |
-| `component` | enum | `llm`, `server`, `engine_worker`, `disagg_worker`, or `unknown`. |
+| `component` | enum | `llm`, `visual_gen`, `server`, `engine_worker`, `disagg_worker`, or `unknown`. |
 | `reportingSource` | enum | `self`, `supervisor`, or `executor_proxy`. |
+| `runtimeKind` | enum | Runtime families observed in the process: `llm`, `visual_gen`, `mixed`, or `unknown`. |
 | `ingressPoint` | ShortString | Entry point copied onto the terminal event so terminal-only early failures remain attributable. |
 | `disaggRole` | ShortString | Disaggregated role (`context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy `ctx0`/`gen0`), or empty when unavailable/not applicable. |
 | `deploymentId` | ShortString | Optional shared disaggregated deployment ID. |
 
 Every terminal report also contains the five aggregate LLM lifecycle counters
-above. Delivery is best-effort and waits no more than 0.5 seconds; the local
+and four VisualGen lifecycle counters above. Delivery is best-effort and waits
+no more than 0.5 seconds; the local
 terminal lock permits at most one delivery attempt per process session.
 
 When a surviving parent observes a subprocess return code such as `-9`, it is
@@ -169,6 +202,7 @@ before it can send a terminal report.
 | ShortString | string | 0–128 characters |
 | LongString | string | 0–256 characters |
 | PositiveInt | integer | 0–4,294,967,295 |
+| Fraction | number | 0.0–1.0 |
 
 ## Ingress Point Values
 
@@ -180,6 +214,7 @@ The `ingressPoint` field identifies which TRT-LLM entry point started the sessio
 | `"cli_bench"` | Started via `trtllm-bench` CLI |
 | `"cli_eval"` | Started via evaluation CLI |
 | `"llm_class"` | Started via `LLM()` Python API directly |
+| `"visual_gen_class"` | Started via `VisualGen()` Python API directly |
 | `"disaggregated"` | Started as a disaggregated coordinator or fleet worker |
 | `"unknown"` | Entry point not identified |
 
@@ -200,10 +235,11 @@ flags such as LoRA/speculative decoding have explicit safe config fields.
 | `chunked_context` | bool | `false` | Chunked prefill enabled (`enable_chunked_prefill=True`). |
 | `data_parallel_size` | int | `1` | Data parallel degree. `1` = no data parallelism. Derived from `tp_size` when attention DP is enabled. |
 
-## LLM API Config Capture
+## Runtime Config Capture
 
-The `llmApiConfigJson` field is a JSON-serialized dict containing a type-driven
-subset of the validated, effective LLM API configuration. Capture is
+The `llmApiConfigJson` and `visualGenConfigJson` fields are JSON-serialized
+dicts containing type-driven subsets of the validated, effective LLM or
+VisualGen configuration. Capture is
 **type-driven**: a field is captured automatically when its type is categorical
 (`Literal`/`Enum`/`bool`) or numeric (`int`/`float`), or a safe collection of
 those. Free-form `str`/`Any`/`Path`/`dict`/`Callable` are not captured unless the
@@ -215,15 +251,15 @@ field is a `Literal[...]` or uses an explicit `allowlist` converter. Paths,
 tokenizer locations, dicts, objects, callables, raw `Any` values, non-finite
 floats (`nan`/`inf`), and unsafe or heterogeneous sequences are excluded.
 Captured sequences are capped at a fixed length and any clipping is reported in
-`llmApiConfigMetaJson`. Exclusion is fail-closed: the value is omitted instead
-of being serialized, and `llmApiConfigMetaJson` reports whether any resolved field
-was excluded as unsafe.
+the corresponding metadata field. Exclusion is fail-closed: the value is
+omitted instead of being serialized, and the metadata reports whether any
+resolved field was excluded as unsafe.
 
 The table below is a non-exhaustive set of examples for readers building
 dashboards. The exhaustive source of truth is
 `tensorrt_llm/usage/llm_args_golden_manifest.json` (regenerated from
 `build_capture_manifest`), after the safety sanitizer has excluded unsafe values.
-Use `llmApiConfigMetaJson` digests and field counts to track the exact capture
+Use the config metadata digests and field counts to track the exact capture
 manifest for a given release. The rendered documentation generates the
 exhaustive field table at docs build time under **Developer Guide > Telemetry**.
 
@@ -250,7 +286,7 @@ exhaustive field table at docs build time under **Developer Guide > Telemetry**.
 | `sparse_attention_config.algorithm` | Sparse attention algorithm discriminator; arm-specific knobs appear under `sparse_attention_config.*`. |
 | `reasoning_parser` | Reasoning parser selection, captured through an allowlist mirroring the `ReasoningParserFactory` registry. |
 
-`llmApiConfigMetaJson` describes the capture process itself. It includes
+The matching config metadata field describes the capture process itself. It includes
 contract/version fields, schema and manifest digests, source args class, field
 counts (`capturable_field_count`, `captured_field_count`, `excluded_field_count`), capture
 success, unsafe-exclusion status, a `sequence_truncated` flag set when any captured
@@ -276,7 +312,7 @@ over time.
 
 Checklist for adding a telemetry field:
 
-1. **`tensorrt_llm/usage/schema.py`** — Add field to `TrtllmInitialReport` (or `TrtllmHeartbeat`) Pydantic model with alias.
+1. **`tensorrt_llm/usage/schema.py`** — Add the field to the appropriate event Pydantic model with an alias.
 2. **`tensorrt_llm/usage/schemas/trtllm_usage_event_schema.json`** — Add to `properties` and `required` array.
 3. **`tensorrt_llm/usage/usage_lib.py`** — Populate the field in `_background_reporter()` and add extraction logic in `_extract_trtllm_config()` or `_collect_gpu_info()` as appropriate.
 4. **`tests/unittest/usage/test_schema.py`** — Update test fixtures and expected field sets.
@@ -285,7 +321,7 @@ Checklist for adding a telemetry field:
 7. **SMS schema upload** — Upload the updated JSON schema to the NvTelemetry Schema Management Service and toggle "on stage" / "on prod".
 8. **Update this README** — Add the field to the appropriate table above.
 
-Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
+Checklist for adding a runtime config capture field inside `llmApiConfigJson` or `visualGenConfigJson`:
 
 1. **Add the field with its natural type.** If it is categorical
    (`Literal`/`Enum`/`bool`) or numeric (`int`/`float`) — or a safe collection of
@@ -317,9 +353,16 @@ Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
    important enough for dashboard users to know by name.
 
 Dashboard note: payloads carry `capture_version` and `field_policy_version` in
-`llmApiConfigMetaJson`. During release adoption, v1 (opt-in) and v2 (type-driven)
+their config metadata. During release adoption, v1 (opt-in) and v2 (type-driven)
 payloads coexist in the same index — **bucket by these before aggregating**
 `captured_field_count` or any `llmApiConfigJson.<field>`.
+
+### VisualGen V1 Boundaries
+
+- No prompts, input media, outputs, request-level parameters, latency, queue, or throughput data are collected.
+- Pipeline and quantization identity are reported only after a worker becomes ready; earlier failures have lifecycle and terminal counters but no resolved pipeline event.
+- Dedicated flags without an authoritative effective runtime value, including two-stage, guardrails, prefetch, and request-level audio or layered-image behavior, are deferred. `resolvedPipelineClass` can still identify a built-in two-stage pipeline.
+- A process has one reporter thread. With multiple runtimes or VisualGen objects, the first runtime supplies static initial and heartbeat metadata while lifecycle counters aggregate all objects. If LLM and VisualGen are both created, the terminal event reports `runtimeKind=mixed` and both counter sets.
 
 ### Conventions
 

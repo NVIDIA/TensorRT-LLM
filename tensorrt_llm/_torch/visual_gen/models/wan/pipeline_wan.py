@@ -121,6 +121,8 @@ _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
         "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
     ],
     doc="Wan 2.1 & 2.2 text-to-video family.",
+    modality="video",
+    telemetry_safe=True,
 )
 class WanPipeline(BasePipeline):
     def __init__(self, pipeline_config):

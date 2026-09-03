@@ -17,6 +17,7 @@ import atexit
 import itertools
 import secrets
 import sys
+import threading
 import weakref
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
@@ -245,6 +246,8 @@ class VisualGen:
     ):
         self.model = str(model)
         self.args = (args or VisualGenArgs()).model_copy(update={"model": self.model})
+        self._usage_lifecycle_active = False
+        self._usage_lifecycle_lock = threading.Lock()
 
         # In external-launch mode (torchrun/srun), ranks 1..N-1 run as pure
         # workers and never return to user code.
@@ -252,13 +255,13 @@ class VisualGen:
         if ext is not None:
             rank, local_rank, world_size, master_addr, master_port = ext
             n_workers = self.args.parallel_config.n_workers
-            if world_size != n_workers:
-                raise ValueError(
-                    f"Launcher world_size ({world_size}) does not match "
-                    f"n_workers ({n_workers}). "
-                    "Launch exactly n_workers tasks."
-                )
             if rank != 0:
+                if world_size != n_workers:
+                    raise ValueError(
+                        f"Launcher world_size ({world_size}) does not match "
+                        f"n_workers ({n_workers}). "
+                        "Launch exactly n_workers tasks."
+                    )
                 logger.info(
                     f"VisualGen: rank {rank}/{world_size}, local_rank {local_rank} — "
                     "starting as worker (external launch mode)"
@@ -276,13 +279,62 @@ class VisualGen:
                     local_rank=local_rank,
                 )
                 sys.exit(0)
-            logger.info(
-                f"VisualGen: rank 0/{world_size} — coordinator + worker (external launch mode)"
-            )
 
-        self.executor = DiffusionRemoteClient(
-            args=self.args,
-        )
+        usage_attempt_tracked = False
+        try:
+            import tensorrt_llm.usage as _usage
+            from tensorrt_llm.usage import usage_lib as _usage_lib
+
+            usage_attempt_tracked = _usage.record_visual_gen_initialization_attempt(
+                self.args.telemetry_config,
+                default_usage_context=_usage.UsageContext.VISUAL_GEN_CLASS.value,
+            )
+        except Exception as exc:
+            logger.debug(f"VisualGen telemetry initialization tracking failed: {exc}")
+
+        try:
+            if ext is not None:
+                if world_size != n_workers:
+                    raise ValueError(
+                        f"Launcher world_size ({world_size}) does not match "
+                        f"n_workers ({n_workers}). "
+                        "Launch exactly n_workers tasks."
+                    )
+                logger.info(
+                    f"VisualGen: rank 0/{world_size} — coordinator + worker "
+                    "(external launch mode)"
+                )
+            self.executor = DiffusionRemoteClient(args=self.args)
+        except Exception:
+            try:
+                if usage_attempt_tracked:
+                    _usage.record_visual_gen_initialization_failure()
+            except Exception as exc:
+                logger.debug(f"VisualGen telemetry failure tracking failed: {exc}")
+            raise
+
+        try:
+            if usage_attempt_tracked:
+                self._usage_lifecycle_active = _usage.record_visual_gen_initialized()
+            telemetry_config = self.args.telemetry_config
+            if telemetry_config.usage_context == _usage.UsageContext.UNKNOWN:
+                telemetry_config = telemetry_config.model_copy(
+                    update={"usage_context": _usage.UsageContext.VISUAL_GEN_CLASS}
+                )
+            telemetry_metadata = dict(self.executor.telemetry_metadata)
+            telemetry_metadata.update(
+                launch_mode=self.executor.launch_mode,
+                node_count=self.executor.node_count,
+                n_workers=self.executor.n_workers,
+            )
+            _usage_lib.report_visual_gen_usage(
+                self.args,
+                telemetry_metadata,
+                telemetry_config,
+            )
+        except Exception as exc:
+            logger.debug(f"VisualGen telemetry setup failed: {exc}")
+
         self._req_counter = itertools.count()
 
         atexit.register(VisualGen._atexit_shutdown, weakref.ref(self))
@@ -484,6 +536,19 @@ class VisualGen:
         logger.info("VisualGen: Shutting down")
         self.executor.shutdown()
         self.executor = None
+        usage_lifecycle_lock = getattr(self, "_usage_lifecycle_lock", None)
+        if usage_lifecycle_lock is not None:
+            with usage_lifecycle_lock:
+                if getattr(self, "_usage_lifecycle_active", False):
+                    self._usage_lifecycle_active = False
+                    try:
+                        import tensorrt_llm.usage as _usage
+
+                        _usage.record_visual_gen_shutdown()
+                    except Exception as exc:
+                        logger.debug(
+                            f"VisualGen telemetry shutdown tracking failed: {exc}"
+                        )
 
     @set_api_status("prototype")
     async def get_stats_async(self, timeout: Optional[float] = None) -> AsyncIterator[Dict]:

@@ -103,6 +103,8 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
     ],
     doc="Wan 2.1 & 2.2 image-to-video family.",
+    modality="video",
+    telemetry_safe=True,
 )
 class WanImageToVideoPipeline(BasePipeline):
     def __init__(self, pipeline_config):

@@ -29,7 +29,10 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.usage import usage_lib
-from tensorrt_llm.usage.llmapi_config import collect_llm_api_config_payloads
+from tensorrt_llm.usage.llmapi_config import (
+    collect_llm_api_config_payloads,
+    collect_visual_gen_config_payloads,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -886,3 +889,41 @@ def test_collect_llm_api_config_caps_total_payload_size(monkeypatch):
     config, meta = _loads_payloads(_BigConfig())
     assert meta["payload_truncated"] is True
     assert len(rc._canonical_json(config).encode("utf-8")) <= 20
+
+
+def test_collect_visual_gen_config_uses_separate_source_and_excludes_model():
+    """VisualGen capture reuses the sanitizer without collecting model paths."""
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    config_json, meta_json = collect_visual_gen_config_payloads(
+        VisualGenArgs(model="/private/customer/model")
+    )
+    config = json.loads(config_json)
+    meta = json.loads(meta_json)
+
+    assert "model" not in config
+    assert "telemetry_config.disabled" not in config
+    assert config["parallel_config.cfg_size"] == 1
+    assert config["attention_config.backend"] == "VANILLA"
+    assert meta["source"] == "effective_validated_visual_gen_args"
+    assert meta["args_class"] == "VisualGenArgs"
+
+
+def test_collect_visual_gen_config_uses_canonical_manifest_for_subclasses():
+    """Custom subclasses cannot add fields or expose their class name."""
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    class _PrivateVisualGenArgs(VisualGenArgs):
+        customer_secret_enabled: bool = True
+        customer_private_limit: int = 7
+
+    config_json, meta_json = collect_visual_gen_config_payloads(
+        _PrivateVisualGenArgs(model="/private/customer/model")
+    )
+    config = json.loads(config_json)
+    meta = json.loads(meta_json)
+
+    assert "customer_secret_enabled" not in config
+    assert "customer_private_limit" not in config
+    assert config["parallel_config.cfg_size"] == 1
+    assert meta["args_class"] == "VisualGenArgs"

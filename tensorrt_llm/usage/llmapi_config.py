@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""LLM API configuration capture for usage telemetry."""
+"""Validated runtime-configuration capture for usage telemetry."""
 
 from __future__ import annotations
 
@@ -34,8 +34,9 @@ CAPTURE_VERSION = "2"
 FIELD_POLICY_VERSION = "2"
 API_CONTRACT_VERSION = "0.2.0"
 CAPTURE_SOURCE = "effective_validated_llm_args"
+VISUAL_GEN_CAPTURE_SOURCE = "effective_validated_visual_gen_args"
 
-# Cap total serialized bytes of llmApiConfigJson. The wire field is unbounded and
+# Cap each serialized runtime-config payload. The wire fields are unbounded and
 # the reporter is fail-silent, so an oversized payload is dropped whole by the
 # endpoint; truncate and flag instead. Conservative bound until the endpoint limit
 # is confirmed.
@@ -388,9 +389,11 @@ def manifest_rows(model_cls: type[BaseModel]) -> list[dict[str, Any]]:
 
 def golden_manifest() -> dict[str, list[dict[str, Any]]]:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
 
     return {
         "TorchLlmArgs": manifest_rows(TorchLlmArgs),
+        "VisualGenArgs": manifest_rows(VisualGenArgs),
     }
 
 
@@ -568,7 +571,7 @@ def _truncate_to_budget(values: dict[str, Any]) -> tuple[dict[str, Any], str]:
     return kept, _canonical_json(kept)
 
 
-def _failure_meta(args_class: str = "") -> dict[str, Any]:
+def _failure_meta(args_class: str = "", source: str = CAPTURE_SOURCE) -> dict[str, Any]:
     """Metadata for capture failure. One shape used by collector and reporter."""
     return {
         "api_contract_version": API_CONTRACT_VERSION,
@@ -583,32 +586,51 @@ def _failure_meta(args_class: str = "") -> dict[str, Any]:
         "payload_truncated": False,
         "schema_digest": "",
         "sequence_truncated": False,
-        "source": CAPTURE_SOURCE,
+        "source": source,
         "unsafe_excluded": False,
     }
 
 
-def _failure_llm_api_config_payloads(args_class: str = "") -> tuple[str, str]:
+def _failure_config_payloads(args_class: str = "", source: str = CAPTURE_SOURCE) -> tuple[str, str]:
     """Return empty config plus canonical failure metadata JSON."""
-    return "{}", _canonical_json(_failure_meta(args_class=args_class))
+    return "{}", _canonical_json(_failure_meta(args_class=args_class, source=source))
 
 
-def collect_llm_api_config_payloads(llm_args: Any) -> tuple[str, str]:
-    """Return sanitized LLM API config and capture metadata JSON strings.
+def _failure_llm_api_config_payloads(args_class: str = "") -> tuple[str, str]:
+    """Return empty LLM config plus canonical failure metadata JSON."""
+    return _failure_config_payloads(args_class=args_class)
+
+
+def _failure_visual_gen_config_payloads(args_class: str = "") -> tuple[str, str]:
+    """Return empty VisualGen config plus canonical failure metadata JSON."""
+    return _failure_config_payloads(
+        args_class=args_class,
+        source=VISUAL_GEN_CAPTURE_SOURCE,
+    )
+
+
+def _collect_config_payloads(
+    config: Any,
+    *,
+    source: str,
+    manifest_cls: type[BaseModel] | None = None,
+) -> tuple[str, str]:
+    """Return sanitized Pydantic config and capture metadata JSON strings.
 
     Manifest-driven: capture exactly the keys build_capture_manifest lists for
-    this class, so the runtime can never emit a key absent from the committed
-    golden (runtime_keys subset of manifest_keys, by construction).
+    the selected manifest class. Callers may pin that class to prevent runtime
+    subclasses from expanding the approved field set.
     """
     try:
-        if not _is_pydantic_model(llm_args):
-            return _failure_llm_api_config_payloads()
+        if not _is_pydantic_model(config):
+            args_class = manifest_cls.__name__ if manifest_cls is not None else ""
+            return _failure_config_payloads(args_class=args_class, source=source)
 
-        cls = llm_args.__class__
+        cls = manifest_cls or config.__class__
         entries = build_capture_manifest(cls)
         state = _CaptureState()
         for entry in entries:
-            present, value = _resolve_path(llm_args, entry.path)
+            present, value = _resolve_path(config, entry.path)
             if not present:
                 continue
             is_safe, sanitized = _sanitize_value(value, entry.annotation, entry.metadata, state)
@@ -637,7 +659,7 @@ def collect_llm_api_config_payloads(llm_args: Any) -> tuple[str, str]:
             "payload_truncated": state.payload_truncated,
             "schema_digest": _schema_digest(cls),
             "sequence_truncated": state.sequence_truncated,
-            "source": CAPTURE_SOURCE,
+            "source": source,
             "unsafe_excluded": state.unsafe_excluded,
         }
         return config_json, _canonical_json(metadata)
@@ -645,5 +667,25 @@ def collect_llm_api_config_payloads(llm_args: Any) -> tuple[str, str]:
         # Stay fail-silent only for the sanitizer/walk error family we expect.
         # Unexpected exceptions propagate to the daemon-thread guard in
         # usage_lib so genuine collector bugs are not silently masked.
-        args_class = type(llm_args).__name__ if llm_args is not None else ""
-        return _failure_llm_api_config_payloads(args_class=args_class)
+        args_class = (
+            manifest_cls.__name__
+            if manifest_cls is not None
+            else type(config).__name__ if config is not None else ""
+        )
+        return _failure_config_payloads(args_class=args_class, source=source)
+
+
+def collect_llm_api_config_payloads(llm_args: Any) -> tuple[str, str]:
+    """Return sanitized LLM API config and capture metadata JSON strings."""
+    return _collect_config_payloads(llm_args, source=CAPTURE_SOURCE)
+
+
+def collect_visual_gen_config_payloads(visual_gen_args: Any) -> tuple[str, str]:
+    """Return sanitized VisualGen config and capture metadata JSON strings."""
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    return _collect_config_payloads(
+        visual_gen_args,
+        source=VISUAL_GEN_CAPTURE_SOURCE,
+        manifest_cls=VisualGenArgs,
+    )
