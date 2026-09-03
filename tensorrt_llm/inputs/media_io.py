@@ -29,7 +29,7 @@ from typing import (
     TypeVar,
     Union,
 )
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import ParseResult, unquote, urljoin, urlparse
 
 import aiohttp
 import numpy as np
@@ -716,6 +716,71 @@ def _normalize_file_uri(uri: str) -> str:
     return uri
 
 
+class NotADataURIError(ValueError):
+    """A URL handed to the data: URI parser that is not a data: URI.
+
+    A plain ValueError rather than also a NotImplementedError: the payload is
+    not an unsupported encoding, the input is simply the wrong kind of URL.
+    """
+
+
+class UnsupportedDataURIEncodingError(NotImplementedError, ValueError):
+    """A data: URI whose payload is not base64-encoded.
+
+    Inherits NotImplementedError so callers already catching it keep working,
+    and ValueError so a malformed client payload maps to a client error rather
+    than an internal one.
+    """
+
+
+def parse_data_uri(url: Union[str, ParseResult]) -> Tuple[str, str]:
+    """Parse an RFC 2397 data URI into its media type and base64 payload.
+
+    The payload is returned as the still-encoded base64 string rather than as
+    decoded bytes, so that it can be handed straight to
+    `BaseMediaIO.load_base64`, which decodes it per modality.
+
+    Args:
+        url: A complete `data:` URI, e.g. `data:image/png;base64,iVBORw0...`,
+            or an already-parsed `ParseResult`. Callers holding a parsed URL
+            should pass it through rather than re-serializing it, since the
+            payload can be large.
+
+    Returns:
+        A `(media_type, data)` pair. `media_type` is the empty string for URIs
+        that omit it, such as `data:;base64,...`, which RFC 2397 permits.
+
+    Raises:
+        NotADataURIError: The URL is not a `data:` URI at all.
+        ValueError: The URI has no `,` separating the header from the payload.
+        UnsupportedDataURIEncodingError: The payload is not base64-encoded. This is
+            both a NotImplementedError and a ValueError.
+    """
+    parsed = url if isinstance(url, ParseResult) else urlparse(url)
+    displayed = parsed.geturl()[:64]
+    # Check the scheme first: without it a filesystem path containing a "," is
+    # split like a data URI and misreported as an encoding problem.
+    if parsed.scheme != "data":
+        raise NotADataURIError(
+            f"Expected a 'data:' URI but got scheme {parsed.scheme!r}: {displayed!r}."
+        )
+    path = parsed.path
+    if "," not in path:
+        raise ValueError(
+            f"Malformed data URI {displayed!r}: expected "
+            "'data:[<media type>][;<parameter>]*,<data>', but found no ',' separating "
+            "the header from the payload."
+        )
+    data_spec, data = path.split(",", 1)
+    # Everything after the media type is a parameter, and `base64` need not be
+    # the first one -- `data:audio/wav;codecs=opus;base64,...` is well-formed.
+    media_type, *parameters = data_spec.split(";")
+    # Parameter names are case-insensitive per RFC 2045.
+    if not any(parameter.lower() == "base64" for parameter in parameters):
+        raise UnsupportedDataURIEncodingError("Only base64 data URLs are supported for now.")
+    return media_type, data
+
+
 _MediaT = TypeVar("_MediaT")
 
 
@@ -801,12 +866,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             data = await _safe_aiohttp_get(url, session=session)
             return await self._run_in_executor(self.load_bytes, data)
         elif parsed.scheme == "data":
-            data_spec, b64_data = parsed.path.split(",", 1)
-            parts = data_spec.split(";", 1)
-            media_type = parts[0]
-            encoding = parts[1] if len(parts) > 1 else ""
-            if encoding != "base64":
-                raise NotImplementedError("Only base64 data URLs are supported for now.")
+            media_type, b64_data = parse_data_uri(url)
             return await self._run_in_executor(self.load_base64, media_type, b64_data)
         elif parsed.scheme in ("", "file"):
             return await self._run_in_executor(self.load_file, url)
