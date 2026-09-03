@@ -953,7 +953,7 @@ def test_selfsampling_varlen_heterogeneous_lengths_main():
         assert torch.equal(got, ref_v), f"row {r}: value multiset mismatch (n={n_r})"
 
 
-def test_selfsampling_varlen_narrow_logits_clamps_envelope_to_row_width():
+def test_selfsampling_varlen_narrow_logits_clamps_envelope_to_row_width() -> None:
     """Logits narrower than k + 1 with kv lengths beyond k: the launch
     envelope must be the physical row width, so every row takes the in-kernel
     short path (identity + -1 tail) instead of reading k + 1 elements across
@@ -975,7 +975,7 @@ def test_selfsampling_varlen_narrow_logits_clamps_envelope_to_row_width():
         assert torch.equal(out, want), kv_len
 
 
-def test_selfsampling_warmup_incremental_rows_populate_exact_launchers():
+def test_selfsampling_warmup_incremental_rows_populate_exact_launchers() -> None:
     """A later warmup_varlen call whose new row count falls inside an already
     warmed engine band must still create that row count's launcher entry, so a
     CUDA-graph capture at it finds its key (DKG issue #60, item 2)."""
@@ -999,7 +999,7 @@ def test_selfsampling_warmup_incremental_rows_populate_exact_launchers():
     assert torch.equal(ref, got)
 
 
-def test_validate_run_ws_requires_16_byte_alignment():
+def test_validate_run_ws_requires_16_byte_alignment() -> None:
     """The workspace fake declares 16-byte alignment; the host check matches
     it so an 8-but-not-16-byte workspace fails here instead of at DSL
     conversion (DKG issue #60, item 3)."""
