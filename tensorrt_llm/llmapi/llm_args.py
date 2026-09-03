@@ -2020,6 +2020,14 @@ class MooncakeStoreConfig(StrictBaseModel):
         description="Copy pages through a pinned host buffer instead of "
         "registering the KV pools with Mooncake. Needed where the HCA cannot "
         "pin GPU pages (no GPUDirect RDMA); costs a copy each way.")
+    staging_buffer_bytes: Optional[Union[int, str]] = Field(
+        None,
+        telemetry=False,
+        description="Size of the buffer stage_through_host copies through, "
+        "per process. Pages move transfer_batch_size at a time, and a buffer "
+        "that cannot hold that many reduces the batch instead of failing, so "
+        "undersizing it costs throughput quietly. Defaults to the connector's "
+        "own 512MiB.")
 
     @model_validator(mode="after")
     def _require_exactly_one_master(self) -> "MooncakeStoreConfig":

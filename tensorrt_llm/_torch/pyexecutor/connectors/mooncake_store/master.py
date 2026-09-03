@@ -152,6 +152,10 @@ def _client_config(pool: Any, master_address: str) -> Dict[str, Any]:
     }
     if pool.cache_prefix is not None:
         config["cache_prefix"] = pool.cache_prefix
+    # Left out when unset so the connector's own default applies, rather than
+    # restating it here for the two to drift apart.
+    if pool.staging_buffer_bytes is not None:
+        config["staging_buffer_bytes"] = pool.staging_buffer_bytes
     return config
 
 

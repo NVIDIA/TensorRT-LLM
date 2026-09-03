@@ -246,6 +246,27 @@ def test_provisioning_points_the_workers_at_a_running_master(running_master):
     assert not os.path.exists(config_path)
 
 
+def test_a_staging_buffer_can_be_sized_where_staging_is_turned_on(running_master):
+    """Undersizing it silently shrinks the transfer batch, so it must be settable."""
+    pool = MooncakeStoreConfig(
+        master_server_address=running_master,
+        stage_through_host=True,
+        staging_buffer_bytes="4GiB",
+    )
+
+    with provision_pool(pool) as config_path:
+        written = json.loads(open(config_path).read())
+        assert written["stage_through_host"] is True
+        assert written["staging_buffer_bytes"] == "4GiB"
+
+
+def test_an_unsized_staging_buffer_leaves_the_connector_its_default(running_master):
+    pool = MooncakeStoreConfig(master_server_address=running_master)
+
+    with provision_pool(pool) as config_path:
+        assert "staging_buffer_bytes" not in json.loads(open(config_path).read())
+
+
 def test_provisioning_fails_before_the_model_loads_if_the_master_is_absent(monkeypatch):
     monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "1")
     pool = MooncakeStoreConfig(master_server_address=f"127.0.0.1:{free_port()}")
