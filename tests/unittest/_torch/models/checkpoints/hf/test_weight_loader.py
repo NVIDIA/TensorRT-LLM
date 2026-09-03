@@ -533,6 +533,7 @@ def test_requires_lazy_safetensors_for_every_listed_model_type(tmp_path, model_t
 
 @pytest.mark.parametrize("config", [{"model_type": "llama"}, {}])
 def test_requires_lazy_safetensors_is_false_for_other_checkpoints(tmp_path, config):
+    """Any other model type, or no model type at all, takes the eager path."""
     import json
 
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -540,4 +541,5 @@ def test_requires_lazy_safetensors_is_false_for_other_checkpoints(tmp_path, conf
 
 
 def test_requires_lazy_safetensors_is_false_without_a_config(tmp_path):
+    """A directory without config.json cannot opt in to lazy loading."""
     assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is False
