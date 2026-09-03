@@ -244,6 +244,30 @@ class CUDAGraphRunner:
                 or (self.enable_encoder_decoder_mixed_cuda_graph
                     and self._is_mixed_encoder_decoder_batch(batch)))
 
+    # Attention-DP graph-batch agreement is gathered once per iteration:
+    # the executor offers the rows from _can_queue, pad_batch reuses them
+    # for the same batch, and maybe_get_cuda_graph reuses pad_batch's
+    # verdict. Any mismatch falls back to a fresh exchange.
+
+    def offer_adp_batch_info(self, batch_size: int, can_run_cuda_graph: bool,
+                             gathered) -> None:
+        """Rows gathered by the executor as ``[batch_size, can_run]`` per rank."""
+        rows = [(bool(int(row[1])), int(row[0])) for row in gathered]
+        self._adp_offer = (int(batch_size), bool(can_run_cuda_graph), rows)
+
+    def _gather_adp_graph_batch_info(self, batch: ScheduledRequests,
+                                     can_run_cuda_graph: bool):
+        """Return ``[(can_run_cuda_graph, batch_size)]`` per TP rank."""
+        offer = getattr(self, "_adp_offer", None)
+        if offer is not None:
+            self._adp_offer = None
+            if offer[0] == batch.batch_size and offer[1] == bool(
+                    can_run_cuda_graph):
+                return offer[2]
+        gathered = self.config.dist.tp_allgather_int64(
+            [int(bool(can_run_cuda_graph)), batch.batch_size])
+        return [(bool(int(row[0])), int(row[1])) for row in gathered]
+
     def _get_seq_len_mode(
         self,
         batch: ScheduledRequests,
@@ -460,12 +484,19 @@ class CUDAGraphRunner:
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_info = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size], small_payload=True)
-            all_can_run_cuda_graph = all(rank_info[0]
-                                         for rank_info in graph_batch_info)
-            all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
-                                        for rank_info in graph_batch_info)
+            verdict = getattr(self, "_adp_post_pad", None)
+            self._adp_post_pad = None
+            if verdict is not None and verdict[0] is batch and verdict[
+                    1] == batch_size:
+                all_can_run_cuda_graph, all_batch_sizes_equal = verdict[2:]
+            else:
+                graph_batch_info = self._gather_adp_graph_batch_info(
+                    batch, can_run_cuda_graph)
+                all_can_run_cuda_graph = all(rank_info[0]
+                                             for rank_info in graph_batch_info)
+                all_batch_sizes_equal = all(
+                    rank_info[1] == graph_batch_info[0][1]
+                    for rank_info in graph_batch_info)
 
             if not all_can_run_cuda_graph or not all_batch_sizes_equal:
                 return None, None, None
@@ -736,14 +767,20 @@ class CUDAGraphRunner:
         batch_size = batch.batch_size
         new_batch_size = batch_size
 
-        if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_info = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size], small_payload=True)
+        adp_exchange = (self.enabled and self.config.enable_attention_dp
+                        and self.config.mapping.tp_size > 1)
+        if adp_exchange:
+            graph_batch_info = self._gather_adp_graph_batch_info(
+                batch, can_run_cuda_graph)
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
+            all_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
+                                  for rank_info in graph_batch_info)
             if all_can_run_cuda_graph:
                 new_batch_size = max(rank_info[1]
                                      for rank_info in graph_batch_info)
+            self._adp_post_pad = (batch, batch_size, all_can_run_cuda_graph,
+                                  all_sizes_equal)
 
         if (not self.enabled or not self.padding_enabled
                 or not can_run_cuda_graph
@@ -757,6 +794,10 @@ class CUDAGraphRunner:
         padded_batch_size = self._round_up_batch_size_with_draft_len(
             new_batch_size, runtime_draft_len)
 
+        if adp_exchange and all_can_run_cuda_graph:
+            # The padded size is rank-uniform, so sizes match after padding.
+            self._adp_post_pad = (batch, padded_batch_size, True, True)
+
         if batch_size == padded_batch_size:
             return 0
 
@@ -764,6 +805,7 @@ class CUDAGraphRunner:
         if padding_size <= 0:
             return 0
         if padding_size + batch.batch_size > self.config.batch_size:
+            self._adp_post_pad = None
             return 0
 
         # No padding if it would create too many concurrent requests.
@@ -778,6 +820,7 @@ class CUDAGraphRunner:
                 f"(draft_len={runtime_draft_len}) from a saturated KV cache; "
                 "falling back to eager mode for padded batches.",
                 key=f"cuda_graph_padding_dummy_fallback_{runtime_draft_len}")
+            self._adp_post_pad = None
             return 0
 
         batch.generation_requests.extend([padding_dummy_request] * padding_size)

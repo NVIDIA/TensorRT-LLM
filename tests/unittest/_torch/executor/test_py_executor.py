@@ -19,6 +19,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as torch_dist
@@ -2159,8 +2160,9 @@ def test_generic_disagg_adp_mixed_rank_states_stay_queueable():
     assert rank_batch_sizes == [1, 1]
 
     for stub, batch_size in zip((busy_rank, terminal_rank), rank_batch_sizes, strict=True):
-        stub.dist.tp_allgather.side_effect = None
-        stub.dist.tp_allgather.return_value = rank_batch_sizes
+        stub.dist.tp_allgather_int64 = Mock(
+            return_value=np.array([[size, 1] for size in rank_batch_sizes])
+        )
         can_queue, can_queue_this_rank = PyExecutor._can_queue(
             stub, types.SimpleNamespace(batch_size=batch_size)
         )
@@ -2279,8 +2281,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     first_dummy = stub._pending_adp_dummy_request
     assert first_dummy is not None
 
-    stub.dist.tp_allgather.side_effect = None
-    stub.dist.tp_allgather.return_value = [1, 0]
+    stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1, 1], [0, 1]]))
     can_queue, _ = PyExecutor._can_queue(stub, types.SimpleNamespace(batch_size=1))
     assert can_queue is False
     PyExecutor._finalize_adp_dummy_allocation(stub, can_queue)
@@ -2289,7 +2290,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
 
-    stub.dist.tp_allgather.return_value = [1, 1]
+    stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1, 1], [1, 1]]))
     _run_pad(stub)
     second_dummy = stub._pending_adp_dummy_request
     assert second_dummy is not None
@@ -3231,8 +3232,8 @@ class TestAdpBalanceExcludesPadDummies:
         """per_rank: list of (num_ctx, num_gen, num_real) as allgathered."""
         executor = object.__new__(PyExecutor)
         executor.dist = Mock()
-        executor.dist.tp_allgather = Mock(
-            return_value=[[ctx, gen, ctx + gen, real] for ctx, gen, real in per_rank]
+        executor.dist.tp_allgather_int64 = Mock(
+            return_value=np.array([[ctx, gen, ctx + gen, real] for ctx, gen, real in per_rank])
         )
         executor.max_batch_size = 64
         executor.attention_dp_enable_balance = True
