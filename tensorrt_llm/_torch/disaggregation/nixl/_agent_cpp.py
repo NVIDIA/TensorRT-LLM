@@ -100,7 +100,8 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             except ValueError:
                 workers = 0
             if workers > 0:
-                backend_params["num_workers"] = str(workers)
+                # Explicit backend_params takes precedence over the legacy env var.
+                backend_params.setdefault("num_workers", str(workers))
             else:
                 logger.warning(
                     f"Ignoring invalid TRTLLM_NIXL_NUM_WORKERS={nixl_num_workers!r} "

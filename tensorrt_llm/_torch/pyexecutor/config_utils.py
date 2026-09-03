@@ -57,6 +57,14 @@ def resolve_cache_transceiver_config(
             f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
         )
 
+    if (cache_transceiver_config.backend_params
+            and cache_transceiver_config.transceiver_runtime != "PYTHON"):
+        logger.warning(
+            "cache_transceiver_config.backend_params is only consumed by the "
+            "Python transceiver with the NIXL backend; the C++ transceiver "
+            "ignores it. Set transceiver_runtime='PYTHON' (or 'auto' on a "
+            "model that prefers the Python transceiver) for it to take effect.")
+
 
 def uses_vswa_kv_cache_layout(
         max_attention_windows: Optional[Sequence[Optional[int]]]) -> bool:

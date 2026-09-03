@@ -43,6 +43,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     RegMemoryDescs,
     TransferOp,
     TransferRequest,
+    use_pure_python_transfer_agent,
 )
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
@@ -2499,18 +2500,45 @@ class RankInfoServer:
         self.shutdown()
 
 
+# Constructor keywords of the transfer agents; letting them through **kwargs
+# would raise a confusing duplicate-keyword TypeError at startup.
+_BACKEND_PARAMS_RESERVED_KEYS = frozenset(
+    {"name", "use_prog_thread", "rank", "world_size", "enable_telemetry"}
+)
+# Keys consumed by the NIXL UCX plugin or the agent constructor. Unknown keys
+# are forwarded anyway (NIXL ignores them silently), so warn about them here.
+_BACKEND_PARAMS_KNOWN_KEYS = frozenset(
+    {
+        "device_list",
+        "engine_config",
+        "num_workers",
+        "num_threads",
+        "split_batch_size",
+        "ucx_num_device_channels",
+        "ucx_error_handling_mode",
+    }
+)
+
+
 def _unset_ucx_env_for_engine_config(engine_config: str) -> None:
     """Unset UCX_<KEY> env vars named in an NIXL 'engine_config' backend param.
 
     NIXL applies 'engine_config' entries via ucp_config_modify only when the
     matching UCX_<KEY> environment variable is NOT set (env wins otherwise).
     Removing those variables up front lets the configured values take effect.
-    Keys are parsed exactly as NIXL does: comma-separated KEY=VALUE elements,
-    elements without '=' are ignored.
+    The removal is a process-wide, irreversible side effect. Keys are parsed
+    exactly as NIXL does: comma-separated KEY=VALUE elements; elements without
+    '=' are dropped by NIXL, so values must not contain commas (multi-value
+    variables like UCX_TLS cannot be expressed here).
     """
     for elem in engine_config.split(","):
         key, sep, _ = elem.partition("=")
         if not sep or not key:
+            if elem:
+                logger.warning(
+                    f"NIXL engine_config element {elem!r} has no '=' and will be "
+                    "ignored by NIXL; note values must not contain commas"
+                )
             continue
         env_key = "UCX_" + key
         old = os.environ.pop(env_key, None)
@@ -2530,7 +2558,30 @@ def _create_nixl_agent(
     kwargs = {}
     if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
         kwargs["split_batch_size"] = int(os.environ["TRTLLM_NIXL_SPLIT_BATCH_SIZE"])
+    if backend_params and use_pure_python_transfer_agent():
+        # The pure Python agent accepts **kwargs but never forwards them to
+        # createBackend; merging (and unsetting UCX env vars) would silently
+        # destroy working env-based tuning without applying the new values.
+        logger.warning(
+            "cache_transceiver_config.backend_params is not supported by the "
+            "pure Python NIXL agent and will be ignored; UCX_* environment "
+            "variables are left untouched"
+        )
+        backend_params = None
     if backend_params:
+        reserved = _BACKEND_PARAMS_RESERVED_KEYS.intersection(backend_params)
+        if reserved:
+            raise ValueError(
+                "cache_transceiver_config.backend_params must not contain "
+                f"reserved keys {sorted(reserved)}; they are transfer agent "
+                "constructor arguments, not NIXL backend parameters"
+            )
+        unknown = set(backend_params) - _BACKEND_PARAMS_KNOWN_KEYS
+        if unknown:
+            logger.warning(
+                f"Unknown NIXL backend_params keys {sorted(unknown)}; NIXL "
+                "silently ignores keys it does not consume, check for typos"
+            )
         # Explicit config wins over the legacy env-var defaults above.
         kwargs.update(backend_params)
         engine_config = backend_params.get("engine_config")

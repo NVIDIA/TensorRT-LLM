@@ -4549,17 +4549,33 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "reuse disabled or set to all_reusable. Invalid static settings fail at "
         "startup; per-request constraints reject the request.")
 
-    backend_params: Optional[Dict[str, str]] = Field(
+    backend_params: Optional[Dict[str, Union[str, int, float]]] = Field(
         default=None,
         description=
-        "Extra key/value parameters forwarded verbatim to the NIXL backend at "
-        "creation (nixlAgent.createBackend), e.g. 'device_list', "
-        "'engine_config' (comma-separated UCX KEY=VALUE pairs, keys uppercase "
-        "without the UCX_ prefix), 'num_workers'. For keys named in "
+        "Extra key/value parameters forwarded to the NIXL backend at creation "
+        "(nixlAgent.createBackend); values are normalized to strings. Known "
+        "keys: 'device_list' (IB device names without port suffix, "
+        "multiple devices separated by ', '; NIXL forces port 1 and Ethernet "
+        "interface names are not supported), 'engine_config' (comma-separated "
+        "UCX KEY=VALUE pairs, keys uppercase without the UCX_ prefix; values "
+        "must not contain commas, so multi-value variables like UCX_TLS "
+        "cannot be set this way), 'num_workers', 'num_threads', "
+        "'split_batch_size', 'ucx_num_device_channels', "
+        "'ucx_error_handling_mode' ('none'|'peer'). For keys named in "
         "'engine_config' the matching UCX_<KEY> environment variables are "
         "unset before agent creation so the configured values take effect. "
         "Only used by the Python (v2) transceiver with the NIXL backend.",
         status="prototype")
+
+    @field_validator('backend_params')
+    @classmethod
+    def normalize_backend_params(
+        cls, v: Optional[Dict[str, Union[str, int,
+                                         float]]]) -> Optional[Dict[str, str]]:
+        """Normalize backend_params values to strings for the NIXL backend."""
+        if v is None:
+            return None
+        return {key: str(value) for key, value in v.items()}
 
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
