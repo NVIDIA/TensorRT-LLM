@@ -49,7 +49,8 @@ class KVSlice:
     Monolithic transfers omit ``token_range`` and cover ``prompt_len``.
     Pipelined transfers use a block-aligned ``token_range`` and mark only the
     final chunk with ``is_last_slice``. Block lists may omit cached or evicted
-    prefixes.
+    prefixes. Paged-attention block lists contain beam 0 only; the receiver
+    replicates its final partial block to the other beams locally.
     """
 
     layer_range: Optional[LayerRange] = None
@@ -98,7 +99,6 @@ class SessionArgsBase:
     params: DisaggregatedParams
     # Captured from LlmRequest.prompt_len; needed for SWA stale_end derivation.
     prompt_len: int
-    beam_width: int = 1
 
 
 def get_unique_rid(request: LlmRequest) -> Optional[int]:

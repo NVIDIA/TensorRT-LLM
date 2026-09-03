@@ -1005,6 +1005,10 @@ public:
     //! whether a subsequent refreshBlocks()/syncTransfers() is necessary.
     bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
+    //! \brief Copy beam 0's final partial attention block to every other beam.
+    //! \return true iff at least one async block transfer was issued.
+    bool copyLastAttentionBlockToAllBeams(GenerationRequest& sequence, SizeType32 validTokens);
+
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
@@ -1585,6 +1589,10 @@ public:
     //! the placeholder block). It should be called after every context chunk is processed.
     //! \return true iff at least one async block transfer was actually issued.
     bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
+
+    //! \brief Copy beam 0's final partial attention block across all non-recurrent window managers.
+    //! \return true iff at least one async block transfer was issued.
+    bool copyLastAttentionBlockToAllBeams(GenerationRequest& sequence, SizeType32 validTokens);
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
@@ -2522,6 +2530,10 @@ public:
 
     //! \brief Batch variant of copyLinearAttentionBlock. Returns true iff at least one copy was issued.
     bool copyLinearAttentionBlockBatch(std::vector<std::shared_ptr<LlmRequest>> const& llmRequests);
+
+    //! \brief Copy beam 0's final partial attention block to every other beam after disaggregated KV transfer.
+    //! \return true iff at least one async block transfer was issued. Call refreshBlocks() before the next forward.
+    bool copyLastAttentionBlockToAllBeams(LlmRequest const& llmRequest);
 
     void addSequenceBatch(
         std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,

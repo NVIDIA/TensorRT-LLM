@@ -425,6 +425,109 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._gen_consensus.assert_called_once_with([])
 
 
+def test_sync_receive_copies_beam_tail_before_marking_complete() -> None:
+    rid = 17
+    req = SimpleNamespace(
+        request_id=rid,
+        py_disaggregated_params=SimpleNamespace(disagg_request_id=rid),
+        state=None,
+        set_kv_cache_size=Mock(),
+    )
+    session = _FakeSession(rid, WaitResult.COMPLETED)
+    session.receive = Mock()
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=session))
+    transceiver._create_kv_slice = Mock(return_value=object())
+    transceiver._slice_num_bytes = Mock(return_value=1)
+    transceiver._kv_size_rank_factor = 1
+    transceiver._need_aux_transfer = Mock(return_value=False)
+    transceiver._assert_disagg_history_declared = Mock()
+    copied_states = []
+    transceiver._copy_last_attention_block_to_all_beams = lambda request: copied_states.append(
+        request.state
+    )
+
+    transceiver.request_and_receive_sync(req)
+
+    assert copied_states == [LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS]
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert session.closed
+
+
+def test_sync_receive_marks_copy_failure_as_transfer_error() -> None:
+    rid = 19
+    req = SimpleNamespace(
+        request_id=rid,
+        py_disaggregated_params=SimpleNamespace(disagg_request_id=rid),
+        state=None,
+        set_kv_cache_size=Mock(),
+    )
+    session = _FakeSession(rid, WaitResult.COMPLETED)
+    session.receive = Mock()
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=session))
+    transceiver._create_kv_slice = Mock(return_value=object())
+    transceiver._slice_num_bytes = Mock(return_value=1)
+    transceiver._kv_size_rank_factor = 1
+    transceiver._copy_last_attention_block_to_all_beams = Mock(
+        side_effect=RuntimeError("copy failed")
+    )
+
+    with pytest.raises(RuntimeError, match="copy failed"):
+        transceiver.request_and_receive_sync(req)
+
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert session.closed
+
+
+def test_async_receive_copies_beam_tail_before_marking_complete() -> None:
+    rid = 18
+    req = SimpleNamespace(
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        py_kv_cache_xfer_bytes=123,
+        set_kv_cache_size=Mock(),
+    )
+    session = _FakeSession(rid, WaitResult.COMPLETED, is_completed=True)
+    session.transfer_end_time = None
+    session.kv_cache_size_bytes = 0
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: req}
+    transceiver._collect_done = Mock(return_value=([rid], []))
+    transceiver._gen_consensus = Mock(return_value=[rid])
+    transceiver._build_to_process = Mock(return_value=[rid])
+    transceiver._gen_consensus_outcome = lambda _ids, cancelled, failed, completed: (
+        cancelled,
+        failed,
+        completed,
+    )
+    transceiver._need_aux_transfer = Mock(return_value=False)
+    transceiver._assert_disagg_history_declared = Mock()
+    transceiver._close_failed_sessions = Mock()
+    copied_states = []
+    transceiver._copy_last_attention_block_to_all_beams = lambda request: copied_states.append(
+        request.state
+    )
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
+
+    assert completed == [rid]
+    assert failed == []
+    assert cancelled == []
+    assert copied_states == [LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS]
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert session.closed
+
+
 def test_consensus_outcome_uses_single_batched_allgather() -> None:
     # The outcome and quiescence id lists are exchanged with ONE allgather.
     transceiver = object.__new__(KvCacheTransceiverV2)
@@ -892,7 +995,6 @@ def test_transfer_worker_passes_overall_timeout_to_tx_session(monkeypatch) -> No
         aux_buffer=worker._aux_buffer,
         timeout_s=0.25,
         prompt_len=128,
-        beam_width=1,
         overall_timeout_s=60.0,
     )
 

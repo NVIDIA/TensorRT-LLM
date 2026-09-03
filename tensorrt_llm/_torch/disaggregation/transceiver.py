@@ -325,18 +325,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 allocated_blocks = (
                     req.prompt_len + self._kv_cache_manager.num_extra_kv_tokens + tpb - 1
                 ) // tpb
-                beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
-                    block_ids,
-                    req.py_beam_width,
-                    allocated_blocks,
-                )
-                if beam0_block_ids.size > allocated_blocks:
-                    beam0_block_ids = beam0_block_ids[:allocated_blocks]
-                    block_ids = (
-                        np.concatenate([beam0_block_ids, tail_block_ids])
-                        if tail_block_ids.size > 0
-                        else beam0_block_ids
-                    )
+                if block_ids.size > allocated_blocks:
+                    block_ids = block_ids[:allocated_blocks]
                 # Current PyExecutor cache managers disable KV-cache token sinks,
                 # so SWA block lists contain an evictable prompt prefix followed
                 # by the speculative scratch tail. If token sinks are enabled,
@@ -355,22 +345,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # Drop stale blocks the manager may still expose (V1 pre-eviction).
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = max(0, prompt_blocks - stale_end)
+                if block_ids.size > expected_valid:
+                    block_ids = (
+                        block_ids[-expected_valid:]
+                        if expected_valid > 0
+                        else np.array([], dtype=np.int64)
+                    )
                 # Skip reused blocks that remain after stale-prefix pruning.
                 cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
             else:
                 # Drop the speculative scratch tail; only prompt_len is transferred.
                 if block_ids.size > prompt_blocks:
                     block_ids = block_ids[:prompt_blocks]
-                expected_valid = prompt_blocks
                 cache_skip = cached_per_lg[idx] // tpb
 
-            block_ids = self._trim_packed_beam_block_ids(
-                block_ids,
-                beam_width=req.py_beam_width,
-                total_blocks=prompt_blocks,
-                expected_valid=expected_valid,
-                cache_skip=cache_skip,
-            )
+            if cache_skip > 0:
+                block_ids = (
+                    block_ids[cache_skip:]
+                    if cache_skip < block_ids.size
+                    else np.array([], dtype=np.int64)
+                )
 
             groups.append(block_ids)
 
@@ -410,55 +404,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     total += n * pool.slot_bytes
         return total
 
-    @staticmethod
-    def _split_packed_beam_block_ids(
-        block_ids: np.ndarray,
-        beam_width: int,
-        total_blocks: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Split 1-D block IDs into beam-0 prefix and appended beam-tail blocks."""
-        if beam_width <= 1 or block_ids.size <= total_blocks:
-            return block_ids, np.array([], dtype=np.int64)
-        tail_count = min(beam_width - 1, block_ids.size - total_blocks)
-        if tail_count <= 0:
-            return block_ids, np.array([], dtype=np.int64)
-        return block_ids[:-tail_count], block_ids[-tail_count:]
-
-    @staticmethod
-    def _trim_packed_beam_block_ids(
-        block_ids: np.ndarray,
-        beam_width: int,
-        total_blocks: int,
-        expected_valid: int,
-        cache_skip: int,
-    ) -> np.ndarray:
-        """Trim/skip beam-0 blocks while preserving packed beam-tail blocks."""
-        if expected_valid <= 0:
-            return np.array([], dtype=np.int64)
-
-        beam0_block_ids, tail_block_ids = KvCacheTransceiverV2._split_packed_beam_block_ids(
-            block_ids, beam_width, total_blocks
-        )
-
-        if beam0_block_ids.size > expected_valid:
-            beam0_block_ids = (
-                beam0_block_ids[-expected_valid:]
-                if expected_valid > 0
-                else np.array([], dtype=np.int64)
-            )
-            if beam0_block_ids.size == 0:
-                tail_block_ids = np.array([], dtype=np.int64)
-
-        if cache_skip > 0:
-            if cache_skip < beam0_block_ids.size:
-                beam0_block_ids = beam0_block_ids[cache_skip:]
-            else:
-                beam0_block_ids = np.array([], dtype=np.int64)
-                tail_block_ids = np.array([], dtype=np.int64)
-
-        if tail_block_ids.size == 0:
-            return beam0_block_ids
-        return np.concatenate([beam0_block_ids, tail_block_ids])
+    def _copy_last_attention_block_to_all_beams(self, req: LlmRequest) -> None:
+        """Replicate received prompt KV into every beam's final partial block."""
+        if req.py_beam_width <= 1:
+            return
+        if isinstance(self._kv_cache_manager, KVCacheManagerV2):
+            raise ValueError("Disaggregated beam search requires KVCacheManager V1")
+        if not isinstance(self._kv_cache_manager, KVCacheManager):
+            raise TypeError("Disaggregated beam search requires a V1 attention KV cache manager")
+        if self._kv_cache_manager.copy_last_attention_block_to_all_beams(req):
+            self._kv_cache_manager.impl.refresh_blocks()
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
@@ -833,6 +788,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if result == WaitResult.COMPLETED:
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
                 req.set_kv_cache_size(self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor)
+                self._copy_last_attention_block_to_all_beams(req)
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
@@ -1018,11 +974,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     kv_cache_size=req.kv_cache_size,
                 )
 
+        fanout_failed = []
         for rid in completed:
             session = self._recv_sessions[rid]
             req = self._recv_reqs[rid]
             # transfer_end already stamped at completion detection above.
             req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
+            try:
+                self._copy_last_attention_block_to_all_beams(req)
+            except Exception:
+                logger.exception(
+                    "Failed to replicate the final attention block for disaggregated "
+                    f"beam request {rid}"
+                )
+                fanout_failed.append(rid)
+                continue
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
             self._assert_disagg_history_declared(req)
@@ -1030,6 +996,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session.close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+        if fanout_failed:
+            failed.extend(fanout_failed)
+            completed = [rid for rid in completed if rid not in fanout_failed]
         if failed:
             logger.warning(
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "
