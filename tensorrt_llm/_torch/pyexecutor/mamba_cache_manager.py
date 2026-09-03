@@ -1063,6 +1063,10 @@ class PythonMambaCacheManager(BaseResourceManager):
     def use_replay_state_update(self) -> bool:
         return self.get_replay_state_update_metadata() is not None
 
+    @property
+    def use_kda_replay_update(self) -> bool:
+        return self._use_kda_replay_update
+
     def get_replay_state_update_metadata(
             self) -> Optional[ReplayStateUpdateMetadata]:
         if (not self._use_replay_state_update
@@ -1277,6 +1281,10 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     @property
     def use_replay_state_update(self) -> bool:
         return self.get_replay_state_update_metadata() is not None
+
+    @property
+    def use_kda_replay_update(self) -> bool:
+        return self._impl.use_kda_replay_update
 
     def get_replay_state_update_metadata(
             self) -> Optional[ReplayStateUpdateMetadata]:

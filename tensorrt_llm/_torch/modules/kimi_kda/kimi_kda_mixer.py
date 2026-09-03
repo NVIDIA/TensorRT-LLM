@@ -308,13 +308,9 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_pool = layer_cache.conv  # [slots, 3D, W - 1] bf16
         ssm_pool = layer_cache.temporal  # [slots, H, V, K] fp32
-        generation_state_indices = state_indices[num_prefills:]
-        # A contiguous slice can still start at an address that CuTe's DLPack
-        # bridge cannot consume. Allocate and copy only for that offset case.
-        if num_generations > 0 and generation_state_indices.data_ptr() % 16:
-            aligned_state_indices = torch.empty_like(generation_state_indices)
-            aligned_state_indices.copy_(generation_state_indices)
-            generation_state_indices = aligned_state_indices
+        generation_state_indices = getattr(mamba_metadata, "generation_state_indices", None)
+        if generation_state_indices is None:
+            generation_state_indices = state_indices[num_prefills:]
 
         outputs: List[torch.Tensor] = []
         if num_prefills > 0:

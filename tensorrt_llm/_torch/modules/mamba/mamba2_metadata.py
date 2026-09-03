@@ -507,6 +507,19 @@ class Mamba2Metadata:
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
 
+        # KDA's CuTe verify kernel requires a 16-byte-aligned DLPack pointer.
+        # A mixed batch can offset the generation view past context rows, so
+        # materialize the aligned copy during metadata prep, not model forward.
+        generation_state_indices = self.state_indices[num_contexts:batch_size]
+        if (getattr(kv_cache_manager, "use_kda_replay_update", False)
+                and generation_state_indices.numel() > 0
+                and generation_state_indices.data_ptr() % 16):
+            self.generation_state_indices = torch.empty_like(
+                generation_state_indices)
+            self.generation_state_indices.copy_(generation_state_indices)
+        elif hasattr(self, "generation_state_indices"):
+            self.generation_state_indices = None
+
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)
 

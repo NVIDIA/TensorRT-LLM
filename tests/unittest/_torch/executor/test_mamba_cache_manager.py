@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
+    MambaCacheManager,
     MambaHybridCacheManagerV2,
     MambaRole,
     MixedMambaHybridCacheManager,
@@ -3447,6 +3448,13 @@ def test_v2_kda_replay_validates_configuration(
             conv_state_layout=conv_state_layout,
             kda_replay_num_spec=num_spec,
         )
+
+
+def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
+    mgr = object.__new__(MambaCacheManager)
+    mgr._impl = SimpleNamespace(use_kda_replay_update=True)
+
+    assert mgr.use_kda_replay_update
 
 
 def test_v2_kda_replay_records_acceptance_and_skips_dummy_rows():

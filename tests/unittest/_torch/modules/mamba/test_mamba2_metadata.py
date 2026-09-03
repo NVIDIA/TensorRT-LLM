@@ -138,6 +138,48 @@ class TestMamba2Metadata:
         assert metadata.chunk_indices is not None
         assert metadata.chunk_offsets is not None
 
+    def test_prepare_materializes_aligned_kda_generation_indices(self) -> None:
+        class KdaCacheManager:
+            use_kda_replay_update = True
+
+            def __init__(self) -> None:
+                self.state_indices = torch.tensor([9, 4, 7], dtype=torch.int32, device="cuda")
+
+            def get_state_indices(
+                self, request_ids: list[int], is_padding: list[bool]
+            ) -> torch.Tensor:
+                return self.state_indices[: len(request_ids)]
+
+        manager = KdaCacheManager()
+        metadata = Mamba2Metadata(max_batch_size=3, chunk_size=8)
+        seq_lens = torch.tensor([2, 1, 1], dtype=torch.int)
+        attn_metadata = SimpleNamespace(
+            seq_lens=seq_lens,
+            seq_lens_cuda=seq_lens.cuda(),
+            num_contexts=1,
+            num_ctx_tokens=2,
+            kv_cache_manager=manager,
+            request_ids=[10, 11, 12],
+            kv_cache_params=SimpleNamespace(
+                num_cached_tokens_per_seq=torch.tensor([0], dtype=torch.int),
+            ),
+        )
+
+        metadata.prepare(attn_metadata)
+
+        assert metadata.state_indices[1:].data_ptr() % 16 != 0
+        assert metadata.generation_state_indices.data_ptr() % 16 == 0
+        torch.testing.assert_close(
+            metadata.generation_state_indices,
+            torch.tensor([4, 7], dtype=torch.int32, device="cuda"),
+        )
+
+        attn_metadata.num_contexts = 0
+        attn_metadata.num_ctx_tokens = 0
+        metadata.prepare(attn_metadata)
+
+        assert metadata.generation_state_indices is None
+
     def test_prepare_replay_work_items_write_first(self):
         class ReplayCacheManager:
             use_replay_state_update = True
