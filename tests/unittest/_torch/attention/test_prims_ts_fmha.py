@@ -16,7 +16,7 @@
 import math
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -151,6 +151,7 @@ def _support_result(
     use_kv_cache_v2: bool = False,
     enable_swa_scratch_reuse: bool = False,
     phase: FmhaPhase | None = None,
+    sm_version: int = 100,
 ) -> tuple[bool, str]:
     attn = _Attention(
         head_dim=head_dim,
@@ -239,15 +240,16 @@ def _support_result(
     fmha = PrimsTSFmha(attn)
     k = _TensorSpec((4, attn.num_kv_heads * head_dim), dtype) if has_separate_kv else None
     v = _TensorSpec((4, attn.num_kv_heads * head_dim), dtype) if has_separate_kv else None
-    return fmha._is_supported_with_reason(
-        q,
-        k,
-        v,
-        attn,
-        metadata,
-        forward_args,
-        phase=phase,
-    )
+    with patch.object(prims_ts_module, "get_sm_version", return_value=sm_version):
+        return fmha._is_supported_with_reason(
+            q,
+            k,
+            v,
+            attn,
+            metadata,
+            forward_args,
+            phase=phase,
+        )
 
 
 @pytest.mark.parametrize(
@@ -297,6 +299,41 @@ def test_supported_matrix(case: dict) -> None:
     supported, reason = _support_result(**case)
 
     assert supported, reason
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("sm_version", [100, 103])
+@pytest.mark.parametrize(
+    ("attention_input_type", "phase"),
+    [
+        pytest.param(AttentionInputType.context_only, FmhaPhase.CONTEXT, id="context"),
+        pytest.param(AttentionInputType.mixed, FmhaPhase.CONTEXT, id="mixed-context"),
+        pytest.param(AttentionInputType.mixed, FmhaPhase.GENERATION, id="mixed-generation"),
+        pytest.param(
+            AttentionInputType.generation_only,
+            FmhaPhase.GENERATION,
+            id="generation",
+        ),
+    ],
+)
+def test_sm103_fp16_bf16_context_uses_fallback(
+    attention_input_type: AttentionInputType,
+    phase: FmhaPhase,
+    sm_version: int,
+    dtype: torch.dtype,
+) -> None:
+    supported, reason = _support_result(
+        attention_input_type=attention_input_type,
+        dtype=dtype,
+        phase=phase,
+        sm_version=sm_version,
+    )
+
+    expected = sm_version == 100 or attention_input_type == AttentionInputType.generation_only
+    assert supported is expected
+    if not expected:
+        assert "SM103" in reason
+        assert "paged-KV cache tails" in reason
 
 
 @pytest.mark.parametrize("phase", [FmhaPhase.CONTEXT, FmhaPhase.GENERATION])

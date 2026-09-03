@@ -18,6 +18,8 @@ import torch
 from backend_case import BackendCase, generate_inputs, run_backend, run_case
 from utils.util import isSM100Family
 
+from tensorrt_llm._utils import get_sm_version
+
 pytestmark = pytest.mark.skipif(
     not isSM100Family(),
     reason="PrimsTS attention kernels require SM100 or SM103",
@@ -91,7 +93,9 @@ def test_prims_ts_qwen2_gqa(
     use_kv_cache_manager_v2: bool,
     phase_args: dict,
 ) -> None:
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    has_context = phase_args["num_contexts"] > 0
+    fmha_libs = "prims_ts,fallback" if has_context and get_sm_version() == 103 else "prims_ts"
+    monkeypatch.setenv("TLLM_FMHA_LIBS", fmha_libs)
     case = BackendCase(
         **_QWEN2_7B,
         **phase_args,
@@ -104,7 +108,10 @@ def test_prims_ts_qwen2_gqa(
 def test_prims_ts_fp16_dense_context_with_alternate_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    # PrimTS context is intentionally disabled on SM103 until its paged-V
+    # loader zero-fills unused final-page rows before the PV matrix multiply.
+    fmha_libs = "prims_ts,fallback" if get_sm_version() == 103 else "prims_ts"
+    monkeypatch.setenv("TLLM_FMHA_LIBS", fmha_libs)
     case = BackendCase(
         num_heads=8,
         num_kv_heads=2,
