@@ -697,6 +697,7 @@ class HfWeightLoader(BaseWeightLoader):
         active_communicator,
         **kwargs,
     ) -> tuple[dict[str, Any], RankStripedReadAheadSession | None]:
+        """Load weights via rank-striped read-ahead, or fall back to native."""
         node_communicator = None
         split_error = None
         try:
@@ -887,6 +888,7 @@ class HfWeightLoader(BaseWeightLoader):
                              _local_communicator=None,
                              _allow_prefetch: bool = True,
                              **kwargs) -> dict[str, Any]:
+        """Load weights with the native (no read-ahead) I/O policy."""
         if self._requires_lazy_safetensors(checkpoint_dir):
             return self._load_lazy_safetensors(checkpoint_dir, use_consolidated)
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")

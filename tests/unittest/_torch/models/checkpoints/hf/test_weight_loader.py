@@ -16,6 +16,7 @@
 import mmap
 import os
 import threading
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -523,7 +524,9 @@ def test_kimi_k3_lazy_load_records_the_checkpoint_dir(tmp_path):
 
 
 @pytest.mark.parametrize("model_type", _LAZY_SAFETENSORS_MODEL_TYPES)
-def test_requires_lazy_safetensors_for_every_listed_model_type(tmp_path, model_type):
+def test_requires_lazy_safetensors_for_every_listed_model_type(
+    tmp_path: Path, model_type: str
+) -> None:
     """Each model type in the table routes to the lazy (mmapped) load path."""
     import json
 
@@ -532,7 +535,9 @@ def test_requires_lazy_safetensors_for_every_listed_model_type(tmp_path, model_t
 
 
 @pytest.mark.parametrize("config", [{"model_type": "llama"}, {}])
-def test_requires_lazy_safetensors_is_false_for_other_checkpoints(tmp_path, config):
+def test_requires_lazy_safetensors_is_false_for_other_checkpoints(
+    tmp_path: Path, config: dict[str, str]
+) -> None:
     """Any other model type, or no model type at all, takes the eager path."""
     import json
 
@@ -540,6 +545,6 @@ def test_requires_lazy_safetensors_is_false_for_other_checkpoints(tmp_path, conf
     assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is False
 
 
-def test_requires_lazy_safetensors_is_false_without_a_config(tmp_path):
+def test_requires_lazy_safetensors_is_false_without_a_config(tmp_path: Path) -> None:
     """A directory without config.json cannot opt in to lazy loading."""
     assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is False
