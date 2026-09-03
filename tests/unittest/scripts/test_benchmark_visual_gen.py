@@ -1008,14 +1008,17 @@ touch "$TRTLLM_MEDIA_STORAGE_PATH/generated.mp4"
 
 
 def test_client_uses_existing_server_without_owning_it(tmp_path: Path) -> None:
-    model = "nvidia/Cosmos3-Nano"
+    model_path = tmp_path / "Cosmos3-Nano"
+    model_path.mkdir()
+    model = str(model_path)
+    reported_model = model_path.name
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             if self.path == "/health":
                 payload = b"ok"
             elif self.path == "/v1/models":
-                payload = json.dumps({"data": [{"id": model}]}).encode("utf-8")
+                payload = json.dumps({"data": [{"id": reported_model}]}).encode("utf-8")
             else:
                 self.send_error(404)
                 return
@@ -1073,6 +1076,7 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
             DRY_RUN="false",
             HOST="127.0.0.1",
             PORT=str(server.server_port),
+            MODEL=model,
             SERVER_TIMEOUT="1",
             PYTHON_BIN=str(python_wrapper),
             SAVE_DETAILED="false",

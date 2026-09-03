@@ -112,7 +112,9 @@ verify_server_model() {
     fi
     if ! "$PYTHON_BIN" -c '
 import json
+import os
 import sys
+from pathlib import Path
 
 expected_model, raw_response = sys.argv[1:]
 try:
@@ -120,7 +122,10 @@ try:
 except json.JSONDecodeError as exc:
     raise SystemExit(f"invalid JSON from /v1/models: {exc}") from exc
 model_ids = [item.get("id") for item in response.get("data", []) if isinstance(item, dict)]
-if expected_model not in model_ids:
+model_matches = expected_model in model_ids
+if not model_matches and os.path.exists(expected_model):
+    model_matches = Path(expected_model).name in model_ids
+if not model_matches:
     raise SystemExit(
         f"expected model {expected_model!r}, but /v1/models reported {model_ids!r}"
     )
