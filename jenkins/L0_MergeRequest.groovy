@@ -135,6 +135,8 @@ def ONLY_MULTI_GPU_TEST = "only_multi_gpu_test"
 @Field
 def DISABLE_MULTI_GPU_TEST = "disable_multi_gpu_test"
 @Field
+def FULL_SINGLE_GPU_RUN = "full_single_gpu_run"
+@Field
 def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
@@ -191,6 +193,7 @@ def testFilter = [
     (ADD_MULTI_GPU_TEST): gitlabParamsFromBot.get((ADD_MULTI_GPU_TEST), false),
     (ONLY_MULTI_GPU_TEST): gitlabParamsFromBot.get((ONLY_MULTI_GPU_TEST), false) || gitlabParamsFromBot.get((ENABLE_MULTI_GPU_TEST), false),
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
+    (FULL_SINGLE_GPU_RUN): gitlabParamsFromBot.get((FULL_SINGLE_GPU_RUN), false),
     (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_ONE_GROUP_CHANGED): "",
@@ -761,51 +764,235 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
     return result
 }
 
-// Gate multi-GPU stages behind 'ci: full pre-merge approved' label.
-// Uses trtllm_utils.validatePRLabelApproval() from the shared lib to verify
-// both label existence and that the labeler is an active team member.
-// Exempt: PostMerge pipelines and GitLab MR builds (no GITHUB_PR_API_URL).
-def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
+def getGithubPrNumber(globalVars) {
+    def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
+    return prMatch ? prMatch[0][1] : null
+}
+
+// Check the existing approval label without deciding whether the new automatic
+// full-approval path may be used. API failures retain the existing fail-open
+// behavior so this feature does not make the current label gate less available.
+def checkMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
     if (!globalVars[GITHUB_PR_API_URL]) {
-        echo "[requireMultiGpuApprovalLabel] Skipping label check: not a GitHub PR (no GITHUB_PR_API_URL)"
-        return false
+        echo "[checkMultiGpuApprovalLabel] Skipping label check: not a GitHub PR (no GITHUB_PR_API_URL)"
+        return [allowed: true]
     }
     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-        echo "[requireMultiGpuApprovalLabel] Skipping label check: PostMerge pipeline is exempt"
-        return false
+        echo "[checkMultiGpuApprovalLabel] Skipping label check: PostMerge pipeline is exempt"
+        return [allowed: true]
     }
 
-    def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
-    if (!prMatch) {
-        echo "[requireMultiGpuApprovalLabel] Could not extract PR number from ${globalVars[GITHUB_PR_API_URL]}. Failing open."
-        return false
+    def prNumber = getGithubPrNumber(globalVars)
+    if (!prNumber) {
+        echo "[checkMultiGpuApprovalLabel] Could not extract PR number from ${globalVars[GITHUB_PR_API_URL]}. Failing open."
+        return [allowed: true]
     }
-    def prNumber = prMatch[0][1]
 
     def result = trtllm_utils.validatePRLabelApproval(pipeline, prNumber, "ci: full pre-merge approved")
     if (!result.checkCompleted) {
-        // API error — fail-open: do not block CI if the label check itself fails
-        echo "[requireMultiGpuApprovalLabel] Label validation incomplete (${result.error}). Failing open."
-        return false
+        echo "[checkMultiGpuApprovalLabel] Label validation incomplete (${result.error}). Failing open."
+        return [allowed: true]
     }
     if (result.labelExists && result.authorized) {
-        return false
+        return [allowed: true]
     }
 
-    // Label missing or unauthorized — write description marker for wrapper
-    // to surface in PR comment, and return the block reason string.
-    def existingDesc = currentBuild.description ?: ""
-    currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
-        "<span data-multi-gpu-label-required='true'>" +
-        "Multi-GPU tests require label 'ci: full pre-merge approved'" +
-        "</span>"
     def reason = !result.labelExists
         ? "label 'ci: full pre-merge approved' is not present on this PR"
         : "label 'ci: full pre-merge approved' was applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
-    def blockMsg = "${arch} Multi-GPU tests blocked: ${reason}. " +
-         "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, then re-trigger CI."
-    echo "[requireMultiGpuApprovalLabel] ${blockMsg}"
-    return blockMsg
+    echo "[checkMultiGpuApprovalLabel] ${arch} Multi-GPU tests are not label-approved: ${reason}."
+    return [allowed: false, prNumber: prNumber, blockReason: reason]
+}
+
+def getMultiGpuLabelBlockMessage(String arch, String reason) {
+    return "${arch} Multi-GPU tests blocked: ${reason}. " +
+        "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, then re-trigger CI."
+}
+
+// Query GitHub's aggregate required-review decision. This is fail-closed for
+// the new automatic path: only an exact APPROVED result can bypass the label.
+def checkPullRequestFullApproval(pipeline, prNumber) {
+    def result = [checkCompleted: false, approved: false, error: null]
+    if (!(prNumber?.toString() ==~ /\d+/)) {
+        result.error = "Invalid PR number: ${prNumber}"
+        return result
+    }
+
+    def query = '''
+        query($owner: String!, $repo: String!, $number: Int!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+              reviewDecision
+            }
+          }
+        }
+    '''
+    def requestBody = JsonOutput.toJson([
+        query: query,
+        variables: [owner: "NVIDIA", repo: "TensorRT-LLM", number: prNumber.toInteger()],
+    ])
+
+    try {
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'github-cred-trtllm-ci',
+                usernameVariable: 'NOT_USED_YET',
+                passwordVariable: 'GITHUB_API_TOKEN'
+            ),
+        ]) {
+            def responseJson = pipeline.sh(
+                script: """curl --silent --fail --show-error --connect-timeout 10 --max-time 30 \\
+                     --request POST \\
+                     --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \\
+                     --header "Accept: application/vnd.github+json" \\
+                     --header "Content-Type: application/json" \\
+                     --data '${requestBody}' \\
+                     --url "https://api.github.com/graphql" """,
+                returnStdout: true
+            )
+            def response = readJSON text: responseJson, returnPojo: true
+            if (response.get("errors")) {
+                result.error = "GraphQL errors: ${JsonOutput.toJson(response.get('errors'))}"
+                echo "[checkPullRequestFullApproval] ${result.error}"
+                return result
+            }
+            def reviewDecision = response.get("data")?.get("repository")?.get("pullRequest")?.get("reviewDecision")
+            result.checkCompleted = true
+            result.approved = (reviewDecision == "APPROVED")
+            echo "[checkPullRequestFullApproval] PR #${prNumber} reviewDecision: ${reviewDecision}"
+        }
+    } catch (FlowInterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        result.error = e.toString()
+        echo "[checkPullRequestFullApproval] Check failed: ${result.error}"
+    }
+    return result
+}
+
+def getWrapperBuildInfo(globalVars) {
+    def parents = globalVars[ACTION_INFO]?.get("parents", []) ?: []
+    // setupPipelineDescription appends the current L0 build, so the wrapper is
+    // the immediately preceding parent.
+    return parents.size() >= 2 ? parents[-2] : null
+}
+
+def appendMarkerToWrapper(pipeline, globalVars, marker, markerName) {
+    def wrapperBuild = getWrapperBuildInfo(globalVars)
+    if (!wrapperBuild) {
+        echo "[${markerName}] No wrapper parent found; marker was not published."
+        return
+    }
+    trtllm_utils.appendBuildDescription(pipeline, wrapperBuild, marker)
+}
+
+def recordSingleGpuResult(pipeline, singleGpuState, stateLockName, globalVars, String arch, String result) {
+    def publishFullSingleMarker = false
+    pipeline.lock(resource: stateLockName) {
+        if (singleGpuState.singleResults[arch] == "PENDING") {
+            singleGpuState.singleResults[arch] = result
+            echo "[fullSingleGpuGate] ${arch} single-GPU result: ${result}"
+        }
+        if (!singleGpuState.fullSingleMarkerPublished &&
+            singleGpuState.singleResults["x86_64"] == "SUCCESS" &&
+            singleGpuState.singleResults["SBSA"] == "SUCCESS") {
+            singleGpuState.fullSingleMarkerPublished = true
+            publishFullSingleMarker = true
+        }
+    }
+
+    if (publishFullSingleMarker) {
+        appendMarkerToWrapper(
+            pipeline,
+            globalVars,
+            '<span data-both-single-gpu-jobs-succeeded="true">Both x86_64 and SBSA single-GPU jobs succeeded</span>',
+            "fullSingleGpuGate"
+        )
+    }
+}
+
+def publishMultiGpuLabelRequiredMarker(pipeline, singleGpuState, stateLockName, globalVars) {
+    def publishMarker = false
+    pipeline.lock(resource: stateLockName) {
+        if (!singleGpuState.labelRequiredMarkerPublished) {
+            singleGpuState.labelRequiredMarkerPublished = true
+            publishMarker = true
+        }
+    }
+    if (!publishMarker) {
+        return
+    }
+
+    def marker = "<span data-multi-gpu-label-required='true'>" +
+        "Multi-GPU tests require label 'ci: full pre-merge approved'" +
+        "</span>"
+    def existingDesc = currentBuild.description ?: ""
+    currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") + marker
+    appendMarkerToWrapper(pipeline, globalVars, marker, "multiGpuLabelGate")
+}
+
+def resolveMultiGpuGate(pipeline, singleGpuState, stateLockName, globalVars,
+                        boolean isFullSingleGpuRun, boolean currentSingleGpuSucceeded,
+                        String arch) {
+    def gate = null
+    // Serialize the one-time API decision separately from the short-lived state
+    // lock, so a slow GitHub request cannot prevent the sibling from recording
+    // its completed single-GPU result.
+    pipeline.lock(resource: "${stateLockName}-gate") {
+        def shouldEvaluate = false
+        pipeline.lock(resource: stateLockName) {
+            shouldEvaluate = (singleGpuState.gateDecision == "UNCHECKED")
+        }
+        if (shouldEvaluate) {
+            def labelCheck = checkMultiGpuApprovalLabel(pipeline, globalVars, arch)
+            def decision = null
+            def reason = ""
+            if (labelCheck.allowed) {
+                decision = "LABEL_ALLOWED"
+            } else if (!isFullSingleGpuRun || !currentSingleGpuSucceeded) {
+                decision = "DENIED"
+                reason = labelCheck.blockReason
+            } else {
+                def approval = checkPullRequestFullApproval(pipeline, labelCheck.prNumber)
+                if (approval.checkCompleted && approval.approved) {
+                    decision = "AUTO_ALLOWED"
+                } else {
+                    decision = "DENIED"
+                    reason = labelCheck.blockReason
+                    if (!approval.checkCompleted) {
+                        echo "[fullSingleGpuGate] Full approval could not be verified (${approval.error}); automatic multi-GPU dispatch is disabled."
+                    }
+                }
+            }
+            pipeline.lock(resource: stateLockName) {
+                singleGpuState.gateDecision = decision
+                singleGpuState.gateReason = reason
+            }
+            echo "[fullSingleGpuGate] Gate decision: ${decision}"
+        }
+        pipeline.lock(resource: stateLockName) {
+            gate = [decision: singleGpuState.gateDecision, reason: singleGpuState.gateReason]
+        }
+    }
+    return gate
+}
+
+def waitForBothSingleGpuResults(pipeline, singleGpuState, stateLockName, String arch) {
+    echo "[fullSingleGpuGate] ${arch} is waiting for both single-GPU jobs to finish."
+    while (true) {
+        def results = null
+        pipeline.lock(resource: stateLockName) {
+            results = new LinkedHashMap(singleGpuState.singleResults)
+        }
+        if (results.values().every { it == "SUCCESS" }) {
+            return "SUCCESS"
+        }
+        if (results.values().any { it == "NON_SUCCESS" }) {
+            echo "[fullSingleGpuGate] Single-GPU results are not both successful: ${results}"
+            return "NON_SUCCESS"
+        }
+        pipeline.sleep(time: 30, unit: "SECONDS")
+    }
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
@@ -1849,6 +2036,17 @@ def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, platform, i
 
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
+    def singleGpuState = [
+        singleResults: ["x86_64": "PENDING", "SBSA": "PENDING"],
+        gateDecision: "UNCHECKED",
+        gateReason: "",
+        fullSingleMarkerPublished: false,
+        labelRequiredMarkerPublished: false,
+    ]
+    def stateLockName = "trtllm-full-single-gpu-${env.JOB_NAME}-${env.BUILD_NUMBER}"
+        .replaceAll(/[^A-Za-z0-9_.-]/, "-")
+    boolean isFullSingleGpuRun = testFilter[FULL_SINGLE_GPU_RUN]?.toString()?.toBoolean() ?: false
+
     stages = [
         "Release-Check": {
             script {
@@ -1918,6 +2116,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         },
         "x86_64-Linux": {
             script {
+                def singleGpuResultRecorded = false
+                try {
                 // CBTS deliberately does NOT short-circuit at the arch / Build
                 // layer. Build always runs so a wheel exists for sanity checks
                 // and post-merge consumers; case-level narrowing happens later
@@ -1976,6 +2176,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 testStageName = "[Test-x86_64-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
                 def singleGpuInfraIncomplete = false
+                def singleGpuResult = "NON_SUCCESS"
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
@@ -1994,6 +2195,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         // sub-job was infra-incomplete: only infra aborts, no real failure.
                         def singleGpuStatus = launchJob(pipeline, "L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                         singleGpuInfraIncomplete = (singleGpuStatus == "UNSTABLE")
+                        singleGpuResult = (singleGpuStatus == "SUCCESS") ? "SUCCESS" : "NON_SUCCESS"
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -2013,6 +2215,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         }
                     }
                 }
+                recordSingleGpuResult(pipeline, singleGpuState, stateLockName, globalVars, "x86_64", singleGpuResult)
+                singleGpuResultRecorded = true
                 uploadArchCoverage("x86_64", pipeline, testFilter)
 
                 def requireMultiGpuTesting = currentBuild.description?.contains("Require x86_64 Multi-GPU Testing") ?: false
@@ -2053,14 +2257,32 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
-                // Label gate: check before entering the Remote Run stage so a
-                // missing/unauthorized label shows as "Blocked" (not a Remote Run
-                // failure) and does not trigger fail-fast.
-                def x86LabelBlock = requireMultiGpuApprovalLabel(pipeline, globalVars, "x86_64")
-                if (x86LabelBlock) {
+                // An existing valid label preserves the current per-architecture
+                // behavior. Without one, a full run may proceed only after both
+                // single-GPU jobs pass and GitHub reports full approval.
+                def x86Gate = resolveMultiGpuGate(
+                    pipeline,
+                    singleGpuState,
+                    stateLockName,
+                    globalVars,
+                    isFullSingleGpuRun,
+                    singleGpuResult == "SUCCESS",
+                    "x86_64"
+                )
+                if (x86Gate.decision == "DENIED") {
+                    publishMultiGpuLabelRequiredMarker(pipeline, singleGpuState, stateLockName, globalVars)
                     stage("[Test-x86_64-Multi-GPU] Blocked") {
                         catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                            error x86LabelBlock
+                            error getMultiGpuLabelBlockMessage("x86_64", x86Gate.reason)
+                        }
+                    }
+                    return
+                }
+                if (x86Gate.decision == "AUTO_ALLOWED" &&
+                    waitForBothSingleGpuResults(pipeline, singleGpuState, stateLockName, "x86_64") != "SUCCESS") {
+                    stage("[Test-x86_64-Multi-GPU] Blocked") {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            error "x86_64 Multi-GPU tests require both x86_64 and SBSA single-GPU jobs to succeed."
                         }
                     }
                     return
@@ -2097,10 +2319,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         }
                     }
                 }
+                } finally {
+                    if (!singleGpuResultRecorded) {
+                        recordSingleGpuResult(
+                            pipeline, singleGpuState, stateLockName, globalVars, "x86_64", "NON_SUCCESS")
+                    }
+                }
             }
         },
         "SBSA-Linux": {
             script {
+                def singleGpuResultRecorded = false
+                try {
                 if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
@@ -2179,6 +2409,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
                 def singleGpuInfraIncomplete = false
+                def singleGpuResult = "NON_SUCCESS"
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "SBSA test job is skipped due to Jenkins configuration"
@@ -2196,6 +2427,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         // sub-job was infra-incomplete: only infra aborts, no real failure.
                         def singleGpuStatus = launchJob(pipeline, "L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
                         singleGpuInfraIncomplete = (singleGpuStatus == "UNSTABLE")
+                        singleGpuResult = (singleGpuStatus == "SUCCESS") ? "SUCCESS" : "NON_SUCCESS"
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -2215,6 +2447,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         }
                     }
                 }
+                recordSingleGpuResult(pipeline, singleGpuState, stateLockName, globalVars, "SBSA", singleGpuResult)
+                singleGpuResultRecorded = true
 
                 uploadArchCoverage("SBSA", pipeline, testFilter)
 
@@ -2256,11 +2490,29 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
-                def sbsaLabelBlock = requireMultiGpuApprovalLabel(pipeline, globalVars, "SBSA")
-                if (sbsaLabelBlock) {
+                def sbsaGate = resolveMultiGpuGate(
+                    pipeline,
+                    singleGpuState,
+                    stateLockName,
+                    globalVars,
+                    isFullSingleGpuRun,
+                    singleGpuResult == "SUCCESS",
+                    "SBSA"
+                )
+                if (sbsaGate.decision == "DENIED") {
+                    publishMultiGpuLabelRequiredMarker(pipeline, singleGpuState, stateLockName, globalVars)
                     stage("[Test-SBSA-Multi-GPU] Blocked") {
                         catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                            error sbsaLabelBlock
+                            error getMultiGpuLabelBlockMessage("SBSA", sbsaGate.reason)
+                        }
+                    }
+                    return
+                }
+                if (sbsaGate.decision == "AUTO_ALLOWED" &&
+                    waitForBothSingleGpuResults(pipeline, singleGpuState, stateLockName, "SBSA") != "SUCCESS") {
+                    stage("[Test-SBSA-Multi-GPU] Blocked") {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            error "SBSA Multi-GPU tests require both x86_64 and SBSA single-GPU jobs to succeed."
                         }
                     }
                     return
@@ -2294,6 +2546,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         } else {
                             throw e
                         }
+                    }
+                }
+                } finally {
+                    if (!singleGpuResultRecorded) {
+                        recordSingleGpuResult(
+                            pipeline, singleGpuState, stateLockName, globalVars, "SBSA", "NON_SUCCESS")
                     }
                 }
             }

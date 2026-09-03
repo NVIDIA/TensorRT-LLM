@@ -1,0 +1,256 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Auto Full Pre-Merge Approval Label
+
+on:
+  status:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+jobs:
+  auto-full-premerge-approval:
+    if: >-
+      github.repository == 'NVIDIA/TensorRT-LLM' &&
+      ((github.event_name == 'status' &&
+        github.event.context == 'full-single-gpu-tests' &&
+        github.event.state == 'success') ||
+       (github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved'))
+    concurrency:
+      group: auto-full-premerge-${{ github.event.pull_request.head.sha || github.event.sha }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require agent token
+        env:
+          AGENT_TOKEN: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
+        run: |
+          if [[ -z "${AGENT_TOKEN}" ]]; then
+            echo "::error::TRTLLM_AGENT_SHARED_TOKEN is unavailable for this event."
+            exit 1
+          fi
+
+      - name: Add full pre-merge approval label when eligible
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
+          script: |
+            const approvalLabel = 'ci: full pre-merge approved';
+            const fullSingleStatus = 'full-single-gpu-tests';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const sleep = (milliseconds) =>
+              new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+            async function withRetry(description, operation) {
+              const attempts = 3;
+              for (let attempt = 1; attempt <= attempts; attempt += 1) {
+                try {
+                  return await operation();
+                } catch (error) {
+                  if (attempt === attempts) {
+                    throw error;
+                  }
+                  core.warning(
+                    `${description} failed (attempt ${attempt}/${attempts}): ${error.message}`
+                  );
+                  await sleep(1000 * attempt);
+                }
+              }
+            }
+
+            async function getCandidatePullRequests() {
+              if (context.eventName === 'pull_request_review') {
+                return [context.payload.pull_request.number];
+              }
+
+              const pullRequests = await withRetry(
+                `Find pull requests associated with ${context.payload.sha}`,
+                () =>
+                  github.paginate(
+                    'GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls',
+                    {
+                      owner,
+                      repo,
+                      commit_sha: context.payload.sha,
+                      per_page: 100,
+                    }
+                  )
+              );
+              const repository = `${owner}/${repo}`.toLowerCase();
+              return [
+                ...new Set(
+                  pullRequests
+                    .filter(
+                      (pullRequest) =>
+                        pullRequest.state === 'open' &&
+                        pullRequest.base.repo.full_name.toLowerCase() === repository
+                    )
+                    .map((pullRequest) => pullRequest.number)
+                ),
+              ];
+            }
+
+            const pullRequestQuery = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    headRefOid
+                    labels(first: 100) {
+                      nodes {
+                        name
+                      }
+                    }
+                    reviewDecision
+                    state
+                  }
+                }
+              }
+            `;
+
+            async function getPullRequestState(pullNumber) {
+              const result = await withRetry(
+                `Read pull request #${pullNumber}`,
+                () =>
+                  github.graphql(pullRequestQuery, {
+                    owner,
+                    repo,
+                    number: pullNumber,
+                  })
+              );
+              return result.repository.pullRequest;
+            }
+
+            function hasApprovalLabel(pullRequest) {
+              return pullRequest.labels.nodes.some(
+                (label) =>
+                  label.name.toLowerCase() === approvalLabel.toLowerCase()
+              );
+            }
+
+            async function getLatestFullSingleStatus(sha) {
+              const statuses = await withRetry(
+                `Read commit statuses for ${sha}`,
+                () =>
+                  github.paginate(
+                    github.rest.repos.listCommitStatusesForRef,
+                    {
+                      owner,
+                      repo,
+                      ref: sha,
+                      per_page: 100,
+                    }
+                  )
+              );
+              return statuses.find(
+                (status) => status.context === fullSingleStatus
+              );
+            }
+
+            async function findSuccessfulFullSingleStatus(pullNumber) {
+              const commits = await withRetry(
+                `Read commits for pull request #${pullNumber}`,
+                () =>
+                  github.paginate(github.rest.pulls.listCommits, {
+                    owner,
+                    repo,
+                    pull_number: pullNumber,
+                    per_page: 100,
+                  })
+              );
+              const commitShas = commits.map((commit) => commit.sha).reverse();
+              const triggeringSha =
+                context.eventName === 'status' ? context.payload.sha : null;
+
+              if (triggeringSha && commitShas.includes(triggeringSha)) {
+                commitShas.splice(commitShas.indexOf(triggeringSha), 1);
+                commitShas.unshift(triggeringSha);
+              }
+
+              for (const sha of commitShas) {
+                const status = await getLatestFullSingleStatus(sha);
+                if (status?.state === 'success') {
+                  return sha;
+                }
+              }
+              return null;
+            }
+
+            const pullNumbers = await getCandidatePullRequests();
+            if (pullNumbers.length === 0) {
+              console.log('No open pull request is associated with this event.');
+              return;
+            }
+
+            for (const pullNumber of pullNumbers) {
+              const initialState = await getPullRequestState(pullNumber);
+              if (!initialState || initialState.state !== 'OPEN') {
+                console.log(`PR #${pullNumber} is not open; skipping.`);
+                continue;
+              }
+              if (hasApprovalLabel(initialState)) {
+                console.log(`PR #${pullNumber} already has the approval label.`);
+                continue;
+              }
+              if (initialState.reviewDecision !== 'APPROVED') {
+                console.log(`PR #${pullNumber} is not fully approved; skipping.`);
+                continue;
+              }
+
+              const successfulCommit =
+                await findSuccessfulFullSingleStatus(pullNumber);
+              if (!successfulCommit) {
+                console.log(
+                  `PR #${pullNumber} has no successful ${fullSingleStatus} status in its current commit history.`
+                );
+                continue;
+              }
+
+              const finalState = await getPullRequestState(pullNumber);
+              if (!finalState || finalState.state !== 'OPEN') {
+                console.log(`PR #${pullNumber} is no longer open; skipping.`);
+                continue;
+              }
+              if (hasApprovalLabel(finalState)) {
+                console.log(`PR #${pullNumber} already has the approval label.`);
+                continue;
+              }
+              if (finalState.reviewDecision !== 'APPROVED') {
+                console.log(`PR #${pullNumber} is no longer fully approved; skipping.`);
+                continue;
+              }
+              if (finalState.headRefOid !== initialState.headRefOid) {
+                console.log(`PR #${pullNumber} changed during validation; skipping.`);
+                continue;
+              }
+
+              await withRetry(`Add approval label to PR #${pullNumber}`, () =>
+                github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: pullNumber,
+                  labels: [approvalLabel],
+                })
+              );
+              console.log(
+                `Added ${approvalLabel} to PR #${pullNumber}; ${fullSingleStatus} succeeded on ${successfulCommit}.`
+              );
+            }
