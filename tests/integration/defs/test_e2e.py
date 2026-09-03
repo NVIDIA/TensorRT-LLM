@@ -19,7 +19,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -752,7 +751,6 @@ def test_openai_lora(llm_root, llm_venv):
 
 
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
-    time.sleep(5*60)
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
         "-m",
