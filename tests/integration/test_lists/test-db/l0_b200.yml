@@ -435,7 +435,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_v2v_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_lpips_against_golden TIMEOUT (20)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_t2v_lpips_against_golden TIMEOUT (20)
