@@ -92,10 +92,12 @@ def test_sessionless_rank_striped_load_uses_native_io(
     reader_start = mock.Mock(side_effect=AssertionError("must not start"))
     open_weight_session = mock.Mock(side_effect=AssertionError("must not open a session"))
     warning = mock.Mock(side_effect=AssertionError("must not warn"))
+    log_info = mock.Mock()
     monkeypatch.setattr(loader, "_load_weights_native", native_load)
     monkeypatch.setattr(loader, "open_weight_session", open_weight_session)
     monkeypatch.setattr(read_ahead.RankStripedReadAheadSession, "start", reader_start)
     monkeypatch.setattr(weight_loader_module.logger, "warning", warning)
+    monkeypatch.setattr(weight_loader_module.logger, "info", log_info)
     mapping = Mapping()
 
     weights = loader.load_weights("/unused", mapping=mapping)
@@ -111,6 +113,12 @@ def test_sessionless_rank_striped_load_uses_native_io(
     open_weight_session.assert_not_called()
     reader_start.assert_not_called()
     warning.assert_not_called()
+    assert any(
+        "requested=rank_striped_read_ahead" in message
+        and "selected=native" in message
+        and "open_weight_session" in message
+        for message, *_ in (call.args for call in log_info.call_args_list)
+    )
 
 
 def test_checkpoint_io_status_log_escapes_multiline_fallback_reason(
