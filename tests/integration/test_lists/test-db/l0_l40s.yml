@@ -52,6 +52,10 @@ l0_l40s:
   # a decoder-only case rather than adding to it; KV-v2 stays covered on H100.
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_transcribe_end_to_end
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v1-encoder-graphs-on-greedy]
+  # The OpenEngine bindings resolve only from a custom index, so the gateway
+  # install guard in jenkins/L0_Test.groovy pins them to CPU-Generic and here.
+  # This is the one OpenEngine test that needs a GPU: it builds a real LLM.
+  - unittest/grpc/openengine/test_capability_conformance.py
 - condition:
     ranges:
       system_gpu_count:

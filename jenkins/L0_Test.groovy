@@ -4963,17 +4963,21 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             //
             // OpenEngine takes that second branch: its bindings resolve only
             // from a custom index (--extra-index-url https://buf.build/gen/python),
-            // so it owns the CPU-Generic stages -- the only stages whose test
-            // list carries unittest/grpc/openengine/ -- and SMG steps aside
-            // there. No test in l0_cpu.yml imports tensorrt_llm.grpc.smg, so
-            // the swap costs no coverage. The guard is on the stage name and
+            // so it owns the CPU-Generic and L40S-PyTorch stages -- the only
+            // stages whose test list carries unittest/grpc/openengine/ -- and SMG
+            // steps aside there. Neither l0_cpu.yml nor l0_l40s.yml imports
+            // tensorrt_llm.grpc.smg (the SMG tests live only in l0_a10.yml), so
+            // the swap costs no coverage. L40S is in the set because
+            // test_capability_conformance.py builds a real LLM and so needs a
+            // GPU; the rest of the OpenEngine suite stubs the engine and stays
+            // on CPU-Generic. The guard is on the stage name and
             // never on the CBTS scope: `scopes` is the union of every fired
             // rule's scope, so a mixed selection (openengine source + any other
             // narrowing change) would push these pins into every shard it runs.
             // Matched as a substring, like the Ray guard below: a stage name that
             // picks up a prefix or suffix must keep matching, because a missed
             // match here is a silent `importorskip` skip rather than a failure.
-            if (stageName.contains("CPU-Generic")) {
+            if (stageName.contains("CPU-Generic") || stageName.contains("L40S-PyTorch")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
             } else {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
