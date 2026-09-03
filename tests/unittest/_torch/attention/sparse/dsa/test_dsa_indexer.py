@@ -198,6 +198,34 @@ def test_use_self_sampling_gvr(kwargs, expected):
     assert use_self_sampling_gvr(**base) is expected
 
 
+@pytest.mark.parametrize("use_self_sampling_topk", [True, False])
+@pytest.mark.parametrize("use_gvr_emission", [False, True])
+def test_use_gvr_emission_threads_to_params(use_gvr_emission, use_self_sampling_topk):
+    """The emission block-skip flag (third GVR dispatch param) threads from the
+    sparse-attention config into both DSAParams and DSAMetadataParams,
+    independently of the V1/V2 selection. The runtime indexer gate additionally
+    requires the temporal-hint (V1) path + FP4 + paged-MQA to take effect."""
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 128],
+        index_head_dim=96,
+        index_topk=512,
+        indexer_k_dtype="fp8",
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=use_self_sampling_topk,
+        use_gvr_emission=use_gvr_emission,
+    )
+    assert sparse_config.to_sparse_params().use_gvr_emission is use_gvr_emission
+    assert sparse_config.to_sparse_metadata_params().use_gvr_emission is use_gvr_emission
+
+
+def test_use_gvr_emission_defaults_off():
+    """Default keeps the emission block-skip optimization disabled end to end."""
+    sparse_config = DeepSeekV4SparseAttentionConfig(index_topk=512)
+    assert sparse_config.use_gvr_emission is False
+    assert sparse_config.to_sparse_params().use_gvr_emission is False
+    assert sparse_config.to_sparse_metadata_params().use_gvr_emission is False
+
+
 @pytest.mark.parametrize(
     "enable_heuristic,use_cute_dsl,sm_version,compress_ratio,next_n,should_warmup",
     [

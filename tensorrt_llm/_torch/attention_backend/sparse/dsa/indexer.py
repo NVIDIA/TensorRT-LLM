@@ -761,12 +761,14 @@ class Indexer(nn.Module):
             compress_ratio=self.compress_ratio,
             gvr_self_sampling=self._use_self_sampling_topk,
         )
-        # GVR emission-assisted decode (opt-in, experimental): the FP4/FP8
-        # indexer epilogue emits candidates the GVR Top-K consumes (see
-        # gvr_emission / gvr_routing; state lives on the TopK module)
-        # only the FP4 scoring op accepts emission kwargs
+        # Emission block-skip is a temporal-hint (V1) optimization: the FP4
+        # indexer epilogue emits per-block max logits the GVR Top-K consumes to
+        # skip whole blocks (see gvr_emission / gvr_routing; state lives on the
+        # TopK module). Off on the self-sampling path (no cross-step state to
+        # assist) and off non-FP4 / non-paged-MQA layers.
         self.use_gvr_emission = (
-            os.environ.get("TRTLLM_GVR_EMISSION", "0") == "1"
+            sparse_params.use_gvr_emission
+            and not self._use_self_sampling_topk
             and decode_top_k_implementation == TopKImplementation.CUTE_DSL_GVR
             and self.use_cute_dsl_paged_mqa_logits
             and self.use_fp4
