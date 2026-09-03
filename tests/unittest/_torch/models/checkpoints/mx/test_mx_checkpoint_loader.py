@@ -18,10 +18,13 @@ import logging
 import os
 import sys
 from contextlib import ExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
+from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -48,8 +51,11 @@ from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     SOURCE_IDENTITY_FORMAT_VERSION,
+    WEIGHT_MANIFEST_DIR_ENV,
+    WEIGHT_MANIFEST_ROLE_ENV,
     ArtifactIdentity,
     SourceIdentity,
+    load_weight_manifest,
 )
 
 _MISSING = object()
@@ -99,6 +105,21 @@ def _source_instance(
 
 
 pytestmark = pytest.mark.cpu_only
+
+
+class _TinyModule(nn.Module):
+    """Two parameters and a buffer with deterministic CPU values."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.arange(8, dtype=torch.float32).reshape(2, 4))
+        self.bias = nn.Parameter(torch.ones(2))
+        self.register_buffer("scale", torch.tensor([0.5, 0.25]))
+
+
+def _enable_manifests(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str) -> None:
+    monkeypatch.setenv(WEIGHT_MANIFEST_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(WEIGHT_MANIFEST_ROLE_ENV, role)
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +403,94 @@ class TestLoadWeightsMxPath:
         assert loader.is_post_transform_weights_preloaded() is False
         assert result is fallback
         mock_super_load.assert_not_called()
+
+    def test_p2p_full_success_writes_receiver_transfer_manifest(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _enable_manifests(monkeypatch, tmp_path, "receiver")
+        events = []
+        monkeypatch.setattr(
+            mx_checkpoint_loader,
+            "_synchronize_cuda_for_mx_publish",
+            lambda: events.append("synchronize"),
+        )
+        real_write = mx_checkpoint_loader._maybe_write_mx_transfer_manifest
+
+        def _recording_write(*args, **kwargs):
+            events.append("manifest")
+            return real_write(*args, **kwargs)
+
+        monkeypatch.setattr(
+            mx_checkpoint_loader, "_maybe_write_mx_transfer_manifest", _recording_write
+        )
+        identity = _identity()
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        fake_mx = _build_fake_modelexpress(
+            load_weights_return={},
+            source_instances=[_source_instance(identity, post_transform=False)],
+        )
+        model = _TinyModule()
+
+        with _install_fake_modelexpress(fake_mx):
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(name="mapping", rank=0),
+                model=model,
+                source_identity=identity,
+            )
+
+        assert result == {}
+        assert events == ["synchronize", "manifest"]
+        files = sorted(path.name for path in tmp_path.iterdir())
+        assert files == ["manifest.transfer.receiver.rank0.json"]
+        manifest = load_weight_manifest(tmp_path / files[0])
+        assert manifest.context["boundary"] == "receiver_p2p_success"
+        assert manifest.context["checkpoint_format"] == "MX"
+        assert manifest.context["role"] == "receiver"
+        assert manifest.context["rank"] == 0
+        assert [entry.fqn for entry in manifest.entries] == ["bias", "scale", "weight"]
+
+    def test_mixed_success_writes_no_transfer_manifest(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _enable_manifests(monkeypatch, tmp_path, "receiver")
+        identity = _identity()
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        fallback_weight = MagicMock()
+        fallback_weight.numel.return_value = 2
+        fallback_weight.element_size.return_value = 4
+        fake_mx = _build_fake_modelexpress(
+            load_weights_return={"some.weight": fallback_weight},
+            source_instances=[_source_instance(identity, post_transform=False)],
+        )
+
+        with (
+            _install_fake_modelexpress(fake_mx),
+            patch.object(HfCheckpointLoader, "load_weights"),
+        ):
+            loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(name="mapping", rank=0),
+                model=_TinyModule(),
+                source_identity=identity,
+            )
+
+        assert list(tmp_path.iterdir()) == []
+
+    def test_disk_fallback_writes_no_transfer_manifest(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _enable_manifests(monkeypatch, tmp_path, "receiver")
+        loader = MXCheckpointLoader()
+
+        with patch.object(HfCheckpointLoader, "load_weights", return_value={"w": 1}) as disk:
+            result = loader.load_weights(
+                "/nonexistent", mapping=MagicMock(name="mapping", rank=0), model=_TinyModule()
+            )
+
+        disk.assert_called_once()
+        assert result == {"w": 1}
+        assert list(tmp_path.iterdir()) == []
 
     def test_post_transform_full_success_prepares_receiver_before_p2p(self) -> None:
         identity = _identity()
@@ -728,6 +837,51 @@ class TestPublishAsSource:
             loader.publish_as_source(MagicMock(), source_identity=_identity())
 
         assert events == ["synchronize", "publish"]
+
+    def test_publish_writes_donor_transfer_manifest_before_publish(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _enable_manifests(monkeypatch, tmp_path, "donor")
+        identity = _identity()
+        expected = tmp_path / "manifest.transfer.donor.rank0.json"
+        seen_at_publish = []
+
+        def _publish(*_args, **_kwargs):
+            seen_at_publish.append(expected.exists())
+
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        fake_mx = _build_fake_modelexpress(publish_side_effect=_publish)
+        with _install_fake_modelexpress(fake_mx):
+            loader.publish_as_source(_TinyModule(), source_identity=identity)
+
+        assert seen_at_publish == [True]
+        manifest = load_weight_manifest(expected)
+        assert manifest.context["boundary"] == "donor_publish"
+        assert manifest.context["role"] == "donor"
+        assert manifest.context["rank"] == identity.rank
+        assert [entry.fqn for entry in manifest.entries] == ["bias", "scale", "weight"]
+
+    def test_publish_manifest_problem_is_not_swallowed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # The manifest runs outside the best-effort publish guard on purpose.
+        _enable_manifests(monkeypatch, tmp_path, "bad role")
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        fake_mx = _build_fake_modelexpress()
+        with _install_fake_modelexpress(fake_mx), pytest.raises(ValueError, match="role"):
+            loader.publish_as_source(_TinyModule(), source_identity=_identity())
+        fake_mx.trtllm_live_transfer.publish_model_params.assert_not_called()
+
+    def test_publish_without_manifest_env_writes_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv(WEIGHT_MANIFEST_DIR_ENV, raising=False)
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        fake_mx = _build_fake_modelexpress()
+        with _install_fake_modelexpress(fake_mx):
+            loader.publish_as_source(_TinyModule(), source_identity=_identity())
+        fake_mx.trtllm_live_transfer.publish_model_params.assert_called_once()
+        assert list(tmp_path.iterdir()) == []
 
     def test_source_identity_required_for_post_transform_publish(self):
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")

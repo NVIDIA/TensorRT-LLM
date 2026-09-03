@@ -93,7 +93,8 @@ Support for another model family requires a focused qualification change:
 5. Run a real ModelExpress donor/receiver test with the model configurations
    being claimed, including the supported quantization and TP/PP/EP layouts.
    Compare deterministic output token IDs with the standard Hugging Face load
-   path before documenting the family as supported.
+   path, and require the per-rank weight manifests to match (see the
+   qualification test below), before documenting the family as supported.
 
 ### Qualification Test
 
@@ -104,6 +105,35 @@ uses a metadata-only view of the donor's canonical snapshot and contains no
 weight shards. A positive result therefore requires direct transfer; disk
 fallback cannot accidentally satisfy the test.
 
+Each role generates eight fixed prompts for exactly 32 greedy tokens
+(`end_id=-1`, so no sequence stops early), and the test requires exact
+token-ID equality of the donor and the receiver against the HF baseline.
+
+**Weight manifests.** Every rank also writes a SHA-256 manifest of all
+registered parameters and buffers
+(`tensorrt_llm/_torch/weight_sharing/weight_manifest.py`) when
+`MX_WEIGHT_MANIFEST_DIR` is set; the harness sets it for all three roles and
+production loads never write one. Two manifest families are compared byte for
+byte:
+
+- `manifest.final.<role>.rank<N>.json` is written at the end of
+  `ModelLoader.load`, after every post-load hook and MoE load-balancer
+  finalization. Baseline, donor, and receiver must be pairwise identical:
+  same tensor names, dtypes, shapes, strides, storage offsets, digests,
+  skipped-tensor sets, and storage-alias partitions.
+- `manifest.transfer.<role>.rank<N>.json` is written inside the MX checkpoint
+  loader at the donor's publish point and at the receiver's P2P success point
+  (MX roles only). Donor and receiver parameters must be identical at this
+  boundary; derived buffers are enforced at the final tier because the
+  receiver's `cache_derived_state()` runs after the transfer.
+
+A row may list `final_manifest_exempt_patterns` on its `MxE2ECase` to exempt
+named tensors from the final-tier digest comparison. That is never a numeric
+tolerance and never applies to the transfer tier, and every pattern needs a
+code comment explaining why; the current BF16 dense rows exempt nothing.
+Manifests carry a `manifest_format_version`, and manifests of different
+versions never compare.
+
 Run the TP=1 smoke test against an isolated ModelExpress 0.4.1 service with
 NIXL enabled:
 
@@ -112,8 +142,15 @@ TRTLLM_MX_E2E_REQUIRED=1 \
 MODEL_EXPRESS_URL=http://127.0.0.1:8001 \
 LLM_MODELS_ROOT=/path/to/llm-models \
 pytest -v tests/integration/defs/model_express/test_model_express.py \
-  -k llama-bf16-tp1
+  -k llama-bf16-tp1 --output-dir /path/to/artifacts
 ```
+
+With `--output-dir` (always set in CI), the worker payloads, worker logs,
+transfer logs, weight manifests, and `timing.json` are copied to
+`model_express/<case-id>/` under that directory, so they are part of the stage
+results archive even when the test fails. The test also prints one
+`MX E2E timing` line per role and rank with the load, generation, and manifest
+durations.
 
 Run the TP=2 rank-mapping qualification on four GPUs by selecting
 `llama-bf16-tp2`. `TRTLLM_MX_LLAMA_MODEL` can override the default TinyLlama
@@ -149,6 +186,57 @@ Both stages set `TRTLLM_MX_E2E_REQUIRED=1`, so missing service, model, client,
 or NIXL prerequisites fail instead of skipping. Do not add every model profile
 to recurring coverage: use the harness for representative rows claimed by the
 support table and keep wider matrices in scheduled qualification.
+
+### Accuracy Canaries (Post-Merge)
+
+`tests/integration/defs/model_express/test_model_express_accuracy.py` runs one
+reference-backed accuracy task per qualified family on an MX receiver. The donor
+publishes exactly as in the smoke test and never evaluates; the receiver starts
+from the metadata-only snapshot, self-checks its own transfer logs before
+spending any evaluation time (a fallback exits with status 3), evaluates the
+task with `tensorrt_llm.evaluate` inside its own subprocess, and writes the
+score to JSON. The pytest process never constructs an `LLM`: it loads the
+accuracy reference YAMLs, asserts the same hypothesis-testing threshold as
+`tests/integration/defs/accuracy/`, and additionally requires the transfer
+evidence and the donor/receiver weight manifests to match. There is no paired
+HF baseline evaluation because the reference value is that baseline.
+
+Current rows (all TP=1, BF16, `references/*.yaml` hold the expected values):
+
+| Test ID | Model | Task | Model path override |
+| --- | --- | --- | --- |
+| `llama3-8b-instruct-mmlu-tp1` | `meta-llama/Meta-Llama-3-8B-Instruct` | MMLU | `TRTLLM_MX_LLAMA3_8B_MODEL` |
+| `qwen2.5-7b-instruct-mmlu-tp1` | `Qwen/Qwen2.5-7B-Instruct` | MMLU | `TRTLLM_MX_QWEN25_MODEL` |
+| `qwen3-8b-gsm8k-tp1` | `Qwen3/Qwen3-8B` | GSM8K | `TRTLLM_MX_QWEN3_MODEL` |
+
+The rows are registered as `stage: post_merge` entries in
+`tests/integration/test_lists/test-db/l0_model_express.yml`, so they run in
+`DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1` on every main commit and
+never in pre-merge pipelines. Trigger the stage on a pull request with:
+
+```text
+/bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1"
+```
+
+GSM8K needs the `lm_eval` package from `requirements-dev.txt`; the test checks
+for it and, under `TRTLLM_MX_E2E_REQUIRED=1`, fails instead of skipping when it
+is absent. Each run records the donor and receiver load times, the evaluation
+time, the score, and the threshold as junit properties and as
+`model_express_accuracy/<test-id>.json` under `--output-dir`; load times are
+observed only, not gated. To run one canary locally:
+
+```bash
+TRTLLM_MX_E2E_REQUIRED=1 \
+MODEL_EXPRESS_URL=http://127.0.0.1:8001 \
+LLM_MODELS_ROOT=/path/to/llm-models \
+pytest -v tests/integration/defs/model_express/test_model_express_accuracy.py \
+  -k llama3-8b-instruct-mmlu-tp1 --output-dir /path/to/artifacts
+```
+
+Adding a canary is one `MxAccuracyCase` row (the model must be inside the
+family's qualified runtime envelope and have a bare reference entry for the
+task), one line in the `post_merge` block of `l0_model_express.yml`, and a row
+in the table above.
 
 ### Transform-Layout ABI Rules
 

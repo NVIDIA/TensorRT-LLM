@@ -6073,7 +6073,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // IMPORTANT: Stage Configuration Syntax Requirement
     //
     // The test_to_stage_mapping.py script expects stage definitions in the following format:
-    // "Stage-Name": ["platform", "yaml_file", splitId, split_count, gpu_count]
+    // "Stage-Name": ["platform", "yaml_file", splitId, split_count, gpu_count, modelExpress]
     //
     // Where:
     // - Stage-Name: Must be quoted string, used to identify the Jenkins stage
@@ -6082,6 +6082,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // - splitId: Current split number (1-based)
     // - split_count: Total number of splits
     // - gpu_count: Number of GPUs required (optional, defaults to 1)
+    // - modelExpress: Optional boolean; true attaches the Redis + ModelExpress server
+    //   sidecars (and the CI ModelExpress env) to the test pod. The mapping regex in
+    //   scripts/test_to_stage_mapping.py accepts trailing booleans.
     //
     // This format is parsed by scripts/test_to_stage_mapping.py to provide bidirectional
     // mapping between test names and Jenkins stage names. Any changes to this syntax
@@ -6104,6 +6107,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // platform, test DB, split, splits, GPU count, ModelExpress sidecars
         "DGX_H100-2_GPUs-PyTorch-ModelExpress-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
         "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 4, true],
+        // Post-merge only: runs the `stage: post_merge` rows of l0_model_express (accuracy canaries).
+        "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-PyTorch-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-PyTorch-2": ["rtx-5080", "l0_gb203", 2, 2],
