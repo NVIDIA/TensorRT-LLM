@@ -387,6 +387,7 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype[moe_b
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_4gpus_static_eplb[moe_backend=DEEPGEMM]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_chunked_prefill
 accuracy/test_llm_api_pytorch.py::TestGLM52::test_nvfp4[tp_size=8-ep_size=8]
+accuracy/test_llm_api_pytorch.py::TestGLM52::test_nvfp4_nvfp4kv[tp_size=8-ep_size=8]
 accuracy/test_llm_api_pytorch.py::TestGLM52::test_nvfp4_mtp_index_share[tp_size=8-ep_size=8]
 accuracy/test_llm_api_pytorch.py::TestGLM5FP8::test_8gpus[tp_size=8-ep_size=8]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format
@@ -682,6 +683,7 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_sof
 accuracy/test_llm_api_pytorch.py::TestQwen3_4B::test_eagle3
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-CUTLASS]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_branch_snapshot[enable_branch_snapshot=True]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=False]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8_moe_dflash

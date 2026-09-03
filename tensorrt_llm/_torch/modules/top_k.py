@@ -30,6 +30,10 @@ _GVR_IMPLEMENTATIONS = {
     TopKImplementation.CUTE_DSL_GVR,
     TopKImplementation.CUTE_DSL_GVR_V2,
 }
+_TEMPORAL_GVR_IMPLEMENTATIONS = {
+    TopKImplementation.CUDA_GVR,
+    TopKImplementation.CUTE_DSL_GVR,
+}
 _MAX_RADIX_BLOCKS_PER_ROW = 10
 
 
@@ -67,6 +71,11 @@ class TopK(nn.Module):
         self._gvr_emission_route = None
         self._gvr_emission_armed = False
 
+    @property
+    def needs_gvr_prior(self) -> bool:
+        """Return whether decode consumes previous-step Top-K indices."""
+        return self.decode_implementation in _TEMPORAL_GVR_IMPLEMENTATIONS
+
     def forward(
         self,
         scores: torch.Tensor,
@@ -94,8 +103,10 @@ class TopK(nn.Module):
             next_n: Number of decode rows per request.
             max_seq_len: Maximum decode score width used for GVR kernel tuning.
             gvr_ext_kwargs: GVR-only keyword arguments. ``gvr_prior_indices``
-                is the required caller-owned int32 previous selection with
-                shape ``[num_requests, top_k]`` on ``scores.device``.
+                is required by the temporal CUDA and CuTe DSL GVR paths. It is
+                caller-owned int32 previous selection with shape
+                ``[num_requests, top_k]`` on ``scores.device``. GVR V2 does
+                not consume this state.
                 ``gvr_row_order`` is an optional int32 request ordering with
                 shape ``[num_requests]`` on the same device.
 
@@ -268,7 +279,6 @@ class TopK(nn.Module):
         gvr_prior_indices: torch.Tensor | None = None,
         gvr_row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert gvr_prior_indices is not None
         if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR_V2:
             assert max_seq_len is not None
             if (
@@ -286,24 +296,25 @@ class TopK(nn.Module):
                 and scores.data_ptr() % 16 == 0
                 and (scores.shape[0] > 1 or scores.shape[1] % 4 == 0)
             ):
+                # hint-free k derives from the output width; pin it to the module's k
+                assert output_indices.shape[1] == self.top_k
                 from ..cute_dsl_kernels.blackwell.top_k import selfsampling_topk_run_varlen
 
                 logger.info_once(
                     "self-sampling GVR top-K engaged "
                     f"(K={self.top_k}, cr={self.compress_ratio}, "
-                    f"next_n={next_n}).",
+                    f"next_n={next_n}, hint-free).",
                     key="selfsampling_topk_engaged",
                 )
                 # Self-sampling GVR varlen engine (TRTLLM_GVR_SELF_SAMPLING=1):
                 # one launch for the batch; per-row n from device kv_lens,
                 # capture-stable tuning from the max-seq-len engine constant
-                # (no host reads — CUDA-graph safe). Hints are consumed raw
-                # (offset-free contract). The module receives max_seq_len in
-                # COMPRESSED index space; run_varlen's max_seq_len is in
-                # kv-token space like sequence_lengths — multiply back.
+                # (no host reads — CUDA-graph safe). The module receives
+                # max_seq_len in compressed index space; run_varlen's value
+                # is in KV-token space like sequence_lengths, so multiply it
+                # back by the compression ratio.
                 selfsampling_topk_run_varlen(
                     scores,
-                    gvr_prior_indices,
                     sequence_lengths,
                     output_indices,
                     next_n=next_n,
@@ -315,11 +326,26 @@ class TopK(nn.Module):
                 "TRTLLM_GVR_SELF_SAMPLING=1 but the decode scores do not "
                 "satisfy the engine's hardware-format gate "
                 f"(dtype={scores.dtype}, strides={tuple(scores.stride())}); "
-                "falling through to the CUDA GVR top-K path.",
+                "falling back to the CUDA insertion/radix Top-K path.",
                 key="selfsampling_topk_fallthrough",
             )
-        if self.decode_implementation != TopKImplementation.CUTE_DSL_GVR:
-            # CUDA_GVR, or the V2 hardware-format fall-through above
+            radix_indices, radix_values = self._get_radix_workspace(scores)
+            torch.ops.trtllm.indexer_topk_decode(
+                scores,
+                sequence_lengths,
+                output_indices,
+                next_n,
+                self.top_k,
+                pre_idx=None,
+                heuristic_scratch=None,
+                compress_ratio=self.compress_ratio,
+                radix_aux_indices=radix_indices,
+                radix_aux_logits=radix_values,
+            )
+            return output_indices
+
+        assert gvr_prior_indices is not None
+        if self.decode_implementation == TopKImplementation.CUDA_GVR:
             workspace = self._get_workspace(
                 scores,
                 (scores.shape[0], self.top_k),
@@ -339,7 +365,7 @@ class TopK(nn.Module):
                 radix_aux_indices=radix_indices,
                 radix_aux_logits=radix_values,
             )
-        else:
+        elif self.decode_implementation == TopKImplementation.CUTE_DSL_GVR:
             assert max_seq_len is not None
             emission_kwargs: dict = {}
             if self._gvr_emission_armed:
@@ -363,6 +389,8 @@ class TopK(nn.Module):
                 order_row=gvr_row_order,
                 **emission_kwargs,
             )
+        else:
+            raise AssertionError(f"Unexpected GVR implementation: {self.decode_implementation}")
         return output_indices
 
     def prepare_gvr_emission(
@@ -445,7 +473,7 @@ class TopK(nn.Module):
                 The slice starting at ``request_offset`` is updated in place.
             request_offset: First request row to update in the prior state.
         """
-        if self.decode_implementation not in _GVR_IMPLEMENTATIONS:
+        if not self.needs_gvr_prior:
             return
         assert gvr_prior_indices is not None
         last_rows = (torch.cumsum(request_lengths, dim=0) - 1).to(dtype=torch.long)

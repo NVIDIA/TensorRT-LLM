@@ -66,7 +66,8 @@ source "$llmSrcNode/jenkins/scripts/slurm_env_setup.sh"
 slurm_setup_runtime_env
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
-env | sort
+# Redact secret values here so they do not leak into the job log
+env | sort | sed -E 's/^([^=]*(TOKEN|SECRET|PASSWORD|CREDENTIALS)[^=]*)=.*/\1=<redacted>/'
 
 echo "Full Command: $pytestCommand"
 

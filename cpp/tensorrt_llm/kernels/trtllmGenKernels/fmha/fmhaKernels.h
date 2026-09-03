@@ -95,6 +95,25 @@ constexpr bool isSMCompatible(int gpuSM, int kernelSM)
     return gpuSM == kernelSM;
 }
 
+inline void checkTrtllmSkipCorrThreshold(fmha::FmhaOptions const& options, float skipCorrThreshold)
+{
+    fmha::checkSkipCorrThreshold(options, skipCorrThreshold);
+    if (skipCorrThreshold <= 0.0F)
+    {
+        return;
+    }
+
+    auto const dtypeBmm2 = fmha::getDtypeBmm2(options);
+    if (dtypeBmm2 == tg::Dtype::Fp16)
+    {
+        TLLM_CHECK_WITH_INFO(skipCorrThreshold <= 15.0F, "skipCorrThreshold must be <= 15 for FP16 BMM2.");
+    }
+    else if (dtypeBmm2 == tg::Dtype::Bfloat16)
+    {
+        TLLM_CHECK_WITH_INFO(skipCorrThreshold <= 32.0F, "skipCorrThreshold must be <= 32 for BF16 BMM2.");
+    }
+}
+
 class TllmGenFmhaKernel
 {
 
@@ -267,6 +286,7 @@ public:
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
+        checkTrtllmSkipCorrThreshold(options, params.mSkipCorrThreshold);
 
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
@@ -362,6 +382,7 @@ private:
 
         checkFmhaOptions(options, optionsFromArgs);
         updateFmhaOptions(options, optionsFromArgs);
+        checkTrtllmSkipCorrThreshold(options, params.mSkipCorrThreshold);
 
         auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
         tg::CudaRunner::Grid grid{numCtasX, numCtasY, numCtasZ};
@@ -479,6 +500,7 @@ public:
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
+        checkTrtllmSkipCorrThreshold(options, params.mSkipCorrThreshold);
 
         // Any caller that selects MultiCtasKvMode must supply the partial-reduction scratch pool
         // and per-CTA counter; fail fast here instead of silently falling back to Disabled.
@@ -583,7 +605,9 @@ public:
 
             launchFmhaKernel(kernelParams, kernelMeta, func, grid, options, params.stream);
             // Run the separate reduction kernel if needed.
-            runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.stream);
+            float const softmaxPScale
+                = fmha::getSoftmaxPScale(fmha::getDtypeBmm2(options), kernelParams.mSkipCorrThreshold);
+            runFmhaReduction(kernelMeta, kernelParams, softmaxPScale, params.mMultiProcessorCount, params.stream);
         }
     }
 
@@ -883,8 +907,8 @@ private:
         fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD = params.firstSparseMaskOffsetsKvPtr;
         fmhaData.mMetaData.sparseMlaTopKLensPtrD = params.ptrSparseMlaTopKLens;
         fmhaData.mMetaData.kvPageIdxD = params.kvPageIdxPtr;
-        fmhaData.mMetaData.inflateMax = 0.0F;        // Default value for inflate max
-        fmhaData.mMetaData.skipCorrThreshold = 0.0F; // 0 disables threshold-based skip correction
+        fmhaData.mMetaData.inflateMax = 0.0F; // Default value for inflate max
+        fmhaData.mMetaData.skipCorrThreshold = params.mSkipCorrThreshold;
         fmhaData.mMetaData.startTokenIdxSfO = params.mSfStartTokenIdx;
 
         // Fill Scales

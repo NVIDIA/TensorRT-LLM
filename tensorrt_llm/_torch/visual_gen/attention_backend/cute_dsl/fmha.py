@@ -57,7 +57,7 @@ except (ImportError, OSError) as e:
     _cute_dsl_import_error = e
 
 
-SUPPORTED_GPU_ARCHS: Tuple[str, ...] = ("sm_100a", "sm_103a")
+SUPPORTED_GPU_ARCHS: Tuple[str, ...] = ("sm_100a", "sm_103a", "sm_107a")
 
 
 # ============================================================================
