@@ -871,6 +871,7 @@
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_2_nodes_grace_blackwell-glm5_fp4_tep8_mtp3_8k1k]": 2221.5655,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_blackwell-glm5_fp4_dep8_mtp1_8k1k]": 511.9454615384616,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_blackwell-glm5_fp4_tep8_mtp3_8k1k]": 481.92153846153843,
+   "perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_blackwell-gpt_oss_fp4_tp1_eagle3_startup]": 10000.0,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_blackwell-gpt_oss_fp4_tp1_mtp0_8k1k]": 673.9433076923077,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_grace_blackwell-gpt_oss_fp4_dep4_1k8k]": 1320.1385,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_grace_blackwell-gpt_oss_fp4_tep2_1k8k]": 841.7785833333334,
