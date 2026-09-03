@@ -150,6 +150,7 @@ def test_flashinfer_context_fallback_scope(
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = 2
+    monkeypatch.setattr(fmha, "_get_total_num_blocks", lambda _: 0)
     attn = FakeAttention()
     attn.sparse_params = None
     attn.position_embedding_type = 0
@@ -235,6 +236,7 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = 2
+    monkeypatch.setattr(fmha, "_get_total_num_blocks", lambda _: 0)
     attn = SimpleNamespace(
         is_mla_enable=False,
         sparse_params=None,
