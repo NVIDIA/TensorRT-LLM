@@ -553,8 +553,11 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                 // bare pytest nodeid, so strip it the same way test_rerun.py does.
                 def bareTestName = isolateTestName.split(/ TIMEOUT | ISOLATION/)[0]
                 def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
+                // conftest.py rewrites item._nodeid to "${test_prefix}/${nodeid}"
+                // (--test-prefix=${stageName}), so that's the line periodic_junit.py
+                // actually writes here — match the full prefixed form, not just the name.
                 def isTestUnfinished = fileExists(unfinishedTestFile) &&
-                    sh(script: "grep -Fxq -- '${bareTestName}' ${unfinishedTestFile}", returnStatus: true) == 0
+                    sh(script: "grep -Fxq -- '${stageName}/${bareTestName}' ${unfinishedTestFile}", returnStatus: true) == 0
                 if (isTestUnfinished) {
                     // Record this crash as a JUnit <testcase> like the regular-test
                     // path does. hasUnrerunFailure stays untouched here: it drives
