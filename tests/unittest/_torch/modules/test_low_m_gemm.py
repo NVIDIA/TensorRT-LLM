@@ -610,6 +610,118 @@ def test_direct_runner_tactics_serialisable(monkeypatch) -> None:
         assert all(isinstance(v, int) for v in t)
 
 
+def test_splitk_tactic_accepts_k_tail_only_without_split() -> None:
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_splitk import (
+        SplitKTactic,
+        default_tactic,
+        validate_tactic,
+    )
+
+    m, n, k = 1, 512, 320
+    tactic = default_tactic(m, n, k)
+    assert tactic.split_k == 1
+    validate_tactic(tactic, m, n, k)
+    with pytest.raises(ValueError, match="does not divide evenly"):
+        validate_tactic(SplitKTactic(64, 8, 2, 2), m, n, k)
+
+
+@_skip_non_sm10x
+@torch.inference_mode()
+def test_low_m_epilogues_match_materialized_bf16_results() -> None:
+    import torch.nn.functional as F
+
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_direct import (
+        DirectTactic,
+        get_direct_dense_epilogue_runner,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_splitk import (
+        default_tactic,
+        get_splitk_dense_epilogue_runner,
+        interleave_grouped_output_rows,
+    )
+
+    run_direct_dense = get_direct_dense_epilogue_runner("none")
+    run_direct_dense_silu_prefix = get_direct_dense_epilogue_runner("silu_prefix")
+    run_splitk_dense = get_splitk_dense_epilogue_runner("none")
+    run_splitk_dense_sigmoid_grouped_reduce = get_splitk_dense_epilogue_runner(
+        "sigmoid_grouped_reduce"
+    )
+    for lookup in (get_direct_dense_epilogue_runner, get_splitk_dense_epilogue_runner):
+        with pytest.raises(ValueError, match="expected one of"):
+            lookup("missing")
+        with pytest.raises(ValueError, match="must be a string"):
+            lookup(None)
+
+    torch.manual_seed(42)
+    # M=2 makes the activated prefix a padded row-major view with stride 336;
+    # M=1 would hide that leading-stride contract behind PyTorch contiguity.
+    rows, group_count, hidden_size, lowrank = 2, 2, 128, 320
+    packed_size, input_size = 336, 1024
+    dtype, device = torch.bfloat16, torch.device("cuda")
+
+    a = torch.randn((rows, input_size), dtype=dtype, device=device)
+    down_weight = torch.randn((packed_size, input_size), dtype=dtype, device=device)
+    plain = torch.empty((rows, packed_size), dtype=dtype, device=device)
+    fused = torch.empty_like(plain)
+    direct_tactic = DirectTactic(128, 2, rows)
+    run_direct_dense(a, down_weight.t(), plain, False, direct_tactic)
+    run_direct_dense_silu_prefix(
+        a,
+        down_weight.t(),
+        fused,
+        False,
+        direct_tactic,
+        scale=1.0 / group_count,
+        prefix=lowrank,
+    )
+
+    expected_prefix = F.silu(plain[:, :lowrank].float() / group_count).to(dtype)
+    torch.testing.assert_close(fused[:, :lowrank], expected_prefix, rtol=1e-2, atol=5e-3)
+    torch.testing.assert_close(fused[:, lowrank:], plain[:, lowrank:], rtol=0.0, atol=0.0)
+
+    grouped_size = group_count * hidden_size
+    up_weight = torch.randn((grouped_size, lowrank), dtype=dtype, device=device)
+    interleaved_weight = interleave_grouped_output_rows(up_weight, group_count)
+    reduction_input = torch.randn((rows, grouped_size), dtype=dtype, device=device)
+    projected = torch.empty((rows, grouped_size), dtype=dtype, device=device)
+    mixed = torch.empty((rows, hidden_size), dtype=dtype, device=device)
+    splitk_tactic = default_tactic(rows, grouped_size, lowrank)
+    run_splitk_dense(
+        fused[:, :lowrank],
+        interleaved_weight.t(),
+        None,
+        projected,
+        False,
+        splitk_tactic,
+    )
+    run_splitk_dense_sigmoid_grouped_reduce(
+        fused[:, :lowrank],
+        interleaved_weight.t(),
+        reduction_input,
+        mixed,
+        False,
+        splitk_tactic,
+        reduction_scale=1.0 / group_count,
+        group_count=group_count,
+    )
+    overlapping_prefix = fused.as_strided((rows, lowrank), (1, 1))
+    with pytest.raises(ValueError, match="non-overlapping"):
+        run_splitk_dense(
+            overlapping_prefix,
+            interleaved_weight.t(),
+            None,
+            projected,
+            False,
+            splitk_tactic,
+        )
+
+    gates = torch.sigmoid(projected.float()).unflatten(-1, (hidden_size, group_count))
+    grouped_input = reduction_input.float().unflatten(-1, (group_count, hidden_size))
+    grouped_input = grouped_input.transpose(-2, -1)
+    expected_mixed = (gates * grouped_input).sum(dim=-1).div(group_count).to(dtype)
+    torch.testing.assert_close(mixed, expected_mixed, rtol=1e-2, atol=5e-3)
+
+
 @_skip_non_sm10x
 @torch.inference_mode()
 def test_cached_direct_tactic_uses_exact_small_m_and_validates_large_m(
