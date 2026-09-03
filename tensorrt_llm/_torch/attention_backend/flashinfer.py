@@ -1606,13 +1606,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
         # indices of used cache blocks for each sequence
-        primary_layer_idx = None
-        if self._vswa_layer_to_pool is not None:
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
-            primary_layer_idx = self._vswa_pool_to_rep_layer[primary_pool_id]
-        else:
-            layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets', {})
-            primary_layer_idx = next(iter(layer_offsets), None)
+        primary_layer_idx = self._primary_kv_layer_idx
 
         paged_kv_indices = self.kv_cache_manager.get_batch_cache_indices_flat(
             self.request_ids, self.num_blocks, layer_idx=primary_layer_idx)
