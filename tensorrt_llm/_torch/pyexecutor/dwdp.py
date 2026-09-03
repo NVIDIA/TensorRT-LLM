@@ -30,6 +30,7 @@ and is wired up by ``setup_dwdp()`` during ``setup(model)``.
 
 from __future__ import annotations
 
+import weakref
 from typing import List, Optional
 
 import torch
@@ -37,7 +38,7 @@ import torch.nn as nn
 from mpi4py.MPI import COMM_WORLD
 
 from tensorrt_llm._torch.distributed import MPIDist
-from tensorrt_llm._torch.modules.dwdp import DWDPWeightManager, setup_dwdp
+from tensorrt_llm._torch.modules.dwdp import DWDPWeightManager, setup_dwdp, teardown_dwdp
 from tensorrt_llm._utils import global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
 from tensorrt_llm.logger import logger
@@ -75,6 +76,8 @@ class DwdpManager:
         dist: object,
         mapping: Mapping,
     ) -> None:
+        if get_global_dwdp_manager() is not None:
+            raise RuntimeError("DwdpManager already registered globally")
         if not isinstance(dist, MPIDist):
             raise RuntimeError("DWDP requires MPI backend (MPIDist)")
         if not mapping.dwdp_enabled:
@@ -141,6 +144,7 @@ class DwdpManager:
 
         # Set by setup(model); None until then
         self._weight_manager: Optional[DWDPWeightManager] = None
+        self._model_ref: Optional[weakref.ReferenceType[nn.Module]] = None
 
     # ------------------------------------------------------------------
     # DWDP MPI group
@@ -169,8 +173,10 @@ class DwdpManager:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        self.cleanup()
-        set_global_dwdp_manager(None)
+        try:
+            self.cleanup()
+        finally:
+            set_global_dwdp_manager(None)
         return False
 
     def is_enabled(self) -> bool:
@@ -178,10 +184,34 @@ class DwdpManager:
 
     def cleanup(self) -> None:
         """Release MPI sub-communicator and reset weight manager. Idempotent."""
-        self._weight_manager = None
-        if self.dwdp_group is not None:
-            self.dwdp_group.Free()
-            self.dwdp_group = None
+        cleanup_error = None
+        cleanup_traceback = None
+        try:
+            model = self._model_ref() if self._model_ref is not None else None
+            if model is not None and self._weight_manager is not None:
+                teardown_dwdp(model, expected_manager=self._weight_manager)
+            elif self._weight_manager is not None:
+                self._weight_manager.release()
+        except BaseException as exc:
+            cleanup_error = exc
+            cleanup_traceback = exc.__traceback__
+        finally:
+            self._weight_manager = None
+            self._model_ref = None
+            if self.dwdp_group is not None:
+                try:
+                    self.dwdp_group.Free()
+                except BaseException:
+                    if cleanup_error is None:
+                        raise
+                    logger.exception(
+                        "Failed to free DWDP MPI communicator after runtime cleanup error"
+                    )
+                finally:
+                    self.dwdp_group = None
+
+        if cleanup_error is not None:
+            raise cleanup_error.with_traceback(cleanup_traceback)
 
     # ------------------------------------------------------------------
     # Layer registration (SSOT) + setup
@@ -215,6 +245,7 @@ class DwdpManager:
             num_prefetch_experts=self.num_prefetch_experts,
             contention_opt=self.config.contention_opt,
         )
+        self._model_ref = weakref.ref(model)
         return self._weight_manager
 
     # ------------------------------------------------------------------
@@ -238,13 +269,19 @@ class DwdpManager:
         self._weight_manager.wait_and_bind(backend_module, layer_idx)
 
     def record_compute_and_prefetch_next(self, layer_idx: int) -> None:
-        """After the current layer finishes compute, kick off the next layer's prefetch.
+        """Record compute and maintain the two-layer prefetch window.
 
-        The WAR signal for the "consumed" slot is recorded inside
-        ``wait_and_bind``; here we just schedule the next prefetch.
+        ``prefetch_first_layers`` warms the first two MoE layers. After each
+        layer's kernel has been enqueued, record consumption of its current
+        buffer slot and prefetch the layer two positions ahead. This avoids
+        duplicate prefetch of the second layer and prevents reuse of a slot
+        before the current kernel has finished reading it.
         """
         if self._weight_manager is None:
             raise RuntimeError("DwdpManager.setup() has not been called yet")
+        self._weight_manager.record_compute(layer_idx)
         next_idx = self._weight_manager.next_moe_layer(layer_idx)
         if next_idx is not None:
-            self._weight_manager.prefetch_layer(next_idx)
+            next_next_idx = self._weight_manager.next_moe_layer(next_idx)
+            if next_next_idx is not None:
+                self._weight_manager.prefetch_layer(next_next_idx)
