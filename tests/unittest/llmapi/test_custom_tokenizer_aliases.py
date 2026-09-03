@@ -12,16 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Custom-tokenizer alias resolution through ``LlmArgs``.
+"""Custom-tokenizer alias resolution through `LlmArgs`.
 
-``tensorrt_llm.tokenizer.TOKENIZER_ALIASES`` is the one place where built-in
-custom tokenizers register a short alias. ``llm_args`` used to carry its own
+`tensorrt_llm.tokenizer.TOKENIZER_ALIASES` is the one place where built-in
+custom tokenizers register a short alias. `llm_args` used to carry its own
 copy of that table, and the copy drifted: an alias present only in the
-canonical table loaded fine through ``load_custom_tokenizer`` but made
-``LlmArgs(custom_tokenizer=<alias>)`` fail with "not enough values to
+canonical table loaded fine through `load_custom_tokenizer` but made
+`LlmArgs(custom_tokenizer=<alias>)` fail with "not enough values to
 unpack", because the unresolved alias was split as if it were a dotted import
 path. These tests pin the two tables to one object and drive every registered
-alias through the ``LlmArgs`` validator.
+alias through the `LlmArgs` validator.
 """
 
 import importlib
@@ -52,7 +52,7 @@ def test_llm_args_uses_the_canonical_alias_table() -> None:
 
 @pytest.mark.parametrize("alias", sorted(TOKENIZER_ALIASES))
 def test_every_alias_names_an_importable_tokenizer_class(alias: str) -> None:
-    """Each alias target is an importable ``TokenizerBase`` with a loader."""
+    """Each alias target is an importable `TokenizerBase` with a loader."""
     tokenizer_class = _resolve(alias)
     assert issubclass(tokenizer_class, TokenizerBase)
     assert callable(getattr(tokenizer_class, "from_pretrained", None))
@@ -60,9 +60,9 @@ def test_every_alias_names_an_importable_tokenizer_class(alias: str) -> None:
 
 @pytest.mark.parametrize("alias", sorted(TOKENIZER_ALIASES))
 def test_llm_args_resolves_every_registered_alias(alias: str) -> None:
-    """``custom_tokenizer=<alias>`` reaches the aliased class's loader.
+    """`custom_tokenizer=<alias>` reaches the aliased class's loader.
 
-    ``from_pretrained`` is stubbed so no checkpoint is read; the point is that
+    `from_pretrained` is stubbed so no checkpoint is read; the point is that
     the alias is resolved to the class rather than split as an import path.
     """
     tokenizer_class = _resolve(alias)
