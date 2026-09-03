@@ -961,6 +961,7 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     request.py_last_context_chunk = (0, 8)
     request.context_remaining_length = 8
     transceiver.respond_and_send_async(request)
+    assert request.state == LlmRequestState.CONTEXT_INIT
 
     request.py_last_context_chunk = (8, 16)
     request.context_remaining_length = 0
