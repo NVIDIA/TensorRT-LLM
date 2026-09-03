@@ -6,6 +6,7 @@
 import asyncio
 import base64
 from collections.abc import AsyncIterator, Mapping, Sequence
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -349,6 +350,11 @@ def _prompt_output(
     )
 
 
+# Finish reasons that carry real terminal information. Anything else (notably
+# "not_finished") would map to FINISH_REASON_UNSPECIFIED.
+_TERMINAL_FINISH_REASONS = frozenset({"stop", "length", "cancelled", "timeout"})
+
+
 def _finish_event(output: Any, end_id: int | None) -> generation_pb2.GenerationFinished:
     reason_map = {
         "stop": generation_pb2.FINISH_REASON_STOP,
@@ -413,6 +419,23 @@ def _endpoint_to_str(endpoints: Sequence[Any]) -> Optional[str]:
     return f"{endpoint.host}:{endpoint.port}" if endpoint.port else endpoint.host
 
 
+def _split_endpoint(value: str) -> Optional[tuple[str, int, str]]:
+    """Split an engine endpoint into (host, port, scheme).
+
+    The engine's ctx_info_endpoint is an opaque URL, so a bare ``partition(":")``
+    would take the scheme for the host and drop the rest.
+    """
+    try:
+        parts = urlsplit(value if "://" in value else f"//{value}")
+        host = parts.hostname or ""
+        port = parts.port or 0
+    except ValueError:
+        return None
+    if not host:
+        return None
+    return host, port, parts.scheme
+
+
 def _serialize_first_gen_log_probs(first_gen_log_probs: Sequence[Any]) -> list[Any]:
     """Serialize first-gen logprobs into a Struct-storable form.
 
@@ -472,40 +495,52 @@ def _disaggregated_params_from_request(
                 raise ValueError(
                     "kv.session.session_id must be an integer context request id"
                 ) from error
-        endpoint = _endpoint_to_str(session.endpoints)
-        if endpoint is not None:
-            params.ctx_info_endpoint = endpoint
         attrs = _struct_to_dict(session.attributes_struct)
+        # Prefer the verbatim endpoint; the structured fields are a fallback for
+        # a peer that did not carry it.
+        endpoint = attrs.get("ctx_info_endpoint") or _endpoint_to_str(session.endpoints)
+        if endpoint:
+            _set_disagg_attr(params, "ctx_info_endpoint", str(endpoint))
         opaque_state = attrs.get("opaque_state")
         if opaque_state:
-            params.opaque_state = base64.b64decode(opaque_state)
+            _set_disagg_attr(params, "opaque_state", base64.b64decode(opaque_state))
         first_gen_tokens = attrs.get("first_gen_tokens")
         if first_gen_tokens:
             params.first_gen_tokens = [int(token) for token in first_gen_tokens]
         draft_tokens = attrs.get("draft_tokens")
         if draft_tokens:
-            params.draft_tokens = [int(token) for token in draft_tokens]
+            _set_disagg_attr(params, "draft_tokens", [int(t) for t in draft_tokens], optional=True)
         disagg_request_id = attrs.get("disagg_request_id")
         if disagg_request_id is not None:
-            params.disagg_request_id = int(disagg_request_id)
+            _set_disagg_attr(params, "disagg_request_id", int(disagg_request_id), optional=True)
         # ctx_dp_rank: prefer the attribute (preserves an explicit 0 and, by its
         # absence, an unset None) and fall back to the native dp_rank field.
         if "ctx_dp_rank" in attrs:
-            params.ctx_dp_rank = int(attrs["ctx_dp_rank"])
+            _set_disagg_attr(params, "ctx_dp_rank", int(attrs["ctx_dp_rank"]))
         elif session.dp_rank:
-            params.ctx_dp_rank = session.dp_rank
+            _set_disagg_attr(params, "ctx_dp_rank", session.dp_rank)
         schedule_style = attrs.get("schedule_style")
         if schedule_style is not None:
-            params.schedule_style = DisaggScheduleStyle(int(schedule_style))
+            _set_disagg_attr(
+                params,
+                "schedule_style",
+                DisaggScheduleStyle(int(schedule_style)),
+                optional=True,
+            )
         conversation_id = attrs.get("conversation_id")
         if conversation_id is not None:
-            params.conversation_id = str(conversation_id)
+            _set_disagg_attr(params, "conversation_id", str(conversation_id), optional=True)
         ctx_usage = attrs.get("ctx_usage")
         if ctx_usage is not None:
-            params.ctx_usage = ctx_usage
+            _set_disagg_attr(params, "ctx_usage", ctx_usage, optional=True)
         first_gen_log_probs = attrs.get("first_gen_log_probs")
         if first_gen_log_probs is not None:
-            params.first_gen_log_probs = _deserialize_first_gen_log_probs(first_gen_log_probs)
+            _set_disagg_attr(
+                params,
+                "first_gen_log_probs",
+                _deserialize_first_gen_log_probs(first_gen_log_probs),
+                optional=True,
+            )
         return params
 
     extra = _struct_to_dict(request.extra) if request.HasField("extra") else {}
@@ -519,10 +554,45 @@ def _disaggregated_params_from_request(
     return DisaggregatedParams(request_type=request_type)
 
 
+def _disagg_attr(params: Any, name: str) -> Any:
+    """Read an optional DisaggregatedParams field.
+
+    The dataclass gains and loses fields between releases (`conversation_id` is
+    on 1.3.0rc23 and gone on rc25), so an unconditional read would fail the whole
+    handoff over one missing attribute.
+    """
+    return getattr(params, name, None)
+
+
+def _set_disagg_attr(params: Any, name: str, value: Any, *, optional: bool = False) -> None:
+    """Assign a DisaggregatedParams field, or fail if this build lacks it.
+
+    DisaggregatedParams is a slots dataclass, so assigning an undeclared field
+    raises AttributeError rather than being ignored. Only fields that genuinely
+    come and go across releases are dropped (`conversation_id` is on 1.3.0rc23
+    and not on rc25); dropping a load-bearing one would decode against a missing
+    address or missing context state and produce a wrong answer instead of an
+    error.
+    """
+    if name in getattr(type(params), "__dataclass_fields__", {}):
+        setattr(params, name, value)
+        return
+    if not optional:
+        raise ValueError(
+            f"the peer's handoff carries '{name}', which this TensorRT-LLM build "
+            "does not support"
+        )
+    logger.warning(
+        f"OpenEngine handoff attribute '{name}' is not supported by this "
+        "TensorRT-LLM build and was dropped"
+    )
+
+
 def _prefill_ready_response(
     request_id: str,
     disaggregated_params: Any,
     transfer_backend: str,
+    usage: Optional[generation_pb2.Usage] = None,
 ) -> generation_pb2.GenerateResponse:
     """Build the PrefillReady event a context worker returns after prefill.
 
@@ -541,39 +611,48 @@ def _prefill_ready_response(
     session = kv_pb2.KvSessionRef(
         session_id="" if ctx_request_id is None else str(ctx_request_id),
         transfer_backend=transfer_backend or "",
-        dp_rank=disaggregated_params.ctx_dp_rank or 0,
+        dp_rank=_disagg_attr(disaggregated_params, "ctx_dp_rank") or 0,
     )
-    endpoint = disaggregated_params.ctx_info_endpoint
-    if endpoint:
-        host, _, port = endpoint.partition(":")
-        session.endpoints.add(
-            host=host,
-            port=int(port) if port.isdigit() else 0,
-            protocol=transfer_backend or "",
-        )
     attributes: dict[str, Any] = {}
-    if disaggregated_params.opaque_state is not None:
-        attributes["opaque_state"] = base64.b64encode(disaggregated_params.opaque_state).decode(
-            "utf-8"
-        )
-    if disaggregated_params.first_gen_tokens:
-        attributes["first_gen_tokens"] = list(disaggregated_params.first_gen_tokens)
-    if disaggregated_params.draft_tokens:
-        attributes["draft_tokens"] = list(disaggregated_params.draft_tokens)
-    if disaggregated_params.disagg_request_id is not None:
-        attributes["disagg_request_id"] = str(disaggregated_params.disagg_request_id)
-    if disaggregated_params.ctx_dp_rank is not None:
-        attributes["ctx_dp_rank"] = disaggregated_params.ctx_dp_rank
-    if disaggregated_params.schedule_style is not None:
-        attributes["schedule_style"] = int(disaggregated_params.schedule_style)
-    if disaggregated_params.conversation_id is not None:
-        attributes["conversation_id"] = disaggregated_params.conversation_id
-    if disaggregated_params.ctx_usage is not None:
-        attributes["ctx_usage"] = dict(disaggregated_params.ctx_usage)
-    if disaggregated_params.first_gen_log_probs is not None:
-        attributes["first_gen_log_probs"] = _serialize_first_gen_log_probs(
-            disaggregated_params.first_gen_log_probs
-        )
+    endpoint = _disagg_attr(disaggregated_params, "ctx_info_endpoint")
+    if endpoint:
+        # Carried verbatim as well as split: the generation worker connects a
+        # ZMQ socket straight to this string, so any lossy round trip through
+        # the structured fields would hand it an unusable address.
+        attributes["ctx_info_endpoint"] = endpoint
+        parts = _split_endpoint(endpoint)
+        if parts is not None:
+            host, port, scheme = parts
+            session.endpoints.add(
+                host=host, port=port, protocol=scheme or transfer_backend or ""
+            )
+    opaque_state = _disagg_attr(disaggregated_params, "opaque_state")
+    if opaque_state is not None:
+        attributes["opaque_state"] = base64.b64encode(opaque_state).decode("utf-8")
+    first_gen_tokens = _disagg_attr(disaggregated_params, "first_gen_tokens")
+    if first_gen_tokens:
+        attributes["first_gen_tokens"] = list(first_gen_tokens)
+    draft_tokens = _disagg_attr(disaggregated_params, "draft_tokens")
+    if draft_tokens:
+        attributes["draft_tokens"] = list(draft_tokens)
+    disagg_request_id = _disagg_attr(disaggregated_params, "disagg_request_id")
+    if disagg_request_id is not None:
+        attributes["disagg_request_id"] = str(disagg_request_id)
+    ctx_dp_rank = _disagg_attr(disaggregated_params, "ctx_dp_rank")
+    if ctx_dp_rank is not None:
+        attributes["ctx_dp_rank"] = ctx_dp_rank
+    schedule_style = _disagg_attr(disaggregated_params, "schedule_style")
+    if schedule_style is not None:
+        attributes["schedule_style"] = int(schedule_style)
+    conversation_id = _disagg_attr(disaggregated_params, "conversation_id")
+    if conversation_id is not None:
+        attributes["conversation_id"] = conversation_id
+    ctx_usage = _disagg_attr(disaggregated_params, "ctx_usage")
+    if ctx_usage is not None:
+        attributes["ctx_usage"] = dict(ctx_usage)
+    first_gen_log_probs = _disagg_attr(disaggregated_params, "first_gen_log_probs")
+    if first_gen_log_probs is not None:
+        attributes["first_gen_log_probs"] = _serialize_first_gen_log_probs(first_gen_log_probs)
     if attributes:
         struct = struct_pb2.Struct()
         struct.update(attributes)
@@ -581,6 +660,7 @@ def _prefill_ready_response(
     return generation_pb2.GenerateResponse(
         request_id=request_id,
         prefill_ready=generation_pb2.PrefillReady(kv_session=session),
+        usage=usage,
     )
 
 
@@ -689,11 +769,20 @@ def _format_result(
         args.sent_text_lengths[output.index] = safe_text_length
 
         if args.is_context_only and output.index not in args.prefill_ready_sent:
+            # `disaggregated_params` is seeded from the *request*, so it is never
+            # None here; only a context phase that actually transmitted fills in
+            # ctx_request_id. Emitting without it fabricates a handoff whose
+            # session the generation worker cannot resolve.
             out_disagg = getattr(output, "disaggregated_params", None)
-            if out_disagg is not None:
+            if out_disagg is not None and _disagg_attr(out_disagg, "ctx_request_id") is not None:
                 args.prefill_ready_sent.add(output.index)
                 responses.append(
-                    _prefill_ready_response(request_id, out_disagg, args.kv_transfer_backend)
+                    _prefill_ready_response(
+                        request_id,
+                        out_disagg,
+                        args.kv_transfer_backend,
+                        usage=_usage(result),
+                    )
                 )
 
         if output.finish_reason and output.index not in args.finished_indices:
@@ -701,10 +790,15 @@ def _format_result(
             newly_finished.append(output)
 
     for index, output in enumerate(newly_finished):
-        # For a prefill-only (context_only) request the PrefillReady event is the
-        # terminal signal; the engine reports the sequence as not-finished, which
-        # would map to a spurious UNSPECIFIED finish, so suppress it.
-        if args.is_context_only:
+        # PrefillReady is the terminal signal for a context request that produced
+        # a handoff. Without one -- cancelled or aborted before transmission --
+        # the client must still get the real terminal event rather than a clean
+        # stream with no ending. A context request that simply has nothing to
+        # report ends as not-finished, which would map to a spurious UNSPECIFIED.
+        if args.is_context_only and (
+            output.index in args.prefill_ready_sent
+            or output.finish_reason not in _TERMINAL_FINISH_REASONS
+        ):
             continue
         is_final = (
             len(args.finished_indices) == sampling_params.n and index == len(newly_finished) - 1
