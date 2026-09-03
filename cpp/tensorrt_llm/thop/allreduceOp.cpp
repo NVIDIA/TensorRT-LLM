@@ -2024,6 +2024,7 @@ MnnvlFusionPattern getMnnvlFusionPattern(AllReduceFusionOp fusionOp)
     switch (fusionOp)
     {
     case AllReduceFusionOp::NONE: return MnnvlFusionPattern::kAllReduce;
+    case AllReduceFusionOp::RMS_NORM: return MnnvlFusionPattern::kARRMSNorm;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return MnnvlFusionPattern::kARResidualRMSNorm;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return MnnvlFusionPattern::kARResidualRMSNormFP8Quant;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return MnnvlFusionPattern::kARResidualRMSNormFP4Quant;
@@ -2052,7 +2053,7 @@ bool isMnnvlNvfp4FusionOp(AllReduceFusionOp fusionOp)
 
 bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
 {
-    return fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
+    return fusionOp == AllReduceFusionOp::RMS_NORM || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
 }
@@ -2063,9 +2064,9 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     torch::optional<torch::Tensor> const& residual_in, torch::optional<double> epsilon, torch::Tensor& comm_buffer,
     torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_)
 {
-    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    auto mcastMem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
-        mcast_mem != nullptr, "[mnnvlFusionAllReduce] comm_buffer must be obtained from a mcastBuffer instance.");
+        mcastMem != nullptr, "[mnnvlFusionAllReduce] comm_buffer must be obtained from a McastGPUBuffer instance");
     TORCH_CHECK(input.is_contiguous(), "[mnnvlFusionAllReduce] input must be contiguous");
     TORCH_CHECK(input.dim() >= 2, "[mnnvlFusionAllReduce] input must have at least 2 dimensions");
 
@@ -2085,6 +2086,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     }
     auto const pattern = getMnnvlFusionPattern(fusionOp);
     bool const hasRmsNormFusion = fusionOp != AllReduceFusionOp::NONE;
+    bool const hasResidualFusion = hasRmsNormFusion && fusionOp != AllReduceFusionOp::RMS_NORM;
 
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
     torch::Tensor reduceOut;
@@ -2095,12 +2097,10 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
 
     if (hasRmsNormFusion)
     {
-        TORCH_CHECK(residual_in.has_value() && gamma.has_value() && epsilon.has_value(),
-            "[mnnvlFusionAllReduce] residual_in, gamma, and epsilon must be provided for RMSNorm fusion");
-        TORCH_CHECK(residual_in.value().is_contiguous(), "[mnnvlFusionAllReduce] residual_in must be contiguous");
+        TORCH_CHECK(gamma.has_value() && epsilon.has_value(),
+            "[mnnvlFusionAllReduce] gamma and epsilon must be provided for RMSNorm fusion");
         TORCH_CHECK(gamma.value().is_contiguous(), "[mnnvlFusionAllReduce] gamma must be contiguous");
 
-        residualOut = torch::empty_like(residual_in.value());
         if (hasMnnvlNormOutput(fusionOp))
         {
             normOut = torch::empty_like(input);
@@ -2109,6 +2109,13 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     else
     {
         reduceOut = torch::empty_like(input);
+    }
+
+    if (hasResidualFusion)
+    {
+        TORCH_CHECK(residual_in.has_value(), "[mnnvlFusionAllReduce] residual_in must be provided for residual fusion");
+        TORCH_CHECK(residual_in.value().is_contiguous(), "[mnnvlFusionAllReduce] residual_in must be contiguous");
+        residualOut = torch::empty_like(residual_in.value());
     }
 
     if (isMnnvlQuantFusionOp(fusionOp))
@@ -2147,14 +2154,14 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     }
 
     auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceFusionParams();
-    allreduce_params.nRanks = mcast_mem->getWorldSize();
-    allreduce_params.rank = mcast_mem->getRank();
+    allreduce_params.nRanks = mcastMem->getWorldSize();
+    allreduce_params.rank = mcastMem->getRank();
     allreduce_params.dType = dtype;
     allreduce_params.numTokens = numTokens;
     allreduce_params.tokenDim = hiddenDim;
-    allreduce_params.bufferPtrsDev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
+    allreduce_params.bufferPtrsDev = reinterpret_cast<void**>(mcastMem->getBufferPtrsDev());
     allreduce_params.bufferPtrLocal = comm_buffer.mutable_data_ptr();
-    allreduce_params.multicastPtr = mcast_mem->getMulticastPtr();
+    allreduce_params.multicastPtr = mcastMem->getMulticastPtr();
     allreduce_params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
     allreduce_params.input = input.const_data_ptr();
     allreduce_params.pattern = pattern;
@@ -2168,12 +2175,10 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     {
         allreduce_params.output = normOut.defined() ? normOut.mutable_data_ptr() : nullptr;
 
-        allreduce_params.residualIn = residual_in.value().const_data_ptr();
+        allreduce_params.residualIn = hasResidualFusion ? residual_in.value().const_data_ptr() : nullptr;
         allreduce_params.gamma = gamma.value().const_data_ptr();
         allreduce_params.epsilon = static_cast<float>(epsilon.value());
-        allreduce_params.rmsNormFusion = true;
-
-        allreduce_params.residualOut = residualOut.mutable_data_ptr();
+        allreduce_params.residualOut = hasResidualFusion ? residualOut.mutable_data_ptr() : nullptr;
     }
 
     if (isMnnvlQuantFusionOp(fusionOp))
@@ -2202,6 +2207,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     switch (fusionOp)
     {
     case AllReduceFusionOp::NONE: return {reduceOut};
+    case AllReduceFusionOp::RMS_NORM: return {normOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return {normOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return {quantOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {normOut, quantOut, residualOut};

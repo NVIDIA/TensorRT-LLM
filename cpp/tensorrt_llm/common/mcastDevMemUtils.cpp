@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,9 @@
  */
 #include "mcastDevMemUtils.h"
 #include "tensorrt_llm/common/config.h"
+
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 
 using McastDeviceMemory = ::tensorrt_llm::runtime::McastDeviceMemory;
@@ -34,24 +37,27 @@ public:
 
     static McastDevMemBufferRegistry& getInstance()
     {
-        static McastDevMemBufferRegistry instance;
-        return instance;
+        static auto* instance = new McastDevMemBufferRegistry;
+        return *instance;
     }
 
-    void registerBuffer(void* ptr, McastDeviceMemory* buf)
+    void registerBuffer(void* ptr, std::shared_ptr<McastDeviceMemory> const& buf)
     {
-        _ptr_to_buf[ptr] = buf;
+        std::lock_guard<std::mutex> const lock(mMutex);
+        mPtrToBuffer[ptr] = buf;
     }
 
     void unregisterBuffer(McastDeviceMemory* buf)
     {
+        std::lock_guard<std::mutex> const lock(mMutex);
         // Potential performance issue! Can use erase-if when we adopt C++20
         // Remove mappings in the table
-        for (auto it = _ptr_to_buf.begin(); it != _ptr_to_buf.end();)
+        for (auto it = mPtrToBuffer.begin(); it != mPtrToBuffer.end();)
         {
-            if (it->second == buf)
+            auto const owner = it->second.lock();
+            if (owner == nullptr || owner.get() == buf)
             {
-                it = _ptr_to_buf.erase(it);
+                it = mPtrToBuffer.erase(it);
             }
             else
             {
@@ -60,21 +66,33 @@ public:
         }
     }
 
-    McastDeviceMemory* findBuffer(void* ptr)
+    std::shared_ptr<McastDeviceMemory> findBuffer(void* ptr)
     {
-        auto it = _ptr_to_buf.find(ptr);
-        return it == _ptr_to_buf.end() ? nullptr : it->second;
+        std::lock_guard<std::mutex> const lock(mMutex);
+        auto const it = mPtrToBuffer.find(ptr);
+        if (it == mPtrToBuffer.end())
+        {
+            return nullptr;
+        }
+
+        auto owner = it->second.lock();
+        if (owner == nullptr)
+        {
+            mPtrToBuffer.erase(it);
+        }
+        return owner;
     }
 
 private:
     McastDevMemBufferRegistry() = default;
     ~McastDevMemBufferRegistry() = default;
 
-    std::unordered_map<void*, McastDeviceMemory*> _ptr_to_buf;
+    std::mutex mMutex;
+    std::unordered_map<void*, std::weak_ptr<McastDeviceMemory>> mPtrToBuffer;
 };
 } // namespace
 
-void registerMcastDevMemBuffer(void* ptr, McastDeviceMemory* buf)
+void registerMcastDevMemBuffer(void* ptr, std::shared_ptr<McastDeviceMemory> const& buf)
 {
     McastDevMemBufferRegistry::getInstance().registerBuffer(ptr, buf);
 }
@@ -84,7 +102,7 @@ void unregisterMcastDevMemBuffer(McastDeviceMemory* buf)
     McastDevMemBufferRegistry::getInstance().unregisterBuffer(buf);
 }
 
-McastDeviceMemory* findMcastDevMemBuffer(void* ptr)
+std::shared_ptr<McastDeviceMemory> findMcastDevMemBuffer(void* ptr)
 {
     return McastDevMemBufferRegistry::getInstance().findBuffer(ptr);
 }

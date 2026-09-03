@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,13 +15,11 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <cstddef>
 #include <cstdint>
 #include <cuda.h>
-#include <memory>
 #include <vector>
 
 namespace tensorrt_llm::runtime
@@ -29,7 +27,7 @@ namespace tensorrt_llm::runtime
 
 //! \brief A class that manages multicast device memory for efficient communication between GPUs.
 //!
-//! This class uses IPC-based allocation if mnNvlink is true, otherwise it uses fabric allocation.
+//! This class uses fabric allocation if mnNvlink is true, otherwise it uses IPC-based allocation.
 //! The fabric allocation can also be used for single-node/intra-node-only communication, but the machine
 //! must properly configure IMEX services. See:
 //! https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/gettingstarted.html
@@ -46,35 +44,24 @@ public:
     McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink,
         int64_t mpiCommFortranHandle);
 
-    // We don't register the pointer in these two functions since we don't expect any python-level code would call
-    // to obtain the raw pointers.
+    // McastGPUBuffer registers these pointers once shared ownership has been established.
     //! Get the raw array of signal pad pointers to all ranks (including self)
-    void** getSignalPadPtrsDev()
+    [[nodiscard]] void** getSignalPadPtrsDev() const
     {
         return mSignalPadsDev;
     }
 
     //! Get the raw array of unicast pointers to all ranks (including self)
-    void** getBufferPtrsDev()
+    [[nodiscard]] void** getBufferPtrsDev() const
     {
         return mUcPtrsDev;
     }
 
     //! Get the raw unicast pointer to a given rank
-    void* getUnicastPtr(uint32_t rank)
-    {
-        auto* data_ptr = reinterpret_cast<void*>(mUcPtrs[rank]);
-        tensorrt_llm::common::registerMcastDevMemBuffer(data_ptr, this);
-        return data_ptr;
-    }
+    [[nodiscard]] void* getUnicastPtr(uint32_t rank) const;
 
     //! Get the raw multicast pointer
-    void* getMulticastPtr()
-    {
-        auto* data_ptr = reinterpret_cast<void*>(mMcPtr);
-        tensorrt_llm::common::registerMcastDevMemBuffer(data_ptr, this);
-        return data_ptr;
-    }
+    [[nodiscard]] void* getMulticastPtr() const;
 
     [[nodiscard]] size_t getRank() const
     {
@@ -86,19 +73,38 @@ public:
         return mGroupSize;
     }
 
-    ~McastDeviceMemory();
+    //! Get the usable logical buffer size. Fabric allocations include reusable multicast-alignment slack.
+    [[nodiscard]] size_t getBufferSize() const
+    {
+        return mBufSize;
+    }
+
+    ~McastDeviceMemory() noexcept;
 
 private:
     bool mIsMNNvlink;
     int mDeviceIdx;
     uint32_t mGroupSize, mGroupRank;
+    int mCommSize{-1};
+    int mCommRank{-1};
+    int mWorldRank{-1};
     size_t mBufSize;
-    size_t mSignalPadOffset;
-    size_t mAllocationSize;
+    size_t mSignalPadOffset{0};
+    size_t mAllocationSize{0};
+    size_t mAllocationGranularity{0};
+    size_t mMulticastRecommendedGranularity{0};
 
-    CUdeviceptr mMcPtr;
-    CUmemGenericAllocationHandle mMcHandle;
+    CUdeviceptr mMcPtr{0};
+    CUdeviceptr mUcPtrBase{0};
+    size_t mUcReservationSize{0};
+    CUmemGenericAllocationHandle mMcHandle{0};
+    bool mMcHandleAcquired{false};
+    bool mMcAddressReserved{false};
+    bool mMcMapped{false};
+    bool mMcBound{false};
     std::vector<CUmemGenericAllocationHandle> mUcHandles;
+    std::vector<uint8_t> mUcHandleAcquired;
+    std::vector<uint8_t> mUcMapped;
 
     tensorrt_llm::mpi::MpiComm mGroupComm; //!< The MPI communicator for the group
 
@@ -107,14 +113,16 @@ private:
     std::vector<CUdeviceptr> mSignalPads;
 
     // Device array of pointers
-    void** mUcPtrsDev;
-    void** mSignalPadsDev;
+    void** mUcPtrsDev{nullptr};
+    void** mSignalPadsDev{nullptr};
 
     // For intra-node mcast
-    tensorrt_llm::runtime::IpcNvlsHandle* mNvlsHandle;
+    tensorrt_llm::runtime::IpcNvlsHandle* mNvlsHandle{nullptr};
 
     void allocMnMcastMem(size_t bufSize);
     void allocNvlsMcastMem(size_t bufSize);
+    void initializePointerArrays();
+    void cleanup() noexcept;
 };
 
 constexpr size_t kSIGNAL_PAD_SIZE = 2048;
