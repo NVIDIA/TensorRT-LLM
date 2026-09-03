@@ -39,10 +39,31 @@ def get_request_conversation_id(request: RequestWithConversationParams) -> Optio
     return None if conversation_params is None else conversation_params.conversation_id
 
 
-def extract_conversation_id_from_headers(headers: Optional[Mapping[str, str]]) -> Optional[str]:
+def extract_conversation_id_from_headers(
+    headers: Optional[Mapping[str, str]],
+    subagent_affinity_header: Optional[str] = None,
+) -> Optional[str]:
     if headers is None:
         return None
     lower_headers = {str(key).lower(): value for key, value in headers.items()}
+
+    # Sub-agent parent-session affinity. When a deployment configures
+    # ``conversation_affinity_header_for_subagents`` (e.g. the Dynamo header
+    # ``X-Dynamo-Parent-Session-ID`` that an agent gateway attaches to every
+    # sub-agent request but NOT to a main-agent request), prefer that header's
+    # value as the conversation id. This pins a sub-agent to its parent's
+    # conversation -- and therefore its parent's server/rank -- so the shared
+    # prefill prefix (parent context/tools/system prompt) is reused instead of
+    # being recomputed on a different instance/rank. A main-agent request lacks
+    # this header and falls through to the default X-Session-ID resolution
+    # below, preserving the pre-existing behaviour.
+    if subagent_affinity_header:
+        parent_id = lower_headers.get(str(subagent_affinity_header).strip().lower())
+        if parent_id is not None:
+            parent_id = str(parent_id).strip()
+            if parent_id:
+                return parent_id
+
     for header_name in CONVERSATION_ID_HEADERS:
         conversation_id = lower_headers.get(header_name)
         if conversation_id is None:
@@ -56,16 +77,21 @@ def extract_conversation_id_from_headers(headers: Optional[Mapping[str, str]]) -
 def resolve_request_conversation_id(
     request: RequestWithConversationParams,
     headers: Optional[Mapping[str, str]] = None,
+    subagent_affinity_header: Optional[str] = None,
 ) -> Optional[str]:
     """Return conversation_params.conversation_id populated at the serve edge.
 
     Body ``conversation_params.conversation_id`` takes precedence over headers.
+    When ``subagent_affinity_header`` is set, that header (a sub-agent's
+    parent-session id) is preferred over the default conversation-id headers so
+    a sub-agent co-locates with its parent; see
+    ``extract_conversation_id_from_headers``.
     """
     conversation_params = request.conversation_params
     if conversation_params is not None:
         return conversation_params.conversation_id
 
-    conversation_id = extract_conversation_id_from_headers(headers)
+    conversation_id = extract_conversation_id_from_headers(headers, subagent_affinity_header)
     if conversation_id is not None:
         from tensorrt_llm.serve.openai_protocol import ConversationParams
 

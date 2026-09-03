@@ -308,13 +308,23 @@ class OpenAIDisaggServer:
         return Response(content=body, status_code=status, headers=headers)
 
     @staticmethod
-    def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
+    def _extract_conversation_id(
+            req: UCompletionRequest,
+            raw_req: Request,
+            subagent_affinity_header: Optional[str] = None):
         """Populate conversation_params.conversation_id from supported headers.
 
         Body ``conversation_params.conversation_id`` is canonical. Headers are
-        used only when the body does not provide an id.
+        used only when the body does not provide an id. When
+        ``subagent_affinity_header`` is set, a sub-agent's parent-session header
+        takes precedence over X-Session-ID so the sub-agent co-locates with its
+        parent (see ``resolve_request_conversation_id``).
         """
-        resolve_request_conversation_id(req, raw_req.headers)
+        resolve_request_conversation_id(
+            req,
+            raw_req.headers,
+            subagent_affinity_header=subagent_affinity_header,
+        )
 
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
@@ -334,7 +344,9 @@ class OpenAIDisaggServer:
                         req, self._allow_request_chat_template)
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=str(e)) from e
-                self._extract_conversation_id(req, raw_req)
+                self._extract_conversation_id(
+                    req, raw_req,
+                    self._config.conversation_affinity_header_for_subagents)
                 hooks = RawRequestResponseHooks(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)

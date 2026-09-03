@@ -166,6 +166,14 @@ class DisaggServerConfig():
     # "Connection reset by peer" on a reused connection.
     server_keep_alive_timeout: int = 10
     internal_request_auth_key: Optional[str] = None
+    # Name of the HTTP header carrying a sub-agent's parent-session id (e.g.
+    # "X-Dynamo-Parent-Session-ID"). When set, the disagg frontend prefers this
+    # header over X-Session-ID when resolving a request's conversation id, so a
+    # sub-agent is routed to the same context/generation instance (and, via the
+    # forwarded body conversation_params, the same attention-DP rank) as its
+    # parent -- maximizing shared-prefix KV reuse. A main-agent request lacks
+    # this header and falls back to the default X-Session-ID resolution.
+    conversation_affinity_header_for_subagents: Optional[str] = None
 
 
 @dataclass
@@ -235,29 +243,30 @@ def parse_disagg_config_file(yaml_config_file: str):
         return disagg_server_config
 
 
-def extract_disagg_cfg(hostname: str = 'localhost',
-                       port: int = 8000,
-                       max_retries: int = 1,
-                       perf_metrics_max_requests: int = 0,
-                       return_perf_metrics: bool = False,
-                       perf_metrics_output_dir: Optional[str] = None,
-                       context_servers: Optional[dict] = None,
-                       generation_servers: Optional[dict] = None,
-                       conditional_disagg_config: Optional[dict] = None,
-                       otlp_config: Optional[dict] = None,
-                       disagg_cluster: Optional[dict] = None,
-                       node_id: Optional[int] = None,
-                       schedule_style: Literal[
-                           'context_first',
-                           'generation_first'] = 'context_first',
-                       allow_request_chat_template: bool = False,
-                       gen_strip_message_history: bool = False,
-                       gen_tokids_ctxbytes: bool = False,
-                       num_workers: int = 1,
-                       disagg_coordinator_url: Optional[str] = None,
-                       server_keep_alive_timeout: int = 10,
-                       internal_request_auth_key: Optional[str] = None,
-                       **kwargs: Any) -> DisaggServerConfig:
+def extract_disagg_cfg(
+        hostname: str = 'localhost',
+        port: int = 8000,
+        max_retries: int = 1,
+        perf_metrics_max_requests: int = 0,
+        return_perf_metrics: bool = False,
+        perf_metrics_output_dir: Optional[str] = None,
+        context_servers: Optional[dict] = None,
+        generation_servers: Optional[dict] = None,
+        conditional_disagg_config: Optional[dict] = None,
+        otlp_config: Optional[dict] = None,
+        disagg_cluster: Optional[dict] = None,
+        node_id: Optional[int] = None,
+        schedule_style: Literal['context_first',
+                                'generation_first'] = 'context_first',
+        allow_request_chat_template: bool = False,
+        gen_strip_message_history: bool = False,
+        gen_tokids_ctxbytes: bool = False,
+        num_workers: int = 1,
+        disagg_coordinator_url: Optional[str] = None,
+        server_keep_alive_timeout: int = 10,
+        internal_request_auth_key: Optional[str] = None,
+        conversation_affinity_header_for_subagents: Optional[str] = None,
+        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
     internal_request_auth_key = _extract_internal_request_auth_key(
@@ -329,6 +338,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     config.server_keep_alive_timeout = validate_config_non_negative_int(
         server_keep_alive_timeout, "server_keep_alive_timeout")
     config.internal_request_auth_key = internal_request_auth_key
+    config.conversation_affinity_header_for_subagents = (
+        conversation_affinity_header_for_subagents)
     return config
 
 
