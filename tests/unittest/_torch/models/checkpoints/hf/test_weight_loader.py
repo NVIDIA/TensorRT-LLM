@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import mmap
 import os
 import threading
@@ -504,7 +505,6 @@ def test_kimi_k3_lazy_load_records_the_checkpoint_dir(tmp_path):
     without this the model silently fell back to the shared mapping and the
     step was OOM-killed.
     """
-    import json
 
     import safetensors.torch
     import torch
@@ -528,8 +528,6 @@ def test_requires_lazy_safetensors_for_every_listed_model_type(
     tmp_path: Path, model_type: str
 ) -> None:
     """Each model type in the table routes to the lazy (mmapped) load path."""
-    import json
-
     (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
     assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is True
 
@@ -539,8 +537,6 @@ def test_requires_lazy_safetensors_is_false_for_other_checkpoints(
     tmp_path: Path, config: dict[str, str]
 ) -> None:
     """Any other model type, or no model type at all, takes the eager path."""
-    import json
-
     (tmp_path / "config.json").write_text(json.dumps(config))
     assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is False
 
