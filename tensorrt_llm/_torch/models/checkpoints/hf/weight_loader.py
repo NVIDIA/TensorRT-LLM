@@ -52,6 +52,9 @@ _NATIVE_IO_POLICY = "native"
 _RANK_STRIPED_IO_POLICY = "rank_striped_read_ahead"
 _SUPPORTED_IO_POLICIES = (_NATIVE_IO_POLICY, _RANK_STRIPED_IO_POLICY)
 _SUPPORTED_REQUESTED_IO_POLICIES = (_AUTO_IO_POLICY, ) + _SUPPORTED_IO_POLICIES
+# Model families whose checkpoints are too large to materialize in host RAM;
+# their models stream rank-local slices out of the lazy mmapped handles.
+_LAZY_SAFETENSORS_MODEL_TYPES = ("kimi_k3", "kimi_linear")
 # Default to a single cached checkpoint: each entry pins a full copy of the
 # raw weights in CPU RAM, so callers wanting cross-model caching must opt in
 # via TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES.
@@ -352,18 +355,25 @@ class HfWeightLoader(BaseWeightLoader):
         return weights
 
     @staticmethod
-    def _is_kimi_k3_checkpoint(checkpoint_dir: str) -> bool:
-        """Kimi K3 checkpoints (~1.5 TB) must not be materialized in host RAM."""
+    def _requires_lazy_safetensors(checkpoint_dir: str) -> bool:
+        """Whether this checkpoint must stay mmapped instead of being read
+        into host RAM.
+
+        The listed model families ship checkpoints too large to materialize
+        in host RAM (Kimi K3 is about 1.5 TB), and their models stream
+        rank-local slices (expert-parallel expert ranges) out of the lazy
+        handles during ``load_weights``.
+        """
         config_path = os.path.join(checkpoint_dir, "config.json")
         if not os.path.isfile(config_path):
             return False
         # Do not swallow read/parse failures: every rank must take the same
-        # branch here (the non-Kimi path enqueues collectives), so a
-        # rank-local transient error routing one rank differently would
-        # deadlock the job. Propagating fails fast on all ranks instead.
+        # branch here (the eager path enqueues collectives), so a rank-local
+        # transient error routing one rank differently would deadlock the job.
+        # Propagating fails fast on all ranks instead.
         with open(config_path) as f:
             model_type = json.load(f).get("model_type")
-        return model_type in ("kimi_k3", "kimi_linear")
+        return model_type in _LAZY_SAFETENSORS_MODEL_TYPES
 
     def _load_lazy_safetensors(
             self,
@@ -715,7 +725,7 @@ class HfWeightLoader(BaseWeightLoader):
         eligibility_reason = None
         preflight_error = None
         try:
-            if self._is_kimi_k3_checkpoint(checkpoint_dir):
+            if self._requires_lazy_safetensors(checkpoint_dir):
                 eligibility_reason = (
                     "the checkpoint requires model-specific lazy SafeTensors loading"
                 )
@@ -877,7 +887,7 @@ class HfWeightLoader(BaseWeightLoader):
                              _local_communicator=None,
                              _allow_prefetch: bool = True,
                              **kwargs) -> dict[str, Any]:
-        if self._is_kimi_k3_checkpoint(checkpoint_dir):
+        if self._requires_lazy_safetensors(checkpoint_dir):
             return self._load_lazy_safetensors(checkpoint_dir, use_consolidated)
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one

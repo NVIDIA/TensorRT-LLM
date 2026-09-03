@@ -22,6 +22,7 @@ import pytest
 
 from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import _LAZY_SAFETENSORS_MODEL_TYPES
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -519,3 +520,24 @@ def test_kimi_k3_lazy_load_records_the_checkpoint_dir(tmp_path):
         assert weights.checkpoint_dir == str(tmp_path)
     finally:
         loader.cleanup()
+
+
+@pytest.mark.parametrize("model_type", _LAZY_SAFETENSORS_MODEL_TYPES)
+def test_requires_lazy_safetensors_for_every_listed_model_type(tmp_path, model_type):
+    """Each model type in the table routes to the lazy (mmapped) load path."""
+    import json
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is True
+
+
+@pytest.mark.parametrize("config", [{"model_type": "llama"}, {}])
+def test_requires_lazy_safetensors_is_false_for_other_checkpoints(tmp_path, config):
+    import json
+
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is False
+
+
+def test_requires_lazy_safetensors_is_false_without_a_config(tmp_path):
+    assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is False
