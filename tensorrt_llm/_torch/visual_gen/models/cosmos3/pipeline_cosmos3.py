@@ -18,6 +18,7 @@ import json
 import math
 import os
 import time
+from io import BytesIO
 from typing import Any, Iterable, List, Optional, Union
 
 import PIL.Image
@@ -37,7 +38,7 @@ except ImportError:  # pragma: no cover - tqdm is optional at runtime.
 
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import load_wan_vae
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import (
     classify_worker_error,
@@ -45,7 +46,7 @@ from tensorrt_llm._torch.visual_gen.utils import (
     synchronize_media_prepare_status,
 )
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.inputs.utils import load_image
+from tensorrt_llm.inputs.media_io import convert_image_mode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.decoding import decode_video_reference_window, video_stream_info
 
@@ -236,7 +237,7 @@ def _condition_pixel_frame_count(
     return max(condition_video_latent_indexes) * int(temporal_compression) + 1
 
 
-def _load_reference_image(path: str):
+def _load_reference_image(data: bytes):
     """Load an I2V reference, reporting unreadable content as a client error.
 
     The worker's load is the acceptance check — the serve boundary only
@@ -246,7 +247,13 @@ def _load_reference_image(path: str):
     upload would be reported as a server fault.
     """
     try:
-        return load_image(path, format="pil")
+        image = PIL.Image.open(BytesIO(data))
+        # open() reads the header only. Truncated pixel data raises here and
+        # nowhere else: an already-RGB image never reaches a decoding convert.
+        image.load()
+        # convert_image_mode composites RGBA onto white, which is what this
+        # pipeline's references went through before.
+        return convert_image_mode(image, "RGB")
     except OSError as exc:
         raise ValueError(
             f"Image reference could not be decoded; it may be truncated, "
@@ -602,6 +609,20 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # ``default_use_system_prompt``.
         return dict(COSMOS3_EXTRA_SPECS)
 
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        return {
+            # Both optional: Cosmos3 also runs T2V with neither.
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="first_frame", min=0, max=1)],
+            ),
+            "video_reference": RefSlotSpec(
+                modality="video",
+                roles=[RoleSpec(role="reference", min=0, max=1)],
+            ),
+        }
+
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;
         # base defaults leave it None ("by mode") — warmup runs the video mode.
@@ -742,7 +763,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             value = getattr(req.params, field_name)
             return value if field_name in specified else None
 
-        video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
+        refs_v = req.params.video_reference
+        # Container and modality are already checked at the coordinator's
+        # reference choke point, so the bytes reaching here are known video.
+        video = refs_v[0].content if refs_v else None
         is_action = extra_params.get("action_mode") is not None
         if is_action:
             # Action resolves its whole recipe in forward() -- the canvas from
@@ -807,11 +831,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             width = resolved["width"]
             num_inference_steps = resolved["num_inference_steps"]
             guidance_scale = resolved["guidance_scale"]
+        refs_i = req.params.image_reference
 
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
-            image=req.params.image,
+            image=refs_i[0].content if refs_i else None,
             height=height,
             width=width,
             num_frames=req.params.num_frames,
@@ -1424,7 +1449,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self,
         prompt: Union[str, List[str]],
         negative_prompt: Optional[str] = None,
-        image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_frames: Optional[int] = None,
@@ -1732,9 +1757,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             raise ValueError("Batch generation is not supported for Cosmos3")
 
         # Validate image input — only single image is supported for batch generation
-        if image is not None and not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
+        if image is not None and not isinstance(image, (PIL.Image.Image, torch.Tensor, bytes)):
             raise ValueError(
-                f"`image` must be a PIL.Image, torch.Tensor, or file path string, "
+                f"`image` must be a PIL.Image, torch.Tensor, or encoded bytes, "
                 f"got {type(image)}. Batch of different images is not supported; "
                 f"use a single image with multiple prompts instead."
             )
@@ -1988,7 +2013,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         elif image is not None:
             prepare_error: Optional[Exception] = None
             try:
-                if isinstance(image, str):
+                if isinstance(image, bytes):
                     image = _load_reference_image(image)
 
                 if isinstance(image, PIL.Image.Image):

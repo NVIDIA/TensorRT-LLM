@@ -330,15 +330,20 @@ class FusedMoEMethodBase(ABC):
         w3_w1_bias_shape: Optional[tuple[int, int]] = None,
         w2_bias_shape: Optional[tuple[int, int]] = None,
     ):
+        from ...locality_domain_utils import get_current_locality_domain
+        is_locality_domain_weights = get_current_locality_domain() is not None
+        device = torch.device('cuda') if is_locality_domain_weights else None
         # Fused gate_up_proj (column parallel)
         w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
-                                                dtype=weight_dtype),
+                                                dtype=weight_dtype,
+                                                device=device),
                                     requires_grad=False)
         module.register_parameter("w3_w1_weight", w3_w1_weight)
 
         # down_proj (row parallel)
         w2_weight = nn.Parameter(torch.empty(w2_weight_shape,
-                                             dtype=weight_dtype),
+                                             dtype=weight_dtype,
+                                             device=device),
                                  requires_grad=False)
         module.register_parameter("w2_weight", w2_weight)
 
@@ -351,11 +356,14 @@ class FusedMoEMethodBase(ABC):
                 w2_bias_shape = w2_weight_shape[:2]
             bias_dtype = bias_dtype or module.dtype
             w3_w1_bias = nn.Parameter(torch.empty(w3_w1_bias_shape,
-                                                  dtype=bias_dtype),
+                                                  dtype=bias_dtype,
+                                                  device=device),
                                       requires_grad=False)
             module.register_parameter("w3_w1_bias", w3_w1_bias)
 
-            w2_bias = nn.Parameter(torch.empty(w2_bias_shape, dtype=bias_dtype),
+            w2_bias = nn.Parameter(torch.empty(w2_bias_shape,
+                                               dtype=bias_dtype,
+                                               device=device),
                                    requires_grad=False)
             module.register_parameter("w2_bias", w2_bias)
         else:
@@ -762,6 +770,40 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
+
+
+class BF16CuteDslFusedMoEMethod(UnquantizedFusedMoEMethod):
+    """Weight loading for BF16/FP16 CuTE DSL MoE on Rubin (SM107).
+
+    Extends UnquantizedFusedMoEMethod by interleaving FC1 (w3_w1) weights
+    for the fused gather + grouped GEMM + SwiGLU kernel. The SwiGLU fusion
+    requires gate/up weights to be interleaved with granularity=32 along
+    the intermediate dimension (dim=1).
+    """
+
+    def load_expert_w3_w1_weight(
+        self,
+        module: torch.nn.Module,
+        w1_weight: torch.Tensor,
+        w3_weight: torch.Tensor,
+        dst_w3_w1_weight: torch.Tensor,
+        allow_partial_loading: bool = False,
+    ) -> None:
+        super().load_expert_w3_w1_weight(
+            module,
+            w1_weight,
+            w3_weight,
+            dst_w3_w1_weight,
+            allow_partial_loading,
+        )
+        # Interleave gate/up weights for GEMM + SwiGLU fusion.
+        # Per-expert weight layout after super(): [w3(up), w1(gate)] along dim=0.
+        # interleave produces [up_0:32, gate_0:32, up_32:64, gate_32:64, ...].
+        w3_w1 = dst_w3_w1_weight.cuda()
+        w3_w1_interleaved = interleave_linear_and_gate(w3_w1,
+                                                       group_size=32,
+                                                       dim=0)
+        dst_w3_w1_weight.copy_(w3_w1_interleaved)
 
 
 class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -2458,6 +2500,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                        block_scales_vec_size,
                        scaling_vector_size=16,
                        bias_dtype: Optional[torch.dtype] = None):
+        from ...locality_domain_utils import get_current_locality_domain
+        is_locality_domain_weights = get_current_locality_domain() is not None
+        locality_domain_factor = 2 if is_locality_domain_weights else 1
+        device = torch.device('cuda') if is_locality_domain_weights else None
 
         module.scaling_vector_size = scaling_vector_size
 
@@ -2466,16 +2512,35 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
          w2_weight_scale_shape) = self.get_weights_shapes(
              module, weight_vec_size, block_scales_vec_size)
 
+        # Apply locality_domain_factor to divide weight and scale shapes
+        if locality_domain_factor > 1:
+            w3_w1_weight_shape = (w3_w1_weight_shape[0],
+                                  w3_w1_weight_shape[1] //
+                                  locality_domain_factor, w3_w1_weight_shape[2])
+            w2_weight_shape = (w2_weight_shape[0],
+                               w2_weight_shape[1] // locality_domain_factor,
+                               w2_weight_shape[2])
+            w3_w1_weight_scale_shape = (w3_w1_weight_scale_shape[0],
+                                        w3_w1_weight_scale_shape[1] //
+                                        locality_domain_factor,
+                                        w3_w1_weight_scale_shape[2])
+            w2_weight_scale_shape = (w2_weight_scale_shape[0],
+                                     w2_weight_scale_shape[1] //
+                                     locality_domain_factor,
+                                     w2_weight_scale_shape[2])
+
         # Divide by 4 because we use int32 to pack 4 fp8 values
         # column parallel
         w3_w1_weight_scale = nn.Parameter(torch.ones(w3_w1_weight_scale_shape,
-                                                     dtype=block_scales_dtype),
+                                                     dtype=block_scales_dtype,
+                                                     device=device),
                                           requires_grad=False)
         module.register_parameter("w3_w1_weight_scale", w3_w1_weight_scale)
 
         # row parallel
         w2_weight_scale = nn.Parameter(torch.ones(w2_weight_scale_shape,
-                                                  dtype=block_scales_dtype),
+                                                  dtype=block_scales_dtype,
+                                                  device=device),
                                        requires_grad=False)
         module.register_parameter("w2_weight_scale", w2_weight_scale)
 
@@ -3717,6 +3782,11 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                                                      w3_weight_scale,
                                                      dst_w3_w1_weight_scale,
                                                      expert_idx=expert_idx)
+        from ...locality_domain_utils import get_current_locality_domain
+        is_locality_domain_weights = get_current_locality_domain() is not None
+        locality_domain_factor = 2 if is_locality_domain_weights else 1
+        # Interleave FC1 scales for GEMM1 + SwiGLU fusion.
+        module.intermediate_size_per_partition * 2 // locality_domain_factor
 
         # CuteDsl interleave deferred to process_weights_after_loading().
 
@@ -5444,6 +5514,24 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # Finalize shared expert alphas and fc31_scale_c for online EPLB
         self._finalize_shared_expert_alphas(module)
 
+        # Cubin clamp / GLU bias inputs are consumed in the pre-dequant GEMM
+        # output domain (i.e. divided by fc31_alpha / fc2_alpha). The ``act_*``
+        # slots are per-expert tensors on every path this method class serves.
+        #
+        # The bias division is gated on module.bias to stay consistent with
+        # _shuffle_all_experts() below. Hoisting this block into the base method
+        # deliberately widens it to W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, which
+        # auto-creates all-zero bias tensors that its kernel
+        # (fp8_fp4_block_scale_moe_runner) never consumes; those must not be
+        # divided, because a zero alpha would turn them into NaN.
+        if module.bias:
+            module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
+            module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
+        if getattr(module, 'act_beta', None) is not None:
+            module.act_beta.data.div_((module.fc31_alpha.data))
+        if getattr(module, 'act_clamp', None) is not None:
+            module.act_clamp.data.div_((module.fc31_alpha.data))
+
     def _shuffle_shared_expert_tensors(self,
                                        module: torch.nn.Module,
                                        num_elts_per_sf: int = 16):
@@ -5936,23 +6024,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                 self._shuffle_w3_w1_weight(module,
                                            module.w3_w1_bias.data[expert_idx])
                 self._shuffle_w2_weight(module.w2_bias.data[expert_idx])
-
-    def process_weights_after_loading(self,
-                                      module: torch.nn.Module,
-                                      num_elts_per_sf: int = 16):
-        super().process_weights_after_loading(module,
-                                              num_elts_per_sf=num_elts_per_sf)
-
-        # Cubin clamp / GLU bias inputs are consumed in the pre-dequant GEMM
-        # output domain (i.e. divided by fc31_alpha / fc2_alpha).
-        if module.w3_w1_bias is not None:
-            module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
-        if module.w2_bias is not None:
-            module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
-        if module.swiglu_beta is not None:
-            module.swiglu_beta.data.div_((module.fc31_alpha.data))
-        if module.swiglu_limit is not None:
-            module.swiglu_limit.data.div_((module.fc31_alpha.data))
 
 
 class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):

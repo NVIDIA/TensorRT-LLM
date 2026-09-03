@@ -1158,7 +1158,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
     bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
-    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps)
+    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps, double skip_correction_threshold)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1300,6 +1300,12 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         = static_cast<float>(skip_softmax_threshold_scale_factor_prefill.value_or(0));
     op->mSkipSoftmaxThresholdScaleFactorDecode
         = static_cast<float>(skip_softmax_threshold_scale_factor_decode.value_or(0));
+    auto constexpr maxSkipCorrectionThreshold = 32.0;
+    TORCH_CHECK(skip_correction_threshold >= 0.0 && skip_correction_threshold <= maxSkipCorrectionThreshold,
+        "skip_correction_threshold must be in the range (0, 32] when enabled, or 0 when disabled.");
+    int const smVersion = op->smVersion();
+    bool const applySkipCorrection = is_mla_enable && (smVersion == 100 || smVersion == 103);
+    op->mSkipCorrectionThreshold = applySkipCorrection ? static_cast<float>(skip_correction_threshold) : 0.0F;
 #ifdef SKIP_SOFTMAX_STAT
     op->mSkipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(skip_softmax_stat.value().data_ptr());
     op->mSkipSoftmaxSkippedBlocks = op->mSkipSoftmaxTotalBlocks + 1;

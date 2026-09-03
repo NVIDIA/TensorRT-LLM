@@ -186,6 +186,13 @@ class MsaSparseGqaFmha(Fmha):
 
     @classmethod
     def is_available(cls, attn: Optional["TrtllmAttention"] = None) -> bool:
+        if (
+            attn is not None
+            and getattr(attn, "skip_correction_threshold", 0.0) > 0.0
+            and not cls.supports_skip_correction
+        ):
+            return False
+
         # fmha_sm100 runs only on the SM100 family and is packaged in the
         # wheel, so it is unavailable off SM100 or without the wheel.
         # Imported lazily because the minimax_m3 package init imports the trtllm

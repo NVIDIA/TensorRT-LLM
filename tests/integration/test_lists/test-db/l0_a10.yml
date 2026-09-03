@@ -19,6 +19,8 @@ l0_a10:
   - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_torch_multi_arange.py
   - unittest/_torch/test_fused_relu2.py
+  - unittest/_torch/test_mnnvl_alltoall_workspace.py
+  - unittest/_torch/test_mnnvl_memory_lifecycle.py
   - unittest/utils/test_util.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
@@ -53,6 +55,7 @@ l0_a10:
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_bounce.py
   - unittest/disaggregated/test_mamba_transfer.py
+  - unittest/disaggregated/test_msgspec_route.py
   # unittest/tools is listed per file rather than as a directory. The directory
   # form swept test_layer_wise_benchmarks.py onto A10, whose DeepSeek FP4 cases
   # pin SM100+ checkpoints -- that is https://nvbugs/6337228.

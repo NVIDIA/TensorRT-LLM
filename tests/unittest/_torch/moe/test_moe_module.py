@@ -73,6 +73,7 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import (
+    DEFAULT_MOE_ACTIVATION,
     DeepSeekV3MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
@@ -81,6 +82,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
     SigmoidRenormMoeRoutingMethod,
+    SwigluBiasActivation,
     create_moe,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
@@ -659,9 +661,15 @@ def _test_moe_worker_impl(
                 reduce_results=True,
                 model_config=model_cfg,
                 bias=swiglu_gptoss_style,
-                swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
-                swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
-                swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+                activation=(
+                    SwigluBiasActivation(
+                        gate_sigmoid_scale=swiglu_tensors["swiglu_alpha"],
+                        linear_offset=swiglu_tensors["swiglu_beta"],
+                        clamp=swiglu_tensors["swiglu_limit"],
+                    )
+                    if swiglu_tensors
+                    else DEFAULT_MOE_ACTIVATION
+                ),
                 weight_loading_mode=weight_loading_mode,
             ) as fused_moe,
         ):

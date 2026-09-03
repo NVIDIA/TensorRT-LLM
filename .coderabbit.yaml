@@ -34,8 +34,11 @@ reviews:
     **QA Engineer Review**
     Always include this section when any files under tests/ are touched.
     For test-list-only changes (only tests/integration/test_lists/ files):
-      - List which test-db/ or qa/ files were modified and what entries were added or removed.
-      - Verdict: "needs follow-up" if CBTS coverage data is unavailable, otherwise "sufficient" or "insufficient".
+      - List all modified test-list files, including waives.txt, and what entries were added or removed.
+      - Review the list changes directly for valid test IDs, formatting, duplicates, and appropriate bug references.
+      - CBTS touchmap coverage evidence is not applicable: these changes are handled directly by Tier 1
+        path/diff rules, while the touchmap is used for residual source-code changes.
+      - Verdict: "sufficient" or "insufficient" based on the correctness and intended scope of the list changes.
     For test-code changes (files outside tests/integration/test_lists/):
       - List test functions added, modified, or removed.
       - State whether each is covered in tests/integration/test_lists/ (test-db/ for CI, qa/ for manual QA).
@@ -60,10 +63,14 @@ reviews:
         Always produce a test coverage summary, even if no issues are found.
 
         If the change touches ONLY files under tests/integration/test_lists/ (no test-code changes):
-        - Report which test-db/ or qa/ list files were modified and what entries were added or removed.
+        - Report all modified test-list files, including waives.txt, and what entries were added or removed.
         - Do NOT require changed test functions for this path.
-        - Use verdict "needs follow-up" when cbts_touchmap.sqlite or a CBTS coverage report is unavailable
-          to confirm the impacted test scope; otherwise use "sufficient" or "insufficient".
+        - Review the list changes directly for valid test IDs, formatting, duplicates, and appropriate bug references.
+        - CBTS touchmap coverage evidence is not applicable: test-list-only changes are handled directly by
+          Tier 1 path/diff rules, while the touchmap is used for residual source-code changes.
+        - Do NOT use verdict "needs follow-up" solely because cbts_touchmap.sqlite or a CBTS coverage report
+          is unavailable. Use "sufficient" or "insufficient" based on the correctness and intended scope of
+          the list changes.
 
         If the change includes test-code files (outside tests/integration/test_lists/), the summary must include:
         1. Which test functions were added, modified, or removed.

@@ -40,7 +40,7 @@ from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
                                            load_hf_tokenizer)
 from tensorrt_llm.sampling_params import LogitsProcessor, SamplingParams
-from tensorrt_llm.serve.openai_protocol import CompletionRequest
+from tensorrt_llm.serve.openai_protocol import CompletionRequest, StreamOptions
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      chat_stream_post_processor)
@@ -1244,6 +1244,41 @@ def test_chat_stream_post_processor_reuses_stream_metadata() -> None:
     assert len({payload["created"] for payload in payloads}) == 1
     assert payloads[0]["choices"][0]["delta"]["role"] == "assistant"
     assert payloads[-1]["choices"][0]["delta"]["content"] == "y"
+
+
+def test_chat_stream_post_processor_usage_applies_prompt_token_offset() -> None:
+    result = GenerationResultBase(123, SamplingParams())
+    output = result._outputs[0]
+    output.text = "x"
+    output.token_ids = [1]
+    output.finish_reason = "stop"
+    result._done = True
+
+    args = ChatPostprocArgs(role="assistant",
+                            model="test-model",
+                            num_prompt_tokens=5,
+                            num_prompt_tokens_offset=3,
+                            stream_options=StreamOptions(include_usage=True))
+    payloads = _stream_payloads_from_chunks(
+        chat_stream_post_processor(result, args))
+
+    final_chunk = payloads[-1]
+    assert final_chunk["choices"] == []
+    assert final_chunk["usage"]["prompt_tokens"] == 2
+    assert final_chunk["usage"]["completion_tokens"] == 1
+    assert final_chunk["usage"]["total_tokens"] == 3
+
+
+def test_chat_stream_post_processor_usage_requires_prompt_token_count() -> None:
+    # Usage arithmetic needs a concrete count: a missing one must surface as a
+    # clear error, never as None leaking into UsageInfo or a TypeError.
+    result = GenerationResultBase(123, SamplingParams())
+    args = ChatPostprocArgs(role="assistant",
+                            model="test-model",
+                            stream_options=StreamOptions(include_usage=True))
+
+    with pytest.raises(ValueError, match="num_prompt_tokens"):
+        chat_stream_post_processor(result, args)
 
 
 class _FakeCompletionGeneratorArgs:

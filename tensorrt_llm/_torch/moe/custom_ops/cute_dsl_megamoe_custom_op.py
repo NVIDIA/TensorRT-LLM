@@ -1014,8 +1014,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         tactic: Optional[Tuple] = None,
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
-        situ_beta: Optional[float] = None,
-        situ_linear_beta: Optional[float] = None,
+        act_alpha: Optional[float] = None,
+        act_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
     ) -> int:
@@ -1073,8 +1073,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             epi_flag_batch=tuple(epi_flag_batch),
             apply_topk_in_fc1=bool(apply_topk_in_fc1),
             gate_up_clamp=(None if gate_up_clamp is None else float(gate_up_clamp)),
-            situ_beta=(None if situ_beta is None else float(situ_beta)),
-            situ_linear_beta=(None if situ_linear_beta is None else float(situ_linear_beta)),
+            situ_beta=(None if act_alpha is None else float(act_alpha)),
+            situ_linear_beta=(None if act_beta is None else float(act_beta)),
             **_LOCKED_KERNEL_KWARGS,
         )
         # The probe MUST build the SAME kernel that runs (same combine_format):
@@ -1702,8 +1702,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         peer_offsets: List[int],
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
-        situ_beta: Optional[float] = None,
-        situ_linear_beta: Optional[float] = None,
+        act_alpha: Optional[float] = None,
+        act_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
         tactic_autotune: bool = False,
@@ -1730,6 +1730,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
         accumulation order). Both write ``combine_output`` with shape
         ``(T, 1, hidden)``. Perf knobs come from the tactic, not op
         arguments.
+
+        ``act_alpha`` / ``act_beta`` also select the activation, because the
+        epilogue has no separate kind argument: both None runs SwiGLU, both set
+        runs SiTU with them as the gate-side and linear-side soft-caps
+        (``epilogue_refactor.py``'s ``situ_beta is None`` branch). They are
+        codegen-time constants, so a change recompiles the kernel.
         """
         sm_version = get_sm_version()
         if sm_version not in (100, 103):
@@ -1758,8 +1764,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
             output_dtype=combine_output.dtype,
             apply_topk_in_fc1=apply_topk_in_fc1,
             gate_up_clamp=gate_up_clamp,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
+            # The runner and the kernel package below it name these registers
+            # after SiTU; this op's boundary does not, so the spelling changes
+            # here and nowhere else.
+            situ_beta=act_alpha,
+            situ_linear_beta=act_beta,
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             combine_format=combine_format,
             tactic_autotune=tactic_autotune,
@@ -1872,8 +1881,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         peer_offsets: List[int],
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
-        situ_beta: Optional[float] = None,
-        situ_linear_beta: Optional[float] = None,
+        act_alpha: Optional[float] = None,
+        act_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
         tactic_autotune: bool = False,

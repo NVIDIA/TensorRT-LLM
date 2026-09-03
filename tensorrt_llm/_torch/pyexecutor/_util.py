@@ -304,15 +304,15 @@ def get_kv_cache_manager_cls(
 # KVCacheManager.get_cache_size_per_token may return either an ``int``
 # (legacy proportional model ``bytes = slope * tokens``) or an affine
 # ``(slope, intercept)`` tuple (CppMambaHybridCacheManager, where mamba
-# state introduces a per-batch fixed cost).  KVCacheManagerV2 reports
-# sliding-window attention fixed cost in the tuple intercept.  CacheCost
-# normalizes the combined shape so the rest of the file does plain attribute
-# access and method calls instead of branching on type.
+# state introduces a per-batch fixed cost). CacheCost normalizes the combined
+# shape so the rest of the file does plain attribute access and method calls
+# instead of branching on type. Managers are responsible for including any
+# pool-specific alignment or capacity headroom in the returned cost.
 
 
 @dataclasses.dataclass(frozen=True)
 class CacheCost:
-    """Affine KV cache cost: ``bytes = slope * tokens + intercept``.
+    """Affine KV cache budget: ``bytes = slope * tokens + intercept``.
 
     The legacy proportional case is just ``intercept = 0``.
     """
@@ -696,6 +696,8 @@ class KvCacheCreator:
                                 manager_cls,
                                 model_config,
                                 kv_cache_config: Optional[KvCacheConfig] = None,
+                                *,
+                                is_draft: bool = False,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -706,8 +708,10 @@ class KvCacheCreator:
                 tokens_per_block=self._tokens_per_block,
                 max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
+                max_num_tokens=self._max_num_tokens if is_draft else 0,
                 kv_cache_config=kv_cache_config,
                 spec_config=self._speculative_config,
+                is_draft=is_draft,
                 **extra_kwargs))
 
     def _get_one_model_draft_layer_mask(self) -> List[bool]:
@@ -765,8 +769,10 @@ class KvCacheCreator:
                     draft_kv_cache_config,
                     is_disagg=self._is_disagg)
                 total += self._per_manager_cache_cost(
-                    draft_kv_cache_manager_cls, effective_draft_config,
-                    draft_kv_cache_config)
+                    draft_kv_cache_manager_cls,
+                    effective_draft_config,
+                    draft_kv_cache_config,
+                    is_draft=True)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 total += self._per_manager_cache_cost(
@@ -1605,11 +1611,11 @@ class KvCacheCreator:
             self._model_engine.model.model_config,
             target_kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
-        # The draft contribution is whatever the aggregate has on top of the
-        # target. Both pieces are CacheCost; subtraction is component-wise.
         draft_kv = CacheCost(slope=total_kv.slope - target_kv.slope,
                              intercept=total_kv.intercept - target_kv.intercept)
-        if target_kv.slope <= 0 or draft_kv.slope <= 0:
+        costs = (target_kv, draft_kv)
+        if any(cost.slope < 0 or cost.intercept < 0 or (
+                cost.slope == 0 and cost.intercept == 0) for cost in costs):
             return None
         return target_kv, draft_kv
 
@@ -1622,14 +1628,21 @@ class KvCacheCreator:
         """Split *total_budget* into (target_budget, draft_budget) byte shares."""
         intercept_total = target_kv.intercept + draft_kv.intercept
         slope_budget = total_budget - intercept_total
-        if slope_budget <= 0:
+        slope_total = target_kv.slope + draft_kv.slope
+        if slope_budget < 0:
             logger.warning(
                 f"KV cache budget {total_budget} is smaller than the fixed "
-                f"mamba state cost {intercept_total}; cannot split between "
+                f"cache cost {intercept_total}; cannot split between "
                 f"target and draft.")
             return None
-        slope_total = target_kv.slope + draft_kv.slope
-        draft_slope_share = int(slope_budget * draft_kv.slope / slope_total)
+        if slope_budget == 0 and slope_total > 0:
+            logger.warning(
+                f"KV cache budget {total_budget} leaves no capacity beyond "
+                f"the fixed cache cost {intercept_total}; cannot split "
+                f"between target and draft with a per-token cache cost.")
+            return None
+        draft_slope_share = (slope_budget * draft_kv.slope //
+                             slope_total if slope_total > 0 else 0)
         draft_budget = draft_kv.intercept + draft_slope_share
         target_budget = total_budget - draft_budget
         return target_budget, draft_budget
@@ -1658,8 +1671,8 @@ class KvCacheCreator:
         GPU-resident state never occupies) the intercept is dropped so the split
         stays proportional to the per-token cost.
 
-        When the split is *infeasible* (the combined fixed cost meets or exceeds
-        the budget — only possible for ``max_gpu_total_bytes`` after the above)
+        When the split is *infeasible* (the combined fixed cost exhausts the
+        budget while either manager has a per-token cost, or exceeds it)
         the shortfall is fatal: both managers need their fixed state resident in
         GPU memory, so the run would OOM. It raises ``ValueError`` rather than
         silently producing an unusable config. A defensive degrade-to-zero path
@@ -1691,7 +1704,7 @@ class KvCacheCreator:
         shares = self._compute_draft_budget_shares(total_budget, target_kv,
                                                    draft_kv)
         if shares is None:
-            # The split is infeasible (combined fixed cost >= total budget).
+            # The split cannot provide each manager with usable GPU capacity.
             intercept_total = target_kv.intercept + draft_kv.intercept
             if budget_attr == "max_gpu_total_bytes":
                 # A GPU budget that cannot even fit the combined fixed cost is
@@ -1700,7 +1713,7 @@ class KvCacheCreator:
                 # guidance rather than producing an unusable zero-budget draft.
                 raise ValueError(
                     f"KV cache GPU budget ({total_budget / GB:.2f} GiB) is "
-                    f"smaller than the combined fixed cost "
+                    f"insufficient after the combined fixed cost "
                     f"({intercept_total / GB:.2f} GiB, e.g. mamba SSM state) "
                     f"for target+draft. Increase free_gpu_memory_fraction or "
                     f"max_gpu_total_bytes, or reduce max_batch_size (the fixed "
