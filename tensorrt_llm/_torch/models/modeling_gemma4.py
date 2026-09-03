@@ -27,6 +27,7 @@ from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._torch.moe.fused_moe.activation import SimpleActivation
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
@@ -669,7 +670,7 @@ class Gemma4MoE(nn.Module):
             reduce_results=True,
             model_config=model_config,
             layer_idx=layer_idx,
-            activation_type=ActivationType.Geglu,
+            activation=SimpleActivation(kind=ActivationType.Geglu),
             # VANILLA mode: preprocess_weights splits 3D gate_up_proj into per-expert w1/w3
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
         )

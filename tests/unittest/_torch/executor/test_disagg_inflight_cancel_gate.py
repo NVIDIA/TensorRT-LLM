@@ -115,14 +115,14 @@ def test_flag_unset_generation_timeout_uses_rank_uniform_cleanup():
 
     executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
     assert executor.active_requests == []
-    executor.dist.tp_allgather.assert_called_once_with(True)
+    executor.dist.tp_allgather.assert_called_once_with(True, small_payload=True)
     executor._handle_errors.assert_called_once_with(
         error_msg="Request timed out (KV transfer)",
         requests=[request],
         charge_budget=False,
     )
     assert executor._timeout_cleanup_order.mock_calls == [
-        call.vote(True),
+        call.vote(True, small_payload=True),
         call.handle(
             error_msg="Request timed out (KV transfer)",
             requests=[request],
@@ -138,14 +138,14 @@ def test_flag_unset_generation_timeout_peer_enters_cleanup():
     PyExecutor._handle_kv_transfer_timeouts_synced(executor)
 
     executor.kv_cache_transceiver.cancel_request.assert_not_called()
-    executor.dist.tp_allgather.assert_called_once_with(False)
+    executor.dist.tp_allgather.assert_called_once_with(False, small_payload=True)
     executor._handle_errors.assert_called_once_with(
         error_msg="Request timed out (KV transfer)",
         requests=[],
         charge_budget=False,
     )
     assert executor._timeout_cleanup_order.mock_calls == [
-        call.vote(False),
+        call.vote(False, small_payload=True),
         call.handle(
             error_msg="Request timed out (KV transfer)",
             requests=[],
@@ -307,6 +307,8 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
     executor.kv_cache_transceiver = Mock()
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
+    # Transfer ownership is released once the request leaves the manager.
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor._disagg_inflight_cancel_unsupported_logged = False
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.requests_in_transfer.return_value = {

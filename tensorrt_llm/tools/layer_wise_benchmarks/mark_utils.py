@@ -36,9 +36,10 @@ def mark_ranges():
         Qwen3NextSparseMoeBlock.forward
     )
     # Kimi K3. KDA runs directly through `KimiKDALinearAttention`.
-    # `KimiK3MLAAttention` overrides `MLA.forward`, so its range is on the
-    # `KimiMLARuntime` wrapper. The gate is entered through `compute_logits`,
-    # not `forward`. Its MLPs are the shared `GatedMLP`.
+    # `KimiK3MLAAttention` runs the shared `MLA.forward`, annotated below; the
+    # `KimiMLARuntime` range bounds the attention-plus-reduction around it. The
+    # gate is entered through `compute_logits`, not `forward`. Its MLPs are the
+    # shared `GatedMLP`.
     KimiKDALinearAttention.forward = nvtx.annotate("KimiKDALinearAttention")(
         KimiKDALinearAttention.forward
     )

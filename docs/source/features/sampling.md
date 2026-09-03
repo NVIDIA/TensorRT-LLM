@@ -17,6 +17,8 @@ The PyTorch backend supports a wide variety of features, listed below:
 
 ## General usage
 
+TorchSampler is the only sampler; the `sampler_type` argument and the TRTLLM Sampler it selected have been removed. `sampler_type="auto"` and `sampler_type="TorchSampler"` are still accepted and ignored, while `sampler_type="TRTLLMSampler"` is rejected. When migrating off TRTLLM Sampler, also review the settings tuned for it, notably `logprobs`: under TorchSampler, `logprobs=0` returns the sampled token's log probability.
+
 Here is an example to run a model with basic usage of sampling parameters. This example prepares two identical prompts which will give different results due to the sampling parameters chosen:
 
 ```python

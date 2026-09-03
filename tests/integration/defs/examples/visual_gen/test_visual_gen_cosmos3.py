@@ -53,7 +53,13 @@ COSMOS3_NANO_MODEL_SUBPATH = "Cosmos3-Nano"
 COSMOS3_LPIPS_PROMPT = "A serene mountain landscape with snow-capped peaks and a flowing river"
 COSMOS3_LPIPS_HEIGHT = 720
 COSMOS3_LPIPS_WIDTH = 1280
-COSMOS3_LPIPS_T2V_NUM_FRAMES = 189
+# 9 frames = 3 latent frames (temporal VAE: floor((F-1)/4)+1), 2,760 video
+# tokens -- the smallest T2V shape that still exercises multi-latent-frame
+# temporal attention. The 720P default of 189 frames (44,160 tokens) costs ~7
+# minutes of generation per CI run and adds no gate value: a golden catches
+# severe regressions, and cross-stepping drift only grows with trajectory
+# length (0.020 at 1 frame -> 0.151 at 189).
+COSMOS3_LPIPS_T2V_NUM_FRAMES = 9
 COSMOS3_LPIPS_T2I_NUM_FRAMES = 1
 # 9 frames = 3 latent frames: latents (0, 1) are pinned to the V2V reference,
 # latent 2 (pixel frames 5-8) is generated. Frame 8 is the golden-compared frame.
@@ -63,7 +69,23 @@ COSMOS3_LPIPS_NUM_INFERENCE_STEPS = 35
 COSMOS3_LPIPS_GUIDANCE_SCALE = 6.0
 COSMOS3_LPIPS_SEED = 42
 COSMOS3_LPIPS_FRAME_RATE = 24.0
-COSMOS3_LPIPS_THRESHOLD = 0.05
+# T2I stays at the original tight bar: the 1-frame shape has the smallest
+# cross-stepping exposure in the family (its B300-cut golden scores 0.020 on
+# the B200 lane), so 0.05 keeps ~2.5x margin over that floor without the
+# relaxed band the longer trajectories need.
+COSMOS3_LPIPS_T2I_THRESHOLD = 0.05
+# T2V/V2V gate at a relaxed KPI-backstop band, not at 0.05: Cosmos3-Nano
+# trajectories are not bit-stable across GPU steppings (nvbugs/6655359 --
+# B300-cut media measured LPIPS 0.020/0.075/0.151 on B200 at 1/9/189 frames
+# with everything else held fixed), so a tight bar just re-fires whenever the
+# media host and the CI lane disagree. The bars sit above the 9-frame
+# cross-stepping floor (0.075) so the gates catch model regressions and survive
+# a CI GPU change without re-cutting media. The one code-caused regression
+# these gates have caught measured 0.608404 (nvbugs/6418815), well above both
+# bars. The V2V golden is B300-cut and scores 0.070 on the B200 lane; the T2V
+# golden is cut on B200, the lane's own GPU.
+COSMOS3_LPIPS_T2V_THRESHOLD = 0.20
+COSMOS3_LPIPS_V2V_THRESHOLD = 0.15
 COSMOS3_I2V_4STEP_MODEL_SUBPATH = "Cosmos3-Super-Image2Video-4Step"
 COSMOS3_I2V_4STEP_LPIPS_PROMPT = (
     "The orange sphere slowly rises while the camera pans right across the scene"
@@ -388,7 +410,7 @@ def test_cosmos3_nano_t2v_lpips_against_golden(_visual_gen_deps, tmp_path):
         golden_path,
         generated_path,
     )
-    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_T2V_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -408,7 +430,7 @@ def test_cosmos3_nano_v2v_lpips_against_golden(_visual_gen_deps, tmp_path):
         golden_path,
         generated_path,
     )
-    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_V2V_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -426,7 +448,7 @@ def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, tmp_path):
         golden_path,
         generated_path,
     )
-    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_T2I_THRESHOLD)
 
 
 def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
@@ -756,11 +778,12 @@ def test_cosmos3_edge_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.getsize(output_path) > 0, f"Example produced an empty video at {output_path}"
 
 
-# Edge LPIPS gates compare against diffusers-main reference goldens with the
-# scheduler patched to the cosmos-framework native flow schedule; full
+# Edge LPIPS gates compare against TRT-LLM self-goldens (originally cut from
+# diffusers-main references, re-baselined as self-goldens when the fp32-matmul
+# pin landed; cross-stack correctness is covered by TestDiffusersParity); full
 # provenance in golden/visual_gen_lpips/cosmos3_edge_*.json. The I2V gate runs
-# 10 steps (cross-stack drift accumulates per step; the deployed 50-step shape
-# is covered by test_cosmos3_edge_i2v_example).
+# 10 steps (drift accumulates per step; the deployed 50-step shape is covered
+# by test_cosmos3_edge_i2v_example).
 COSMOS3_EDGE_LPIPS_SEED = 42
 COSMOS3_EDGE_LPIPS_FRAME_RATE = 24.0
 COSMOS3_EDGE_LPIPS_NUM_FRAMES = 29

@@ -11,8 +11,8 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import (Any, Callable, Dict, Hashable, List, Optional, Sequence,
-                    Tuple, Union)
+from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple, Type,
+                    Union)
 
 import torch
 import torch._dynamo.config
@@ -32,13 +32,10 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
                                             strip_mm_data_for_generation)
-from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
-                                          BaseMultimodalInputProcessor,
-                                          create_input_processor,
-                                          get_multimodal_encoder_item_metadata)
+from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+                                          create_input_processor)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
-                                          MultimodalEncoderSchedulingPolicy,
                                           PrefillCudaGraphBackend,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
@@ -62,9 +59,7 @@ from ..distributed.communicator import init_pp_comm
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from ..models.modeling_multimodal_mixin import (MultimodalEncoderContractError,
-                                                MultimodalModelMixin,
+from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
                                                 _build_request_multimodal_input)
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -79,8 +74,8 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_loaded_model)
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
+from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
-from ..tensor_lru_cache import TensorLRUCache
 from ..utils import (get_model_extra_attrs,
                      get_per_request_prefill_cuda_graph_flag,
                      set_per_request_prefill_cuda_graph_flag,
@@ -91,14 +86,15 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
+from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
+                                mm_encoder_cache_enabled,
+                                setup_mm_encoder_attn_metadata)
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import (LlmRequest, LlmRequestState,
-                          MultimodalEncoderRequestError, _Unset,
-                          get_draft_token_length,
+from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
                           get_multimodal_embedding_lengths)
-from .mamba_cache_manager import MambaHybridCacheManager
+from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
@@ -107,6 +103,19 @@ from .sampler import SampleStateTensors
 from .sampler.ops.flashinfer import warmup_sampling_module
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
+
+
+def _get_context_prompt_lookahead_token(request: LlmRequest,
+                                        chunk_end: int) -> int:
+    """Read the prompt token immediately following a context chunk."""
+    if chunk_end >= request.py_prompt_len:
+        return INVALID_PROMPT_LOOKAHEAD_TOKEN
+    return request.get_token(0, chunk_end)
+
+
+def resolve_mamba_metadata_cls(model: torch.nn.Module) -> Type[Mamba2Metadata]:
+    """Resolve the model-specific Mamba metadata class with a default."""
+    return getattr(model, 'mamba_metadata_cls', None) or Mamba2Metadata
 
 
 def _make_single_token_context_graph_batch(
@@ -155,38 +164,6 @@ def _make_single_token_context_graph_batch(
     promoted_context_request_ids = frozenset(request.py_request_id
                                              for request in context_requests)
     return graph_batch, promoted_context_request_ids
-
-
-def _resolve_mm_encoder_token_budget(base_budget: int,
-                                     model_max_atomic_item_tokens: int) -> int:
-    """Keep the model's largest indivisible MM item schedulable."""
-    return max(base_budget, model_max_atomic_item_tokens)
-
-
-def _validate_mm_encoder_scheduling_compatibility(
-        llm_args: TorchLlmArgs, item_scheduling_enabled: bool) -> None:
-    """Validate item-scheduling combinations after model capability is known."""
-    policy = llm_args.multimodal_config.encoder_scheduling_policy
-    if not item_scheduling_enabled:
-        return
-    if llm_args.multimodal_config.encoder_side_stream_max_ahead > 0:
-        raise ValueError(
-            "MM encoder item scheduling does not yet support side-stream "
-            "prefetch (multimodal_config.encoder_side_stream_max_ahead > 0); "
-            "set encoder_scheduling_policy=DISABLED or "
-            "encoder_side_stream_max_ahead=0")
-    if policy != MultimodalEncoderSchedulingPolicy.EAGER:
-        return
-    if llm_args.enable_attention_dp:
-        raise ValueError(
-            "multimodal_config.encoder_scheduling_policy=EAGER does not yet "
-            "support attention DP (enable_attention_dp=True)")
-    cache_transceiver_config = llm_args.cache_transceiver_config
-    if (cache_transceiver_config is not None
-            and cache_transceiver_config.backend is not None):
-        raise ValueError(
-            "multimodal_config.encoder_scheduling_policy=EAGER does not yet "
-            "support disaggregated serving (cache_transceiver_config)")
 
 
 class ModelEngine(ABC):
@@ -446,6 +423,9 @@ class PyTorchModelEngine(ModelEngine):
                 llm_args.checkpoint_format,
                 mx_config=llm_args.mx_config,
                 mx_model_name=llm_args.model,
+                checkpoint_io_policy=llm_args.checkpoint_io_policy,
+                load_format=llm_args.load_format,
+                partial_model_loading=llm_args.is_partial_model_loading,
             )
 
         self.mapping = mapping
@@ -556,95 +536,30 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
-        # Item scheduling is declared once, as a model capability (the
-        # `MultimodalModelMixin` ClassVar). The engine stores only the
-        # actionable flag: whether the item-scheduling wiring is engaged this
-        # run (setup below, scheduler wrap, executor encoder step).
-        # `disable_mm_encoder` and a `DISABLED` policy both keep the capability
-        # but run only the base LLM scheduler.
-        _mm_config = getattr(self.llm_args, "multimodal_config", None)
-        _mm_scheduling_policy = (_mm_config.encoder_scheduling_policy
-                                 if _mm_config is not None else
-                                 MultimodalEncoderSchedulingPolicy.DEFAULT)
-        self.mm_encoder_item_scheduling_enabled = (
-            not self.llm_args.disable_mm_encoder
-            and isinstance(self.model, MultimodalModelMixin)
-            and self.model.supports_mm_encoder_item_scheduling and
-            _mm_scheduling_policy != MultimodalEncoderSchedulingPolicy.DISABLED)
-        _validate_mm_encoder_scheduling_compatibility(
-            self.llm_args, self.mm_encoder_item_scheduling_enabled)
-        self.mm_encoder_attention_metadata_capacity: Optional[Dict[str,
-                                                                   int]] = None
+        # Every MM item-scheduling decision -- policy, capability, feature
+        # validation, budget resolution -- lives in engine/multimodal.py; the
+        # engine only copies back the three budgets that are external contract.
+        mm_item_scheduler = MultimodalItemScheduler.maybe_create(
+            llm_args=self.llm_args,
+            model=self.model,
+            input_processor=self.input_processor,
+            encoder_max_num_tokens=self.encoder_max_num_tokens)
+        self._mm_item_scheduler = mm_item_scheduler
+        # `getattr`-read by py_executor.py and _util.py.
+        self.mm_encoder_item_scheduling_enabled = mm_item_scheduler is not None
         self.mm_encoder_output_budget_bytes: Optional[int] = None
-        # Item scheduling bounds four distinct MM encoder resources. They are
-        # owned in different places and measured in different units, so they
-        # are enumerated here once:
-        #   (A) encoder batch cardinality — `encoder_batch_size`, counting
-        #       atomic MM items rather than model-internal attention sequences.
-        #   (B) encoder-forward workspace — `encoder_max_num_tokens` (below),
-        #       in encoder attention tokens, clamped up to the largest atomic
-        #       item; profiled by a direct full-budget encoder warmup.
-        #   (C) resident output bytes — `mm_encoder_output_budget_bytes`
-        #       (`_resolve_mm_encoder_output_budget_bytes`), the maximum
-        #       post-encoder embeddings produced by one legal encoder iteration,
-        #       converted to bytes. Enforced by the scheduler; any capacity not
-        #       materialized by warmup is reserved in KV-capacity estimation.
-        #   (D) reuse cache bytes — `encoder_cache_max_bytes` on the mixin's
-        #       `TensorLRUCache`, self-bounded by LRU; unprofiled capacity is
-        #       reserved on top of (C) for cache-enabled models.
-        # Prefill currently waits for every item in a request, so admission
-        # rejects a request whose complete MM embedding exceeds (C).
-        if self.mm_encoder_item_scheduling_enabled:
-            if self.encoder_max_num_tokens is None:
-                raise ValueError(
-                    "MM encoder item scheduling requires a token budget; set "
-                    "encoder_max_num_tokens or max_num_tokens")
-            max_tokens_per_item = self.input_processor.get_mm_max_tokens_per_item(
-            )
-            if not max_tokens_per_item:
-                raise ValueError(
-                    "A model with MM encoder item scheduling must implement "
-                    "get_mm_max_tokens_per_item()")
-            if any(value <= 0 for value in max_tokens_per_item.values()):
-                raise ValueError(
-                    "get_mm_max_tokens_per_item() must return positive token "
-                    "counts")
-            model_max_atomic_item_tokens = max(max_tokens_per_item.values())
-            encoder_token_budget_base = self.encoder_max_num_tokens
-            effective_encoder_token_budget = _resolve_mm_encoder_token_budget(
-                encoder_token_budget_base, model_max_atomic_item_tokens)
-            if effective_encoder_token_budget > self.encoder_max_num_tokens:
-                logger.warning_once(
-                    f"encoder_max_num_tokens={self.encoder_max_num_tokens} "
-                    "is smaller than the model's largest profiled atomic "
-                    f"multimodal item ({model_max_atomic_item_tokens}); "
-                    f"using {model_max_atomic_item_tokens} as the "
-                    "effective encoder runtime budget.",
-                    key="raise_encoder_max_num_tokens_for_atomic_item",
-                )
-                self.encoder_max_num_tokens = effective_encoder_token_budget
-            attention_metadata_capacity = (
-                self.input_processor.get_mm_encoder_attention_metadata_capacity(
-                    self.encoder_max_num_tokens))
-            if attention_metadata_capacity is not None:
-                if (not attention_metadata_capacity or any(
-                        value <= 0
-                        for value in attention_metadata_capacity.values())):
-                    raise ValueError(
-                        "get_mm_encoder_attention_metadata_capacity() must "
-                        "return nonempty positive capacities or None")
-                self.mm_encoder_attention_metadata_capacity = (
-                    attention_metadata_capacity)
-            logger.info("Multimodal encoder token budget: "
-                        f"configured={llm_args.encoder_max_num_tokens}, "
-                        f"base={encoder_token_budget_base}, "
-                        f"effective={self.encoder_max_num_tokens}, "
-                        f"model_atomic_max={model_max_atomic_item_tokens}, "
-                        "attention_capacity="
-                        f"{self.mm_encoder_attention_metadata_capacity}.")
-            self.mm_encoder_output_budget_bytes = (
-                self._resolve_mm_encoder_output_budget_bytes())
-        self._set_up_multimodal_encoder_attn_metadata()
+        if mm_item_scheduler is not None:
+            # The raised encoder token budget is read back off the engine by
+            # `_util.py`, and sizes the encoder metadata set up below.
+            self.encoder_max_num_tokens = mm_item_scheduler.encoder_max_num_tokens
+            self.mm_encoder_output_budget_bytes = mm_item_scheduler.output_budget_bytes
+            # Absent, not None, when item scheduling is off: external readers
+            # rely on the `getattr` default.
+            self.bytes_per_mm_encoder_embedding = mm_item_scheduler.bytes_per_embedding
+        setup_mm_encoder_attn_metadata(
+            self.model, self.input_processor, self.encoder_max_num_tokens,
+            mm_item_scheduler.attention_metadata_capacity
+            if mm_item_scheduler is not None else None)
         if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
             module_prefix = 'Model'
@@ -1239,9 +1154,7 @@ class PyTorchModelEngine(ModelEngine):
     @functools.cached_property
     def _mm_encoder_cache_enabled(self) -> bool:
         """Whether the multimodal encoder cache is active for this model."""
-        model = self.model
-        return (isinstance(model, MultimodalModelMixin)
-                and model.encoder_cache_active)
+        return mm_encoder_cache_enabled(self.model)
 
     @property
     def is_warmup(self):
@@ -1449,6 +1362,26 @@ class PyTorchModelEngine(ModelEngine):
         # Deduplicate the warmup_configs while keeping the order.
         return list(dict.fromkeys(warmup_configs))
 
+    @contextmanager
+    def maybe_autotune_lora(self):
+        """Enable autotuning while warming up CUDA-graph LoRA kernels."""
+        if not (self.llm_args.enable_autotuner
+                and self.cuda_graph_lora_manager is not None):
+            yield
+            return
+
+        cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+        with autotune(cache_path=cache_path):
+            try:
+                yield
+            finally:
+                # Complete the PP cache hand-off even on ranks without a
+                # CUDA-graph-only tunable op.
+                autotuner = AutoTuner.get()
+                autotuner.cache_pp_recv()
+                autotuner.cache_pp_send()
+                autotuner.clean_pp_flag()
+
     @with_warmup_flag
     @warmup_with_kv_cache_cleanup
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -1549,7 +1482,8 @@ class PyTorchModelEngine(ModelEngine):
             with self.cuda_graph_runner.allow_capture():
                 self.cuda_graph_runner.is_warmup_only = True
                 try:
-                    self._run_cuda_graph_warmup(resource_manager)
+                    with self.maybe_autotune_lora():
+                        self._run_cuda_graph_warmup(resource_manager)
                 finally:
                     self.cuda_graph_runner.is_warmup_only = False
                 self.cuda_graph_runner.padding_dummy_requests = {}
@@ -2090,10 +2024,79 @@ class PyTorchModelEngine(ModelEngine):
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
         """Runs forward passes to populate the autotuner cache."""
-        if not self.llm_args.enable_autotuner:
+        from ..custom_ops.torch_custom_ops import MXFP8GemmRunner
+        from ..modules.linear import (MXFP8LinearMethod,
+                                      flashinfer_mxfp8_autotune)
+
+        enable_trtllm_autotuner = self.llm_args.enable_autotuner
+        if not enable_trtllm_autotuner:
             return
+
+        mxfp8_methods = []
+        for module in self.model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if isinstance(quant_method, MXFP8LinearMethod):
+                mxfp8_methods.append(quant_method)
+
+        # This engine owns startup warmup, so it explicitly opts its MXFP8
+        # methods into native tuning. Standalone modules and engine paths that
+        # skip this warmup remain on the direct native op.
+        for method in mxfp8_methods:
+            method.enable_native_autotune()
+
+        # Native and FlashInfer tuning are independent. Capture native
+        # eligibility before enabling graph-only FlashInfer dispatch.
+        native_mxfp8_methods = [
+            method for method in mxfp8_methods if method.needs_native_autotune
+        ]
+        use_mxfp8_flashinfer_graph_default = (
+            self.cuda_graph_runner.enabled
+            and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ and any(
+                getattr(module, "_use_flashinfer_mxfp8_decode_graph_default",
+                        False) for module in self.model.modules()))
+        if use_mxfp8_flashinfer_graph_default:
+            for quant_method in mxfp8_methods:
+                quant_method.enable_flashinfer_auto()
+        flashinfer_mxfp8_methods = [
+            method for method in mxfp8_methods
+            if method.needs_flashinfer_autotune
+        ]
+
+        # Every TP and PP rank must make the same backend decision before any
+        # rank returns or enters a tuning forward with model collectives.
+        if self.mapping.tp_size > 1 or self.mapping.has_pp():
+            local_flashinfer_enabled = int(bool(flashinfer_mxfp8_methods))
+            all_flashinfer_enabled = [local_flashinfer_enabled]
+            if self.mapping.tp_size > 1:
+                all_flashinfer_enabled = list(
+                    self.dist.tp_allgather(local_flashinfer_enabled))
+            if self.mapping.has_pp():
+                all_flashinfer_enabled = [
+                    enabled for stage_flags in self.dist.pp_allgather(
+                        all_flashinfer_enabled) for enabled in stage_flags
+                ]
+            if any(all_flashinfer_enabled) and not all(all_flashinfer_enabled):
+                forced_flashinfer = any(method.backend == "flashinfer"
+                                        for method in mxfp8_methods)
+                for method in mxfp8_methods:
+                    method.disable_flashinfer_auto()
+                flashinfer_mxfp8_methods = []
+                if forced_flashinfer:
+                    raise RuntimeError(
+                        "FlashInfer MXFP8 was explicitly requested but is not "
+                        "available on every TP/PP rank")
+                logger.warning(
+                    "FlashInfer MXFP8 availability differs across TP/PP ranks; "
+                    "using the native TensorRT-LLM GEMM backend on every rank.")
+
+        enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
+        enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
+
         AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
-        logger.info("Running autotuner warmup...")
+        logger.info(
+            f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
+            f"native MXFP8={enable_native_mxfp8_autotuner}, "
+            f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
@@ -2108,41 +2111,81 @@ class PyTorchModelEngine(ModelEngine):
             # Add generation request to warmup the autotuner cache.
             warmup_configs.append((1 + self.max_total_draft_tokens, 1))
 
-        cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
-        with self.no_cuda_graph(), autotune(cache_path=cache_path):
+        def run_autotuner_pass(autotune_context: Any,
+                               synchronize_trtllm_cache: bool) -> bool:
+            """Run one isolated tuning pass with fresh synthetic batches."""
             ran_forward = False
-            for num_tokens, num_gen_requests in warmup_configs:
-                warmup_request = self._create_warmup_request(
-                    resource_manager, num_tokens, num_gen_requests)
-                with self._release_batch_context(warmup_request,
-                                                 resource_manager) as batch:
-                    if not self._should_run_warmup_batch(
-                            batch, num_tokens,
-                            f"autotuner, num_tokens={num_tokens}, "
-                            f"num_gen_requests={num_gen_requests}"):
-                        continue
-                    # Reset the flag is_first_draft for the draft model.
-                    # This is necessary for overlap scheduler.
-                    spec_resource_manager = resource_manager.get_resource_manager(
-                        ResourceManagerType.SPEC_RESOURCE_MANAGER)
-                    if self.is_draft_model and isinstance(
-                            spec_resource_manager, Eagle3ResourceManager):
-                        spec_resource_manager.is_first_draft = True
+            with self.no_cuda_graph(), autotune_context:
+                for num_tokens, num_gen_requests in warmup_configs:
+                    warmup_request = self._create_warmup_request(
+                        resource_manager, num_tokens, num_gen_requests)
+                    with self._release_batch_context(warmup_request,
+                                                     resource_manager) as batch:
+                        if not self._should_run_warmup_batch(
+                                batch, num_tokens,
+                                f"autotuner, num_tokens={num_tokens}, "
+                                f"num_gen_requests={num_gen_requests}"):
+                            continue
+                        # Reset the flag is_first_draft for the draft model.
+                        # This is necessary for overlap scheduler.
+                        spec_resource_manager = resource_manager.get_resource_manager(
+                            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                        if self.is_draft_model and isinstance(
+                                spec_resource_manager, Eagle3ResourceManager):
+                            spec_resource_manager.is_first_draft = True
 
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
-                    ran_forward = True
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                        ran_forward = True
+                        torch.cuda.synchronize()
 
-            if ran_forward:
-                # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
-                # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
-                AutoTuner.get().cache_pp_recv()
-                # Send the cache after the tuning process to the next PP rank
-                AutoTuner.get().cache_pp_send()
-                # Clean the pp flag to avoid deadlock with synchronous send/recv
-                AutoTuner.get().clean_pp_flag()
+                if ran_forward and synchronize_trtllm_cache:
+                    # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
+                    # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
+                    AutoTuner.get().cache_pp_recv()
+                    # Send the cache after the tuning process to the next PP rank
+                    AutoTuner.get().cache_pp_send()
+                    # Clean the pp flag to avoid deadlock with synchronous send/recv
+                    AutoTuner.get().clean_pp_flag()
+            return ran_forward
+
+        cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+        ran_native_forward = run_autotuner_pass(autotune(cache_path=cache_path),
+                                                synchronize_trtllm_cache=True)
+        ran_flashinfer_forward = False
+        if enable_flashinfer_mxfp8_autotuner:
+            ran_flashinfer_forward = run_autotuner_pass(
+                flashinfer_mxfp8_autotune(), synchronize_trtllm_cache=False)
+
+        if enable_flashinfer_mxfp8_autotuner:
+            if ran_flashinfer_forward:
+                for method in flashinfer_mxfp8_methods:
+                    method.mark_flashinfer_autotuned()
+            else:
+                forced_flashinfer = any(method.backend == "flashinfer"
+                                        for method in flashinfer_mxfp8_methods)
+                for method in flashinfer_mxfp8_methods:
+                    method.disable_flashinfer_auto()
+                if forced_flashinfer:
+                    raise RuntimeError(
+                        "FlashInfer MXFP8 was explicitly requested but its autotuner "
+                        "warmup forward could not run")
+                logger.warning(
+                    "FlashInfer MXFP8 autotuning could not run; using the native "
+                    "TensorRT-LLM GEMM backend.")
+
+        if enable_native_mxfp8_autotuner:
+            if ran_native_forward:
+                MXFP8GemmRunner.sync_all_tactic_caches(AutoTuner.get())
+                for method in native_mxfp8_methods:
+                    method.mark_native_autotuned()
+            else:
+                for method in native_mxfp8_methods:
+                    method.disable_native_autotune()
+                logger.warning(
+                    "Native MXFP8 autotuning had no runnable warmup batch; "
+                    "using the default native GEMM tactic.")
 
         logger.info(
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
@@ -2424,7 +2467,25 @@ class PyTorchModelEngine(ModelEngine):
                 != PrefillCudaGraphBackend.DISABLED):
             return
 
-        self._capture_generation_cuda_graphs(resource_manager)
+        from ..modules.linear import (MXFP8LinearMethod,
+                                      flashinfer_mxfp8_autotune,
+                                      flashinfer_mxfp8_decode_graph_capture)
+
+        # The automatic MiniMax-M3 MXFP8 selection is decode-graph-only.
+        # Tune every generation graph shape during the warmup-only pass. Keep
+        # piecewise context/prefill graph capture on the native backend.
+        flashinfer_methods = [
+            quant_method for module in self.model.modules()
+            if isinstance((quant_method := getattr(module, "quant_method", None)
+                           ), MXFP8LinearMethod)
+            and quant_method.needs_flashinfer_autotune
+        ]
+        flashinfer_autotune_context = (
+            flashinfer_mxfp8_autotune() if self.cuda_graph_runner.is_warmup_only
+            and flashinfer_methods else contextlib.nullcontext())
+        with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture(
+        ):
+            self._capture_generation_cuda_graphs(resource_manager)
         self._capture_mixed_encoder_decoder_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
@@ -3470,27 +3531,18 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
         )
+        if isinstance(kv_cache_manager, BaseMambaCacheManager):
+            self.attn_metadata.mamba_chunk_size = getattr(
+                config, 'chunk_size', self.attn_metadata.mamba_chunk_size)
+        self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(
+            self.model)
 
         return self.attn_metadata
 
     @property
     def is_multimodal(self) -> bool:
-        """True iff this engine drives a multimodal model.
-
-        Primary signal: ``MultimodalModelMixin`` is the
-        canonical marker — multimodal LM classes inherit from it. Until
-        every model has migrated (Mistral done; Qwen-VL, Nemotron, Gemma,
-        Phi-4-MM, etc. pending), fall back to whether the input processor
-        subclasses ``BaseMultimodalInputProcessor``, which every
-        multimodal model necessarily provides at the data boundary.
-
-        TODO(TRTLLM-13542): Once all multimodal models inherit
-        ``MultimodalModelMixin``, drop the input-processor fallback so the
-        model class itself is the single source of truth.
-        """
-        if isinstance(self.model, MultimodalModelMixin):
-            return True
-        return isinstance(self.input_processor, BaseMultimodalInputProcessor)
+        """True iff this engine drives a multimodal model."""
+        return is_multimodal(self.model, self.input_processor)
 
     def _validate_breakable_cuda_graph_compatibility(self) -> None:
         if self.llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
@@ -3509,7 +3561,6 @@ class PyTorchModelEngine(ModelEngine):
                 "breakable prefill CUDA graph does not support multimodal models"
             )
 
-    @torch.inference_mode()
     def forward_multimodal_encoder_items(
         self,
         requests: List[LlmRequest],
@@ -3518,246 +3569,10 @@ class PyTorchModelEngine(ModelEngine):
         """Forward selected MM encoder items and commit request-local outputs."""
         if not scheduled_items:
             return
-        if not isinstance(self.model, MultimodalModelMixin):
+        if self._mm_item_scheduler is None:
             raise TypeError(
                 "Item-level MM scheduling requires MultimodalModelMixin")
-
-        # Read-through against the model's encoder cache when enabled
-        # (`supports_encoder_cache` + `encoder_cache_max_bytes > 0`): a hit
-        # records a clone and skips the encode; a miss encodes, records, and
-        # populates the cache. The hit/miss branch runs here — at encode time,
-        # on every rank against rank-local cache state — so ranks perform
-        # identical get/put sequences and stay in sync. When the cache is off
-        # (`encoder_cache` is None), every item is a miss and outputs live only
-        # on the request. Records take a clone regardless, so a recorded slot
-        # never aliases a batch output or an evictable cache entry.
-        encoder_cache = self.mm_encoder_cache
-        request_by_id = {request.request_id: request for request in requests}
-        miss_items = []
-        miss_owners: List[Tuple[LlmRequest, int, Optional[Hashable]]] = []
-        touched_requests: Dict[int, LlmRequest] = {}
-        for request_id, item_indices in scheduled_items.items():
-            request = request_by_id.get(request_id)
-            if request is None:
-                raise MultimodalEncoderRequestError(
-                    f"Scheduled MM request {request_id} is no longer active")
-            state = request.py_mm_encoder_state
-            if state is None:
-                raise MultimodalEncoderRequestError(
-                    f"Scheduled MM request {request_id} has no encoder "
-                    "item state")
-            touched_requests[request_id] = request
-            multimodal_param = MultimodalParams(
-                multimodal_data=request.py_multimodal_data)
-            # Scope the lookup to this iteration's items: probing an item the
-            # budget cannot encode yet would still refresh its LRU recency and
-            # reorder eviction against items actually in flight.
-            # Keys come from the request: the executor's params carry
-            # `py_multimodal_data` only, while the content hashes live on the
-            # `LlmRequest`.
-            item_keys = (self.get_mm_encoder_item_keys(request)
-                         if encoder_cache is not None else None)
-            try:
-                partition = (self.model.partition_encoder_cache(
-                    multimodal_param,
-                    encoder_cache,
-                    item_indices=item_indices,
-                    keys=item_keys) if item_keys is not None else None)
-            except MultimodalEncoderContractError as error:
-                raise MultimodalEncoderRequestError(str(error)) from error
-            if partition is None:
-                # No cache, or the request cannot build stable content keys:
-                # every scheduled item is a miss and its output lives only on
-                # the request.
-                for item_idx in item_indices:
-                    miss_items.append((multimodal_param, item_idx))
-                    miss_owners.append((request, item_idx, None))
-                continue
-            for item_idx, cached in partition.hits.items():
-                state.record(item_idx, cached)
-            for item_idx in partition.miss_indices:
-                miss_items.append((multimodal_param, item_idx))
-                miss_owners.append(
-                    (request, item_idx, partition.keys[item_idx]))
-
-        if miss_items:
-            try:
-                encoder_inputs = self.model.prepare_multimodal_encoder_inputs(
-                    miss_items)
-            except MultimodalEncoderContractError as error:
-                raise MultimodalEncoderRequestError(str(error)) from error
-            for encoder_input, _, _ in encoder_inputs:
-                encoder_input.to_device(
-                    "multimodal_data",
-                    "cuda",
-                    pin_memory=prefer_pinned(),
-                    target_keywords=getattr(self.model,
-                                            "multimodal_data_device_paths",
-                                            None),
-                )
-
-            try:
-                outputs = self.model.forward_multimodal_encoder_items(
-                    encoder_inputs)
-            except MultimodalEncoderContractError as error:
-                raise MultimodalEncoderRequestError(str(error)) from error
-            if len(outputs) != len(miss_owners):
-                raise MultimodalEncoderRequestError(
-                    "MM item encoder must return one output per item")
-
-            for output, (request, item_idx, key) in zip(outputs,
-                                                        miss_owners,
-                                                        strict=True):
-                request.py_mm_encoder_state.record(item_idx, output)
-                if encoder_cache is not None and key is not None:
-                    encoder_cache.put(key, output)
-
-        for request in touched_requests.values():
-            request.py_mm_encoder_state.finalize(request.py_multimodal_data)
-
-    def _resolve_mm_encoder_output_budget_bytes(self) -> int:
-        """Resolve the byte budget for resident MM encoder outputs.
-
-        Encoder attention tokens and output embeddings use different units:
-        `encoder_max_num_tokens` bounds pre-merge encoder attention tokens in
-        one encoder iteration, while the input processor converts that runtime
-        capacity into a model-specific upper bound on aggregate post-encoder
-        embeddings. The byte budget is that embedding capacity multiplied by
-        bytes per encoder embedding; the LLM-side `max_num_tokens` does not
-        participate.
-
-        It caps outputs held between encode and prefill and is reserved during
-        KV-capacity estimation. It is separate from the optional reuse cache
-        (`encoder_cache_max_bytes`). A request whose total embedding exceeds
-        this budget is rejected at admission.
-        """
-        max_output_embeddings = (
-            self.input_processor.get_max_mm_encoder_output_embeddings(
-                self.encoder_max_num_tokens))
-        if max_output_embeddings is None or max_output_embeddings <= 0:
-            raise ValueError(
-                "A model with MM encoder item scheduling must implement "
-                "get_max_mm_encoder_output_embeddings() and return a positive "
-                "aggregate embedding capacity")
-        bytes_per_embedding = self._resolve_bytes_per_mm_encoder_embedding()
-        self.bytes_per_mm_encoder_embedding = bytes_per_embedding
-        return max_output_embeddings * bytes_per_embedding
-
-    @property
-    def mm_encoder_cache(self) -> Optional[TensorLRUCache]:
-        """The encoder cache the item path reads through, or `None`.
-
-        Only models that opt into the encoder cache
-        (`supports_encoder_cache` with `encoder_cache_max_bytes > 0`)
-        participate — the same lazily created `TensorLRUCache` instance the
-        legacy inline path uses. Item-scheduled models without the flag
-        (e.g. Qwen today) get `None` and never touch the cache; cross-request
-        reuse for them is out of scope here.
-        """
-        model = self.model
-        if not getattr(model, "supports_encoder_cache", False):
-            return None
-        getter = getattr(model, "_get_multimodal_encoder_cache", None)
-        return getter() if getter is not None else None
-
-    def get_mm_encoder_item_keys(
-            self, request: LlmRequest) -> Optional[List[Hashable]]:
-        """Return the request's per-item cache keys, or `None`.
-
-        `None` means the request cannot build stable content keys (no item
-        metadata, content hashes, or processor-kwargs hash), so its items
-        bypass the cache (always encoded; outputs live only on the request).
-        The key format is shared with the legacy full-request path
-        (`_encoder_cache_item_key`) so entries hit across both.
-        """
-        # `getattr`: unit tests exercise partially constructed engines.
-        if not getattr(self, "mm_encoder_item_scheduling_enabled", False):
-            return None
-        # Memoized on the request's encoder state: the inputs are fixed at
-        # admission, and a request whose items span several iterations would
-        # otherwise rebuild the same keys on each one.
-        state = request.py_mm_encoder_state
-        if state is not None and not isinstance(state.cache_item_keys, _Unset):
-            return state.cache_item_keys
-        mm_data = request.py_multimodal_data
-        try:
-            item_metadata = get_multimodal_encoder_item_metadata(mm_data)
-        except (TypeError, ValueError) as error:
-            raise MultimodalEncoderRequestError(str(error)) from error
-        keys = None if item_metadata is None else (
-            self.model.build_encoder_cache_item_keys(
-                request.multimodal_hashes,
-                item_metadata.item_refs,
-                item_metadata.output_embedding_lengths,
-                mm_data.get("mm_processor_kwargs_hash"),
-            ))
-        if state is not None:
-            state.cache_item_keys = keys
-        return keys
-
-    def _resolve_bytes_per_mm_encoder_embedding(self) -> int:
-        """Bytes occupied by one multimodal encoder output embedding.
-
-        Prefers the mixin's explicit `embedding_dim`/`embedding_dtype`
-        contract, then the text embedding layer's weight, then the
-        pretrained config's hidden size with the loaded weights' dtype —
-        both mixin properties are optional and most VLMs implement
-        neither.
-        """
-        model = self.model
-        try:
-            return (model.embedding_dim * torch.empty(
-                (), dtype=model.embedding_dtype).element_size())
-        except NotImplementedError:
-            pass
-        try:
-            weight = model.text_embedding_layer.weight
-            return weight.shape[-1] * weight.element_size()
-        except NotImplementedError:
-            pass
-        pretrained = model.model_config.pretrained_config
-        hidden_size = getattr(pretrained, "hidden_size", None)
-        if hidden_size is None:
-            hidden_size = getattr(getattr(pretrained, "text_config", None),
-                                  "hidden_size", None)
-        if hidden_size is None:
-            raise ValueError(
-                "Cannot derive the MM embedding row size: the model "
-                "implements neither embedding_dim/embedding_dtype nor "
-                "text_embedding_layer, and its pretrained config exposes "
-                "no (text_config.)hidden_size")
-        element_size = next(model.parameters()).dtype.itemsize
-        return hidden_size * element_size
-
-    def _set_up_multimodal_encoder_attn_metadata(self) -> None:
-        """Construct AttentionMetadata for any multimodal encoders inside the
-        loaded model, using the engine's encoder token budget
-        (`encoder_max_num_tokens`, falling back to the LLM-side
-        `max_num_tokens`).
-
-        Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
-        by inheriting `MultimodalEncoderMixin`, and the engine drives the construction
-        so the sizes match the resolved encoder token budget rather than being
-        hardcoded inside each encoder's `__init__`. The optional
-        per-segment capacity combines the encoder token budget with the input
-        processor's largest supported item.
-        """
-        max_seq_len = self.encoder_max_num_tokens
-        if isinstance(self.input_processor, BaseMultimodalDummyInputsBuilder):
-            max_tokens_per_item = (
-                self.input_processor.get_mm_max_tokens_per_item())
-            max_seq_len = max(max_seq_len,
-                              max(max_tokens_per_item.values(), default=0))
-
-        for module in self.model.modules():
-            if isinstance(module, MultimodalEncoderMixin):
-                setup_kwargs: Dict[str, Any] = dict(
-                    max_num_tokens=self.encoder_max_num_tokens)
-                if self.mm_encoder_attention_metadata_capacity is not None:
-                    setup_kwargs["attention_metadata_capacity"] = (
-                        self.mm_encoder_attention_metadata_capacity)
-                module.setup_attn_metadata(**setup_kwargs)
-                module.set_attn_max_seq_len(max_seq_len)
+        self._mm_item_scheduler.forward_items(requests, scheduled_items)
 
     def _set_up_spec_metadata(
             self,
@@ -3800,7 +3615,8 @@ class PyTorchModelEngine(ModelEngine):
 
         1. The optional ``ModelLoader`` (which in turn releases any
            GMS client; see :meth:`ModelLoader.cleanup`).
-        2. The model module reference.
+        2. The model module reference, and the MM item scheduler, which
+           holds one of its own.
         3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
         4. Input processors.
 
@@ -3829,6 +3645,10 @@ class PyTorchModelEngine(ModelEngine):
             model_loader.cleanup()
             self.model_loader = None
 
+        # The scheduler keeps its own references to the model and the input
+        # processor, so clearing the engine's attributes alone would leave the
+        # weights reachable past `release_gc()` below.
+        self._mm_item_scheduler = None
         self.model = None
 
         self._release_cuda_graphs()
@@ -4108,14 +3928,38 @@ class PyTorchModelEngine(ModelEngine):
                 # mapping where tp_size = original tp * cp) can index
                 # with its tp_rank.
                 num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
-                return list(self.dist.tp_cp_allgather(num_tokens))
-            return list(self.dist.tp_allgather(num_tokens))
+                return list(
+                    self.dist.tp_cp_allgather(num_tokens, small_payload=True))
+            return list(self.dist.tp_allgather(num_tokens, small_payload=True))
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
-            return list(self.dist.tp_allgather(num_ctx_requests))
+            return list(
+                self.dist.tp_allgather(num_ctx_requests, small_payload=True))
         return None
+
+    def _get_all_rank_num_tokens_and_spec_counts(
+        self, attn_metadata: AttentionMetadata, spec_counts: Tuple[int, ...]
+    ) -> Tuple[Optional[List[int]], Optional[List[List[int]]]]:
+        """Exchange the attention and speculative per-rank counts in a single
+        collective instead of one collective each."""
+        if not self.enable_attention_dp:
+            return None, None
+        if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
+            # attn counts span TP only while spec counts span TP*CP; keep the
+            # two exchanges separate.
+            gathered = self.dist.tp_cp_allgather(list(spec_counts),
+                                                 small_payload=True)
+            return (self._get_all_rank_num_tokens(attn_metadata),
+                    [list(col) for col in zip(*gathered)])
+        num_tokens = attn_metadata.num_tokens
+        if self.mapping.has_cp_helix():
+            num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
+        gathered = self.dist.tp_cp_allgather([num_tokens, *spec_counts],
+                                             small_payload=True)
+        cols = [list(col) for col in zip(*gathered)]
+        return cols[0], cols[1:]
 
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
         """All-gather the per-rank greedy flags and store the group AND.
@@ -4137,7 +3981,7 @@ class PyTorchModelEngine(ModelEngine):
                 and spec_metadata.use_rejection_sampling):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
-        all_flags = self.dist.tp_allgather(local_flag)
+        all_flags = self.dist.tp_allgather(local_flag, small_payload=True)
         spec_metadata.group_all_greedy_sample = all(all_flags)
         # Also overwrite the live flag directly: this iteration's scan already
         # ran (update_is_all_greedy_sample just returned) and the CUDA graph
@@ -4183,8 +4027,6 @@ class PyTorchModelEngine(ModelEngine):
             can_run_prefill_cuda_graph: whether a prefill CUDA graph can run
             attn_all_rank_num_tokens: the number of tokens for each rank
         """
-        all_rank_ctx_requests = self._get_all_rank_ctx_requests(
-            num_ctx_requests)
 
         def get_padded_prefill_tokens(tokens: int) -> int:
             return self._prefill_cuda_graph_num_tokens[bisect.bisect_left(
@@ -4192,6 +4034,8 @@ class PyTorchModelEngine(ModelEngine):
 
         if (self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED
                 and self._prefill_cuda_graph_num_tokens):
+            all_rank_ctx_requests = self._get_all_rank_ctx_requests(
+                num_ctx_requests)
             max_captured_num_tokens = self._prefill_cuda_graph_num_tokens[-1]
             if attn_all_rank_num_tokens is not None:
                 has_ctx_requests = num_ctx_requests != 0 or (
@@ -4202,7 +4046,8 @@ class PyTorchModelEngine(ModelEngine):
                                               and max(attn_all_rank_num_tokens)
                                               <= max_captured_num_tokens)
                 all_ranks_can_run_prefill_cuda_graph = list(
-                    self.dist.tp_allgather(can_run_prefill_cuda_graph))
+                    self.dist.tp_allgather(can_run_prefill_cuda_graph,
+                                           small_payload=True))
                 if all(all_ranks_can_run_prefill_cuda_graph):
                     padded_num_tokens = get_padded_prefill_tokens(
                         max(attn_all_rank_num_tokens))
@@ -4877,9 +4722,17 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.padded_num_tokens = None
 
         # Handle attention DP
+        spec_all_rank_counts = None
         if enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
-                attn_metadata)
+            if spec_metadata is not None:
+                (attn_metadata.all_rank_num_tokens, spec_all_rank_counts
+                 ) = self._get_all_rank_num_tokens_and_spec_counts(
+                     attn_metadata,
+                     (total_num_tokens, len(spec_metadata.seq_lens),
+                      attn_metadata.num_generations))
+            else:
+                attn_metadata.all_rank_num_tokens = \
+                    self._get_all_rank_num_tokens(attn_metadata)
 
         # Prepare speculative metadata
         if spec_metadata is not None:
@@ -4892,15 +4745,8 @@ class PyTorchModelEngine(ModelEngine):
 
             # Handle distributed spec metadata
             if enable_attention_dp:
-                sequence_lengths = spec_metadata.seq_lens
-                all_rank_num_tokens = self.dist.tp_cp_allgather([
-                    spec_metadata.num_tokens,
-                    len(sequence_lengths), attn_metadata.num_generations
-                ])
                 self._set_spec_metadata_all_rank_num_tokens(
-                    spec_metadata, [item[0] for item in all_rank_num_tokens],
-                    [item[1] for item in all_rank_num_tokens],
-                    [item[2] for item in all_rank_num_tokens])
+                    spec_metadata, *spec_all_rank_counts)
 
         # Set iteration states - batch dictionary updates
         self.iter_states.update({
@@ -5016,9 +4862,6 @@ class PyTorchModelEngine(ModelEngine):
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
-        if self.enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
-                attn_metadata)
 
         final_position_ids = self.position_ids_cuda[:
                                                     virtual_num_tokens].unsqueeze(
@@ -5231,9 +5074,6 @@ class PyTorchModelEngine(ModelEngine):
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
-        if self.enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
-                attn_metadata)
 
         final_position_ids = self.position_ids_cuda[:
                                                     virtual_num_tokens].unsqueeze(
@@ -5526,6 +5366,11 @@ class PyTorchModelEngine(ModelEngine):
         # (start_idx, end_idx, seq_slot) for first_draft requests
         first_draft_input_ids_positions = []
 
+        context_prompt_lookahead = None
+        if (spec_metadata is not None
+                and spec_metadata.context_prompt_lookahead_tokens is not None):
+            context_prompt_lookahead = []
+
         def append_cross_attention_state(request: LlmRequest,
                                          project_encoder_output: bool,
                                          repeat: int = 1) -> None:
@@ -5562,6 +5407,9 @@ class PyTorchModelEngine(ModelEngine):
             draft_lens.append(0)
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
+            if context_prompt_lookahead is not None:
+                context_prompt_lookahead.append(
+                    _get_context_prompt_lookahead_token(request, end_compute))
             # Fetch only the current chunk. get_tokens(0) marshals the whole
             # O(seq_len) VecTokens into a Python list of boxed ints; chunked
             # prefill re-enters this loop for every chunk of the same prompt, so
@@ -6559,7 +6407,15 @@ class PyTorchModelEngine(ModelEngine):
             maybe_graph,
             use_lora_graph=use_lora_graph)
 
-        attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
+        spec_all_rank_counts = None
+        if spec_metadata is not None and self.enable_attention_dp:
+            (attn_all_rank_num_tokens, spec_all_rank_counts
+             ) = self._get_all_rank_num_tokens_and_spec_counts(
+                 attn_metadata, (total_num_tokens, len(sequence_lengths),
+                                 len(scheduled_requests.generation_requests)))
+        else:
+            attn_all_rank_num_tokens = self._get_all_rank_num_tokens(
+                attn_metadata)
         (padded_num_tokens, can_run_prefill_cuda_graph,
          attn_all_rank_num_tokens) = self._get_padding_params(
              total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
@@ -6632,6 +6488,9 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.seq_lens = sequence_lengths
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:len(
                 num_accepted_draft_tokens)]
+            if context_prompt_lookahead is not None:
+                spec_metadata.populate_context_prompt_lookahead(
+                    context_prompt_lookahead)
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
             # No-op for non 1-model
@@ -6646,14 +6505,8 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
-                all_rank_num_tokens = self.dist.tp_cp_allgather([
-                    spec_metadata.num_tokens,
-                    len(sequence_lengths), spec_metadata.num_generations
-                ])
                 self._set_spec_metadata_all_rank_num_tokens(
-                    spec_metadata, [item[0] for item in all_rank_num_tokens],
-                    [item[1] for item in all_rank_num_tokens],
-                    [item[2] for item in all_rank_num_tokens])
+                    spec_metadata, *spec_all_rank_counts)
 
         if mm_token_indices is not None:
             self._ship_multimodal_indices(
