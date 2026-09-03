@@ -26,6 +26,7 @@ from fastapi import Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
 
+from tensorrt_llm._utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
@@ -142,9 +143,7 @@ class _VideoRoutesMixin:
         - JSON: Send VideoGenerationRequest as application/json
         - Multipart: Send form fields + optional input_reference file
         """
-        # Stamp request arrival for the Server-Timing ``total`` (full server
-        # time, incl. request parsing) before any work.
-        request_received = time.perf_counter()
+        request_received = raw_request.state.server_arrival_time
         try:
             # Client-side ValueErrors from content-type parsing, request
             # translation, encoder-format preflight, parameter validation,
@@ -213,7 +212,7 @@ class _VideoRoutesMixin:
                     f"Video {video_id} serialized as tensor: latency={latency:.3f}s "
                     f"generation={getattr(output.metrics, 'generation', 0.0):.3f}s"
                 )
-                total = time.perf_counter() - request_received
+                total = get_steady_clock_now_in_seconds() - request_received
                 headers = build_visual_gen_timing_headers(
                     build_visual_gen_server_timings(output.metrics, total=total)
                 )
@@ -252,7 +251,7 @@ class _VideoRoutesMixin:
                 f"latency={latency:.3f}s generation={generation:.3f}s "
                 f"denoise={denoise:.3f}s"
             )
-            total = time.perf_counter() - request_received
+            total = get_steady_clock_now_in_seconds() - request_received
             headers = build_visual_gen_timing_headers(
                 build_visual_gen_server_timings(metrics, total=total)
             )
@@ -376,10 +375,7 @@ class _VideoRoutesMixin:
         - JSON: Send VideoGenerationRequest as application/json
         - Multipart: Send form fields + optional input_reference file
         """
-        # Stamp request arrival for the Server-Timing ``total`` (full server
-        # time, POST arrival -> job completed); the background task reads it
-        # back off the job to compute ``total``.
-        request_received = time.perf_counter()
+        request_received = raw_request.state.server_arrival_time
         try:
             # Parse request based on content-type
             request = await self._parse_video_generation_request(raw_request)
@@ -542,7 +538,7 @@ class _VideoRoutesMixin:
                 # from the status wire). ``total`` spans POST arrival ->
                 # completion.
                 total = (
-                    time.perf_counter() - job.request_started
+                    get_steady_clock_now_in_seconds() - job.request_started
                     if job.request_started is not None
                     else None
                 )

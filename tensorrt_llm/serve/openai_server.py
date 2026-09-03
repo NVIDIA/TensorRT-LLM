@@ -3056,6 +3056,7 @@ class OpenAIServer(_VideoRoutesMixin):
         with ``request.format`` extended to accept tensor payloads
         (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
         """
+        request_received = raw_request.state.server_arrival_time
         try:
             image_id = f"image_{uuid.uuid4().hex}"
 
@@ -3168,8 +3169,9 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} generated and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
+            total = get_steady_clock_now_in_seconds() - request_received
             headers = build_visual_gen_timing_headers(
-                build_visual_gen_server_timings(metrics))
+                build_visual_gen_server_timings(metrics, total=total))
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 
@@ -3247,13 +3249,15 @@ class OpenAIServer(_VideoRoutesMixin):
             )
         return None
 
-    def _image_object(self, request: ImageGenerationRequest,
+    def _image_object(self, request: Union[ImageGenerationRequest,
+                                           ImageEditRequest],
                       raw_request: Request, image_id: str, i: int,
                       path: Path) -> ImageObject:
         """Build the per-item ``ImageObject`` for the ``path``/``url`` transports.
 
-        ``b64_json`` is handled separately. Shared by the tensor and encoder
-        branches so they cannot drift when a transport changes.
+        ``b64_json`` is handled separately. Shared by the generation
+        (tensor + encoder) and edit routes so they cannot drift when a
+        transport changes.
         """
         if request.response_format == "path":
             return ImageObject(path=str(path), revised_prompt=request.prompt)
@@ -3316,6 +3320,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_image_edit(self, raw_request: Request) -> Response:
         """OpenAI-compatible image editing endpoint."""
+        request_received = raw_request.state.server_arrival_time
         if not self._supports_image_edit():
             return self._create_not_supported_error(
                 "Image editing is not supported by the loaded visual generation model."
@@ -3327,6 +3332,9 @@ class OpenAIServer(_VideoRoutesMixin):
 
             try:
                 request = await self._parse_image_edit_request(raw_request)
+                path_error = self._reject_disabled_path(request.response_format)
+                if path_error is not None:
+                    return path_error
                 params = parse_visual_gen_params(
                     request,
                     image_id,
@@ -3382,11 +3390,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     path = self.media_storage_path / f"{image_id}_{i}{ext}"
                     path.write_bytes(image_to_bytes(image, format=pil_format))
                     data.append(
-                        ImageObject(
-                            url=self._build_image_content_url(
-                                raw_request, image_id, i),
-                            revised_prompt=request.prompt,
-                        ))
+                        self._image_object(request, raw_request, image_id, i,
+                                           path))
 
             response = ImageGenerationResponse(
                 created=int(time.time()),
@@ -3402,8 +3407,9 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} edited and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
+            total = get_steady_clock_now_in_seconds() - request_received
             headers = build_visual_gen_timing_headers(
-                build_visual_gen_server_timings(metrics))
+                build_visual_gen_server_timings(metrics, total=total))
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 
