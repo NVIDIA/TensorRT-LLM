@@ -182,7 +182,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-    
+
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
@@ -198,20 +198,19 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
 
         pytorch_config = dict(
             disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
-                                              enable_padding=True),
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
             moe_config=MoeConfig(backend="CUTEDSL"),
             enable_chunked_prefill=False,
         )
 
         with LLM(
-                model_path,
-                tensor_parallel_size=tp_size,
-                pipeline_parallel_size=1,
-                moe_expert_parallel_size=ep_size,
-                kv_cache_config=kv_cache_config,
-                max_seq_len=8192,
-                **pytorch_config,
+            model_path,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=ep_size,
+            kv_cache_config=kv_cache_config,
+            max_seq_len=8192,
+            **pytorch_config,
         ) as llm:
             assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
