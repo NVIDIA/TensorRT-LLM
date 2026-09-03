@@ -31,6 +31,12 @@ l0_a10:
   - unittest/_torch/modeling/test_multimodal_encoder_mixin.py
   - unittest/_torch/sampler/test_token_ban.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
+  - unittest/_torch/distributed/test_communicator.py
+  - unittest/_torch/executor/test_ep_failure_broadcast.py
+  # MPI prerequisites are required by default. Local environments can opt out
+  # with TLLM_ALLOW_MPI_FT_SMOKE_SKIP=1. The three-minute outer timeout wraps
+  # six launcher processes with 30-second inner timeouts and bounded cleanup.
+  - unittest/_torch/executor/test_ep_failure_broadcast_mpi.py TIMEOUT (3) ISOLATION
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
   - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_error_classification.py
