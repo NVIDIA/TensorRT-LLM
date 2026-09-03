@@ -361,41 +361,20 @@ def _register_fake():
                                 dtype=torch.int32)
 
     @torch.library.register_fake("trtllm::kda_decode")
-    def _(x_q: torch.Tensor,
-          x_k: torch.Tensor,
-          x_v: torch.Tensor,
-          w_q_t: torch.Tensor,
-          w_k_t: torch.Tensor,
-          w_v_t: torch.Tensor,
-          bias_q: torch.Tensor,
-          bias_k: torch.Tensor,
-          bias_v: torch.Tensor,
-          conv_state_q: torch.Tensor,
-          conv_state_k: torch.Tensor,
-          conv_state_v: torch.Tensor,
-          a_log: torch.Tensor,
-          g: torch.Tensor,
-          dt_bias: torch.Tensor,
-          beta: torch.Tensor,
-          onorm_g: torch.Tensor,
-          onorm_weight: torch.Tensor,
-          ssm_state_indices: Optional[torch.Tensor],
-          cu_seqlens: torch.Tensor,
-          state: torch.Tensor,
-          apply_onorm: bool,
-          update_conv_cache: bool,
-          use_lower_bound: bool,
-          apply_beta_sigmoid: bool,
-          lower_bound: float,
-          scale: float,
-          onorm_eps: float,
-          output: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Mirror the CUDA impl: write into the caller-provided output when
-        # given (schema returns Tensor(e!)), else allocate.
-        if output is not None:
-            return output
-        # x_q is [1, tokens, H, 128]; the kernel emits one row per token.
-        return x_q.new_empty((x_q.size(1), 1, x_v.size(2), x_v.size(3)))
+    def _(x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor,
+          w_q_t: torch.Tensor, w_k_t: torch.Tensor, w_v_t: torch.Tensor,
+          bias_q: torch.Tensor, bias_k: torch.Tensor, bias_v: torch.Tensor,
+          conv_state_q: torch.Tensor, conv_state_k: torch.Tensor,
+          conv_state_v: torch.Tensor, a_log: torch.Tensor, g: torch.Tensor,
+          dt_bias: torch.Tensor, beta: torch.Tensor, onorm_g: torch.Tensor,
+          onorm_weight: torch.Tensor, ssm_state_indices: Optional[torch.Tensor],
+          cu_seqlens: torch.Tensor, state: torch.Tensor, apply_onorm: bool,
+          update_conv_cache: bool, use_lower_bound: bool,
+          apply_beta_sigmoid: bool, lower_bound: float, scale: float,
+          onorm_eps: float, output: torch.Tensor) -> None:
+        # Inplace-only: the kernel writes into ``output``, so there is nothing
+        # to allocate and nothing to return.
+        return None
 
     @torch.library.register_fake("trtllm::minimax_m3_fp8_indexer_qk_norm_rope")
     def minimax_m3_fp8_indexer_qk_norm_rope_fake(
@@ -896,6 +875,7 @@ def _register_fake():
         has_initial_state: Optional[torch.Tensor],
         silu_activation: bool,
         pad_slot_id: int,
+        out: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 

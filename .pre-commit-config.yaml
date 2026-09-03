@@ -720,7 +720,6 @@ common-files: &common_files |
         tests/unittest/llmapi/test_serialization.py |
         tests/unittest/llmapi/test_utils.py |
         tests/unittest/others/__init__.py |
-        tests/unittest/others/test_convert_spec_decoding_mask_to_packed_mask.py |
         tests/unittest/others/test_exception.py |
         tests/unittest/others/test_export.py |
         tests/unittest/others/test_kv_cache_transceiver.py |
@@ -1484,7 +1483,6 @@ legacy-files: &legacy_files |
         tests/unittest/llmapi/test_serialization.py |
         tests/unittest/llmapi/test_utils.py |
         tests/unittest/others/__init__.py |
-        tests/unittest/others/test_convert_spec_decoding_mask_to_packed_mask.py |
         tests/unittest/others/test_exception.py |
         tests/unittest/others/test_export.py |
         tests/unittest/others/test_kv_cache_transceiver.py |

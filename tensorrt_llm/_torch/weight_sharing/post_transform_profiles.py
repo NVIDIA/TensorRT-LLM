@@ -26,6 +26,9 @@ qualified under the same architecture and lifecycle contract.
 
 from __future__ import annotations
 
+import abc
+import importlib
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, ClassVar
@@ -42,6 +45,9 @@ LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-llama-target-layout-v1"
 # Stable contract for unquantized Qwen2 dense fused-QKV and fused-gate-up
 # tensors plus the target-only receiver finalization used by its first profile.
 QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen2-dense-target-layout-v1"
+# Stable contract for unquantized Qwen3 dense fused-QKV and fused-gate-up
+# tensors, Q/K norm state, and target-only receiver finalization.
+QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
 _MISSING = object()
 
 
@@ -322,12 +328,66 @@ class PostTransformQualificationReason(str, Enum):
     FEATURE_NOT_SUPPORTED = "feature_not_supported"
 
 
+class RootModelIdentity(abc.ABC):
+    """Describe a root model, and test for identity"""
+
+    @property
+    @abc.abstractmethod
+    def class_name(self) -> str: ...
+
+    @abc.abstractmethod
+    def matches(self, candidate: type[nn.Module]) -> bool: ...
+
+
+@dataclass(frozen=True)
+class EagerRootModelIdentity(RootModelIdentity):
+    class_: type[nn.Module]
+
+    @property
+    def class_name(self) -> str:
+        return self.class_.__name__
+
+    def matches(self, candidate: type[nn.Module]) -> bool:
+        return candidate is self.class_
+
+
+@dataclass(frozen=True)
+class LazyRootModelIdentity(RootModelIdentity):
+    module_name: str
+    class_name_: str
+
+    @property
+    def class_name(self) -> str:
+        # dataclass field cannot implement abstract property
+        return self.class_name_
+
+    def matches(self, candidate: type[nn.Module]) -> bool:
+        """Whether ``candidate`` is the very class this reference names.
+
+        Never really loads a module: ``candidate`` can only be this class if the
+        defining module has already executed in this interpreter, so the guard
+        below turns every answer that would need a load into a ``False`` and
+        ``importlib.import_module`` becomes a guarded dict read on
+        ``sys.modules``.
+        """
+        if self.module_name not in sys.modules:
+            return False
+        # Guarded above, so this resolves out of sys.modules without importing.
+        module = importlib.import_module(self.module_name)
+        return candidate is getattr(module, self.class_name)
+
+
 @dataclass(frozen=True)
 class PostTransformProfile:
-    """One exact root-model profile qualified for post-transform sharing."""
+    """One exact root-model profile qualified for post-transform sharing.
+
+    ``root_model_class`` can be initialized with either the root class directly,
+     or a ``RootModelIdentity`` instance, and will always be converted into a
+     ``RootModelIdentity``.
+    """
 
     profile_id: str
-    root_model_class: type[nn.Module]
+    root_model_class: RootModelIdentity | type[nn.Module]
     architecture: str
     model_type: str
     speculative_mode: str | None
@@ -354,6 +414,10 @@ class PostTransformProfile:
         if not isinstance(self.runtime_constraints, PostTransformRuntimeConstraints):
             raise TypeError(
                 "Post-transform runtime_constraints must be PostTransformRuntimeConstraints"
+            )
+        if not isinstance(self.root_model_class, RootModelIdentity):
+            object.__setattr__(
+                self, "root_model_class", EagerRootModelIdentity(self.root_model_class)
             )
 
 
@@ -427,8 +491,10 @@ class PostTransformProfileRegistry:
         object.__setattr__(self, "profiles", tuple(self.profiles))
 
         profile_ids: set[str] = set()
+        # Keyed by root class *name*: resolving a LazyRootModelClass here would
+        # import every profiled model's module just to construct the registry.
         profile_keys: dict[
-            tuple[type[nn.Module], str, str, str | None, int, PostTransformTransferScope],
+            tuple[str, str, str, str | None, int, PostTransformTransferScope],
             list[PostTransformProfile],
         ] = {}
         for profile in self.profiles:
@@ -437,7 +503,7 @@ class PostTransformProfileRegistry:
             profile_ids.add(profile.profile_id)
 
             key = (
-                profile.root_model_class,
+                profile.root_model_class.class_name,
                 profile.architecture,
                 profile.model_type,
                 profile.speculative_mode,
@@ -448,7 +514,7 @@ class PostTransformProfileRegistry:
                 if profile.runtime_constraints.overlaps(existing_profile.runtime_constraints):
                     raise ValueError(
                         "Duplicate post-transform profile for "
-                        f"{profile.root_model_class.__name__}/{profile.architecture}/"
+                        f"{profile.root_model_class.class_name}/{profile.architecture}/"
                         f"{profile.model_type}/{profile.speculative_mode or 'target-only'}/"
                         f"v{profile.protocol_version}/{profile.transfer_scope.value}: "
                         "runtime constraints overlap"
@@ -487,7 +553,9 @@ class PostTransformProfileRegistry:
         """
 
         model_profiles = tuple(
-            profile for profile in self.profiles if profile.root_model_class is root_model_class
+            profile
+            for profile in self.profiles
+            if profile.root_model_class.matches(root_model_class)
         )
         if not model_profiles:
             return PostTransformQualificationDecision(

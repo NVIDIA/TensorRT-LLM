@@ -47,7 +47,7 @@ from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_moe import MoEWeightLoadingMode, create_moe
+from ..moe.fused_moe import MoEWeightLoadingMode, SimpleActivation, create_moe
 from ..moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from ..moe.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
                                           W4A16NVFP4CutlassFusedMoEMethod)
@@ -177,7 +177,7 @@ class NemotronHMOE(nn.Module):
         # Import here to avoid circular dependency.
         from .modeling_deepseekv3 import DeepseekV3Gate
 
-        self.activation_type = ActivationType.Relu2
+        self.moe_activation = SimpleActivation(kind=ActivationType.Relu2)
         self.reduce_results = False
 
         config = model_config.pretrained_config
@@ -273,7 +273,7 @@ class NemotronHMOE(nn.Module):
             layer_idx=self.layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
             bias=self.mlp_bias,
-            activation_type=self.activation_type,
+            activation=self.moe_activation,
         )
 
         if reduce_output:
