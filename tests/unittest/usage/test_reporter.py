@@ -241,9 +241,7 @@ class TestReportUsage:
         assert parameters["nWorkers"] == 2
         assert parameters["quantizedComponentsJson"] == '["transformer"]'
 
-    def test_visual_gen_heartbeat_reports_runtime_and_current_counters(
-        self, monkeypatch
-    ):
+    def test_visual_gen_heartbeat_reports_runtime_and_current_counters(self, monkeypatch):
         """VisualGen heartbeat carries topology and the latest lifecycle snapshot."""
 
         class _OneHeartbeat:

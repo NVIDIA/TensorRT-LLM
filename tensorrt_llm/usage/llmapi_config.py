@@ -670,7 +670,9 @@ def _collect_config_payloads(
         args_class = (
             manifest_cls.__name__
             if manifest_cls is not None
-            else type(config).__name__ if config is not None else ""
+            else type(config).__name__
+            if config is not None
+            else ""
         )
         return _failure_config_payloads(args_class=args_class, source=source)
 

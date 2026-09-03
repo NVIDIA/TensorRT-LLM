@@ -218,9 +218,7 @@ def visual_gen_command(
         with open(visual_gen_args, "r") as f:
             extra_args = yaml.safe_load(f) or {}
         if not isinstance(extra_args, dict):
-            raise ValueError(
-                "VisualGenArgs YAML must contain a mapping at the document root"
-            )
+            raise ValueError("VisualGenArgs YAML must contain a mapping at the document root")
 
     ctx = click.get_current_context()
     explicit_cli_telemetry = (

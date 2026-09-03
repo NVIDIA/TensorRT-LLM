@@ -301,8 +301,7 @@ class VisualGen:
                         "Launch exactly n_workers tasks."
                     )
                 logger.info(
-                    f"VisualGen: rank 0/{world_size} — coordinator + worker "
-                    "(external launch mode)"
+                    f"VisualGen: rank 0/{world_size} — coordinator + worker (external launch mode)"
                 )
             self.executor = DiffusionRemoteClient(args=self.args)
         except Exception:
@@ -546,9 +545,7 @@ class VisualGen:
 
                         _usage.record_visual_gen_shutdown()
                     except Exception as exc:
-                        logger.debug(
-                            f"VisualGen telemetry shutdown tracking failed: {exc}"
-                        )
+                        logger.debug(f"VisualGen telemetry shutdown tracking failed: {exc}")
 
     @set_api_status("prototype")
     async def get_stats_async(self, timeout: Optional[float] = None) -> AsyncIterator[Dict]:
