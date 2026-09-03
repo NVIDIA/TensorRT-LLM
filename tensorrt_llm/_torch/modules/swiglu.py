@@ -96,33 +96,6 @@ def silu_and_mul_2in_kernel(o_ptr, o_scale_ptr, gate_ptr, up_ptr, n_elements,
     tl.store(o_ptr + offsets, result, mask=mask)
 
 
-def get_silu_b200_tuning_params(out_dtype: torch.dtype) -> tuple[int, int]:
-    """Launch parameters for silu_and_mul_2in_kernel, measured on B200 (sm100).
-
-    Returns ``(block_elements, num_warps)``. ``block_elements`` is how many
-    elements one Triton program handles -- Triton's ``BLOCK_SIZE`` -- not a CUDA
-    thread count; threads are ``num_warps * 32``, so 4 warps is 128 threads each
-    covering ``block_elements / 128`` elements.
-
-    The output dtype matters because it sets the read/write balance: an FP8
-    output writes one byte per element where BF16 writes two, leaving the FP8
-    case more read-dominated and better served by more elements in flight. From
-    a sweep over ``block_elements`` {1024..8192} x ``num_warps`` {2, 4, 8} at the
-    Cosmos3 shapes, FP8 output was ~5% faster at 4096 than at 2048, while the
-    BF16 candidates tied within 0.6%.
-
-    Validated and performance-tuned on B200 only. Other architectures are
-    unvalidated and are not rejected; no performance guarantee is made.
-
-    When another architecture is tuned, add its own
-    ``get_silu_<arch>_tuning_params`` and dispatch on device capability here
-    rather than widening this one.
-    """
-    if out_dtype == torch.float8_e4m3fn:
-        return 4096, 4
-    return 2048, 4
-
-
 def swiglu(x,
            quant_scale: Optional[torch.Tensor] = None,
            quant_type=None,

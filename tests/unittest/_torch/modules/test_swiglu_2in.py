@@ -27,7 +27,11 @@ accumulate in fp32, so any difference is a defect rather than drift.
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.swiglu import get_silu_b200_tuning_params, swiglu, swiglu_2in
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    _SILU_AND_MUL_2IN_LAUNCH_PARAMS,
+    _silu_and_mul_2in_launch_params,
+)
+from tensorrt_llm._torch.modules.swiglu import swiglu, swiglu_2in
 
 # (M, intermediate). The large case is the Cosmos3 Nano default T2V request:
 # 720x1280 x 189 frames with CFG gives M = 88320.
@@ -225,25 +229,36 @@ def test_opcheck(quantized):
     torch.library.opcheck(torch.ops.trtllm.silu_and_mul_2in, (gate, up), kwargs)
 
 
-def test_tuning_params_are_valid_launch_configs():
+@pytest.mark.parametrize("sm_version", sorted(_SILU_AND_MUL_2IN_LAUNCH_PARAMS) + [90, 120])
+def test_launch_params_are_valid_launch_configs(sm_version):
     """Guards the tuning table against edits that would not launch.
 
     Triton needs a power-of-two block, and threads (num_warps * 32) must stay
     within the 1024-per-block limit -- easy to violate when hand-editing tuned
-    values.
+    values. Covers every tuned SM version plus untuned ones that take the
+    fallback row, since an untuned architecture must still launch.
     """
     for out_dtype in (torch.bfloat16, torch.float16, torch.float8_e4m3fn):
-        block_elements, num_warps = get_silu_b200_tuning_params(out_dtype)
+        block_elements, num_warps = _silu_and_mul_2in_launch_params(sm_version, out_dtype)
         assert block_elements & (block_elements - 1) == 0, (
-            f"{out_dtype}: block_elements {block_elements} is not a power of two"
+            f"sm_{sm_version} {out_dtype}: block_elements {block_elements} is not a power of two"
         )
         assert 1 <= num_warps <= 32
         assert num_warps * 32 <= 1024, (
-            f"{out_dtype}: {num_warps} warps exceeds the per-block thread limit"
+            f"sm_{sm_version} {out_dtype}: {num_warps} warps exceeds the per-block thread limit"
         )
         assert block_elements % (num_warps * 32) == 0, (
-            f"{out_dtype}: {block_elements} elements do not divide evenly across "
-            f"{num_warps * 32} threads"
+            f"sm_{sm_version} {out_dtype}: {block_elements} elements do not divide evenly "
+            f"across {num_warps * 32} threads"
+        )
+
+
+def test_sm103_shares_the_sm100_row():
+    """Pins the documented measurement: the sm_103 sweep landed within 0.4% of
+    the sm_100 configuration, so it must not silently diverge."""
+    for out_dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        assert _silu_and_mul_2in_launch_params(103, out_dtype) == _silu_and_mul_2in_launch_params(
+            100, out_dtype
         )
 
 
