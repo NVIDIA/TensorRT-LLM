@@ -70,7 +70,7 @@ def _dequant_fp4(packed: torch.Tensor, sf_words: torch.Tensor, gran: int = 32):
     return v * sf[:, g]
 
 
-def _build_inputs(batch, n_comp, k_top, weight_mode, seed, device):
+def _build_inputs(batch, n_comp, k_top, weight_mode, seed, device, pattern="random"):
     g = torch.Generator(device=device)
     g.manual_seed(seed)
     maxb = n_comp // PAGE
@@ -78,6 +78,23 @@ def _build_inputs(batch, n_comp, k_top, weight_mode, seed, device):
     q = torch.randn((batch * 64, 128), generator=g, device=device)
     q_packed, q_sf = _quant_fp4(q)
     kv = torch.randn((nb_total * PAGE, 128), generator=g, device=device)
+    if pattern != "random":
+        # adversarial score shapes for the safe-line filter: all keys share one
+        # direction u so the score is a scalar function of the per-token scale
+        u = torch.randn((128,), generator=g, device=device)
+        u = u / u.norm()
+        t = torch.arange(nb_total * PAGE, device=device, dtype=torch.float32)
+        if pattern == "monotone":  # scores grow along the row: every tile beats the line
+            c = 0.5 + 2.5 * (t % (n_comp * 1.0)) / n_comp
+        elif pattern == "allequal":  # one fp16 tie class over the whole row
+            c = torch.full_like(t, 2.0)
+        else:  # "giantbin": 70% of the row shares one high value
+            c = torch.where(
+                torch.rand(t.shape, generator=g, device=device) < 0.7,
+                torch.full_like(t, 3.0),
+                torch.rand(t.shape, generator=g, device=device),
+            )
+        kv = c.unsqueeze(1) * u.unsqueeze(0) * 4.0
     kv_packed, kv_sf = _quant_fp4(kv)
     # planar production page: 2048 B data plane then 128 B scale plane
     flat = torch.empty((nb_total, PAGE * 68), device=device, dtype=torch.uint8)
@@ -255,7 +272,7 @@ def test_fused_indexer_topk_nospill_cuda_graph(batch, k_top):
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("batch", [1, 3, 16, 64])
 @pytest.mark.parametrize("n_comp", [65536, 131072, 262144])
 @pytest.mark.parametrize("k_top", [512, 1024])
 def test_fused_indexer_topk_nospill_long_context(batch, n_comp, k_top):
@@ -289,4 +306,110 @@ def test_fused_indexer_topk_nospill_long_context(batch, n_comp, k_top):
         dv = (got - want).abs()
         assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
             f"row {i}: max value err {float(dv.max()):.4f}"
+        )
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("pattern", ["random", "monotone", "allequal", "giantbin"])
+@pytest.mark.parametrize("batch", [2, 16, 64])
+@pytest.mark.parametrize("k_top", [512, 1024])
+def test_fused_indexer_topk_nospill_filtered(pattern, batch, k_top, monkeypatch):
+    # Force the safe-line filter path on short rows: an 8-tile dense prefix,
+    # everything after it filtered/compacted. Adversarial score shapes make
+    # every chunk trigger a compaction (monotone) or a single giant tie class.
+    monkeypatch.setenv("TRTLLM_FUSED_TOPK_NDENSE", "8")
+    device = torch.device("cuda")
+    weight_mode = "nonneg" if pattern != "random" else "signed"
+    inp = _build_inputs(batch, 16384, k_top, weight_mode, seed=99, device=device, pattern=pattern)
+    indices = torch.full((batch, k_top), -3, dtype=torch.int32, device=device)
+    values = torch.full((batch, k_top), float("nan"), dtype=torch.float32, device=device)
+    fused_indexer_topk_nospill.run(
+        inp["q_fp4"],
+        inp["sf_q"],
+        inp["kv_cache"],
+        inp["weights"],
+        inp["context_lens"],
+        inp["block_table"],
+        None,
+        indices,
+        values,
+    )
+    torch.cuda.synchronize()
+    ref_vals = _reference(inp, k_top)
+    for i in range(batch):
+        row = indices[i]
+        assert int(row.min()) >= 0
+        assert int(row.max()) < int(inp["context_lens"][i])
+        assert row.unique().numel() == k_top, "duplicate indices"
+        got, _ = torch.sort(values[i], descending=True)
+        want, _ = torch.sort(ref_vals[i], descending=True)
+        dv = (got - want).abs()
+        assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
+            f"row {i}: max value err {float(dv.max()):.4f}"
+        )
+
+
+def _reference_indices(inp, k_top):
+    """fp32 reference top-K indices and full score rows (same math as _reference)."""
+    kvf = inp["kv_cache"].reshape(inp["kv_cache"].shape[0], -1)
+    kvp = kvf[:, : PAGE * 64].reshape(-1, 64)
+    kvs = kvf[:, PAGE * 64 :].contiguous().view(torch.int32).reshape(-1)
+    k = _dequant_fp4(kvp, kvs).reshape(-1, PAGE, 128)
+    batch = inp["q_fp4"].shape[0]
+    q = _dequant_fp4(
+        inp["q_fp4"][:, 0].reshape(batch * 64, 64), inp["sf_q"][:, 0].reshape(batch * 64)
+    ).view(batch, 64, 128)
+    rows = []
+    for i in range(batch):
+        length = int(inp["context_lens"][i])
+        nb = (length + PAGE - 1) // PAGE
+        kx = k[inp["block_table"][i, :nb].long()].reshape(nb * PAGE, 128)
+        s = torch.relu(q[i] @ kx.t())
+        s = (s * inp["weights"][i].unsqueeze(1)).sum(dim=0)
+        s[length:] = float("-inf")
+        rows.append(s)
+    return rows
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch", [2, 16])
+@pytest.mark.parametrize("n_comp", [8192, 16384])
+@pytest.mark.parametrize("k_top", [512, 1024])
+def test_fused_indexer_topk_nospill_fp32_boundary(batch, n_comp, k_top, monkeypatch):
+    # Opt-in fp32 boundary refinement: the selected INDEX set equals the fp32
+    # top-K set; members may differ only inside a genuine fp32 tie class at the
+    # boundary (scores equal to within 1e-6 relative).
+    monkeypatch.setenv("TRTLLM_FUSED_TOPK_FP32_EXACT", "1")
+    device = torch.device("cuda")
+    inp = _build_inputs(batch, n_comp, k_top, "signed", seed=777, device=device)
+    indices = torch.full((batch, k_top), -3, dtype=torch.int32, device=device)
+    values = torch.full((batch, k_top), float("nan"), dtype=torch.float32, device=device)
+    fused_indexer_topk_nospill.run(
+        inp["q_fp4"],
+        inp["sf_q"],
+        inp["kv_cache"],
+        inp["weights"],
+        inp["context_lens"],
+        inp["block_table"],
+        None,
+        indices,
+        values,
+    )
+    torch.cuda.synchronize()
+    scores = _reference_indices(inp, k_top)
+    for i in range(batch):
+        s = scores[i]
+        ref = torch.topk(s, k_top).indices
+        kth = s[ref[-1]]
+        got = indices[i].long()
+        assert got.unique().numel() == k_top
+        # every selected token must score >= the fp32 K-th value (within 1e-6 rel)
+        tol = 1e-6 * kth.abs() + 1e-6
+        below = (s[got] < kth - tol).sum().item()
+        assert below == 0, f"row {i}: {below} selected tokens fall below the fp32 K-th value"
+        # and the sorted score multiset must match the reference to fp32 tolerance
+        gs, _ = torch.sort(s[got], descending=True)
+        rs, _ = torch.sort(s[ref], descending=True)
+        assert bool(((gs - rs).abs() <= 1e-6 * rs.abs() + 1e-6).all()), (
+            f"row {i}: fp32 score multiset differs"
         )

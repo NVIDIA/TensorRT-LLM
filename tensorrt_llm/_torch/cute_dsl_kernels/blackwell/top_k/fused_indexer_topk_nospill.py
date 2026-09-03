@@ -36,6 +36,8 @@ Contract
 - context_lens are per-row and arbitrary within n_comp.
 """
 
+import os
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -84,7 +86,11 @@ M_WARP = 14
 NTHREADS = 480  # 15 warps => 136 regs/thread, enough to keep all 64
 # per-head weights resident in registers for the scan
 NACC = 3
-MAX_NLOC = 256  # tiles per CTA whose 16-bit keys fit next to a >=14-stage pipeline
+MAX_NLOC = 512  # tiles per CTA (dense prefix + filtered survivors; page-table slice is NLOC*16 B)
+NDENSE_MAX = 256  # tiles whose keys are stored densely; later tiles are safe-line filtered
+CHUNK = 24  # filtered tiles between two consumer rendezvous (multiple of NACC)
+LP = 96  # safe-line refresh period in tiles after the dense prefix (multiple of NACC)
+TIECAP = 256  # boundary tie members refined in fp32 (larger tie classes keep the fp16 fill)
 
 
 @cute.jit
@@ -174,6 +180,273 @@ def _pick32(sFine, sCtl, tidx, warp_idx, target, out):
             sCtl[out + 1] = excl
 
 
+@cute.jit
+def _pick_warp(sH, lane, target):
+    """One-warp, barrier-free descending-cumulative search over NBINS bins.
+    Safe on a histogram that is still being incremented: every bin read is
+    <= its final value, so the result is a lower bound of the final bin.
+    Lane l owns bins [NBINS-64*(l+1), NBINS-64*l); reads are lane-rotated to
+    spread banks. Returns (found, bin, count_strictly_above), warp-uniform."""
+    base = NBINS - 64 * (lane + 1)
+    ls = I32(0)
+    for k in cutlass.range_constexpr(64):
+        ls = ls + sH[base + ((k + lane) & 63)]
+    incl = ls
+    for d in cutlass.range_constexpr(5):
+        oth = cute.arch.shuffle_sync_up(incl, 1 << d, mask_and_clamp=0)
+        if lane >= (1 << d):
+            incl = incl + oth
+    excl = incl - ls
+    hit = (excl < target) and (incl >= target)
+    hm = cute.arch.vote_ballot_sync(hit)
+    found = hm != 0
+    hl = cute.arch.popc(hm - 1)
+    sel_base = cute.arch.shuffle_sync(base, hl)
+    acc0 = cute.arch.shuffle_sync(excl, hl)
+    v0 = sH[sel_base + 63 - 2 * lane]
+    v1 = sH[sel_base + 62 - 2 * lane]
+    ps = v0 + v1
+    inc2 = ps
+    for d in cutlass.range_constexpr(5):
+        oth2 = cute.arch.shuffle_sync_up(inc2, 1 << d, mask_and_clamp=0)
+        if lane >= (1 << d):
+            inc2 = inc2 + oth2
+    exc2 = acc0 + inc2 - ps
+    hit2 = (exc2 < target) and (acc0 + inc2 >= target)
+    m2 = cute.arch.vote_ballot_sync(hit2)
+    l2 = cute.arch.popc(m2 - 1)
+    bsel_l = sel_base + 63 - 2 * lane
+    above_l = exc2
+    if exc2 + v0 < target:
+        bsel_l = sel_base + 62 - 2 * lane
+        above_l = exc2 + v0
+    bsel = cute.arch.shuffle_sync(bsel_l, l2)
+    above = cute.arch.shuffle_sync(above_l, l2)
+    return found, bsel, above
+
+
+@cute.jit
+def _compact(
+    sHist,
+    sKey32,
+    sSPos,
+    sSKey,
+    sFine,
+    sCtl,
+    tidx,
+    wl,
+    lmaskw,
+    warp_idx,
+    crk,
+    L,
+    ndense,
+    n,
+    KTOP,
+    SCAP,
+    CS,
+):
+    """Consumer-only (384 threads, named barrier 1) exact shrink of the
+    survivor buffer to <= KTOP entries: keep everything above the K-th value
+    seen so far, plus exactly the tie quota at that value. sHist is quiescent
+    and exact here, so the result is the CTA-local top-K-so-far."""
+    if tidx < 32:
+        sFine[tidx] = I32(0)
+    if tidx == 0:
+        sCtl[6] = I32(0)
+        sCtl[7] = I32(0)
+    if warp_idx == 0:
+        f, bs, ca = _pick_warp(sHist, wl, I32(KTOP))
+        if wl == 0:
+            sCtl[12] = I32(-1)
+            if f:
+                sCtl[12] = bs
+            sCtl[13] = ca
+    cute.arch.barrier(barrier_id=1, number_of_threads=C_THREADS)
+    bs = sCtl[12]
+    ca = sCtl[13]
+    if bs >= 0:
+        r1s = I32(KTOP) - ca
+        for w in cutlass.range(tidx, ndense * (TOK // 2), C_THREADS, unroll=1):
+            x = I32(sKey32[w])
+            k0 = x & 0xFFFF
+            k1 = (x >> 16) & 0xFFFF
+            p0 = 2 * w
+            t0 = (crk + (p0 >> 7) * CS) * TOK + (p0 & (TOK - 1))
+            if (t0 < L) and ((k0 >> 5) == bs):
+                cute.arch.atomic_add(sFine.iterator + (k0 & (NFINE - 1)), I32(1), scope="cta")
+            if (t0 + 1 < L) and ((k1 >> 5) == bs):
+                cute.arch.atomic_add(sFine.iterator + (k1 & (NFINE - 1)), I32(1), scope="cta")
+        for q in cutlass.range(tidx, n, C_THREADS, unroll=1):
+            kq = I32(sSKey[q])
+            if (kq >> 5) == bs:
+                cute.arch.atomic_add(sFine.iterator + (kq & (NFINE - 1)), I32(1), scope="cta")
+        cute.arch.barrier(barrier_id=1, number_of_threads=C_THREADS)
+        _pick32(sFine, sCtl, tidx, warp_idx, r1s, 14)
+        cute.arch.barrier(barrier_id=1, number_of_threads=C_THREADS)
+        fs = sCtl[14]
+        r2s = r1s - sCtl[15]
+        nr = (n + C_THREADS - 1) // C_THREADS
+        for r in cutlass.range(nr, unroll=1):
+            q = r * C_THREADS + tidx
+            live = q < n
+            kq = I32(0)
+            pq = I32(0)
+            if live:
+                kq = I32(sSKey[q])
+                pq = sSPos[q]
+            b = kq >> 5
+            fb = kq & (NFINE - 1)
+            kp = live and ((b > bs) or ((b == bs) and (fb > fs)))
+            if live and (b == bs) and (fb == fs):
+                tq = cute.arch.atomic_add(sCtl.iterator + 6, I32(1), scope="cta")
+                if tq < r2s:
+                    kp = True
+            cute.arch.barrier(barrier_id=1, number_of_threads=C_THREADS)
+            m = cute.arch.vote_ballot_sync(kp)
+            base = I32(0)
+            if wl == 0:
+                if m != 0:
+                    base = cute.arch.atomic_add(sCtl.iterator + 7, cute.arch.popc(m), scope="cta")
+            base = cute.arch.shuffle_sync(base, 0)
+            if kp:
+                d = base + cute.arch.popc(m & lmaskw)
+                sSPos[d] = pq
+                sSKey[d] = U16(kq & 0xFFFF)
+        cute.arch.barrier(barrier_id=1, number_of_threads=C_THREADS)
+        if tidx == 0:
+            sCtl[5] = sCtl[7]
+            if bs > sCtl[4]:
+                sCtl[4] = bs
+        if tidx < 32:
+            sFine[tidx] = I32(0)
+    cute.arch.barrier(barrier_id=1, number_of_threads=C_THREADS)
+
+
+@cute.jit
+def _filter_window(sWin, woff, sSPos, sSKey, sCtl, tidx, wl, lmaskw, crk, L, ntl, tile0, CS):
+    """Consumer-only pass over one chunk window (CHUNK*TOK keys, 8 per
+    thread): count survivors per warp first, reserve the slots with ONE atomic
+    per warp, then place (position, key). Keeps the rendezvous short."""
+    NIT = (CHUNK * TOK) // C_THREADS
+    keeps = [cutlass.Boolean(False) for _ in range(NIT)]
+    nks = [I32(0) for _ in range(NIT)]
+    masks = [I32(0) for _ in range(NIT)]
+    tot = I32(0)
+    for r in cutlass.range_constexpr(NIT):
+        w = r * C_THREADS + tidx
+        k = I32(sWin[woff + w])
+        tl = tile0 + w // TOK
+        tok = (crk + tl * CS) * TOK + (w % TOK)
+        kp = (tl < ntl) and (tok < L) and ((k >> 5) >= sCtl[4])
+        mk = cute.arch.vote_ballot_sync(kp)
+        keeps[r] = kp
+        masks[r] = mk
+        nks[r] = tot
+        tot = tot + cute.arch.popc(mk)
+    sb = I32(0)
+    if wl == 0:
+        if tot > 0:
+            sb = cute.arch.atomic_add(sCtl.iterator + 5, tot, scope="cta")
+    sb = cute.arch.shuffle_sync(sb, 0)
+    for r in cutlass.range_constexpr(NIT):
+        if keeps[r]:
+            w = r * C_THREADS + tidx
+            tl = tile0 + w // TOK
+            qs = sb + nks[r] + cute.arch.popc(masks[r] & lmaskw)
+            sSPos[qs] = tl * TOK + (w % TOK)
+            sSKey[qs] = U16(I32(sWin[woff + w]) & 0xFFFF)
+
+
+@cute.jit
+def _st_dsmem_u32(addr, val):
+    """st.shared::cluster.u32 [addr], val (plain remote SMEM store)."""
+    _llvm.inline_asm(
+        _T.i32(),
+        [I32(addr).ir_value(), I32(val).ir_value()],
+        "st.shared::cluster.u32 [$1], $2;\n\tmov.u32 $0, 0;",
+        "=r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def _fp4(c):
+    """FP4 E2M1 code -> value ({0, .5, 1, 1.5, 2, 3, 4, 6}, bit 3 = sign) by arithmetic."""
+    m = c & 7
+    e = m >> 1
+    man = F32(1.0) + F32(0.5) * (m & 1).to(F32)  # 1.0 or 1.5
+    v = man * ((I32(126) + e) << 23).bitcast(F32)  # * 2^(e-1)
+    if m == 0:
+        v = F32(0.0)
+    if m == 1:
+        v = F32(0.5)
+    if (c & 8) != 0:
+        v = -v
+    return v
+
+
+@cute.jit
+def _score_fp32(kv_ptr, q_ptr, sfq_ptr, bt_ptr, b, MAXB, t, lane, sW):
+    """fp32 indexer score of token t for request b (same math as the scan:
+    relu per head, weighted sum; UE8M0 block scales per 32 dims). Lane owns
+    heads 2*lane, 2*lane+1; the warp-reduced score is returned on every lane.
+    Operand words are preloaded (16 + 16 registers); nibbles are decoded on
+    the fly in a runtime loop to keep code size and register use small."""
+    pg = cute.make_tensor(bt_ptr + cutlass.Int64(b) * MAXB, cute.make_layout(MAXB))[t >> 5]
+    toff = t & 31
+    kw = cute.make_tensor(
+        cute.make_ptr(
+            U32, kv_ptr.toint() + cutlass.Int64(pg) * PGB + toff * 64, GMEM, assumed_align=4
+        ),
+        cute.make_layout(16),
+    )
+    kr = [I32(0) for _ in range(16)]
+    for w in cutlass.range_constexpr(16):
+        kr[w] = I32(kw[w])
+    ksw = I32(
+        cute.make_tensor(
+            cute.make_ptr(
+                U32,
+                kv_ptr.toint() + cutlass.Int64(pg) * PGB + 2048 + toff * 4,
+                GMEM,
+                assumed_align=4,
+            ),
+            cute.make_layout(1),
+        )[0]
+    )
+    acc = F32(0.0)
+    for hh in cutlass.range_constexpr(2):
+        h = 2 * lane + hh
+        qw = cute.make_tensor(
+            cute.make_ptr(
+                U32, q_ptr.toint() + cutlass.Int64(b) * 4096 + h * 64, GMEM, assumed_align=4
+            ),
+            cute.make_layout(16),
+        )
+        qr = [I32(0) for _ in range(16)]
+        for w in cutlass.range_constexpr(16):
+            qr[w] = I32(qw[w])
+        qsw = I32(cute.make_tensor(sfq_ptr + b * 64 + h, cute.make_layout(1))[0])
+        dot = F32(0.0)
+        for blk in cutlass.range_constexpr(4):
+            part = F32(0.0)
+            for w in cutlass.range_constexpr(4):
+                kx = kr[blk * 4 + w]
+                qx = qr[blk * 4 + w]
+                for n in cutlass.range(8, unroll=1):
+                    sh = 4 * n
+                    part = part + _fp4((kx >> sh) & 15) * _fp4((qx >> sh) & 15)
+            sk = (((ksw >> (8 * blk)) & 255) << 23).bitcast(F32)
+            sq = (((qsw >> (8 * blk)) & 255) << 23).bitcast(F32)
+            dot = dot + part * sk * sq
+        acc = acc + sW[h] * cute.arch.fmax(dot, F32(0.0))
+    for d in cutlass.range_constexpr(5):
+        acc = acc + cute.arch.shuffle_sync_bfly(acc, 1 << d)
+    return acc
+
+
 @cute.kernel
 def _dsv4_kernel(
     tiled_mma: cute.TiledMma,
@@ -196,6 +469,9 @@ def _dsv4_kernel(
     STAGES: cutlass.Constexpr,
     CS: cutlass.Constexpr,
     NLOC: cutlass.Constexpr,
+    NDENSE: cutlass.Constexpr,
+    SCAP: cutlass.Constexpr,
+    REFINE: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -219,7 +495,7 @@ def _dsv4_kernel(
     sB_raw = smem.allocate_array(U32, HD * DIMB // 4, byte_alignment=1024)
     sSFA_raw = smem.allocate_array(U32, STAGES * 128, byte_alignment=128)
     sSFB_raw = smem.allocate_array(U32, 128, byte_alignment=128)
-    sKey_raw = smem.allocate_array(U16, NLOC * TOK, byte_alignment=128)
+    sKey_raw = smem.allocate_array(U16, NDENSE * TOK, byte_alignment=128)
     sHist = smem.allocate_tensor(I32, cute.make_layout(NBINS), byte_alignment=128)
     sTot = smem.allocate_tensor(I32, cute.make_layout(NBINS), byte_alignment=128)
     sFTot = smem.allocate_tensor(I32, cute.make_layout(NFINE), byte_alignment=128)
@@ -229,13 +505,18 @@ def _dsv4_kernel(
     sFine = smem.allocate_tensor(I32, cute.make_layout(NFINE), byte_alignment=128)
     sBT = smem.allocate_tensor(I32, cute.make_layout(NLOC * 4), byte_alignment=128)
     sCand = smem.allocate_tensor(I32, cute.make_layout(CAP), byte_alignment=128)
+    sSPos = smem.allocate_tensor(I32, cute.make_layout(max(SCAP, 4)), byte_alignment=128)
+    sSKey = smem.allocate_tensor(U16, cute.make_layout(max(SCAP, 8)), byte_alignment=128)
+    sWin = smem.allocate_tensor(
+        U16, cute.make_layout(2 * CHUNK * TOK if SCAP > 0 else 8), byte_alignment=128
+    )
     tmem_hold = smem.allocate_array(I32, 1, byte_alignment=16)
     mbar = smem.allocate_array(cutlass.Int64, 2 * STAGES + 2 * NACC, byte_alignment=16)
 
-    sKey = cute.make_tensor(sKey_raw, cute.make_layout(NLOC * TOK))
-    sVal = cute.make_tensor(cute.recast_ptr(sKey_raw, dtype=F16), cute.make_layout(NLOC * TOK))
+    sKey = cute.make_tensor(sKey_raw, cute.make_layout(NDENSE * TOK))
+    sVal = cute.make_tensor(cute.recast_ptr(sKey_raw, dtype=F16), cute.make_layout(NDENSE * TOK))
     sKey32 = cute.make_tensor(
-        cute.recast_ptr(sKey_raw, dtype=U32), cute.make_layout(NLOC * TOK // 2)
+        cute.recast_ptr(sKey_raw, dtype=U32), cute.make_layout(NDENSE * TOK // 2)
     )
 
     ab_full = mbar
@@ -508,54 +789,190 @@ def _dsv4_kernel(
         # relu is scalar (there is no max.f32x2) but the weighted accumulation
         # runs on the Blackwell packed FP32 datapath: 64 fmax + 32 fma.f32x2
         # instead of 64 fmax + 64 fma per token.
-        for i in cutlass.range(gwg, ntl, NACC, unroll=1):
-            cute.arch.mbarrier_wait(acc_full + gwg, (i // NACC) & 1)
-            if gwg == 0:
-                cute.copy(tt, s00, frg)
-            elif gwg == 1:
-                cute.copy(tt, s10, frg)
-            else:
-                cute.copy(tt, s20, frg)
-            cute.arch.fence_view_async_tmem_load()
-            acc = [[z, z], [z, z], [z, z], [z, z]]
-            for j in cutlass.range_constexpr(16):
-                k = j & 3
-                r0 = cute.arch.fmax(frg[2 * j], z)
-                r1 = cute.arch.fmax(frg[2 * j + 1], z)
-                acc[k][0], acc[k][1] = cute.arch.fma_packed_f32x2(
-                    (wr[2 * j], wr[2 * j + 1]), (r0, r1), (acc[k][0], acc[k][1])
+        wl = tidx % 32
+        lmaskw = (I32(1) << wl) - I32(1)
+        ndense = ntl
+        nch = I32(0)
+        ntl_pad = ntl
+        if cutlass.const_expr(NLOC > NDENSE):
+            if ntl > NDENSE:
+                ndense = I32(NDENSE)
+                nch = (ntl - NDENSE + CHUNK - 1) // CHUNK
+                ntl_pad = NDENSE + nch * CHUNK
+        wslot = I32(0)
+        if cutlass.const_expr(NLOC > NDENSE):
+            # window slot of this group's first filtered tile: smallest i >= NDENSE with i % NACC == gwg
+            wslot = ((NDENSE + NACC - 1) // NACC) * NACC + gwg - NDENSE
+            if wslot >= NACC:
+                wslot = wslot - NACC
+        for i in cutlass.range(gwg, ntl_pad, NACC, unroll=1):
+            if cutlass.const_expr(NLOC > NDENSE):
+                # chunk rendezvous (consumers only): all 3 groups aligned, the
+                # survivor count is quiescent; shrink the buffer if the next
+                # chunk could overflow it. Phantom tiles i >= ntl only exist to
+                # keep the rendezvous count identical across the 12 warps.
+                if (i >= NDENSE) and (((i - NDENSE) % CHUNK) < NACC):
+                    rc = (i - NDENSE) // CHUNK
+                    cute.arch.barrier(barrier_id=1, number_of_threads=C_THREADS)
+                    nsv = sCtl[5]
+                    cute.arch.barrier(barrier_id=1, number_of_threads=C_THREADS)
+                    if nsv > SCAP - CHUNK * TOK:
+                        _compact(
+                            sHist,
+                            sKey32,
+                            sSPos,
+                            sSKey,
+                            sFine,
+                            sCtl,
+                            tidx,
+                            wl,
+                            lmaskw,
+                            warp_idx,
+                            crk,
+                            L,
+                            ndense,
+                            nsv,
+                            KTOP,
+                            SCAP,
+                            CS,
+                        )
+                    if rc >= 1:
+                        _filter_window(
+                            sWin,
+                            ((rc - 1) % 2) * (CHUNK * TOK),
+                            sSPos,
+                            sSKey,
+                            sCtl,
+                            tidx,
+                            wl,
+                            lmaskw,
+                            crk,
+                            L,
+                            ntl,
+                            NDENSE + (rc - 1) * CHUNK,
+                            CS,
+                        )
+            if i < ntl:
+                cute.arch.mbarrier_wait(acc_full + gwg, (i // NACC) & 1)
+                if gwg == 0:
+                    cute.copy(tt, s00, frg)
+                elif gwg == 1:
+                    cute.copy(tt, s10, frg)
+                else:
+                    cute.copy(tt, s20, frg)
+                cute.arch.fence_view_async_tmem_load()
+                acc = [[z, z], [z, z], [z, z], [z, z]]
+                for j in cutlass.range_constexpr(16):
+                    k = j & 3
+                    r0 = cute.arch.fmax(frg[2 * j], z)
+                    r1 = cute.arch.fmax(frg[2 * j + 1], z)
+                    acc[k][0], acc[k][1] = cute.arch.fma_packed_f32x2(
+                        (wr[2 * j], wr[2 * j + 1]), (r0, r1), (acc[k][0], acc[k][1])
+                    )
+                if gwg == 0:
+                    cute.copy(tt, s01, frg)
+                elif gwg == 1:
+                    cute.copy(tt, s11, frg)
+                else:
+                    cute.copy(tt, s21, frg)
+                cute.arch.fence_view_async_tmem_load()
+                cute.arch.mbarrier_arrive(acc_empty + gwg)
+                for j in cutlass.range_constexpr(16):
+                    k = j & 3
+                    r0 = cute.arch.fmax(frg[2 * j], z)
+                    r1 = cute.arch.fmax(frg[2 * j + 1], z)
+                    acc[k][0], acc[k][1] = cute.arch.fma_packed_f32x2(
+                        (wr[32 + 2 * j], wr[33 + 2 * j]), (r0, r1), (acc[k][0], acc[k][1])
+                    )
+                q0 = cute.arch.add_packed_f32x2((acc[0][0], acc[0][1]), (acc[1][0], acc[1][1]))
+                q1 = cute.arch.add_packed_f32x2((acc[2][0], acc[2][1]), (acc[3][0], acc[3][1]))
+                q2 = cute.arch.add_packed_f32x2(q0, q1)
+                sc = q2[0] + q2[1]
+                # signed monotone key: k = u ^ (0x8000 | sign*0x7FFF). The
+                # buffer stores KEYS, so every downstream ordering site (coarse
+                # bin >> 5, fine bin & 31, comparisons) is unchanged; only the
+                # value OUTPUT sites decode back to fp16 bits.
+                hv0 = sc.to(F16)
+                ui = I32(hv0.bitcast(U16)) & 0xFFFF
+                ki = ui ^ (0x8000 + ((ui >> 15) & 1) * 0x7FFF)
+                hv = U16(ki).bitcast(F16)
+                pos = i * TOK + lane
+                tok = (crk + i * CS) * TOK + lane
+                if cutlass.const_expr(NLOC > NDENSE):
+                    if i < NDENSE:
+                        sVal[pos] = hv
+                        if tok < L:
+                            cute.arch.atomic_add(sHist.iterator + (ki >> 5), I32(1), scope="cta")
+                    else:
+                        # filtered tile: histogram stays complete; the key parks in
+                        # the chunk window and is filtered at the next rendezvous
+                        if tok < L:
+                            cute.arch.atomic_add(sHist.iterator + (ki >> 5), I32(1), scope="cta")
+                        sWin[wslot * TOK + lane] = U16(ki & 0xFFFF)
+                        wslot = wslot + NACC
+                        if wslot >= 2 * CHUNK:
+                            wslot = wslot - 2 * CHUNK
+                else:
+                    sVal[pos] = hv
+                    if tok < L:
+                        cute.arch.atomic_add(sHist.iterator + (ki >> 5), I32(1), scope="cta")
+                if cutlass.const_expr(NLOC > NDENSE):
+                    # safe line: coarse bin of the K-th key seen so far (a lower
+                    # bound of the final boundary bin). Refreshed by consumer warp 0
+                    # after its accumulator is released: TMA and MMA issue never wait.
+                    # first line at the last group-0 tile of the dense prefix, then
+                    # every LP tiles: a ~1000-cycle detour on any role stalls the
+                    # whole pipeline, so it must stay rare.
+                    if warp_idx == 0:
+                        if (i >= (NDENSE - 1 - ((NDENSE - 1) % NACC))) and (
+                            ((i - (NDENSE - 1 - ((NDENSE - 1) % NACC))) % LP) == 0
+                        ):
+                            fl, bl, _ab = _pick_warp(sHist, wl, I32(KTOP))
+                            if fl:
+                                if wl == 0:
+                                    if bl > sCtl[4]:
+                                        sCtl[4] = bl
+
+        if cutlass.const_expr(NLOC > NDENSE):
+            if ntl > NDENSE:
+                cute.arch.barrier(barrier_id=1, number_of_threads=C_THREADS)
+                nsv2 = sCtl[5]
+                cute.arch.barrier(barrier_id=1, number_of_threads=C_THREADS)
+                if nsv2 > SCAP - CHUNK * TOK:
+                    _compact(
+                        sHist,
+                        sKey32,
+                        sSPos,
+                        sSKey,
+                        sFine,
+                        sCtl,
+                        tidx,
+                        wl,
+                        lmaskw,
+                        warp_idx,
+                        crk,
+                        L,
+                        ndense,
+                        nsv2,
+                        KTOP,
+                        SCAP,
+                        CS,
+                    )
+                _filter_window(
+                    sWin,
+                    ((nch - 1) % 2) * (CHUNK * TOK),
+                    sSPos,
+                    sSKey,
+                    sCtl,
+                    tidx,
+                    wl,
+                    lmaskw,
+                    crk,
+                    L,
+                    ntl,
+                    NDENSE + (nch - 1) * CHUNK,
+                    CS,
                 )
-            if gwg == 0:
-                cute.copy(tt, s01, frg)
-            elif gwg == 1:
-                cute.copy(tt, s11, frg)
-            else:
-                cute.copy(tt, s21, frg)
-            cute.arch.fence_view_async_tmem_load()
-            cute.arch.mbarrier_arrive(acc_empty + gwg)
-            for j in cutlass.range_constexpr(16):
-                k = j & 3
-                r0 = cute.arch.fmax(frg[2 * j], z)
-                r1 = cute.arch.fmax(frg[2 * j + 1], z)
-                acc[k][0], acc[k][1] = cute.arch.fma_packed_f32x2(
-                    (wr[32 + 2 * j], wr[33 + 2 * j]), (r0, r1), (acc[k][0], acc[k][1])
-                )
-            q0 = cute.arch.add_packed_f32x2((acc[0][0], acc[0][1]), (acc[1][0], acc[1][1]))
-            q1 = cute.arch.add_packed_f32x2((acc[2][0], acc[2][1]), (acc[3][0], acc[3][1]))
-            q2 = cute.arch.add_packed_f32x2(q0, q1)
-            sc = q2[0] + q2[1]
-            # signed monotone key: k = u ^ (0x8000 | sign*0x7FFF). The
-            # buffer stores KEYS, so every downstream ordering site (coarse
-            # bin >> 5, fine bin & 31, comparisons) is unchanged; only the
-            # value OUTPUT sites decode back to fp16 bits.
-            hv0 = sc.to(F16)
-            ui = I32(hv0.bitcast(U16)) & 0xFFFF
-            ki = ui ^ (0x8000 + ((ui >> 15) & 1) * 0x7FFF)
-            hv = U16(ki).bitcast(F16)
-            pos = i * TOK + lane
-            sVal[pos] = hv
-            if (crk + i * CS) * TOK + lane < L:
-                cute.arch.atomic_add(sHist.iterator + (ki >> 5), I32(1), scope="cta")
 
     # Each warp signals cluster arrival as soon as its own scan work is done;
     # the matching wait sits after the CTA barrier, so a CTA only pays the
@@ -620,26 +1037,41 @@ def _dsv4_kernel(
     # coarse descent; local slot == output slot) and write them out with full
     # lines after the pass, instead of per-warp partial-line stores.
     sWK = cute.make_tensor(cute.recast_ptr(sTot.iterator, dtype=U16), cute.make_layout(2 * NBINS))
-    nw = ntl * (TOK // 2)
-    niter = (nw + NTHREADS - 1) // NTHREADS
+    ndn = ntl
+    nsurv = I32(0)
+    if cutlass.const_expr(NLOC > NDENSE):
+        if ntl > NDENSE:
+            ndn = I32(NDENSE)
+        nsurv = sCtl[5]
+    nw = ndn * (TOK // 2)
+    ntot = nw + nsurv
+    niter = (ntot + NTHREADS - 1) // NTHREADS
     lane = cute.arch.lane_idx()
     lmask = (I32(1) << lane) - I32(1)
     for it in cutlass.range(niter, unroll=1):
         w = it * NTHREADS + tidx
-        live = w < nw
+        live = w < ntot
+        dense = w < nw
         xi = I32(0)
+        p0 = 2 * w
+        es0 = p0
         if live:
-            xi = I32(sKey32[w])
+            if dense:
+                xi = I32(sKey32[w])
+        if cutlass.const_expr(NLOC > NDENSE):
+            if live and (w >= nw):
+                xi = I32(sSKey[w - nw])
+                p0 = sSPos[w - nw]
+                es0 = NDENSE * TOK + (w - nw)
         kv0 = U16(xi & 0xFFFF)
         kv1 = U16((xi >> 16) & 0xFFFF)
-        p0 = 2 * w
         # local slot -> global kv position
         t0 = (crk + (p0 >> 7) * CS) * TOK + (p0 & (TOK - 1))
         t1 = t0 + 1
         n0 = I32(kv0) >> 5
         n1 = I32(kv1) >> 5
         hi0 = live and (t0 < L) and (n0 > b1)
-        hi1 = live and (t1 < L) and (n1 > b1)
+        hi1 = live and dense and (t1 < L) and (n1 > b1)
         # warp-aggregated claim: lanes of a warp take consecutive output slots,
         # which turns 32 scattered 4B stores into one coalesced pair of stores.
         m0 = cute.arch.vote_ballot_sync(hi0)
@@ -671,12 +1103,12 @@ def _dsv4_kernel(
         if live and (t0 < L) and (n0 == b1):
             q = cute.arch.atomic_add(sCtl.iterator + 11, I32(1), scope="cta")
             if q < CAP:
-                sCand[q] = p0
+                sCand[q] = es0
             cute.arch.atomic_add(sFine.iterator + (I32(kv0) & (NFINE - 1)), I32(1), scope="cta")
-        if live and (t1 < L) and (n1 == b1):
+        if live and dense and (t1 < L) and (n1 == b1):
             q = cute.arch.atomic_add(sCtl.iterator + 11, I32(1), scope="cta")
             if q < CAP:
-                sCand[q] = p0 + 1
+                sCand[q] = es0 + 1
             cute.arch.atomic_add(sFine.iterator + (I32(kv1) & (NFINE - 1)), I32(1), scope="cta")
     cute.arch.barrier()
 
@@ -716,17 +1148,28 @@ def _dsv4_kernel(
     if cutlass.const_expr(CS > 1):
         cnt9 = cute.arch.map_dsmem_ptr(sCtl.iterator + 9, 0)
         cnt10 = cute.arch.map_dsmem_ptr(sCtl.iterator + 10, 0)
+    tie_base = I32(0)
+    if cutlass.const_expr(CS > 1):
+        tie_base = I32(cute.arch.map_dsmem_ptr(sPart.iterator, 0).toint())
     ncand = sCtl[11]
     nscan = ncand
     if ncand > CAP:
-        nscan = ntl * TOK
+        nscan = ndn * TOK + nsurv
     for ci in cutlass.range(tidx, nscan, NTHREADS, unroll=2):
-        pl = ci
+        es = ci
         if ncand <= CAP:
-            pl = sCand[ci]
+            es = sCand[ci]
+        pl = es
+        kk = I32(0)
+        if cutlass.const_expr(NLOC > NDENSE):
+            if es < NDENSE * TOK:
+                kk = I32(sKey[es])
+            else:
+                kk = I32(sSKey[es - NDENSE * TOK])
+                pl = sSPos[es - NDENSE * TOK]
+        else:
+            kk = I32(sKey[es])
         t = (crk + (pl >> 7) * CS) * TOK + (pl & (TOK - 1))
-        kv = sKey[pl]
-        kk = I32(kv)
         take = t < L
         if ncand <= CAP:
             take = True
@@ -745,9 +1188,106 @@ def _dsv4_kernel(
                     gI[base2 + p] = t
                     ub2 = kk ^ (0x8000 + ((((kk >> 15) & 1) ^ 1) * 0x7FFF))
                     gV[base2 + p] = U16(ub2 & 0xFFFF).bitcast(F16).to(F32)
+                if cutlass.const_expr(REFINE == 1):
+                    if p < TIECAP:
+                        # tie member list for the fp32 refinement (sPart is dead here)
+                        if cutlass.const_expr(CS > 1):
+                            _st_dsmem_u32(tie_base + p * 4, t)
+                        else:
+                            sPart[p] = t
     if cutlass.const_expr(CS > 1):
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
+    elif cutlass.const_expr(REFINE == 1):
+        cute.arch.barrier()
+
+    # ---------------- fp32 boundary refinement (opt-in) ----------------------
+    # The fp16 key is exact for everything above the boundary; only the tie
+    # class at the K-th fp16 value can differ from an fp32 top-K. Rank 0 (or
+    # the single CTA) rescores the recorded tie members in fp32 straight from
+    # the fp4 pages and rewrites the r2 tie slots in exact fp32 order.
+    # ntie <= r2 (all ties selected anyway) or ntie > TIECAP keeps the fill.
+    if cutlass.const_expr(REFINE == 1):
+        _refine_boundary(
+            sPart,
+            sHist,
+            sCtl,
+            sW,
+            gI,
+            gV,
+            kv_ptr,
+            q_ptr,
+            sfq_ptr,
+            bt_ptr,
+            b,
+            MAXB,
+            crk,
+            tidx,
+            lane,
+            warp_idx,
+            r2,
+            base2,
+            b1,
+            b2,
+        )
+
+
+@cute.jit
+def _refine_boundary(
+    sPart,
+    sHist,
+    sCtl,
+    sW,
+    gI,
+    gV,
+    kv_ptr,
+    q_ptr,
+    sfq_ptr,
+    bt_ptr,
+    b,
+    MAXB,
+    crk,
+    tidx,
+    lane,
+    warp_idx,
+    r2,
+    base2,
+    b1,
+    b2,
+):
+    if crk == 0:
+        ntie = sCtl[10]
+        if (ntie > r2) and (ntie <= TIECAP):
+            sTS = cute.make_tensor(
+                cute.recast_ptr(sHist.iterator, dtype=F32), cute.make_layout(TIECAP)
+            )
+            for ti in cutlass.range(warp_idx, ntie, NTHREADS // 32, unroll=1):
+                tt = sPart[ti]
+                sc = _score_fp32(kv_ptr, q_ptr, sfq_ptr, bt_ptr, b, MAXB, tt, lane, sW)
+                if lane == 0:
+                    sTS[ti] = sc
+            cute.arch.barrier()
+            tv = (
+                U16(
+                    (
+                        I32(b1 * NFINE + b2)
+                        ^ (0x8000 + ((((I32(b1 * NFINE + b2) >> 15) & 1) ^ 1) * 0x7FFF))
+                    )
+                    & 0xFFFF
+                )
+                .bitcast(F16)
+                .to(F32)
+            )
+            for ti in cutlass.range(tidx, ntie, NTHREADS, unroll=1):
+                si = sTS[ti]
+                rk = I32(0)
+                for tj in cutlass.range(ntie, unroll=1):
+                    sj = sTS[tj]
+                    if (sj > si) or ((sj == si) and (tj < ti)):
+                        rk = rk + 1
+                if rk < r2:
+                    gI[base2 + rk] = sPart[ti]
+                    gV[base2 + rk] = tv
 
 
 @cute.jit
@@ -769,6 +1309,9 @@ def _launch(
     STAGES: cutlass.Constexpr,
     CS: cutlass.Constexpr,
     NLOC: cutlass.Constexpr,
+    NDENSE: cutlass.Constexpr,
+    SCAP: cutlass.Constexpr,
+    REFINE: cutlass.Constexpr,
 ):
     tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
         FP4, FP4, OperandMajorMode.K, OperandMajorMode.K, SF, 32, tcgen05.CtaGroup.ONE, (TOK, HD)
@@ -825,7 +1368,7 @@ def _launch(
         STAGES * (TOK * DIMB + 512)
         + HD * DIMB
         + 512
-        + NLOC * TOK * 2
+        + NDENSE * TOK * 2
         + 2 * NBINS * 4
         + 64 * 4
         + (NBINS // 8) * 4
@@ -835,6 +1378,8 @@ def _launch(
         + (2 * STAGES + 2 * NACC) * 8
         + NLOC * 4 * 4
         + CAP * 4
+        + SCAP * 6
+        + (2 * CHUNK * TOK * 2 if SCAP > 0 else 16)
         + 2048
     )
 
@@ -859,6 +1404,9 @@ def _launch(
         STAGES,
         CS,
         NLOC,
+        NDENSE,
+        SCAP,
+        REFINE,
     ).launch(
         grid=[B * CS, 1, 1],
         block=[NTHREADS, 1, 1],
@@ -873,11 +1421,13 @@ _cache = {}
 SMEM_CAP = 231424
 
 
-def _stages(NLOC, MAXB):
+def _stages(NDENSE, NLOC, SCAP):
     fixed = (
         HD * DIMB
         + 512
-        + NLOC * TOK * 2
+        + NDENSE * TOK * 2
+        + SCAP * 6
+        + (2 * CHUNK * TOK * 2 if SCAP > 0 else 16)
         + 2 * NBINS * 4
         + 64 * 4
         + (NBINS // 8) * 4
@@ -915,8 +1465,21 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
     assert NLOC <= MAX_NLOC, (
         f"row of {NCOMP} tokens exceeds the supported length (16 CTAs x {MAX_NLOC * TOK})"
     )
-    STAGES = _stages(NLOC, MAXB)
-    key = (B, NCOMP, KTOP, MAXB, NPAGES, STAGES, CS, NLOC)
+    # dense prefix of NDENSE tiles; longer CTAs filter the rest by the safe
+    # line into a compact survivor buffer that can never overflow:
+    # SCAP >= KTOP + CHUNK*TOK (one chunk of appends after a shrink to <= KTOP)
+    # rows that fit stay dense; longer rows keep a 128-tile dense prefix so the
+    # pipeline keeps 16 stages next to the survivor buffer
+    ndense_max = int(os.environ.get("TRTLLM_FUSED_TOPK_NDENSE", NDENSE_MAX))
+    NDENSE = NLOC if NLOC <= ndense_max else min(ndense_max, 128)
+    SCAP = 0
+    if NLOC > NDENSE:
+        SCAP = ((KTOP + CHUNK * TOK + 511) // 512) * 512
+    STAGES = _stages(NDENSE, NLOC, SCAP)
+    # fp32-exact boundary (rescoring the K-th fp16 tie class): opt-in until the
+    # rescoring is fast; default contract is exact at fp16 granularity
+    REFINE = 1 if os.environ.get("TRTLLM_FUSED_TOPK_FP32_EXACT", "0") == "1" else 0
+    key = (B, NCOMP, KTOP, MAXB, NPAGES, STAGES, CS, NLOC, NDENSE, SCAP, REFINE)
     kv_ptr = make_ptr(U8, kv_cache.data_ptr(), GMEM, assumed_align=16)
     q_ptr = make_ptr(U8, q_fp4.data_ptr(), GMEM, assumed_align=16)
     sfq_ptr = make_ptr(U32, sf_q.data_ptr(), GMEM, assumed_align=16)
@@ -947,6 +1510,9 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
             STAGES,
             CS,
             NLOC,
+            NDENSE,
+            SCAP,
+            REFINE,
         )
         _cache[key] = fn
     fn(kv_ptr, q_ptr, sfq_ptr, w_ptr, clen_ptr, bt_ptr, oi_ptr, ov_ptr, stream)
