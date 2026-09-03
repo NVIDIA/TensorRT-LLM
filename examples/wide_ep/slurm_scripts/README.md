@@ -120,5 +120,7 @@ Benchmark results will be saved in your configured `work_dir`, including:
 Process generation iteration logs to extract performance metrics:
 
 ```bash
-python3 process_gen_iterlog.py <path_to_gen_iter_log>
+python3 process_gen_iterlog.py --dir_prefix <benchmark_run_dir_prefix>
 ```
+
+`--dir_prefix` is a path prefix for the benchmark run directories, not a single log file: the script globs `<dir_prefix>*/concurrency_*/gen_only.txt`. Run it from `work_dir` or pass an absolute prefix. Only runs submitted with `benchmark.mode: gen_only` produce these logs.

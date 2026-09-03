@@ -58,8 +58,8 @@ moe_config:
 
 #### `backend`
 
- - MoE backend type, defaults to `CUTLASS`.
- - TensorRT LLM has multiple MoE backends that support wide EP, including `CUTEDSL`, `CUTLASS` and `TRTLLM`. The dedicated `WIDEEP` backend is deprecated and can no longer be selected; use `CUTEDSL` for large-EP NVFP4 deployments, or `DEEPGEMM` for FP8 block-scale checkpoints on Blackwell.
+ - MoE backend type, defaults to `AUTO`, which selects a backend based on the model.
+ - TensorRT LLM has multiple MoE backends that support wide EP: `CUTEDSL`, `CUTLASS`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `MEGAMOE_CUTEDSL` and `MEGAMOE_DEEPGEMM`. The remaining backends (`VANILLA`, `TRITON`, `MARLIN`) do not support the load balancer. The dedicated `WIDEEP` backend is deprecated and can no longer be selected; use `CUTEDSL` for large-EP NVFP4 deployments, or `DEEPGEMM` for FP8 block-scale checkpoints on Blackwell.
 
 #### `max_num_tokens`
 
@@ -69,14 +69,21 @@ If set, at most `max_num_tokens` tokens will be sent to `torch.ops.trtllm.fused_
 
 Configuration for MoE load balancing, users can directly set `num_slots` and `layer_updates_per_iter` as online EPLB settings, while set path to a YAML file that also includes `initial_global_assignments` for offline EPLB.
 
+EPLB is only set up when all of the following hold. Otherwise the `load_balancer` section is silently ignored:
+
+* The model architecture is listed in `moe_model_arch_list` in [`moe_load_balancer.py`](../../tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py) — DeepSeek-V3/V3.2/V4, GLM MoE DSA, GPT-OSS, Kimi K2.5, Mixtral, Llama 4, Nemotron-H, Qwen2/Qwen3/Qwen3.5 MoE, and the Qwen3-VL / Qwen3.5 MoE conditional-generation wrappers.
+* Expert parallelism is enabled (`moe_expert_parallel_size` greater than 1) together with attention DP (`enable_attention_dp: true`).
+* The MoE smart router is not in use (`moe_cluster_size` equal to 1).
+
 #### `num_slots`
 
-Total number of expert slots, must be ≥ total experts. Three typical settings:
+Total number of expert slots. It must be ≥ total experts, and divisible by the EP size so that every rank holds the same number of slots. Two typical settings:
 
-1. Set to 0. MoE load balancing is disabled.
-2. Set to number of total experts, such as 256 for DeepSeek R1.
-3. Set to number of total experts + EP size, such as 288 for DeepSeek R1, 32-way EP.
+1. Set to number of total experts, such as 256 for DeepSeek R1.
+2. Set to number of total experts + EP size, such as 288 for DeepSeek R1, 32-way EP.
    * This means there is 1 extra expert on each EP rank, so that there is more room for the per-rank token distribution to be more balanced.
+
+To disable MoE load balancing, omit the whole `load_balancer` section. EPLB is enabled by the presence of `load_balancer`, so setting `num_slots` to 0 does not disable it.
 
 #### `layer_updates_per_iter`
 
@@ -166,8 +173,8 @@ Refer to the [Troubleshooting and FAQ](https://github.com/NVIDIA/TensorRT-LLM/bl
 ## References
 
 To understand more details on wide EP and the optimizations we've added, refer to the technical blog series: Scaling Expert Parallelism in TensorRT-LLM
-  - [Part 1: Design and Implementation of Large-scale EP](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
-  - [Part 2: Performance Status and Optimization](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md)
+  - [Part 1: Design and Implementation of Large-scale EP](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
+  - [Part 2: Performance Status and Optimization](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md)
   - [Part 3: Pushing the Performance Boundary](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md)
 
 To review how wide EP helps with Blackwell's leading inference benchmarks, also read these recent blog posts:
