@@ -206,6 +206,7 @@ def test_flashinfer_context_fallback_scope(
     assert generation_supported, generation_reason
     assert generation_reason == ""
 
+
 @pytest.mark.parametrize("kv_cache_dtype", [DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize(
     "dtype,sm_version",
