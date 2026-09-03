@@ -6679,7 +6679,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // so the answer is reportable to the DLFW team as it stands. It runs no
     // tests and needs no GPU or wheel -- see the script header. On-demand only:
     // it is a diagnostic, not a gate.
-    mpiHostnameProbeSpec = createKubernetesPodConfig(DLFW_IMAGE, "build")
+    // Pod type "cpu", not "build": renaming the pod needs CAP_SYS_ADMIN, which
+    // only the tester pods add (see createKubernetesPodConfig), and without it
+    // every variant after the first is skipped and the run says nothing beyond
+    // what the pod happened to be named. It is the same pod type the failure was
+    // first seen on, and still costs no GPU.
+    mpiHostnameProbeSpec = createKubernetesPodConfig(DLFW_IMAGE, "cpu")
     def mpiHostnameProbeStageName = "CPU-OnDemand-MPIHostnameProbe"
     mpiHostnameProbeConfigs = [
         (mpiHostnameProbeStageName): [mpiHostnameProbeSpec, {
