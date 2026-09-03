@@ -7823,7 +7823,13 @@ class PyTorchModelEngine(ModelEngine):
         # capture the sampling kernels are recorded as part of this graph. The
         # hook is a no-op unless the sampler staged a graph-capturable tier for
         # this batch.
-        if self.sample_in_graph_callable is not None:
+        #
+        # Only the last PP rank runs the LM head. The others get a placeholder
+        # that is the right shape but never filled, so a shape check waves it
+        # through and they would sample garbage every step -- discarded, but
+        # not free. _execute_logit_post_processors skips them for this reason.
+        if (self.sample_in_graph_callable is not None
+                and self.mapping.is_last_pp_rank()):
             self.sample_in_graph_callable(outputs)
 
         return outputs
