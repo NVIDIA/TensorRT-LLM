@@ -2162,6 +2162,7 @@ def test_cute_dsl_moe_zero_tokens_short_circuits_autotune(quantized: bool):
         backend = SimpleNamespace(
             has_any_quant=False,
             hidden_size=hidden_size,
+            use_fused_finalize=True,
         )
         output = CuteDslFusedMoE.run_moe_bf16(
             backend,
