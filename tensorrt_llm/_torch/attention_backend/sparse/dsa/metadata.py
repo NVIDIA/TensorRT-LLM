@@ -1797,11 +1797,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.gen_token_repeats_cuda[:num_generations] = verify_lens.to(torch.int64)
         self.row_req_idx_cuda[:num_rows] = req_idx
         self.row_kv_correction_cuda[:num_rows] = kv_correction
-        self.attn_row_req_idx_cuda[:num_rows] = req_idx + num_contexts
-        self.attn_row_kv_correction_cuda[:num_rows] = kv_correction
-        self.req_idx_per_token[num_contexts : num_contexts + num_rows] = (
-            req_idx + num_contexts
-        ).to(self.req_idx_per_token.dtype)
+        attn_row_start = num_contexts
+        attn_row_end = attn_row_start + num_rows
+        self.attn_row_req_idx_cuda[attn_row_start:attn_row_end] = req_idx + num_contexts
+        self.attn_row_kv_correction_cuda[attn_row_start:attn_row_end] = kv_correction
+        token_start = self.num_ctx_tokens
+        token_end = token_start + num_rows
+        self.req_idx_per_token[token_start:token_end] = (req_idx + num_contexts).to(
+            self.req_idx_per_token.dtype
+        )
         self.refresh_token_major_block_table()
         width = min(
             self.indexer_k_cache_block_offsets.shape[-1],

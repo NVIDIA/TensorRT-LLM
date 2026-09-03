@@ -25,13 +25,15 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import DSAtrtllmAttentionM
 class _StubCacheManager:
     """Only the attributes the row expansion reads."""
 
-    def __init__(self, num_pools: int, max_blocks_per_seq: int):
+    def __init__(self, num_pools: int, max_blocks_per_seq: int) -> None:
         self.num_pools = num_pools
         self.num_attention_op_pools = num_pools
         self.max_blocks_per_seq = max_blocks_per_seq
 
 
-def _metadata(*, num_pools, max_blocks, max_seqs, draft=5):
+def _metadata(
+    *, num_pools: int, max_blocks: int, max_seqs: int, draft: int = 5
+) -> DSAtrtllmAttentionMetadata:
     """A metadata object with just enough state to build its own buffers.
 
     Constructed through ``__new__`` rather than the real constructor: the real
@@ -49,11 +51,25 @@ def _metadata(*, num_pools, max_blocks, max_seqs, draft=5):
     meta.num_sms = torch.cuda.get_device_properties(0).multi_processor_count
     meta.runtime_tokens_per_gen_step = 0
     meta.create_expanded_buffers(capture_graph=False)
+    # ``create_buffers_for_indexer`` owns this stable-address repeat vector in
+    # the real runtime.  The focused fixture intentionally bypasses that much
+    # larger initializer, so provide the one buffer the device-layout path
+    # consumes explicitly.
+    meta.gen_token_repeats_cuda = torch.empty(
+        max_seqs, dtype=torch.int64, device="cuda"
+    )
     meta.prompt_lens_cpu = torch.zeros(max_seqs, dtype=torch.int32)
     return meta
 
 
-def _expand(meta, *, num_contexts, row_req_idx, num_seqs, block_offsets):
+def _expand(
+    meta: DSAtrtllmAttentionMetadata,
+    *,
+    num_contexts: int,
+    row_req_idx: list[int],
+    num_seqs: int,
+    block_offsets: torch.Tensor,
+) -> int:
     """Drive the private expansion with an explicit row->request map."""
     ngt = len(row_req_idx)
     meta.num_contexts = num_contexts
@@ -69,7 +85,7 @@ def _expand(meta, *, num_contexts, row_req_idx, num_seqs, block_offsets):
 
 
 @pytest.mark.parametrize("num_pools", [1, 2])
-def test_row_block_table_matches_op_layout(num_pools):
+def test_row_block_table_matches_op_layout(num_pools: int) -> None:
     """The expanded table keeps the op's rank, axis order and pool/KV axes."""
     torch.cuda.init()
     max_blocks, max_seqs = 8, 4
@@ -99,7 +115,7 @@ def test_row_block_table_matches_op_layout(num_pools):
         torch.testing.assert_close(got[:, row], src[:, req])
 
 
-def test_row_indices_stay_in_bounds_of_the_sequence_axis():
+def test_row_indices_stay_in_bounds_of_the_sequence_axis() -> None:
     """A request id must index num_seqs, never a shorter axis.
 
     This is the assertion the device-side gather was making. Checking it here
@@ -118,7 +134,7 @@ def test_row_indices_stay_in_bounds_of_the_sequence_axis():
     )
 
 
-def test_context_rows_precede_generation_rows():
+def test_context_rows_precede_generation_rows() -> None:
     """Contexts keep row 0..nc-1 so the ops' generation offset still lands."""
     torch.cuda.init()
     meta = _metadata(num_pools=1, max_blocks=8, max_seqs=6)
@@ -137,7 +153,56 @@ def test_context_rows_precede_generation_rows():
     assert meta.attn_row_prompt_lens_cpu[nc:rows].tolist() == [1, 1, 1]
 
 
-def test_every_runtime_view_shares_the_row_count():
+def test_device_layout_preserves_mixed_context_row_and_token_prefixes() -> None:
+    """Device-selected generation windows start after both context prefixes."""
+    torch.cuda.init()
+    meta = _metadata(num_pools=1, max_blocks=8, max_seqs=4)
+    block_offsets = torch.arange(1 * 4 * 2 * 8, dtype=torch.int32, device="cuda").reshape(
+        1, 4, 2, 8
+    )
+    rows = _expand(
+        meta,
+        num_contexts=2,
+        row_req_idx=[0, 1, 1],
+        num_seqs=4,
+        block_offsets=block_offsets,
+    )
+    assert rows == 5
+
+    meta.num_generations = 2
+    meta._num_ctx_tokens = 5
+    meta.seq_lens = torch.tensor([2, 3, 1, 2], dtype=torch.int32)
+    meta._seq_lens_cuda = meta.seq_lens.to(device="cuda")
+    meta.req_idx_per_token = torch.full((32,), -1, dtype=torch.int32, device="cuda")
+    context_token_requests = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32, device="cuda")
+    meta.req_idx_per_token[:5].copy_(context_token_requests)
+    context_row_requests = torch.tensor([0, 1], dtype=torch.long, device="cuda")
+    context_row_corrections = torch.tensor([10, 20], dtype=torch.int32, device="cuda")
+    meta.attn_row_req_idx_cuda[:2].copy_(context_row_requests)
+    meta.attn_row_kv_correction_cuda[:2].copy_(context_row_corrections)
+    meta.indexer_k_cache_block_offsets = torch.arange(
+        4 * 8, dtype=torch.int32, device="cuda"
+    ).reshape(4, 8)
+
+    meta.apply_device_ragged_layout(
+        verify_lens=torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
+        req_idx=torch.tensor([0, 1, 1], dtype=torch.long, device="cuda"),
+        kv_correction=torch.tensor([-2, -1, 0], dtype=torch.int32, device="cuda"),
+    )
+
+    assert torch.equal(meta.attn_row_req_idx_cuda[:5], torch.tensor([0, 1, 2, 3, 3], device="cuda"))
+    assert torch.equal(
+        meta.attn_row_kv_correction_cuda[:5],
+        torch.tensor([10, 20, -2, -1, 0], dtype=torch.int32, device="cuda"),
+    )
+    assert torch.equal(meta.req_idx_per_token[:5], context_token_requests)
+    assert torch.equal(
+        meta.req_idx_per_token[5:8],
+        torch.tensor([2, 3, 3], dtype=torch.int32, device="cuda"),
+    )
+
+
+def test_every_runtime_view_shares_the_row_count() -> None:
     """All views the op reads must agree on batch_size, which is the row count.
 
     ``TrtllmAttention.forward`` asserts this directly, and the C++ op indexes

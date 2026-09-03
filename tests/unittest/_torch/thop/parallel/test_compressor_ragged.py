@@ -25,7 +25,6 @@ independent statement of what "correct" means here.
 """
 
 import os
-from typing import List, Optional
 
 import pytest
 import torch
@@ -84,13 +83,14 @@ class _CompressorCase:
 
     def __init__(
         self,
-        kv_lens: List[int],
-        new_tokens: List[int],
+        kv_lens: list[int],
+        new_tokens: list[int],
         device: torch.device,
         dtype: torch.dtype,
         seed: int = 0,
-    ):
-        assert len(kv_lens) == len(new_tokens)
+    ) -> None:
+        if len(kv_lens) != len(new_tokens):
+            raise ValueError("kv_lens and new_tokens must have the same length")
         self.batch_size = len(kv_lens)
         self.kv_lens = list(kv_lens)
         self.new_tokens = list(new_tokens)
@@ -150,7 +150,9 @@ class _CompressorCase:
 
         self.kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device=device)
 
-    def run(self, next_n: int, new_tokens_per_seq: Optional[torch.Tensor]) -> torch.Tensor:
+    def run(
+        self, next_n: int, new_tokens_per_seq: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         paged_kv = self.paged_kv.clone()
         paged_score = self.paged_score.clone()
         # Filled, not zeroed: a kernel that skips an output row would otherwise
@@ -179,7 +181,7 @@ class _CompressorCase:
             next_n,
             new_tokens_per_seq,
         )
-        return output
+        return output, paged_kv, paged_score
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -195,7 +197,9 @@ class _CompressorCase:
         ([255, 258, 261, 1023], 4),
     ],
 )
-def test_uniform_new_tokens_matches_none(kv_lens: List[int], next_n: int, dtype: torch.dtype):
+def test_uniform_new_tokens_matches_none(
+    kv_lens: list[int], next_n: int, dtype: torch.dtype
+) -> None:
     """Filling ``new_tokens_per_seq`` uniformly must equal passing None.
 
     This is the differential that licenses the optional argument. If it fails,
@@ -210,19 +214,25 @@ def test_uniform_new_tokens_matches_none(kv_lens: List[int], next_n: int, dtype:
     uniform_vector = torch.tensor(new_tokens, dtype=torch.int32, device=device)
     ragged = case.run(next_n, uniform_vector)
 
-    assert not torch.isnan(reference).any(), (
+    reference_output, reference_kv, reference_score = reference
+    ragged_output, ragged_kv, ragged_score = ragged
+    assert not torch.isnan(reference_output[: case.total_outputs]).any(), (
         "reference call left output rows unwritten; the test's cu_kv_comp does "
         "not match what the kernel produces"
     )
-    assert torch.equal(reference, ragged), (
+    assert torch.equal(
+        reference_output[: case.total_outputs], ragged_output[: case.total_outputs]
+    ), (
         "passing a uniformly-filled new_tokens_per_seq changed the result; the "
         "ragged branch is not a strict generalization of the uniform one. Max "
-        f"abs diff: {(reference.float() - ragged.float()).abs().max().item()}"
+        f"abs diff: {(reference_output.float() - ragged_output.float()).abs().max().item()}"
     )
+    assert torch.equal(reference_kv, ragged_kv)
+    assert torch.equal(reference_score, ragged_score)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_ragged_new_tokens_matches_per_request_uniform(dtype: torch.dtype):
+def test_ragged_new_tokens_matches_per_request_uniform(dtype: torch.dtype) -> None:
     """Genuinely differing counts, checked against single-request uniform calls.
 
     The test above cannot catch a kernel that ignores ``new_tokens_per_seq``
@@ -237,7 +247,9 @@ def test_ragged_new_tokens_matches_per_request_uniform(dtype: torch.dtype):
     next_n = max(new_tokens)
 
     batched = _CompressorCase(kv_lens, new_tokens, device, dtype, seed=99)
-    ragged_out = batched.run(next_n, torch.tensor(new_tokens, dtype=torch.int32, device=device))
+    ragged_out, ragged_kv, ragged_score = batched.run(
+        next_n, torch.tensor(new_tokens, dtype=torch.int32, device=device)
+    )
     assert not torch.isnan(ragged_out).any(), "ragged call left output rows unwritten"
 
     cu_kv_comp = batched.cu_kv_comp.tolist()
@@ -256,7 +268,7 @@ def test_ragged_new_tokens_matches_per_request_uniform(dtype: torch.dtype):
         single.paged_kv = batched.paged_kv[block_start : block_start + num_blocks].clone()
         single.paged_score = batched.paged_score[block_start : block_start + num_blocks].clone()
 
-        expected = single.run(count, None)
+        expected, expected_kv, expected_score = single.run(count, None)
         start, end = cu_kv_comp[index], cu_kv_comp[index + 1]
         actual = ragged_out[start:end]
         assert torch.equal(expected, actual), (
@@ -264,3 +276,38 @@ def test_ragged_new_tokens_matches_per_request_uniform(dtype: torch.dtype):
             f"between the ragged batch and a uniform batch of one. Max abs "
             f"diff: {(expected.float() - actual.float()).abs().max().item()}"
         )
+        assert torch.equal(expected_kv, ragged_kv[block_start : block_start + num_blocks])
+        assert torch.equal(expected_score, ragged_score[block_start : block_start + num_blocks])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_ragged_append_without_output_updates_paged_state(dtype: torch.dtype) -> None:
+    """A request crossing no compression boundary still updates paged state."""
+    device = torch.device("cuda")
+    kv_lens = [257, 260]
+    new_tokens = [1, 4]
+    batched = _CompressorCase(kv_lens, new_tokens, device, dtype, seed=7)
+
+    ragged_out, ragged_kv, ragged_score = batched.run(
+        max(new_tokens), torch.tensor(new_tokens, dtype=torch.int32, device=device)
+    )
+    assert batched.cu_kv_comp.tolist() == [0, 0, 1]
+    assert not torch.isnan(ragged_out[:1]).any()
+
+    for index, (kv_len, count) in enumerate(zip(kv_lens, new_tokens)):
+        single = _CompressorCase([kv_len], [count], device, dtype, seed=7)
+        token_start = batched.cu_seq_lens[index].item()
+        single.kv_score = batched.kv_score[token_start : token_start + count]
+        single.ape = batched.ape
+        block_row = batched.block_table[index : index + 1]
+        block_start = int(block_row.min().item())
+        num_blocks = block_row.shape[1]
+        single.block_table = block_row - block_start
+        single.paged_kv = batched.paged_kv[block_start : block_start + num_blocks].clone()
+        single.paged_score = batched.paged_score[block_start : block_start + num_blocks].clone()
+
+        expected_out, expected_kv, expected_score = single.run(count, None)
+        start, end = batched.cu_kv_comp[index : index + 2].tolist()
+        assert torch.equal(expected_out[: end - start], ragged_out[start:end])
+        assert torch.equal(expected_kv, ragged_kv[block_start : block_start + num_blocks])
+        assert torch.equal(expected_score, ragged_score[block_start : block_start + num_blocks])
