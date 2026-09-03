@@ -554,7 +554,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                 def bareTestName = isolateTestName.split(/ TIMEOUT | ISOLATION/)[0]
                 def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
                 def isTestUnfinished = fileExists(unfinishedTestFile) &&
-                    sh(script: "grep -qF -- '${bareTestName}' ${unfinishedTestFile}", returnStatus: true) == 0
+                    sh(script: "grep -Fxq -- '${bareTestName}' ${unfinishedTestFile}", returnStatus: true) == 0
                 if (isTestUnfinished) {
                     // Record this crash as a JUnit <testcase> like the regular-test
                     // path does. hasUnrerunFailure stays untouched here: it drives
