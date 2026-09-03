@@ -355,6 +355,21 @@ def _prompt_output(
 _TERMINAL_FINISH_REASONS = frozenset({"stop", "length", "cancelled", "timeout"})
 
 
+def _aligned_logprobs(output: Any) -> Sequence[Any]:
+    """Logprobs index-aligned with ``output.token_ids``.
+
+    On a generation_only request the engine tolerates being one logprob short --
+    the context worker did not transfer the first token's -- and only logs a
+    warning. Slicing positionally against that would attribute every logprob,
+    rank and candidate set to the wrong token, so pad the missing head instead.
+    """
+    logprobs = output.logprobs or []
+    shortfall = len(output.token_ids or []) - len(logprobs)
+    if shortfall > 0 and logprobs:
+        return [None] * shortfall + list(logprobs)
+    return logprobs
+
+
 def _finish_event(output: Any, end_id: int | None) -> generation_pb2.GenerationFinished:
     reason_map = {
         "stop": generation_pb2.FINISH_REASON_STOP,
@@ -752,7 +767,7 @@ def _format_result(
         args.observed_text_lengths[output.index] = len(all_text)
 
         if delta_token_ids or delta_text:
-            logprobs = output.logprobs or []
+            logprobs = _aligned_logprobs(output)
             delta_logprobs = logprobs[sent_token_count:]
             token_infos = _token_infos(
                 tokenizer, delta_token_ids, delta_logprobs, sampling_params.logprobs or 0
