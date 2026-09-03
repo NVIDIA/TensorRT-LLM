@@ -209,11 +209,11 @@ __global__ void fusedDiTQKNormRopeKernel(__nv_bfloat16* qkv, // [num_tokens, tot
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Static-E4M3 output variant for FLUX. Each warp handles one Q, K, or V head
-// for one token. Q/K execute the same fp32 norm + RoPE math as the in-place
-// kernel, round once to BF16 at the existing storage boundary, then apply the
-// calibrated per-tensor scale while converting to E4M3. V is converted
-// directly from the packed BF16 projection output.
+//
+// Per-head QK Norm + RoPE + static E4M3 quantization kernel (FLUX)
+//
+// Each warp processes one Q, K, or V head of one token.
+//
 template <int head_dim, bool interleave>
 __global__ void fusedDiTQKNormRopeQuantFp8Kernel(__nv_bfloat16 const* qkv, __nv_fp8_e4m3* q_out, __nv_fp8_e4m3* k_out,
     __nv_fp8_e4m3* v_out, int const num_heads_q, int const num_heads_k, int const num_heads_v, float const eps,

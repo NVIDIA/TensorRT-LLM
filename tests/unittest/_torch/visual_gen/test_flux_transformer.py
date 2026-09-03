@@ -24,7 +24,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
 # FLUX.1 dev config (12B params)
 FLUX1_CONFIG = {
@@ -380,103 +380,6 @@ def test_flux2_mlp_fp4_guard_requires_static_output_quant(monkeypatch):
     down_proj.pre_quant_scale = None
     down_proj.force_dynamic_quantization = True
     assert not attn._can_project_mlp_out_from_fp4()
-
-
-@pytest.mark.parametrize(
-    ("mode", "dual_enabled", "single_enabled"),
-    [
-        ("0", False, False),
-        ("1", True, True),
-        ("single", False, True),
-        ("dual", True, False),
-        ("full", True, True),
-        ("SINGLE", False, True),
-    ],
-)
-def test_flux1_fused_mlp_gelu_mode_controls_block_types(
-    monkeypatch, mode, dual_enabled, single_enabled
-):
-    from tensorrt_llm._torch.visual_gen.models.flux import transformer_flux
-
-    monkeypatch.setenv("TRTLLM_FLUX_FUSED_MLP_GELU", mode)
-    assert transformer_flux._fused_mlp_gelu_enabled("dual") is dual_enabled
-    assert transformer_flux._fused_mlp_gelu_enabled("single") is single_enabled
-
-
-def test_flux1_fused_mlp_gelu_mode_rejects_invalid_value(monkeypatch):
-    from tensorrt_llm._torch.visual_gen.models.flux import transformer_flux
-
-    monkeypatch.setenv("TRTLLM_FLUX_FUSED_MLP_GELU", "invalid")
-    with pytest.raises(ValueError, match="TRTLLM_FLUX_FUSED_MLP_GELU"):
-        transformer_flux._fused_mlp_gelu_enabled("single")
-
-
-def test_flux1_shared_nvfp4_quantization_is_automatic_for_static_projections():
-    from tensorrt_llm._torch.visual_gen.models.flux import transformer_flux
-
-    input_scale = torch.ones(1)
-    proj_mlp = SimpleNamespace(
-        has_nvfp4_activation_quantization=True,
-        input_scale=input_scale,
-        pre_quant_scale=None,
-        force_dynamic_quantization=False,
-        scaling_vector_size=1,
-    )
-    qkv_proj = SimpleNamespace(
-        has_nvfp4_activation_quantization=True,
-        input_scale=input_scale.clone(),
-        pre_quant_scale=None,
-        force_dynamic_quantization=False,
-        scaling_vector_size=1,
-    )
-    block = SimpleNamespace(
-        proj_mlp=proj_mlp,
-        attn=SimpleNamespace(fuse_qk_norm_rope=True, qkv_proj=qkv_proj),
-        _share_nvfp4_quantize=False,
-    )
-
-    assert transformer_flux.FluxSingleTransformerBlock.configure_shared_nvfp4_quantize(block)
-    assert block._share_nvfp4_quantize
-
-
-def test_flux1_static_e4m3_attention_scales_use_modelopt_amax():
-    from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
-
-    model_config = DiffusionModelConfig(
-        pretrained_config=SimpleNamespace(**FLUX1_CONFIG),
-        quant_config=QuantConfig(),
-        mapping=Mapping(),
-        attention=AttentionConfig(
-            backend="CUTEDSL",
-            quant_attention_config=QuantAttentionConfig(
-                qk_dtype="fp8",
-                v_dtype="fp8",
-                q_block_size=0,
-                k_block_size=0,
-                v_block_size=0,
-            ),
-        ),
-        skip_create_weights_in_init=False,
-    )
-    attn = FluxJointAttention(
-        hidden_size=16,
-        num_attention_heads=2,
-        head_dim=8,
-        bias=False,
-        config=model_config,
-    )
-
-    attn.load_static_e4m3_attention_scales(
-        torch.tensor(8.0, dtype=torch.bfloat16),
-        torch.tensor(14.0, dtype=torch.bfloat16),
-        torch.tensor(28.0, dtype=torch.bfloat16),
-    )
-
-    assert attn.requires_static_e4m3_attention
-    assert attn.static_e4m3_attention_scales_loaded
-    torch.testing.assert_close(attn._static_q_dequant_scale, torch.tensor(8.0 / 448.0))
-    torch.testing.assert_close(attn._static_k_dequant_scale, torch.tensor(14.0 / 448.0))
-    torch.testing.assert_close(attn._static_v_dequant_scale, torch.tensor(28.0 / 448.0))
 
 
 class TestFluxTransformer(unittest.TestCase):

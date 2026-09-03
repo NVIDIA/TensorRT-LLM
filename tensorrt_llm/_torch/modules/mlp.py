@@ -263,13 +263,12 @@ class MLP(nn.Module):
         The runtime quant_method check is applied in forward (quant_method can
         be downgraded after this).
         """
-        if (self.activation is not gelu_tanh
-                or not is_nvfp4_gemm_gelu_fusion_eligible(self.up_proj)):
-            return False, False
-        fp4_ok = (hasattr(torch.ops.trtllm,
-                          "cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell")
-                  and is_static_nvfp4_input_eligible(self.down_proj))
-        return True, fp4_ok
+        bf16_out_ok = (self.activation is gelu_tanh
+                       and is_nvfp4_gemm_gelu_fusion_eligible(self.up_proj))
+        fp4_out_ok = (bf16_out_ok and hasattr(
+            torch.ops.trtllm, "cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell")
+                      and is_static_nvfp4_input_eligible(self.down_proj))
+        return bf16_out_ok, fp4_out_ok
 
     @staticmethod
     def _token_count(x: Union[torch.Tensor, tuple, Fp4QuantizedTensor]) -> int:

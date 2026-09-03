@@ -49,7 +49,7 @@ VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP = os.path.join(
 )
 VISUAL_GEN_OUTPUT_VIDEO = "trtllm_output.mp4"
 
-QuantizationMode = Literal["none", "FP8", "FP8_BLOCK_SCALES", "NVFP4"]
+QuantizationMode = Literal["none", "FP8_BLOCK_SCALES", "NVFP4"]
 QuantizationSource = Literal["dynamic", "static"]
 
 
@@ -76,12 +76,10 @@ class FeatureConfigState:
     cuda_graph: bool = False
 
     def __post_init__(self):
-        if self.quantization == "FP8" and self.quantization_source != "static":
-            raise ValueError("Per-tensor FP8 VisualGen quantization requires a static checkpoint")
         if self.mha_quantize and not (
-            self.quantization in ("FP8", "NVFP4") and self.quantization_source == "static"
+            self.quantization == "NVFP4" and self.quantization_source == "static"
         ):
-            raise ValueError("MHA quantization requires a static FP8 or static NVFP4 checkpoint")
+            raise ValueError("MHA quantization requires a static NVFP4 checkpoint")
 
 
 def _enabled_feature_ids(features):
@@ -90,7 +88,6 @@ def _enabled_feature_ids(features):
     if features.quantization != "none":
         enabled.append(
             {
-                "FP8": "fp8",
                 "FP8_BLOCK_SCALES": "fp8-blockwise",
                 "NVFP4": "nvfp4",
             }[features.quantization]
@@ -200,7 +197,6 @@ def _assert_resolved_single_device_feature_config(
     config = pipeline.pipeline_config
     expected_quant_algo = {
         "none": None,
-        "FP8": QuantAlgo.FP8,
         "FP8_BLOCK_SCALES": QuantAlgo.FP8_BLOCK_SCALES,
         "NVFP4": QuantAlgo.NVFP4,
     }[features.quantization]
@@ -209,7 +205,7 @@ def _assert_resolved_single_device_feature_config(
         expected_quant_algo is not None and features.quantization_source == "dynamic"
     )
     assert config.dynamic_weight_quant is expected_dynamic_quantization
-    if features.quantization in ("FP8", "NVFP4"):
+    if features.quantization == "NVFP4":
         assert config.force_dynamic_quantization is expected_dynamic_quantization
 
     expected_autotune = features.quantization_source != "static"
@@ -264,7 +260,6 @@ def _assert_feature_quantization_installed(pipeline, features):
         return
 
     predicate = {
-        "FP8": lambda module: module.has_fp8_qdq,
         "FP8_BLOCK_SCALES": lambda module: module.has_fp8_block_scales,
         "NVFP4": lambda module: module.has_nvfp4,
     }[features.quantization]
@@ -273,13 +268,9 @@ def _assert_feature_quantization_installed(pipeline, features):
     sample = quantized_linears[0]
     assert getattr(sample, "weight", None) is not None
     assert getattr(sample, "weight_scale", None) is not None
-    if features.quantization in ("FP8", "FP8_BLOCK_SCALES"):
+    if features.quantization == "FP8_BLOCK_SCALES":
         assert sample.weight.dtype == torch.float8_e4m3fn
-        expected_scale_ndim = 0 if features.quantization == "FP8" else 2
-        assert sample.weight_scale.ndim == expected_scale_ndim
-        if features.quantization == "FP8":
-            assert sample.input_scale is not None
-            assert sample.force_dynamic_quantization is False
+        assert sample.weight_scale.ndim == 2
     else:
         assert sample.weight.shape[-1] * 2 == sample.in_features
         assert sample.scaling_vector_size == 16

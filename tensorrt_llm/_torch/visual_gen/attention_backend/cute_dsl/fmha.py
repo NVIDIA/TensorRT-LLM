@@ -190,7 +190,6 @@ class _CacheKey(NamedTuple):
     with_lse: bool
     with_sink: bool
     with_scale_v_channels: bool
-    with_scale_v_tensor: bool
     has_window: bool
     has_skip_softmax: bool
     use_tma_store: bool
@@ -299,15 +298,8 @@ def cute_dsl_fmha_fwd(
             raise ValueError("Block-scaled path (qk_sf_vec != 0) requires q_sf and k_sf tensors.")
         if not q_sf.is_contiguous() or not k_sf.is_contiguous():
             raise ValueError("q_sf and k_sf must be contiguous.")
-        scale_v_tensor = scale_v if isinstance(scale_v, torch.Tensor) else None
-        if scale_v_tensor is not None:
-            # Keep the dynamic tensor-wide V dequantization scale on device. Reading it with
-            # Tensor.item() would synchronize the stream and is forbidden during CUDA Graph capture.
-            scale_v = 1.0
     elif scale_v_channels is not None:
         raise ValueError("scale_v_channels is only supported by MXFP8 and NVFP4 kernels.")
-    else:
-        scale_v_tensor = None
 
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("Q, K, and V must be contiguous before the CuTe DSL launch boundary.")
@@ -357,16 +349,6 @@ def cute_dsl_fmha_fwd(
             raise ValueError("scale_v_channels must be on the same device as V.")
         if not scale_v_channels.is_contiguous():
             raise ValueError("scale_v_channels must be contiguous.")
-    if scale_v_tensor is not None:
-        if scale_v_tensor.numel() != 1:
-            raise ValueError("Tensor-wide scale_v must contain exactly one element.")
-        if scale_v_tensor.dtype != torch.float32:
-            raise ValueError("Tensor-wide scale_v must use torch.float32.")
-        if scale_v_tensor.device != v.device:
-            raise ValueError("Tensor-wide scale_v must be on the same device as V.")
-        if not scale_v_tensor.is_contiguous():
-            raise ValueError("Tensor-wide scale_v must be contiguous.")
-        scale_v_tensor = scale_v_tensor.reshape(1)
 
     q_5d = q.view(batch_size, seq_len_q, num_heads_kv, num_head_groups, qk_storage_dim)
     o_5d = o.view(batch_size, seq_len_q, num_heads_kv, num_head_groups, value_head_dim)
@@ -417,9 +399,6 @@ def cute_dsl_fmha_fwd(
         sf_dtype = cutlass.Float8E8M0FNU if qk_sf_vec == 32 else cutlass.Float8E4M3FN
         q_sf_cute = _to_cute_tensor(q_sf, leading_dim=0, cutlass_element_type=sf_dtype)
         k_sf_cute = _to_cute_tensor(k_sf, leading_dim=0, cutlass_element_type=sf_dtype)
-        scale_v_tensor_cute = (
-            _to_cute_tensor(scale_v_tensor, leading_dim=0) if scale_v_tensor is not None else None
-        )
         scale_v_channels_cute = (
             _to_cute_tensor(scale_v_channels.view(-1), leading_dim=0)
             if scale_v_channels is not None
@@ -428,7 +407,6 @@ def cute_dsl_fmha_fwd(
     else:
         q_sf_cute = None
         k_sf_cute = None
-        scale_v_tensor_cute = None
         scale_v_channels_cute = None
     # lse_4d is (B, S_q, h_kv, h_r) contiguous → h_r is the stride-1 inner dim (index 3).
     lse_cute = (
@@ -476,7 +454,6 @@ def cute_dsl_fmha_fwd(
         with_lse=lse is not None,
         with_sink=False,
         with_scale_v_channels=scale_v_channels is not None,
-        with_scale_v_tensor=scale_v_tensor is not None,
         has_window=has_window,
         has_skip_softmax=use_skip_softmax,
         use_tma_store=True,
@@ -501,7 +478,6 @@ def cute_dsl_fmha_fwd(
             cute_typing.Float32(scale_softmax_log2),
             cute_typing.Float32(scale_softmax),
             cute_typing.Float32(scale_output),
-            scale_v_tensor_cute,
             scale_v_channels_cute,
             skip_threshold_log2,
             ws_left,
@@ -588,10 +564,7 @@ def _quantize_fp8_v(
 
     v_qscale = _FP8_E4M3_MAX / v_bshd.abs().amax().clamp(min=1e-3)
     v_quantized = (v_bshd * v_qscale).to(torch.float8_e4m3fn)
-    # The block-scaled FMHA epilogue consumes this as a device scalar. Keep the quantizer
-    # arithmetic unchanged and only normalize the dequantization scale's launch dtype/shape.
-    v_dequant_scale = v_qscale.reciprocal().to(torch.float32).reshape(1).contiguous()
-    return v_quantized, v_dequant_scale, None
+    return v_quantized, v_qscale.reciprocal(), None
 
 
 def _quantize_blockscaled_one(

@@ -156,10 +156,7 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
         static_cast<int>(num_txt_tokens), interleave, static_cast<int>(tokens_per_batch), cos_seq_per_batch, stream);
 }
 
-// Out-of-place FLUX variant that preserves the fused DiT QK norm + RoPE
-// numerics and folds three calibrated static E4M3 conversions into the same
-// launch. The returned Q/K/V tensors are dense and directly consumable by the
-// CUTEDSL attention backend.
+// Fused FLUX QK norm + RoPE with static per-tensor E4M3 Q/K/V outputs.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_dit_qk_norm_rope_quant_fp8(torch::Tensor const& qkv,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_dim, double eps,
     torch::Tensor const& q_weight, torch::Tensor const& k_weight, c10::optional<torch::Tensor> q_add_weight,
