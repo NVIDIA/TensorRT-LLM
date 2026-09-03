@@ -337,6 +337,18 @@ class MLA(nn.Module):
                 "fuse_qkv_a_proj=True; the separate q_a_proj layout is not "
                 "supported with sparse MLA."
             )
+        if self.sparse_attn_hooks is not None and type(self)._apply_output_gate is not (
+            MLA._apply_output_gate
+        ):
+            # _apply_output_gate is defined against the dense output path, where
+            # attn_output[0] is o_proj's input. Sparse hooks own _create_outputs
+            # and _project_output, so the tensor's rank, shape and projection
+            # differ and the gate would not compose.
+            raise NotImplementedError(
+                f"{type(self).__name__} overrides _apply_output_gate, which is "
+                "only defined for the dense MLA output path; it cannot be "
+                "combined with sparse MLA hooks."
+            )
 
         # Fold the residual-less q_a_layernorm -> q_b_proj NVFP4 input
         # quantization into one fused RMSNorm + FP4-quantize kernel. Resolve
@@ -1755,6 +1767,27 @@ class MLA(nn.Module):
                 latent_cache_gen,
             )
 
+    def _apply_output_gate(
+        self,
+        hidden_states: torch.Tensor,
+        attn_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Transform the attention output before the output projection.
+
+        ``attn_output`` is the row-parallel ``o_proj``'s input and
+        ``hidden_states`` is the unquantized module input, so an override that
+        derives a gate from ``hidden_states`` must match ``o_proj``'s input
+        sharding. Runs on both the ``register_to_config`` and eager branches,
+        and ahead of the helix-CP reduce-scatter.
+
+        Dense output path only: ``__init__`` rejects an override combined with
+        sparse MLA hooks, which replace ``o_proj`` and may hand
+        ``attn_output[0]`` on in a different rank and layout.
+
+        The base is the identity.
+        """
+        return attn_output
+
     def _project_output(
         self,
         attn_output: list[torch.Tensor],
@@ -1808,14 +1841,17 @@ class MLA(nn.Module):
             hidden_states, attn_metadata, self.mapping, self.layer_idx
         )
 
+        # Unquantized view of the module input, used by create_mla_outputs and
+        # by _apply_output_gate.
+        output_hidden_states = hidden_states
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            assert hidden_states.unquantized_hidden_states is not None, (
+                "MLA.forward received an Fp4QuantizedTensor without a "
+                "unquantized_hidden_states view"
+            )
+            output_hidden_states = hidden_states.unquantized_hidden_states
+
         if self.register_to_config:
-            output_hidden_states = hidden_states
-            if isinstance(hidden_states, Fp4QuantizedTensor):
-                assert hidden_states.unquantized_hidden_states is not None, (
-                    "MLA.forward received an Fp4QuantizedTensor without a "
-                    "unquantized_hidden_states view"
-                )
-                output_hidden_states = hidden_states.unquantized_hidden_states
             attn_output = [
                 torch.ops.trtllm.create_mla_outputs(output_hidden_states, self.layer_idx_str)
             ]
@@ -1835,6 +1871,7 @@ class MLA(nn.Module):
                 latent_cache_gen=latent_cache_gen,
             )
 
+        attn_output[0] = self._apply_output_gate(output_hidden_states, attn_output[0])
         return self._project_output(attn_output, position_ids, attn_metadata, all_reduce_params)
 
     def resmooth_parameters(self, module_weight, module_weight_scale, recipe=(1, 128, 128)):
