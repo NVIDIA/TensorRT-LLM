@@ -57,6 +57,7 @@ agent-team --clean \
 | `--clean` | off | Wipe the workspace checkpoint and workflow-managed files (`.agent_team_state.json`, `plan.md`, `acceptance-criteria.md`, `progress.yaml`, `status.md`) and start fresh. Without this flag the workflow auto-resumes from the checkpoint when one is present. |
 | `--plan` | unset | Pre-supply `plan.md` (text or file path). Combined with `--acceptance-criteria` it skips the plan phase entirely; alone it still runs the plan phase so the PlanDrafter generates the missing `acceptance-criteria.md`. Ignored when resuming from a checkpoint — pass `--clean` to start fresh. |
 | `--acceptance-criteria` | unset | Pre-supply `acceptance-criteria.md` (text or file path). Mirrors `--plan`: combined with `--plan` skips the plan phase; alone runs the plan phase to generate `plan.md`. |
+| `--no-mcp-tools` | off | Disable the workflow's in-process MCP tools for **every** role, on both the claude-code and codex backends. Reads are replaced by context inlined into each prompt; `append_*_progress` / `update_status` are replaced by a per-turn handoff file the orchestrator parses back into `progress.yaml`. `ask_human` is unavailable, so `--plan-human-review` / `--build-human-review` are rejected. Use on machines where a dynamically configured MCP server is blocked (e.g. an enterprise `managed-mcp.json` lockdown). See [No-MCP mode](#no-mcp-mode---no-mcp-tools). |
 | `--feedback` | unset | Append a human-feedback entry to `progress.yaml`'s `human_feedback` list before the next iteration runs. Value is either the literal feedback text or a path to a file containing it. Intended for resume scenarios: stop the workflow (Ctrl-C), re-run with `--feedback "..."`, and the build-phase agents (coder, reviewer, qa) pick it up via `read_human_feedback` on their next turn. Each invocation appends — prior entries are preserved. |
 
 ## Workflow
@@ -150,6 +151,7 @@ only reference paths, never embed content.
 | `progress.yaml` | every agent (append-only); orchestrator on `--feedback` | every agent (via `read_latest_progress`); build-phase agents also via `read_human_feedback` | Structured audit log split into top-level `plan_stage`, `build_stage`, and `human_feedback` lists. Stage entries carry `decision` / `weighted_score` so the orchestrator never has to regex-scrape agent prose. `human_feedback` entries hold user-authored notes injected via `--feedback`. |
 | `status.md` | Coder, Reviewer (overwrite each turn) | Coder, Reviewer | Short rolling scratchpad: current state, execution path, what was tried, what worked, what didn't, pointers for the next step. PlanDrafter / PlanReviewer / QA do not see it. |
 | `.agent_team_state.json` | orchestrator | orchestrator (on resume) | Checkpoint of `stage` + iteration indices. Re-running the workflow against the workspace auto-resumes from it; pass `--clean` to wipe it. |
+| `.turn/<role>.yaml` | the acting agent | orchestrator | `--no-mcp-tools` only. Per-turn handoff file carrying the `summary` / `decision` / `weighted_score` the `append_*_progress` MCP tool would have carried. Deleted before every attempt and consumed immediately after, so it is scratch space, not state. |
 
 ## MCP tools
 
@@ -187,6 +189,43 @@ integrate the reply before finishing its turn. Without the flag the
 tool is not registered and the Coder must drive the iteration to a
 build/run/test result, deviate from the plan with documented
 evidence, or surface a hard blocker in its `summary` instead.
+
+### No-MCP mode (`--no-mcp-tools`)
+
+Some environments refuse to let the workflow register the tools above:
+an enterprise-managed MCP config makes Claude Code abort when the SDK
+configures an MCP server of its own, and a hardened runner may block
+dynamic tool registration outright. `--no-mcp-tools` runs the workflow
+without them. It is a single switch that applies to **every** role
+regardless of backend — the claude-code roles and the codex-backed
+PlanDrafter / Reviewer alike — so no dynamically configured server is
+ever created.
+
+Each role then runs with `tools=None`, no required-tool stop hooks, and
+no `ask_human`; only the backend's own built-in tools remain (reading,
+editing, and running commands are not MCP servers, so they are
+unaffected). The coordination the tools provided is re-plumbed in
+[`mcpless.py`](mcpless.py):
+
+- **Reads** — the orchestrator gathers the same slices the `read_*`
+  tools returned (recent progress for the role's phase, `human_feedback`,
+  and `status.md` for Coder / Reviewer) and inlines them into the prompt
+  under a `CONTEXT` block. Agents are told not to go read `progress.yaml`
+  or `status.md` themselves.
+- **Writes** — a protocol preamble prepended to each turn's prompt tells
+  the agent to end its turn by writing `.turn/<role>.yaml` with exactly
+  the keys its `append_*_progress` tool used to take. The instruction
+  names no backend-specific tool as mandatory, since `Write` exists only
+  on claude-code. The orchestrator parses and validates that file, then
+  records it into `progress.yaml` with the iteration, agent, and
+  timestamp stamped server-side. Coder and Reviewer are additionally
+  told to overwrite `status.md` in place of `update_status`.
+
+A missing or invalid handoff gets one corrective retry before the turn
+raises `HandoffError`. Because `ask_human` is gone, `--plan-human-review`
+and `--build-human-review` are rejected at construction time rather than
+silently ignored, and `HUMAN_APPROVED` is dropped from the PlanDrafter's
+accepted decisions.
 
 ### Injecting mid-run feedback
 

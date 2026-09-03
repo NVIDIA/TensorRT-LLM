@@ -1612,3 +1612,55 @@ def test_multimodal_text_first_in_planner_only():
         "multimodal text-first guidance leaked into the Coder prompt; "
         "it is PlanDrafter-only planning guidance"
     )
+
+
+def _capture_workflow_kwargs(monkeypatch) -> dict:
+    """Stub ``AgentTeamWorkflow`` in the agent-team CLI and capture its kwargs.
+
+    Lets a modeling-bringup CLI test assert on what the wrapper ultimately
+    hands the workflow, exercising the whole
+    ``modeling_bringup.main -> _team_main -> AgentTeamWorkflow`` chain
+    instead of just the argv forwarding.
+    """
+    from agent_flow.workflows.agent_team import cli as agent_team_cli
+
+    captured: dict = {}
+
+    class _StubWorkflow:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def run(self, task):
+            captured["task"] = task
+
+    monkeypatch.setattr(agent_team_cli, "AgentTeamWorkflow", _StubWorkflow)
+    return captured
+
+
+def test_modeling_bringup_cli_defaults_to_in_process_tools(tmp_path, monkeypatch):
+    task_path = _write_task_yaml(tmp_path, _valid_task_payload(tmp_path))
+    captured = _capture_workflow_kwargs(monkeypatch)
+
+    _modeling_bringup_cli_module.main(
+        ["--task", str(task_path), "--workspace", str(tmp_path / "work")]
+    )
+
+    assert captured["use_in_process_tools"] is True
+
+
+def test_modeling_bringup_cli_forwards_no_mcp_tools(tmp_path, monkeypatch):
+    """``--no-mcp-tools`` must reach ``AgentTeamWorkflow`` through the wrapper."""
+    task_path = _write_task_yaml(tmp_path, _valid_task_payload(tmp_path))
+    captured = _capture_workflow_kwargs(monkeypatch)
+
+    _modeling_bringup_cli_module.main(
+        ["--task", str(task_path), "--workspace", str(tmp_path / "work"), "--no-mcp-tools"]
+    )
+
+    assert captured["use_in_process_tools"] is False
