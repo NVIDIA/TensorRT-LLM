@@ -8,6 +8,7 @@ Run:
 """
 
 import json
+from io import BytesIO
 
 import numpy as np
 import PIL.Image
@@ -246,6 +247,24 @@ class TestActionReferenceSize:
             image=PIL.Image.new("RGB", (256, 128)),
             video=None,
         ) == (128, 256)
+
+    def test_accepts_uploaded_image_bytes(self):
+        image_bytes = BytesIO()
+        PIL.Image.new("RGB", (256, 128), "blue").save(image_bytes, format="PNG")
+
+        assert action_reference_size(
+            action_mode="policy",
+            image=image_bytes.getvalue(),
+            video=None,
+        ) == (128, 256)
+
+    def test_rejects_unreadable_uploaded_image_bytes(self):
+        with pytest.raises(ValueError, match="image reference could not be decoded"):
+            action_reference_size(
+                action_mode="policy",
+                image=b"not-an-image",
+                video=None,
+            )
 
     def test_missing_source_raises(self):
         with pytest.raises(ValueError, match="requires an image or video"):
