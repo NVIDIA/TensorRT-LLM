@@ -756,6 +756,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 "in_channels": in_channels,
                 "out_channels": out_channels,
                 "num_layers": num_layers,
+                "expand_timesteps": getattr(config, "expand_timesteps", False),
             },
         )()
 
@@ -921,6 +922,10 @@ class WanTransformer3DModel(BaseDiffusionModel):
         else:
             # batch_size, 6, hidden_size
             temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))
+            if self.config.expand_timesteps:
+                # x is already sequence-sharded; uniform T2V timesteps only need
+                # a local broadcast view for fused AdaLN.
+                temb_proj = temb_proj.unsqueeze(1).expand(-1, x.shape[1], -1, -1)
 
         # I2V: Concatenate image and text embeddings if image embeddings are provided
         if encoder_hidden_states_image is not None:

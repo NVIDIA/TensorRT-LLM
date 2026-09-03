@@ -37,7 +37,7 @@ def test_python_runtime_rejects_non_nixl_backend_at_creation(backend: str) -> No
     backend raises at creation instead of being silently rerouted."""
     config = CacheTransceiverConfig(backend=backend, transceiver_runtime="PYTHON")
 
-    with pytest.raises(ValueError, match="only supports the NIXL backend"):
+    with pytest.raises(ValueError, match="only supports NIXL backend"):
         transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
 
 

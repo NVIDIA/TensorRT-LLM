@@ -25,7 +25,7 @@ Tier 0/1 (no LLM_MODELS_ROOT needed, GPU only):
 
 Tier 2 (LLM_MODELS_ROOT gated, real tokenizer/processor):
   - ``TestGemma4InputProcessor`` — image/audio/video pre-processing.
-  - ``TestGemma4MultimodalE2E`` — full LLM+vision generate parity via the
+  - ``TestGemma4MultimodalE2E`` — full LLM+vision context/decode execution via the
     shared ``TestModelingMultimodal`` skeleton (image / multi-image modalities).
 
 Audio-side tests (``TestGemma4InputProcessor.test_audio_*``) are intentionally
@@ -38,6 +38,7 @@ import os
 import unittest
 from copy import deepcopy
 from typing import Dict, List, Type
+from unittest import mock
 
 import pytest
 import torch
@@ -299,7 +300,7 @@ def _build_trt_vision_tower(vision_cfg, dtype=torch.float32, device="cuda"):
     )
     tower = Gemma4VisionModel(mc).to(device).to(dtype).eval()
     # The engine builds the encoder AttentionMetadata after model load via
-    # `_set_up_multimodal_encoder_attn_metadata`; standalone tests must mirror
+    # `setup_mm_encoder_attn_metadata`; standalone tests must mirror
     # that before the encoder forward.
     tower.setup_attn_metadata(max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
     return tower
@@ -812,7 +813,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         mc = ModelConfig(
             pretrained_config=config,
             mapping=Mapping(world_size=1, tp_size=1, rank=0),
-            attn_backend="FLASHINFER",
+            attn_backend="TRTLLM",
         )
         model = Gemma4ForConditionalGeneration(mc)
 
@@ -824,6 +825,32 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         # Regression guard for Option B: the vision tower must be the native
         # TRT-LLM class, not ``transformers.AutoModel`` output.
         self.assertIsInstance(model.vision_tower, Gemma4VisionModel)
+
+    def test_text_submodel_preserves_explicit_attention_backend(self):
+        """The text submodel honors explicit backend overrides."""
+        text_config = Gemma4TextConfig(**SMALL_TEXT_CONFIG)
+        vision_config = Gemma4VisionConfig(**SMALL_VISION_CONFIG)
+        config = Gemma4Config(
+            text_config=text_config,
+            vision_config=vision_config,
+            audio_config=None,
+        )
+
+        for backend in ("FLASHINFER", "TRTLLM"):
+            model_config = ModelConfig(
+                pretrained_config=config,
+                mapping=Mapping(world_size=1, tp_size=1, rank=0),
+                attn_backend=backend,
+            )
+            text_model_config = Gemma4ForConditionalGeneration.get_sub_model_config(
+                model_config, "text_config"
+            )
+            vision_model_config = Gemma4ForConditionalGeneration.get_sub_model_config(
+                model_config, "vision_config"
+            )
+
+            self.assertEqual(text_model_config.attn_backend, backend)
+            self.assertEqual(vision_model_config.attn_backend, "TRTLLM")
 
     def test_encoder_cache_reuses_image_embedding_across_requests(self):
         """Persistent cache reuse applies to the shared dense/MoE Gemma4 wrapper."""
@@ -1089,7 +1116,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         mc = ModelConfig(
             pretrained_config=config,
             mapping=Mapping(world_size=1, tp_size=1, rank=0),
-            attn_backend="FLASHINFER",
+            attn_backend="TRTLLM",
         )
         model = Gemma4ForConditionalGeneration(mc)
 
@@ -1105,9 +1132,18 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
 
 def _get_model_path():
     llm_models_root = os.environ.get("LLM_MODELS_ROOT")
-    if llm_models_root:
-        return os.path.join(llm_models_root, "gemma4/gemma-4-26B-A4B-it")
-    return None
+    if not llm_models_root:
+        return None
+
+    model_subdirs = (
+        "gemma/gemma-4-26B-A4B-it",
+        "gemma4/gemma-4-26B-A4B-it",
+    )
+    for model_subdir in model_subdirs:
+        model_path = os.path.join(llm_models_root, model_subdir)
+        if os.path.isfile(os.path.join(model_path, "config.json")):
+            return model_path
+    return os.path.join(llm_models_root, model_subdirs[0])
 
 
 MODEL_26B_PATH = _get_model_path()
@@ -1422,19 +1458,13 @@ class TestGemma4InputProcessor(unittest.TestCase):
         """Video input bypasses HF Gemma4Processor and yields per-frame
         pixel_values + expanded video soft tokens in input_ids.
         """
-        import numpy as np
-        from PIL import Image
-
         from tensorrt_llm.sampling_params import SamplingParams
 
         proc = self._make_processor()
         if not hasattr(proc._processor, "video_processor"):
             self.skipTest("Processor has no video_processor")
 
-        frames = [
-            Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
-            for _ in range(32)
-        ]
+        frames = [torch.randint(0, 256, (3, 180, 320), dtype=torch.uint8) for _ in range(40)]
         VideoData = type("VideoData", (), {})
         vd = VideoData()
         vd.frames = frames
@@ -1456,6 +1486,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
             "multi_modal_data": {"video": [vd]},
         }
         sp = SamplingParams(max_tokens=10)
+        predicted_video_tokens = proc.get_num_tokens_per_video(video=frames)
         input_ids, mm_data = proc(inputs, sp)
 
         self.assertIsNotNone(mm_data)
@@ -1463,15 +1494,48 @@ class TestGemma4InputProcessor(unittest.TestCase):
         video_data = mm_data["multimodal_data"]["video"]
         self.assertIn("pixel_values", video_data)
         self.assertEqual(video_data["pixel_values"].dim(), 3)
-        self.assertEqual(video_data["pixel_values"].shape[0], 32)
+        self.assertEqual(video_data["pixel_values"].shape[0], len(frames))
 
         video_token_id = self._video_token_id()
         if video_token_id is not None:
+            actual_video_tokens = sum(1 for t in input_ids if t == video_token_id)
             self.assertGreater(
-                sum(1 for t in input_ids if t == video_token_id),
+                actual_video_tokens,
                 0,
                 "Expected video soft tokens in expanded input_ids",
             )
+            self.assertEqual(
+                predicted_video_tokens,
+                actual_video_tokens,
+                "Expected one timestamp and soft-token block per supplied frame",
+            )
+
+    def test_video_token_prediction_for_non_square_pil_frames(self):
+        """Video token prediction pools non-square PIL patch grids per dimension."""
+        from PIL import Image
+
+        proc = self._make_processor()
+        if not hasattr(proc._processor, "video_processor"):
+            self.skipTest("Processor has no video_processor")
+
+        video_processor = proc._processor.video_processor
+        patch_size = int(video_processor.patch_size)
+        pooling_kernel_size = int(video_processor.pooling_kernel_size)
+        patch_grid_height = 2 * pooling_kernel_size + 1
+        patch_grid_width = 3 * pooling_kernel_size + 1
+        height = patch_grid_height * patch_size
+        width = patch_grid_width * patch_size
+        frames = [Image.new("RGB", (width, height)) for _ in range(2)]
+
+        expected_tokens_per_frame = (patch_grid_height // pooling_kernel_size) * (
+            patch_grid_width // pooling_kernel_size
+        )
+        # Use the real video processor, but disable resizing temporarily: its resize path produces
+        # pooling-aligned dimensions, while the regression requires a non-divisible patch grid.
+        with mock.patch.object(video_processor, "do_resize", False):
+            predicted_video_tokens = proc.get_num_tokens_per_video(video=frames)
+
+        self.assertEqual(predicted_video_tokens, len(frames) * expected_tokens_per_frame)
 
     def _video_token_id(self):
         return getattr(self.config, "video_token_id", None)
@@ -1489,11 +1553,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
 # follow-up work.
 
 
-_GEMMA4_E2E_PATH = (
-    os.path.join(os.environ["LLM_MODELS_ROOT"], "gemma4/gemma-4-26B-A4B-it")
-    if os.environ.get("LLM_MODELS_ROOT")
-    else None
-)
+_GEMMA4_E2E_PATH = _get_model_path()
 
 
 def _gemma4_e2e_model_available() -> bool:
@@ -1517,7 +1577,7 @@ def _gemma4_e2e_model_available() -> bool:
 # Reduced-layer text+vision config for E2E. Real ``_name_or_path`` so the
 # input processor + tokenizer pick up the genuine Gemma4 processor files;
 # attention head_dim follows the existing dummy-config recipe in
-# ``test_gemma4_e2e_dummy.py`` (128 / 256 for FlashInfer compatibility).
+# ``test_gemma4_e2e_dummy.py`` (128 / 256 for TRTLLM FMHA compatibility).
 GEMMA4_E2E_CONFIG = {
     "architectures": ["Gemma4ForConditionalGeneration"],
     "model_type": "gemma4",
@@ -1526,7 +1586,8 @@ GEMMA4_E2E_CONFIG = {
     # HF Gemma4 (transformers 5.5.3) does not advertise SDPA support; pin
     # to eager so PreTrainedModel.__init__ does not raise on dispatch check.
     "_attn_implementation": "eager",
-    "image_token_id": 262145,
+    # Match the real processor output used by this E2E.
+    "image_token_id": 258880,
     "audio_token_id": 262273,
     "video_token_id": 262146,
     "boi_token_index": 255999,
@@ -1555,6 +1616,8 @@ GEMMA4_E2E_CONFIG = {
         "hidden_size_per_layer_input": 0,
         "use_double_wide_mlp": False,
         "final_logit_softcapping": None,
+        # Exercise the custom mask for image-token blocks.
+        "use_bidirectional_attention": "vision",
         "torch_dtype": "bfloat16",
         "tie_word_embeddings": True,
         "attention_bias": False,
@@ -1588,15 +1651,17 @@ GEMMA4_E2E_CONFIG = {
     not _gemma4_e2e_model_available(),
     reason=(
         "LLM_MODELS_ROOT not set or Gemma4 model not available — "
-        "E2E generate parity requires real tokenizer/processor files."
+        "E2E generation requires real tokenizer/processor files."
     ),
 )
 class TestGemma4MultimodalE2E(unittest.TestCase):
-    """Full LLM + vision parity via the shared multimodal skeleton.
+    """Full LLM + vision execution via the shared multimodal skeleton.
 
     Implemented as a thin wrapper around ``TestModelingMultimodal`` so we
-    reuse the standardized context+generation phase, KV cache manager
-    setup, HF input loading, and tolerance/compare helpers.
+    reuse the standardized context+generation phases and KV cache setup.
+    Component tests above cover HF numerical parity; this test targets the
+    fused TRTLLM runtime path because full-vocabulary random-weight BF16
+    parity is numerically unstable across the fused and eager implementations.
     """
 
     # The actual abstract base + skeleton live in
@@ -1629,6 +1694,29 @@ class TestGemma4MultimodalE2E(unittest.TestCase):
 
             def get_model_config_class(self) -> Type:
                 return Gemma4Config
+
+            @property
+            def skip_hf_inference(self) -> bool:
+                return True
+
+            def get_kv_cache_manager(
+                self,
+                dtype,
+                config,
+                tokens_per_block,
+                max_seq_len,
+                batch_size,
+                num_blocks,
+            ):
+                del dtype, max_seq_len
+                from test_modeling_gemma4 import _build_gemma4_kv_cache_manager
+
+                return _build_gemma4_kv_cache_manager(
+                    config.text_config,
+                    num_blocks=num_blocks,
+                    tokens_per_block=tokens_per_block,
+                    batch_size=batch_size,
+                )
 
             def get_scenarios(self) -> List[MultimodalScenario]:
                 # Single sanity-image scenario for the in-PR test list.

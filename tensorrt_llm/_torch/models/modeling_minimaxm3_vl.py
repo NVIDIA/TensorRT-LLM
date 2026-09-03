@@ -1181,6 +1181,22 @@ class MiniMaxVLEncoderMLP(nn.Module):
         return self.fc2(x)
 
 
+class _MiniMaxVLCheckpointLayerNorm(nn.LayerNorm):
+    """LayerNorm whose checkpoint-backed affine tensors support meta init.
+
+    ``MetaInitMode`` redirects empty parameter allocations to ``meta`` but
+    rejects the ``fill_`` calls made by ``LayerNorm.reset_parameters``. Every
+    affine tensor in the M3 vision tower is loaded from the checkpoint, so its
+    reset can be skipped only while the parameter is meta. Normal CPU and CUDA
+    construction retain PyTorch's ones/zeros initialization.
+    """
+
+    def reset_parameters(self) -> None:
+        if self.weight is not None and self.weight.is_meta:
+            return
+        super().reset_parameters()
+
+
 class MiniMaxVLEncoderLayer(nn.Module):
     """Vision encoder layer: pre-norm self-attention + pre-norm MLP.
 
@@ -1192,9 +1208,13 @@ class MiniMaxVLEncoderLayer(nn.Module):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.self_attn = MiniMaxVLEncoderSelfAttention(config, dtype)
-        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.layer_norm1 = _MiniMaxVLCheckpointLayerNorm(
+            self.embed_dim, eps=config.layer_norm_eps, dtype=dtype
+        )
         self.mlp = MiniMaxVLEncoderMLP(config, dtype)
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.layer_norm2 = _MiniMaxVLCheckpointLayerNorm(
+            self.embed_dim, eps=config.layer_norm_eps, dtype=dtype
+        )
 
     def forward(
         self,
@@ -1265,7 +1285,9 @@ class MiniMaxVLVisionTransformer(nn.Module):
 
         self.embeddings = MiniMaxVLPatchEmbedding(config, dtype)
         # NOTE: the typo "layrnorm" matches the published checkpoint key.
-        self.pre_layrnorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.pre_layrnorm = _MiniMaxVLCheckpointLayerNorm(
+            embed_dim, eps=config.layer_norm_eps, dtype=dtype
+        )
         self.encoder = MiniMaxVLEncoder(config, dtype)
 
         if config.position_embedding_type != "rope" or config.rope_mode != "3d":

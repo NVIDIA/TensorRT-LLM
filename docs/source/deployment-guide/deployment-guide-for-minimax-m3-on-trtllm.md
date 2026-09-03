@@ -101,6 +101,20 @@ If you don't have access to the source code locally, you can manually create the
 
 The configuration uses Data-Expert Parallelism (DEP): `enable_attention_dp: true` runs the attention layers data-parallel across ranks while the MoE experts run expert-parallel, which favors high-throughput / large-batch serving on MiniMax-M3.
 
+For MXFP8 checkpoints, TensorRT LLM selects the GEMM backend automatically.
+`TRTLLM_MXFP8_GEMM_BACKEND` is an advanced override for debugging and
+performance experiments:
+
+* `trtllm` uses the native TensorRT LLM GEMM for eager execution and CUDA graphs.
+* `flashinfer` forces FlashInfer for eligible captured decode CUDA graphs; eager,
+  context/prefill, and piecewise CUDA-graph execution remain on the native GEMM.
+  It requires the pinned `flashinfer-python` package and Blackwell MXFP8 support.
+* `auto` keeps eager execution on the native GEMM and uses FlashInfer in
+  captured decode CUDA graphs after startup tuning.
+
+Leave the variable unset for normal deployments. An explicit value disables
+MiniMax-M3's automatic backend selection and uses the requested policy.
+
 ### Launch the TensorRT LLM Server
 
 MiniMax-M3 is launched through the `trtllm-llmapi-launch` wrapper, which sets up the multi-rank (MPI/Slurm) environment that the parallel server requires. The wrapper is run once per rank by Slurm (`srun`), with one task (rank) per GPU. The example below launches the server across 2 nodes (`-N 2`), 4 GPUs per node (`--ntasks-per-node 4`, 8 ranks total), using the curated YAML to drive parallelism, batching, and the MiniMax-M3 sparse-attention backend:

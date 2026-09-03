@@ -683,12 +683,13 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
-        # With the lazily loaded model zoo this snapshot is intentionally
-        # partial: it carries only externally-registered (and already
-        # resolved) classes; workers resolve built-ins on demand. Do not
-        # "fix" it by importing the zoo eagerly before submit.
+        # Only the architectures a worker cannot find for itself, and only as
+        # module names. Built-ins come from the worker's own static index, and
+        # naming a module rather than sending the class keeps the worker's zoo
+        # lazy -- a class in this payload would be resolved while unpickling,
+        # importing its module in every worker whether or not it is ever used.
         from tensorrt_llm._torch.models.modeling_utils import \
-            MODEL_CLASS_MAPPING
+            export_external_model_modules
         torch.cuda.Stream()
 
         # Strip the tokenizer from worker_kwargs to avoid MPI pickle failures.
@@ -709,7 +710,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             **mpi_worker_kwargs,
             worker_cls=self.worker_cls,
             tracer_init_kwargs=tracer_init_kwargs,
-            _torch_model_class_mapping=MODEL_CLASS_MAPPING,
+            _torch_external_model_modules=export_external_model_modules(),
             ready_signal=GenerationExecutorProxy.READY_SIGNAL,
             worker_process_identities_signal=worker_process_identities_signal,
         )

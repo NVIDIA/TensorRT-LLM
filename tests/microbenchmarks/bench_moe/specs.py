@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from tensorrt_llm._torch.modules.fused_moe.routing import (
+from tensorrt_llm._torch.moe.fused_moe.routing import (
     DeepSeekV3MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
@@ -246,7 +246,8 @@ class ConfigSpec:
     """One executable MoE runtime configuration."""
 
     backend: str
-    parallel_mode: str  # "DEP" | "TEP" | "DTP" | "TTP" | "CUSTOM"
+    # "DEP" | "TEP" | "DTP" | "TTP" | hybrid "(D|T)TP<k>EP<m>" (e.g. "DTP2EP2") | "CUSTOM"
+    parallel_mode: str
     moe_ep_size: Optional[int] = None
     moe_tp_size: Optional[int] = None
     enable_attention_dp: Optional[bool] = None

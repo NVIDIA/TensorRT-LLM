@@ -146,7 +146,7 @@ def _prefill_metadata(
 
 
 @torch.no_grad()
-def test_kda_fused_prefill_matches_separate_projections():
+def test_kda_prefill_matches_reference():
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
 
@@ -168,15 +168,14 @@ def test_kda_fused_prefill_matches_separate_projections():
 
     reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     reference.load_state_dict(runtime.state_dict())
+    reference._build_mtp_conv_weights()
     runtime.finalize_decode_weights()
-    assert runtime._qkvg_proj_weight is not None
-    assert runtime._bfa_proj_weight is not None
 
     slots = 4
     slot_indices = torch.tensor([2, 0], device=device, dtype=torch.long)
     cu_seqlens = torch.tensor([0, 3, 5], device=device, dtype=torch.long)
     hidden_states = torch.randn(5, cfg.hidden_size, device=device, dtype=torch.bfloat16) * 0.05
-    conv_seed = torch.randn(slots, 3 * d, w, device=device, dtype=torch.bfloat16) * 0.02
+    conv_seed = torch.randn(slots, 3 * d, w - 1, device=device, dtype=torch.bfloat16) * 0.02
     state_seed = (
         torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
     )
@@ -197,13 +196,15 @@ def test_kda_fused_prefill_matches_separate_projections():
 
 
 @torch.no_grad()
-def test_kda_qkvg_multistream_decode_matches_separate_projections():
+@pytest.mark.parametrize("num_heads", [6, 8])
+def test_kda_decode_matches_reference(num_heads):
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
 
     torch.manual_seed(0)
     device = "cuda"
     cfg = _K3Cfg()
+    cfg.linear_attn_config = {**cfg.linear_attn_config, "num_heads": num_heads}
     lin = cfg.linear_attn_config
     h = lin["num_heads"]
     head_dim = lin["head_dim"]
@@ -227,7 +228,7 @@ def test_kda_qkvg_multistream_decode_matches_separate_projections():
     slots = batch + 2
     slot_indices = torch.tensor([2, 0, 4], device=device, dtype=torch.long)
     hidden_states = torch.randn(batch, cfg.hidden_size, device=device, dtype=torch.bfloat16) * 0.05
-    conv_seed = torch.randn(slots, 3 * d, w, device=device, dtype=torch.bfloat16) * 0.02
+    conv_seed = torch.randn(slots, 3 * d, w - 1, device=device, dtype=torch.bfloat16) * 0.02
     state_seed = (
         torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
     )
@@ -244,8 +245,12 @@ def test_kda_qkvg_multistream_decode_matches_separate_projections():
         actual = runtime(hidden_states, _decode_metadata(actual_cache, slot_indices))
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(actual_cache.temporal, expected_cache.temporal, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_cache.temporal, expected_cache.temporal, rtol=2e-4, atol=2e-4)
+    untouched = torch.ones(slots, dtype=torch.bool, device=device)
+    untouched[slot_indices] = False
+    assert torch.equal(actual_cache.conv[untouched], expected_cache.conv[untouched])
+    assert torch.equal(actual_cache.temporal[untouched], expected_cache.temporal[untouched])
 
 
 @pytest.mark.parametrize("batch", [1, 3])
@@ -267,7 +272,7 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     # NaN/Inf bit pattern poisons both paths identically (nvbug 6599150).
     torch.nn.init.normal_(runtime.dt_bias, std=0.1)
     slots = batch + 2  # non-trivial slot mapping
-    cache = _LayerCache(slots, 3 * dim, w, h, lin["head_dim"], lin["head_dim"], t_steps, device)
+    cache = _LayerCache(slots, 3 * dim, w - 1, h, lin["head_dim"], lin["head_dim"], t_steps, device)
     slot_indices = torch.arange(2, 2 + batch, device=device, dtype=torch.long)
 
     # Random-but-fixed starting state and inputs.

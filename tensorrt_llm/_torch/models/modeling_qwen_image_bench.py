@@ -82,7 +82,7 @@ class _QwenImageBenchModelMixin:
             self.mm_encoder.load_weights(weights)
 
         qwen3_5_weight_mapper = Qwen3_5MoeHfWeightMapper()
-        qwen3_5_weight_mapper.init_model_and_config(self.llm, self.model_config)
+        qwen3_5_weight_mapper.init_model_and_config(self.llm, self.llm.model_config)
         filtered_weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
         self.llm.load_weights(filtered_weights, qwen3_5_weight_mapper)
 

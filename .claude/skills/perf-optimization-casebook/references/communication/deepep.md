@@ -34,4 +34,4 @@ measured: []
 - **Accuracy risk:** lossless (bf16 token exchange; path asserts `dtype==bfloat16` — changes transport, not math).
 - **Verify:** end-to-end throughput/latency vs allgather/reducescatter baseline; correctness with `test_fused_moe.py`; sanity accuracy on a small eval.
 - **Rollback:** unset `TRTLLM_CAN_USE_DEEP_EP` (falls back to allgather/reducescatter). Trigger: DeepEP build/IBGDA unavailable, regression vs baseline, or CUDA-Graph capture failure on the non-LL method.
-- **Prior art:** PR #4792. Files: `_torch/modules/fused_moe/deep_ep_utils.py`, `fused_moe_cutlass.py` (`AlltoallMethodType`), `modeling_deepseekv3.py`, `docker/common/install_deep_ep.sh`. Owning skill: **trtllm-moe-develop**; sweep with **perf-sweep-workflow**.
+- **Prior art:** PR #4792. Files: `_torch/moe/fused_moe/deep_ep_utils.py`, `fused_moe_cutlass.py` (`AlltoallMethodType`), `modeling_deepseekv3.py`, `docker/common/install_deep_ep.sh`. Owning skill: **trtllm-moe-develop**; sweep with **perf-sweep-workflow**.

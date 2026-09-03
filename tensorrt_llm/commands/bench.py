@@ -8,6 +8,7 @@ from tensorrt_llm.bench.benchmark.throughput import throughput_command
 from tensorrt_llm.bench.benchmark.visual_gen import visual_gen_command
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataset.prepare_dataset import prepare_dataset
+from tensorrt_llm.commands._telemetry import TelemetryGroup
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.usage import config as _telemetry_config
 
@@ -22,7 +23,13 @@ class NotRequiredForHelp(click.Option):
         return super().handle_parse_result(ctx, opts, args)
 
 
-@click.group(name="trtllm-bench", context_settings={'show_default': True})
+@click.group(
+    name="trtllm-bench",
+    cls=TelemetryGroup,
+    telemetry_usage_context=_telemetry_config.UsageContext.CLI_BENCH,
+    telemetry_component="llm",
+    context_settings={'show_default': True},
+)
 @click.option(
     "--model",
     "-m",

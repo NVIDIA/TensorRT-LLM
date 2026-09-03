@@ -22,7 +22,7 @@ import uuid
 import weakref
 from pathlib import Path
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -196,12 +196,16 @@ class BaseWorker(GenerationExecutor):
             if self._backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
+                partial_model_loading = self.llm_args.is_partial_model_loading
                 self.checkpoint_loader = _construct_checkpoint_loader(
                     self.llm_args.backend,
                     self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format,
                     mx_config=self.llm_args.mx_config,
                     mx_model_name=self.llm_args.model,
+                    checkpoint_io_policy=self.llm_args.checkpoint_io_policy,
+                    load_format=self.llm_args.load_format,
+                    partial_model_loading=partial_model_loading,
                 )
 
             self.max_seq_len = self.llm_args.max_seq_len
@@ -633,7 +637,7 @@ class BaseWorker(GenerationExecutor):
 
     def _multi_rank_sleep_wakeup(
         self,
-        action: str,
+        action: Literal["sleep", "wakeup"],
         tags: list[ExecutorMemoryType],
     ) -> None:
         """Coordinate a sleep or wakeup operation across all MPI ranks.
@@ -647,12 +651,17 @@ class BaseWorker(GenerationExecutor):
         2. Send PREPARE to every non-rank-0 rank via the dedicated
            ``_sleep_wakeup_comm`` communicator.  Peers quiesce and ACK without
            changing VMM state.
-        3. Execute the VMM operation (``release_with_tag`` or
-           ``materialize_with_tag``) locally on rank-0.
-        4. Send COMMIT to prepared peers and collect ACKs after their local VMM
-           operations.  If PREPARE or rank-0 local execution fails, send ABORT
-           so peers leave the control barrier without changing VMM state.
-        5. Exit ``control_action()``, resuming rank-0's event loop.
+        3. When native MNNVL MoE resources are selected, send COMMIT to every
+           prepared peer before rank-0 enters the subgroup checkpoint
+           collectives. Otherwise execute the local VMM operation first.
+        4. Execute the selected VMM and MNNVL operations and collect bounded
+           COMMIT ACKs. If PREPARE or the initial rank-0 synchronization fails,
+           send ABORT before any rank changes VMM state. Once COMMIT or local
+           mutation starts, any error fail-stops the distributed worker because
+           rank state can no longer be reconciled safely.
+        5. Exit ``control_action()`` only after a successful operation or a
+           recoverable pre-COMMIT abort. The public ``sleep()``/``wakeup()``
+           wrapper owns the persistent admission transition around this helper.
 
         Args:
             action: ``"sleep"`` or ``"wakeup"``.
@@ -683,6 +692,9 @@ class BaseWorker(GenerationExecutor):
         tag_strings = [t.value for t in tags]
         op_id = uuid.uuid4().hex
         target_action = _SleepWakeupAction(action)
+        has_mnnvl_resources = getattr(self.engine,
+                                      "_has_mnnvl_checkpoint_resources",
+                                      lambda _tags: False)(tags)
         prepare_msg = {
             "action": _SleepWakeupAction.PREPARE,
             "target_action": target_action,
@@ -707,9 +719,14 @@ class BaseWorker(GenerationExecutor):
             errors = []
             local_error = None
             abort_sent = False
+            commit_ranks = []
+            commit_sent_early = False
+            local_commit_started = False
+            abort_incomplete = False
 
             def send_abort(reason: str,
                            ranks: Optional[list[int]] = None) -> list[int]:
+                nonlocal abort_incomplete
                 abort_ranks = []
                 abort_dests = ranks if ranks is not None else range(
                     1, world_size)
@@ -728,18 +745,20 @@ class BaseWorker(GenerationExecutor):
                         )
                         abort_ranks.append(abort_dest)
                     except Exception as abort_exc:
+                        abort_incomplete = True
                         abort_error = (
                             "rank 0 failed to send sleep/wakeup abort "
                             f"to rank {abort_dest}: {abort_exc}")
                         errors.append(abort_error)
                         logger.error(
-                            "_multi_rank_sleep_wakeup: %s",
-                            abort_error,
-                            exc_info=True,
-                        )
+                            f"_multi_rank_sleep_wakeup: {abort_error}\n"
+                            f"{traceback.format_exc()}")
                 return abort_ranks
 
-            def drain_acks(ranks: list[int], phase: _SleepWakeupAction) -> None:
+            def drain_acks(ranks: list[int],
+                           phase: _SleepWakeupAction) -> list[dict]:
+                nonlocal abort_incomplete
+                received_acks = []
                 ack_deadline = time.monotonic() + _SLEEP_WAKEUP_ACK_TIMEOUT_S
                 for src in ranks:
                     try:
@@ -749,21 +768,50 @@ class BaseWorker(GenerationExecutor):
                                                            expected_op_id=op_id,
                                                            expected_phase=phase)
                     except Exception as exc:
+                        if phase == _SleepWakeupAction.ABORT:
+                            abort_incomplete = True
                         errors.append(
                             f"rank 0 failed to receive {phase} ACK from "
                             f"rank {src}: {exc}")
                         logger.error(
-                            "_multi_rank_sleep_wakeup: failed to receive %s "
-                            "ACK from rank %d",
-                            phase,
-                            src,
-                            exc_info=True,
+                            "_multi_rank_sleep_wakeup: failed to receive "
+                            f"{phase} ACK from rank {src}\n{traceback.format_exc()}"
                         )
                         continue
+                    received_acks.append(ack)
                     if ack.get("status") != "ok":
+                        if phase == _SleepWakeupAction.ABORT:
+                            abort_incomplete = True
                         errors.append(
                             ack.get("error")
                             or f"rank {src} returned unknown {phase} ACK")
+                return received_acks
+
+            def send_commits() -> list[int]:
+                sent_ranks = []
+                failed_ranks = []
+                for dest in prepared_ranks:
+                    try:
+                        sleep_wakeup_comm.send(
+                            commit_msg,
+                            dest=dest,
+                            tag=_SleepWakeupTag.ACTION,
+                        )
+                        sent_ranks.append(dest)
+                    except Exception as exc:
+                        commit_error = (
+                            f"rank 0 failed to send '{action}' commit to "
+                            f"rank {dest}: {exc}")
+                        errors.append(commit_error)
+                        failed_ranks.append(dest)
+                        logger.error(
+                            f"_multi_rank_sleep_wakeup: {commit_error}\n"
+                            f"{traceback.format_exc()}")
+                if failed_ranks:
+                    abort_ranks = send_abort("\n".join(errors),
+                                             ranks=failed_ranks)
+                    drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                return sent_ranks
 
             try:
                 # Phase 1: prepare peers.  A prepared peer has reached the
@@ -781,11 +829,8 @@ class BaseWorker(GenerationExecutor):
                             f"rank 0 failed to send '{action}' prepare to rank "
                             f"{dest}: {exc}")
                         errors.append(send_error)
-                        logger.error(
-                            "_multi_rank_sleep_wakeup: %s",
-                            send_error,
-                            exc_info=True,
-                        )
+                        logger.error(f"_multi_rank_sleep_wakeup: {send_error}\n"
+                                     f"{traceback.format_exc()}")
                         abort_ranks = send_abort(send_error)
                         abort_sent = True
                         drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
@@ -793,15 +838,30 @@ class BaseWorker(GenerationExecutor):
                         break
 
                 if not errors:
-                    drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
+                    prepare_acks = drain_acks(prepared_ranks,
+                                              _SleepWakeupAction.PREPARE)
+                    has_mnnvl_resources = has_mnnvl_resources or any(
+                        ack.get("has_mnnvl_resources", False)
+                        for ack in prepare_acks)
 
                 if not errors:
-                    # Execute locally on rank-0.  Only CUDA/VMM errors are
-                    # captured as local_error. Peers are still prepared but
-                    # uncommitted, so local failure can abort them without
-                    # changing their VMM state.
+                    # MNNVL resource hooks contain subgroup handle exchange,
+                    # so peers must enter COMMIT before rank 0 executes them.
+                    if has_mnnvl_resources:
+                        # A failed MPI send has uncertain delivery, so any
+                        # attempted COMMIT requires the bounded local phase.
+                        commit_sent_early = bool(prepared_ranks)
+                        commit_ranks = send_commits()
+
+                if not errors or commit_sent_early:
                     torch.cuda.synchronize()
+                    local_commit_started = True
                     if action == _SleepWakeupAction.SLEEP:
+                        run_mnnvl = (getattr(
+                            self.engine, "_run_mnnvl_checkpoint_resources",
+                            None) if has_mnnvl_resources else None)
+                        if run_mnnvl is not None:
+                            run_mnnvl(target_action, tags)
                         release_with_tag(*tags)
                         torch.cuda.synchronize()
                         gc.collect()
@@ -809,53 +869,60 @@ class BaseWorker(GenerationExecutor):
                     else:
                         materialize_with_tag(*tags)
                         torch.cuda.synchronize()
-            except (RuntimeError, torch.OutOfMemoryError) as exc:
+                        run_mnnvl = (getattr(
+                            self.engine, "_run_mnnvl_checkpoint_resources",
+                            None) if has_mnnvl_resources else None)
+                        if run_mnnvl is not None:
+                            run_mnnvl(target_action, tags)
+            except Exception as exc:
                 local_error = (f"rank 0 '{action}' failed: {exc}\n"
                                f"{traceback.format_exc()}")
-                logger.error(
-                    "_multi_rank_sleep_wakeup: rank-0 local %s failed:",
-                    action,
-                    exc_info=True,
-                )
+                logger.error(f"_multi_rank_sleep_wakeup: {local_error}")
             finally:
                 if local_error:
                     errors.append(local_error)
 
-                if errors and prepared_ranks and not abort_sent:
+                if commit_sent_early:
+                    drain_acks(commit_ranks, _SleepWakeupAction.COMMIT)
+
+                if (errors and prepared_ranks and not abort_sent
+                        and not commit_sent_early):
                     abort_ranks = send_abort("\n".join(errors))
                     drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
-                elif not errors:
-                    commit_ranks = []
-                    commit_failed_ranks = []
-                    for dest in prepared_ranks:
-                        try:
-                            sleep_wakeup_comm.send(
-                                commit_msg,
-                                dest=dest,
-                                tag=_SleepWakeupTag.ACTION,
-                            )
-                            commit_ranks.append(dest)
-                        except Exception as exc:
-                            commit_error = (
-                                f"rank 0 failed to send '{action}' commit to "
-                                f"rank {dest}: {exc}")
-                            errors.append(commit_error)
-                            commit_failed_ranks.append(dest)
-                            logger.error(
-                                "_multi_rank_sleep_wakeup: %s",
-                                commit_error,
-                                exc_info=True,
-                            )
-                    if commit_failed_ranks:
-                        abort_ranks = send_abort("\n".join(errors),
-                                                 ranks=commit_failed_ranks)
-                        drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                elif not errors and not commit_sent_early:
+                    commit_ranks = send_commits()
                     drain_acks(commit_ranks, _SleepWakeupAction.COMMIT)
 
                 if errors:
-                    raise RuntimeError(
+                    operation_error = RuntimeError(
                         f"{action}() failed on {len(errors)} rank(s):\n" +
                         "\n".join(errors))
+                    if commit_sent_early or local_commit_started or abort_incomplete:
+                        self._fail_stop_divergent_sleep_wakeup(operation_error)
+                    raise operation_error
+
+    def _fail_stop_divergent_sleep_wakeup(self, error: RuntimeError) -> None:
+        """Stop every rank after a sleep/wakeup operation may have diverged."""
+        from tensorrt_llm._torch.pyexecutor.hang_detector import \
+            propagate_hard_kill
+
+        self._set_fatal_error(error)
+        if self.engine is not None:
+            fail_transition = getattr(
+                self.engine,
+                "fail_sleep_wakeup_transition",
+                None,
+            )
+            if fail_transition is not None:
+                fail_transition()
+            if getattr(self.engine, "_fatal_error", None) is None:
+                self.engine._fatal_error = error
+            self.engine.is_shutdown = True
+        try:
+            logger.critical("Distributed sleep/wakeup state may have diverged; "
+                            f"hard-killing all ranks: {error}")
+        finally:
+            propagate_hard_kill()
 
     def sleep(self, sleep_tags: list[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
@@ -882,9 +949,9 @@ class BaseWorker(GenerationExecutor):
                 value strings (e.g. ``["kv_cache"]``).
 
         Returns:
-            None.  The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been released on every rank and the
-            event loop has been resumed.
+            None. The call is synchronous; when it returns all requested
+            VMM-tagged allocations have been released on every rank and request
+            admission remains closed until ``wakeup()`` succeeds.
 
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
@@ -896,15 +963,30 @@ class BaseWorker(GenerationExecutor):
 
         tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
         logger.info(f"Sleep: {tags}")
-        if self.llm_args.parallel_config.world_size > 1:
-            self._multi_rank_sleep_wakeup("sleep", tags)
-        else:
-            with self.engine._sleep_wakeup_lock, self.engine.control_action():
-                torch.cuda.synchronize()
-                release_with_tag(*tags)
-                torch.cuda.synchronize()
-                gc.collect()
-                torch.cuda.empty_cache()
+        self.engine.begin_sleep_transition(tags)
+        local_mutation_started = False
+        try:
+            if self.llm_args.parallel_config.world_size > 1:
+                self._multi_rank_sleep_wakeup("sleep", tags)
+            else:
+                with self.engine._sleep_wakeup_lock, self.engine.control_action(
+                ):
+                    torch.cuda.synchronize()
+                    local_mutation_started = True
+                    release_with_tag(*tags)
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+        except Exception:
+            if local_mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_sleep_transition()
+            raise
+        try:
+            self.engine.complete_sleep_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     def wakeup(self, wakeup_tags: list[str]) -> None:
         """Materialize GPU virtual memory for the specified memory type tags.
@@ -920,9 +1002,10 @@ class BaseWorker(GenerationExecutor):
                 value strings (e.g. ``["kv_cache"]``).
 
         Returns:
-            None.  The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been materialized on every rank and the
-            event loop has been resumed.
+            None. The call is synchronous; when it returns all requested
+            VMM-tagged allocations have been materialized on every rank.
+            Request admission reopens once every tag from the corresponding
+            sleep transition has been restored.
 
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
@@ -934,13 +1017,28 @@ class BaseWorker(GenerationExecutor):
 
         tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
         logger.info(f"Wakeup: {tags}")
-        if self.llm_args.parallel_config.world_size > 1:
-            self._multi_rank_sleep_wakeup("wakeup", tags)
-        else:
-            with self.engine._sleep_wakeup_lock, self.engine.control_action():
-                torch.cuda.synchronize()
-                materialize_with_tag(*tags)
-                torch.cuda.synchronize()
+        self.engine.begin_wakeup_transition(tags)
+        local_mutation_started = False
+        try:
+            if self.llm_args.parallel_config.world_size > 1:
+                self._multi_rank_sleep_wakeup("wakeup", tags)
+            else:
+                with self.engine._sleep_wakeup_lock, self.engine.control_action(
+                ):
+                    torch.cuda.synchronize()
+                    local_mutation_started = True
+                    materialize_with_tag(*tags)
+                    torch.cuda.synchronize()
+        except Exception:
+            if local_mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_wakeup_transition()
+            raise
+        try:
+            self.engine.complete_wakeup_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     def shutdown(self):
         if self.doing_shutdown:
@@ -948,9 +1046,13 @@ class BaseWorker(GenerationExecutor):
         else:
             self.doing_shutdown = True
 
-        if self.engine is not None and self.engine.can_enqueue_requests():
-            self.engine.shutdown()
-            self.engine = None
+        if self.engine is not None:
+            can_shutdown = getattr(self.engine, "can_shutdown", None)
+            if can_shutdown is None:
+                can_shutdown = self.engine.can_enqueue_requests
+            if can_shutdown():
+                self.engine.shutdown()
+                self.engine = None
 
     def get_disaggregated_params(self) -> dict:
         if self.engine is None or self.engine.kv_cache_transceiver is None:

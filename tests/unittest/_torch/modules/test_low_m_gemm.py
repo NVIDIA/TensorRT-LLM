@@ -296,6 +296,92 @@ def test_direct_runner_tactics_serialisable(monkeypatch) -> None:
         assert all(isinstance(v, int) for v in t)
 
 
+@_skip_non_sm10x
+@torch.inference_mode()
+def test_cached_direct_tactic_uses_exact_small_m_and_validates_large_m(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-trip exact M=3 and reject an incompatible M=16-bucket tactic."""
+    from tensorrt_llm._torch.autotuner import TuningConfig
+    from tensorrt_llm._torch.modules.low_m_gemm import (
+        _M_DIM_SPEC,
+        _M_TUNING_BUCKETS,
+        _CuBLASGemmRunner,
+        _DirectGemmRunner,
+        _SplitKGemmRunner,
+    )
+
+    n, k = 256, 8192
+    tactics = {3: (256, 2, 3), 10: (256, 2, 8)}
+    weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    direct = _DirectGemmRunner(pdl=False)
+    splitk = _SplitKGemmRunner(has_bias=False, pdl=False)
+    cublas = _CuBLASGemmRunner(has_bias=False)
+    direct.forward = MagicMock(wraps=direct.forward)
+    splitk.forward = MagicMock(wraps=splitk.forward)
+    cublas.forward = MagicMock(wraps=cublas.forward)
+
+    tuning_config = TuningConfig(dynamic_tensor_specs=(_M_DIM_SPEC,))
+    tuner = _mod.AutoTuner()
+    profiles = tuner._optimization_profiles(
+        tuning_config,
+        [torch.empty((1, k), dtype=torch.bfloat16, device="cuda"), weight.t()],
+    )
+    assert tuple(int(profile.get_opt_shapes()[0][0]) for profile in profiles) == _M_TUNING_BUCKETS
+
+    custom_op = "test::low_m_exact_cache_round_trip"
+    input_shapes = (torch.Size((3, k)), torch.Size((k, n)))
+    cache_key = tuner.profiling_cache.get_cache_key(
+        custom_op,
+        direct,
+        input_shapes,
+        tuning_config,
+        apply_map_to_tuning_buckets=False,
+    )
+    tuner.profiling_cache[cache_key] = (2, tactics[3], 0.0)
+    cache_hit, runner_id, cached_tactic, _ = tuner.profiling_cache.search_cache(
+        custom_op,
+        [cublas, splitk, direct],
+        input_shapes,
+        tuning_config,
+    )
+    assert (cache_hit, runner_id, cached_tactic) == (True, 2, tactics[3])
+
+    dispatcher = LowMGemmDispatcher()
+    dispatcher._prepared = True
+    dispatcher._direct = direct
+    dispatcher._runner_no_bias = splitk
+    dispatcher._runner_with_bias = _SplitKGemmRunner(has_bias=True, pdl=False)
+    dispatcher._cublas_no_bias = cublas
+    dispatcher._cublas_with_bias = _CuBLASGemmRunner(has_bias=True)
+    dispatcher._tuning_config = tuning_config
+
+    mock_at = MagicMock()
+    mock_at.choose_one.side_effect = lambda _op, _runners, _config, inputs, **_: (
+        direct,
+        tactics[int(inputs[0].shape[0])],
+    )
+    monkeypatch.setattr(_mod, "AutoTuner", MagicMock(get=staticmethod(lambda: mock_at)))
+
+    assert all(_M_DIM_SPEC.map_to_tuning_buckets(m) == m for m in range(1, 9))
+    assert _M_DIM_SPEC.map_to_tuning_buckets(10) == 16
+
+    module = torch.nn.Linear(1, 1)
+    module._low_m_gemm_name = "direct_tactic_cache"
+    # M=3 retrieves its exact tactic. M=10 shares the M=16 cache bucket and
+    # must reject that bucket's incompatible row-8 direct tactic.
+    for m in (3, 10):
+        a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+        actual = dispatcher.apply(module, a, weight, None, force_active=True)
+        torch.testing.assert_close(actual, torch.mm(a, weight.t()), rtol=1e-2, atol=5e-3)
+
+    assert direct.forward.call_args.kwargs["tactic"] == tactics[3]
+    assert direct.forward.call_count == 1
+    assert cublas.forward.call_args.kwargs["tactic"] == -1
+    assert cublas.forward.call_count == 1
+    splitk.forward.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # _SplitKGemmRunner
 # ---------------------------------------------------------------------------

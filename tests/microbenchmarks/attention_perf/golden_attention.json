@@ -62,7 +62,7 @@
    "_src": "samesession build2801 REPEAT=5 B300-pcie: 0.0599/0.0532/0.0532/0.0553/0.0522; cv 5.04% (first val warmup outlier; drop-first cv 2.11%) -> gate ~20%, NEARLY USELESS. INSENSITIVE case: 0.053ms kernel too short for stable CUDA-event timing on fast B300. TODO raise warmup/iters or treat as discrete-only (launch_count=71 still guards structure)."
   }
  },
- "_comment_gqa": "Model-representative GQA cases (isolated harness, build2806). sm120 only so far; other arches bootstrap-skip until re-blessed on cluster. q8b=Qwen3-8B 32/8/128; l70b=64/8/128 (Qwen3-32B/Llama-3.3-70B/Nemotron-Super-49B). Continuous baselines are n=2 smoke values (1% floor binds since cv<0.1%); refine with a K=5 bootstrap.",
+ "_comment_gqa": "Model-representative GQA cases (isolated harness, build2806). sm120 only so far; other arches bootstrap-skip until re-blessed on cluster. q8b=Qwen3-8B 32/8/128; l70b=Qwen3-32B 64/8/128. Continuous baselines are n=2 smoke values (1% floor binds since cv<0.1%); refine with a K=5 bootstrap.",
  "attn_q8b_ctx_dispatch": {
   "NVIDIA RTX PRO 6000 Blackwell Server Edition": false
  },

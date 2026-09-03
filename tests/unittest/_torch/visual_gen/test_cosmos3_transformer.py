@@ -722,7 +722,7 @@ class TestCosmos3TransformerCheckpoint:
             )
         _assert_finite_output(out.video, hs.shape)
 
-    @pytest.mark.parametrize("quant_algo", ["FP8"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_load_fp8_quantization(self, quant_algo: str):
         checkpoint_dir = _require_checkpoint()
         if not torch.cuda.is_available():
@@ -734,7 +734,7 @@ class TestCosmos3TransformerCheckpoint:
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=_SKIP_AUX)
         try:
-            assert pipeline.transformer.model_config.quant_config.quant_algo is not None
+            assert pipeline.pipeline_config.quant_config.quant_algo is not None
             transformer = pipeline.transformer
             c = transformer.latent_channel_size
             hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(

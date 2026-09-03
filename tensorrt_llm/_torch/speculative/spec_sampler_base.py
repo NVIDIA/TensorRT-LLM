@@ -27,8 +27,6 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm.logger import logger
-
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -98,9 +96,24 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         buffer there, so it would be silently dropped and the request would
         decode from a different distribution than the user asked for. Threading
         it through costs measurable throughput on the rejection path, so reject
-        instead. Raised from validate_request (request admission), so only the
-        offending request fails rather than the whole executor step.
+        instead. This sampler also does not return context logits, generation
+        logits, or log probabilities. Raised from validate_request (request
+        admission), so only the offending request fails rather than the whole
+        executor step.
         """
+        requested_outputs = (
+            ("return_context_logits / prompt_logprobs", request.py_return_context_logits),
+            ("return_generation_logits", request.py_return_generation_logits),
+            ("logprobs", request.py_return_log_probs),
+        )
+        unsupported_outputs = [name for name, requested in requested_outputs if requested]
+        if unsupported_outputs:
+            raise ValueError(
+                "The following output options are not supported with speculative decoding: "
+                f"{', '.join(unsupported_outputs)}. Drop these options from "
+                "the request, or disable speculative decoding."
+            )
+
         sampling_config = request.sampling_config
         if sampling_config is None:
             return
@@ -264,23 +277,6 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len: Optional[int],
     ) -> None:
         """Common handling for both context and generation requests."""
-        if request.py_return_context_logits:
-            logger.warning(
-                "return_context_logits not supported with speculative decoding, "
-                "skipping for request %s",
-                request.py_request_id,
-            )
-        if request.py_return_generation_logits:
-            logger.warning(
-                "return_generation_logits not supported with speculative decoding, "
-                "skipping for request %s",
-                request.py_request_id,
-            )
-        if request.py_return_log_probs:
-            logger.warning(
-                "return_log_probs not supported with speculative decoding, skipping for request %s",
-                request.py_request_id,
-            )
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 

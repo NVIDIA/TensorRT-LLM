@@ -238,7 +238,8 @@ class _KVCache:
         "_blocks",
         "_base_page_indices",
         "_committed_tokens",
-        "_num_tokens_before_hybrid_pruning",
+        "_num_reusable_tokens_before_hybrid_pruning",
+        "_num_reusable_tokens_before_pruning",
         "_num_committed_blocks",
         "_finish_event",
         "_tokens_per_block",
@@ -276,7 +277,8 @@ class _KVCache:
     _base_page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _committed_tokens: list[TokenIdExt]
     # Internal diagnostic captured from the reuse match: see ReuseMatch.
-    _num_tokens_before_hybrid_pruning: int
+    _num_reusable_tokens_before_hybrid_pruning: int
+    _num_reusable_tokens_before_pruning: int
     # Sometimes we can't commit a block because all its tokens are already covered by another block in
     # the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric
     # difference, 2. if our block is a partial block, we can't write to memory of the other blocks.
@@ -336,8 +338,11 @@ class _KVCache:
             self.beam_width,
         )
         self._committed_tokens = []
-        self._num_tokens_before_hybrid_pruning = (
-            reuse_match.num_tokens_before_hybrid_pruning if reuse_match is not None else 0
+        self._num_reusable_tokens_before_hybrid_pruning = (
+            reuse_match.num_reusable_tokens_before_hybrid_pruning if reuse_match is not None else 0
+        )
+        self._num_reusable_tokens_before_pruning = (
+            reuse_match.num_reusable_tokens_before_pruning if reuse_match is not None else 0
         )
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
@@ -1110,9 +1115,13 @@ class _KVCache:
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
 
-    def _get_num_tokens_before_hybrid_pruning(self) -> int:
+    def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int:
         """Return the pre-hybrid-pruning prefix for internal diagnostics."""
-        return self._num_tokens_before_hybrid_pruning
+        return self._num_reusable_tokens_before_hybrid_pruning
+
+    def _get_num_reusable_tokens_before_pruning(self) -> int:
+        """Return the raw token-path walk depth, before any pruning."""
+        return self._num_reusable_tokens_before_pruning
 
     @property
     def committed_tokens(self) -> list[TokenIdExt]:
@@ -1214,6 +1223,13 @@ class _KVCache:
             # Free scratch slots on suspend since the data is ephemeral
             self._free_scratch_slots()
         self._status = self.Status.SUSPENDED
+        # Manager-level counter, so gate on the manager predicate: it also honours
+        # the per-cache stats exclusion (dummy / CUDA-graph caches). C++ spells the
+        # gate _shouldRecordStats() (manager OR request); the two are equivalent
+        # here because KVCacheManager.record_request_suspended already returns
+        # early when stats are disabled.
+        if self._should_record_manager_stats():
+            self.manager.record_request_suspended()
 
     # Resume, migrate buffers to GPU memory.
     def resume(self, cuda_stream: CudaStream | None = None) -> bool:
@@ -1403,8 +1419,15 @@ class _KVCache:
             # Clear tree_block for the partial block — it's now uncommitted.
             if self.num_committed_tokens % self.tokens_per_block != 0:
                 self._blocks[last_ordinal].tree_block = None
+        # A freshly-created cache starts SUSPENDED and is activated by this same
+        # resume() call, so gate the counter on _never_resumed: only a cache that
+        # was previously ACTIVE and got suspended counts as a preemption recovery.
+        # Without this, the counter would track request admissions, not preemption.
+        first_activation = self._never_resumed
         self._never_resumed = False
         self._status = self.Status.ACTIVE
+        if not first_activation and self._should_record_manager_stats():
+            self.manager.record_request_resumed()
         return True
 
     def prefetch(self, target: CacheLevel) -> bool:

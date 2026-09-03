@@ -13,8 +13,8 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen3_next_weight_mapper import (
     Qwen3NextHfWeightMapper,
 )
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
-from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
-from tensorrt_llm._torch.modules.fused_moe.weight_owner import is_moe_weight_owner
+from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm.quantization import QuantAlgo
 
 _FP8_2D_BLOCK_SIZE = 128

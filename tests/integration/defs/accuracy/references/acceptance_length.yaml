@@ -39,3 +39,6 @@ TestQwen3_5_4B::test_dflash:
 TestKimiK3::test_w4a16_mxfp4:
   ref_al: 1.318
   min_al: 1.15
+TestQwen3_8B::test_dspark:
+  ref_al: 6.259
+  min_al: 5.946

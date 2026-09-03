@@ -22,9 +22,9 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
-#include "tensorrt_llm/runtime/runtimeKernels.h"
 #include <chrono>
 #include <cmath>
+#include <curand_kernel.h>
 #include <memory> //@todo check the usage of this
 #include <random> //@todo check the usage of this
 
@@ -42,7 +42,6 @@ using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
-namespace trk = tensorrt_llm::runtime::kernels;
 
 using PackedFloat = moe::dev::routing::PackedScoreIdx<float>;
 

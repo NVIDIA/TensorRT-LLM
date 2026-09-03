@@ -3,6 +3,7 @@
 """Helpers for indexed KDA prefill parity tests."""
 
 import torch
+from fla.modules.l2norm import l2norm_fwd
 
 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import KDAKernelDispatch
 from tensorrt_llm._torch.modules.mamba.recurrent_state_cache import reset_recurrent_state_rows
@@ -26,6 +27,8 @@ def run_indexed_prefill(
     """Run optimized prefill against a pool and return its selected rows."""
     assert dispatch.prefill_kernel_path == "optimized"
     q, k, v, g, beta = inputs
+    q, _ = l2norm_fwd(q.clone())
+    k, _ = l2norm_fwd(k.clone())
     a_log, dt_bias = gate_params
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     pool_was_provided = state_pool is not None
@@ -60,8 +63,8 @@ def run_indexed_prefill(
     )
     reset_recurrent_state_rows(state_pool, state_indices, has_initial_states)
     output, final_state = dispatch.prefill_chunk_kda(
-        q=q.clone(),
-        k=k.clone(),
+        q=q,
+        k=k,
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
@@ -92,10 +95,12 @@ def run_fla_prefill(
     """Run the independent FLA state path."""
     assert dispatch.prefill_kernel_path == "fla"
     q, k, v, g, beta = inputs
+    q, _ = l2norm_fwd(q.clone())
+    k, _ = l2norm_fwd(k.clone())
     a_log, dt_bias = gate_params
     output, final_state = dispatch.prefill_chunk_kda(
-        q=q.clone(),
-        k=k.clone(),
+        q=q,
+        k=k,
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),

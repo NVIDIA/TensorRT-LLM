@@ -25,7 +25,7 @@ Reference:
 
 import platform
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -39,7 +39,7 @@ _LONG_STR = 256  # NvTelemetry "LongString" maxLength
 
 CLIENT_ID = "616561816355034"
 EVENT_PROTOCOL = "1.6"
-EVENT_SCHEMA_VER = "0.2"
+EVENT_SCHEMA_VER = "0.7"
 EVENT_SYS_VER = "trtllm-telemetry/1.0"
 CLIENT_TYPE = "Native"
 CLIENT_VARIANT = "Release"
@@ -51,7 +51,56 @@ CPU_ARCHITECTURE = platform.uname().machine
 # ---------------------------------------------------------------------------
 
 
-class TrtllmInitialReport(BaseModel):
+class _LlmCounterSnapshot(BaseModel):
+    """Process-local aggregate LLM lifecycle counters.
+
+    - Initialization attempts: entries into LLM construction.
+    - Instances created: LLM objects initialized successfully.
+    - Active instances: initialized objects not yet shut down.
+    - Maximum concurrent instances: highest active count observed.
+    - Initialization failures: construction attempts that raised an exception.
+    """
+
+    llm_initialization_attempts: int = Field(
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="llmInitializationAttempts",
+        description="Number of LLM construction attempts in this process.",
+    )
+    llm_instances_created: int = Field(
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="llmInstancesCreated",
+        description="Number of LLM instances successfully created in this process.",
+    )
+    active_llm_instances: int = Field(
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="activeLlmInstances",
+        description="Number of initialized LLM instances not yet shut down.",
+    )
+    max_concurrent_llm_instances: int = Field(
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="maxConcurrentLlmInstances",
+        description="Highest number of concurrently active LLM instances observed.",
+    )
+    llm_initialization_failures: int = Field(
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="llmInitializationFailures",
+        description="Number of LLM construction attempts that raised an exception.",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class TrtllmInitialReport(_LlmCounterSnapshot):
     """TRT-LLM initial report event parameters.
 
     Sent once at startup with full environment and configuration details.
@@ -88,6 +137,12 @@ class TrtllmInitialReport(BaseModel):
     architecture_class_name: str = Field(
         default="", max_length=_LONG_STR, alias="architectureClassName"
     )
+    architecture_class_hash: str = Field(
+        default="",
+        max_length=_LONG_STR,
+        alias="architectureClassHash",
+        description="Stable hash of the model architecture class definition.",
+    )
 
     # TRT-LLM config
     backend: str = Field(default="", max_length=_SHORT_STR, alias="backend")  # ShortString
@@ -111,11 +166,26 @@ class TrtllmInitialReport(BaseModel):
     )  # ShortString
 
     # Ingress point (how TRT-LLM was invoked) (ShortString)
-    ingress_point: str = Field(default="", max_length=_SHORT_STR, alias="ingressPoint")
+    ingress_point: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="ingressPoint",
+        description="TRT-LLM API or CLI entry point that created this session.",
+    )
 
     # Disaggregated serving metadata (ShortString)
-    disagg_role: str = Field(default="", max_length=_SHORT_STR, alias="disaggRole")
-    deployment_id: str = Field(default="", max_length=_SHORT_STR, alias="deploymentId")
+    disagg_role: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="disaggRole",
+        description="Role of this process in a disaggregated deployment.",
+    )
+    deployment_id: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="deploymentId",
+        description="Identifier used to correlate a disaggregated deployment.",
+    )
 
     # Legacy feature summary and sanitized opt-in LLM API config capture.
     features_json: str = Field(default="{}", alias="featuresJson")
@@ -125,14 +195,133 @@ class TrtllmInitialReport(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-class TrtllmHeartbeat(BaseModel):
+class TrtllmHeartbeat(_LlmCounterSnapshot):
     """TRT-LLM heartbeat event parameters.
 
     Sent periodically to signal the session is still alive.
-    Contains only a monotonically increasing sequence counter.
+    Contains a monotonically increasing sequence counter, process correlation
+    fields, and the latest aggregate LLM lifecycle counter snapshot.
     """
 
-    seq: int = Field(..., ge=0, le=_UINT32_MAX, alias="seq")  # PositiveInt
+    seq: int = Field(
+        ...,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="seq",
+        description="Zero-based heartbeat sequence number for this session.",
+    )
+    ingress_point: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="ingressPoint",
+        description="TRT-LLM API or CLI entry point that created this session.",
+    )
+    disagg_role: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="disaggRole",
+        description="Role of this process in a disaggregated deployment.",
+    )
+    deployment_id: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="deploymentId",
+        description="Identifier used to correlate a disaggregated deployment.",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+TerminationKind = Literal[
+    "clean",
+    "exception",
+    "signal",
+    "worker_failure",
+    "timeout",
+    "unknown",
+]
+LifecyclePhase = Literal[
+    "cli_parsing",
+    "config_validation",
+    "model_initialization",
+    "serving",
+    "unknown",
+]
+TerminationComponent = Literal[
+    "llm",
+    "server",
+    "engine_worker",
+    "disagg_worker",
+    "unknown",
+]
+ReportingSource = Literal["self", "supervisor", "executor_proxy"]
+
+
+class TrtllmExitReport(_LlmCounterSnapshot):
+    """TRT-LLM terminal event parameters.
+
+    Sent at most once for a telemetry session when TRT-LLM or a surviving
+    observer can classify the session outcome. Unknown values use explicit
+    sentinels instead of inferred causes.
+    """
+
+    exit_code_known: bool = Field(
+        ...,
+        alias="exitCodeKnown",
+        description="Whether exitCode is an observed process exit code.",
+    )
+    exit_code: int = Field(
+        ...,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="exitCode",
+        description="Observed process exit code, or zero when unavailable.",
+    )
+    signal_number: int = Field(
+        ...,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="signalNumber",
+        description="Observed terminating signal number, or zero when unavailable.",
+    )
+    termination_kind: TerminationKind = Field(
+        ...,
+        alias="terminationKind",
+        description="Allowlisted classification of how the session terminated.",
+    )
+    lifecycle_phase: LifecyclePhase = Field(
+        ...,
+        alias="lifecyclePhase",
+        description="Last known lifecycle phase when the session terminated.",
+    )
+    component: TerminationComponent = Field(
+        ...,
+        alias="component",
+        description="TRT-LLM component associated with the terminal outcome.",
+    )
+    reporting_source: ReportingSource = Field(
+        ...,
+        alias="reportingSource",
+        description="Observer that classified and reported the terminal outcome.",
+    )
+    ingress_point: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="ingressPoint",
+        description="TRT-LLM API or CLI entry point that created this session.",
+    )
+    disagg_role: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="disaggRole",
+        description="Role of this process in a disaggregated deployment.",
+    )
+    deployment_id: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="deploymentId",
+        description="Identifier used to correlate a disaggregated deployment.",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -238,7 +427,7 @@ def get_iso_timestamp(dt: Optional[datetime] = None) -> str:
 
 
 def build_gxt_payload(
-    event: Union[TrtllmInitialReport, TrtllmHeartbeat],
+    event: Union[TrtllmInitialReport, TrtllmHeartbeat, TrtllmExitReport],
     *,
     session_id: str,
     trtllm_version: str,
@@ -246,7 +435,7 @@ def build_gxt_payload(
     """Build a complete GXT payload dict ready for json.dumps().
 
     Args:
-        event: The TRT-LLM event to send (initial report or heartbeat).
+        event: The TRT-LLM event to send.
         session_id: Ephemeral session UUID (hex string).
         trtllm_version: TRT-LLM package version string.
 
@@ -259,6 +448,8 @@ def build_gxt_payload(
         event_name = "trtllm_initial_report"
     elif isinstance(event, TrtllmHeartbeat):
         event_name = "trtllm_heartbeat"
+    elif isinstance(event, TrtllmExitReport):
+        event_name = "trtllm_exit_report"
     else:
         raise TypeError(f"Unknown event type: {type(event).__name__}")
 

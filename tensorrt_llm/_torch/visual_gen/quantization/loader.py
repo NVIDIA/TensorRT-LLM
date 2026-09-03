@@ -13,6 +13,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.quantization.ops import (
     quantize_fp8_blockwise,
     quantize_fp8_per_tensor,
+    quantize_fp8_rowwise,
     quantize_nvfp4,
 )
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -215,7 +216,11 @@ class DynamicLinearWeightLoader:
             return False
 
         # For FP8 algorithms: quantize if weight is high precision
-        if quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES):
+        if quant_algo in (
+            QuantAlgo.FP8,
+            QuantAlgo.FP8_BLOCK_SCALES,
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+        ):
             if weight.dtype == torch.float8_e4m3fn and "weight_scale" in weight_dict:
                 return False  # Already quantized
             return weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
@@ -247,6 +252,9 @@ class DynamicLinearWeightLoader:
         elif quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             block_size = self.quant_config.group_size if self.quant_config else 128
             qweight, scale = quantize_fp8_blockwise(weight, block_size=block_size)
+            return {**weight_dict, "weight": qweight, "weight_scale": scale}
+        elif quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
+            qweight, scale = quantize_fp8_rowwise(weight)
             return {**weight_dict, "weight": qweight, "weight_scale": scale}
         elif quant_algo == QuantAlgo.NVFP4:
             qweight, weight_scale, weight_scale_2 = quantize_nvfp4(weight)

@@ -24,9 +24,9 @@ Four groups, each self-contained and free of ``TorchSampler`` state:
   deciding when a request is finished.
 * **Logit adjustments** -- embedding bias, d2t remapping and the fused greedy
   sampling kernel.
-* **Async D2H** -- ``AsyncWorkerMixin`` (shared by ``TorchSampler`` and
-  ``TRTLLMSampler``), its private side-stream copier, and the ``SamplerEvent``
-  that bundles the resulting worker futures / CUDA events for callers to await.
+* **Async D2H** -- ``AsyncWorkerMixin`` (used by ``TorchSampler``), its
+  private side-stream copier, and the ``SamplerEvent`` that bundles the
+  resulting worker futures / CUDA events for callers to await.
 
 Anything here that outgrows a few dozen lines, or acquires per-slot state of
 its own, should move to its own module -- as beam search, penalties, token bans

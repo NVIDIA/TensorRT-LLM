@@ -20,12 +20,17 @@ hook fires, and that telemetry_disabled flows through correctly.
 
 import os
 import sys
+import threading
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from tensorrt_llm import LLM as LLM_torch
+from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm.llmapi import KvCacheConfig, llm_args
+from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.usage import usage_lib
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
@@ -35,6 +40,20 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
+
+@pytest.fixture
+def enable_telemetry(monkeypatch):
+    """Enable telemetry for lifecycle tests in this sibling test package."""
+    monkeypatch.delenv("TRTLLM_NO_USAGE_STATS", raising=False)
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    monkeypatch.delenv("TELEMETRY_DISABLED", raising=False)
+    monkeypatch.setenv("TRTLLM_USAGE_FORCE_ENABLED", "1")
+    monkeypatch.setattr(
+        usage_lib,
+        "_OPT_OUT_FILE",
+        Path("/nonexistent/path/do_not_track"),
+    )
 
 
 def _get_model_path():
@@ -54,6 +73,154 @@ def _make_spy():
         captured.update(kwargs)
 
     return captured, spy_report_usage
+
+
+class TestProcessLifecycleCounters:
+    """Exercise BaseLLM telemetry hooks without loading a model."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_usage_state(self):
+        usage_lib._SESSION = None
+        usage_lib._SESSION_DISABLED = False
+        usage_lib._SESSION_LOCK = threading.Lock()
+        usage_lib._REPORTER_STARTED = False
+        usage_lib._REPORTER_ACTIVE = False
+        usage_lib._REPORTER_STOP = threading.Event()
+        usage_lib._PENDING_TERMINAL = None
+        usage_lib._PROCESS_PID = os.getpid()
+        yield
+        usage_lib._REPORTER_STOP.set()
+        usage_lib._SESSION = None
+        usage_lib._SESSION_DISABLED = False
+        usage_lib._REPORTER_ACTIVE = False
+        usage_lib._PENDING_TERMINAL = None
+
+    def test_two_live_objects_update_concurrency_counters(self, enable_telemetry):
+        """Two successful constructors share one session and prove overlap."""
+        with (
+            patch.object(BaseLLM, "__init__", return_value=None),
+            patch.object(BaseLLM, "_start_usage_reporting"),
+        ):
+            first = LLM_torch(model="unused")
+            second = LLM_torch(model="unused")
+
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["llmInitializationAttempts"] == 2
+        assert snapshot["llmInstancesCreated"] == 2
+        assert snapshot["activeLlmInstances"] == 2
+        assert snapshot["maxConcurrentLlmInstances"] == 2
+
+        with patch.object(BaseLLM, "_shutdown_resources"):
+            first.shutdown()
+            second.shutdown()
+
+    def test_initialization_exception_is_counted_and_preserved(self, enable_telemetry):
+        """Constructor tracking increments the counter and re-raises unchanged."""
+        error = ValueError("expected test failure")
+        with (
+            patch.object(BaseLLM, "__init__", side_effect=error),
+            patch.object(BaseLLM, "_start_usage_reporting"),
+            pytest.raises(ValueError) as raised,
+        ):
+            LLM_torch(model="unused")
+
+        assert raised.value is error
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["llmInitializationAttempts"] == 1
+        assert snapshot["llmInitializationFailures"] == 1
+        assert snapshot["llmInstancesCreated"] == 0
+        assert usage_lib._REPORTER_STARTED is False
+        assert snapshot["activeLlmInstances"] == 0
+
+    def test_failure_before_base_constructor_is_counted(self, enable_telemetry):
+        """The public LLM boundary includes subclass argument validation."""
+        with pytest.raises(ValueError):
+            LLM_torch(model="unused", definitely_not_an_llm_argument=True)
+
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["llmInitializationAttempts"] == 1
+        assert snapshot["llmInitializationFailures"] == 1
+        assert snapshot["llmInstancesCreated"] == 0
+
+    def test_multimodal_validation_failure_is_counted(self, enable_telemetry):
+        """Multimodal-specific validation runs inside the shared boundary."""
+        with pytest.raises(ValueError):
+            MultimodalEncoder(model="unused", encode_only=True)
+
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["llmInitializationAttempts"] == 1
+        assert snapshot["llmInitializationFailures"] == 1
+        assert snapshot["llmInstancesCreated"] == 0
+
+    def test_validated_dict_config_tracks_success_only(self, enable_telemetry):
+        """A raw dict starts tracking only after it becomes a validated config."""
+
+        def initialize(instance, *args, **kwargs):
+            del args, kwargs
+            instance.args = SimpleNamespace(
+                telemetry_config=llm_args.TelemetryConfig(disabled=False)
+            )
+
+        with (
+            patch.object(BaseLLM, "__init__", autospec=True, side_effect=initialize),
+            patch.object(BaseLLM, "_start_usage_reporting"),
+        ):
+            llm = LLM_torch(model="unused", telemetry_config={"disabled": False})
+
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["llmInitializationAttempts"] == 1
+        assert snapshot["llmInstancesCreated"] == 1
+        with patch.object(BaseLLM, "_shutdown_resources"):
+            llm.shutdown()
+
+    def test_invalid_config_does_not_disable_later_session(self, enable_telemetry):
+        """A rejected config object cannot poison later valid telemetry."""
+        with pytest.raises(ValueError):
+            LLM_torch(model="unused", telemetry_config=object())
+
+        assert usage_lib._SESSION is None
+        assert usage_lib._SESSION_DISABLED is False
+
+        with (
+            patch.object(BaseLLM, "__init__", return_value=None),
+            patch.object(BaseLLM, "_start_usage_reporting"),
+        ):
+            llm = LLM_torch(model="unused")
+
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["llmInitializationAttempts"] == 1
+        assert snapshot["llmInstancesCreated"] == 1
+        with patch.object(BaseLLM, "_shutdown_resources"):
+            llm.shutdown()
+
+    def test_completion_tracking_failure_is_fail_silent(self, enable_telemetry):
+        """A telemetry completion error must not fail LLM construction."""
+        with (
+            patch.object(BaseLLM, "__init__", return_value=None),
+            patch(
+                "tensorrt_llm.usage.record_llm_initialized",
+                side_effect=RuntimeError("telemetry failure"),
+            ),
+            patch.object(BaseLLM, "_start_usage_reporting") as start_reporting,
+        ):
+            llm = LLM_torch(model="unused")
+
+        assert llm._usage_lifecycle_active is False
+        start_reporting.assert_called_once_with()
+
+    def test_shutdown_decrements_once_per_object(self, enable_telemetry):
+        """Repeated shutdown calls cannot decrement the active gauge twice."""
+        with (
+            patch.object(BaseLLM, "__init__", return_value=None),
+            patch.object(BaseLLM, "_start_usage_reporting"),
+        ):
+            llm = LLM_torch(model="unused")
+
+        with patch.object(BaseLLM, "_shutdown_resources"):
+            llm.shutdown()
+            llm.shutdown()
+
+        assert usage_lib._SESSION.snapshot()["activeLlmInstances"] == 0
 
 
 class TestTelemetryPyTorchBackend:

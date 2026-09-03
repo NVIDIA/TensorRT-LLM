@@ -18,7 +18,6 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
@@ -44,8 +43,6 @@
 
 // Opaque bindings
 NB_MAKE_OPAQUE(tensorrt_llm::batch_manager::ReqIdsSet)
-NB_MAKE_OPAQUE(std::vector<tensorrt_llm::batch_manager::SlotDecoderBuffers>)
-NB_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::SamplingConfig>)
 
 namespace nb = nanobind;
 

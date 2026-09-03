@@ -12,7 +12,6 @@ const SELECTOR_JS = path.join(REPO_ROOT, "docs/source/_static/config_selector.js
 const CONFIG_DB_JSON = path.join(REPO_ROOT, "docs/source/_static/config_db.json");
 const DEEPSEEK_MODEL = "deepseek-ai/DeepSeek-R1-0528";
 const DEEPSEEK_NVFP4_MODEL = "nvidia/DeepSeek-R1-0528-FP4-v2";
-const LLAMA_FP8_MODEL = "nvidia/Llama-3.3-70B-Instruct-FP8";
 
 function loadSelectorExports() {
   const source = fs.readFileSync(SELECTOR_JS, "utf8");
@@ -373,13 +372,4 @@ test("data-models filter applies to curated entries too", () => {
     !filteredCurated.some((e) => e.model === "openai/gpt-oss-120b"),
     "gpt-oss should be filtered out"
   );
-});
-
-test("Llama-3.3-70B has exactly one curated entry", () => {
-  const selector = loadSelectorExports();
-  const curated = loadCuratedEntries();
-
-  const llamaCurated = selector.curatedEntriesForModel(curated, LLAMA_FP8_MODEL);
-  assert.equal(llamaCurated.length, 1, "Llama-3.3-70B should have exactly 1 curated entry");
-  assert.equal(llamaCurated[0].scenario, "Max Throughput");
 });

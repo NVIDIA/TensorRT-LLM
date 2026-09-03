@@ -7,6 +7,7 @@ import torch
 from tensorrt_llm._torch.visual_gen.quantization.ops import (
     quantize_fp8_blockwise,
     quantize_fp8_per_tensor,
+    quantize_fp8_rowwise,
 )
 
 
@@ -112,6 +113,43 @@ class TestQuantOps(unittest.TestCase):
         qweight, scales = quantize_fp8_blockwise(weight, block_size=128)
 
         # Should handle zero weights gracefully
+        self.assertEqual(qweight.dtype, torch.float8_e4m3fn)
+        self.assertTrue(torch.all(qweight.to(torch.float32) == 0))
+
+    def test_fp8_rowwise(self):
+        """Test FP8 rowwise (per-channel) quantization."""
+        out_features, in_features = 256, 512
+        weight = torch.randn(out_features, in_features, dtype=torch.bfloat16, device="cuda")
+        qweight, scale = quantize_fp8_rowwise(weight)
+
+        self.assertEqual(qweight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(qweight.shape, weight.shape)
+        self.assertEqual(scale.dtype, torch.float32)
+        # One scale per output row
+        self.assertEqual(scale.shape, (out_features,))
+
+        # Dequantize and check round-trip error
+        dequant = qweight.to(torch.float32) * scale.unsqueeze(1)
+        error = (dequant - weight.to(torch.float32)).abs().mean()
+        self.assertLess(error, 0.15)
+
+    def test_fp8_rowwise_different_shapes(self):
+        """Test FP8 rowwise quantization with various shapes."""
+        shapes = [(128, 256), (256, 512), (512, 1024)]
+        for shape in shapes:
+            with self.subTest(shape=shape):
+                weight = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+                qweight, scale = quantize_fp8_rowwise(weight)
+
+                self.assertEqual(qweight.dtype, torch.float8_e4m3fn)
+                self.assertEqual(qweight.shape, weight.shape)
+                self.assertEqual(scale.shape, (shape[0],))
+
+    def test_fp8_rowwise_zero_weight(self):
+        """Test FP8 rowwise quantization with zero weight."""
+        weight = torch.zeros(128, 256, dtype=torch.bfloat16, device="cuda")
+        qweight, scale = quantize_fp8_rowwise(weight)
+
         self.assertEqual(qweight.dtype, torch.float8_e4m3fn)
         self.assertTrue(torch.all(qweight.to(torch.float32) == 0))
 

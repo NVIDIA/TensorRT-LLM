@@ -545,14 +545,40 @@ def test_mhc_fused_hc_mma_tactic_filter_hidden_sizes():
         for hidden_size in (4096, 7168, 8192)
     }
 
-    # After P0 (Path D KS=112 enable + scalar-vec tail in Phase 4), the
-    # support trait reduces to `hidden % bf16_vec == 0` and `h_tiles % ks == 0`,
-    # so any KS in the table that divides HIDDEN/BLOCK_K is supported.
-    # h_tiles(4096) = 64 → KS divisors of 64; h_tiles(7168) = 112 → divisors
-    # of 112; hidden=8192 is not in the supported-hidden allowlist.
+    # Support reduces to `hidden % bf16_vec == 0` plus an even split, so any KS
+    # dividing HIDDEN/BLOCK_K qualifies: h_tiles(4096) = 64 → divisors of 64;
+    # h_tiles(7168) = 112 → divisors of 112. KS=53/106 are the two uneven
+    # exceptions, admitted at H=7168 only. hidden=8192 is not in the
+    # supported-hidden allowlist.
     assert supported_by_hidden_size[4096] == {1, 2, 4, 8, 16, 32, 64}
-    assert supported_by_hidden_size[7168] == {1, 2, 4, 7, 8, 14, 16, 28, 56, 112}
+    assert supported_by_hidden_size[7168] == {1, 2, 4, 7, 8, 14, 16, 28, 53, 56, 106, 112}
     assert supported_by_hidden_size[8192] == set()
+
+
+def test_mhc_fused_hc_single_wave_target_mma_ks():
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_target_mma_ks
+
+    expected = {32: 112, 64: 112, 128: 106, 256: 53, 8192: 8, 16384: 4}
+    assert {
+        m: _fused_hc_target_mma_ks(7168, m, sm_count=212, is_sm107=True) for m in expected
+    } == expected
+
+    # The selected split must fit the launch guard, otherwise get_valid_tactics
+    # drops the MMA tactics and emits nothing at all for the shape.
+    sm_count = 212
+    for hidden_size in (4096, 7168):
+        for m in range(64, 40000, 64):
+            ks = _fused_hc_target_mma_ks(hidden_size, m, sm_count=sm_count, is_sm107=True)
+            assert ((m + 63) // 64) * ks <= sm_count * 5, (hidden_size, m, ks)
+
+
+def test_mhc_fused_hc_uneven_splits_unreachable_off_sm107():
+    """The uneven split counts must stay unselectable on non-SM107 devices."""
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_target_mma_ks
+
+    for hidden_size in (4096, 7168):
+        for m in range(32, 33000, 32):
+            assert _fused_hc_target_mma_ks(hidden_size, m) not in (53, 106)
 
 
 @pytest.mark.parametrize("n", [128, 2048])
@@ -878,6 +904,97 @@ def test_mhc_fused_hc_realistic_scale_regression(tactic, hidden_size: int):
         comb_mix_ref, comb_mix_cur.view(n, hc_mult, hc_mult), rtol=3e-3, atol=5e-3
     )
     torch.testing.assert_close(layer_input_ref, layer_input_cur, rtol=1e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size", "num_k_splits"),
+    [
+        pytest.param(64, 4096, 1, id="single-split"),
+        pytest.param(3200, 4096, 4, id="single-warp-no-tail"),
+        pytest.param(64, 7168, 112, id="multi-warp-tail"),
+    ],
+)
+@skip_pre_blackwell
+def test_mhc_fused_all_mma_phase4_reload_is_coherent(
+    num_tokens: int, hidden_size: int, num_k_splits: int
+) -> None:
+    """Exercise the all-MMA Phase-4 store/reload paths.
+
+    The pre-fix kernel reloaded its just-stored output with ``__ldg``, which can
+    observe stale data. Compared against the two-kernel half-MMA path, which has
+    no same-kernel store/reload. The geometries cover, in order: the final
+    TMA-store drain before single-CTA Phase 3, the single-warp/no-tail path, and
+    an eight-warp token team with its named barrier plus the tail reload.
+    """
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    if not _mhc_fused_hc_mma_available():
+        pytest.skip("mHC fused-HC MMA kernels require SM100 and BUILD_DEEP_GEMM=ON")
+
+    hc_mult = 4
+    shape_n = hc_mult * (2 + hc_mult)
+    eps = 1.0e-6
+
+    torch.manual_seed(123 + num_tokens)
+    device = torch.device("cuda")
+    inputs = [
+        torch.randn((num_tokens, hidden_size), device=device, dtype=torch.float32).bfloat16(),
+        torch.randn(
+            (num_tokens, hc_mult, hidden_size), device=device, dtype=torch.float32
+        ).bfloat16(),
+        torch.randn((num_tokens, hc_mult), device=device, dtype=torch.float32) * 0.1,
+        torch.randn((num_tokens, hc_mult, hc_mult), device=device, dtype=torch.float32) * 0.1,
+        (
+            torch.randn((shape_n, hc_mult, hidden_size), device=device, dtype=torch.float32) * 0.05
+        ).flatten(1, 2),
+        torch.tensor([0.10, 0.10, 0.30], device=device, dtype=torch.float32),
+        torch.randn((shape_n,), device=device, dtype=torch.float32) * 2.0,
+    ]
+    norm_weight = (
+        1.0 + 0.02 * torch.randn((hidden_size,), device=device, dtype=torch.float32)
+    ).bfloat16()
+
+    runner = MhcFusedHcRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=eps,
+        hc_pre_eps=eps,
+        hc_sinkhorn_eps=eps,
+        hc_post_mult_value=1.0,
+        sinkhorn_repeat=20,
+    )
+    half_mma_tactic = ("fused_half_mma", 0, num_k_splits, 256, 1)
+    all_mma_tactic = ("fused_all_mma", 0, num_k_splits, 0, 1)
+
+    reference = tuple(
+        output.clone()
+        for output in runner(
+            inputs=inputs,
+            tactic=half_mma_tactic,
+            norm_weight=norm_weight,
+            norm_eps=eps,
+        )
+    )
+    torch.cuda.synchronize()
+
+    for repetition in range(5):
+        actual = runner(
+            inputs=inputs,
+            tactic=all_mma_tactic,
+            norm_weight=norm_weight,
+            norm_eps=eps,
+        )
+        torch.cuda.synchronize()
+        assert all(torch.isfinite(output).all() for output in actual), (
+            f"non-finite fused_all_mma output at repetition {repetition}"
+        )
+        # residual_cur (output 0) uses the same FMA post-mapping path in both
+        # tactics, independent of the GEMM tiling and split-K configuration,
+        # so it is expected to remain bit-exact.
+        torch.testing.assert_close(actual[0], reference[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual[1], reference[1], rtol=3e-3, atol=5e-3)
+        torch.testing.assert_close(actual[2], reference[2], rtol=3e-3, atol=5e-3)
+        torch.testing.assert_close(actual[3], reference[3], rtol=1e-2, atol=4e-2)
 
 
 @pytest.mark.parametrize("n", [128, 2048])

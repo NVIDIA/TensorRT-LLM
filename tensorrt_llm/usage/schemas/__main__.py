@@ -45,6 +45,7 @@ def validate() -> List[str]:
     model_map = {
         "trtllm_initial_report": schema.TrtllmInitialReport,
         "trtllm_heartbeat": schema.TrtllmHeartbeat,
+        "trtllm_exit_report": schema.TrtllmExitReport,
     }
 
     for event_name, model_cls in model_map.items():

@@ -105,6 +105,8 @@ struct MlaParams
     int const* flash_mla_tile_scheduler_metadata = nullptr;
     int const* flash_mla_num_splits = nullptr;
     KvCacheDataType cache_type;
+    // Separate E4M3 block-scale pool used by NVFP4 paged MLA cache.
+    KVBlockArray kv_cache_block_scales_buffer{};
     // Scales for mla quantization
     float* bmm1_scale;
     float* bmm2_scale;
@@ -175,10 +177,10 @@ void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_ca
     float const* kv_scale_quant_orig_ptr, cudaStream_t stream);
 
 template <typename T, typename TCache>
-void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* latent_cache_ptr, int const num_requests,
-    int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
-    float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size, int lora_size,
-    float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
+void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, KVBlockArray& kv_scale_cache, T* q_ptr,
+    T* latent_cache_ptr, int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,
+    int const max_input_uncached_seq_len, float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size,
+    int lora_size, KvCacheDataType cache_type, float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
 
 // Apply neox-style RoPE in-place to only the last rope_dim elements of each head,
 // leaving the first nope_dim elements untouched.

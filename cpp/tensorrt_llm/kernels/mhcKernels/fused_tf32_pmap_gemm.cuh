@@ -165,6 +165,18 @@ __device__ __forceinline__ float2 fma_f32x2_vv(float2 a, float2 b, float2 c)
 #endif
 }
 
+// The read-only cache is not coherent with stores issued earlier by the same
+// kernel, so Phase 4's store-to-load path cannot use __ldg.
+__device__ __forceinline__ uint4 ld_global_volatile_u128(uint4 const* addr)
+{
+    uint4 val;
+    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                 : "l"(addr)
+                 : "memory");
+    return val;
+}
+
 __device__ __forceinline__ void stsm_x4_b16_rout(void* smem_dst, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
 {
     asm volatile(
@@ -187,8 +199,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 
     constexpr uint32_t SHAPE_K = HC_MULT * HIDDEN;
     constexpr uint32_t H_TILES_PER_HC = HIDDEN / BLOCK_K;
-    static_assert(H_TILES_PER_HC % kNumSplits == 0, "H_TILES_PER_HC must be divisible by kNumSplits");
-    constexpr uint32_t H_TILES_PER_SPLIT = H_TILES_PER_HC / kNumSplits;
+    static_assert(kNumSplits <= H_TILES_PER_HC, "Each split must own at least one H tile");
+    constexpr uint32_t H_TILES_BASE = H_TILES_PER_HC / kNumSplits;
+    constexpr uint32_t H_TILES_EXTRA = H_TILES_PER_HC % kNumSplits;
     constexpr uint32_t kNumCastStages = 4;
     constexpr uint32_t kSwizzleAMode = cute::min(BLOCK_K * sizeof(nv_bfloat16), 128);
     constexpr uint32_t kSwizzleBMode = cute::min(BLOCK_K * sizeof(float), 128);
@@ -300,8 +313,21 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     const uint32_t m_block_idx = block_idx / kNumSplits;
     const uint32_t k_split_idx = block_idx % kNumSplits;
     const uint32_t m_offset = m_block_idx * BLOCK_M;
-    const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
-    constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
+    // Give the first H_TILES_EXTRA splits one extra tile. Even splits fold back
+    // to the original constants.
+    uint32_t h_tile_start;
+    uint32_t h_tiles_this_split;
+    if constexpr (H_TILES_EXTRA == 0)
+    {
+        h_tile_start = k_split_idx * H_TILES_BASE;
+        h_tiles_this_split = H_TILES_BASE;
+    }
+    else
+    {
+        h_tile_start = k_split_idx * H_TILES_BASE + cute::min(k_split_idx, H_TILES_EXTRA);
+        h_tiles_this_split = H_TILES_BASE + static_cast<uint32_t>(k_split_idx < H_TILES_EXTRA);
+    }
+    const uint32_t num_total_stages = h_tiles_this_split * HC_MULT;
 
     // Prologue removed: pmap threads load their own post_mix/comb_mix rows
     // directly into registers below, so the MMA/TMA warps never wait on those
@@ -314,7 +340,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             uint32_t b_stage = 0;
             uint32_t i_stage = 0;
             uint32_t s = 0;
-            for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+            for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
             {
                 const uint32_t h_tile = h_tile_start + ht;
                 empty_input[i_stage]->wait(((ht / N_INPUT_STAGES) & 1) ^ 1);
@@ -484,7 +510,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         static_assert(kNumLoads % 2 == 0, "kNumLoads must be even for LDSM.x4");
 
         uint32_t s = 0;
-        for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+        for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
         {
             const uint32_t i_stage = ht % N_INPUT_STAGES;
             full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
@@ -737,8 +763,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     constexpr uint32_t HC_MULT3 = HC_MULT * (2 + HC_MULT);
     constexpr uint32_t SHAPE_K = HC_MULT * HIDDEN;
     constexpr uint32_t H_TILES_PER_HC = HIDDEN / BLOCK_K;
-    static_assert(H_TILES_PER_HC % kNumSplits == 0, "H_TILES_PER_HC must be divisible by kNumSplits");
-    constexpr uint32_t H_TILES_PER_SPLIT = H_TILES_PER_HC / kNumSplits;
+    static_assert(kNumSplits <= H_TILES_PER_HC, "Each split must own at least one H tile");
+    constexpr uint32_t H_TILES_BASE = H_TILES_PER_HC / kNumSplits;
+    constexpr uint32_t H_TILES_EXTRA = H_TILES_PER_HC % kNumSplits;
     constexpr uint32_t kNumCastStages = 4;
     constexpr uint32_t kSwizzleAMode = cute::min(BLOCK_K * sizeof(nv_bfloat16), 128);
     constexpr uint32_t kSwizzleBMode = cute::min(BLOCK_K * sizeof(float), 128);
@@ -851,8 +878,21 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     const uint32_t m_block_idx = block_idx / kNumSplits;
     const uint32_t k_split_idx = block_idx % kNumSplits;
     const uint32_t m_offset = m_block_idx * BLOCK_M;
-    const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
-    constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
+    // Give the first H_TILES_EXTRA splits one extra tile. Even splits fold back
+    // to the original constants.
+    uint32_t h_tile_start;
+    uint32_t h_tiles_this_split;
+    if constexpr (H_TILES_EXTRA == 0)
+    {
+        h_tile_start = k_split_idx * H_TILES_BASE;
+        h_tiles_this_split = H_TILES_BASE;
+    }
+    else
+    {
+        h_tile_start = k_split_idx * H_TILES_BASE + cute::min(k_split_idx, H_TILES_EXTRA);
+        h_tiles_this_split = H_TILES_BASE + static_cast<uint32_t>(k_split_idx < H_TILES_EXTRA);
+    }
+    const uint32_t num_total_stages = h_tiles_this_split * HC_MULT;
 
     // Prologue: pmap warp group loads post_mix_prev, comb_mix_prev into SMEM
     if (warp_idx >= kNumMMAThreads / 32)
@@ -895,7 +935,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             uint32_t b_stage = 0;
             uint32_t i_stage = 0;
             uint32_t s = 0;
-            for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+            for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
             {
                 const uint32_t h_tile = h_tile_start + ht;
                 empty_input[i_stage]->wait(((ht / N_INPUT_STAGES) & 1) ^ 1);
@@ -1059,7 +1099,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         static_assert(kNumLoads % 2 == 0, "kNumLoads must be even for LDSM.x4");
 
         uint32_t s = 0;
-        for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+        for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
         {
             const uint32_t i_stage = ht % N_INPUT_STAGES;
             full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
@@ -1184,8 +1224,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             }
         }
 
-        // Drain any in-flight residual_out TMA stores before exit.
-        cute::tma_store_wait<0>();
+        // tma_store_wait is the `.read` form and retires only the SMEM reads,
+        // so the global writes could still be in flight at the Phase-3 fence.
+        asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
 
         // Warp-reduce sqr across 4 col_lanes then atomicAdd to global.
         sqr_u += __shfl_xor_sync(0xffffffff, sqr_u, 1);
@@ -1245,6 +1286,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             {
                 /* spin */
             }
+            // Acquire the Phase-2 writes published before each increment.
+            __threadfence();
         }
         __syncthreads();
     }
@@ -1396,6 +1439,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         // When WARPS_PER_TOK>1, warp_in_team 0..WARPS_PER_TOK-1 together cover
         // HIDDEN in strides of WARPS_PER_TOK * 32 * 8.  When WARPS_PER_TOK==1,
         // each warp sweeps HIDDEN alone (same as the original single-warp case).
+
+        // First read of these addresses, ordered by the acquire fence above, so
+        // __ldg stays for residual read throughput. The layer_input reload below
+        // is the same-thread store-to-load case and cannot.
         __nv_bfloat16 const* rbase = residual_cur_ptr + static_cast<long long>(tok) * HC_MULT * HIDDEN;
         __nv_bfloat16* obase = layer_input_out + static_cast<long long>(tok) * HIDDEN;
 
@@ -1495,7 +1542,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             // Reduce: intra-warp __shfl_xor; cross-warp via SMEM + per-team
             //   named PTX barrier when WARPS_PER_TOK > 1 (KS ≥ 16 instances).
             //   Inactive teams `continue`'d above and never reach this barrier.
-            // Pass 2: re-LDG layer_input_out from L2, multiply by
+            // Pass 2: volatile-reload layer_input_out, multiply by
             //   rsqrt * norm_weight, STG normalized bf16 back to the same
             //   address. Avoids the FMA recompute that doubling pass 1 would
             //   require (Path D Phase 4 is already FMA-heavy).
@@ -1607,13 +1654,15 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
 
             float const rsqrt_val = rsqrtf(sum_sq_local / static_cast<float>(HIDDEN) + norm_eps);
 
-            // Pass 2: re-LDG the un-normalized layer_input we just wrote
-            // (L2-hot), LDG norm_weight, normalize, STG back. No FMA recompute.
+            // Pass 2: reload the un-normalized layer_input this thread wrote,
+            // LDG norm_weight, normalize, STG back. No FMA recompute. Each
+            // thread reloads only its own stores, so no CTA fence is needed --
+            // just a load that bypasses the read-only cache.
             __nv_bfloat16 const* nbase = norm_weight;
 #pragma unroll
             for (uint32_t h = h_start; h < H_VEC_END; h += H_STRIDE)
             {
-                uint4 li_raw = __ldg(reinterpret_cast<uint4 const*>(&obase[h]));
+                uint4 li_raw = ld_global_volatile_u128(reinterpret_cast<uint4 const*>(&obase[h]));
                 uint4 nw_raw = __ldg(reinterpret_cast<uint4 const*>(&nbase[h]));
                 __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
                 __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);
@@ -1636,7 +1685,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 if (my_chunk < TAIL_CHUNKS)
                 {
                     const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
-                    uint4 li_raw = __ldg(reinterpret_cast<uint4 const*>(&obase[h]));
+                    uint4 li_raw = ld_global_volatile_u128(reinterpret_cast<uint4 const*>(&obase[h]));
                     uint4 nw_raw = __ldg(reinterpret_cast<uint4 const*>(&nbase[h]));
                     __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
                     __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);

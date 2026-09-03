@@ -40,6 +40,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
+                           resolve_cache_transceiver_config,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -206,19 +207,6 @@ def _get_mapping(_mapping: Mapping) -> Mapping:
     return mapping
 
 
-def update_sampler_max_seq_len(max_seq_len, sampler):
-    # Originally, TRTLLMSampler is constructed with executor_config, but
-    # _create_kv_cache_manager (via build_managers) may later overwrite executor_config.max_seq_len.
-    # Because TRTLLMSampler.sample_async still needs the updated limit and executor_config is
-    # deprecated inside TRTLLMSampler, keep TRTLLMSampler.max_seq_len updated with
-    # with executor_config.max_seq_len.
-    from .sampler import TRTLLMSampler
-
-    if isinstance(sampler, TRTLLMSampler):
-        assert hasattr(sampler, "max_seq_len")
-        sampler.max_seq_len = max_seq_len
-
-
 def _extend_full_attention_windows_for_spec_decode(
     kv_cache_config: KvCacheConfig,
     spec_config: Optional[SpeculativeConfig],
@@ -272,6 +260,9 @@ def _load_config_and_create_checkpoint_loader(
         llm_args.checkpoint_format,
         mx_config=llm_args.mx_config,
         mx_model_name=llm_args.model,
+        checkpoint_io_policy=llm_args.checkpoint_io_policy,
+        load_format=llm_args.load_format,
+        partial_model_loading=llm_args.is_partial_model_loading,
     )
     llm_args = ModelLoader.load_config_and_apply_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)
@@ -381,8 +372,6 @@ def create_py_executor(
         # Disable KV cache reuse for deterministic mode
         kv_cache_config.enable_block_reuse = False
         kv_cache_config.enable_partial_reuse = False
-
-    decoding_config = llm_args.decoding_config
 
     # The tokenizer is stripped from MPI kwargs in proxy.py to avoid pickle
     # failures with trust_remote_code models.  Reload it from the checkpoint
@@ -590,7 +579,7 @@ def create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
-    validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
+    validate_feature_combination(llm_args, model_engine)
 
     calibrator = get_calibrator()
     layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
@@ -668,6 +657,9 @@ def create_py_executor(
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
 
+    # Resolve this before cache reuse and cache manager selection consume it.
+    resolve_cache_transceiver_config(cache_transceiver_config)
+
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
                                 max_batch_size * getattr(mapping, "pp_size", 1))
@@ -700,11 +692,16 @@ def create_py_executor(
                                            False)
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
+        nvfp4_dsa_cache_reuse = (kv_cache_quant_algo == QuantAlgo.NVFP4
+                                 and getattr(sparse_attention_config,
+                                             "algorithm", None) == "dsa")
         if kv_cache_config.enable_block_reuse and not (
                 kv_cache_quant_algo is None or kv_cache_quant_algo
-                == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8):
+                == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8
+                or nvfp4_dsa_cache_reuse):
             logger.warning(
-                f"KV cache reuse for MLA can only be enabled without KV cache quantization or with FP8 quantization, "
+                f"KV cache reuse for MLA can only be enabled without KV cache quantization, with FP8 quantization, "
+                f"or with NVFP4 quantization on the DSA sparse path, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
@@ -800,11 +797,8 @@ def create_py_executor(
             mapping,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
-            max_seq_len=max_seq_len,
             mm_encoder_only=mm_encoder_only,
             speculative_config=spec_config,
-            decoding_config=decoding_config,
-            kv_cache_config=kv_cache_config,
             max_num_sequences=max_num_seq_slots,
         )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
@@ -933,10 +927,6 @@ def create_py_executor(
                 ExecutorMemoryType.INIT_KV_CACHE
                 if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
-            # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
-            # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
-            max_seq_len = kv_cache_creator._max_seq_len
-            update_sampler_max_seq_len(max_seq_len, sampler)
 
     # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
     # weight manager + MoE backend fixup (single entry point).
@@ -1032,10 +1022,6 @@ def create_py_executor(
             # the original value before creating the final KV cache.
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
             kv_cache_creator.build_managers(resources, False)
-            # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
-            # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
-            max_seq_len = kv_cache_creator._max_seq_len
-            update_sampler_max_seq_len(max_seq_len, sampler)
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 

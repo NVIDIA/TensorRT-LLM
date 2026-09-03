@@ -160,6 +160,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.enable_pipelined_transfer"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
@@ -203,6 +210,17 @@
       "converter": "",
       "kind": "categorical",
       "path": "cache_transceiver_config.transceiver_runtime"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "native",
+        "rank_striped_read_ahead"
+      ],
+      "annotation": "Literal['auto', 'native', 'rank_striped_read_ahead']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "checkpoint_io_policy"
     },
     {
       "allowed_values": [],
@@ -459,6 +477,13 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "enable_mla_skip_correction"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "enable_resource_governor"
     },
     {
@@ -615,10 +640,11 @@
     },
     {
       "allowed_values": [
+        "quantization_for_cold_page",
         "triattention"
       ],
       "annotation": "Literal['triattention']",
-      "converter": "",
+      "converter": "allowlist",
       "kind": "categorical",
       "path": "kv_cache_compression_config.algorithm"
     },
@@ -653,6 +679,15 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_compression_config.normalize_scores"
+    },
+    {
+      "allowed_values": [
+        "nvfp4"
+      ],
+      "annotation": "Literal['nvfp4']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.quant"
     },
     {
       "allowed_values": [],
@@ -829,6 +864,13 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.mamba_ssm_stochastic_rounding"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_state_config.enable_branch_snapshot"
     },
     {
       "allowed_values": [],
@@ -1043,6 +1085,13 @@
       "converter": "",
       "kind": "value",
       "path": "max_stats_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "mla_skip_correction_threshold"
     },
     {
       "allowed_values": [],
@@ -1453,17 +1502,6 @@
       "converter": "",
       "kind": "value",
       "path": "sampler_force_async_worker"
-    },
-    {
-      "allowed_values": [
-        "TRTLLMSampler",
-        "TorchSampler",
-        "auto"
-      ],
-      "annotation": "Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]",
-      "converter": "allowlist",
-      "kind": "categorical",
-      "path": "sampler_type"
     },
     {
       "allowed_values": [
@@ -2183,7 +2221,8 @@
         "llm_class",
         "cli_serve",
         "cli_bench",
-        "cli_eval"
+        "cli_eval",
+        "disaggregated"
       ],
       "annotation": "<enum 'UsageContext'>",
       "converter": "",
@@ -2283,6 +2322,13 @@
       "converter": "",
       "kind": "value",
       "path": "use_cute_dsl_blockscaling_mm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "use_fine_grained_sync"
     }
   ]
 }

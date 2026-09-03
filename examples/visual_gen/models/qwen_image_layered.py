@@ -24,6 +24,7 @@ import argparse
 from pathlib import Path
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm.visual_gen import MediaRef
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,7 +64,7 @@ def main() -> None:
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
     params = visual_gen.default_params
-    params.image = args.image
+    params.image_reference = [MediaRef(content=args.image, format="path")]
 
     output = visual_gen.generate(inputs=args.prompt, params=params)
     if output.image is not None and output.image.shape[0] > 1:

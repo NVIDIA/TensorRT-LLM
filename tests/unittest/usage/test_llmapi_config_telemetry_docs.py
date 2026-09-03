@@ -286,6 +286,67 @@ def test_build_capture_manifest_matches_committed_golden():
     _assert_committed_manifest_current(golden_manifest())
 
 
+def test_kv_cache_compression_discriminator_captures_both_algorithms() -> None:
+    """The shared allowlist captures either compression discriminator."""
+    from tensorrt_llm.llmapi.llm_args import (
+        ColdPageQuantizationCompressionConfig,
+        TorchLlmArgs,
+        TriAttentionKvCacheCompressionConfig,
+    )
+    from tensorrt_llm.usage.llmapi_config import (
+        build_capture_manifest,
+        collect_llm_api_config_payloads,
+    )
+
+    entry = next(
+        item
+        for item in build_capture_manifest(TorchLlmArgs)
+        if item.path == "kv_cache_compression_config.algorithm"
+    )
+    assert repr(entry.annotation) == "typing.Literal['triattention']"
+    assert entry.converter == "allowlist"
+    assert set(entry.allowed_values) == {
+        "quantization_for_cold_page",
+        "triattention",
+    }
+    cold_field = ColdPageQuantizationCompressionConfig.model_fields["algorithm"]
+    assert cold_field.json_schema_extra["telemetry"] == {"exclude": True}
+    tri_field = TriAttentionKvCacheCompressionConfig.model_fields["algorithm"]
+    assert tri_field.json_schema_extra["telemetry"] == {
+        "kind": "categorical",
+        "converter": "allowlist",
+        "allowed_values": ["quantization_for_cold_page", "triattention"],
+    }
+
+    private_paths = (
+        "/private/modelopt-scales",
+        "/private/triattention.pt",
+    )
+    configs = (
+        ColdPageQuantizationCompressionConfig(
+            scale_checkpoint_path=private_paths[0],
+        ),
+        TriAttentionKvCacheCompressionConfig(
+            calibration_path=private_paths[1],
+        ),
+    )
+    for config in configs:
+        args = TorchLlmArgs(
+            model="/model",
+            kv_cache_compression_config=config,
+        )
+        config_json, metadata_json = collect_llm_api_config_payloads(args)
+        captured = json.loads(config_json)
+        metadata = json.loads(metadata_json)
+        assert captured["kv_cache_compression_config.algorithm"] == config.algorithm
+        assert "kv_cache_compression_config.scale_checkpoint_path" not in captured
+        assert "kv_cache_compression_config.calibration_path" not in captured
+        for private_path in private_paths:
+            assert private_path not in config_json
+            assert private_path not in metadata_json
+        assert metadata["capture_succeeded"] is True
+
+
 def test_load_generator_does_not_leak_sys_modules():
     """_load_generator must not leak its temporary module into sys.modules.
 

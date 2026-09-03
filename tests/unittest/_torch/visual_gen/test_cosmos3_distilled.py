@@ -81,10 +81,10 @@ def _base_policy() -> Cosmos3SamplingPolicy:
 
 
 def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
-    """A pipeline instance without heavyweight __init__; ``rank``/``dtype``/
-    ``device`` are BasePipeline properties and must not be set here."""
+    """A pipeline instance without heavyweight ``__init__``."""
     pipeline = object.__new__(Cosmos3OmniMoTPipeline)
     defaults = dict(
+        _device=torch.device("cpu"),
         audio_gen=False,
         action_gen=False,
         has_action_weights=False,

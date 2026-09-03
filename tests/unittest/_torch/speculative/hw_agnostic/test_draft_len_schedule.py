@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import sys
 
@@ -5,6 +20,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig, NGramDecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
@@ -29,18 +45,21 @@ def enforce_single_worker(monkeypatch):
     "drafter_type,schedule",
     [
         ("ngram", {1: 3, 4: 2, 8: 1}),
+        ("model_drafter", {1: 3, 4: 2, 8: 1}),
     ],
 )
 @pytest.mark.high_cuda_memory
-def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
+def test_correctness_across_batch_sizes(
+    enforce_single_worker, monkeypatch, drafter_type: str, schedule: dict
+):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     memory_required = 30 if drafter_type == "model_drafter" else 20
     if total_mem_gb < memory_required:
         pytest.skip(f"Not enough memory (need {memory_required}GB, have {total_mem_gb:.1f}GB)")
 
     models_path = llm_models_root()
-    target_model = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-    draft_model = f"{models_path}/llama-3.2-models/Llama-3.2-3B-Instruct"
+    target_model = f"{models_path}/Qwen3/Qwen3-8B"
+    draft_model = f"{models_path}/Qwen3/Qwen3-0.6B"
 
     max_batch_size = 8
     max_draft_len = max(schedule.values())  # Use max from schedule
@@ -99,28 +118,72 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
         )
         for i in range(len(prompts))
     ]
+
+    if drafter_type == "model_drafter":
+        prompts = ["The capital of France is"] * max_batch_size
+        sampling_params_list = [
+            SamplingParams(
+                max_tokens=max_tokens,
+                temperature=0,
+                seed=42,
+                ignore_eos=True,
+                top_k=1,
+                top_p=1.0,
+            )
+            for max_tokens in [4] * 4 + [8] * 3 + [12]
+        ]
+
     # With dynamic draft_len_schedule
     llm_with_schedule = LLM(**llm_common_config, speculative_config=spec_config)
+
+    runtime_schedule = []
+    if drafter_type == "model_drafter":
+        executor = llm_with_schedule._executor.engine
+        original_handle_dynamic_draft_len = executor._handle_dynamic_draft_len
+
+        def instrumented_handle_dynamic_draft_len(scheduled_batch):
+            original_handle_dynamic_draft_len(scheduled_batch)
+            runtime_schedule.append(
+                (scheduled_batch.batch_size, executor.model_engine.runtime_draft_len)
+            )
+
+        monkeypatch.setattr(
+            executor, "_handle_dynamic_draft_len", instrumented_handle_dynamic_draft_len
+        )
+
     results_with_schedule = llm_with_schedule.generate(prompts, sampling_params_list)
     generated_text_with_schedule = [result.outputs[0].text for result in results_with_schedule]
     llm_with_schedule.shutdown()
+
+    if drafter_type == "model_drafter":
+        for batch_size, runtime_draft_len in runtime_schedule:
+            expected_draft_len = get_draft_len_for_batch_size(schedule, batch_size, max_draft_len)
+            assert runtime_draft_len == expected_draft_len, (
+                f"DraftTarget resolved batch size {batch_size} to draft length "
+                f"{runtime_draft_len}, expected {expected_draft_len} from {schedule}"
+            )
+
+        runtime_transitions = [
+            observation
+            for index, observation in enumerate(runtime_schedule)
+            if index == 0 or observation != runtime_schedule[index - 1]
+        ]
+        expected_key_transitions = {(8, 1), (4, 2), (1, 3)}
+        assert expected_key_transitions.issubset(runtime_transitions), (
+            f"DraftTarget runtime schedule did not exercise {expected_key_transitions}: "
+            f"got {runtime_transitions}"
+        )
+        return
+
     # Reference: spec decode with fixed max_draft_len (no schedule)
-    if drafter_type == "ngram":
-        spec_config_fixed = NGramDecodingConfig(
-            max_draft_len=max_draft_len,
-            max_matching_ngram_size=2,
-            draft_len_schedule=None,  # No schedule - fixed draft length
-            is_keep_all=True,
-            is_use_oldest=True,
-            is_public_pool=False,
-        )
-    else:
-        # skipped for move to 1 model
-        spec_config_fixed = DraftTargetDecodingConfig(
-            max_draft_len=max_draft_len,
-            speculative_model=str(draft_model),
-            draft_len_schedule=None,  # No schedule - fixed draft length
-        )
+    spec_config_fixed = NGramDecodingConfig(
+        max_draft_len=max_draft_len,
+        max_matching_ngram_size=2,
+        draft_len_schedule=None,  # No schedule - fixed draft length
+        is_keep_all=True,
+        is_use_oldest=True,
+        is_public_pool=False,
+    )
     llm_fixed = LLM(**llm_common_config, speculative_config=spec_config_fixed)
     results_fixed = llm_fixed.generate(prompts, sampling_params_list)
     generated_text_fixed = [result.outputs[0].text for result in results_fixed]
@@ -163,7 +226,7 @@ def test_draft_len_schedule_functionality(
     )
 
     llm_common_config = dict(
-        model=llm_models_root() / "llama-3.1-model" / "Meta-Llama-3.1-8B",
+        model=llm_models_root() / "Qwen3" / "Qwen3-8B",
         backend="pytorch",
         attn_backend="TRTLLM",
         disable_overlap_scheduler=True,
@@ -179,10 +242,9 @@ def test_draft_len_schedule_functionality(
             draft_len_schedule=draft_schedule,
         )
     else:
-        # skipped for move to 1 model
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=5,
-            speculative_model=str(llm_models_root() / "llama-3.2-models" / "Llama-3.2-3B-Instruct"),
+            speculative_model=str(llm_models_root() / "Qwen3" / "Qwen3-0.6B"),
             draft_len_schedule=draft_schedule,
         )
     prompts = ["The capital of France is" for i in range(7)]

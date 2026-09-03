@@ -16,8 +16,8 @@
 
 import torch
 
-from tensorrt_llm._torch.models.dspark.draft import build_draft_input_ids, dspark_propose
-from tensorrt_llm._torch.models.dspark.heads import DSparkConfidenceHead, build_markov_head
+from tensorrt_llm._torch.models.modeling_dspark import build_draft_input_ids, dspark_propose
+from tensorrt_llm._torch.models.modeling_speculative import DSparkConfidenceHead, build_markov_head
 
 VOCAB, HID, RANK, B, BLK = 257, 32, 16, 2, 5
 NOISE_ID = 199

@@ -10,7 +10,15 @@ This guide uses Slurm and the `trtllm-llmapi-launch` multi-node launcher. The co
 
 ## Prerequisites
 
-* GPU: NVIDIA Blackwell GPUs. DEP16 and TEP16 use 16 GPUs; the TEP8 recipe uses 8 GPUs. These deployment recipes were validated on GB300 NVL GPUs. The repository's Slurm examples assume 4 GPUs per node. Other GPU architectures are not currently supported.
+* GPU: NVIDIA Blackwell GPUs. DEP16 and TEP16 use 16 GPUs; the TEP8 recipe uses 8 GPUs. These deployment recipes were validated on GB300 NVL GPUs. The repository's Slurm examples assume 4 GPUs per node. Per-GPU memory requirements differ per recipe, and are set by the attention layout rather than by the GPU count:
+
+  | Recipe | Attention layout | Per-rank weights | Requires |
+  | :-- | :-- | --: | :-- |
+  | DEP16 | attention-DP (replicated) | 210 GB | GB300-class per-GPU memory |
+  | TEP8 | attention-TP, EP8 | 213 GB | GB300-class per-GPU memory |
+  | TEP16 | attention-TP, EP16 | 115 GB | validated on GB200 (`SM100`) |
+
+  DEP16 replicates the BF16 non-expert weights on every rank (114 GB per rank) on top of the MXFP4 routed experts at 16-way expert parallelism (90 GB per rank). TEP16 shards those non-expert weights instead, which is what brings it within `SM100` per-GPU memory; TEP8 does not fit because its 8-way expert share alone is 181 GB per rank. On B200 (`SM100`), Kimi K3 is functionally supported at the kernel and module level and covered by unit tests in CI. Other GPU architectures are not supported.
 * Multi-node launcher: Slurm with the pyxis/enroot container plugin (or an equivalent MPI launcher) to start one rank per GPU across the nodes.
 * High-speed inter-node interconnect (e.g., NVLink/InfiniBand) for the expert-parallel traffic.
 * Shared filesystem visible to all nodes for the repository, the model weights, and the configuration file.
@@ -26,7 +34,7 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 
 ## Feature Support Notes
 
-* **Blackwell only.** NVIDIA Blackwell GPUs are supported. The configurations and results in this guide were validated on NVIDIA GB300 NVL GPUs. Support for other GPU architectures may be added in a future release.
+* **Blackwell only.** NVIDIA Blackwell GPUs are supported. The performance results in this guide were validated on NVIDIA GB300 NVL GPUs. Kimi K3 kernels and modules are also functional on B200 (`SM100`) and covered by unit tests in CI, and the TEP16 deployment is validated end-to-end on GB200 (`SM100`); DEP16 and TEP8 require GB300-class per-GPU memory (see Prerequisites). Support for other GPU architectures may be added in a future release.
 * **High-throughput and low-latency deployments are provided.** DEP16 (`enable_attention_dp: true`, `moe_expert_parallel_size: 16`) is the high-throughput deployment. TEP16 (`enable_attention_dp: false`, `moe_expert_parallel_size: 16`) is the low-latency deployment. An 8-GPU deployment, TEP8 (`enable_attention_dp: false`, `moe_expert_parallel_size: 8`), is also provided. Select the deployment and concurrency appropriate for your workload.
 * **CUDA graphs and the overlap scheduler are enabled.** The performance-sweep recipes set `disable_overlap_scheduler: false` and enable CUDA graphs. DEP16 additionally sets `cuda_graph_config.enable_padding: true`.
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
@@ -44,7 +52,7 @@ python3 scripts/build_wheel.py --cuda_architectures 103-real --skip_building_whe
 .venv-3.12/bin/python -m pip install -e .
 ```
 
-`build_wheel.py` creates the virtual environment at the repository root, named after the container's Python version: `.venv-3.12` for the current containers (Python 3.12). If your container ships a different Python, substitute the matching `.venv-<major>.<minor>` path in the commands on this page. Adjust `--cuda_architectures` to the target GPUs (`103-real` for GB300). The multi-node jobs below run TensorRT LLM from this in-place environment, so build and install with the repository at the same path the jobs use.
+`build_wheel.py` creates the virtual environment at the repository root, named after the container's Python version: `.venv-3.12` for the current containers (Python 3.12). If your container ships a different Python, substitute the matching `.venv-<major>.<minor>` path in the commands on this page. Adjust `--cuda_architectures` to the target GPUs (`103-real` for GB300, `100-real` for B200). A `103-real` build also runs on B200 (the Kimi K3 kernels compile for the `100f` family) but omits the `sm100a`-specific batched-GEMM kernels, so build with `100-real` when targeting B200. The multi-node jobs below run TensorRT LLM from this in-place environment, so build and install with the repository at the same path the jobs use.
 
 Kimi K3 additionally depends on `fla` and `einops`, installed into the same in-place environment (these dependencies might be removed in future releases, replaced by other kernels):
 
@@ -210,6 +218,16 @@ These options are set within the YAML file passed to `trtllm-serve` via the `--c
 
 * **Description:** Required to load the Kimi K3 configuration and tokenizer code shipped with the checkpoint.
 
+### Kimi-Specific API Behavior and Environment Variables
+
+When the served model is Kimi K3, `trtllm-serve` applies Kimi/Moonshot API semantics on `/v1/chat/completions` (all of these are exercised by Moonshot's [Kimi Vendor Verifier](https://www.kimi.com/blog/kimi-vendor-verifier.html)):
+
+* **Request extensions:** the `thinking` object (`{"type": "enabled"|"disabled", "keep": "all", "effort": "low"|"high"|"max"}`), `reasoning_effort` values `"low"`, `"high"`, `"max"`, and `"none"` (an explicit `thinking` object takes precedence), `tool_choice: "required"`, message-level (dynamic) tools declared on system messages, and `response_format` `json_object`/`json_schema` (the `json_schema` wrapper must carry a non-empty `name` and a `schema` object). These map onto the checkpoint chat template's native control messages; explicit `chat_template_kwargs` always win.
+* **Streaming usage:** `usage` is reported in the final streaming chunk even when the client does not send `stream_options` (Kimi API parity).
+* **Prompt-token accounting:** reported `usage.prompt_tokens` excludes the trailing 3-token generation channel opener, matching Kimi's reference accounting; the model still consumes the full rendered prompt.
+* **`TRTLLM_KIMI_PARAM_POLICY`** (default `0`, off): when set to `1`, enforces Kimi's immutable sampling parameters — `top_p` pinned to 0.95 (unset or the OpenAI default `1.0` are coerced to 0.95; other values are rejected with HTTP 400), `presence_penalty`/`frequency_penalty` 0, `n` 1, and `temperature` bounded to [0, 1]. Off by default so existing deployments keep accepting the requests they accept today; a Kimi-Vendor-Verifier certification run must set it to `1` (the KVV params suite requires the rejections).
+* **`TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR`** (default `0`): opt-in constrained decoding for tools with `strict: true` (requires `guided_decoding_backend: xgrammar`). Disabled by default pending the investigation of a device-side assert observed under sustained concurrent guided load; strict tools otherwise fall back to warn-and-continue.
+
 ## Testing API Endpoint
 
 The server (the OpenAI-compatible REST endpoint) runs on the rank-0 node, listening on port `8000`. Send requests to that node's hostname or IP; `localhost` only works from the rank-0 node itself.
@@ -260,6 +278,34 @@ The job writes progress and results to `kimi-k3-eval-<job-id>.log` in the submis
 | Strict match | 96.44 |
 
 The expected average accuracy is approximately 96.47. Small differences (roughly ±0.5 points) are possible with different checkpoint or dependency revisions.
+
+### TEP16 on GB200
+
+The same job runs the TEP16 layout with `--parallel tep`, which rewrites a per-job copy of the evaluation YAML with `enable_attention_dp: false` and raises `max_batch_size` from 32 to 128 (with attention-DP off every rank serves the same global batch instead of its own, so the batch size is raised to recover eval concurrency):
+
+```bash
+sbatch --account <account> --partition batch --qos <qos> --time 04:00:00 \
+    examples/kimi_k3/run_eval_kimi_k3.sbatch \
+    --model /path/to/kimi-k3-checkpoint \
+    --image /path/to/tensorrt-llm-container.sqsh \
+    --task gsm8k --parallel tep
+```
+
+The batch script declares `--nodes=4 --ntasks-per-node=4 --gpus-per-node=4`, and takes `--account`, `--partition` and `--qos` from the submitting command line. Export `KIMI_K3_ROUTER_BF16=0` before submitting: with attention-DP off the MoE router gate defaults to its BF16 fast path, which can flip borderline expert picks, so the reference scores above are only comparable with that path disabled. `KIMI_K3_FP8_WEIGHT_READ` defaults to `0`, which is the precision the reference scores were measured at.
+
+Measured on 16 GB200 GPUs (4 nodes, `100-real` build, 184.31 GiB per GPU), with the checkpoint's native MXFP4 routed experts:
+
+| Filter | Exact match |
+| :-- | --: |
+| Flexible extract | 96.82 |
+| Strict match | 96.74 |
+
+| Per-rank memory | Value |
+| :-- | --: |
+| Weights | 106.67 GiB |
+| Non-torch (NCCL, CUDA graphs) | 15.32 GiB |
+| Peak during profiling | 125.96 GiB |
+| KV cache at `free_gpu_memory_fraction: 0.25` | 15.60 GiB |
 
 ## Benchmarking Performance
 

@@ -282,16 +282,16 @@ def measure_drift(sel: dict, pr_head: Optional[str]) -> dict:
 
 def describe(sel: dict) -> str:
     """One-line account of the selection, for the CI log."""
-    lag = "lag unknown" if sel.get("lag") is None else f"{sel['lag']} commit(s) behind main"
+    lag = "unknown" if sel.get("lag") is None else f"+{sel['lag']} commit(s)"
     if sel.get("drift") is None:
-        drifted = "drift unmeasured"
+        base_distance = "unknown"
     else:
-        base = (sel.get("base_commit") or "")[:10]
-        relation = "at" if sel["drift"] == 0 else "before"
-        drifted = f"{sel['drift']} commit(s) {relation} the PR base {base}"
+        base_distance = f"+{sel['drift']} commit(s)"
+    base = (sel.get("base_commit") or "unknown")[:10]
     return (
-        f"[artifact] build {sel.get('build')}, commit {(sel.get('commit') or 'unknown')[:10]}, "
-        f"{lag}, {drifted}"
+        f"[artifact] selected build {sel.get('build')}, "
+        f"DB commit {(sel.get('commit') or 'unknown')[:10]}; topology from DB: "
+        f"PR base {base} ({base_distance}), current main tip ({lag})"
     )
 
 

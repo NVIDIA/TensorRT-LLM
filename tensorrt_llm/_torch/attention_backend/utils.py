@@ -63,6 +63,7 @@ def create_attention(
     aux_stream: Optional[torch.cuda.Stream] = None,
     kv_cache_dtype: str = "auto",
     flashinfer_mla_backend: Optional[str] = None,
+    skip_correction_threshold: float = 0.0,
 ) -> AttentionBackend:
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -98,6 +99,7 @@ def create_attention(
         aux_stream=aux_stream,
         sparse_params=sparse_params,
         kv_cache_dtype=kv_cache_dtype,
+        skip_correction_threshold=skip_correction_threshold,
     )
     if flashinfer_mla_backend is not None:
         # Only TrtllmAttention understands this selector. Raise instead of

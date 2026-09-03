@@ -16,7 +16,7 @@ tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_ct
 tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_decode_xqa_time  continuous    # decode XQA gpu_time — the green-discrete + red-continuous blind-spot case
 
 # --- GQA model-representative shapes (ctx prefill seq=2048 / decode cached=1024 bs=256) ---
-#   q8b = Qwen3-8B (32/8/128); l70b = Qwen3-32B / Llama-3.3-70B / Nemotron-Super-49B (64/8/128)
+#   q8b = Qwen3-8B (32/8/128); l70b = Qwen3-32B (64/8/128)
 tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_gqa_ctx_dispatch[attn_q8b_ctx_dispatch]       discrete
 tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_gqa_ctx_dispatch[attn_l70b_ctx_dispatch]      discrete
 tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_gqa_decode_dispatch[attn_q8b_decode_dispatch]  discrete

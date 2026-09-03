@@ -13,7 +13,10 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 @dataclass
 class TokenRange:
-    """Range of tokens in the sequence dimension."""
+    """Half-open token range [start, end) within one request.
+
+    ``KVSlice`` ranges are block-aligned. Empty ranges are valid.
+    """
 
     start: int
     end: int  # exclusive
@@ -21,7 +24,7 @@ class TokenRange:
     def __post_init__(self):
         if self.start < 0 or self.end < 0:
             raise ValueError("Token indices must be non-negative")
-        if self.start >= self.end:
+        if self.start > self.end:
             raise ValueError(f"Invalid range: [{self.start}, {self.end})")
 
 
@@ -41,29 +44,20 @@ class LayerRange:
 
 @dataclass
 class KVSlice:
-    """A KV cache slice covering token_range = [start, end) of one request.
+    """KV-cache blocks for one request transfer slice.
 
-    Single-slice transfer uses [0, prompt_len) with is_last_slice=True;
-    multi-slice transfers split token_range and mark the last slice.
-
-    Per-layer token starts are NOT encoded in token_range — they are derived
-    from block count by the sender:
-        total_blocks    = ceil(token_range.end / tpb)
-        token_start_i   = (total_blocks - len(block_ids_per_layer_groups[i])) * tpb
-    Cached prefix (full-attn or per-layer SWA) shows up only by shrinking the
-    block list. Beam search keeps this field 1-D: beam 0's blocks first,
-    followed by the final unshared block from each remaining beam.
-
-    SWA stale_end uses the request prompt_len (on the session), not
-    token_range.end — they differ for non-final slices.
+    Monolithic transfers omit ``token_range`` and cover ``prompt_len``.
+    Pipelined transfers use a block-aligned ``token_range`` and mark only the
+    final chunk with ``is_last_slice``. Block lists may omit cached or evicted
+    prefixes.
     """
 
-    token_range: Optional[TokenRange] = None
     layer_range: Optional[LayerRange] = None
     block_ids_per_layer_groups: List[np.ndarray] = field(
         default_factory=list
     )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
+    token_range: Optional[TokenRange] = None
 
 
 class SessionStatus(Enum):
@@ -103,7 +97,7 @@ class SessionArgsBase:
 
     params: DisaggregatedParams
     # Captured from LlmRequest.prompt_len; needed for SWA stale_end derivation.
-    prompt_len: Optional[int] = None
+    prompt_len: int
     beam_width: int = 1
 
 
@@ -157,7 +151,16 @@ class TxSessionBase(_SessionBase):
         self._sender = sender
 
     @abstractmethod
-    def send(self, slice: KVSlice) -> None: ...
+    def send(self, slice: KVSlice) -> None:
+        """Send a KV slice.
+
+        Args:
+            slice: The KV slice describing which source blocks to send.
+                For pipelined chunks, ``token_range`` is the shared sender-side
+                chunk cursor; each layer group projects it into its own
+                resident/windowed source and destination block ranges.
+        """
+        ...
 
     @abstractmethod
     def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]: ...

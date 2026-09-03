@@ -14,12 +14,13 @@ from io import BytesIO
 from typing import Any
 
 import numpy as np
+import PIL.Image
 import torch
 import torch.distributed as dist
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
+from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 
 from .pipeline_qwen_image import QwenImagePipeline, _calculate_shift
@@ -131,6 +132,15 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
     def default_warmup_resolutions(self) -> list[tuple[int, int]]:
         return [(1024, 1024)]
 
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="reference", min=1, max=None)],
+            ),
+        }
+
     def warmup_cache_key(self, height: int | None, width: int | None, **kwargs) -> tuple:
         return (height, width)
 
@@ -151,18 +161,27 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
 
     @staticmethod
     def _load_edit_images(image: Any) -> list[Any]:
-        if image is None:
-            raise ValueError("Qwen-Image-Edit requires params.image.")
-        images = image if isinstance(image, list) else [image]
-        pil_images = []
-        for item in images:
-            if isinstance(item, bytes):
-                from PIL import Image
+        """Normalize reference inputs to RGB images.
 
-                pil_images.append(Image.open(BytesIO(item)).convert("RGB"))
+        A request always arrives as encoded bytes; a direct caller may hand
+        over a PIL image instead, and converting it here costs nothing while
+        keeping ``forward`` usable as a library entry point.
+        """
+        if image is None:
+            raise ValueError("Qwen-Image-Edit requires image_reference.")
+        images = image if isinstance(image, list) else [image]
+        loaded = []
+        for index, item in enumerate(images):
+            if isinstance(item, PIL.Image.Image):
+                loaded.append(item.convert("RGB"))
+            elif isinstance(item, bytes):
+                loaded.append(PIL.Image.open(BytesIO(item)).convert("RGB"))
             else:
-                pil_images.append(load_image(item, format="pil"))
-        return pil_images
+                raise ValueError(
+                    "Reference images must be PIL images or encoded bytes; "
+                    f"item {index} has type {type(item).__name__}."
+                )
+        return loaded
 
     def _preprocess_edit_images(
         self,
@@ -341,7 +360,8 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
                 "QwenImageEditPlusPipeline currently supports num_images_per_prompt=1 only."
             )
         prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
-        pil_images = self._load_edit_images(params.image)
+        refs = params.image_reference
+        pil_images = self._load_edit_images([r.content for r in refs] if refs else None)
         height = params.height
         width = params.width
         if height is None or width is None:

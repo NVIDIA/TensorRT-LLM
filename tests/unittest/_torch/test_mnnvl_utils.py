@@ -18,7 +18,7 @@ from unittest.mock import patch
 import pynvml
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 
 
 def setup_function() -> None:
@@ -205,15 +205,15 @@ def test_supports_mnnvl_accepts_full_fabric(
 
 
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.deep_ep_installed",
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.deep_ep_installed",
     True,
 )
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.get_sm_version",
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.get_sm_version",
     return_value=90,
 )
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.torch.cuda.current_device",
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.torch.cuda.current_device",
     return_value=0,
 )
 @patch.object(MnnvlMemory, "_is_pcie_nvl_sku", return_value=True)
@@ -224,15 +224,15 @@ def test_deep_ep_low_latency_rejects_split_topology(
 
 
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.deep_ep_installed",
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.deep_ep_installed",
     True,
 )
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.get_sm_version",
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.get_sm_version",
     return_value=100,
 )
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.torch.cuda.current_device",
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.torch.cuda.current_device",
     return_value=0,
 )
 @patch.object(MnnvlMemory, "_is_pcie_nvl_sku", return_value=False)

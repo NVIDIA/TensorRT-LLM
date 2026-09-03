@@ -16,8 +16,8 @@
  */
 #pragma once
 
-#include <cassert>
 #include <string>
+#include <cassert>
 
 namespace batchedGemm
 {

@@ -328,3 +328,118 @@ def test_cute_dsl_fmha_blockscaled_forward(
     out_ref = _sdpa_ref(q_bf16, k_bf16, v_bf16, is_causal, sm_scale)
     assert torch.isfinite(out).all(), "Block-scaled FMHA produced NaN / Inf"
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize(
+    ("qk_sf_vec", "qk_cutlass_dtype_name"),
+    [
+        pytest.param(32, "Float8E4M3FN", id="mxfp8"),
+        pytest.param(16, "Float4E2M1FN", id="nvfp4"),
+    ],
+)
+def test_cute_dsl_fmha_blockscaled_forward_skip_softmax(
+    qk_sf_vec: int,
+    qk_cutlass_dtype_name: str,
+) -> None:
+    """SkipSoftmax composed with the block-scaled (MXFP8 / NVFP4) Q@K path.
+
+    The kernel's skip threshold in log2-space is
+    ``log2(skip_softmax_threshold_scale_factor / seq_len_kv)``, and at this
+    ``seq_len_kv`` the skip decision is block-granular (only a handful of
+    K-blocks), so which blocks get skipped is a step function of the
+    threshold rather than a smooth one: values calibrated empirically (via a
+    threshold sweep on this exact seed/shape/dtype) below ~650 skip nothing
+    (dense-equivalent, just quantization noise) and above ~750 over-skip
+    into a near-degenerate output (cosine similarity vs. the dense SDPA
+    reference collapsing well under 0.5). 700 sits past the first skip
+    transition with margin from the next one, so it reliably skips at least
+    one block without over-skipping, for both MXFP8 and NVFP4. To confirm
+    skipping actually happened (not just that the kernel didn't crash), the
+    skip-softmax output is asserted to measurably differ from the dense
+    (``threshold=0``) output computed from the *same* quantized inputs, in
+    addition to a cosine-similarity check against the dense SDPA reference.
+    Unlike ``test_cute_dsl_fmha_blockscaled_forward``, this doesn't use a
+    tight elementwise tolerance or the 0.99 bound
+    ``test_attention_trtllm_sage.py`` uses for the TRTLLM backend's
+    (differently-thresholded) skip_softmax check: SkipSoftmax intentionally
+    discards information once a block is actually skipped, so 0.95 is used
+    instead -- still a strong correlation, but consistent with a threshold
+    picked to guarantee real skipping over reproducing TRTLLM's bound.
+    """
+    _require_supported_gpu_arch()
+
+    device = torch.device("cuda:0")
+    batch_size, seq_len_q, seq_len_kv = 1, 512, 512
+    num_heads, num_heads_kv = 4, 2
+    head_dim = 128  # kernel-imposed for block-scaled MXFP8 / NVFP4
+    sm_scale = head_dim**-0.5
+    skip_softmax_threshold_scale_factor = 700.0
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    q_bf16 = (
+        torch.randn(batch_size, seq_len_q, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+        * 0.5
+    )
+    k_bf16 = (
+        torch.randn(
+            batch_size, seq_len_kv, num_heads_kv, head_dim, dtype=torch.bfloat16, device=device
+        )
+        * 0.5
+    )
+    v_bf16 = (
+        torch.randn(
+            batch_size, seq_len_kv, num_heads_kv, head_dim, dtype=torch.bfloat16, device=device
+        )
+        * 0.5
+    )
+
+    q_q, q_sf, scale_q = _quantize_blockscaled_one(q_bf16, qk_sf_vec)
+    k_q, k_sf, scale_k = _quantize_blockscaled_one(k_bf16, qk_sf_vec)
+    v_q, scale_v, scale_v_channels = _quantize_fp8_v(v_bf16, per_head_channel=False)
+    qk_cutlass_dtype = getattr(cutlass, qk_cutlass_dtype_name)
+
+    def _run(threshold: float) -> torch.Tensor:
+        out = torch.empty(
+            batch_size, seq_len_q, num_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        lse = torch.empty(batch_size, seq_len_q, num_heads, dtype=torch.float32, device=device)
+        cute_dsl_fmha_fwd(
+            q_q,
+            k_q,
+            v_q,
+            out,
+            is_causal=False,
+            scale_v=scale_v,
+            scale_v_channels=scale_v_channels,
+            sm_scale=sm_scale,
+            lse=lse,
+            scale_q=scale_q,
+            scale_k=scale_k,
+            qk_sf_vec=qk_sf_vec,
+            q_sf=q_sf,
+            k_sf=k_sf,
+            qk_cutlass_dtype=qk_cutlass_dtype,
+            skip_softmax_threshold_scale_factor=threshold,
+        )
+        torch.cuda.synchronize()
+        return out
+
+    out_dense = _run(0.0)
+    out_skip = _run(skip_softmax_threshold_scale_factor)
+
+    assert torch.isfinite(out_dense).all(), "Dense block-scaled FMHA produced NaN / Inf"
+    assert torch.isfinite(out_skip).all(), "SkipSoftmax block-scaled FMHA produced NaN / Inf"
+
+    max_abs_diff = (out_skip.float() - out_dense.float()).abs().max().item()
+    assert max_abs_diff > 1e-3, (
+        f"SkipSoftmax output matches the dense output (max abs diff {max_abs_diff:.6f}); "
+        "skip_softmax_threshold_scale_factor did not actually skip any blocks."
+    )
+
+    out_ref = _sdpa_ref(q_bf16, k_bf16, v_bf16, is_causal=False, sm_scale=sm_scale)
+    cos_sim = F.cosine_similarity(
+        out_skip.reshape(-1).float(), out_ref.reshape(-1).float(), dim=0
+    ).item()
+    assert cos_sim > 0.95, f"Cosine similarity {cos_sim:.6f} below threshold"

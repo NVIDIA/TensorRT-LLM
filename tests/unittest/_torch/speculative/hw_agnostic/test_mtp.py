@@ -12,7 +12,10 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
-from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+from tensorrt_llm._torch.speculative.interface import (
+    INVALID_PROMPT_LOOKAHEAD_TOKEN,
+    should_use_separate_draft_kv_cache,
+)
 from tensorrt_llm._torch.speculative.mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
 from tensorrt_llm._torch.speculative.utils import (
     get_num_extra_kv_tokens,
@@ -1788,19 +1791,22 @@ def test_mtp_shared_kv_draft_inputs():
 
     draft_ids, recurrent_hidden, draft_positions = worker._prepare_shared_kv_draft_inputs(
         accepted_tokens=accepted_tokens,
-        num_accepted_tokens=torch.tensor([1, 2, 3]),
+        num_accepted_tokens=torch.tensor([1, 1, 3]),
         hidden_states=torch.arange(20, dtype=torch.float32).unsqueeze(1),
         position_ids=torch.arange(10, dtype=torch.int32).unsqueeze(0),
         sequence_lengths=torch.tensor([2, 4, 4]),
-        num_contexts=1,
+        num_contexts=2,
         batch_indices=torch.arange(3),
+        prompt_lookahead_tokens=torch.tensor(
+            [13, INVALID_PROMPT_LOOKAHEAD_TOKEN], dtype=torch.int32
+        ),
     )
 
-    torch.testing.assert_close(draft_ids, torch.tensor([10, 21, 32], dtype=torch.int32))
-    torch.testing.assert_close(recurrent_hidden.squeeze(1), torch.tensor([1.0, 3.0, 8.0]))
+    torch.testing.assert_close(draft_ids, torch.tensor([13, 20, 32], dtype=torch.int32))
+    torch.testing.assert_close(recurrent_hidden.squeeze(1), torch.tensor([1.0, 5.0, 8.0]))
     torch.testing.assert_close(
         draft_positions,
-        torch.tensor([[2, 4, 9]], dtype=torch.int32),
+        torch.tensor([[2, 6, 9]], dtype=torch.int32),
     )
 
 

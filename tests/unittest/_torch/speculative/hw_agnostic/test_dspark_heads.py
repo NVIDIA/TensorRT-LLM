@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.dspark.heads import (
+from tensorrt_llm._torch.models.modeling_speculative import (
     DSparkConfidenceHead,
     RNNHead,
     VanillaMarkov,

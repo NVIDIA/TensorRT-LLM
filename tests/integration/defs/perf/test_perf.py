@@ -839,12 +839,6 @@ class PerfTestConfig:
                     [b >= 32 for b in self.batch_sizes]
                 ), f"BERT with small BS is very unstable! Please increase to at least 32."
 
-            # GPT-350m and Bloom-560m with small BS are very unstable. Only run these small models with larger BS.
-            if self.model_name in ["gpt_350m", "bloom_560m"]:
-                assert all(
-                    [b >= 32 for b in self.batch_sizes]
-                ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
-
         # Skip if not enough GPUs. TRTLLM_TOTAL_GPU_COUNT overrides
         # auto-detection for multi-node setups.
         total_gpus = int(os.environ["TRTLLM_TOTAL_GPU_COUNT"]

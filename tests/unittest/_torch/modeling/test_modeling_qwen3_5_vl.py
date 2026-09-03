@@ -5,8 +5,11 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List, Optional
+from unittest.mock import patch
 
+import pytest
 import torch
 import transformers
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
@@ -19,7 +22,10 @@ from tensorrt_llm._torch.models import Qwen3_5VLModel
 from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
-from tensorrt_llm._torch.models.modeling_qwen3_5 import _normalize_qwen35_vl_config
+from tensorrt_llm._torch.models.modeling_qwen3_5 import (
+    _normalize_qwen35_quant_config_dict,
+    _normalize_qwen35_vl_config,
+)
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
     load_pretrained_config,
@@ -27,6 +33,8 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_mamba_ssm_cache_dtype
 from tensorrt_llm.inputs import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 # Dense sibling of test_modeling_qwen3_5_vl_moe.py. The dense Qwen3.5-VL
 # (Qwen/Qwen3.5-27B, arch Qwen3_5ForConditionalGeneration, model_type qwen3_5)
@@ -172,6 +180,76 @@ def test_qwen35_dense_vl_resolves_model_and_mapper(tmp_path: Path) -> None:
         AutoCheckpointMapper.get("HF", "Qwen3_5ForConditionalGeneration"),
         Qwen3_5MoeHfWeightMapper,
     )
+
+
+@pytest.mark.parametrize("sm_version", [90, 100, 103, 120, 121])
+def test_qwen35_dense_vl_normalizes_native_nvfp4_mlp_paths(sm_version: int) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={
+            f"model.language_model.layers.0.mlp.{proj}": QuantConfig(quant_algo=QuantAlgo.NVFP4)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        },
+    )
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        return_value=sm_version,
+    ):
+        _normalize_qwen35_quant_config_dict(model_config)
+
+    assert set(model_config.quant_config_dict) == {
+        f"model.layers.0.mlp.mlp.{proj}" for proj in ("gate_proj", "up_proj", "down_proj")
+    }
+    assert all(
+        config.quant_algo == QuantAlgo.NVFP4 for config in model_config.quant_config_dict.values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("sm_version", "expected_algo"),
+    [
+        (90, QuantAlgo.W4A16_NVFP4),
+        (100, QuantAlgo.NVFP4),
+        (103, QuantAlgo.NVFP4),
+        (120, QuantAlgo.W4A16_NVFP4),
+        (121, QuantAlgo.W4A16_NVFP4),
+    ],
+)
+def test_qwen35_dense_vl_preserves_w4a16_nvfp4_behavior(
+    sm_version: int, expected_algo: QuantAlgo
+) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={
+            "model.language_model.layers.0.mlp.gate_proj": QuantConfig(
+                quant_algo=QuantAlgo.W4A16_NVFP4
+            )
+        },
+    )
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        return_value=sm_version,
+    ):
+        _normalize_qwen35_quant_config_dict(model_config)
+
+    config = model_config.quant_config_dict["model.layers.0.mlp.mlp.gate_proj"]
+    assert config.quant_algo == expected_algo
+
+
+def test_qwen35_dense_vl_leaves_fp8_mlp_paths_unchanged() -> None:
+    name = "model.language_model.layers.0.mlp.gate_proj"
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={name: QuantConfig(quant_algo=QuantAlgo.FP8)},
+    )
+
+    _normalize_qwen35_quant_config_dict(model_config)
+
+    assert model_config.quant_config_dict == {
+        "model.layers.0.mlp.gate_proj": QuantConfig(quant_algo=QuantAlgo.FP8)
+    }
 
 
 def test_qwen35_dense_vl_disable_mm_encoder_skips_vision_tower(

@@ -51,6 +51,10 @@ struct FmhaData {
     // [0..8] is a reasonable range of values for this.
     float inflateMax;
 
+    // Freeze a running row max when its increase in the base-2 softmax domain does not exceed this
+    // threshold. A value of 0 disables threshold-based freezing; 8 is recommended for E4M3 BMM2.
+    float skipCorrThreshold{0.f};
+
     // page indexes of Kv. The shape is [batchSize, 2, maxNumPagesPerSeqKv], or [numHeadsKv *
     // batchSize, 2, maxNumPagesPerSeqKv] for sparse attention.
     int32_t const* kvPageIdxD;
@@ -70,7 +74,7 @@ struct FmhaData {
 
   struct Scales {
     // DSv4 inverse-RoPE + 1x128 FP8 quant fusion output scale tensor.
-    float* dsv4OScaleFp32D{nullptr};
+    float* dsv4OScaleD{nullptr};
 
     // FP4 scaling factors for KV cache
     void const* kSfBasePtr;
@@ -142,6 +146,12 @@ struct FmhaData {
     // The output tensor for O. The shape is [sum(seqLensQ), hiddenDimO]
     void* oPtrD;
 
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+    // The output pointer used for invalidation to test FineGrained producer.
+    void* invalidatePtrD;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
   };
 
   MetaData mMetaData;

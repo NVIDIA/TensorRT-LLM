@@ -80,6 +80,12 @@ cudaStream_t currentStreamFor(at::Tensor const& tensor)
     return at::cuda::getCurrentCUDAStream(tensor.get_device()).stream();
 }
 
+bool isQOnlyInput(at::Tensor const& qkvInput, int64_t const numHeads, int64_t const headSize)
+{
+    TORCH_CHECK(qkvInput.dim() > 0, "QKV input must have at least one dimension.");
+    return qkvInput.size(-1) == numHeads * headSize;
+}
+
 struct WorkspaceAccessor
 {
     uint8_t* base{};
@@ -276,7 +282,8 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     TORCH_CHECK(kv_cache_block_offsets.has_value(), "kv_cache_block_offsets is required.");
     TORCH_CHECK(!cross_attention || !is_mla_enable, "trtllm-gen cross attention does not support MLA.");
 
-    bool const separateQKvOutput = paged_context_fmha || fp8_context_fmha || cross_attention;
+    bool const qOnlyInput = !cross_attention && isQOnlyInput(qkv_input, num_heads, head_size);
+    bool const separateQKvOutput = paged_context_fmha || fp8_context_fmha || cross_attention || qOnlyInput;
     auto const qkvScalarType = qkv_input.scalar_type();
     auto const qkvElementSize = static_cast<size_t>(qkv_input.element_size());
     auto const quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
@@ -396,6 +403,7 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
         qkvParams.separate_q_kv_output = separateQKvOutput;
         qkvParams.quantized_fp8_output = fp8_context_fmha;
         qkvParams.generation_phase = false;
+        qkvParams.q_only_input = qOnlyInput;
         qkvParams.multi_processor_count = static_cast<int>(multi_processor_count);
         qkvParams.rotary_vision_start = 0;
         qkvParams.rotary_vision_length = 0;
@@ -470,6 +478,10 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     int64_t const attention_chunk_size, int64_t const multi_processor_count)
 {
     (void) mask_type;
+    if (isQOnlyInput(qkv_input, num_heads, head_size))
+    {
+        return;
+    }
     auto const qkvScalarType = qkv_input.scalar_type();
     auto const qkvElementSize = static_cast<size_t>(qkv_input.element_size());
     auto const quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
@@ -596,6 +608,7 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     (void) bmm2_scale;
 
     bool const isMultiTokenGen = spec_decoding_generation_lengths.has_value() && predicted_tokens_per_seq > 1;
+    bool const qOnlyInput = !cross_attention && isQOnlyInput(qkv_input, num_heads, head_size);
     TORCH_CHECK(
         !cross_attention || !isMultiTokenGen, "trtllm-gen cross attention does not support multi-token generation.");
     auto const qkvScalarType = qkv_input.scalar_type();
@@ -728,6 +741,7 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
         qkvParams.separate_q_kv_output = true;
         qkvParams.quantized_fp8_output = fp8_context_fmha;
         qkvParams.generation_phase = true;
+        qkvParams.q_only_input = qOnlyInput;
         qkvParams.multi_processor_count = static_cast<int>(multi_processor_count);
         qkvParams.rotary_vision_start = 0;
         qkvParams.rotary_vision_length = 0;

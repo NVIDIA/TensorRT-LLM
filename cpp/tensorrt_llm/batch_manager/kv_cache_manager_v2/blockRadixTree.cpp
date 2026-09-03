@@ -916,20 +916,23 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
+    // Content-divergence depth is measured before page or recurrent-snapshot pruning.
+    int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
     auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
     // Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
     // the prefix the attention pages alone support. Only hybrid models pay for
     // the second pass; without an SSM life cycle the two results are identical.
-    std::optional<int> attnOnlyTokens;
+    std::optional<int> numReusableTokensBeforeHybridPruning;
     if (ssmLcId.has_value())
     {
-        attnOnlyTokens = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+        numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
     }
     auto const matched = pruneMatch(std::move(rawMatched), ssmLcId);
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
-    result.numTokensBeforeHybridPruning = attnOnlyTokens.value_or(result.numTokens);
+    result.numReusableTokensBeforeHybridPruning = numReusableTokensBeforeHybridPruning.value_or(result.numTokens);
+    result.numReusableTokensBeforePruning = numReusableTokensBeforePruning;
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {

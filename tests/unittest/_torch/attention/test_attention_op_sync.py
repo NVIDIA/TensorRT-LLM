@@ -41,6 +41,7 @@ import re
 import textwrap
 import typing
 from dataclasses import fields
+from types import SimpleNamespace
 
 import pytest
 
@@ -658,3 +659,20 @@ def test_no_sequence_kwargs_at_thop_attention_boundary():
         "the following params into their named scalar/tensor components:\n"
         + "\n".join(f"  - {name}: {t}" for name, t in sequence_params)
     )
+
+
+@pytest.mark.parametrize(
+    ("is_cross", "update_kv_cache", "expected"),
+    (
+        (False, False, False),
+        (False, True, True),
+        (True, False, True),
+    ),
+)
+def test_fallback_support_matches_thop_kv_update_contract(is_cross, update_kv_cache, expected):
+    """Do not dispatch requests that the native attention op rejects."""
+    fmha = object.__new__(FallbackFmha)
+    metadata = SimpleNamespace(is_cross=is_cross)
+    forward_args = AttentionForwardArgs(update_kv_cache=update_kv_cache)
+
+    assert fmha.is_supported(None, None, None, metadata, forward_args) is expected

@@ -17,12 +17,12 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (RenormalizeMoeRoutingMethod, VanillaMoE,
-                                 create_moe, is_moe_weight_owner)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (RenormalizeMoeRoutingMethod, VanillaMoE,
+                             create_moe, is_moe_weight_owner)
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              duplicate_kv_weight, register_auto_model)

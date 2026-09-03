@@ -204,8 +204,11 @@ class GenerationResultBase:
         self.metrics_dict = {}
         self.candidate_metrics: list[dict] = []
         self.trace_headers: Optional[dict[str, str]] = None
-        # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
-        self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
+        # Multi-beam search does not report logprobs incrementally: each response
+        # carries the full list, so it is sliced against _last_logprobs_len rather
+        # than appended wholesale.
+        self._logprobs_reported_cumulatively = (sampling_params.use_beam_search
+                                                and sampling_params.best_of > 1)
 
         if has_event_loop():
             self.aqueue = AsyncQueue()
@@ -289,19 +292,13 @@ class GenerationResultBase:
             self, perf_metrics: "tllm.RequestPerfMetrics") -> None:
         """Backfill RequestPerfMetrics.speculative_decoding in the PyTorch flow.
 
-        The C++ runtime accumulates that section in
-        LlmRequest::updateNumTokensPerIteration, which the PyTorch flow
-        (TorchSampler) never calls, so the section arrives zeroed even when
-        drafting ran. The PyTorch executor instead attaches cumulative
+        Nothing populates that section runtime-side, so it arrives zeroed even
+        when drafting ran. The PyTorch executor instead attaches cumulative
         (accepted, drafted) totals to the response (LlmResult.spec_dec_totals,
         stashed on self in _handle_response); fill the section from them.
-        No-op when the section is already populated (TRT engine / TRTLLMSampler
-        paths) or when no drafting occurred.
+        No-op when no drafting occurred.
         """
         if not self.spec_dec_totals:
-            return
-        spec_dec = perf_metrics.speculative_decoding
-        if spec_dec is not None and spec_dec.total_draft_tokens > 0:
             return
         accepted, drafted = self.spec_dec_totals
         if drafted <= 0:
@@ -360,7 +357,7 @@ class GenerationResultBase:
                     *self._get_decoder_output_prefix_logprobs(),
                     *response_tensors.log_probs[src_idx],
                 ]
-            elif self.use_trtllm_sampler:
+            elif self._logprobs_reported_cumulatively:
                 assert output._last_logprobs_len <= len(
                     response_tensors.log_probs[src_idx]
                 ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
@@ -375,7 +372,7 @@ class GenerationResultBase:
 
             # overcome some WAR in the cpp executor
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
-                if self.use_trtllm_sampler and len(
+                if self._logprobs_reported_cumulatively and len(
                         output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.

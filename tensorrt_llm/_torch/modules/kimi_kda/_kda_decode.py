@@ -33,6 +33,13 @@ def _require_cuda_fp32(name: str, tensor: torch.Tensor) -> None:
         raise TypeError(f"{name} must be a CUDA float32 tensor")
 
 
+def _as_token_rows(tensor: torch.Tensor) -> torch.Tensor:
+    """Keep a decode input view when its head and channel axes are packed."""
+    if tensor.ndim == 4 and tensor.stride(3) == 1 and tensor.stride(2) == tensor.shape[3]:
+        return tensor
+    return tensor.contiguous()
+
+
 def _dummy_tensor(
     tag: str,
     shape: tuple[int, ...],
@@ -126,7 +133,11 @@ def run_kda_decode_fusion_cuda(
         )
     if ssm_state_indices is None and not state.is_contiguous():
         raise ValueError("state must be contiguous because it is updated in place")
-    if out is not None:
+    if out is None:
+        # The op is inplace-only and never allocates, so supply a buffer here.
+        # Hot decode paths pass a persistent one instead.
+        out = x_q.new_empty((B, 1, HV, 128))
+    else:
         _require_cuda_bf16("out", out)
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
@@ -159,19 +170,20 @@ def run_kda_decode_fusion_cuda(
         _require_cuda_fp32(name, tensor)
 
     if update_conv_cache:
-        q_stride = H * 128
-        v_stride = HV * 128
+        if any(tensor.ndim != 3 for tensor in (cs_q, cs_k, cs_v)):
+            raise ValueError("update_conv_cache expects rank-3 conv-state pools")
+        projection_size = H * 128
+        conv_state_width = cs_q.shape[2]
+        min_slot_stride = 3 * projection_size * conv_state_width
         if not (
-            cs_q.stride(1) == 1
-            and cs_k.stride(1) == 1
-            and cs_v.stride(1) == 1
-            and cs_q.stride(2) == q_stride
-            and cs_k.stride(2) == q_stride
-            and cs_v.stride(2) == v_stride
+            cs_q.stride(0) == cs_k.stride(0) == cs_v.stride(0)
+            and cs_q.stride(0) >= min_slot_stride
+            and cs_q.stride(1) == cs_k.stride(1) == cs_v.stride(1) == conv_state_width
+            and cs_q.stride(2) == cs_k.stride(2) == cs_v.stride(2) == 1
         ):
             raise ValueError(
-                "update_conv_cache expects transposed conv-state layout: "
-                "shape [B, dim, 3], stride(1)=1, stride(2)=dim"
+                "update_conv_cache expects section views of packed "
+                "[slots, 3 * dim, width] conv states"
             )
 
     if cu_seqlens is None:
@@ -184,9 +196,9 @@ def run_kda_decode_fusion_cuda(
         cu_seqlens = cu_seqlens.contiguous()
 
     args = (
-        x_q.contiguous(),
-        x_k.contiguous(),
-        x_v.contiguous(),
+        _as_token_rows(x_q),
+        _as_token_rows(x_k),
+        _as_token_rows(x_v),
         w_q_t.contiguous(),
         w_k_t.contiguous(),
         w_v_t.contiguous(),
@@ -197,10 +209,10 @@ def run_kda_decode_fusion_cuda(
         cs_k if update_conv_cache else cs_k.contiguous(),
         cs_v if update_conv_cache else cs_v.contiguous(),
         A_log.contiguous(),
-        g.contiguous(),
+        _as_token_rows(g),
         dt_bias.contiguous(),
-        beta.contiguous(),
-        onorm_g.contiguous(),
+        beta if beta.ndim == 3 and beta.stride(2) == 1 else beta.contiguous(),
+        _as_token_rows(onorm_g),
         onorm_weight.contiguous(),
         ssm_state_indices,
         cu_seqlens,
@@ -218,4 +230,5 @@ def run_kda_decode_fusion_cuda(
         float(scale),
         float(onorm_eps),
     )
-    return torch.ops.trtllm.kda_decode(*args, *launch_args, output=out)
+    torch.ops.trtllm.kda_decode(*args, *launch_args, output=out)
+    return out

@@ -28,7 +28,7 @@ from triton_kernels.target_info import cuda_capability_geq
 from triton_kernels.tensor import FP4, Tensor, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
 
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import (
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_triton import (
     TritonEPRouter,
     TritonRoutingData,
     combine_expert_outputs,

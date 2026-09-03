@@ -17,53 +17,17 @@
 
 from collections.abc import Iterable, Mapping
 
-_SCENARIO_SERVER_MATCH_KEYS = (
-    "s_model_name",
-    "l_gpus",
-)
-
-_CONFIG_SERVER_MATCH_KEYS = (
-    "s_model_name",
-    "l_tp",
-    "l_ep",
-    "l_pp",
-    "l_cp",
-    "l_gpus_per_node",
-    "l_max_batch_size",
-    "b_enable_attention_dp",
-    "s_serving_backend",
-    "s_kv_cache_dtype",
-    "s_cache_transceiver_backend",
-    "s_spec_decoding_type",
-    "l_num_nextn_predict_layers",
-    "l_force_num_accepted_tokens",
-    "l_load_balancer_num_slots",
-)
-
-_CLIENT_MATCH_KEYS = (
-    "l_concurrency",
-    "l_iterations",
-    "l_isl",
-    "l_osl",
-    "d_random_range_ratio",
-    "s_backend",
-    "b_use_chat_template",
-    "b_streaming",
-    "b_use_nv_sa_benchmark",
-    "b_eos",
+_TEST_CASE_MATCH_KEYS = (
+    "s_test_case_name",
+    "s_gpu_type",
+    "s_runtime",
+    "s_branch",
 )
 
 
-def get_server_match_keys(match_mode: str) -> list[str]:
-    """Return database fields that identify an equivalent server run."""
-    if match_mode == "scenario":
-        return list(_SCENARIO_SERVER_MATCH_KEYS)
-    return list(_CONFIG_SERVER_MATCH_KEYS)
-
-
-def get_client_match_keys() -> list[str]:
-    """Return database fields that identify an equivalent client workload."""
-    return list(_CLIENT_MATCH_KEYS)
+def get_test_case_match_keys() -> list[str]:
+    """Return database fields that identify an equivalent perf test case."""
+    return list(_TEST_CASE_MATCH_KEYS)
 
 
 def benchmark_data_matches(
