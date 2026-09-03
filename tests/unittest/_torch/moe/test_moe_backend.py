@@ -19,6 +19,7 @@ import itertools
 import logging
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock
@@ -1239,12 +1240,16 @@ def should_skip_locality_domain_param(
     quant_algo: Optional[QuantAlgo],
     activation_type: ActivationType,
     swiglu_gptoss_style: bool,
+    dtype: torch.dtype,
 ) -> Optional[str]:
     """Return a static skip reason for locality domain MoE backend params."""
     if backend_type != MoeBackendType.CUTEDSL:
         return "locality domain MoE backend test only supports CuteDSL"
     if quant_algo not in (QuantAlgo.NVFP4, None):
         return "locality domain MoE backend test only supports NVFP4 or BF16"
+    # plan_moe only enables the unquantized path for bfloat16 activations.
+    if quant_algo is None and dtype != torch.bfloat16:
+        return "unquantized locality domain MoE requires bfloat16"
     if activation_type != ActivationType.Swiglu:
         return "locality domain MoE backend test only supports SwiGLU"
     if swiglu_gptoss_style:
@@ -1269,7 +1274,9 @@ def should_skip_locality_domain_runtime(enable_locality_domains: bool) -> Option
     return None
 
 
-def test_ci_acceleration_keeps_only_locality_domain_cutedsl_bf16(monkeypatch: pytest.MonkeyPatch):
+def test_ci_acceleration_keeps_only_locality_domain_cutedsl_bf16(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from _torch.moe import moe_test_utils
 
     monkeypatch.setattr(moe_test_utils, "IS_CI_MODE", True)
@@ -1358,6 +1365,7 @@ def generate_test_params() -> List:
                 quant_algo,
                 ActivationType.Swiglu,
                 swiglu_gptoss_style,
+                dtype,
             )
             locality_domain_param_values = (
                 dtype,
@@ -1518,7 +1526,7 @@ def test_moe_backend(
     swiglu_limit: Optional[float],
     monkeypatch: pytest.MonkeyPatch,
     enable_locality_domains: bool,
-    tmp_path,
+    tmp_path: Path,
 ):
     """
     Test MoE backend with autotune to capture all tactics.
