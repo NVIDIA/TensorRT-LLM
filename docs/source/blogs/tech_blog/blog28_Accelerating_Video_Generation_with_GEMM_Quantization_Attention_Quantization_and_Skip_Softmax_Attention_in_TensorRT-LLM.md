@@ -13,7 +13,7 @@ Figure 1 breaks down pipeline-forward time for Wan 2.2 T2V-A14B on a single NVID
 </p>
 <p align="center"><sub><em>Figure 1. Diffusion pipeline-forward breakdown for Wan 2.2 T2V-A14B in BF16 on B200.</em></sub></p>
 
-Our earlier post, [Scaling Video Generation Across NVL72 Rack with TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md), showed how TensorRT-LLM accelerates video generation across an NVL72 rack. This post focuses on three complementary techniques within one transformer pipeline: GEMM quantization, quantized attention, and sparse attention. The central question is how to reduce latency without giving up more visual quality than the application can tolerate.
+Our earlier post, [Scaling Video Generation Across NVL72 Rack with TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md), showed how to accelerate video generation with multiple GPUs. This post focuses on three complementary techniques within one GPU: GEMM quantization, quantized attention, and sparse attention. The central question is how to reduce latency without giving up more visual quality than the application can tolerate.
 
 ## Table of Contents
 
@@ -95,12 +95,10 @@ We evaluate the three techniques on a fixed Wan 2.2 workload while varying GEMM 
 
 The ModelOpt checkpoints have already included calibrated Skip Softmax metadata. For the BF16 Skip Softmax rows, the same metadata is added to the BF16 checkpoint.
 
-We use two baselines:
+We use compiled BF16 with standard attention and no Skip Softmax as the common baseline:
 
-- **Quality:** LPIPS compares each video with an eager BF16 generation from the same prompt and seed.
-- **Speed:** Speedup compares pipeline-forward latency with compiled dense BF16, whose mean latency is **412.6 seconds** across the seven prompts. This excludes compilation's own speedup and isolates the three optimizations studied here.
-
-Compilation can change kernel fusion and floating-point operation ordering, so compiled dense BF16 is not numerically identical to eager BF16. It therefore appears at `1.00×` speedup but has a nonzero mean LPIPS of `0.2150` against the eager quality baseline.
+- **Quality:** LPIPS compares each video with the BF16 generation from the same prompt and seed, with `torch.compile` enabled.
+- **Speed:** Speedup compares pipeline-forward latency with the same compiled BF16 baseline, whose mean latency is **412.6 seconds** across the seven prompts. This excludes compilation's own speedup and isolates the three optimizations studied here.
 
 The 96 configurations are a characterization sweep, not a recommended per-model tuning cost:
 
@@ -127,24 +125,24 @@ The aggressive point shows the upper-speed end of the sweep rather than a recomm
   <img src="../media/tech_blog28_quality_speed_frontier.png" alt="Scatter plot of speedup versus mean LPIPS for the Wan 2.2 optimization sweep, with squares for runs without Skip Softmax, stars for conservative configurations, triangles for aggressive configurations, and a dashed global Pareto frontier" width="1080">
 </p>
 
-<p align="center"><sub><em>Figure 2. Speedup–quality frontier across all 96 configurations. LPIPS is measured against eager BF16; speedup is relative to compiled dense BF16.</em></sub></p>
+<p align="center"><sub><em>Figure 2. Speedup–quality frontier across all 96 configurations. Both LPIPS and speedup are measured against compiled BF16 with standard attention and no Skip Softmax.</em></sub></p>
 
 ### Frontier analysis
 
-The table condenses the 18 marked points into six family (GEMM/attention quantization) and lists the three Skip Softmax configs on top of them. Each cell reports `speedup / mean LPIPS`; the star and triangle use the same Skip Softmax settings as Figure 2.
+The table condenses the 18 marked points into six GEMM/attention quantization families and three representative Skip Softmax settings. Each cell reports `speedup / mean LPIPS`; the star and triangle use the same Skip Softmax settings as Figure 2.
 
 | GEMM/attention quantization | ■ No Skip Softmax | ★ Conservative Skip Softmax | ▲ Aggressive Skip Softmax |
 | :--- | :--- | :--- | :--- |
-| BF16 | 1.000× / 0.2150 | 1.098× / 0.2422 | 1.194× / 0.4910 |
-| BF16 + SAGE | 1.091× / 0.2815 | 1.191× / 0.3011 | 1.288× / 0.4851 |
-| FP8 per-tensor | 1.069× / 0.2654 | 1.202× / 0.2807 | 1.311× / 0.4904 |
-| FP8 per-tensor + SAGE | 1.210× / 0.2966 | 1.354× / 0.3164 | 1.475× / 0.4850 |
-| NVFP4 | 1.133× / 0.3785 | 1.275× / 0.3883 | 1.404× / 0.4821 |
-| NVFP4 + SAGE | 1.272× / 0.3646 | 1.427× / 0.3786 | 1.540× / 0.4843 |
+| BF16 | 1.000× / 0.0000 | 1.098× / 0.1105 | 1.194× / 0.4948 |
+| BF16 + SAGE | 1.091× / 0.2907 | 1.191× / 0.3107 | 1.288× / 0.4884 |
+| FP8 per-tensor | 1.069× / 0.2516 | 1.202× / 0.2702 | 1.311× / 0.4938 |
+| FP8 per-tensor + SAGE | 1.210× / 0.3074 | 1.354× / 0.3253 | 1.475× / 0.4880 |
+| NVFP4 | 1.133× / 0.3701 | 1.275× / 0.3820 | 1.404× / 0.4867 |
+| NVFP4 + SAGE | 1.272× / 0.3653 | 1.427× / 0.3811 | 1.540× / 0.4887 |
 
-FP8 per-tensor stays close to BF16 in LPIPS while reducing latency, whereas NVFP4 moves to a faster operating range with a larger quality tradeoff. Choosing BF16, FP8, or NVFP4 therefore establishes the overall speed-quality range before the attention optimizations tune the operating point within it.
+With compiled BF16 as the common origin, conservative Skip Softmax on BF16 reaches `1.098×` at `0.1105` LPIPS. Moving directly to FP8 per-tensor reaches `1.069×` at `0.2516` LPIPS, while NVFP4 reaches `1.133×` at `0.3701` LPIPS. For this workload, Skip Softmax offers the gentler first step; GEMM quantization opens a faster operating range with a larger quality tradeoff.
 
-SAGE shifts every GEMM family toward higher speedup with a smaller LPIPS change than the move between GEMM formats. It can therefore be selected independently before using Skip Softmax to fine-tune the operating point.
+SAGE adds speed in all three GEMM families, but its quality effect depends on the precision: the LPIPS shift is substantial from BF16, modest from FP8 per-tensor, and nearly flat for NVFP4. This is why the combined frontier is more useful than prescribing a fixed order in which to enable the optimizations.
 
 Skip Softmax then fills the space within each family. `target_sparsity` controls how much work can be rejected, while `disabled_until_timestep` controls how early that rejection begins. Together they provide a continuum between the conservative stars and aggressive triangles instead of a single all-or-nothing sparse mode.
 
@@ -152,7 +150,7 @@ This layering explains the shape of the Pareto frontier: its higher-speed region
 
 ### Latency step-down
 
-Figure 3 isolates the attention optimizations within each GEMM precision. Each group starts with dense attention, adds SAGE, and then adds the conservative Skip Softmax setting from the frontier. The bars report absolute pipeline-forward latency, while their labels retain the common speedup against compiled dense BF16.
+Figure 3 isolates the attention optimizations within each GEMM precision. Each group starts with standard attention, adds SAGE, and then adds the conservative Skip Softmax setting from the frontier. The bars report absolute pipeline-forward latency, while their labels retain the common speedup against the compiled BF16 baseline.
 
 <p align="center">
   <img src="../media/tech_blog28_latency_step_down.png" alt="Horizontal latency step-down bars for BF16, FP8 per-tensor, and NVFP4, each progressing from dense attention to SAGE and then SAGE with conservative Skip Softmax" width="1080">
@@ -162,11 +160,11 @@ Figure 3 isolates the attention optimizations within each GEMM precision. Each g
 
 ### Visual validation
 
-Figure 4 compares the generated videos for prompt P1 across the same six GEMM/attention quantization families used in the frontier. Eager BF16 serves as the visual quality reference, while the speedup labels use compiled dense BF16 as their baseline.
+Figure 4 compares the generated videos for prompt P1 across the same six GEMM/attention quantization families used in the frontier. The compiled BF16 baseline is also the visual reference.
 
-| Eager BF16 reference |
+| BF16 baseline |
 | :---: |
-| ![Eager BF16 P1 generation](../media/tech_blog28_video_p01_eager_bf16.gif) |
+| ![BF16 baseline P1 generation](../media/tech_blog28_video_p01_compiled_bf16.gif) |
 
 The six videos below are grouped by GEMM precision, with the SAGE variant on the right. All six use the **Conservative** Skip Softmax setting (★): `target_sparsity=0.75` and `disabled_until_timestep=0.86`.
 
@@ -178,36 +176,36 @@ The six videos below are grouped by GEMM precision, with the SAGE variant on the
 | **NVFP4 + Skip Softmax (1.27×)** | **NVFP4 + SAGE + Skip Softmax (1.43×)** |
 | ![NVFP4 with Skip Softmax P1 generation](../media/tech_blog28_video_p01_nvfp4_skip_softmax.gif) | ![NVFP4 with SAGE and Skip Softmax P1 generation](../media/tech_blog28_video_p01_nvfp4_sage_skip_softmax.gif) |
 
-<p align="center"><sub><em>Figure 4. P1 video comparison across the eager BF16 reference and six conservative Skip Softmax configurations.</em></sub></p>
+<p align="center"><sub><em>Figure 4. P1 video comparison across the BF16 baseline and six conservative Skip Softmax configurations.</em></sub></p>
 
-Figure 5 expands the first-frame comparison to all seven prompts. Each row compares the eager reference with the same six conservative configurations as Figure 4. The previews are downsampled from the original videos.
+Figure 5 expands the first-frame comparison to all seven prompts. Each row compares the BF16 baseline with the same six conservative configurations as Figure 4. The previews are downsampled from the original videos.
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p01_cat_garden.jpg" alt="First-frame comparison for a cat in a sunlit garden, with an eager BF16 reference and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="../media/tech_blog28_visual_comparison_p01_cat_garden.jpg" alt="First-frame comparison for a cat in a sunlit garden, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p03_park_kids.jpg" alt="First-frame comparison for children in a park, with an eager BF16 reference and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="../media/tech_blog28_visual_comparison_p03_park_kids.jpg" alt="First-frame comparison for children in a park, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p04_drone_coast.jpg" alt="First-frame comparison for a coastal drone shot, with an eager BF16 reference and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="../media/tech_blog28_visual_comparison_p04_drone_coast.jpg" alt="First-frame comparison for a coastal drone shot, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p05_neon_sign.jpg" alt="First-frame comparison for a neon OPEN sign, with an eager BF16 reference and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="../media/tech_blog28_visual_comparison_p05_neon_sign.jpg" alt="First-frame comparison for a neon OPEN sign, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p06_woman_smile.jpg" alt="First-frame comparison for a studio portrait, with an eager BF16 reference and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="../media/tech_blog28_visual_comparison_p06_woman_smile.jpg" alt="First-frame comparison for a studio portrait, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p07_horse_gallop.jpg" alt="First-frame comparison for a galloping racehorse, with an eager BF16 reference and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="../media/tech_blog28_visual_comparison_p07_horse_gallop.jpg" alt="First-frame comparison for a galloping racehorse, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p10_market.jpg" alt="First-frame comparison for a street market, with an eager BF16 reference and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="../media/tech_blog28_visual_comparison_p10_market.jpg" alt="First-frame comparison for a street market, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 5. First-frame comparison across all seven prompts. Every Skip Softmax result uses `target_sparsity=0.75` and `disabled_until_timestep=0.86`, corresponding to the stars in Figure 2.</em></sub></p>
@@ -298,7 +296,7 @@ curl --fail --silent --show-error \
 
 </details>
 
-For the reported latency, the pipeline forward is bracketed by CUDA synchronization and the seven prompt times are averaged. The eager BF16 quality reference disables compilation, quantization, SAGE, and Skip Softmax. AlexNet LPIPS is computed between corresponding frames, averaged over all 81 frames and then over the seven prompts.
+For the reported latency, the pipeline forward is bracketed by CUDA synchronization and the seven prompt times are averaged. The compiled BF16 baseline enables `torch.compile` and disables quantization, SAGE, and Skip Softmax. AlexNet LPIPS is computed against its corresponding frames, averaged over all 81 frames and then over the seven prompts.
 
 ## Conclusion
 
