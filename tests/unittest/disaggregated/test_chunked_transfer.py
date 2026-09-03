@@ -784,6 +784,8 @@ def test_send_kv_cache_early_only_sends_reused_prefixes():
 
     executor = MagicMock()
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
+    executor._is_kv_manager_v2 = False
+    executor.kv_cache_manager.blocks_in_secondary_pool = 0
     executor.kv_cache_manager.tokens_per_block = 32
 
     def make_request(
@@ -827,6 +829,36 @@ def test_send_kv_cache_early_only_sends_reused_prefixes():
     assert unaligned.py_last_context_chunk == (0, 3872)
     assert below_one_block.py_last_context_chunk == (None, None)
     assert not below_one_block.py_kv_prefix_sent
+
+
+@pytest.mark.parametrize(
+    ("is_kv_manager_v2", "blocks_in_secondary_pool", "can_evict"),
+    [(False, 1, False), (True, 0, True)],
+)
+def test_send_kv_cache_early_skips_offload_tiers(
+    is_kv_manager_v2, blocks_in_secondary_pool, can_evict
+):
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = MagicMock()
+    executor.kv_cache_transceiver.pipeline_transfer_enabled = True
+    executor._is_kv_manager_v2 = is_kv_manager_v2
+    executor.kv_cache_manager.blocks_in_secondary_pool = blocks_in_secondary_pool
+    executor.kv_cache_manager.can_evict = can_evict
+    request = SimpleNamespace(
+        is_context_only_request=True,
+        is_finished_due_to_cancellation=False,
+        is_first_context_chunk=True,
+        prepopulated_prompt_len=128,
+        py_last_context_chunk=(None, None),
+        py_kv_prefix_sent=False,
+    )
+
+    PyExecutor._send_kv_cache_early(executor, [request])
+
+    executor._send_kv_async.assert_not_called()
+    assert request.py_last_context_chunk == (None, None)
+    assert not request.py_kv_prefix_sent
 
 
 def test_send_kv_cache_early_requires_pipelined_transfer():

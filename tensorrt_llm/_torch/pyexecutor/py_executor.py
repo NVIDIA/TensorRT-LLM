@@ -7651,6 +7651,12 @@ class PyExecutor:
                 or not self.kv_cache_transceiver.pipeline_transfer_enabled):
             return
 
+        has_offload_tier = (self.kv_cache_manager.can_evict
+                            if self._is_kv_manager_v2 else
+                            self.kv_cache_manager.blocks_in_secondary_pool > 0)
+        if has_offload_tier:
+            return
+
         tokens_per_block = self.kv_cache_manager.tokens_per_block
         requests = []
         for req in scheduled_requests:
