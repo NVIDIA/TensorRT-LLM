@@ -6674,6 +6674,28 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         }
     }]]}
 
+    // mpi-hostname probe: asks which hostnames a singleton MPI_Comm_spawn
+    // survives, in the stock NGC image and with no TensorRT-LLM in the picture,
+    // so the answer is reportable to the DLFW team as it stands. It runs no
+    // tests and needs no GPU or wheel -- see the script header. On-demand only:
+    // it is a diagnostic, not a gate.
+    mpiHostnameProbeSpec = createKubernetesPodConfig(DLFW_IMAGE, "build")
+    def mpiHostnameProbeStageName = "CPU-OnDemand-MPIHostnameProbe"
+    mpiHostnameProbeConfigs = [
+        (mpiHostnameProbeStageName): [mpiHostnameProbeSpec, {
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+            sh "bash ${LLM_ROOT}/jenkins/scripts/mpi_hostname_probe.sh"
+        }],
+    ]
+
+    fullSet += mpiHostnameProbeConfigs.keySet()
+
+    mpiHostnameProbeJobs = mpiHostnameProbeConfigs.collectEntries{key, values -> [key, [values[0], { attemptTag, isFinalAttempt, retryContext = null ->
+        stage("[${key}] Run") {
+            cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, isFinalAttempt, retryContext)
+        }
+    }]]}
+
     // Python version and OS for sanity check
     // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall, platName]
     x86SanityCheckConfigs = [
@@ -6914,6 +6936,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     parallelJobs += docBuildJobs
     parallelJobs += sanityCheckJobs
     parallelJobs += agentFlowTestJobs
+    parallelJobs += mpiHostnameProbeJobs
 
     onDemandJobs = parallelJobs.findAll {it.key.contains("-OnDemand-")}
     postMergeJobs = parallelJobs.findAll {it.key.contains("Post-Merge")}
