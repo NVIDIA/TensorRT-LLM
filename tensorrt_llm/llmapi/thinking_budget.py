@@ -94,10 +94,12 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
         reasoning_token_count = len(token_ids) - reasoning_start
         # End tokens the model emitted itself are not reasoning content, so they
         # must not count against the budget, and the sequence has to resume where
-        # it stands rather than restart at its first token.
-        partial_end_len = min(
-            _longest_suffix_prefix_len(token_ids, self.reasoning_end_token_ids),
-            reasoning_token_count,
+        # it stands rather than restart at its first token. Match inside the current
+        # block: _longest_suffix_prefix_len guarantees token_ids[-L:] == end[:L], and
+        # scanning the whole prompt can satisfy that with tokens from before
+        # reasoning_start, which clamping the length afterwards would not repair.
+        partial_end_len = _longest_suffix_prefix_len(
+            token_ids[reasoning_start:], self.reasoning_end_token_ids
         )
         if reasoning_token_count - partial_end_len >= self.thinking_token_budget:
             self._end_progress[key] = partial_end_len + 1
