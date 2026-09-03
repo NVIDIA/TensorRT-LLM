@@ -94,6 +94,7 @@ class VisualGenRequestInput:
     seed: Optional[int] = None
     extra_body: Optional[dict] = None
     input_reference: Optional[str] = None
+    input_reference_type: Optional[str] = None
     validate_audio: bool = False
     media_output_stem: Optional[str] = None
     saved_media_paths: list[str] = field(default_factory=list, init=False)
@@ -150,9 +151,14 @@ def _get_headers(*, json_content: bool) -> dict[str, str]:
 
 
 def _build_multipart_form(
-    payload: dict[str, Any], input_reference: str, media_file: BinaryIO
+    payload: dict[str, Any],
+    input_reference: str,
+    input_reference_type: str,
+    media_file: BinaryIO,
 ) -> aiohttp.FormData:
     """Build a multipart request, leaving Content-Type generation to aiohttp."""
+    if input_reference_type not in {"image", "video"}:
+        raise ValueError("input_reference_type must be 'image' or 'video'")
     form = aiohttp.FormData()
     for key, value in payload.items():
         if value is None:
@@ -167,7 +173,7 @@ def _build_multipart_form(
             field_value = str(value)
         form.add_field(key, field_value)
     form.add_field(
-        "input_reference",
+        f"{input_reference_type}_reference",
         media_file,
         filename=Path(input_reference).name,
         content_type="application/octet-stream",
@@ -401,8 +407,15 @@ async def _do_post(
             ) as response:
                 await _consume_response(response)
         else:
+            if request_input.input_reference_type is None:
+                raise ValueError("input_reference_type is required when input_reference is set")
             with open(request_input.input_reference, "rb") as media_file:
-                form = _build_multipart_form(payload, request_input.input_reference, media_file)
+                form = _build_multipart_form(
+                    payload,
+                    request_input.input_reference,
+                    request_input.input_reference_type,
+                    media_file,
+                )
                 async with request_session.post(
                     url=request_input.api_url,
                     data=form,
@@ -478,6 +491,7 @@ async def benchmark(
     gen_params: dict[str, Any],
     extra_body: Optional[dict],
     input_reference: Optional[str] = None,
+    input_reference_type: Optional[str] = None,
     require_audio: bool = False,
     no_test_input: bool = False,
     request_timeout: float = 6 * 60 * 60,
@@ -506,6 +520,7 @@ async def benchmark(
             seed=gen_params.get("seed"),
             extra_body=extra_body,
             input_reference=input_reference,
+            input_reference_type=input_reference_type,
             validate_audio=require_audio,
         )
 
@@ -849,6 +864,7 @@ def _validate_request_configuration(
     backend: str,
     model_id: str,
     input_reference: Optional[str],
+    input_reference_type: Optional[str],
     extra_body: Optional[dict[str, Any]],
     require_audio: bool,
     transfer_controls: Optional[dict[str, Optional[str]]] = None,
@@ -856,10 +872,20 @@ def _validate_request_configuration(
     """Reject incompatible client request combinations before benchmarking."""
     if input_reference is not None and backend != "openai-videos":
         raise ValueError("--input-reference is supported only by the openai-videos backend")
-    if input_reference is not None and extra_body and "input_reference" in extra_body:
+    if input_reference is None and input_reference_type is not None:
+        raise ValueError("--input-reference-type requires --input-reference")
+    if input_reference is not None and input_reference_type not in {"image", "video"}:
+        raise ValueError("--input-reference requires --input-reference-type=image or video")
+    conflicting_reference_fields = {
+        "input_reference",
+        "image_reference",
+        "video_reference",
+    }.intersection(extra_body or {})
+    if input_reference is not None and conflicting_reference_fields:
+        formatted_fields = ", ".join(sorted(conflicting_reference_fields))
         raise ValueError(
             "Specify conditioning media with --input-reference, not both "
-            "--input-reference and --extra-body.input_reference"
+            f"--input-reference and --extra-body field(s): {formatted_fields}"
         )
     if transfer_controls is not None:
         if backend != "openai-videos":
@@ -949,6 +975,7 @@ def main(args: argparse.Namespace):
 
     extra_body = _parse_extra_body(args.extra_body)
     input_reference = _validate_input_reference(args.input_reference)
+    input_reference_type = args.input_reference_type
     action_trajectory = _load_action_trajectory(args.action_json)
     extra_body = _prepare_action_extra_body(
         extra_body=extra_body,
@@ -964,6 +991,7 @@ def main(args: argparse.Namespace):
         backend=backend,
         model_id=model_id,
         input_reference=input_reference,
+        input_reference_type=input_reference_type,
         extra_body=extra_body,
         require_audio=args.require_audio,
         transfer_controls=transfer_controls,
@@ -991,6 +1019,7 @@ def main(args: argparse.Namespace):
             gen_params=gen_params,
             extra_body=extra_body,
             input_reference=input_reference,
+            input_reference_type=input_reference_type,
             require_audio=args.require_audio,
             no_test_input=args.no_test_input,
             request_timeout=args.request_timeout,
@@ -1009,6 +1038,7 @@ def main(args: argparse.Namespace):
         result_json["num_prompts"] = args.num_prompts
         if input_reference is not None:
             result_json["input_reference"] = Path(input_reference).name
+            result_json["input_reference_type"] = input_reference_type
         if transfer_controls is not None:
             result_json["transfer_controls"] = {
                 hint: "input_reference" if path is None else Path(path).name
@@ -1169,7 +1199,16 @@ if __name__ == "__main__":
         "--input-reference",
         type=str,
         default=None,
-        help="Image or video conditioning file for multipart video requests.",
+        help="Local conditioning file for a multipart video request.",
+    )
+    gen_group.add_argument(
+        "--input-reference-type",
+        choices=("image", "video"),
+        default=None,
+        help=(
+            "Modality of --input-reference. Sends the typed image_reference or "
+            "video_reference multipart field."
+        ),
     )
     gen_group.add_argument(
         "--action-json",

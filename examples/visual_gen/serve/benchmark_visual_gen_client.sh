@@ -16,6 +16,7 @@ SERVER_LOG_PATH=${SERVER_LOG_PATH-}
 SERVER_PROCESS_PID=${SERVER_PROCESS_PID-}
 BACKEND=${BACKEND-}
 INPUT_REFERENCE=${INPUT_REFERENCE-}
+INPUT_REFERENCE_TYPE=${INPUT_REFERENCE_TYPE-}
 ACTION_JSON=${ACTION_JSON-}
 TRANSFER_CONTROLS=${TRANSFER_CONTROLS-}
 EXTRA_PARAMS=${EXTRA_PARAMS-"{}"}
@@ -166,6 +167,13 @@ BACKEND=$EXPECTED_BACKEND
 if [ -n "$INPUT_REFERENCE" ] && [ ! -f "$INPUT_REFERENCE" ]; then
     fail "INPUT_REFERENCE file does not exist: ${INPUT_REFERENCE}"
 fi
+case "$INPUT_REFERENCE_TYPE" in
+    ''|image|video) ;;
+    *) fail "INPUT_REFERENCE_TYPE must be image or video, got '${INPUT_REFERENCE_TYPE}'" ;;
+esac
+if [ -n "$INPUT_REFERENCE_TYPE" ] && [ -z "$INPUT_REFERENCE" ]; then
+    fail "INPUT_REFERENCE_TYPE requires INPUT_REFERENCE"
+fi
 if [ -n "$ACTION_JSON" ] && [ ! -f "$ACTION_JSON" ]; then
     fail "ACTION_JSON file does not exist: ${ACTION_JSON}"
 fi
@@ -179,6 +187,17 @@ case "$MODE" in
         if [ "$MODE" = "forward_dynamics" ] && [ -z "$ACTION_JSON" ]; then
             fail "MODE=forward_dynamics requires ACTION_JSON containing a [T, D] trajectory"
         fi
+        case "$MODE" in
+            i2v|ti2av) EXPECTED_REFERENCE_TYPE=image ;;
+            v2v|inverse_dynamics) EXPECTED_REFERENCE_TYPE=video ;;
+            policy|forward_dynamics) EXPECTED_REFERENCE_TYPE=${INPUT_REFERENCE_TYPE:-image} ;;
+        esac
+        if [ -n "$INPUT_REFERENCE_TYPE" ] && [ "$INPUT_REFERENCE_TYPE" != "$EXPECTED_REFERENCE_TYPE" ]; then
+            fail \
+                "MODE=${MODE} requires INPUT_REFERENCE_TYPE=${EXPECTED_REFERENCE_TYPE}; " \
+                "got INPUT_REFERENCE_TYPE=${INPUT_REFERENCE_TYPE}"
+        fi
+        INPUT_REFERENCE_TYPE=$EXPECTED_REFERENCE_TYPE
         case "$MODE:$MODEL" in
             policy:*Cosmos3-Edge*|policy:*cosmos3-edge*|\
             forward_dynamics:*Cosmos3-Edge*|forward_dynamics:*cosmos3-edge*|\
@@ -246,6 +265,12 @@ print(json.dumps(metadata, separators=(",", ":")))
                 fail "Cosmos3-Edge does not support Transfer; use Cosmos3-Nano or Cosmos3-Super"
                 ;;
         esac
+        if [ -n "$INPUT_REFERENCE" ]; then
+            if [ -n "$INPUT_REFERENCE_TYPE" ] && [ "$INPUT_REFERENCE_TYPE" != "video" ]; then
+                fail "MODE=transfer requires INPUT_REFERENCE_TYPE=video"
+            fi
+            INPUT_REFERENCE_TYPE=video
+        fi
         ;;
     *)
         if [ -n "$INPUT_REFERENCE" ]; then
@@ -419,7 +444,10 @@ if [ "$EXTRA_BODY" != "{}" ]; then
     BENCHMARK_CMD+=(--extra-body "$EXTRA_BODY")
 fi
 if [ -n "$INPUT_REFERENCE" ]; then
-    BENCHMARK_CMD+=(--input-reference "$INPUT_REFERENCE")
+    BENCHMARK_CMD+=(
+        --input-reference "$INPUT_REFERENCE"
+        --input-reference-type "$INPUT_REFERENCE_TYPE"
+    )
 fi
 if [ -n "$ACTION_JSON" ]; then
     BENCHMARK_CMD+=(--action-json "$ACTION_JSON")
@@ -453,6 +481,7 @@ BENCHMARK_CMD+=(
     "mode=${MODE}"
     "server_config=${CONFIG_METADATA}"
     "input_reference=${INPUT_REFERENCE_BASENAME}"
+    "input_reference_type=${INPUT_REFERENCE_TYPE}"
     "action_json=${ACTION_JSON_BASENAME}"
 )
 
@@ -472,6 +501,7 @@ from pathlib import Path
     request_rate,
     max_concurrency,
     input_reference,
+    input_reference_type,
     action_json,
     transfer_controls,
     request_body,
@@ -487,6 +517,7 @@ metadata = {
     "request_rate": request_rate,
     "max_concurrency": int(max_concurrency),
     "input_reference": input_reference or None,
+    "input_reference_type": input_reference_type or None,
     "action_json": action_json or None,
     "transfer_controls": json.loads(transfer_controls),
     "extra_params": request_body.get("extra_params", {}),
@@ -503,6 +534,7 @@ Path(output_path).write_text(json.dumps(metadata, indent=2) + "\n", encoding="ut
     "$REQUEST_RATE" \
     "$MAX_CONCURRENCY" \
     "$INPUT_REFERENCE_BASENAME" \
+    "$INPUT_REFERENCE_TYPE" \
     "$ACTION_JSON_BASENAME" \
     "$TRANSFER_CONTROLS_METADATA" \
     "$EXTRA_BODY" \
@@ -518,6 +550,7 @@ echo "GPUs:                ${NUM_GPUS_VALUE}"
 echo "Request rate:        ${REQUEST_RATE}"
 echo "Max concurrency:     ${MAX_CONCURRENCY}"
 echo "Input reference:     ${INPUT_REFERENCE_BASENAME:-none}"
+echo "Reference type:      ${INPUT_REFERENCE_TYPE:-none}"
 echo "Action trajectory:   ${ACTION_JSON_BASENAME:-none}"
 echo "Transfer controls:   ${TRANSFER_CONTROLS_METADATA}"
 echo "Client media:        ${CLIENT_MEDIA_DIR:-disabled}"

@@ -37,20 +37,31 @@ def _form_fields(form) -> dict[str, Any]:
     return {options["name"]: value for options, _, value in form._fields}
 
 
-def _multipart_fields(tmp_path: Path, extra_body: dict[str, Any] | None = None):
+def _multipart_fields(
+    tmp_path: Path,
+    input_reference_type: str,
+    extra_body: dict[str, Any] | None = None,
+):
     input_reference = tmp_path / "conditioning media.bin"
     input_reference.write_bytes(b"conditioning bytes")
     request_input = _request_input(
         input_reference=str(input_reference),
+        input_reference_type=input_reference_type,
         extra_body=extra_body,
         num_frames=17,
         fps=8,
     )
     payload = benchmark._build_video_payload(request_input)
     with input_reference.open("rb") as media_file:
-        form = benchmark._build_multipart_form(payload, str(input_reference), media_file)
+        form = benchmark._build_multipart_form(
+            payload,
+            str(input_reference),
+            input_reference_type,
+            media_file,
+        )
         fields = _form_fields(form)
-        assert fields["input_reference"] is media_file
+        assert fields[f"{input_reference_type}_reference"] is media_file
+        assert "input_reference" not in fields
         return fields
 
 
@@ -86,7 +97,7 @@ def test_t2av_json_payload() -> None:
 
 
 def test_i2v_multipart_payload(tmp_path: Path) -> None:
-    fields = _multipart_fields(tmp_path)
+    fields = _multipart_fields(tmp_path, "image")
 
     assert fields["prompt"] == "A test prompt"
     assert fields["num_frames"] == "17"
@@ -99,14 +110,14 @@ def test_v2v_multipart_payload(tmp_path: Path) -> None:
         "condition_video_latent_indexes": [0, 1],
         "condition_video_keep": "first",
     }
-    fields = _multipart_fields(tmp_path, {"extra_params": extra_params})
+    fields = _multipart_fields(tmp_path, "video", {"extra_params": extra_params})
 
     assert json.loads(fields["extra_params"]) == extra_params
 
 
 def test_transfer_multi_control_multipart_payload(tmp_path: Path) -> None:
     controls = {"edge": True, "seg": {"control": "encoded-segmentation"}}
-    fields = _multipart_fields(tmp_path, {"extra_params": controls})
+    fields = _multipart_fields(tmp_path, "video", {"extra_params": controls})
 
     assert json.loads(fields["extra_params"]) == controls
 
@@ -114,6 +125,7 @@ def test_transfer_multi_control_multipart_payload(tmp_path: Path) -> None:
 def test_ti2av_multipart_payload(tmp_path: Path) -> None:
     fields = _multipart_fields(
         tmp_path,
+        "image",
         {"format": "mp4", "extra_params": {"enable_audio": True}},
     )
 
@@ -274,7 +286,38 @@ def test_input_reference_rejects_image_backend(tmp_path: Path) -> None:
             backend="openai-images",
             model_id="nvidia/Cosmos3-Nano",
             input_reference=str(input_reference),
+            input_reference_type="image",
             extra_body=None,
+            require_audio=False,
+        )
+
+
+def test_input_reference_requires_typed_modality(tmp_path: Path) -> None:
+    input_reference = tmp_path / "input.png"
+    input_reference.write_bytes(b"image")
+
+    with pytest.raises(ValueError, match="requires --input-reference-type"):
+        benchmark._validate_request_configuration(
+            backend="openai-videos",
+            model_id="nvidia/Cosmos3-Nano",
+            input_reference=str(input_reference),
+            input_reference_type=None,
+            extra_body=None,
+            require_audio=False,
+        )
+
+
+def test_input_reference_rejects_duplicate_typed_field(tmp_path: Path) -> None:
+    input_reference = tmp_path / "input.png"
+    input_reference.write_bytes(b"image")
+
+    with pytest.raises(ValueError, match="image_reference"):
+        benchmark._validate_request_configuration(
+            backend="openai-videos",
+            model_id="nvidia/Cosmos3-Nano",
+            input_reference=str(input_reference),
+            input_reference_type="image",
+            extra_body={"image_reference": {"content": "...", "format": "base64"}},
             require_audio=False,
         )
 
@@ -287,6 +330,7 @@ def test_known_non_audio_checkpoint_rejected(monkeypatch: pytest.MonkeyPatch) ->
             backend="openai-videos",
             model_id="nvidia/Cosmos3-Edge",
             input_reference=None,
+            input_reference_type=None,
             extra_body={"format": "mp4", "extra_params": {"enable_audio": True}},
             require_audio=True,
         )
@@ -298,6 +342,7 @@ def test_cosmos3_edge_transfer_rejected() -> None:
             backend="openai-videos",
             model_id="nvidia/Cosmos3-Edge",
             input_reference="source.mp4",
+            input_reference_type="video",
             extra_body={"extra_params": {"edge": True}},
             require_audio=False,
             transfer_controls={"edge": None},
@@ -327,7 +372,7 @@ class _Session:
 
     def post(self, **kwargs):
         fields = _form_fields(kwargs["data"])
-        self.media_file = fields["input_reference"]
+        self.media_file = fields["video_reference"]
         assert not self.media_file.closed
         assert "Content-Type" not in kwargs["headers"]
         return _Response()
@@ -336,7 +381,9 @@ class _Session:
 def test_media_file_is_closed_after_each_request(tmp_path: Path) -> None:
     input_reference = tmp_path / "reference.dat"
     input_reference.write_bytes(b"reference")
-    request_input = _request_input(input_reference=str(input_reference))
+    request_input = _request_input(
+        input_reference=str(input_reference), input_reference_type="video"
+    )
     session = _Session()
 
     output = asyncio.run(
@@ -457,6 +504,7 @@ def test_initial_and_measured_requests_have_identical_payloads(
             gen_params={"num_frames": 17, "num_inference_steps": 4},
             extra_body={"format": "mp4", "extra_params": {"enable_audio": True}},
             input_reference=str(input_reference),
+            input_reference_type="image",
             require_audio=True,
             num_gpus=1,
             media_dir=str(tmp_path / "media"),
@@ -468,6 +516,7 @@ def test_initial_and_measured_requests_have_identical_payloads(
         seen_inputs[1]
     )
     assert seen_inputs[0].input_reference == seen_inputs[1].input_reference
+    assert seen_inputs[0].input_reference_type == seen_inputs[1].input_reference_type
     assert [request.validate_audio for request in seen_inputs] == [True, True]
     assert [request.media_output_stem for request in seen_inputs] == [
         None,
@@ -653,6 +702,8 @@ def test_shell_argument_construction_with_spaces_and_json(tmp_path: Path) -> Non
     assert metadata["mode"] == "ti2av"
     assert metadata["num_gpus"] == 4
     assert metadata["input_reference"] == "conditioning image.jpg"
+    assert metadata["input_reference_type"] == "image"
+    assert "--input-reference-type image" in result.stdout
     assert metadata["request_body"] == {
         "format": "mp4",
         "extra_params": {
@@ -679,6 +730,7 @@ def test_shell_action_policy_uses_tensor_response_and_domain_defaults(tmp_path: 
     metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
     assert metadata["mode"] == "policy"
     assert metadata["input_reference"] == "robot observation.jpg"
+    assert metadata["input_reference_type"] == "image"
     assert metadata["action_json"] is None
     assert metadata["request_body"] == {
         "extra_params": {
@@ -687,6 +739,25 @@ def test_shell_action_policy_uses_tensor_response_and_domain_defaults(tmp_path: 
         }
     }
     assert "--media-dir" in result.stdout
+
+
+def test_shell_action_policy_accepts_video_reference(tmp_path: Path) -> None:
+    input_reference = tmp_path / "robot observation.mp4"
+    input_reference.write_bytes(b"video bytes")
+
+    result = _run_shell(
+        tmp_path,
+        script_name="benchmark_visual_gen_client.sh",
+        MODE="policy",
+        INPUT_REFERENCE=str(input_reference),
+        INPUT_REFERENCE_TYPE="video",
+        EXTRA_PARAMS='{"domain_name":"bridge_orig_lerobot"}',
+    )
+
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
+    assert metadata["input_reference_type"] == "video"
+    assert "--input-reference-type video" in result.stdout
 
 
 def test_shell_action_forward_dynamics_passes_trajectory_path(tmp_path: Path) -> None:
@@ -709,6 +780,7 @@ def test_shell_action_forward_dynamics_passes_trajectory_path(tmp_path: Path) ->
     metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
     assert metadata["mode"] == "forward_dynamics"
     assert metadata["action_json"] == "steering trajectory.json"
+    assert metadata["input_reference_type"] == "image"
     assert "--action-json" in result.stdout
     assert "steering\\ trajectory.json" in result.stdout
     assert metadata["request_body"] == {
@@ -735,6 +807,7 @@ def test_shell_action_inverse_dynamics_uses_video_reference(tmp_path: Path) -> N
     assert result.returncode == 0, result.stderr
     metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
     assert metadata["mode"] == "inverse_dynamics"
+    assert metadata["input_reference_type"] == "video"
     assert metadata["request_body"]["extra_params"] == {
         "domain_name": "bridge_orig_lerobot",
         "action_mode": "inverse_dynamics",
@@ -759,6 +832,7 @@ def test_shell_transfer_derives_edge_from_input_video(tmp_path: Path) -> None:
     metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
     assert metadata["mode"] == "transfer"
     assert metadata["input_reference"] == "source video.mp4"
+    assert metadata["input_reference_type"] == "video"
     assert metadata["transfer_controls"] == {"edge": "input_reference"}
 
 
@@ -778,6 +852,7 @@ def test_shell_transfer_accepts_one_precomputed_control(tmp_path: Path) -> None:
     metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
     assert metadata["mode"] == "transfer"
     assert metadata["input_reference"] is None
+    assert metadata["input_reference_type"] is None
     assert metadata["transfer_controls"] == {"depth": "depth control.mp4"}
 
 

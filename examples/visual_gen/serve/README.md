@@ -85,17 +85,26 @@ set a unique path.
 | `MODE` | Endpoint | Request encoding | Required conditioning | Required `extra_params` |
 |--------|----------|------------------|-----------------------|-------------------------|
 | `t2i` | `/v1/images/generations` | JSON | None | `output_type: image` |
-| `t2v` | `/v1/videos/generations` | JSON | None | None |
-| `i2v` | `/v1/videos/generations` | Multipart | Image `INPUT_REFERENCE` | None |
-| `v2v` | `/v1/videos/generations` | Multipart | Video `INPUT_REFERENCE` | Optional V2V conditioning fields |
-| `t2av` | `/v1/videos/generations` | JSON | None | `enable_audio: true` |
-| `ti2av` | `/v1/videos/generations` | Multipart | Image `INPUT_REFERENCE` | `enable_audio: true` |
+| `t2v` | `/v1/videos/sync` | JSON | None | None |
+| `i2v` | `/v1/videos/sync` | Multipart | Image `INPUT_REFERENCE` | None |
+| `v2v` | `/v1/videos/sync` | Multipart | Video `INPUT_REFERENCE` | Optional V2V conditioning fields |
+| `transfer` | `/v1/videos/sync` | Multipart or JSON | Optional source video `INPUT_REFERENCE`; controls in `TRANSFER_CONTROLS` | One or more Transfer hints |
+| `t2av` | `/v1/videos/sync` | JSON | None | `enable_audio: true` |
+| `ti2av` | `/v1/videos/sync` | Multipart | Image `INPUT_REFERENCE` | `enable_audio: true` |
+| `policy` | `/v1/videos/sync` | Multipart | Image or video `INPUT_REFERENCE` | `action_mode: policy` plus a domain |
+| `forward_dynamics` | `/v1/videos/sync` | Multipart | Image or video `INPUT_REFERENCE`; `ACTION_JSON` | `action_mode: forward_dynamics` plus a domain |
+| `inverse_dynamics` | `/v1/videos/sync` | Multipart | Video `INPUT_REFERENCE` | `action_mode: inverse_dynamics` plus a domain |
 
-The server classifies `INPUT_REFERENCE` from its bytes, not its filename
-extension. `EXTRA_PARAMS` is a JSON object containing model-specific fields;
-the wrapper places it under the request's top-level `extra_params` field. The
-wrapper supplies the required `output_type` and `enable_audio` values for the
-selected mode and rejects conflicting values.
+The benchmark keeps `INPUT_REFERENCE` as its local file-path interface, but
+sends the current typed multipart field: `image_reference` for `i2v` and
+`ti2av`, and `video_reference` for `v2v`, `transfer`, and
+`inverse_dynamics`. `policy` and `forward_dynamics` default to an image; set
+`INPUT_REFERENCE_TYPE=video` when their input is a video. The wrapper rejects
+a reference type that contradicts an unambiguous mode. `EXTRA_PARAMS` is a
+JSON object containing model-specific fields; the wrapper places it under the
+request's top-level `extra_params` field. The wrapper supplies the required
+`output_type`, `enable_audio`, and `action_mode` values for the selected mode
+and rejects conflicting values.
 
 ```bash
 # Text to image
