@@ -41,12 +41,14 @@ from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT
 from .perf_regression_utils import _percentile, process_and_upload_test_results
 from .time_breakdown_metrics import ALL_METRICS as TIME_BREAKDOWN_METRIC_NAMES
+from .time_breakdown_metrics import COMPLETION_STABLE_SECONDS as _TB_SETTLE_SECONDS
+from .time_breakdown_metrics import COMPLETION_TIMEOUT_SECONDS as _TB_SETTLE_TIMEOUT
 from .time_breakdown_metrics import MODE_GROUPS as TIME_BREAKDOWN_MODE_GROUPS
 from .time_breakdown_metrics import STATS as TIME_BREAKDOWN_STATS
 from .time_breakdown_metrics import (
     compute_time_breakdown_metrics,
-    discover_perf_metrics_files,
     format_metric_log_lines,
+    wait_for_perf_metrics_files,
 )
 
 SUPPORTED_GPU_MAPPING = {
@@ -129,6 +131,13 @@ DISAGG_SERVER_READY_TIMEOUT = 3600
 # Keep this well below the whole-test timeout so a stuck multi-node srun cannot
 # turn the optional log-flush synchronization into a pytest/Slurm cancellation.
 GEN_LOG_SENTINEL_TIMEOUT = 120
+# How long the perf_metrics JSONLs must hold still before the time_breakdown
+# aggregation reads them, and the backstop for a writer that never settles. Only
+# the GEN workers have a completion sentinel, so this is the ctx workers' and the
+# disagg server's equivalent; see wait_for_perf_metrics_files. Named constants
+# rather than call-site literals so a test can shorten the window.
+PERF_METRICS_SETTLE_SECONDS = _TB_SETTLE_SECONDS
+PERF_METRICS_SETTLE_TIMEOUT = _TB_SETTLE_TIMEOUT
 
 
 def server_ready_timeout(default: int, mode: str) -> int:
@@ -1405,6 +1414,15 @@ class ClientConfig:
         if not self.name:
             self.name = f"con{self.concurrency}_iter{self.iterations}_isl{self.isl}_osl{self.osl}"
 
+    @property
+    def num_requests(self) -> int:
+        """Measured requests the client issues (``--num-prompts``).
+
+        Excludes the warmup request, which ``benchmark_serving`` sends before the measured
+        window when ``--no-test-input`` is omitted.
+        """
+        return self.concurrency * self.iterations
+
     def to_cmd(self) -> List[str]:
         """Generate benchmark command."""
         model_dir = get_model_dir(self.model_name)
@@ -1454,7 +1472,7 @@ class ClientConfig:
             "--dataset-name",
             "random",
             "--num-prompts",
-            str(self.concurrency * self.iterations),
+            str(self.num_requests),
             "--max-concurrency",
             str(self.concurrency),
             "--random-input-len",
@@ -1489,7 +1507,7 @@ class ClientConfig:
             "--tokenizer",
             self.model_path,
             "--num-prompts",
-            str(self.concurrency * self.iterations),
+            str(self.num_requests),
             "--max-concurrency",
             str(self.concurrency),
             "--percentile-metrics",
@@ -1630,7 +1648,10 @@ def append_time_breakdown_metrics(
     Must be called *after* benchmark_status is written, for the same reason the
     gen_only device step time is (nvbugs 6487036 / 6487040): the workers keep
     appending to their JSONLs until their process exits, and reading early would
-    silently aggregate a truncated run.
+    silently aggregate a truncated run. Being last in the sequence is necessary but
+    not sufficient -- only the *generation* workers have a completion sentinel, so
+    wait_for_perf_metrics_files adds the positive gate for the context workers and
+    the disaggregated server before anything is read.
 
     Failures are reported and skipped rather than raised: the resulting absence of
     parsed ``Time Breakdown ...`` lines is what check_test_failure hard-fails on,
@@ -1639,7 +1660,24 @@ def append_time_breakdown_metrics(
     """
     if not pending_time_breakdown:
         return
-    paths = discover_perf_metrics_files(breakdown_dir)
+    # The largest request count across this directory's clients: every client's
+    # records land in the same files, so the census check has to allow for all of them.
+    expected_requests = max(
+        (record.get("expected_requests") or 0 for record in pending_time_breakdown),
+        default=0,
+    )
+    paths, wait_info = wait_for_perf_metrics_files(
+        breakdown_dir,
+        expected_requests=expected_requests or None,
+        stable_seconds=PERF_METRICS_SETTLE_SECONDS,
+        timeout_seconds=PERF_METRICS_SETTLE_TIMEOUT,
+    )
+    for warning in wait_info["warnings"]:
+        print_info(f"Time breakdown: {warning}")
+    print_info(
+        f"Time breakdown: perf_metrics settled after {wait_info['waited_seconds']:.1f}s "
+        f"(stable={wait_info['stable']}, lines={wait_info['line_counts']})"
+    )
     if not paths:
         print_info(
             f"No perf_metrics-*.jsonl under {breakdown_dir}; skipping time breakdown aggregation"
@@ -1795,6 +1833,9 @@ class AggrTestCmds(NamedTuple):
                                 "benchmark_file_path": client_file_path,
                                 "benchmark_mode": self.benchmark_mode,
                                 "warmup": bool(client_config and client_config.warmup),
+                                "expected_requests": (
+                                    client_config.num_requests if client_config else 0
+                                ),
                             }
                         )
                 else:
@@ -2450,6 +2491,9 @@ class DisaggTestCmds(NamedTuple):
                                     "benchmark_file_path": benchmark_file_path,
                                     "benchmark_mode": benchmark_mode_for_idx,
                                     "warmup": bool(client_config and client_config.warmup),
+                                    "expected_requests": (
+                                        client_config.num_requests if client_config else 0
+                                    ),
                                 }
                             )
                     else:

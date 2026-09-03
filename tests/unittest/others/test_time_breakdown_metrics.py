@@ -55,6 +55,7 @@ GROUP_METRICS = _tbm.GROUP_METRICS
 MODE_GROUPS = _tbm.MODE_GROUPS
 STATS = _tbm.STATS
 compute_time_breakdown_metrics = _tbm.compute_time_breakdown_metrics
+wait_for_perf_metrics_files = _tbm.wait_for_perf_metrics_files
 
 
 def _chunk(base, *, fwd=0.100, upd=0.002, smp=0.001, post=0.010, gpu_fwd=110.0):
@@ -382,3 +383,143 @@ def test_role_is_classified_by_content_not_filename(tmp_path):
     _, info = compute_time_breakdown_metrics([ctx, gen], "e2e")
     kinds = {name.split("-")[2]: kind.split(" ")[0] for name, kind in info["files"].items()}
     assert kinds == {"aaa": "ctx_worker", "bbb": "gen_worker"}
+
+
+def test_a_truncated_final_line_costs_that_line_not_the_file(tmp_path):
+    """A partial write is the expected failure mode, so it must not discard the file.
+
+    Discarding it is worse than it looks: with the disagg server's file gone the
+    per-request groups fall back to the workers of their own role and still upload
+    plausible values, so nothing downstream can notice.
+    """
+    ctx = _ctx_file(tmp_path, n=5)
+    with open(ctx, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_read(ctx)[0])[:40])  # writer killed mid-record
+
+    metrics, info = compute_time_breakdown_metrics([ctx], "ctx_only")
+    assert info["skipped_lines"] == {os.path.basename(ctx): 1}
+    assert info["files"][os.path.basename(ctx)] == "ctx_worker (n=5)"
+    assert metrics["d_tb_ctx_processing_mean"] > 0.0
+    assert any("skipped 1 unparsable line" in w for w in info["warnings"])
+
+
+def test_a_non_object_line_is_skipped_too(tmp_path):
+    """json.loads succeeds on a bare scalar; _classify would then raise on it."""
+    ctx = _ctx_file(tmp_path, n=3)
+    with open(ctx, "a", encoding="utf-8") as handle:
+        handle.write("null\n")
+    metrics, info = compute_time_breakdown_metrics([ctx], "ctx_only")
+    assert info["skipped_lines"] == {os.path.basename(ctx): 1}
+    assert metrics["d_tb_ctx_processing_mean"] > 0.0
+
+
+class _FakeClock:
+    """Injected time source: ``sleep`` advances ``monotonic``, so no wall time passes."""
+
+    def __init__(self, on_sleep=None):
+        self.now = 0.0
+        self.on_sleep = on_sleep or (lambda _: None)
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+        self.on_sleep(self.now)
+
+
+def test_completion_gate_waits_until_the_files_stop_growing(tmp_path):
+    """The context workers and the disagg server have no sentinel; size stability is it."""
+    path = tmp_path / "perf_metrics-server-hostA-1-t.jsonl"
+    path.write_text("{}\n")
+    grew = []
+
+    def grow(now):
+        # Keep appending for the first 2 simulated seconds, then go quiet.
+        if now <= 2.0:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("{}\n")
+            grew.append(now)
+
+    clock = _FakeClock(on_sleep=grow)
+    paths, info = wait_for_perf_metrics_files(
+        str(tmp_path),
+        stable_seconds=3.0,
+        timeout_seconds=60.0,
+        poll_seconds=0.5,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+    assert paths == [str(path)]
+    assert info["stable"] is True
+    assert grew, "the fixture never grew the file, so the test proves nothing"
+    # Growth stopped at 2.0 and the window is 3.0, so it cannot have returned before 5.0.
+    assert info["waited_seconds"] >= 5.0
+    assert info["warnings"] == []
+
+
+def test_completion_gate_gives_up_and_warns_instead_of_hanging(tmp_path):
+    """A wedged writer must cost a warning, not the run: what is on disk is still usable."""
+    path = tmp_path / "perf_metrics-server-hostA-1-t.jsonl"
+    path.write_text("{}\n")
+
+    def grow(_):
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("{}\n")
+
+    clock = _FakeClock(on_sleep=grow)
+    paths, info = wait_for_perf_metrics_files(
+        str(tmp_path),
+        stable_seconds=3.0,
+        timeout_seconds=10.0,
+        poll_seconds=0.5,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+    assert paths == [str(path)]
+    assert info["stable"] is False
+    assert any("still growing after" in w for w in info["warnings"])
+
+
+def test_completion_gate_reports_a_record_census_shortfall(tmp_path):
+    """The census check is the only thing that can see a *silently* truncated run."""
+    ctx = _ctx_file(tmp_path, n=5)
+    clock = _FakeClock()
+    _, info = wait_for_perf_metrics_files(
+        str(tmp_path),
+        expected_requests=10,
+        stable_seconds=1.0,
+        poll_seconds=0.5,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+    assert info["line_counts"] == {os.path.basename(ctx): 5}
+    assert any("holds 5 complete record(s)" in w for w in info["warnings"])
+
+    clock = _FakeClock()
+    _, info = wait_for_perf_metrics_files(
+        str(tmp_path),
+        expected_requests=5,
+        stable_seconds=1.0,
+        poll_seconds=0.5,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+    assert info["warnings"] == []
+
+
+def test_completion_gate_line_count_excludes_a_partial_final_line(tmp_path):
+    """A record without its trailing newline is in flight, so it must not count."""
+    path = tmp_path / "perf_metrics-server-hostA-1-t.jsonl"
+    path.write_text('{"a": 1}\n{"b": 2}\n{"c": ')
+    clock = _FakeClock()
+    _, info = wait_for_perf_metrics_files(
+        str(tmp_path),
+        expected_requests=3,
+        stable_seconds=1.0,
+        poll_seconds=0.5,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+    assert info["line_counts"] == {path.name: 2}
+    assert any("holds 2 complete record(s)" in w for w in info["warnings"])

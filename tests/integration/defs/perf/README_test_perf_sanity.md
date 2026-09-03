@@ -345,6 +345,25 @@ Two consequences worth knowing:
   aggregate numbers are deliberately not comparable to the sibling unmodified
   case.
 
+### Reading the JSONLs without racing the writers
+
+Each request-serving process appends to its own `perf_metrics-*.jsonl` from a
+background writer thread and flushes the tail when it exits, so the aggregation has
+to run after the writers are done. Only the **gen** workers announce that
+(`gen_server_{i}.done`, which the device-step-time path already waits for); the ctx
+workers and the disaggregated server do not. `wait_for_perf_metrics_files` therefore
+polls the discovered set until its total size holds still for
+`PERF_METRICS_SETTLE_SECONDS`, bounded by `PERF_METRICS_SETTLE_TIMEOUT`, before
+anything is read, and then compares the largest file's complete-record count against
+the client's `--num-prompts`. Both a still-growing set at the timeout and a census
+shortfall are logged as warnings, not failures — a nearly-complete file still yields
+usable statistics, and the numbers are not regression-gated. This matters because a
+truncated read is otherwise **invisible**: all 108 fields are still populated and the
+row uploads green. For the same reason a malformed line (a partial write caught
+mid-record) costs only that line, never the whole file: dropping the disagg server's
+file would silently reroute the per-request groups to same-role worker fallbacks,
+which produce plausible values for the wrong phase.
+
 ## CI Test Database
 
 Test lists are defined in `tests/integration/test_lists/test-db/`.

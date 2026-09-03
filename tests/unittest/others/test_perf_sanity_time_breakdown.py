@@ -128,6 +128,16 @@ def _load_test_perf_sanity():
 _sanity = _load_test_perf_sanity()
 
 
+@pytest.fixture(autouse=True)
+def _no_settle_wait(monkeypatch):
+    """Collapse the perf_metrics settle window; these tests write their files up front.
+
+    The window itself is covered directly in test_time_breakdown_metrics.py, with an
+    injected clock. Paying it here would only add wall time per call.
+    """
+    monkeypatch.setattr(_sanity, "PERF_METRICS_SETTLE_SECONDS", 0.0)
+
+
 def _format_line(span: str, stat: str, value: float) -> str:
     """Reproduce exactly what ``benchmark_serving.main`` prints.
 

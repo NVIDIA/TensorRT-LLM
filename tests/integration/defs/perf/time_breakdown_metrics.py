@@ -54,6 +54,13 @@ clock whose origin differs from the ``timing_metrics`` base by a constant offset
 are offset-invariant, but the *first* chunk's / *first* step's preprocessing is anchored at
 ``first_scheduled_time`` and crosses the boundary. That offset is estimated per worker file and
 removed; uncorrected, one worker's first-step preprocessing would read as ``+377680 s``.
+
+**The writers are still running when the client exits.** Reading early truncates the
+population *silently* -- every field is still populated and the row still uploads. Only the
+generation workers have a completion sentinel, so ``wait_for_perf_metrics_files`` supplies the
+missing gate for the context workers and the disaggregated server (size stability plus a
+record census against the client's request count), and ``_read_jsonl`` skips a partial final
+line rather than discarding the file it appears in.
 """
 
 import argparse
@@ -62,6 +69,7 @@ import json
 import math
 import os
 import statistics
+import time
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -256,14 +264,35 @@ def _classify(path: str, records: List[Dict[str, Any]]) -> str:
     return "ctx_worker"
 
 
-def _read_jsonl(path: str) -> List[Dict[str, Any]]:
-    out = []
+def _read_jsonl(path: str) -> Tuple[List[Dict[str, Any]], int]:
+    """Parse a JSONL file, skipping unparsable lines. Returns ``(records, skipped)``.
+
+    A malformed line is expected rather than exceptional: the client and every worker
+    append to these files while the run is live, so the final line can be a partial
+    write at the moment the aggregator reads (and, for a worker killed mid-flush, can
+    stay partial forever). Dropping the whole file on one bad line is the worst possible
+    response -- it zeroes the cross-role group and silently reroutes the per-request
+    groups to same-role fallbacks, which still upload plausible-looking values. Skip the
+    line and count it instead; the count is surfaced as a warning by the caller. This
+    mirrors ``benchmark_serving._read_new_perf_metrics``, which also skips.
+    """
+    out: List[Dict[str, Any]] = []
+    skipped = 0
     with open(path) as handle:
         for line in handle:
             line = line.strip()
-            if line:
-                out.append(json.loads(line))
-    return out
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            if isinstance(record, dict):
+                out.append(record)
+            else:
+                skipped += 1
+    return out, skipped
 
 
 def _request_window(raw: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
@@ -497,12 +526,19 @@ def compute_time_breakdown_metrics(
     ctx_workers: List[Tuple[str, List[Dict[str, Any]]]] = []
     gen_workers: List[Tuple[str, List[Dict[str, Any]]]] = []
 
+    skipped_lines: Dict[str, int] = {}
     for path in paths:
         try:
-            records = _read_jsonl(path)
-        except (OSError, json.JSONDecodeError) as exc:
+            records, skipped = _read_jsonl(path)
+        except OSError as exc:
             warnings.append(f"{os.path.basename(path)}: unreadable ({exc})")
             continue
+        if skipped:
+            skipped_lines[os.path.basename(path)] = skipped
+            warnings.append(
+                f"{os.path.basename(path)}: skipped {skipped} unparsable line(s) "
+                f"(kept {len(records)}); a truncated final line is the usual cause"
+            )
         if drop_warmup_request:
             records, dropped = _drop_warmup_record(records)
             if dropped is not None:
@@ -612,6 +648,8 @@ def compute_time_breakdown_metrics(
         # Per file, so an unexpected pattern is visible: with a warmup request exactly one
         # ctx worker and one gen worker (plus the disagg server) should report a drop.
         "warmup_dropped": warmup_dropped,
+        # Per file, non-empty only when a line failed to parse (usually a partial write).
+        "skipped_lines": skipped_lines,
         "sample_counts": {
             name: len(
                 (per_instance if name in CHUNK_METRICS + STEP_METRICS else per_request).get(
@@ -647,6 +685,137 @@ def discover_perf_metrics_files(output_dir: str) -> List[str]:
             seen.add(real)
             result.append(path)
     return result
+
+
+# Bounds for wait_for_perf_metrics_files. The gate exists to cover the *tail* of the
+# writers' drain, not a hang: PerfMetricsJsonlWriter drains its queue continuously in a
+# background thread (batch 64, no timer), so at the moment the client exits only the last
+# handful of records are still in flight. Seconds is the right order of magnitude; the
+# timeout is a backstop for a worker that is wedged, and expiring it is a warning rather
+# than an error because reading a nearly-complete file still yields usable statistics.
+COMPLETION_STABLE_SECONDS = 3.0
+COMPLETION_TIMEOUT_SECONDS = 60.0
+COMPLETION_POLL_SECONDS = 0.5
+
+
+def _count_lines(path: str) -> int:
+    """Number of newline-terminated lines in ``path``.
+
+    Deliberately counts newlines, not records: a final line without a trailing newline is
+    a partial write, and excluding it is exactly the semantics the completion check wants.
+    """
+    total = 0
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1 << 20)
+            if not chunk:
+                return total
+            total += chunk.count(b"\n")
+
+
+def wait_for_perf_metrics_files(
+    output_dir: str,
+    expected_requests: Optional[int] = None,
+    stable_seconds: float = COMPLETION_STABLE_SECONDS,
+    timeout_seconds: float = COMPLETION_TIMEOUT_SECONDS,
+    poll_seconds: float = COMPLETION_POLL_SECONDS,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """Wait for the perf_metrics JSONLs to stop growing, then return them.
+
+    Positive completion gate for the aggregation. The harness has no completion signal for
+    the context workers or the disaggregated server -- unlike the generation workers, whose
+    ``gen_server_{i}.done`` sentinels the device-step-time path already waits on -- so
+    without this the aggregator races the writers' tail flush and silently reduces a
+    truncated population. Nothing downstream can notice: every metric is still populated
+    and the row uploads green.
+
+    Poll the discovered set's total byte size until it holds still for ``stable_seconds``
+    (new files appearing counts as growth), bounded by ``timeout_seconds``. Then, if
+    ``expected_requests`` is known, compare it against the largest file's complete-line
+    count -- the disagg server and the aggregated server each write one record per request,
+    so that file is the run's census -- and report a shortfall.
+
+    ``sleep`` / ``monotonic`` are injected so the unit tests can drive this without wall
+    time.
+
+    Returns ``(paths, info)``; ``info`` carries ``stable`` (bool), ``waited_seconds``,
+    ``total_bytes``, ``line_counts`` and ``warnings``.
+    """
+    warnings: List[str] = []
+    deadline = monotonic() + timeout_seconds
+
+    def snapshot() -> Tuple[List[str], Tuple[Tuple[str, Optional[int]], ...]]:
+        paths = discover_perf_metrics_files(output_dir)
+        sizes = []
+        for path in paths:
+            try:
+                sizes.append((os.path.basename(path), os.path.getsize(path)))
+            except OSError:
+                # Raced with a rename/removal; ``None`` differs from any size, so the
+                # next poll sees a change and the stability window restarts.
+                sizes.append((os.path.basename(path), None))
+        return paths, tuple(sizes)
+
+    started = monotonic()
+    paths, fingerprint = snapshot()
+    if not paths:
+        # Nothing was ever created, so there is nothing to wait for: the workers write
+        # their first record long before the client exits. The caller reports the empty
+        # discovery itself.
+        return [], {
+            "stable": True,
+            "waited_seconds": 0.0,
+            "total_bytes": 0,
+            "line_counts": {},
+            "expected_requests": expected_requests,
+            "warnings": warnings,
+        }
+    unchanged_since = monotonic()
+    stable = False
+    while True:
+        now = monotonic()
+        if now - unchanged_since >= stable_seconds:
+            stable = True
+            break
+        if now >= deadline:
+            warnings.append(
+                f"perf_metrics files under {output_dir} were still growing after "
+                f"{timeout_seconds:.0f}s; aggregating what is on disk"
+            )
+            break
+        sleep(min(poll_seconds, max(0.0, deadline - now)))
+        paths, new_fingerprint = snapshot()
+        if new_fingerprint != fingerprint:
+            fingerprint = new_fingerprint
+            unchanged_since = monotonic()
+
+    line_counts: Dict[str, int] = {}
+    for path in paths:
+        try:
+            line_counts[os.path.basename(path)] = _count_lines(path)
+        except OSError as exc:
+            warnings.append(f"{os.path.basename(path)}: could not count lines ({exc})")
+
+    if expected_requests and line_counts:
+        census = max(line_counts.values())
+        if census < expected_requests:
+            warnings.append(
+                f"the largest perf_metrics file holds {census} complete record(s) but the "
+                f"client issued {expected_requests} request(s); the breakdown covers a "
+                "subset of the run"
+            )
+
+    info = {
+        "stable": stable,
+        "waited_seconds": monotonic() - started,
+        "total_bytes": sum(size for _, size in fingerprint if size is not None),
+        "line_counts": line_counts,
+        "expected_requests": expected_requests,
+        "warnings": warnings,
+    }
+    return paths, info
 
 
 def format_metric_log_lines(metrics: Dict[str, float]) -> List[str]:

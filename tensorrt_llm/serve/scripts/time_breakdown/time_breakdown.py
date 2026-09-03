@@ -28,7 +28,7 @@ import json
 import math
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import plotly.graph_objects as go
@@ -373,17 +373,26 @@ class RequestTimeBreakdown:
                     "Expected a JSON array, JSON object, or JSONL file: "
                     f"{json_file_path}")
 
-        timing_data = []
         with open(json_file_path, 'r') as json_file:
-            for i, request in enumerate(iter_records(json_file)):
-                parsed_data = self.parser.parse_request(request, i)
+            return self.parse_records(iter_records(json_file))
 
-                # Calculate durations for each metric
-                for metric in self.config.metrics:
-                    duration = metric.calculate_duration(parsed_data)
-                    parsed_data[f'{metric.name}_time'] = duration
+    def parse_records(self, records: Iterable[Dict]) -> List[Dict]:
+        """Extract timing information from already-decoded perf-metrics records.
 
-                timing_data.append(parsed_data)
+        Same reduction as :meth:`parse_json_file`, minus the file decoding, so a caller
+        that already holds the records in memory does not have to write them out and read
+        them back just to get the breakdown.
+        """
+        timing_data = []
+        for i, request in enumerate(records):
+            parsed_data = self.parser.parse_request(request, i)
+
+            # Calculate durations for each metric
+            for metric in self.config.metrics:
+                duration = metric.calculate_duration(parsed_data)
+                parsed_data[f'{metric.name}_time'] = duration
+
+            timing_data.append(parsed_data)
 
         if timing_data:
             has_gen_metrics = any(not math.isnan(

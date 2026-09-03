@@ -236,17 +236,20 @@ def test_append_time_breakdown_metrics_reads_the_configured_dir(
 
     discover_calls: list[str] = []
 
-    def discover(directory: str) -> list[str]:
+    def wait_for_files(directory: str, **kwargs: object) -> tuple[list[str], dict]:
         discover_calls.append(directory)
-        return [str(breakdown_dir / "perf_metrics-server-0.jsonl")]
+        return (
+            [str(breakdown_dir / "perf_metrics-server-0.jsonl")],
+            {"stable": True, "waited_seconds": 0.0, "line_counts": {}, "warnings": []},
+        )
 
-    monkeypatch.setattr(perf_sanity, "discover_perf_metrics_files", discover)
+    monkeypatch.setattr(perf_sanity, "wait_for_perf_metrics_files", wait_for_files)
     monkeypatch.setattr(
         perf_sanity,
         "compute_time_breakdown_metrics",
-        lambda paths, case_type: (
+        lambda paths, case_type, **kwargs: (
             {"d_tb_ctx_queue_mean": 4.5},
-            {"warnings": [], "counts": {"ctx": 1}},
+            {"warnings": [], "counts": {"ctx": 1}, "warmup_dropped": {}},
         ),
     )
 
