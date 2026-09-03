@@ -13,13 +13,7 @@ pytest.importorskip(
 )
 
 import grpc  # noqa: E402
-from openengine.v1 import (  # noqa: E402
-    kv_pb2,
-    lifecycle_pb2,
-    lora_pb2,
-    model_pb2,
-    server_pb2,
-)
+from openengine.v1 import kv_pb2, lifecycle_pb2, lora_pb2, model_pb2, server_pb2  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
@@ -300,9 +294,7 @@ async def test_abort_leaves_cleanup_to_the_generate_stream():
     handle = _FakeHandle()
     inference = _inference({"req-1": handle})
 
-    await _servicer(inference).Abort(
-        lifecycle_pb2.AbortRequest(request_id="req-1"), _FakeContext()
-    )
+    await _servicer(inference).Abort(lifecycle_pb2.AbortRequest(request_id="req-1"), _FakeContext())
 
     assert handle.aborted is True
     assert inference.active_request_count() == 1
@@ -321,9 +313,7 @@ async def test_abort_fails_the_rpc_when_the_engine_refuses():
     context = _FakeContext()
 
     with pytest.raises(_Aborted):
-        await _servicer(inference).Abort(
-            lifecycle_pb2.AbortRequest(request_id="req-1"), context
-        )
+        await _servicer(inference).Abort(lifecycle_pb2.AbortRequest(request_id="req-1"), context)
 
     assert handle.aborted is False
     assert context.code == grpc.StatusCode.INTERNAL

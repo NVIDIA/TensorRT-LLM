@@ -327,9 +327,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             return lifecycle_pb2.HealthCheck(
                 name="inference_probe",
                 state=lifecycle_pb2.HEALTH_STATE_DEGRADED,
-                message=(
-                    f"probe did not complete within {_INFERENCE_PROBE_TIMEOUT_SECONDS}s"
-                ),
+                message=(f"probe did not complete within {_INFERENCE_PROBE_TIMEOUT_SECONDS}s"),
             )
         # CancelledError is a BaseException, so `except Exception` misses it.
         except asyncio.CancelledError:

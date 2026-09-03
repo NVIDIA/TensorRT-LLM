@@ -6,9 +6,9 @@
 import asyncio
 import base64
 from collections.abc import AsyncIterator, Mapping, Sequence
-from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import grpc
 from google.protobuf import struct_pb2
@@ -546,9 +546,7 @@ def _validate_kv_session(session: Any) -> None:
     if endpoint:
         parts = _split_endpoint(str(endpoint))
         if parts is None or not parts[1]:
-            raise ValueError(
-                f"kv.session ctx_info_endpoint '{endpoint}' is not a usable address"
-            )
+            raise ValueError(f"kv.session ctx_info_endpoint '{endpoint}' is not a usable address")
     elif not attrs.get("opaque_state"):
         # One or the other locates the context worker: an endpoint on builds that
         # fetch its info over ZMQ, opaque_state on builds that carry it inline.
@@ -707,9 +705,7 @@ def _prefill_ready_response(
         parts = _split_endpoint(endpoint)
         if parts is not None:
             host, port, scheme = parts
-            session.endpoints.add(
-                host=host, port=port, protocol=scheme or transfer_backend or ""
-            )
+            session.endpoints.add(host=host, port=port, protocol=scheme or transfer_backend or "")
     opaque_state = _disagg_attr(disaggregated_params, "opaque_state")
     if opaque_state is not None:
         attributes["opaque_state"] = base64.b64encode(opaque_state).decode("utf-8")

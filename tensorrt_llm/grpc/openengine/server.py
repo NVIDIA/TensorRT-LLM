@@ -66,9 +66,7 @@ class OpenEngineServer:
         self.port = port
         self._server = grpc.aio.server(options=_SERVER_OPTIONS)
         kv_transfer_backend = _kv_transfer_backend(llm)
-        inference = OpenEngineInferenceServicer(
-            llm, model, kv_transfer_backend=kv_transfer_backend
-        )
+        inference = OpenEngineInferenceServicer(llm, model, kv_transfer_backend=kv_transfer_backend)
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         # Control shares the inference servicer's in-flight request table so
         # Abort and GetLoad see the same requests Generate is serving.

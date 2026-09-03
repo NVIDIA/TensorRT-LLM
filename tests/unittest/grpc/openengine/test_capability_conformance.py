@@ -269,12 +269,12 @@ def test_logprob_ceiling_is_the_limit_the_engine_enforces(llm, model_info):
             )
         )
 
-    assert _accepted(llm, candidates(limit)), (
-        f"advertised max_top_n={limit} but the engine rejected it"
-    )
-    assert not _accepted(llm, candidates(limit + 1)), (
-        f"engine accepted top_n={limit + 1}, above the advertised ceiling {limit}"
-    )
+    assert _accepted(
+        llm, candidates(limit)
+    ), f"advertised max_top_n={limit} but the engine rejected it"
+    assert not _accepted(
+        llm, candidates(limit + 1)
+    ), f"engine accepted top_n={limit + 1}, above the advertised ceiling {limit}"
 
 
 def test_logprob_ceiling_matches_the_enforced_constant(model_info):
@@ -282,7 +282,7 @@ def test_logprob_ceiling_matches_the_enforced_constant(model_info):
 
 
 def test_multi_sequence_support_matches_max_num_sequences(llm, model_info):
-    """n > 1 is served by sampling, so a beam-width-derived limit would be wrong."""
+    """N > 1 is served by sampling, so a beam-width-derived limit would be wrong."""
     generation = model_info.generation
     accepted = _accepted(
         llm,
