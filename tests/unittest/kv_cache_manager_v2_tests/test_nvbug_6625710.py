@@ -152,7 +152,7 @@ class TestNvBug6625710(unittest.TestCase):
         # the attention pages were evicted too, which is not the case under test.
         probe = self.manager.create_kv_cache(input_tokens=list(prompt))
         reusable = probe.num_committed_tokens
-        attn_only = probe._get_num_tokens_before_hybrid_pruning()
+        attn_only = probe._get_num_reusable_tokens_before_hybrid_pruning()
         probe.close()
         self.assertLess(
             reusable,
