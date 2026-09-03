@@ -41,7 +41,7 @@ import os
 import random
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import sys
 import tempfile
 import time
