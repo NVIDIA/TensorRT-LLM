@@ -99,6 +99,46 @@ def reference_rms_norm(
         return hidden_states
 
 
+def test_cuda_tile_rms_norm_rejects_sm107(monkeypatch: pytest.MonkeyPatch) -> None:
+    """cuda_tile_rms_norm has no SM107 kernels; it must raise instead of launching one."""
+    import tensorrt_llm._torch.custom_ops.cuda_tile_custom_ops as cuda_tile_custom_ops
+
+    monkeypatch.setattr(cuda_tile_custom_ops, "get_sm_version", lambda: 107)
+    x = torch.randn(4, 16, device="cuda")
+    weight = torch.randn(16, device="cuda")
+    with pytest.raises(RuntimeError, match="not supported on SM 107"):
+        torch.ops.trtllm.cuda_tile_rms_norm(
+            x=x,
+            weight=weight,
+            eps=1e-5,
+            static_persistent=False,
+            gather=False,
+            use_gemma=False,
+        )
+
+
+def test_cuda_tile_rms_norm_fuse_residual_rejects_sm107(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cuda_tile_rms_norm_fuse_residual_ has no SM107 kernels; it must raise instead of launching one."""
+    import tensorrt_llm._torch.custom_ops.cuda_tile_custom_ops as cuda_tile_custom_ops
+
+    monkeypatch.setattr(cuda_tile_custom_ops, "get_sm_version", lambda: 107)
+    x = torch.randn(4, 16, device="cuda").contiguous()
+    residual = torch.randn(4, 16, device="cuda").contiguous()
+    weight = torch.randn(16, device="cuda")
+    with pytest.raises(RuntimeError, match="not supported on SM 107"):
+        torch.ops.trtllm.cuda_tile_rms_norm_fuse_residual_(
+            x=x,
+            residual=residual,
+            weight=weight,
+            eps=1e-5,
+            static_persistent=False,
+            gather=False,
+            use_gemma=False,
+        )
+
+
 @skip_rubin
 @pytest.mark.parametrize(
     "M,N",
