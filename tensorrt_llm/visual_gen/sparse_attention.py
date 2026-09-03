@@ -221,7 +221,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         return None
 
 
-class SolAttnAttentionConfig(BaseSparseAttentionConfig):
+class SolAttentionConfig(BaseSparseAttentionConfig):
     """Sol-Attn sparse attention configuration for visual generation.
 
     Dynamic block routing + sparse computation + approximation correction in
@@ -281,7 +281,7 @@ class SolAttnAttentionConfig(BaseSparseAttentionConfig):
     )
 
     def to_sparse_params(self, **kwargs):
-        # Sol-Attn's knobs are consumed directly by SolAttnAttention.__init__
+        # Sol-Attn's knobs are consumed directly by SolAttention.__init__
         # (constructed via CUTEDSL backend dispatch in create_attention), not
         # lowered into a shared SparseParams -- the vendored kernel has no
         # checkpoint-calibration step to resolve here, unlike skip_softmax.

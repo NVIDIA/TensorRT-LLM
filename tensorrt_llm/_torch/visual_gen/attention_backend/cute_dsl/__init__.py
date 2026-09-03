@@ -17,11 +17,11 @@ CuTe DSL attention backend family for visual generation models.
 
   fmha.py      — CuTeDSLAttention  (dense and blockscaled JIT FMHA)
   vsa.py       — VSAAttention       (Video Sparse Attention, CuTe JIT + SDPA fallback)
-  sol_attn.py  — SolAttnAttention   (Sol-Attn dynamic block routing, CuTe JIT + SDPA fallback)
+  sol_attn.py  — SolAttention   (Sol-Attn dynamic block routing, CuTe JIT + SDPA fallback)
 """
 
 from .fmha import CuTeDSLAttention, _cute_dsl_import_error
-from .sol_attn import SolAttnAttention, sol_attn_graph_phase
+from .sol_attn import SolAttention, sol_attn_graph_phase
 from .vsa import (
     VSA_KERNEL_MAX_CUBES,
     VSA_TILE_SIZE,
@@ -44,6 +44,6 @@ __all__ = [
     "set_vsa_forward_context",
     "get_vsa_forward_context",
     "_cute_dsl_import_error",
-    "SolAttnAttention",
+    "SolAttention",
     "sol_attn_graph_phase",
 ]

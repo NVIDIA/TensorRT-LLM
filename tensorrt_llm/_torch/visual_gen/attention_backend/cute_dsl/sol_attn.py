@@ -126,7 +126,7 @@ def _parse_dense_layers(spec: Optional[str]) -> frozenset:
     return frozenset(layers)
 
 
-class SolAttnAttention(AttentionBackend):
+class SolAttention(AttentionBackend):
     """Sol-Attn dynamic block-routing sparse attention (CuTeDSL, sm100).
 
     The kernel wrapper already falls back to dense attention on any unsupported
@@ -147,7 +147,7 @@ class SolAttnAttention(AttentionBackend):
     ):
         if _sol_attn_run is None:
             raise ImportError(
-                "SolAttnAttention requires the vendored sol_attn kernel "
+                "SolAttention requires the vendored sol_attn kernel "
                 f"package; import failed: {_sol_attn_import_error}"
             )
         self.layer_idx = layer_idx
@@ -214,7 +214,7 @@ class SolAttnAttention(AttentionBackend):
             # sparse kernel rather than silently forcing dense forever.
             # This degrades quality rather than raising, so say so once.
             logger.warning_once(
-                "SolAttnAttentionConfig.disabled_until_timestep="
+                "SolAttentionConfig.disabled_until_timestep="
                 f"{self.disabled_until_timestep} is set, but no `timestep` reached "
                 "the Sol-Attn forward call. The dense prefix it requests will not "
                 "be applied. Ensure the pipeline passes a normalized timestep, or "
