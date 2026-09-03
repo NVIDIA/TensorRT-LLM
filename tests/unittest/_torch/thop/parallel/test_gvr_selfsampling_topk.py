@@ -317,6 +317,24 @@ def test_selfsampling_topk_posinf_completeness(pos):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
+def test_selfsampling_topk_posinf_regclus_completeness():
+    """A collapsed reg_clus bracket must use its whole-row key-space
+    fallback instead of emitting from the lossy float-space histogram."""
+    batch_size, n_valid, top_k = 4, 32768, 1024
+    assert ss_host.route(batch_size, n_valid, n_valid, top_k)["kernel"] == "reg_clus"
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((batch_size, n_valid), generator=gen, dtype=torch.float32, device=_DEV)
+    logits[:, 1000] = float("inf")
+    ref_vals, _ = torch.topk(logits, top_k, dim=1)
+    indices = torch.full((batch_size, top_k), -7, dtype=torch.int32, device=_DEV)
+    kv = torch.full((batch_size,), n_valid, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, kv, indices, max_seq_len=n_valid)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots"
+    assert torch.isposinf(logits.gather(1, indices.long())).any(dim=1).all()
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
 def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False):
     """Build a per-row-poisoned varlen batch, run run_varlen, verify every
     row against its own n_r (production formula) — short rows included."""

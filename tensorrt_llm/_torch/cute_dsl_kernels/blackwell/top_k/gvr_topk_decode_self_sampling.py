@@ -6136,10 +6136,13 @@ class GvrRegClusKernel:
             Tv = invkey(lmin)
             GMAX = invkey(lmax)
 
-            # ---- collapse guard, NaN-safe
+            # ---- collapse guard, NaN-safe. Reject infinite width as well:
+            # otherwise SC becomes zero and can collapse +inf into a finite
+            # histogram bin.
             okc = cutlass.Int32(0)
             if Tv < GMAX:
-                if (GMAX - Tv) > cutlass.Float32(1e-30):
+                w_ = GMAX - Tv
+                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(3.5e38):
                     okc = cutlass.Int32(1)
             if okc == cutlass.Int32(0):
                 Tv = cutlass.Float32(SENT_LO)
@@ -6200,6 +6203,12 @@ class GvrRegClusKernel:
                 whole = cutlass.Int32(1)
             degen = cutlass.Int32(0)
             if m > cutlass.Int32(CS * CMPC):
+                degen = cutlass.Int32(1)
+            # The sentinel bracket also has infinite width. Bypass its
+            # collapsed histogram and enter the exact whole-row key-space
+            # fallback on rank 0, where fkey(+inf) is the maximum key.
+            if okc == cutlass.Int32(0):
+                whole = cutlass.Int32(0)
                 degen = cutlass.Int32(1)
             for z in cutlass.range_constexpr(NB__regclus // self.blk):
                 i = tid + cutlass.Int32(z * self.blk)
