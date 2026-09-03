@@ -6,8 +6,7 @@
 import json
 import os
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -117,10 +116,11 @@ def test_wan_warmup_encodes_each_fp4_ti2v_resolution_once():
             self.encoded_shapes.append(tuple(image.shape))
 
     pipeline = object.__new__(WanPipeline)
+    torch.nn.Module.__init__(pipeline)
     pipeline.is_wan22_5b = True
     pipeline._fp4_vae_encoder_warmup_resolutions = set()
     pipeline.vae = _FakeVAE()
-    pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+    pipeline._device = torch.device("cpu")
     forward_calls = []
     pipeline.forward = lambda **kwargs: forward_calls.append(kwargs)
 
@@ -145,7 +145,14 @@ def test_fp4_conv_composes_with_parallel_vae_halo():
     # ParallelVAE_TrtllmWan targets the native base class, which intentionally
     # includes its NVFP4 subclass when replacing convs with halo wrappers.
     assert isinstance(fp4_conv, ParallelVAE_TrtllmWan._conv3d_cls)
-    halo = WanCausalConvHalo(fp4_conv, chunk_dim=4, adj_groups=[None], rank=0, world_size=2)
+    adjacent_group = MagicMock(spec=torch.distributed.ProcessGroup)
+    halo = WanCausalConvHalo(
+        fp4_conv,
+        chunk_dim=4,
+        adj_groups=[adjacent_group],
+        rank=0,
+        world_size=2,
+    )
     assert halo.module is fp4_conv
     assert halo.absorbs_silu
     assert halo.absorbs_norm
