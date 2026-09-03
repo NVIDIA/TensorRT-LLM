@@ -97,18 +97,19 @@ def _make_config(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Sol-Attn needs CUDA")
-def test_sol_attn_cross_attention_uses_dense_cutedsl():
-    """Cross-attention must stay on CuTeDSL, not drop to VANILLA.
+def test_sol_attn_cross_attention_delegates_to_dense_cutedsl():
+    """Cross-attention is delegated to the dense backend, decided per call.
 
-    Sol-Attn is self-attention only, so SEPARATE_QKV modules fall back -- but to
-    the dense kernel of the *configured* backend, not to torch SDPA. Falling back
-    to VANILLA made a `backend: CUTEDSL` run and a `CUTEDSL + sol_attn` run differ
-    in cross-attention in every block, regardless of any sparse setting, which is
-    a backend difference masquerading as a sparsity difference in any A/B.
+    Sol-Attn is self-attention only. It is still the module's backend for a
+    cross-attention module -- `create_attention` has no rule excluding it -- and
+    delegates at `forward` because `_can_serve` sees `k.shape[1] != q.shape[1]`.
+
+    Deciding this per call rather than at construction is the point: `qkv_mode`
+    describes how Q/K/V are projected, not whether K/V come from another
+    sequence, so a construction-time rule keyed on SEPARATE_QKV silently
+    stripped the configured backend from self-attention modules that use that
+    mode for unrelated reasons (Qwen-Image; WAN attn1 under async Ulysses).
     """
-    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import CuTeDSLAttention
-    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import SolAttention
-
     device = torch.device("cuda")
     dtype = torch.bfloat16
     cfg = _make_config(
@@ -120,14 +121,32 @@ def test_sol_attn_cross_attention_uses_dense_cutedsl():
         .eval()
     )
     assert cross_attn.attn_backend == "CUTEDSL", (
-        f"expected CUTEDSL cross-attention, got {cross_attn.attn_backend!r}"
+        f"expected CUTEDSL, got {cross_attn.attn_backend!r}"
     )
-    assert isinstance(cross_attn.attn, CuTeDSLAttention), (
-        f"expected the dense CuTeDSL kernel, got {type(cross_attn.attn).__name__}"
+    assert isinstance(cross_attn.attn, SolAttention), (
+        "Sol-Attn should remain the backend and delegate per call, not be "
+        f"swapped out at construction; got {type(cross_attn.attn).__name__}"
     )
-    assert not isinstance(cross_attn.attn, SolAttention), (
-        "cross-attention must not re-select the sparse backend"
+    # q and k with different sequence lengths -> not self-attention -> delegate
+    q = torch.randn(1, 32, 4, 16, device=device, dtype=dtype)
+    k = torch.randn(1, 77, 4, 16, device=device, dtype=dtype)
+    assert not cross_attn.attn._can_serve(q, k), (
+        "differing q/k sequence lengths must be delegated, not routed to the sparse kernel"
     )
+
+
+def test_sol_attn_self_attention_is_served_under_separate_qkv():
+    """SEPARATE_QKV self-attention keeps Sol-Attn -- the async-Ulysses case.
+
+    WAN's attn1 switches to SEPARATE_QKV when async Ulysses is active, and
+    Qwen-Image uses it unconditionally. Both are self-attention; both must still
+    get the sparse kernel.
+    """
+    device = torch.device("cuda")
+    attn = SolAttention(layer_idx=1, num_heads=2, head_dim=128)
+    attn.disabled_until_timestep = None
+    q = k = torch.randn(1, 64, 2, 128, device=device, dtype=torch.bfloat16)
+    assert attn._can_serve(q, k), "equal q/k sequence lengths must reach the sparse kernel"
 
 
 def test_sol_attn_with_context_parallelism_raises():
@@ -472,7 +491,7 @@ def test_timestep_scalar_read_is_opaque_to_dynamo():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_dense_paths_use_cutedsl_backend(monkeypatch):
-    """All three dense paths must reach the configured backend's dense kernel.
+    """Every path Sol-Attn cannot serve must reach the configured dense kernel.
 
     Sol-Attn does dense attention on the `dense_layers` guard, the
     `disabled_until_timestep` prefix, and kernel-ineligibility fallback. If those
@@ -492,13 +511,13 @@ def test_dense_paths_use_cutedsl_backend(monkeypatch):
     def _make():
         a = SolAttention(layer_idx=0, num_heads=2, head_dim=128)
         calls = {"n": 0}
-        real = a._dense_backend.forward
+        real = a._inner.forward
 
         def _spy(*args, **kwargs):
             calls["n"] += 1
             return real(*args, **kwargs)
 
-        monkeypatch.setattr(a._dense_backend, "forward", _spy)
+        monkeypatch.setattr(a._inner, "forward", _spy)
         return a, calls
 
     # 1. dense prefix: timestep at/above the cutoff
@@ -506,14 +525,14 @@ def test_dense_paths_use_cutedsl_backend(monkeypatch):
     a.disabled_until_timestep = 0.9
     a.dense_layers = frozenset()
     a.forward(q, k, v, timestep=torch.tensor(0.95))
-    assert calls["n"] == 1, "dense prefix did not use the CuTeDSL dense kernel"
+    assert calls["n"] == 1, "dense prefix was not delegated to the CuTeDSL dense kernel"
 
     # 2. dense_layers guard
     a, calls = _make()
     a.disabled_until_timestep = None
     a.dense_layers = frozenset({0})
     a.forward(q, k, v)
-    assert calls["n"] == 1, "dense_layers guard did not use the CuTeDSL dense kernel"
+    assert calls["n"] == 1, "dense_layers guard was not delegated to the CuTeDSL dense kernel"
 
     # 3. ineligibility fallback, reached through `dense_fn`
     a, calls = _make()
