@@ -718,15 +718,33 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if self._shutdown_requested:
                 raise RuntimeError("cannot create a TxSession after Sender shutdown")
-            self._sessions[unique_rid] = (
-                tx_session if self._enforce_physical_ownership else weakref.ref(tx_session)
-            )
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
                 self._pre_cancelled_rids.discard(unique_rid)
+            if not (pre_cancel and self._enforce_physical_ownership):
+                self._sessions[unique_rid] = (
+                    tx_session if self._enforce_physical_ownership else weakref.ref(tx_session)
+                )
         if pre_cancel:
             if self._enforce_physical_ownership:
                 tx_session.cancel_local()
+                # Make the cancelled session visible only after its terminal
+                # state and the previously saved requests are captured. This
+                # prevents the listener from reporting the same first
+                # REQUEST_DATA concurrently with this pre-cancel path.
+                with self._sessions_lock:
+                    if self._shutdown_requested:
+                        raise RuntimeError("cannot create a TxSession after Sender shutdown")
+                    self._pre_cancelled_rids.discard(unique_rid)
+                    with self._peer_requests_lock:
+                        req_infos = list(self._peer_requests.get(unique_rid, {}).values())
+                    self._sessions[unique_rid] = tx_session
+                for info in req_infos:
+                    self._send_failed_result_to_receiver(
+                        info,
+                        include_aux=getattr(tx_session, "_need_aux", False),
+                        defer_to_worker=True,
+                    )
             else:
                 tx_session.cancel()
             return
@@ -1133,10 +1151,23 @@ class Sender(SenderBase):
         if write_meta.src_ptrs.size > 0:
             try:
                 request = Sender._make_agent_request(write_meta, device_id=self._device_id)
-            except Exception:
+            except Exception as error:
+                logger.error(
+                    "_deliver_aux_to_agent: failed to build the auxiliary send "
+                    f"request for {write_meta.unique_rid}: {error}"
+                )
                 if owned:
                     aux_task.finish_physical_operation(write_meta.peer_rank)
-                raise
+                aux_task.fail(RuntimeError(f"build aux transfer request failed: {error}"))
+                self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
+                    [
+                        MessageType.AUX_AGENT_RESULT,
+                        str(self._instance_rank).encode("ascii"),
+                        str(write_meta.unique_rid).encode("ascii"),
+                        AgentResult.FAILED.value.encode("ascii"),
+                    ]
+                )
+                return
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
             try:
@@ -1596,22 +1627,34 @@ class Sender(SenderBase):
                     self._save_peer_req_info(info)
                     tasks = list(session.kv_tasks)
             if tasks is None:
-                self._send_failed_result_to_receiver(info)
+                self._send_failed_result_to_receiver(
+                    info,
+                    include_aux=getattr(session, "_need_aux", False),
+                )
                 return
             # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
             # Send it directly to unblock the receiver's TRANSFERRING task future;
             # CANCEL_SESSION alone would leave it stuck indefinitely.
             if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
-                self._send_failed_result_to_receiver(info)
+                self._send_failed_result_to_receiver(
+                    info,
+                    include_aux=getattr(session, "_need_aux", False),
+                )
                 return
         for task in tasks:
             self._dispatch_task_to_peer(task, info)
 
-    def _send_failed_result_to_receiver(self, info: RecvReqInfo):
+    def _send_failed_result_to_receiver(
+        self,
+        info: RecvReqInfo,
+        *,
+        include_aux: bool = False,
+        defer_to_worker: bool = False,
+    ):
         try:
             peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
             slice_id = info.slice_id if info.slice_id is not None else 0
-            self._get_or_connect_dealer(peer_ri.self_endpoint).send(
+            messages = [
                 _make_kv_result_msg(
                     self._instance_rank,
                     info.unique_rid,
@@ -1619,7 +1662,27 @@ class Sender(SenderBase):
                     True,  # is_last_slice
                     AgentResult.FAILED,
                 )
-            )
+            ]
+            if include_aux:
+                messages.append(
+                    [MessageType.AUX_AGENT_RESULT]
+                    + [
+                        str(value).encode("ascii")
+                        for value in (
+                            self._instance_rank,
+                            info.unique_rid,
+                            AgentResult.FAILED.value,
+                        )
+                    ]
+                )
+            if defer_to_worker:
+                thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
+                for message in messages:
+                    self._send_task_queues[thread_idx].put((peer_ri.self_endpoint, message))
+            else:
+                dealer = self._get_or_connect_dealer(peer_ri.self_endpoint)
+                for message in messages:
+                    dealer.send(message)
         except Exception as e:
             logger.warning(
                 f"_respond_with_kv: failed to abort receiver for rid={info.unique_rid}: {e}"
@@ -1633,10 +1696,11 @@ class Sender(SenderBase):
                 info.instance_name, info.instance_rank
             ).self_endpoint
             if isinstance(task, KVSendTask):
+                receiver_slice_id = info.slice_id if info.slice_id is not None else 0
                 message = _make_kv_result_msg(
                     self._instance_rank,
                     info.unique_rid,
-                    task.slice_id,
+                    receiver_slice_id,
                     True,
                     AgentResult.FAILED,
                 )

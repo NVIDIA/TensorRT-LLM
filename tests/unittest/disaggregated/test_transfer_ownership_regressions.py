@@ -1043,10 +1043,11 @@ def test_send_terminal_session_is_retained_when_close_refuses(
     transceiver._send_reqs = {rid: request}
     transceiver._ctx_consensus = Mock(side_effect=lambda rids: rids)
     transceiver._ctx_consensus_outcome = Mock(
-        side_effect=lambda _rids, cancelled, failed, completed: (
+        side_effect=lambda _rids, cancelled, failed, completed, locally_quiesced: (
             cancelled,
-            failed,
-            completed,
+            [rid for rid in failed if rid not in set(cancelled)],
+            [rid for rid in completed if rid not in set(cancelled) | set(failed)],
+            locally_quiesced,
         )
     )
     transceiver._transfer_worker = SimpleNamespace(sweep_stale_req_infos=Mock())
@@ -1253,6 +1254,50 @@ def test_context_manager_preserves_primary_exception_when_shutdown_refuses() -> 
         transceiver.__exit__(None, None, None)
 
 
+@pytest.mark.cpu_only
+def test_concurrent_shutdown_is_serialized() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    lock_events: queue.Queue[str] = queue.Queue()
+    thread_results: queue.Queue[Exception | None] = queue.Queue()
+    call_count = 0
+
+    def worker_shutdown() -> None:
+        nonlocal call_count
+        call_count += 1
+        entered.set()
+        assert release.wait(timeout=10)
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._shutdown_complete = False
+    transceiver._shutdown_lock = _TrackingLock(lock_events)
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._transfer_worker = SimpleNamespace(shutdown=worker_shutdown)
+
+    first = _start_checked_thread(transceiver.shutdown, thread_results)
+    assert entered.wait(timeout=10)
+
+    def second_shutdown() -> None:
+        transceiver._shutdown_lock.tracked_thread_id = threading.get_ident()
+        transceiver.shutdown()
+
+    second = _start_checked_thread(second_shutdown, thread_results)
+    assert lock_events.get(timeout=10) == "blocked"
+    assert call_count == 1
+
+    release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    _raise_thread_errors(thread_results, expected=2)
+    assert transceiver._shutdown_complete
+    assert call_count == 1
+
+
 def _make_owned_sender(
     operation_drain_timeout_s: float | None = None,
 ) -> transfer_mod.Sender:
@@ -1265,6 +1310,109 @@ def _make_owned_sender(
     sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
     sender._instance_rank = 0
     return sender
+
+
+@pytest.mark.cpu_only
+def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch) -> None:
+    rid = 97
+    sender = _make_owned_sender()
+    sender._peer_requests_lock = threading.Lock()
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=18,
+        instance_name="gen",
+        instance_rank=2,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+        slice_id=0,
+    )
+    sender._peer_requests = {rid: {info.instance_rank: info}}
+    sender._pre_cancelled_rids = {rid}
+    sender._instance_rank = 5
+    sender._num_threads = 1
+    sender._send_task_queues = [queue.Queue()]
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
+    )
+    make_result = Mock(return_value=[MessageType.KV_AGENT_RESULT, b"failed"])
+    monkeypatch.setattr(transfer_mod, "_make_kv_result_msg", make_result)
+    session = SimpleNamespace(
+        disagg_request_id=rid,
+        _need_aux=True,
+        cancel_local=Mock(return_value=True),
+    )
+
+    sender.setup_session(session)
+
+    assert sender._sessions == {rid: session}
+    assert sender._pre_cancelled_rids == set()
+    session.cancel_local.assert_called_once_with()
+    make_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
+    assert sender._send_task_queues[0].get_nowait() == (
+        "receiver",
+        [MessageType.KV_AGENT_RESULT, b"failed"],
+    )
+    assert sender._send_task_queues[0].get_nowait() == (
+        "receiver",
+        [
+            MessageType.AUX_AGENT_RESULT,
+            b"5",
+            b"97",
+            AgentResult.FAILED.value.encode("ascii"),
+        ],
+    )
+    assert sender._send_task_queues[0].empty()
+
+
+@pytest.mark.cpu_only
+def test_aux_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> None:
+    rid = 98
+    peer_rank = 2
+    sender = _make_owned_sender()
+    sender._device_id = 0
+    sender._agent = Mock()
+    sender._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="ctx", instance_rank=5)
+    )
+    dealer = Mock()
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
+    task = transfer_mod.AuxSendTask(
+        DisaggregatedParams(disagg_request_id=rid),
+        slot=0,
+    )
+    assert task.begin_physical_operation(peer_rank)
+    session = SimpleNamespace(aux_task=task, set_exception=Mock())
+    sender._sessions = {rid: session}
+    write_meta = transfer_mod.WriteMeta(
+        task=task,
+        expected_transfers=1,
+        peer_name="gen2",
+        peer_rank=peer_rank,
+        peer_endpoint="receiver",
+        unique_rid=rid,
+        src_ptrs=np.array([0x1000], dtype=np.int64),
+        dst_ptrs=np.array([0x2000], dtype=np.int64),
+        sizes=np.array([0x100], dtype=np.int64),
+        meta_type=transfer_mod.WriteMetaType.AUX,
+    )
+    monkeypatch.setattr(
+        transfer_mod.Sender,
+        "_make_agent_request",
+        Mock(side_effect=RuntimeError("descriptor build failed")),
+    )
+
+    sender._deliver_aux_to_agent(write_meta)
+
+    sender._agent.submit_transfer_requests.assert_not_called()
+    assert task.resources_drained
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    dealer.send.assert_called_once_with(
+        [
+            MessageType.AUX_AGENT_RESULT,
+            b"5",
+            b"98",
+            AgentResult.FAILED.value.encode("ascii"),
+        ]
+    )
 
 
 @pytest.mark.cpu_only
@@ -1383,6 +1531,41 @@ def test_agent_gate_timeouts_retain_active_transfer() -> None:
 
 
 @pytest.mark.cpu_only
+def test_rejected_sender_slice_addresses_receiver_task(monkeypatch) -> None:
+    rid = 96
+    sender = object.__new__(transfer_mod.Sender)
+    sender._instance_rank = 5
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
+    )
+    sender._num_threads = 1
+    sender._send_task_queues = [queue.Queue()]
+    task = transfer_mod.KVSendTask(
+        KVSlice(is_last_slice=False),
+        DisaggregatedParams(disagg_request_id=rid),
+        slice_id=3,
+    )
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=17,
+        instance_name="gen",
+        instance_rank=2,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+        slice_id=0,
+    )
+    make_result = Mock(return_value=[MessageType.KV_AGENT_RESULT, b"failed"])
+    monkeypatch.setattr(transfer_mod, "_make_kv_result_msg", make_result)
+
+    sender._send_failed_task_result_to_receiver(task, info)
+
+    make_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
+    assert sender._send_task_queues[0].get_nowait() == (
+        "receiver",
+        [MessageType.KV_AGENT_RESULT, b"failed"],
+    )
+
+
+@pytest.mark.cpu_only
 def test_gen_first_aux_owner_uses_anonymous_no_retry_writer_count() -> None:
     receiver = _ReceiverProbe()
     session = RxSession(
@@ -1431,6 +1614,7 @@ def test_fp4_mla_bridge_uses_production_cache_layout(monkeypatch) -> None:
         transceiver_runtime="PYTHON",
         kv_transfer_timeout_ms=60_000,
         kv_cache_bounce_size_mb=0,
+        enable_pipelined_transfer=False,
     )
     profile = (mapping, manager, config)
 
@@ -1463,3 +1647,66 @@ def test_fp4_mla_bridge_uses_production_cache_layout(monkeypatch) -> None:
         patch.setattr(mapping, "enable_attention_dp", False)
         with pytest.raises(ValueError, match="no-retry ADP"):
             transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(config, "enable_pipelined_transfer", True)
+        with pytest.raises(ValueError, match="monolithic"):
+            transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+
+    for target, attribute, value in (
+        (config, "backend", "UCX"),
+        (config, "transceiver_runtime", "CPP"),
+        (config, "kv_transfer_timeout_ms", None),
+        (config, "kv_cache_bounce_size_mb", 1),
+        (mapping, "pp_size", 2),
+        (mapping, "cp_size", 2),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(target, attribute, value)
+            with pytest.raises(ValueError, match="FP4 MLA lifecycle bridge requires"):
+                transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+
+    for variable in (
+        "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP",
+        "TRTLLM_DISAGG_LAYERWISE",
+    ):
+        with monkeypatch.context() as patch:
+            patch.setenv(variable, "1")
+            with pytest.raises(ValueError, match="FP4 MLA lifecycle bridge requires"):
+                transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+
+
+@pytest.mark.cpu_only
+def test_fp4_mla_bridge_rejects_requests_outside_qualified_protocol() -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._fp4_mla_bridge_enabled = True
+    valid = SimpleNamespace(
+        schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
+        disagg_request_id=1,
+    )
+    transceiver._validate_bridge_req(SimpleNamespace(py_disaggregated_params=valid))
+
+    invalid_cases = (
+        (None, False),
+        (
+            SimpleNamespace(
+                schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
+                disagg_request_id=1,
+            ),
+            False,
+        ),
+        (
+            SimpleNamespace(
+                schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
+                disagg_request_id=None,
+            ),
+            False,
+        ),
+        (valid, True),
+    )
+    for params, synchronous in invalid_cases:
+        with pytest.raises(ValueError, match="async generation-first requests"):
+            transceiver._validate_bridge_req(
+                SimpleNamespace(py_disaggregated_params=params),
+                synchronous=synchronous,
+            )
