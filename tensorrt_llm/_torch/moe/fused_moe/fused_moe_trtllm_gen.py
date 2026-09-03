@@ -325,12 +325,9 @@ class TRTLLMGenFusedMoE(MoEImplBase):
 
         # Eligibility (SM / smart_router / BF16 FlashInfer dep) is owned by
         # ``can_implement``. Keep only the provider selection for the op.
-        self.use_flashinfer = self._check_flashinfer_backend_support()
-        backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
-        self.op_backend: MoEOpBackend = get_op_backend(backend_name)
+        self._select_op_provider()
 
         self._weights_created = False
-        self.num_fused_shared_expert = 0
 
         # Fusing the shared experts into the routed-expert grouped GEMM is opt-in:
         # set TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION=1 to enable it. The benefit is
@@ -339,29 +336,21 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         # restricts tactics to tileN>=32 to avoid a small-tile dynB kernel defect.
         fusion_enabled = os.environ.get("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION",
                                         "0") == "1"
-        # Only the trtllm op backend implements fused shared experts
-        on_trtllm_backend = isinstance(self.op_backend, TRTLLMOpBackend)
         # Expert parallelism (moe_ep_size > 1) is not supported by the fused path yet
         # (the routing kernel's shared-expert append assumes the full expert set is
         # local); gate it out here so EP configs fall back to the unfused path instead
         # of tripping the runtime EP check in the TRTLLM-Gen runner.
-        fusion_supported = (
-            fusion_enabled and on_trtllm_backend
-            and model_config.mapping.dp_size == 1
-            and model_config.mapping.moe_ep_size == 1
-            and self.quant_config is not None
-            and self.quant_config.layer_quant_mode.has_fp8_block_scales())
-        if fusion_supported:
-            # Not all models that use this backend define shared experts (e.g. non-DeepSeek
-            # MoEs), so fall back to 0 when the config has no `n_shared_experts`.
-            self.num_fused_shared_expert = getattr(
+        fusion_requested = (fusion_enabled and model_config.mapping.dp_size == 1
+                            and model_config.mapping.moe_ep_size == 1)
+        # Not all models that use this backend define shared experts (e.g. non-DeepSeek
+        # MoEs), so fall back to 0 when the config has no `n_shared_experts`.
+        self._n_shared_experts_to_fuse = 0
+        if fusion_requested:
+            self._n_shared_experts_to_fuse = getattr(
                 model_config.pretrained_config, "n_shared_experts", 0) or 0
-            if self.num_fused_shared_expert > 0:
-                logger.info_once(
-                    f"Shared-expert fusion enabled: folding "
-                    f"{self.num_fused_shared_expert} shared expert(s) into the "
-                    f"routed-expert grouped GEMM.",
-                    key="trtllm_gen_shared_expert_fusion")
+        # Whether they can actually be fused depends on the op provider and the
+        # quant config, both of which `create_weights` re-resolves.
+        self._select_shared_expert_fusion()
 
         # create_weights must see the final fused-expert count so the fused shared
         # slots are allocated when fusion is enabled.
@@ -458,6 +447,48 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         if not (self.use_flashinfer and self._is_unquantized_path()):
             return False
         return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
+
+    def _select_op_provider(self) -> None:
+        """Pick the op provider for the quant config currently installed.
+
+        The provider is either the native TRTLLM-Gen op or FlashInfer. This
+        runs in `__init__` and again at the top of `create_weights`: the
+        wrapper installs the final per-layer quant config on the backend only
+        right before `create_weights` (layerwise quantization can leave
+        individual layers unquantized while the model-level config says e.g.
+        NVFP4), so the choice made in `__init__` can be stale by then. Only
+        FlashInfer implements the BF16 kernels, so the provider has to be
+        re-resolved from the same config `_get_quant_method` reads;
+        otherwise such a layer keeps the native provider and fails in
+        `run_bf16_moe` at its first forward.
+        """
+        self.use_flashinfer = self._check_flashinfer_backend_support()
+        backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
+        self.op_backend: MoEOpBackend = get_op_backend(backend_name)
+
+    def _select_shared_expert_fusion(self) -> None:
+        """Derive the fused shared-expert count from the provider and quant config.
+
+        Only the native TRTLLM-Gen provider implements fused shared experts,
+        and only on the FP8 block-scale path, so this runs right after
+        `_select_op_provider`: in `__init__` and again in `create_weights`.
+        A layer whose final per-layer quant config moved it off that path
+        must not keep the count taken from the model-level config: its quant
+        method allocates no fused slots, and `fuse_shared_expert` would run
+        against a method that has none.
+        """
+        fusion_supported = (
+            isinstance(self.op_backend, TRTLLMOpBackend)
+            and self.quant_config is not None
+            and self.quant_config.layer_quant_mode.has_fp8_block_scales())
+        self.num_fused_shared_expert = (self._n_shared_experts_to_fuse
+                                        if fusion_supported else 0)
+        if self.num_fused_shared_expert > 0:
+            logger.info_once(
+                f"Shared-expert fusion enabled: folding "
+                f"{self.num_fused_shared_expert} shared expert(s) into the "
+                f"routed-expert grouped GEMM.",
+                key="trtllm_gen_shared_expert_fusion")
 
     def _check_flashinfer_backend_support(self) -> bool:
         # SiTu is provided by the native TRTLLM-Gen cubin and is not part of
@@ -621,9 +652,16 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         else:
             return BF16TRTLLMGenFusedMoEMethod()
 
-    def create_weights(self):
+    def create_weights(self) -> None:
         if self._weights_created:
             return
+
+        # The final per-layer quant config is in place only now (see
+        # `_select_op_provider`), so re-resolve the provider, and the
+        # shared-expert fusion that depends on it, before the quant method is
+        # chosen from the same config.
+        self._select_op_provider()
+        self._select_shared_expert_fusion()
 
         self.quant_method = self._get_quant_method()
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(

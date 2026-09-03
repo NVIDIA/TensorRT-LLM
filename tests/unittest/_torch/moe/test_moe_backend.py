@@ -56,6 +56,15 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluBiasActivation,
     materialize_activation_params,
 )
+from tensorrt_llm._torch.moe.fused_moe.communication import (
+    AllGatherReduceScatter,
+    Communication,
+    NVLinkTwoSided,
+)
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided_flashinfer import (
+    NVLinkTwoSidedFlashinfer,
+)
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
@@ -74,13 +83,16 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEStaticCapability,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
+    MoEDep,
     collect_moe_environment,
     override_moe_environment,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import FlashinferOpBackend, TRTLLMOpBackend
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
+    BF16TRTLLMGenFusedMoEMethod,
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
@@ -548,18 +560,29 @@ def _make_trtllm_gen_moe(
     top_k: int = 2,
     hidden_size: int = 512,
     intermediate_size: int = 256,
+    skip_create_weights_in_init: bool = False,
+    n_shared_experts: int = 0,
 ) -> TRTLLMGenFusedMoE:
-    """A single-rank TRTLLM-Gen MoE, with or without the SiTu override."""
+    """A single-rank TRTLLM-Gen MoE, with or without the SiTu override.
+
+    `skip_create_weights_in_init` defers the weights the way a model build
+    does, so a later `create_weights` sees the final quant config.
+    `n_shared_experts` lands on the pretrained config, where the backend reads
+    it to size shared-expert fusion.
+    """
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = num_experts
     pretrained_config.hidden_size = hidden_size
     pretrained_config.intermediate_size = intermediate_size
     pretrained_config.torch_dtype = torch.bfloat16
+    if n_shared_experts > 0:
+        pretrained_config.n_shared_experts = n_shared_experts
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         quant_config=quant_config,
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         moe_backend="TRTLLM",
+        skip_create_weights_in_init=skip_create_weights_in_init,
     )
     return TRTLLMGenFusedMoE(
         routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
@@ -740,6 +763,284 @@ def test_nvfp4_trtllm_gen_class_alignment_would_admit_bad_shards() -> None:
     resolved, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(1536, 192)
     assert 192 % NVFP4TRTLLMGenFusedMoEMethod.weight_alignment == 0
     assert 192 % resolved != 0
+
+
+# ============================================================================
+# TRTLLM-Gen op provider follows the per-layer quant config
+# ============================================================================
+# `TRTLLMGenFusedMoE` picks its op provider (native TRTLLM-Gen or FlashInfer)
+# from its quant config, but `ConfigurableMoE.create_weights` installs the
+# final per-layer config on the backend only after `__init__` has run. Only
+# FlashInfer implements the BF16 kernels, so a layer that layerwise quantization
+# leaves unquantized has to move providers when its weights are created, or it
+# keeps the native provider and fails in `run_bf16_moe` at its first forward.
+# The fused shared-expert count, which only the native provider supports,
+# follows the provider.
+
+
+def _flashinfer_bf16_moe_available() -> bool:
+    return collect_moe_environment().has_dep(MoEDep.FLASHINFER_BF16_MOE)
+
+
+@pytest.mark.parametrize(
+    "layer_quant_config, expect_flashinfer, expected_method",
+    [
+        (QuantConfig(quant_algo=None), True, BF16TRTLLMGenFusedMoEMethod),
+        (QuantConfig(quant_algo=QuantAlgo.NVFP4), False, NVFP4TRTLLMGenFusedMoEBaseMethod),
+    ],
+    ids=["layer_left_unquantized", "layer_stays_nvfp4"],
+)
+def test_trtllm_gen_reresolves_op_provider_from_per_layer_quant_config(
+    monkeypatch: pytest.MonkeyPatch,
+    layer_quant_config: QuantConfig,
+    expect_flashinfer: bool,
+    expected_method: type,
+) -> None:
+    """The provider must be chosen from the config `create_weights` sees.
+
+    The model-level config says NVFP4, so `__init__` selects the native
+    provider. Installing the final per-layer config and then creating the
+    weights -- what `ConfigurableMoE.create_weights` does -- must re-resolve
+    it: a layer left unquantized moves to FlashInfer, the only provider with
+    BF16 kernels, while a layer that stays NVFP4 keeps the native one.
+    """
+    monkeypatch.delenv("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER", raising=False)
+    if expect_flashinfer and not _flashinfer_bf16_moe_available():
+        pytest.skip("the unquantized TRTLLM-Gen path needs FlashInfer's trtllm_bf16_moe")
+
+    backend = _make_trtllm_gen_moe(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        situ=False,
+        skip_create_weights_in_init=True,
+    )
+    assert backend.use_flashinfer is False
+    assert type(backend.op_backend) is TRTLLMOpBackend
+
+    backend.quant_config = layer_quant_config
+    backend.create_weights()
+
+    assert backend.use_flashinfer is expect_flashinfer
+    expected_op_backend = FlashinferOpBackend if expect_flashinfer else TRTLLMOpBackend
+    assert type(backend.op_backend) is expected_op_backend
+    assert type(backend.quant_method) is expected_method
+
+
+@pytest.mark.parametrize(
+    "layer_quant_config, expected_fused",
+    [
+        (QuantConfig(quant_algo=None), 0),
+        (QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES), 2),
+    ],
+    ids=["layer_left_unquantized", "layer_stays_fp8_block_scales"],
+)
+def test_trtllm_gen_rederives_shared_expert_fusion_from_per_layer_quant_config(
+    monkeypatch: pytest.MonkeyPatch, layer_quant_config: QuantConfig, expected_fused: int
+) -> None:
+    """The fused shared-expert count is a provider decision and follows it.
+
+    Only the native provider fuses shared experts, and only on the FP8
+    block-scale path. With fusion opted in and an FP8 block-scale model-level
+    config, `__init__` plans to fuse two shared experts. A layer left
+    unquantized must drop the count to zero in `create_weights` (its quant
+    method allocates no fused slots and has no `fuse_shared_expert`), while a
+    layer that stays FP8 block-scaled keeps its trailing fused slots.
+    """
+    monkeypatch.delenv("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER", raising=False)
+    monkeypatch.setenv("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION", "1")
+    n_fused = 2
+
+    backend = _make_trtllm_gen_moe(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        situ=False,
+        skip_create_weights_in_init=True,
+        n_shared_experts=n_fused,
+    )
+    assert type(backend.op_backend) is TRTLLMOpBackend
+    assert backend.num_fused_shared_expert == n_fused
+
+    backend.quant_config = layer_quant_config
+    backend.create_weights()
+
+    assert backend.num_fused_shared_expert == expected_fused
+    assert backend.w3_w1_weight.shape[0] == backend.expert_size_per_partition + expected_fused
+    assert backend.w2_weight.shape[0] == backend.expert_size_per_partition + expected_fused
+
+
+def test_configurable_moe_runs_layerwise_unquantized_trtllm_gen_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production sequence, end to end on one rank.
+
+    Build the layer as a model does (NVFP4 model-level config, weights
+    deferred), install the per-layer config the way
+    `apply_layerwise_quant_config` does for a layer the checkpoint leaves
+    unquantized, create the weights, and run a forward against the reference.
+    Without the re-resolution the layer keeps the native provider and the
+    forward raises in `TRTLLMOpBackend.run_bf16_moe`, which is why the
+    provider assertions come last.
+    """
+    monkeypatch.delenv("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER", raising=False)
+    if not is_sm_100f():
+        pytest.skip("TRTLLMGenFusedMoE serves the SM100 family only")
+    if not _flashinfer_bf16_moe_available():
+        pytest.skip("the unquantized TRTLLM-Gen path needs FlashInfer's trtllm_bf16_moe")
+
+    num_experts, top_k, hidden_size, intermediate_size = 8, 2, 512, 256
+    seq_len = 8
+    dtype = torch.bfloat16
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = num_experts
+    pretrained_config.hidden_size = hidden_size
+    pretrained_config.intermediate_size = intermediate_size
+    pretrained_config.torch_dtype = dtype
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        moe_backend="TRTLLM",
+        max_num_tokens=256,
+        skip_create_weights_in_init=True,
+    )
+    routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+
+    with torch.device("cuda"):
+        torch.manual_seed(0)
+        moe = ConfigurableMoE(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=model_config,
+            weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+            layer_idx=3,
+            moe_cls=TRTLLMGenFusedMoE,
+        )
+        # The model-level config is NVFP4, so the wrapper mirrors the native provider.
+        assert moe.use_flashinfer is False
+
+        moe.quant_config = QuantConfig(quant_algo=None)
+        moe.create_weights()
+        # The quant method followed the per-layer config even before the fix;
+        # the provider is checked after the forward that depends on it.
+        assert type(moe.backend.quant_method) is BF16TRTLLMGenFusedMoEMethod
+
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            None, x, MoeBackendType.TRTLLM
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+        moe.load_weights([weights])
+        moe.post_load_weights()
+        moe.cuda()
+
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+            output = moe.forward(x, router_logits)
+        ref_fused_moe.check_accuracy(output, ref_output)
+
+        # The provider the forward just ran on, and the wrapper's mirror of it,
+        # which feeds communication-strategy selection.
+        assert type(moe.backend.op_backend) is FlashinferOpBackend
+        assert moe.use_flashinfer is True
+
+
+def _wrapper_after_provider_flip(
+    comm: Optional[Communication], *, assign_comm: bool = True
+) -> ConfigurableMoE:
+    """A `ConfigurableMoE` whose backend just moved onto FlashInfer.
+
+    The wrapper's mirror still says native and `comm` was selected for that;
+    nothing else of the wrapper is needed to exercise the contract. With
+    `assign_comm=False` the attribute does not exist at all, as on the
+    `create_weights` call `_create_and_sync_backend` makes before `__init__`
+    assigns it.
+    """
+    moe = ConfigurableMoE.__new__(ConfigurableMoE)
+    torch.nn.Module.__init__(moe)
+    moe.backend = SimpleNamespace(use_flashinfer=True)
+    moe.use_flashinfer = False
+    moe.layer_idx = 7
+    if assign_comm:
+        moe.comm = comm
+    return moe
+
+
+@pytest.mark.parametrize("comm_cls", [NVLinkTwoSided, NVLinkTwoSidedFlashinfer])
+def test_configurable_moe_provider_flip_rejects_nvlink_two_sided(comm_cls: type) -> None:
+    """The NVLink two-sided strategies are provider-specific, and constructing
+    a replacement inside weight creation would run a collective there, so a
+    flip under either of them has to fail loudly rather than carry the payload
+    through the other provider's alltoall, which is unsupported.
+    """
+    moe = _wrapper_after_provider_flip(comm_cls.__new__(comm_cls))
+    with pytest.raises(NotImplementedError, match="NVLink two-sided"):
+        moe._resync_op_provider()
+
+
+@pytest.mark.parametrize(
+    "comm, assign_comm, backend_provider",
+    [
+        (None, False, True),
+        (None, True, True),
+        (AllGatherReduceScatter.__new__(AllGatherReduceScatter), True, True),
+        (NVLinkTwoSided.__new__(NVLinkTwoSided), True, False),
+    ],
+    ids=[
+        "flip_before_comm_is_assigned",
+        "flip_without_comm",
+        "flip_under_allgather",
+        "no_flip_under_nvlink_two_sided",
+    ],
+)
+def test_configurable_moe_resync_op_provider_updates_mirror(
+    comm: Optional[Communication], assign_comm: bool, backend_provider: bool
+) -> None:
+    """Every other combination just brings the mirror in line with the backend."""
+    moe = _wrapper_after_provider_flip(comm, assign_comm=assign_comm)
+    moe.backend.use_flashinfer = backend_provider
+    moe._resync_op_provider()
+    assert moe.use_flashinfer is backend_provider
+
+
+def test_configurable_moe_create_weights_resyncs_provider_mirror() -> None:
+    """`create_weights` installs the final quant config, lets the backend
+    allocate (and re-resolve its provider), then refreshes the mirror.
+    """
+    moe = ConfigurableMoE.__new__(ConfigurableMoE)
+    torch.nn.Module.__init__(moe)
+    backend = torch.nn.Module()
+    backend._weights_created = True  # keeps the activation re-install out of the way
+    backend.use_flashinfer = False
+
+    def create_weights() -> None:
+        # What TRTLLMGenFusedMoE does once it sees an unquantized config.
+        backend.use_flashinfer = backend.quant_config.quant_algo is None
+
+    backend.create_weights = create_weights
+    moe.backend = backend
+    moe._override_quant_config = None
+    moe.quant_config = QuantConfig(quant_algo=None)
+    moe.use_flashinfer = False
+    moe.layer_idx = 7
+    moe.comm = None
+
+    moe.create_weights()
+    assert backend.quant_config is moe.quant_config
+    assert moe.use_flashinfer is True
 
 
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():

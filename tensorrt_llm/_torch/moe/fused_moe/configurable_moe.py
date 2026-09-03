@@ -49,7 +49,13 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import install_activation_params
-from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
+from .communication import (
+    AllGatherReduceScatter,
+    Communication,
+    CommunicationFactory,
+    NVLinkTwoSided,
+)
+from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
@@ -708,7 +714,7 @@ class ConfigurableMoE(MoE):
 
         backend.validate_configurable_moe(self)
 
-    def create_weights(self):
+    def create_weights(self) -> None:
         """
         Create weights - delegated to backend
 
@@ -734,7 +740,46 @@ class ConfigurableMoE(MoE):
         # NVFP4TRTLLMGenFusedMoEBaseMethod applies to beta and clamp.
         if not self.backend._weights_created:
             install_activation_params(self.backend)
-        return self.backend.create_weights()
+        self.backend.create_weights()
+        self._resync_op_provider()
+
+    def _resync_op_provider(self) -> None:
+        """Refresh the provider mirror after the backend saw its final quant config.
+
+        A backend may re-resolve which op provider it runs on from the quant
+        config installed just above (`TRTLLMGenFusedMoE` must: only FlashInfer
+        implements its BF16 kernels, so a layer that layerwise quantization
+        leaves unquantized moves providers here). The mirror taken in
+        `__init__` feeds communication-strategy selection, so it has to follow.
+
+        Only the mirror is updated; the strategy is not rebuilt. Constructing
+        one is a collective for the NVLink two-sided strategies (they allocate
+        their MNNVL workspaces in the constructor), and re-running that from
+        per-layer weight creation is not a supported path (see the developer
+        guide). Provider and strategy can only actually disagree for that same
+        pair, which is provider-specific; carrying one provider's payload
+        through the other's alltoall is unsupported and untested, so the
+        combination is rejected rather than repaired silently.
+        """
+        provider = getattr(self.backend, "use_flashinfer", False)
+        if provider == self.use_flashinfer:
+            return
+        self.use_flashinfer = provider
+        # `create_weights` also runs from `_create_and_sync_backend`, before
+        # `__init__` has assigned `self.comm`. The provider cannot change on
+        # that call (the backend re-reads the config it was built with), so only
+        # a real flip -- which happens after construction -- gets this far.
+        comm = getattr(self, "comm", None)
+        if isinstance(comm, (NVLinkTwoSided, NVLinkTwoSidedFlashinfer)):
+            raise NotImplementedError(
+                f"layer {self.layer_idx}: the per-layer quant config moved this MoE "
+                f"onto the {'FlashInfer' if provider else 'native TRTLLM-Gen'} op "
+                f"provider after {type(comm).__name__} was selected for the other "
+                "one. The NVLink two-sided strategies are provider-specific and "
+                "cannot be re-selected during weight creation; choose a "
+                "communication method that is not, e.g. NVLINK_ONE_SIDED or "
+                "ALLGATHER, for this model."
+            )
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
         """

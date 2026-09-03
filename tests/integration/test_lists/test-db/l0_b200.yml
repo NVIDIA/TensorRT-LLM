@@ -179,6 +179,12 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_reresolves_op_provider_from_per_layer_quant_config
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_rederives_shared_expert_fusion_from_per_layer_quant_config
+  - unittest/_torch/moe/test_moe_backend.py::test_configurable_moe_runs_layerwise_unquantized_trtllm_gen_layer
+  - unittest/_torch/moe/test_moe_backend.py::test_configurable_moe_provider_flip_rejects_nvlink_two_sided
+  - unittest/_torch/moe/test_moe_backend.py::test_configurable_moe_resync_op_provider_updates_mirror
+  - unittest/_torch/moe/test_moe_backend.py::test_configurable_moe_create_weights_resyncs_provider_mirror
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_bakes_situ_softcaps_as_uniform_scalars
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_plain_swiglu_carries_no_constants
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_situ_activation_as_one_carrier

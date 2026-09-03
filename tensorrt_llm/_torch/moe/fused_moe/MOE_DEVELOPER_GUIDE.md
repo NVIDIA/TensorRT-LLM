@@ -437,6 +437,21 @@ defines `resolve_activation_support` and narrows the shape per instance from
 the slots: `apply_layerwise_quant_config` can move one layer onto that path
 after `__init__` has already run.
 
+The op provider of `TRTLLMGenFusedMoE` follows the same rule. Its
+`create_weights` re-runs `_select_op_provider` (native TRTLLM-Gen op or
+FlashInfer, the only provider with BF16 kernels) and
+`_select_shared_expert_fusion` before `_get_quant_method`, so all three are
+derived from the final per-layer `quant_config`; a layer that layerwise
+quantization leaves unquantized moves to FlashInfer there instead of failing
+in `TRTLLMOpBackend.run_bf16_moe` at its first forward.
+`ConfigurableMoE.create_weights` then re-syncs its `use_flashinfer` mirror
+(`_resync_op_provider`), which feeds communication-strategy selection, but
+does not rebuild the strategy: the NVLink two-sided strategies allocate their
+MNNVL workspaces in the constructor, a collective. They are also the only
+provider-specific strategies, so a provider flip under `NVLinkTwoSided` /
+`NVLinkTwoSidedFlashinfer` raises `NotImplementedError`; such a model has to
+pick a provider-independent communication method.
+
 Selection keeps both halves of the picture in the tuning key —
 `MoEProblem.activation` (the kind) and `MoEProblem.activation_constants` (which
 registers the carrier actually fills) — because the kind alone does not separate
@@ -533,6 +548,7 @@ Five backends declare `MoEImplBase` directly — `CutlassFusedMoE`, `TRTLLMGenFu
 - **Do NOT substitute a backend without recording it** — A degradation must be visible in the `MoEResolutionReport`, not only in a log line
 - **Do NOT pick `scheduler_kind` opportunistically** — Use `EXTERNAL_COMM` (default) unless your backend's fused kernel genuinely owns cross-rank exchange via SymmBuffer / equivalent in-kernel collective; `FUSED_COMM` brings hard invariants (no host comm, lockstep launches, no multi-stream overlap)
 - **Schedulers MUST NOT write `moe.repeat_idx`** — `repeat_idx` is wrapper state advanced once per `forward_impl` regardless of chunk count
+- **Do NOT rebuild a communication strategy from `create_weights`** — constructing one is a collective for the NVLink two-sided strategies (MNNVL workspace allocation), not something to redo inside per-layer weight creation. A backend that re-resolves its op provider there (`TRTLLMGenFusedMoE`, see [Activation Support](#activation-support)) only gets its `use_flashinfer` mirror refreshed by `ConfigurableMoE._resync_op_provider`; a flip under the provider-specific `NVLinkTwoSided` / `NVLinkTwoSidedFlashinfer` raises `NotImplementedError` rather than re-selecting
 - **Do NOT allocate symmetric memory from `run_moe` in `FUSED_COMM` backends** — Symmetric-memory rendezvous is a build-time collective and is unsafe under PP / layer-skip or CUDA graph capture; allocate from `create_weights()` after `ConfigurableMoE` has synchronized EPLB-derived attributes. See `mega_moe/mega_moe_deepgemm.py` for the DG pattern and `mega_moe/mega_moe_cute_dsl.py:_alloc_symm_provider` for the NVSHMEM-equivalent provider.
 - **Do NOT add a new `FUSED_COMM` backend without a zero-token `quantize_input` regression test** — `FusedCommMoEScheduler` calls `quantize_input` for every chunk (including zero-token chunks) so each backend must return its own empty-tensor layout. See `tests/unittest/_torch/moe/test_moe_backend.py::test_megamoe_deepgemm_quantize_input_zero_tokens` and `test_megamoe_cutedsl_quantize_input_zero_tokens` for the pattern.
 - **Do NOT use a dataclass for an autotuner tactic without a tested `__repr__` round-trip** — `AutoTuner` serializes tactic values through `json.dumps`/`json.loads` and `eval(repr(tactic))`; a plain dataclass fails the `eval(repr(...))` check. Prefer a JSON-friendly **tuple of primitives or lists of primitives** (lists are JSON-friendly; tuples round-trip via `eval(repr(...))`). See the tactic-representation comment block in `tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py` for the 8-tuple tactic pattern (mma_tiler/cluster_shape as `list[int]`, `epi_flag_batch` as a nested `(int, int)` tuple, the rest as `bool`/`int`/`str`; `_unpack_tactic` is the single source of truth for the field order). The fallback tactic is the token-aware `default_megamoe_tactic(num_tokens)` helper, selected by `Sm100MegaMoENvfp4Runner.forward(tactic=-1)`, not a separate `fallback_tactic()` method.
