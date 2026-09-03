@@ -31,6 +31,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -85,6 +86,7 @@ from .modeling_utils import (
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
 # and flash SDPA does not accept attn_mask.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+_MAX_DIAGNOSTIC_FORWARDS = 32
 
 
 # ---------------------------------------------------------------------------
@@ -1813,8 +1815,10 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        diagnostic_forward_id: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
+        diagnostics_enabled = diagnostic_forward_id is not None
         # Layer-0 prologue only. For every subsequent layer the input_layernorm
         # (an add+RMSNorm at the layer boundary) was already applied by the
         # previous layer as its next_layer_layernorm, so residual is not None
@@ -1830,6 +1834,11 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         attn_all_reduce_params = (
             AllReduceParams(enable_allreduce=False) if self.pre_feed_forward_fusion else None
         )
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=attention start"
+            )
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1837,11 +1846,25 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             all_reduce_params=attn_all_reduce_params,
             **kwargs,
         )
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=attention submitted"
+            )
 
         if self.block_sparse_moe is not None:
-            hidden_states, residual = self.forward_MoE(hidden_states, attn_metadata, residual)
+            hidden_states, residual = self.forward_MoE(
+                hidden_states,
+                attn_metadata,
+                residual,
+                diagnostic_forward_id=diagnostic_forward_id,
+            )
         else:
-            hidden_states, residual = self.forward_mlp(hidden_states, residual)
+            hidden_states, residual = self.forward_mlp(
+                hidden_states,
+                residual,
+                diagnostic_forward_id=diagnostic_forward_id,
+            )
 
         return hidden_states, residual
 
@@ -1915,31 +1938,95 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
+        diagnostic_forward_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        diagnostics_enabled = diagnostic_forward_id is not None
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=pre_moe_boundary start"
+            )
         hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=pre_moe_boundary submitted"
+            )
 
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=routed_moe start"
+            )
         hidden_states = self.block_sparse_moe(
             hidden_states,
             attn_metadata,
             final_all_reduce_params=self._feed_forward_all_reduce_params(),
         )
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=routed_moe submitted"
+            )
 
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=post_moe_boundary start"
+            )
         hidden_states, residual = self._apply_next_layer_layernorm(hidden_states, residual)
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=post_moe_boundary submitted"
+            )
         return hidden_states, residual
 
     def forward_mlp(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        diagnostic_forward_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        diagnostics_enabled = diagnostic_forward_id is not None
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=pre_dense_mlp_boundary start"
+            )
         hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=pre_dense_mlp_boundary submitted"
+            )
 
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=dense_mlp_projection start"
+            )
         hidden_states = self.mlp(
             hidden_states,
             final_all_reduce_params=self._feed_forward_all_reduce_params(),
         )
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=dense_mlp_projection submitted"
+            )
 
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=post_dense_mlp_boundary start"
+            )
         hidden_states, residual = self._apply_next_layer_layernorm(hidden_states, residual)
+        if diagnostics_enabled:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=post_dense_mlp_boundary submitted"
+            )
         return hidden_states, residual
 
 
@@ -1957,6 +2044,7 @@ class MiniMaxM3Model(DecoderModel):
             model_config.pretrained_config.torch_dtype = torch.bfloat16
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
+        self._diagnostic_forward_id = 0
         # Aux streams shared across layers, matching the DeepSeekV3 convention:
         # one for attention branch overlap, one for MoE shared/routed parallel
         # execution, and one for MoE chunking overlap inside the fused MoE kernel.
@@ -2012,13 +2100,39 @@ class MiniMaxM3Model(DecoderModel):
         hidden_states = inputs_embeds
 
         residual = None
-        for decoder_layer in self.layers:
+        diagnostic_forward_id = None
+        if not attn_metadata.is_cuda_graph:
+            next_diagnostic_forward_id = self._diagnostic_forward_id
+            self._diagnostic_forward_id += 1
+            if next_diagnostic_forward_id < _MAX_DIAGNOSTIC_FORWARDS:
+                diagnostic_forward_id = next_diagnostic_forward_id
+                batch_size = (
+                    attn_metadata.seq_lens.shape[0] if attn_metadata.seq_lens is not None else None
+                )
+                logger.info(
+                    f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"phase=model start, tokens={hidden_states.shape[0]}, "
+                    f"batch_size={batch_size}, num_contexts={attn_metadata.num_contexts}"
+                )
+
+        for idx, decoder_layer in enumerate(self.layers):
+            if diagnostic_forward_id is not None:
+                logger.info(
+                    f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={idx}, phase=layer start"
+                )
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                diagnostic_forward_id=diagnostic_forward_id,
             )
+            if diagnostic_forward_id is not None:
+                logger.info(
+                    f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={idx}, phase=layer submitted"
+                )
 
         # When setup_aliases has chained the final norm into the last decoder
         # layer (next_layer_layernorm = self.norm), the last layer's boundary
@@ -2028,7 +2142,17 @@ class MiniMaxM3Model(DecoderModel):
         # returns the unnormed (hidden_states, residual) pair and the final
         # add+RMSNorm is applied here.
         if self.layers[-1].next_layer_layernorm is None:
+            if diagnostic_forward_id is not None:
+                logger.info(
+                    f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    "phase=final_norm start"
+                )
             hidden_states, _ = self.norm(hidden_states, residual)
+        if diagnostic_forward_id is not None:
+            logger.info(
+                f"[MiniMaxM3 forward diagnostic] forward={diagnostic_forward_id}, "
+                "phase=model submitted"
+            )
         return hidden_states
 
 

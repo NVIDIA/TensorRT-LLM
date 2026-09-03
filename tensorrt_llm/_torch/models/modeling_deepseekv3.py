@@ -81,8 +81,6 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
 
-_FORWARD_DIAGNOSTICS_ENABLED = os.environ.get(
-    "TLLM_DEEPSEEKV3_FORWARD_DIAGNOSTICS") == "1"
 _MAX_DIAGNOSTIC_FORWARDS = 32
 
 
@@ -1965,6 +1963,11 @@ class DeepseekV3Model(DecoderModel):
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
         self.mapping_with_cp = mapping_with_cp
+        # Keep the temporary NVBug diagnostic narrowly scoped to Kimi-K2. The
+        # previous environment gate was set inside the pytest process, after
+        # MGMN workers had already imported this module, so it never enabled
+        # their logs.
+        self._forward_diagnostics_enabled = config.model_type == "kimi_k2"
         self._diagnostic_forward_id = 0
         aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
         self.aux_stream_dict = {
@@ -2012,7 +2015,8 @@ class DeepseekV3Model(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
         diagnostic_forward_id = None
-        if (_FORWARD_DIAGNOSTICS_ENABLED and not attn_metadata.is_cuda_graph):
+        if (self._forward_diagnostics_enabled
+                and not attn_metadata.is_cuda_graph):
             next_diagnostic_forward_id = self._diagnostic_forward_id
             self._diagnostic_forward_id += 1
             if next_diagnostic_forward_id < _MAX_DIAGNOSTIC_FORWARDS:

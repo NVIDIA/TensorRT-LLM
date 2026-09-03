@@ -48,12 +48,20 @@ _MINIMAX_M3_EVAL_CONFIG = {
         "enable_block_reuse": False,
     },
     "max_seq_len": 4096,
+    # Diagnostic control for https://nvbugs/6656598: MiniMax-M3 always uses
+    # KVCM V2, so disable overlap to isolate their interaction.
+    "disable_overlap_scheduler": True,
+    "print_iter_log": True,
 }
 
 _KIMI_K2_EVAL_DIAGNOSTIC_CONFIG = {
-    # Diagnostic only: preserve the inherited 262K context and KVCM V2 while
-    # isolating the overlap scheduler's interaction with TP16/EP16 MGMN MoE.
-    "disable_overlap_scheduler": True,
+    # Diagnostic control for https://nvbugs/6656598: preserve the inherited
+    # 262K context, re-enable overlap, and switch only KVCM from V2 to V1.
+    "disable_overlap_scheduler": False,
+    "kv_cache_config": {
+        "use_kv_cache_manager_v2": False,
+    },
+    "print_iter_log": True,
 }
 
 
@@ -1720,16 +1728,11 @@ def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
         run_cmd.append(f"--config={config_path}")
 
     run_cmd.extend([eval_task, f"--dataset_path={mmlu_dataset_root}"])
-    run_env = os.environ.copy()
-    if "Kimi" in model_path:
-        run_env["TLLM_DEEPSEEKV3_FORWARD_DIAGNOSTICS"] = "1"
-
     try:
         # run the command with trtllm-llmapi-launch pytest wrapper
         output = subprocess.check_output(run_cmd,
                                          text=True,
                                          stderr=subprocess.STDOUT,
-                                         env=run_env,
                                          timeout=5400)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print_warning(f"eval failed: {e.returncode}")
