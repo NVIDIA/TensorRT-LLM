@@ -2714,6 +2714,8 @@ def create_py_executor_instance(
             cross_kv_cache_manager=cross_kv_cache_manager,
             no_schedule_until_state=no_schedule_until_state,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
+            max_input_len=max_seq_len
+            if max_seq_len is not None else 0x7fffffff,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
