@@ -321,6 +321,14 @@ class PrimsTSFmha(PhasedFmha):
         has_generation = num_generations > 0 and input_type != AttentionInputType.context_only
         if not has_context and not has_generation:
             return False, "the request contains no active attention phase."
+        if has_context and q.dtype in (torch.float16, torch.bfloat16) and get_sm_version() == 103:
+            # NVBug 6641268: on SM103, the persistent context path can read
+            # unused paged-V tail elements. Zero probabilities do not suppress
+            # NaNs in those elements during the PV matrix multiply.
+            return False, (
+                "FP16/BF16 PrimTS context attention is disabled on SM103 "
+                "because the persistent context path can read unused paged-KV cache tails."
+            )
         if has_context and torch.cuda.is_current_stream_capturing():
             return False, "context planning is not CUDA-graph capturable."
         if has_context and (attn.attention_chunk_size or 0) != 0:
