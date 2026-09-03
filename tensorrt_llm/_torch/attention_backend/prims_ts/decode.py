@@ -26,9 +26,18 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
 import torch
 
 from flashinfer.api_logging import flashinfer_api
-from flashinfer.trace.templates.attention import (
-    attention_ts_decode_trace_dispatch,
-    prims_ts_decode_trace_dispatch,
+
+from ._trace import _get_attention_trace_template
+
+
+attention_ts_decode_trace_dispatch = _get_attention_trace_template(
+    "attention_ts_decode_trace_dispatch"
+)
+prims_ts_decode_trace_dispatch = _get_attention_trace_template(
+    "prims_ts_decode_trace_dispatch"
+)
+prims_ts_decode_wrapper_trace_dispatch = _get_attention_trace_template(
+    "prims_ts_decode_wrapper_trace_dispatch"
 )
 
 from ._tensor_aliasing import (
@@ -265,7 +274,7 @@ def _planned_kv_lengths_mode(
     When every evidenced request is exactly the compiled maximum, native CSR
     page addressing still uses runtime indptr/indices while task domains and
     masks can use the compile-time length. Validated runs recheck this equality
-    proof against their live lengths; the evidence itself is not retained.
+    proof against their per-run lengths; the evidence itself is not retained.
     """
 
     if not seq_lens or max_kv_len <= 0:
@@ -1809,7 +1818,7 @@ def _validate_decode_output_aliasing(
     paged_kv_last_page_len: Optional[torch.Tensor],
     workspace_buffer: torch.Tensor,
 ) -> None:
-    """Keep output disjoint from every live FMHA decode allocation."""
+    """Keep output disjoint from every FMHA decode input allocation."""
 
     _validate_out_does_not_overlap_inputs(
         runtime.out,
@@ -1977,7 +1986,7 @@ def _validate_decode_run_metadata_values(
     paged_kv_indices: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
 ) -> None:
-    """Synchronously validate live metadata values and constexpr evidence."""
+    """Synchronously validate per-run metadata values and constexpr evidence."""
 
     combined = torch.cat((paged_kv_indptr, seq_lens)).tolist()
     indptr = tuple(int(value) for value in combined[: state.batch_size + 1])
@@ -2107,7 +2116,7 @@ def prims_ts_batch_decode_with_kv_cache(
     must ensure that packed offsets start at zero, are strictly increasing, end
     at ``query.shape[0]``, and have every delta at most ``max_seq_len_q``. For
     causal masking, every fixed or packed per-request Q length must also be no
-    greater than the corresponding live ``seq_lens`` value.
+    greater than the corresponding per-run ``seq_lens`` value.
 
     ``kv_cache`` is either a combined
     ``[pages, 2, Hkv, page_size, D]`` tensor or a ``(K, V)`` tuple of
@@ -2116,14 +2125,14 @@ def prims_ts_batch_decode_with_kv_cache(
     exact static maximum used for automatic policy selection and JIT caching.
     It must be no larger than ``2,147,483,392`` so the padded 256-token K/V
     tile endpoint remains representable as signed Int32.
-    Each request must own enough CSR entries for its live length::
+    Each request must own enough CSR entries for its per-run length::
 
         (seq_lens[b] + page_size - 1) // page_size <= (
             paged_kv_indptr[b + 1] - paged_kv_indptr[b]
         )
 
     The indptr must start at zero, increase strictly, and end at
-    ``paged_kv_indices.numel()``; every live page ID must index ``kv_cache``.
+    ``paged_kv_indices.numel()``; every active page ID must index ``kv_cache``.
 
     ``workspace_buffer`` must be zero-initialized before its first use and
     re-zeroed whenever an argument contributing to the semantic JIT key changes,
@@ -2131,7 +2140,7 @@ def prims_ts_batch_decode_with_kv_cache(
     to one in-flight launch or captured graph and must not overlap query, K/V
     cache, metadata, or output storage. Runtime sequence lengths must remain
     positive and no larger than ``max_seq_len``; this hot path
-    deliberately does not read device metadata back to the host. Live CSR,
+    deliberately does not read device metadata back to the host. Per-run CSR,
     length, page-ID, and packed-Q values may change between completed launches
     or graph replays only while all of their contracts remain valid. They must
     not be mutated concurrently with a launch or replay that reads them. Warm
@@ -2155,7 +2164,7 @@ def prims_ts_batch_decode_with_kv_cache(
     paged_kv_indptr, paged_kv_indices : torch.Tensor
         Native CSR row offsets and physical page IDs.
     seq_lens : torch.Tensor
-        Live K/V sequence lengths for each request.
+        Per-run K/V sequence lengths for each request.
     max_seq_len : int
         Static maximum K/V length used for policy selection and JIT caching.
     seq_len_q : int
@@ -2328,15 +2337,12 @@ def prims_ts_batch_decode_with_kv_cache(
 
 
 class BatchDecodePagedTSWrapper:
-    """Plan static paged-decode capacity and run with live request metadata.
-
-    Experimental: this wrapper's breaking plan/run contract may change without
-    compatibility shims.
+    """Plan static paged-decode capacity and run with per-run request metadata.
 
     A plan fixes device, batch size, geometry, dtypes, query storage mode, and
     maximum K/V capacity. It owns compiled callables and one mutable scratch
     workspace, but no request tensors. Every run supplies sequence lengths and
-    native CSR page metadata; packed-query plans also consume live Q offsets.
+    native CSR page metadata; packed-query plans also consume per-run Q offsets.
 
     One wrapper supports one ordered execution lane. Concurrent streams or
     graph replays require separate wrappers and workspace buffers.
@@ -2400,7 +2406,7 @@ class BatchDecodePagedTSWrapper:
         omitted, both K/V prefix and length handling compile dynamically. When
         supplied, planning may prove a full split prefix or uniform maximum
         K/V length. The values are never passed to a launch. With validation
-        enabled, ``run`` synchronously verifies that live lengths still satisfy
+        enabled, ``run`` synchronously verifies that per-run lengths still satisfy
         every selected constexpr proof.
 
         ``workspace_buffer`` is caller-owned scratch for this plan. It is
@@ -2608,7 +2614,7 @@ class BatchDecodePagedTSWrapper:
         # previous complete plan revision usable.
         self._plan_state = candidate
 
-    @flashinfer_api
+    @flashinfer_api(trace=prims_ts_decode_wrapper_trace_dispatch)
     def run(
         self,
         q: torch.Tensor,
@@ -2623,7 +2629,7 @@ class BatchDecodePagedTSWrapper:
         out: Optional[torch.Tensor] = None,
         validate: bool = True,
     ) -> torch.Tensor:
-        """Launch the current plan with entirely live request metadata.
+        """Launch the current plan with per-run request metadata.
 
         ``validate=True`` performs structural, value,
         specialization-evidence, and alias validation. It reads metadata
@@ -2645,13 +2651,13 @@ class BatchDecodePagedTSWrapper:
         paged_kv_cache : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
             Runtime combined or separate paged K/V storage matching the plan.
         seq_lens : torch.Tensor
-            Live contiguous int32 CUDA K/V lengths with shape ``[B]``.
+            Per-run contiguous int32 CUDA K/V lengths with shape ``[B]``.
         paged_kv_indptr : torch.Tensor
-            Live contiguous int32 CUDA CSR row offsets with shape ``[B + 1]``.
+            Per-run contiguous int32 CUDA CSR row offsets with shape ``[B + 1]``.
         paged_kv_indices : torch.Tensor
-            Live contiguous int32 CUDA physical page IDs.
+            Per-run contiguous int32 CUDA physical page IDs.
         qo_indptr : torch.Tensor, optional
-            Live cumulative query offsets with shape ``[B + 1]``. Required for
+            Per-run cumulative query offsets with shape ``[B + 1]``. Required for
             a packed-query plan and rejected for a fixed-query plan.
         bmm1_scale : float, optional
             QK scaling factor. Defaults to the inverse square root of
@@ -2686,11 +2692,11 @@ class BatchDecodePagedTSWrapper:
             )
             if metadata_device != state.device:
                 raise ValueError(
-                    f"live metadata must be on {state.device}, got {metadata_device}"
+                    f"per-run metadata must be on {state.device}, got {metadata_device}"
                 )
             if metadata_batch_size != state.batch_size:
                 raise ValueError(
-                    "live metadata batch size must match the plan "
+                    "per-run metadata batch size must match the plan "
                     f"({state.batch_size}), got {metadata_batch_size}"
                 )
             if state.use_packed_q:

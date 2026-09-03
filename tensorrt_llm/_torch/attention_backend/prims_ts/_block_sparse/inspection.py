@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host side of one-shot live-metadata validation and capacity reduction.
+"""Host side of one-shot per-run metadata validation and capacity reduction.
 
 The one-shot public entry points validate tensor structure before this module
 launches GPU inspectors and decodes their fixed Int64 summary into Python
@@ -57,7 +57,7 @@ def _raise_for_invalid_paged_metadata(
     minimum_seq_len_kv: int,
     max_seq_len_kv: int,
 ) -> None:
-    """Decode the strongest paged request or live-BSR validation failure."""
+    """Decode the strongest paged-request or runtime-BSR validation failure."""
 
     error_code = summary_values[0]
     if error_code == 0:
@@ -73,7 +73,7 @@ def _raise_for_invalid_paged_metadata(
     }.get(error_code)
     if reason is None:
         reason = (
-            "block_indptr/block_indices must form canonical BSR for live "
+            "block_indptr/block_indices must form canonical BSR for per-run "
             f"seq_lens_kv: {_bsr_error_reason(error_code)}"
         )
     raise ValueError(reason)
@@ -160,7 +160,7 @@ def _inspect_paged_block_sparse_metadata(
     num_physical_kv_pages: int,
     stream: torch.cuda.Stream,
 ) -> int:
-    """Inspect paged requests and return the maximum live BSR row width."""
+    """Inspect paged requests and return the maximum active BSR row width."""
 
     page_size = static.page_size
     if page_size is None:

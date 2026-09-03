@@ -766,10 +766,7 @@ def test_kv_page_offset_is_inferred_from_v1_host_tables() -> None:
     )
 
 
-def test_context_metadata_uses_kernel_kv_tile_contract(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(prims_context_module, "_CONTEXT_KV_TILE_N", 256)
+def test_context_metadata_uses_stable_native_csr() -> None:
     block_tables = torch.tensor(
         [
             [[10, 11, 12, 13], [110, 111, 112, 113]],
@@ -780,41 +777,20 @@ def test_context_metadata_uses_kernel_kv_tile_contract(
     cu_kv_seqlens = torch.tensor([0, 33, 97], dtype=torch.int32)
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
-    fmha._ensure_metadata_buffers(
-        torch.device("cpu"),
-        2,
-        4,
-        32,
-        need_context=True,
-    )
-    assert fmha._context_page_column_capacity == 8
+    fmha._ensure_metadata_buffers(torch.device("cpu"), 2, 4)
 
-    logical_kv_indptr, seq_lens, dense_page_table = fmha._stage_context_metadata(
+    paged_kv_indptr, paged_kv_indices, seq_lens = fmha._stage_context_csr_metadata(
         block_tables,
         cu_kv_seqlens,
         batch_size=2,
-        page_size=32,
-        max_kv_len=64,
     )
 
-    assert logical_kv_indptr.data_ptr() == cu_kv_seqlens.data_ptr()
-    torch.testing.assert_close(seq_lens, torch.tensor([33, 64], dtype=torch.int32))
+    torch.testing.assert_close(paged_kv_indptr, torch.tensor([0, 4, 8], dtype=torch.int32))
     torch.testing.assert_close(
-        dense_page_table,
-        torch.tensor(
-            [
-                [
-                    [10, 11, 11, 11, 11, 11, 11, 11],
-                    [10, 11, 11, 11, 11, 11, 11, 11],
-                ],
-                [
-                    [20, 21, 21, 21, 21, 21, 21, 21],
-                    [20, 21, 21, 21, 21, 21, 21, 21],
-                ],
-            ],
-            dtype=torch.int32,
-        ),
+        paged_kv_indices,
+        torch.tensor([10, 11, 12, 13, 20, 21, 22, 23], dtype=torch.int32),
     )
+    torch.testing.assert_close(seq_lens, torch.tensor([33, 64], dtype=torch.int32))
 
 
 def test_fixed_stride_csr_reuses_stable_storage(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -829,7 +805,7 @@ def test_fixed_stride_csr_reuses_stable_storage(monkeypatch: pytest.MonkeyPatch)
         dtype=torch.int32,
     )
 
-    indptr, indices = fmha._make_fixed_stride_csr(block_tables, 2, 32)
+    indptr, indices = fmha._make_fixed_stride_csr(block_tables, 2)
     first_storage = indices.data_ptr()
     torch.testing.assert_close(indptr, torch.tensor([0, 3, 6], dtype=torch.int32))
     torch.testing.assert_close(
@@ -838,7 +814,7 @@ def test_fixed_stride_csr_reuses_stable_storage(monkeypatch: pytest.MonkeyPatch)
     )
 
     block_tables[:, 0].add_(100)
-    _, updated_indices = fmha._make_fixed_stride_csr(block_tables, 2, 32)
+    _, updated_indices = fmha._make_fixed_stride_csr(block_tables, 2)
 
     assert updated_indices.data_ptr() == first_storage
     torch.testing.assert_close(
@@ -858,20 +834,14 @@ def test_mla_aligned_sequence_lengths_use_source_storage() -> None:
     assert actual.data_ptr() == sequence_lengths.data_ptr()
 
 
-def test_context_wrapper_plans_once_and_reads_live_staged_metadata(
+def test_context_wrapper_plans_once_and_reads_per_run_staged_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 120
-    fmha._ensure_metadata_buffers(
-        torch.device("cpu"),
-        2,
-        4,
-        32,
-        need_context=True,
-    )
+    fmha._ensure_metadata_buffers(torch.device("cpu"), 2, 4)
     q_processed = torch.empty((3, attn.num_heads, attn.head_dim), dtype=torch.bfloat16)
     kv_pool = torch.empty((12, attn.num_kv_heads, 32, attn.head_dim), dtype=torch.bfloat16)
     block_tables = torch.tensor(
@@ -983,8 +953,7 @@ def test_context_wrapper_plans_once_and_reads_live_staged_metadata(
         "device": q_processed.device,
         "batch_size": 2,
         "max_seq_len_q": 8,
-        "max_seq_len_k": 128,
-        "max_num_pages_per_seq_kv": 4,
+        "max_kv_len": 128,
         "num_qo_heads": attn.num_heads,
         "num_kv_heads": attn.num_kv_heads,
         "head_dim": attn.head_dim,
@@ -1008,20 +977,17 @@ def test_context_wrapper_plans_once_and_reads_live_staged_metadata(
     assert run_kwargs["out"] is output
     assert run_kwargs["validate"] is False
     assert run_args[3] is cu_q_seqlens
-    assert run_args[4].data_ptr() == cu_kv_seqlens.data_ptr()
     torch.testing.assert_close(
         run_args[6],
         torch.tensor([33, 64], dtype=torch.int32),
     )
     torch.testing.assert_close(
+        run_args[4],
+        torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
         run_args[5],
-        torch.tensor(
-            [
-                [[0, 1, 1, 1], [0, 1, 1, 1]],
-                [[2, 3, 3, 3], [2, 3, 3, 3]],
-            ],
-            dtype=torch.int32,
-        ),
+        torch.tensor([0, 1, 2, 3, 2, 3, 4, 5], dtype=torch.int32),
     )
     context_preprocess.assert_called_once()
     context_postprocess.assert_called_once()
@@ -1043,13 +1009,7 @@ def test_context_wrapper_plans_once_and_reads_live_staged_metadata(
     )
     torch.testing.assert_close(
         second_run_args[5],
-        torch.tensor(
-            [
-                [[1, 2, 2, 2], [1, 2, 2, 2]],
-                [[3, 4, 4, 4], [3, 4, 4, 4]],
-            ],
-            dtype=torch.int32,
-        ),
+        torch.tensor([1, 2, 3, 4, 3, 4, 5, 6], dtype=torch.int32),
     )
 
 
@@ -1296,8 +1256,7 @@ def test_context_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
             v_cache,
             batch_size=batch_size,
             max_seq_len_q=128,
-            max_seq_len_k=256,
-            max_num_pages_per_seq_kv=8,
+            max_kv_len=256,
             page_size=32,
             mask_type="causal",
             window_left=-1,
@@ -2001,7 +1960,7 @@ def test_workspace_cannot_grow_during_capture(monkeypatch: pytest.MonkeyPatch) -
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 1
-    fmha._ensure_metadata_buffers(torch.device("cpu"), 2, 4, 32)
+    fmha._ensure_metadata_buffers(torch.device("cpu"), 2, 4)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(
         prims_ts_module.thop,
@@ -2053,7 +2012,7 @@ def test_metadata_buffers_cannot_grow_during_capture(
         RuntimeError,
         match="PrimTS metadata buffers must be allocated before CUDA graph capture",
     ):
-        fmha._ensure_metadata_buffers(torch.device("cpu"), 2, 4, 32)
+        fmha._ensure_metadata_buffers(torch.device("cpu"), 2, 4)
 
 
 def test_metadata_buffer_growth_retains_graph_visible_allocations(
@@ -2062,37 +2021,15 @@ def test_metadata_buffer_growth_retains_graph_visible_allocations(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
-    fmha._ensure_metadata_buffers(
-        torch.device("cpu"),
-        2,
-        4,
-        32,
-        need_context=True,
-    )
+    fmha._ensure_metadata_buffers(torch.device("cpu"), 2, 4)
     original_buffers = (
         fmha._page_indices_buffer,
         fmha._fixed_indptr_buffer,
         fmha._sequence_lengths_buffer,
-        fmha._context_page_indices_buffer,
-        fmha._context_page_gather_indices_buffer,
-        fmha._context_page_columns_buffer,
-        fmha._context_last_page_indices_buffer,
     )
 
-    fmha._ensure_metadata_buffers(
-        torch.device("cpu"),
-        3,
-        4,
-        32,
-        need_context=True,
-    )
-    fmha._ensure_metadata_buffers(
-        torch.device("cpu"),
-        3,
-        4,
-        32,
-        need_context=True,
-    )
+    fmha._ensure_metadata_buffers(torch.device("cpu"), 3, 4)
+    fmha._ensure_metadata_buffers(torch.device("cpu"), 3, 4)
 
     assert len(fmha._retained_metadata_buffers) == 1
     assert all(
@@ -2108,10 +2045,6 @@ def test_metadata_buffer_growth_retains_graph_visible_allocations(
                 fmha._page_indices_buffer,
                 fmha._fixed_indptr_buffer,
                 fmha._sequence_lengths_buffer,
-                fmha._context_page_indices_buffer,
-                fmha._context_page_gather_indices_buffer,
-                fmha._context_page_columns_buffer,
-                fmha._context_last_page_indices_buffer,
             ),
             original_buffers,
             strict=True,

@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import inspect
+
 import pytest
 import torch
 from backend_case import BackendCase, generate_inputs, run_backend, run_case
@@ -117,8 +120,8 @@ def test_prims_ts_context_zero_fills_nan_v_tail(
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         qo_indptr: torch.Tensor,
-        logical_kv_indptr: torch.Tensor,
-        dense_page_idx_kv: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
         seq_lens_kv: torch.Tensor,
         **kwargs: object,
     ) -> torch.Tensor:
@@ -126,13 +129,14 @@ def test_prims_ts_context_zero_fills_nan_v_tail(
         # launches, so only the kernel's handling of unused V rows is tested.
         page_size = v_cache.shape[2]
         seq_lens = seq_lens_kv.cpu().tolist()
-        v_page_indices = dense_page_idx_kv[:, 1].cpu()
+        row_offsets = paged_kv_indptr.cpu().tolist()
+        page_indices = paged_kv_indices.cpu()
         for batch_idx, seq_len in enumerate(seq_lens):
             logical_last_page = (seq_len - 1) // page_size
             tail_start = (seq_len - 1) % page_size + 1
             if tail_start == page_size:
                 continue
-            physical_page = int(v_page_indices[batch_idx, logical_last_page].item())
+            physical_page = int(page_indices[row_offsets[batch_idx] + logical_last_page].item())
             v_cache[physical_page, :, tail_start:, :].fill_(float("nan"))
             poisoned_tails.append((batch_idx, tail_start))
 
@@ -142,8 +146,8 @@ def test_prims_ts_context_zero_fills_nan_v_tail(
             k_cache,
             v_cache,
             qo_indptr,
-            logical_kv_indptr,
-            dense_page_idx_kv,
+            paged_kv_indptr,
+            paged_kv_indices,
             seq_lens_kv,
             **kwargs,
         )
@@ -345,11 +349,59 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
     run_case(case)
 
 
-def test_prims_ts_context_live_wrapper_cuda_graph_replay() -> None:
+def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tensorrt_llm._torch.attention_backend.prims_ts.context as context_module
     from tensorrt_llm._torch.attention_backend.prims_ts import (
         BatchPrefillPagedTSWrapper,
         batch_prefill_with_paged_kv_cache,
     )
+
+    # Isolate this regression from compile-cache entries created by earlier
+    # tests while retaining each compiled module through the full A/E/F
+    # sequence. The former ragged V tensor map aborted on SM100 only after a
+    # CLC D128 -> nonpersistent D256 -> distinct CLC D128 compile/run order.
+    uncached_compile = inspect.unwrap(context_module._get_compiled_paged_context)
+    compile_records = []
+
+    @functools.cache
+    def compile_with_record(*args):
+        result = uncached_compile(*args)
+        compiled, policy = result
+        compile_records.append((args, dict(policy), compiled))
+        return result
+
+    monkeypatch.setattr(context_module, "_get_compiled_paged_context", compile_with_record)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+
+    a_results = run_case(
+        BackendCase(
+            **_QWEN2_7B,
+            seq_lens=[65, 37],
+            num_cached_tokens=[0, 0],
+            num_contexts=2,
+            use_kv_cache_manager_v2=False,
+        )
+    )
+    assert "TRTLLM" in a_results
+
+    e_results = run_case(
+        BackendCase(
+            num_heads=8,
+            num_kv_heads=2,
+            head_dim=256,
+            seq_lens=[67, 33],
+            num_cached_tokens=[0, 0],
+            num_contexts=2,
+            dtype="float16",
+            causal=False,
+            kv_layout="HND",
+            page_size=64,
+            use_kv_cache_manager_v2=True,
+        )
+    )
+    assert "TRTLLM" in e_results
 
     batch_size = 2
     num_qo_heads = 8
@@ -357,7 +409,6 @@ def test_prims_ts_context_live_wrapper_cuda_graph_replay() -> None:
     head_dim = 128
     page_size = 32
     max_seq_len = 64
-    max_pages_per_request = 4
     dtype = torch.bfloat16
     device = torch.device("cuda")
 
@@ -372,24 +423,16 @@ def test_prims_ts_context_live_wrapper_cuda_graph_replay() -> None:
     )
     v_cache = torch.randn_like(k_cache)
     qo_indptr = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
-    logical_kv_indptr = torch.tensor([0, 33, 97], device=device, dtype=torch.int32)
+    paged_kv_indptr = torch.tensor([0, 2, 4], device=device, dtype=torch.int32)
+    paged_kv_indices = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32)
     seq_lens = torch.tensor([33, 64], device=device, dtype=torch.int32)
-    dense_page_table = torch.tensor(
-        [
-            [[0, 1, 1, 1], [0, 1, 1, 1]],
-            [[2, 3, 3, 3], [2, 3, 3, 3]],
-        ],
-        device=device,
-        dtype=torch.int32,
-    )
     output = torch.empty_like(query)
     wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
     wrapper.plan(
         device=device,
         batch_size=batch_size,
         max_seq_len_q=3,
-        max_seq_len_k=max_seq_len,
-        max_num_pages_per_seq_kv=max_pages_per_request,
+        max_kv_len=max_seq_len,
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -403,13 +446,24 @@ def test_prims_ts_context_live_wrapper_cuda_graph_replay() -> None:
     assert plan_state is not None
     compiled = plan_state.compiled
 
+    assert len(compile_records) == 3
+    assert [
+        (args[2], args[3], policy["scheduler"]) for args, policy, _compiled in compile_records
+    ] == [
+        (96, 96, "clc_dynamic_persistent"),
+        (128, 128, "nonpersistent"),
+        (3, 64, "clc_dynamic_persistent"),
+    ]
+    assert compile_records[0][0] != compile_records[2][0]
+    assert len({id(recorded) for _args, _policy, recorded in compile_records}) == 3
+
     wrapper.run(
         query,
         k_cache,
         v_cache,
         qo_indptr,
-        logical_kv_indptr,
-        dense_page_table,
+        paged_kv_indptr,
+        paged_kv_indices,
         seq_lens,
         out=output,
     )
@@ -420,8 +474,8 @@ def test_prims_ts_context_live_wrapper_cuda_graph_replay() -> None:
             k_cache,
             v_cache,
             qo_indptr,
-            logical_kv_indptr,
-            dense_page_table,
+            paged_kv_indptr,
+            paged_kv_indices,
             seq_lens,
             out=output,
             validate=False,
@@ -429,17 +483,16 @@ def test_prims_ts_context_live_wrapper_cuda_graph_replay() -> None:
 
     query.copy_(query.flip(0).clone())
     qo_indptr.copy_(torch.tensor([0, 2, 5], device=device, dtype=torch.int32))
-    logical_kv_indptr.copy_(torch.tensor([0, 64, 97], device=device, dtype=torch.int32))
     seq_lens.copy_(torch.tensor([64, 33], device=device, dtype=torch.int32))
-    dense_page_table.copy_(dense_page_table.flip(0).clone())
+    paged_kv_indices.copy_(torch.tensor([2, 3, 0, 1], device=device, dtype=torch.int32))
 
     reference = batch_prefill_with_paged_kv_cache(
         query,
         k_cache,
         v_cache,
         qo_indptr,
-        torch.tensor([0, 2, 4], device=device, dtype=torch.int32),
-        torch.tensor([2, 3, 0, 1], device=device, dtype=torch.int32),
+        paged_kv_indptr,
+        paged_kv_indices,
         torch.tensor([32, 1], device=device, dtype=torch.int32),
         page_size=page_size,
         mask_type="causal",
