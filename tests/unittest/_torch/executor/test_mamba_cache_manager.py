@@ -912,7 +912,7 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
     assert all(ids.size == 0 for ids in kv_slice.block_ids_per_layer_groups)
 
 
-def test_v2_disagg_mamba_cache_tiers_are_remote():
+def test_v2_disagg_gen_init_with_local_mamba_layers_reports_no_local_cached_tokens():
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.tokens_per_block = 4
     manager.local_num_mamba_layers = 1
