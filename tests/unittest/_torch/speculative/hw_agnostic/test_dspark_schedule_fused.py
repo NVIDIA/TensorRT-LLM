@@ -185,7 +185,7 @@ def test_fused_helper_rejects_infeasible_graph_without_dispatch():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("graph_bs", [16, 32, 64, 128])
+@pytest.mark.parametrize("graph_bs", [16, 32, 64, 128, 192, 256])
 def test_cuda_fused_matches_tensor_oracle_across_all_graph_sizes(graph_bs):
     cfg = DSparkScheduleConfig(block_size=5, min_verify_len=1, max_verify_len=5)
     generator = torch.Generator(device="cuda").manual_seed(347805 + graph_bs)
