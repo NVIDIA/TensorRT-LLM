@@ -69,6 +69,11 @@ l0_b300:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
+  - unittest/_torch/moe/test_moe_backend.py::test_nvfp4_gate_up_weight_scale_2_resolution
+  - unittest/_torch/moe/test_moe_backend.py::test_nvfp4_reconcile_and_compute_alphas_split_gate_up
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_split_gate_up_weight_scale_2_fallback
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_split_gate_up_weight_scale_2_alphas
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_split_gate_up_weight_scale_2_forward
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   # ------------- MoE: test_single_gpu (specific quant per backend) ---------------
   # CUTLASS backend: FP8, NVFP4, W4A8_MXFP4_MXFP8, W8A16

@@ -2820,6 +2820,46 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                               local_shared_w2_scale_tensors,
                                               module.tmp_shared_weight_scale_2)
 
+    # Whether this backend's FC1 kernel consumes the gate and up global weight
+    # scales as two separate scalars. trtllm-gen does
+    # (`output1_scale_gate_scalar` for the gate half, `output1_scale_scalar`
+    # for the linear half), so a checkpoint that stores them per half can be
+    # reproduced exactly. Single-alpha kernels (Cutlass) have to reconcile the
+    # two into one value. Whether a given layer actually keeps them separate is
+    # decided per module by `_splits_gate_up_weight_scale_2`.
+    supports_split_gate_up_weight_scale_2 = False
+
+    def _splits_gate_up_weight_scale_2(self, module: torch.nn.Module) -> bool:
+        """Whether `module` is loaded with separate gate and up global scales.
+
+        Requires a kernel that takes the two scales as separate scalars
+        (`supports_split_gate_up_weight_scale_2`); backends narrow this to the
+        layers on which the split is exact. When False, unequal scales are
+        reconciled to the larger value.
+        """
+        del module
+        return self.supports_split_gate_up_weight_scale_2
+
+    def _resolve_gate_up_weight_scale_2(
+            self, w1_ws2: torch.Tensor, w3_ws2: torch.Tensor,
+            split: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the (gate, up) global weight scales to load for one expert.
+
+        With `split` (see `_splits_gate_up_weight_scale_2`) each half keeps
+        its own scale. Otherwise the halves must agree: unequal scales are
+        reconciled to the larger value, with a warning that accuracy may be
+        affected.
+        """
+        if split:
+            return w1_ws2, w3_ws2
+        if torch.allclose(w1_ws2, w3_ws2):
+            return w1_ws2, w1_ws2
+        logger.warning(
+            f"w1_weight_scale_2 != w3_weight_scale_2 ({w1_ws2} != {w3_ws2}), "
+            f"selecting the larger value. Accuracy may be affected.")
+        reconciled = torch.max(w1_ws2, w3_ws2)
+        return reconciled, reconciled
+
     def _reconcile_and_compute_alphas(
             self,
             module: torch.nn.Module,
@@ -2828,13 +2868,19 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             dst_fc2_alpha: torch.Tensor,
             dst_fc31_weight_scale_2: Optional[torch.Tensor] = None,
             dst_fc2_weight_scale_2: Optional[torch.Tensor] = None,
-            load_expert_ids: Optional[List[int]] = None):
-        """Reconcile w1/w3 weight_scale_2 and compute alphas for each expert.
+            load_expert_ids: Optional[List[int]] = None,
+            dst_fc31_up_alpha: Optional[torch.Tensor] = None) -> None:
+        """Resolve w1/w3 weight_scale_2 and compute alphas for each expert.
 
-        For each expert, reconciles w1 and w3 weight_scale_2 (taking the max
-        if they differ), then computes fc31_alpha and fc2_alpha using the
-        finalized global input_scale values.
+        For each expert, resolves the gate/up `weight_scale_2` pair with
+        `_resolve_gate_up_weight_scale_2` (kept separate on a layer for which
+        `_splits_gate_up_weight_scale_2` holds, otherwise reconciled to the
+        larger value with a warning), then computes `fc31_alpha` from the gate
+        scale and `fc2_alpha`, using the finalized global input scales. When
+        `dst_fc31_up_alpha` is given, the up half's alpha is written there; it
+        equals the gate alpha unless the scales were kept separate.
         """
+        split = self._splits_gate_up_weight_scale_2(module)
         for expert_idx, scales in tmp_weight_scale_2.items():
             expert_id = (load_expert_ids[expert_idx]
                          if load_expert_ids is not None else expert_idx)
@@ -2844,14 +2890,15 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             if w1_ws2 is None or w3_ws2 is None or w2_ws2 is None:
                 continue
 
-            if not torch.allclose(w1_ws2, w3_ws2):
-                logger.warning(
-                    f"w1_weight_scale_2 != w3_weight_scale_2 ({w1_ws2} != {w3_ws2}), "
-                    f"selecting the larger value. Accuracy may be affected.")
-                w1_ws2 = torch.max(w1_ws2, w3_ws2)
-                w3_ws2 = w1_ws2
+            w1_ws2, w3_ws2 = self._resolve_gate_up_weight_scale_2(
+                w1_ws2, w3_ws2, split)
 
-            self.load_expert_fc31_alpha_nvfp4(w1_ws2, w3_ws2,
+            if dst_fc31_up_alpha is not None:
+                self.load_expert_fc31_alpha_nvfp4(w3_ws2, w3_ws2,
+                                                  module.fc31_input_scale.data,
+                                                  dst_fc31_up_alpha[expert_idx])
+
+            self.load_expert_fc31_alpha_nvfp4(w1_ws2, w1_ws2,
                                               module.fc31_input_scale.data,
                                               dst_fc31_alpha[expert_idx])
             fc2_alpha_input_scale = self._get_fc2_alpha_input_scale(
@@ -2925,7 +2972,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         experts migrated by online EPLB receive correctly-laid-out scales.
         """
 
-    def process_weights_after_loading(self, module: torch.nn.Module):
+    def process_weights_after_loading(self, module: torch.nn.Module) -> None:
         if not hasattr(module, 'tmp_raw_input_scales'):
             return  # No quant scales were loaded, nothing to finalize
 
@@ -2955,14 +3002,25 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # Step 2: Finalize pre_quant_scale (NVFP4_AWQ)
         self._finalize_pre_quant_scales(module)
 
-        # Step 3: Reconcile weight_scale_2 and compute alphas
+        # Step 3: Resolve weight_scale_2 and compute alphas
+        if self.supports_split_gate_up_weight_scale_2:
+            # The up (w3) half's alpha for a kernel that dequantizes the two
+            # FC1 halves separately. Derived load-time scratch, not checkpoint
+            # state: the backend's process_weights_after_loading consumes and
+            # drops it. Starts as a copy of fc31_alpha so an expert the alpha
+            # loop skips keeps one dequant for both halves.
+            module.fc31_up_alpha = module.fc31_alpha.data.clone()
         self._reconcile_and_compute_alphas(
-            module, module.tmp_weight_scale_2, module.fc31_alpha.data,
-            module.fc2_alpha.data, module.fc31_weight_scale_2.data if hasattr(
-                module, 'fc31_weight_scale_2') else None,
+            module,
+            module.tmp_weight_scale_2,
+            module.fc31_alpha.data,
+            module.fc2_alpha.data,
+            module.fc31_weight_scale_2.data
+            if hasattr(module, 'fc31_weight_scale_2') else None,
             module.fc2_weight_scale_2.data
             if hasattr(module, 'fc2_weight_scale_2') else None,
-            module.initial_local_expert_ids)
+            module.initial_local_expert_ids,
+            dst_fc31_up_alpha=getattr(module, 'fc31_up_alpha', None))
         delattr(module, 'tmp_weight_scale_2')
 
         # Step 4: Finalize shared weight alphas if needed
@@ -4992,9 +5050,37 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
     weight_dtype = float4_sf_dtype
     block_scales_dtype = torch.float8_e4m3fn
 
+    # trtllm-gen takes the gate and up global scales as two separate scalars
+    # (`output1_scale_gate_scalar` / `output1_scale_scalar`), so a checkpoint
+    # that stores them per half needs no reconciliation on the layers
+    # `_splits_gate_up_weight_scale_2` admits.
+    supports_split_gate_up_weight_scale_2 = True
+
     # Cache the permute indices during weight loading to avoid recompute
     # This assumes the same input shape always results in the same permute indices
     _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
+
+    def _splits_gate_up_weight_scale_2(self, module: torch.nn.Module) -> bool:
+        """Whether `module` keeps separate gate and up global weight scales.
+
+        The cubins dequantize the two FC1 halves separately only where scaleC
+        carries the linear half's dequant, i.e. where
+        `_fc31_scale_c_omits_dequant` is False: SiTu folds one dequant,
+        scaleGate, into both halves. A finite activation clamp is one
+        pre-dequant limit for both halves (`limit / dequantAb`; see
+        `mPtrClampLimit` in `BatchedGemmInterface.h`, which assumes
+        `dequantScaleAb == scaleGate`), so it is exact only when the halves
+        share a dequant; such layers keep reconciling as before.
+        """
+        if not self.supports_split_gate_up_weight_scale_2:
+            return False
+        if _fc31_scale_c_omits_dequant(module):
+            return False
+        act_clamp = getattr(module, 'act_clamp', None)
+        if act_clamp is not None and bool(
+                torch.isfinite(torch.as_tensor(act_clamp)).any()):
+            return False
+        return True
 
     def create_weights(self,
                        module: torch.nn.Module,
@@ -5298,7 +5384,7 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
 
     def process_weights_after_loading(self,
                                       module: torch.nn.Module,
-                                      num_elts_per_sf: int = 16):
+                                      num_elts_per_sf: int = 16) -> None:
         # Shuffle/interleave shared expert tensors BEFORE super() call,
         # because super().process_weights_after_loading() will delattr these tensors
         # after registering them with EPLB.
@@ -5306,6 +5392,11 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
 
         # Call parent to compute global input scales and main alphas first
         super().process_weights_after_loading(module)
+
+        # Divide the biases and activation constants by the alphas BEFORE
+        # _shuffle_all_experts() permutes the FC1 bias rows: the division is
+        # per FC1 half, so it relies on the [w3 | w1] layout the loader wrote.
+        self._fold_alphas_into_bias_and_act_constants(module)
 
         # Apply shuffle/interleave to all regular expert weights and weight scales.
         self._shuffle_all_experts(module, num_elts_per_sf)
@@ -5316,23 +5407,59 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # Finalize shared expert alphas and fc31_scale_c for online EPLB
         self._finalize_shared_expert_alphas(module)
 
-        # Cubin clamp / GLU bias inputs are consumed in the pre-dequant GEMM
-        # output domain (i.e. divided by fc31_alpha / fc2_alpha). The ``act_*``
-        # slots are per-expert tensors on every path this method class serves.
-        #
-        # The bias division is gated on module.bias to stay consistent with
-        # _shuffle_all_experts() below. Hoisting this block into the base method
-        # deliberately widens it to W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, which
-        # auto-creates all-zero bias tensors that its kernel
-        # (fp8_fp4_block_scale_moe_runner) never consumes; those must not be
-        # divided, because a zero alpha would turn them into NaN.
+        # The up-half alpha was load-time scratch for the steps above.
+        if hasattr(module, 'fc31_up_alpha'):
+            delattr(module, 'fc31_up_alpha')
+
+    @staticmethod
+    def _fc31_up_alpha(module: torch.nn.Module) -> torch.Tensor:
+        """The linear (w3) half's per-expert dequant scale.
+
+        `fc31_alpha` unless the load kept separate gate/up global scales, in
+        which case `NVFP4FusedMoEMethod.process_weights_after_loading` derived
+        the up half's own alpha.
+        """
+        return getattr(module, 'fc31_up_alpha', module.fc31_alpha.data)
+
+    def _fold_alphas_into_bias_and_act_constants(
+            self, module: torch.nn.Module) -> None:
+        """Divide the biases and activation constants by their dequant scales.
+
+        The cubins consume the FC1 bias, the GLU beta and the clamp in the
+        pre-dequant GEMM output domain -- `bias' = bias / dequantAb` per row,
+        `beta' = beta / dequantAb`, `limit' = limit / dequantAb` (see
+        `BatchedGemmInterface.h`) -- and the FC2 bias likewise under
+        `fc2_alpha`. Each FC1 half has its own dequant: the w1 (gate) half is
+        scaled by `fc31_alpha`, the w3 (linear) half, whose domain `act_beta`
+        (the GLU offset, or the SiTu linear soft-cap) shares, by the up
+        alpha; the two differ only on a split-scale load. The clamp is one
+        limit for both halves, which is why a finite clamp turns the split
+        off (`_splits_gate_up_weight_scale_2`) and is divided by `fc31_alpha`
+        here. The `act_*` slots are per-expert tensors on every path this
+        method class serves.
+
+        The bias division is gated on `module.bias` to stay consistent with
+        `_shuffle_all_experts`. Hoisting it into the base method deliberately
+        widens it to `W4A8NVFP4FP8TRTLLMGenFusedMoEMethod`, which auto-creates
+        all-zero bias tensors that its kernel
+        (`fp8_fp4_block_scale_moe_runner`) never consumes; those must not be
+        divided, because a zero alpha would turn them into NaN.
+        """
+        gate_alpha = module.fc31_alpha.data
+        up_alpha = self._fc31_up_alpha(module)
         if module.bias:
-            module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
-            module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
+            fc31_bias = module.w3_w1_bias.data
+            if module.is_gated_activation:
+                up_bias, gate_bias = fc31_bias.chunk(2, dim=1)
+                up_bias.div_(up_alpha.view(-1, 1))
+                gate_bias.div_(gate_alpha.view(-1, 1))
+            else:
+                fc31_bias.div_(gate_alpha.view(-1, 1))
+            module.w2_bias.data.div_(module.fc2_alpha.data.view(-1, 1))
         if getattr(module, 'act_beta', None) is not None:
-            module.act_beta.data.div_((module.fc31_alpha.data))
+            module.act_beta.data.div_(up_alpha)
         if getattr(module, 'act_clamp', None) is not None:
-            module.act_clamp.data.div_((module.fc31_alpha.data))
+            module.act_clamp.data.div_(gate_alpha)
 
     def _shuffle_shared_expert_tensors(self,
                                        module: torch.nn.Module,
@@ -5386,7 +5513,7 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                                            module.w3_w1_bias.data[expert_idx])
                 self._shuffle_w2_weight(module.w2_bias.data[expert_idx])
 
-    def _compute_fc31_scale_c(self, module: torch.nn.Module):
+    def _compute_fc31_scale_c(self, module: torch.nn.Module) -> None:
         # Compute fc31_scale_c now that global input_scale and alphas are finalized
         # c_global_sf: fc2_input_scale
         # For gated activations (SwiGlu), scale_c_fc1 includes both input and weight scales
@@ -5397,12 +5524,16 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                 module.expert_size_per_partition),
                                            non_blocking=True)
         else:
-            # For SwiGlu (default): scale_c_fc1 = fc2_input_scale * fc31_alpha
+            # For SwiGlu (default): scale_c_fc1 = fc2_input_scale * dequantAb
+            # of the linear (w3) half. scaleC multiplies the linear half
+            # together with the GEMM2-input quant scale, while scaleGate
+            # (fc31_alpha) dequantizes the gate (w1) half, so this takes the
+            # up alpha; it differs from fc31_alpha only on a split-scale load.
             module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
-                                           module.fc31_alpha.data,
+                                           self._fc31_up_alpha(module),
                                            non_blocking=True)
 
-    def _finalize_shared_expert_alphas(self, module: torch.nn.Module):
+    def _finalize_shared_expert_alphas(self, module: torch.nn.Module) -> None:
         """Finalize shared weight alphas and fc31_scale_c for online EPLB."""
         if hasattr(module, 'tmp_trtllmgen_shared_weight_scale_2'):
             num_shared = len(module.tmp_trtllmgen_shared_weight_scale_2)
@@ -5414,19 +5545,27 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                 (num_shared, ) + module.fc2_alpha.data.shape[1:],
                 dtype=module.fc2_alpha.data.dtype,
                 device='cpu')
+            local_shared_fc31_up_alpha = (
+                torch.empty_like(local_shared_fc31_alpha)
+                if self.supports_split_gate_up_weight_scale_2 else None)
             self._reconcile_and_compute_alphas(
-                module, module.tmp_trtllmgen_shared_weight_scale_2,
-                local_shared_fc31_alpha, local_shared_fc2_alpha)
+                module,
+                module.tmp_trtllmgen_shared_weight_scale_2,
+                local_shared_fc31_alpha,
+                local_shared_fc2_alpha,
+                dst_fc31_up_alpha=local_shared_fc31_up_alpha)
 
             # The shared host copy of fc31_scale_c is consumed by online EPLB
             # when an expert is migrated into a local slot, so it must match
-            # the main-slot formula exactly (see _compute_fc31_scale_c above).
+            # the main-slot formula exactly (see _compute_fc31_scale_c above),
+            # including its use of the up-half global scale.
             if _fc31_scale_c_omits_dequant(module):
                 local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
                 ).expand(num_shared).contiguous()
             else:
                 local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
-                ) * local_shared_fc31_alpha
+                ) * (local_shared_fc31_up_alpha if local_shared_fc31_up_alpha
+                     is not None else local_shared_fc31_alpha)
 
             module.register_all_parameter_slot_and_to_fix_weight_fns({
                 'fc31_scale_c':
