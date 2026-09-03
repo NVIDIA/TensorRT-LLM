@@ -44,7 +44,10 @@ int computeIndexerTopKDecodeBlocksPerRow(int numRows, int numColumns, int splitW
 ///   token space. Non-null selects the ragged layout: rows no longer map to
 ///   requests by `rowIdx / next_n`, so the extent every row may attend to is
 ///   supplied directly instead of being reconstructed from `next_n`. Null keeps
-///   the uniform arithmetic, bit-identical to before.
+///   the uniform arithmetic, bit-identical to before. A
+///   negative extent or one whose compressed length exceeds `numColumns` fails
+///   closed as an empty row, so device-updated graph inputs cannot read beyond
+///   the corresponding logits row.
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK = 2048, int const compressRatio = 1,
