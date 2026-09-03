@@ -429,23 +429,43 @@ def validate_streaming_support(
 def validate_endpoint_ranges(
     config: KVEventsConfig, ranks_per_host: int, data_parallel_size: int
 ) -> None:
-    """Reject configurations whose publish and replay port ranges overlap.
+    """Reject endpoint configurations the per-rank binding cannot honour.
 
     Ranks bind ``base_port + rank`` using their **global** rank, so each rank's port is
-    distinct cluster-wide and the sockets span ``[base, base + world - 1]``. Only ranks
-    co-located on one host actually contend for a port, and a host holds a contiguous
-    run of ranks, so the required spacing between the two base ports is the per-host
-    rank count rather than the total. Catch it before any socket is created rather than
-    as an opaque ``EADDRINUSE``.
+    distinct cluster-wide and the sockets span ``[base, base + world - 1]``. Two things
+    can go wrong, and both are checked on every rank -- before any socket is created and
+    before the initialization collectives -- so all ranks fail identically rather than
+    one aborting while its peers wait in an all-reduce:
+
+    * The span can run past port 65535. ``ZmqEventPublisher.__init__`` resolves
+      ``base_port + rank`` itself, but only raises on the ranks that actually overflow.
+    * The publish and replay spans can intersect. Only ranks co-located on one host
+      contend for a port, and a host holds a contiguous run of ranks, so the required
+      spacing between the two base ports is the per-host rank count, not the total.
     """
+    world = max(1, data_parallel_size)
     pub_base = _tcp_base_port(config.endpoint)
     replay_base = _tcp_base_port(config.replay_endpoint)
+
+    for name, endpoint, base_port in (
+        ("endpoint", config.endpoint, pub_base),
+        ("replay_endpoint", config.replay_endpoint, replay_base),
+    ):
+        if base_port is None:
+            continue
+        highest = base_port + world - 1
+        if highest > 65_535:
+            raise ValueError(
+                f"KV event {name} {endpoint!r} does not fit {world} rank(s): ranks bind "
+                f"base_port+rank, so the highest would be {highest}, above the maximum "
+                f"port 65535. Use a base port at or below {65_535 - world + 1}."
+            )
+
     if pub_base is None or replay_base is None:
         return
     span = max(1, ranks_per_host)
     distance = abs(pub_base - replay_base)
     if distance < span:
-        world = max(1, data_parallel_size)
         raise ValueError(
             f"KV event endpoint {config.endpoint!r} and replay_endpoint "
             f"{config.replay_endpoint!r} overlap: ranks bind base_port+rank by global "

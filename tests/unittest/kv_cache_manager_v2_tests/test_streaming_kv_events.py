@@ -438,6 +438,45 @@ def test_life_cycle_hooks_ignore_none_ids() -> None:
         manager.shutdown()
 
 
+@pytest.mark.parametrize(
+    "endpoint,replay_endpoint,dp_size,overflows",
+    [
+        # rank 1 would bind 65536, which offset_endpoint_port rejects on that rank
+        # alone -- before rank 0 reaches the collective.
+        ("tcp://*:65535", None, 2, True),
+        ("tcp://*:65535", None, 1, False),
+        ("tcp://*:65534", None, 2, False),
+        ("tcp://*:65534", None, 3, True),
+        # The replay endpoint is checked too, not just the publish endpoint.
+        ("tcp://*:5557", "tcp://*:65535", 2, True),
+        ("tcp://*:5557", "tcp://*:60000", 2, False),
+        # ipc/inproc have no port, so the span does not apply.
+        ("ipc:///tmp/kv-events", None, 64, False),
+    ],
+)
+def test_validate_endpoint_ranges_rejects_port_overflow(
+    endpoint, replay_endpoint, dp_size, overflows
+) -> None:
+    kwargs = {"replay_endpoint": replay_endpoint} if replay_endpoint else {}
+    config = KVEventsConfig(enable_kv_cache_events=True, endpoint=endpoint, **kwargs)
+    # ranks_per_host=1 isolates the span check from the overlap check.
+    if overflows:
+        with pytest.raises(ValueError, match="above the maximum port 65535"):
+            validate_endpoint_ranges(config, 1, dp_size)
+    else:
+        validate_endpoint_ranges(config, 1, dp_size)
+
+
+def test_validate_streaming_support_rejects_overflowing_port_span() -> None:
+    """Every rank must reject the span, so none reaches the following collective."""
+    config = KVEventsConfig(enable_kv_cache_events=True, endpoint="tcp://*:65535")
+    supported = dict(pp_size=1, cp_size=1, ranks_per_host=1, backend="python")
+    # One rank fits; two do not, and rank 0 must refuse it just as rank 1 would.
+    validate_streaming_support(config, **supported, data_parallel_size=1)
+    with pytest.raises(ValueError, match="above the maximum port 65535"):
+        validate_streaming_support(config, **supported, data_parallel_size=2)
+
+
 def test_kv_events_config_publisher_default() -> None:
     """model_post_init resolves the publisher default (the common user path)."""
     assert KVEventsConfig(enable_kv_cache_events=True).publisher == "zmq"
