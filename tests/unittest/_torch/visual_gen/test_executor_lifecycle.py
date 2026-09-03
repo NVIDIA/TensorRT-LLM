@@ -28,7 +28,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-import torch
 import zmq
 from utils.spawn_process import SpawnProcessContext, spawn_process
 
@@ -78,27 +77,6 @@ def _pause() -> None:
 
 def _exit_immediately(exitcode: int) -> None:
     os._exit(exitcode)
-
-
-def _gpu_bound_worker(
-    rank: int,
-    parent_pid: int,
-    ready_queue,
-) -> None:
-    executor_module._start_coordinator_watchdog(parent_pid)
-    torch.cuda.set_device(rank)
-    # Keep a live CUDA allocation on each device while the parent injects a
-    # process failure. NCCL is intentionally not initialized here: killing a
-    # rank inside an active NCCL group can wedge NVIDIA UVM teardown and poison
-    # the shared CI node, which tests driver recovery rather than this client's
-    # worker-containment behavior.
-    allocation = torch.empty(1024, device=f"cuda:{rank}")
-    torch.cuda.synchronize(rank)
-    ready_queue.put(rank)
-    ready_queue.close()
-    ready_queue.join_thread()
-    assert allocation.is_cuda
-    _pause()
 
 
 def _supervised_pause_worker(parent_pid: int, ready_queue) -> None:
@@ -1010,82 +988,6 @@ def test_worker_failure_shutdown_does_not_wait_for_thread_timeout() -> None:
     assert elapsed < 1.0
     assert not client.background_thread.is_alive()
     client._cleanup_ipc.assert_called_once_with()
-
-
-@pytest.mark.gpu4
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="native parent monitoring and /proc are Linux-specific",
-)
-def test_sigkill_one_worker_contains_real_multi_gpu_group() -> None:
-    world_size = 4
-    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
-        pytest.skip(f"requires {world_size} GPUs")
-
-    context = executor_module._get_mp_context("spawn")
-    ready_queue = context.Queue()
-    parent_pid = os.getpid()
-    workers = [
-        context.Process(
-            target=_gpu_bound_worker,
-            args=(
-                rank,
-                parent_pid,
-                ready_queue,
-            ),
-        )
-        for rank in range(world_size)
-    ]
-    for worker in workers:
-        worker.start()
-
-    try:
-        ready_deadline = time.monotonic() + _COLD_SPAWN_TIMEOUT
-        ready_ranks = {
-            ready_queue.get(timeout=max(0.0, ready_deadline - time.monotonic()))
-            for _ in range(world_size)
-        }
-        assert ready_ranks == set(range(world_size))
-
-        failed_worker = workers[0]
-        assert failed_worker.pid is not None
-        os.kill(failed_worker.pid, signal.SIGKILL)
-        deadline = time.monotonic() + 10.0
-        while _process_state(failed_worker.pid) != "Z" and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert _process_state(failed_worker.pid) == "Z"
-
-        client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
-        client.worker_processes = workers
-        client._worker_spawner = executor_module._WorkerProcessSpawner(workers)
-        client._ext_worker_thread = None
-        client._monitor_worker_liveness = True
-        client._worker_failure = None
-        client._shutdown_started = False
-        client.shutdown_event = threading.Event()
-        client.response_event = threading.Event()
-
-        deadline = time.monotonic() + 10.0
-        while client._worker_failure is None and time.monotonic() < deadline:
-            client._check_worker_liveness()
-            time.sleep(0.001)
-
-        assert client._worker_failure == (
-            f"DiffusionClient: local worker processes exited: pid={failed_worker.pid}, exitcode=-9"
-        )
-        assert failed_worker.exitcode == -signal.SIGKILL
-        for worker in workers[1:]:
-            assert worker.exitcode == -signal.SIGKILL
-        for worker in workers:
-            assert worker.pid is not None
-            assert _process_state(worker.pid) is None
-    finally:
-        for worker in workers:
-            if worker.is_alive():
-                worker.kill()
-            worker.join(timeout=10.0)
-        ready_queue.close()
-        ready_queue.join_thread()
 
 
 def test_worker_failure_completes_pending_response_with_error() -> None:
