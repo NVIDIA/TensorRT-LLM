@@ -101,36 +101,18 @@ class Attention(nn.Module):
         _is_vsa = base_backend == "CUTEDSL" and _sa_algo == "vsa"
         _is_sol_attn = base_backend == "CUTEDSL" and _sa_algo == "sol_attn"
 
-        # SEPARATE_QKV fallback: TRTLLM and CUTEDSL VSA/Sol-Attn cannot serve it.
+        # SEPARATE_QKV fallback: TRTLLM and CUTEDSL VSA cannot serve it.
         #
-        # For genuine cross-attention, Sol-Attn falls back within its own backend
-        # family -- the dense CuTe DSL kernel serves cross-attention fine. VSA still
-        # goes to VANILLA and has the same defect; see TRTLLM-16105.
-        # Falling back to VANILLA instead silently swapped cross-attention from
-        # CuTeDSL to torch SDPA in every block the moment a sparse algorithm was
-        # enabled, so a `backend: CUTEDSL` run and a `CUTEDSL + sol_attn` run
-        # differed in cross-attention regardless of any sparse setting.
-        #
-        # This branch also catches *self*-attention that merely uses SEPARATE_QKV
-        # (Qwen-Image always; WAN's attn1 under async Ulysses). Those keep
-        # VANILLA: callers such as
-        # `qwen_image/transformer_qwen_image.py::_supports_qwen_key_padding_mask`
-        # test for the literal string "VANILLA", so redirecting them changes
-        # unrelated behaviour. TRTLLM keeps VANILLA throughout -- TrtllmAttention
-        # genuinely cannot serve SEPARATE_QKV.
-        _is_true_cross_attn = not separate_qkv_is_self_attention
-        _cross_attn_fallback = "CUTEDSL" if (_is_sol_attn and _is_true_cross_attn) else "VANILLA"
-        if self.qkv_mode == QKVMode.SEPARATE_QKV and (
-            base_backend == "TRTLLM" or _is_vsa or _is_sol_attn
-        ):
-            backend_name = _cross_attn_fallback
-            requested = (
-                f"{base_backend} (VSA)"
-                if _is_vsa
-                else f"{base_backend} (Sol-Attn)"
-                if _is_sol_attn
-                else base_backend
-            )
+        # Sol-Attn is deliberately absent: it decides per call (`_can_serve`) and
+        # delegates what it cannot serve to the dense backend of its own family.
+        # A rule here would have to guess from `qkv_mode`, which describes how
+        # Q/K/V are *projected* rather than whether K/V come from another
+        # sequence -- and that guess is wrong wherever SEPARATE_QKV is chosen for
+        # other reasons (Qwen-Image always; WAN's attn1 under async Ulysses),
+        # silently costing those modules their configured backend.
+        if self.qkv_mode == QKVMode.SEPARATE_QKV and (base_backend == "TRTLLM" or _is_vsa):
+            backend_name = "VANILLA"
+            requested = f"{base_backend} (VSA)" if _is_vsa else base_backend
             # Warn once per (module class, requested, resolved) triple so the
             # fallback is visible without per-module-instance log spam.
             logger.warning_once(
@@ -273,14 +255,7 @@ class Attention(nn.Module):
             num_kv_heads=backend_num_kv_heads,
             quant_config=self.quant_config,
             dtype=self.dtype,
-            attention_config=(
-                config.attention.model_copy(update={"sparse_attention_config": None})
-                if backend_name == "CUTEDSL"
-                and _is_sol_attn
-                and _is_true_cross_attn
-                and self.qkv_mode == QKVMode.SEPARATE_QKV
-                else config.attention
-            ),
+            attention_config=config.attention,
             attention_metadata_state=attention_metadata_state,
             sparse_params=sparse_params,
         )
