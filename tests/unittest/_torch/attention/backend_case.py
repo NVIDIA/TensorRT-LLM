@@ -28,7 +28,11 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.utils import create_attention, get_attention_backend
+from tensorrt_llm._torch.attention_backend.utils import (
+    append_mla_latent_cache,
+    create_attention,
+    get_attention_backend,
+)
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
@@ -461,7 +465,8 @@ def _run_mla_gen_backend(
     """Run one backend's absorbed-MLA generation; return [nnz_q, heads*kv_lora].
 
     No ``mla_rope_generation`` call (see ``generate_mla_gen_inputs``): ``fused_q``
-    is passed as-is and the backend's ``forward`` appends the new latent + MQA.
+    is passed as-is. The harness prepares TRTLLM's cache and scheduler inputs
+    directly, while the other backends retain their normal Python cache update.
     """
     AttentionCls = get_attention_backend(backend)
     H = case.num_heads
@@ -490,20 +495,41 @@ def _run_mla_gen_backend(
     expected_latents = _split_packed_tokens(latent_cache, case.seq_lens)
 
     def _forward(metadata, q, q_pe):
+        forward_args = AttentionForwardArgs(
+            latent_cache=latent_cache,
+            q_pe=q_pe,
+            attention_input_type=AttentionInputType.generation_only,
+        )
+        if backend == "TRTLLM":
+            num_ctx = metadata.num_contexts
+            num_gen = metadata.num_generations
+            gen_q_lens = metadata.seq_lens_cuda[num_ctx : num_ctx + num_gen].to(torch.int32)
+            gen_kv_lens = metadata.kv_lens_cuda_runtime[num_ctx : num_ctx + num_gen].to(torch.int32)
+            cu_q_seqlens = torch.zeros(num_gen + 1, dtype=torch.int32, device=q.device)
+            cu_kv_seqlens = torch.zeros(num_gen + 1, dtype=torch.int32, device=q.device)
+            cu_q_seqlens[1:] = torch.cumsum(gen_q_lens, dim=0).to(torch.int32) * H
+            cu_kv_seqlens[1:] = torch.cumsum(gen_kv_lens, dim=0).to(torch.int32)
+            forward_args.cu_q_seqlens = cu_q_seqlens
+            forward_args.cu_kv_seqlens = cu_kv_seqlens
+            forward_args.fmha_scheduler_counter = torch.zeros(
+                1, dtype=torch.uint32, device=q.device
+            )
+            append_mla_latent_cache(
+                metadata.kv_cache_manager,
+                attn.get_local_layer_idx(metadata),
+                metadata.request_ids,
+                metadata.seq_lens.tolist(),
+                metadata.kv_cache_params.num_cached_tokens_per_seq,
+                latent_cache,
+                kv_layout=metadata.kv_layout,
+                seq_start=num_ctx,
+            )
         out = attn.forward(
             q,
             None,
             None,
             metadata,
-            forward_args=AttentionForwardArgs(
-                latent_cache=latent_cache,
-                q_pe=q_pe,
-                attention_input_type=AttentionInputType.generation_only,
-                # The harness feeds a pre-RoPE'd fused_q, so skip the RoPE step;
-                # the TRTLLM backend still appends the new latent and inits its
-                # scheduler buffers. Vanilla/FlashInfer ignore this flag.
-                skip_mla_rope_generation=True,
-            ),
+            forward_args=forward_args,
         )
         return out[0] if isinstance(out, tuple) else out
 
