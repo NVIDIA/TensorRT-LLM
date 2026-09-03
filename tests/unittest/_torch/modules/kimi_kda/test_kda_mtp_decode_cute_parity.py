@@ -548,7 +548,7 @@ def test_misaligned_state_indices_rejected_after_aligned_warmup():
 
     misaligned_data = dict(data)
     misaligned_data["ssm_state_indices"] = misaligned_indices
-    with pytest.raises(AssertionError, match="16-byte aligned"):
+    with pytest.raises(ValueError, match="16-byte aligned"):
         cute_run(misaligned_data)
 
 
