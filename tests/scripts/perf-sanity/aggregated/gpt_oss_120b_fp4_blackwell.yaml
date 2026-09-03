@@ -12,7 +12,7 @@ server_configs:
     tensor_parallel_size: 1
     moe_expert_parallel_size: 1
     pipeline_parallel_size: 1
-    checkpoint_io_policy: "rank_striped_read_ahead"
+    checkpoint_io_policy: "native"
     max_batch_size: 1
     max_num_tokens: 256
     attn_backend: "TRTLLM"
