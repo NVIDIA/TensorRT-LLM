@@ -477,6 +477,13 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "enable_mla_skip_correction"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "enable_resource_governor"
     },
     {
@@ -1078,6 +1085,13 @@
       "converter": "",
       "kind": "value",
       "path": "max_stats_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "mla_skip_correction_threshold"
     },
     {
       "allowed_values": [],

@@ -558,6 +558,8 @@ public:
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactorPrefill = 0;
     float mSkipSoftmaxThresholdScaleFactorDecode = 0;
+    // Skip correction when the row-max increase is within this base-2 threshold.
+    float mSkipCorrectionThreshold = 0;
     // Optional SageAttention block sizes.
     // Currently, these are only consumed by the TllmGen backend path.
     int mSageAttnNumEltsPerBlkQ = 0;
@@ -587,8 +589,8 @@ public:
             mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast,
             mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
             mFusesDsv4InvRopeFp8Quant, mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1),
-            mSkipSoftmaxThresholdScaleFactorPrefill, mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ,
-            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
+            mSkipSoftmaxThresholdScaleFactorPrefill, mSkipSoftmaxThresholdScaleFactorDecode, mSkipCorrectionThreshold,
+            mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
     };
 
 private:
