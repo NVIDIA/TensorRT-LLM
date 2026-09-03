@@ -931,11 +931,15 @@ class PyExecutor:
         # normal dummy add-forward-terminate lifecycle handles taper-down.
         # Only relevant in benchmark disagg mode; False otherwise.
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
-        # Set when a blocking generation transfer returns during benchmark
-        # fill. The gate consumes this signal to retry immediately instead of
-        # adding an unnecessary polling delay after synchronous progress.
-        self._sync_disagg_transfer_made_progress = False
-        self._benchmark_sync_progress_global = False
+        # Set when a generation transfer completes during benchmark fill. The
+        # gate consumes this signal to retry immediately instead of adding an
+        # unnecessary polling delay after transfer progress.
+        self._disagg_gen_transfer_made_progress = False
+        self._benchmark_transfer_progress_global = False
+        # A completion can surface through a status ID or request-state
+        # mutation. Credit each logical request once across both signals so it
+        # cannot reset the benchmark fill watchdog more than once.
+        self._benchmark_completed_gen_transfer_ids: set[int] = set()
         # Slow-start admission cap for benchmark disagg fill (see
         # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
         # seeds it to tp_size and each subsequent iter doubles it.
@@ -3696,7 +3700,7 @@ class PyExecutor:
 
         Args:
             local_status: Caller-defined ``(state, flag)`` pair from this rank.
-                The fill gate uses ``(ready, synchronous_progress)`` and the
+                The fill gate uses ``(ready, transfer_progress)`` and the
                 fail-fast path uses ``(all_fetched, terminal_no_fit)``.
 
         Returns:
@@ -3827,7 +3831,7 @@ class PyExecutor:
         return all_ranks_fetched and any_rank_terminal_no_fit
 
     def _prepare_and_schedule_batch(self):
-        self._sync_disagg_transfer_made_progress = False
+        self._disagg_gen_transfer_made_progress = False
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -3996,7 +4000,7 @@ class PyExecutor:
     def _is_benchmark_disagg_fill_complete(
             self,
             scheduled_batch: ScheduledRequests,
-            local_sync_progress: bool = False) -> bool:
+            local_transfer_progress: bool = False) -> bool:
         """State-based fill-complete predicate for benchmark disagg mode.
 
         The gate opens when all three conditions hold globally:
@@ -4007,7 +4011,7 @@ class PyExecutor:
             KV-transfer phase (not in INIT, TRANS_IN_PROGRESS, or ERROR).
         (C) The KV cache transceiver has no pending receive sessions.
 
-        The conditions and synchronous-progress signal are gathered across the
+        The conditions and transfer-progress signal are gathered across the
         TP+CP scheduling group so every model-parallel rank makes the same gate
         and sleep decision.
 
@@ -4016,8 +4020,8 @@ class PyExecutor:
         Args:
             scheduled_batch: Passed for API compatibility with callers
                 but no longer used by this predicate.
-            local_sync_progress: Whether this rank completed a synchronous KV
-                transfer in the current iteration.
+            local_transfer_progress: Whether this rank completed a KV transfer
+                in the current iteration.
 
         Returns:
             True when the fill phase is complete and the first forward
@@ -4055,12 +4059,12 @@ class PyExecutor:
 
         local_ok = int(local_all_fetched and local_all_past_transfer
                        and local_no_inflight)
-        local_status = (local_ok, bool(local_sync_progress))
+        local_status = (local_ok, bool(local_transfer_progress))
 
         all_rank_status = self._allgather_model_parallel_status(local_status)
         all_ranks_ok = [status[0] for status in all_rank_status]
         global_ok = min(all_ranks_ok) == 1
-        self._benchmark_sync_progress_global = any(
+        self._benchmark_transfer_progress_global = any(
             status[1] for status in all_rank_status)
 
         if self.dist.rank == 0:
@@ -4099,8 +4103,8 @@ class PyExecutor:
 
         A short sleep (0.1s) yields the CPU between retries that made no
         transfer progress while keeping the polling interval short enough to
-        avoid KV transfer backpressure on the CTX server. Synchronous receives
-        already block until they make progress, so those retries do not sleep.
+        avoid KV transfer backpressure on the CTX server. Retries that complete
+        a transfer do not sleep.
 
         Args:
             scheduled_batch: The current scheduled batch.
@@ -4111,20 +4115,20 @@ class PyExecutor:
             the caller should ``continue`` to the next loop iteration.
         """
         if not self.is_warmup and not can_forward:
-            sync_transfer_made_progress = getattr(
-                self, "_sync_disagg_transfer_made_progress", False)
-            self._sync_disagg_transfer_made_progress = False
+            transfer_made_progress = self._disagg_gen_transfer_made_progress
+            self._disagg_gen_transfer_made_progress = False
             can_forward = self._is_benchmark_disagg_fill_complete(
-                scheduled_batch, sync_transfer_made_progress)
-            sync_transfer_made_progress = self._benchmark_sync_progress_global
+                scheduled_batch, transfer_made_progress)
+            transfer_made_progress = self._benchmark_transfer_progress_global
             if can_forward:
                 self._benchmark_fill_phase_active = False
                 self._fill_admit_cap = 0
                 self._benchmark_fill_stall_since = None
-            elif not sync_transfer_made_progress:
+                self._benchmark_completed_gen_transfer_ids.clear()
+            elif not transfer_made_progress:
                 time.sleep(0.1)
             if not can_forward:
-                self._fail_if_fill_gate_stalled(sync_transfer_made_progress)
+                self._fail_if_fill_gate_stalled(transfer_made_progress)
                 return can_forward, True
         return can_forward, False
 
@@ -7624,7 +7628,7 @@ class PyExecutor:
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
-                    self._sync_disagg_transfer_made_progress = True
+                    self._disagg_gen_transfer_made_progress = True
             self._check_cache_transfer_errors("generation requests")
             return
 
@@ -7817,8 +7821,38 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
+        # Python transceivers report completed IDs, while the C++ runtime only
+        # mutates request state. Capture both forms of completion so the fill
+        # watchdog remains independent of the selected transceiver runtime.
+        tracked_requests = ()
+        track_benchmark_fill_progress = (self.is_benchmark_disagg
+                                         and not self.is_warmup
+                                         and self._dist_size(
+                                             self.dist, "pp_size") == 1
+                                         and self._benchmark_fill_phase_active)
+        if track_benchmark_fill_progress:
+            tracked_requests = tuple(
+                req for req in self.active_requests
+                if req.is_disagg_generation_transmission_in_progress)
+
         gen_status = self.kv_cache_transceiver.check_gen_transfer_status(
             atLeastNum)
+        if track_benchmark_fill_progress:
+            completed_request_ids = set(gen_status.completed_request_ids)
+            for req in tracked_requests:
+                if (req.state
+                        != LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE):
+                    continue
+                request_id = get_unique_rid(req)
+                if request_id is not None:
+                    completed_request_ids.add(request_id)
+            new_completed_request_ids = (
+                completed_request_ids -
+                self._benchmark_completed_gen_transfer_ids)
+            if new_completed_request_ids:
+                self._benchmark_completed_gen_transfer_ids.update(
+                    new_completed_request_ids)
+                self._disagg_gen_transfer_made_progress = True
         if gen_status.cancelled_requests:
             user_canceled_set = set(self.canceled_req_ids)
             for req in gen_status.cancelled_requests:
