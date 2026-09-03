@@ -503,7 +503,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
     }
 }
 
-def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag="") {
+def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName, postTag="") {
     // Run the isolated tests one by one to avoid any potential conflicts
     def isolateTestList = preprocessedLists.isolate
     def isolateTestLines = readFile(file: isolateTestList).readLines()
@@ -544,15 +544,30 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag=
                 }
                 // Mark that at least one isolated test failed, but continue processing other tests
                 rerunFailed = true
-            } else if (fileExists("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
-                // Same duration/no-signature gap as the regular-test path: this
-                // finished but failed, and was never actually rerun, so
-                // results_isolated_${i}.xml still carries the original
-                // <failure> with nothing here to flag it.
-                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                    error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun (duration > 10 min, no matching failure signature)"
+            } else {
+                // unfinished_test.txt is shared across the whole stage, so match
+                // by this test's own name instead of just checking file presence.
+                def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
+                def isTestUnfinished = fileExists(unfinishedTestFile) &&
+                    sh(script: "grep -qF -- '${isolateTestName}' ${unfinishedTestFile}", returnStatus: true) == 0
+                if (isTestUnfinished) {
+                    // Record this crash as a JUnit <testcase> like the regular-test
+                    // path does. hasUnrerunFailure stays untouched here: it drives
+                    // the duration/no-signature message below, which doesn't apply.
+                    generateTimeoutTestResultXml(pipeline, stageName)
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        error "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
+                    }
+                } else if (fileExists("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
+                    // Same duration/no-signature gap as the regular-test path: this
+                    // finished but failed, and was never actually rerun, so
+                    // results_isolated_${i}.xml still carries the original
+                    // <failure> with nothing here to flag it.
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun (duration > 10 min, no matching failure signature)"
+                    }
+                    hasUnrerunFailure = true
                 }
-                hasUnrerunFailure = true
             }
         } finally {
             // Clean up the temporary test file
@@ -568,7 +583,7 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag=
     }
     if (hasUnrerunFailure) {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            error "One or more isolated tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature)"
+            error "One or more isolated tests failed and were not eligible for rerun, please check the test report."
         }
     }
 
@@ -5333,7 +5348,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         stage ("[${stageName}] Run Pytest (Isolated)") {
                             echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
                             def isolatedResult = runIsolatedTests(
-                                preprocessedLists, pytestCommand, llmSrc, stageName, postTag)
+                                pipeline, preprocessedLists, pytestCommand, llmSrc, stageName, postTag)
                             rerunFailed = isolatedResult.rerunFailed || rerunFailed
                             hasUnrerunFailure = isolatedResult.hasUnrerunFailure || hasUnrerunFailure
                         }
