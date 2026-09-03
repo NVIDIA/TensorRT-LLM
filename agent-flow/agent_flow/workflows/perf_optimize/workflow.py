@@ -40,6 +40,14 @@ from .progress import (
 )
 from .prompts import DEFAULT_PROMPTS, PromptBundle
 from .roadmap_schema import RoadmapError
+from .sol_track import (
+    adopt_sweep,
+    ctx_json_path,
+    has_sol_track,
+    sweep_path,
+    track_name,
+    tuning_seed_yaml,
+)
 from .state import (
     ROUND_STAGES,
     STAGE_ANALYZER,
@@ -602,6 +610,7 @@ class PerfOptimizeWorkflow:
                 state.reporter_done = True
                 state.done = True
                 self._checkpoint(state)
+                self._release_repo(state)
                 print_message(
                     f"[bold green]✔ optimization report written to {self.report_path}[/bold green]",
                     log,
@@ -674,12 +683,18 @@ class PerfOptimizeWorkflow:
             task,
             max_rounds_override=self.max_rounds_override,
         )
+        # Before the spec is materialized, so the task.yaml every agent
+        # reads already names the copy this campaign will edit rather than
+        # the file the user wrote.
+        if has_sol_track(task_data):
+            adopt_sweep(task_data, self.workspace)
         self.task_path.write_text(dump_task_yaml(task_data), encoding="utf-8")
 
         # Materialize the live tuning config (the single
         # --extra_llm_api_options every serve in this workflow uses) and
         # its last-accepted snapshot. In a disagg campaign the same file
-        # holds the harness config's ctx / gen worker_config instead, so
+        # holds the harness config's ctx / gen worker_config instead, and
+        # in a SOL-track campaign it holds that track's single role — so
         # the optimizer still edits exactly one file and the diff /
         # revert / accepted-snapshot machinery applies unchanged.
         self.tuning_dir.mkdir(parents=True, exist_ok=True)
@@ -689,6 +704,13 @@ class PerfOptimizeWorkflow:
             self.tuning_config_path.write_text(
                 worker_config_yaml(load_disagg_config(disagg_config)), encoding="utf-8"
             )
+        elif has_sol_track(task_data):
+            # A SOL track's tuning file is an *overlay*, not a whole role
+            # config: `bench-disagg` deep-merges it onto the worker config
+            # its sweep row generated. So it starts as whatever override
+            # the sweep already carried — usually nothing — and the
+            # topology the row owns stays out of the optimizer's reach.
+            self.tuning_config_path.write_text(tuning_seed_yaml(task_data), encoding="utf-8")
         elif extra:
             shutil.copyfile(extra, self.tuning_config_path)
         else:
@@ -800,6 +822,7 @@ class PerfOptimizeWorkflow:
                 f"needs git to commit accepted optimizations and revert rejected "
                 f"ones — clone the checkout with git and retry."
             )
+        self._require_unclaimed_repo(repo)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         state.git_branch = f"perf-optimize/{self.workspace.name}-{timestamp}"
         state.git_base_commit = gitops.rev_parse_head(repo)
@@ -1230,31 +1253,134 @@ class PerfOptimizeWorkflow:
         """True iff ``path`` exists and holds non-whitespace content."""
         return path.is_file() and bool(path.read_text(encoding="utf-8").strip())
 
-    def _disagg_directive(self) -> str:
-        """The disagg override every stage prompt opens with, or ``""``.
+    def _campaign_directive(self) -> str:
+        """The campaign-mode override every stage prompt opens with, or ``""``.
 
         The role prompts are composed of two layers: a system prompt built
         from shared fragments, and the per-stage instruction this
-        orchestrator writes. ``DISAGG_CAMPAIGN`` supersedes the
-        single-server guidance in the *first* layer — but the second layer
-        also names ``trtllm-serve``, ``--extra_llm_api_options`` and a
-        readiness poll, and it arrives last and reads as the more specific
-        of the two. Without this the agent is handed a contradiction and
-        the disagg section can lose on specificity.
+        orchestrator writes. ``DISAGG_CAMPAIGN`` and the SOL-track
+        sections supersede the single-server guidance in the *first*
+        layer — but the second layer also names ``trtllm-serve``,
+        ``--extra_llm_api_options`` and a readiness poll, and it arrives
+        last and reads as the more specific of the two. Without this the
+        agent is handed a contradiction and the overriding section can
+        lose on specificity.
 
         So the stage prompt states the mode up front and points at the
         section that governs it, rather than every stage's instruction
-        growing a disagg variant of its own.
+        growing a variant per campaign mode.
         """
-        if not has_disagg(self._task_data()):
-            return ""
-        config = disagg_config_path(self._task_data())
-        return (
-            f"⚠️ **This campaign is DISAGGREGATED** (harness config: `{config}`). "
-            f"Nothing below that mentions `trtllm-serve`, `--extra_llm_api_options` "
-            f"or polling a server applies — your system prompt's "
-            f"*Disaggregated serving* section replaces all of it.\n\n"
+        task_data = self._task_data()
+        if has_disagg(task_data):
+            config = disagg_config_path(task_data)
+            return (
+                f"⚠️ **This campaign is DISAGGREGATED** (harness config: `{config}`). "
+                f"Nothing below that mentions `trtllm-serve`, `--extra_llm_api_options` "
+                f"or polling a server applies — your system prompt's "
+                f"*Disaggregated serving* section replaces all of it.\n\n"
+            )
+        if has_sol_track(task_data):
+            track = str(track_name(task_data))
+            config = sweep_path(task_data)
+            directive = (
+                f"⚠️ **This campaign is a {track.upper()} TRACK** — one half of a "
+                f"disaggregated deployment, measured in isolation (sweep: "
+                f"`{config}`). Nothing below that mentions `trtllm-serve`, "
+                f"`--extra_llm_api_options` or polling a server applies — your system "
+                f"prompt's *{track.upper()} track* section replaces all of it.\n\n"
+            )
+            anchor = ctx_json_path(task_data)
+            if anchor is not None:
+                # Not discoverable: the campaign measures no ctx stage, so
+                # `frontier build` would refuse without being told where the
+                # rate-match's other half comes from.
+                directive += (
+                    f"This campaign has no ctx stage, so every `frontier build` must "
+                    f"carry `--ctx-json {anchor}`.\n\n"
+                )
+            return directive
+        return ""
+
+    #: A campaign's branch is named for the workspace that owns it, which
+    #: makes the branch a claim on the checkout without any new bookkeeping
+    #: -- and bookkeeping is what this cannot have, since `gitops` may be
+    #: running every command over ssh.
+    BRANCH_PREFIX = "perf-optimize/"
+
+    def _require_unclaimed_repo(self, repo: str) -> None:
+        """Refuse a checkout another campaign is already optimizing on.
+
+        The flow resets the checkout hard and branches from it. Two
+        campaigns pointed at one checkout therefore stomp each other: the
+        second resets the first's worktree mid-attempt, and the first's
+        evaluator -- which reads `git status` / `git diff` / `git log` to
+        review what the optimizer changed -- reviews the wrong tree. With
+        `approach: code` it is worse than a bad review, because the wheel
+        built from that tree is what gets measured.
+
+        This matters most for a disaggregated deployment optimized in
+        halves: the ctx and gen campaigns are independent by design and are
+        *meant* to run at the same time, so a shared checkout is exactly
+        the arrangement someone will reach for. It measures fine and reads
+        wrong, which is this codebase's least favourite shape of bug.
+
+        The branch is the claim. It already carries the owning workspace's
+        name, so no lock file is needed -- which is the point, because
+        `gitops` may be talking to a remote host where this process cannot
+        write files.
+        """
+        try:
+            branch = gitops.current_branch(repo)
+        except gitops.GitOpsError:
+            return
+        mine = f"{self.BRANCH_PREFIX}{self.workspace.name}-"
+        if not branch.startswith(self.BRANCH_PREFIX) or branch.startswith(mine):
+            return
+        owner = branch[len(self.BRANCH_PREFIX) :].rsplit("-", 2)[0]
+        raise RuntimeError(
+            f"{repo} is claimed by another campaign: it is on branch {branch!r}, "
+            f"which belongs to workspace {owner!r}, not {self.workspace.name!r}. "
+            f"Give each campaign its own checkout -- they are cheap, and a "
+            f"disaggregated deployment optimized in halves is meant to run two at "
+            f"once:\n"
+            f"    git -C {repo} worktree add ../{self.workspace.name}-trtllm <commit>\n"
+            f"then point this campaign's `trtllm_repo_path` at that path. If "
+            f"{owner!r} has finished and you mean to reuse this one, release it "
+            f"with `git -C {repo} checkout <base-branch>` and re-run."
         )
+
+    def _release_repo(self, state: Any) -> None:
+        """Hand the checkout back when the campaign is over.
+
+        The branch is this campaign's claim on the checkout, which is what
+        lets `_require_unclaimed_repo` refuse a second campaign without a
+        lock file. But a claim nothing releases is indistinguishable from a
+        live one, so a *finished* campaign would block the next -- which it
+        did, on the very first run after the guard landed.
+
+        Only when the campaign committed nothing, though. A campaign that
+        accepted something leaves its work on that branch and is expected
+        to still be sitting on it -- that is where a reader goes to see
+        what was accepted, and detaching would hide it. A campaign with
+        zero accepts has nothing to show and no reason to keep the
+        checkout, which is the case that was blocking.
+
+        A campaign that crashed also keeps its claim, and that is right:
+        its checkout is in an unknown state and should not be silently
+        reused.
+        """
+        repo = self._trtllm_repo_path()
+        if not repo or not state.git_base_commit:
+            return
+        try:
+            if gitops.rev_parse_head(repo) != state.git_base_commit:
+                return  # it committed something; leave it on display
+            gitops.checkout(repo, state.git_base_commit)
+        except gitops.GitOpsError:
+            # Uncommitted work, a missing commit, anything: the campaign is
+            # done and its results are written. Failing here would turn a
+            # finished run into a failed one over bookkeeping.
+            pass
 
     def _require_baseline_measurement(self) -> None:
         """Fail loudly when the baseline stage produced no measurement.
@@ -1747,7 +1873,7 @@ class PerfOptimizeWorkflow:
                 "the roadmap's `baseline.value`. "
             )
         self.benchmarker(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n\n"
+            self._campaign_directive() + f"Workspace: {self.workspace}\n\n"
             f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
             f"`trtllm_repo_path`, and the `benchmark` / `optimize` blocks.\n\n"
             f"Then **load the `perf-optimization-casebook` skill** (via the "
@@ -1869,7 +1995,7 @@ class PerfOptimizeWorkflow:
                 f"`{analysis_dir}` — do not re-derive it.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._campaign_directive() + f"Workspace: {self.workspace}\n"
             f"Round: 1 (**reused analysis** — no profiling this round)\n"
             f"Analysis directory (already populated): {analysis_dir}\n\n"
             f"This campaign was launched with "
@@ -2037,7 +2163,7 @@ class PerfOptimizeWorkflow:
                 f"cannot be closed in this campaign.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._campaign_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no}\n"
             f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
             f"Read `{self.task_path}` and `{self.baseline_results_path}` to "
@@ -2130,7 +2256,7 @@ class PerfOptimizeWorkflow:
                 f"campaign.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._campaign_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} (**replan only** — no profiling this round)\n"
             f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
             f"Round {state.round_index} accepted **nothing**. "
@@ -2249,7 +2375,7 @@ class PerfOptimizeWorkflow:
                 f"your summary, not a claim to re-assert.\n\n"
             )
         self.optimizer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._campaign_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
@@ -2416,7 +2542,7 @@ class PerfOptimizeWorkflow:
         else:
             attempt_note = ""
         self.evaluator(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._campaign_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
@@ -2520,7 +2646,7 @@ class PerfOptimizeWorkflow:
                 "`cumulative_improvement_pct` — from your own measurement"
             )
         self.qa(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._campaign_directive() + f"Workspace: {self.workspace}\n"
             f"Campaign: the optimization loop is over ({state.round_index} "
             f"round(s) ran); the system under test is the final accepted "
             f"state.\n"

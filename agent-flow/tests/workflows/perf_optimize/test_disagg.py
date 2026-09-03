@@ -279,7 +279,7 @@ def test_stage_prompts_state_the_mode_so_the_system_prompt_section_wins(tmp_path
     wf = PerfOptimizeWorkflow.__new__(PerfOptimizeWorkflow)
     wf._task_data = lambda: task_schema.load_and_validate_task_yaml(task)
 
-    directive = wf._disagg_directive()
+    directive = wf._campaign_directive()
     assert "DISAGGREGATED" in directive
     assert "replaces all of it" in directive
     assert str(harness) in directive
