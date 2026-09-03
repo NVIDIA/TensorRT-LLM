@@ -126,9 +126,39 @@ kv_connector_config:
     local_buffer_size: 1GiB
 ```
 
-Replacing `master_server_address` with `launch_master: true` makes the server start a `mooncake_master` itself and use it, so a single-instance deployment needs nothing prepared outside `trtllm-serve`. **That master lives and dies with the server**, which makes it wrong for anything else: several engines that should share one pool would each get their own, and a pool meant to survive a restart cannot be owned by the thing restarting. Those deployments run a master with its own lifetime and name it in `master_server_address`.
+Replacing `master_server_address` with `launch_master: true` makes the server start a `mooncake_master` itself and use it, so a single-instance deployment needs nothing prepared outside `trtllm-serve`. **That master lives and dies with the server**, which makes it wrong for anything else: several engines that should share one pool would each get their own, and a pool meant to survive a restart cannot be owned by the thing restarting.
 
-`TRTLLM_MOONCAKE_MASTER_BINARY` overrides the binary a launched master runs, and `TRTLLM_MOONCAKE_MASTER_TIMEOUT` (default 60s) how long startup waits for any master to accept connections -- reaching a master that is not there otherwise fails inside every rank after the model has loaded. Set `TRTLLM_MOONCAKE_RUN_DIR` to keep the generated client config and the master's log, which are otherwise in a temporary directory removed at shutdown.
+Those deployments run the master as its own command instead:
+
+```bash
+trtllm-serve mooncake_master --rpc_port 50051 --address_file /shared/master.addr
+```
+
+The pool then lasts as long as that command, independently of any engine. `--address_file` receives `host:port` once the master accepts connections, and `master_server_address` accepts `file://<path>` as well as a literal address:
+
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    master_server_address: file:///shared/master.addr
+```
+
+This is what makes a master reachable without anyone writing its address down. Under a scheduler its host is not known when the configs are written; publishing it to a file the configs already name closes that gap, and a server reading the file waits for it, so the master and the engines can be started in any order. The file is removed when the master stops, so a stale address is never dialed.
+
+`TRTLLM_MOONCAKE_MASTER_BINARY` overrides the binary a launched master runs, and `TRTLLM_MOONCAKE_MASTER_TIMEOUT` (default 60s) how long startup waits for any master to accept connections or publish its address -- reaching a master that is not there otherwise fails inside every rank after the model has loaded. Set `TRTLLM_MOONCAKE_RUN_DIR` to keep the generated client config and the master's log, which are otherwise in a temporary directory removed at shutdown.
+
+#### Pool capacity
+
+Capacity comes only from processes that open a store handle, and `global_segment_size` is what each contributes -- so the pool is that value times the number of such processes. In a disaggregated deployment the connector belongs on the context servers only, which makes every byte of the pool prefill-node memory: prefill's DRAM caching prefill's GPUs, largely duplicating what `kv_cache_config.host_cache_size` already does.
+
+To give the pool memory from nodes that run no connector, run a donor on them:
+
+```bash
+trtllm-serve mooncake_donor --master_server_address file:///shared/master.addr \
+    --segment_size 160GiB --protocol rdma --device_name mlx5_0
+```
+
+A donor holds a segment and issues no reads or writes, so a generation node can hold pages that prefill wrote while its engine stays connector-free and keeps its cache transceiver for the prefill-to-decode handoff. Contributing memory is deliberately not a `TRTLLM_MOONCAKE_STORE_ROLE`: the roles describe an engine's traffic, and every one of them reads or writes, so expressing capacity as a role would start that engine using the store. The donated memory is charged to the donor process and competes with anything else on the node, `kv_cache_config.host_cache_size` above all, so size the two together.
 
 Topology can equally come from a JSON file named by `MOONCAKE_CONFIG_PATH`, using the same schema as the vLLM Mooncake store connector so one deployment can point both engines at the same pool:
 

@@ -48,7 +48,7 @@ Three ways to get there, in increasing order of how much you have to arrange:
 | Deployment | Master |
 |---|---|
 | One `trtllm-serve`, own pool | `mooncake_store: {launch_master: true}` — the server starts it |
-| Several engines, or a pool that outlives them | `mooncake_store: {master_server_address: host:50051}` — a master you run |
+| Several engines, or a pool that outlives them | `trtllm-serve mooncake_master --address_file P`, then `mooncake_store: {master_server_address: file://P}` |
 | SLURM benchmark harness | Nothing: `disaggr_torch.slurm` starts the master and writes the JSON per job |
 
 The first two make `trtllm-serve` render the client config and export
@@ -58,7 +58,15 @@ both and says so in the log, which is why the harness path is unaffected.
 
 A launched master dies with the server, so use it only for a single engine:
 two context servers that each launch one get two disjoint pools, and the
-survival-across-restart case is impossible by construction.
+survival-across-restart case is impossible by construction. Those cases want
+row two, where the master is its own command and nothing else's lifetime
+bounds it.
+
+`master_server_address` takes a plain `host:port` or `file://<path>`. The file
+is what a scheduler-placed master needs: its host is not known when the configs
+are written, `--address_file` publishes it once the master answers, and a
+server reading it waits for the master to exist. Nobody has to write an address
+down, and a stale one cannot be dialed because the file is removed on exit.
 
 Set `TRTLLM_MOONCAKE_RUN_DIR` to keep the generated JSON and the master's log,
 which otherwise sit in a temporary directory that shutdown removes.
@@ -99,10 +107,20 @@ Per-process environment, on the workers that open a handle:
 | `TRTLLM_MOONCAKE_STORE_MODEL_KEY` | Defaults to the checkpoint directory's basename — set it explicitly for anything long-lived. |
 
 Pool capacity comes only from processes that open a store handle, so a
-prefill-only connector gives a prefill-only pool. `mooncake_segment_donor.py`
-contributes host memory from the generation nodes without any traffic;
-`disaggr_torch.slurm` starts one per generation node
-(`MOONCAKE_DONOR_SEGMENT_SIZE`, default `32GiB`).
+prefill-only connector gives a prefill-only pool — which caches prefill's GPUs
+in prefill's own DRAM, largely duplicating the native host offload.
+`trtllm-serve mooncake_donor` contributes host memory from a node without any
+traffic, leaving that engine connector-free:
+
+```bash
+trtllm-serve mooncake_donor --master_server_address file://$WORK_DIR/master.addr \
+    --segment_size 160GiB --protocol rdma --device_name mlx5_0
+```
+
+`disaggr_torch.slurm` starts one per generation node already
+(`MOONCAKE_DONOR_SEGMENT_SIZE`, default `32GiB`, `0` to skip). Donated memory
+is charged to the donor process, so it competes with that node's own
+`kv_cache_config.host_cache_size` — size the two together.
 
 ## 3. Partial reuse must be off — now enforced
 

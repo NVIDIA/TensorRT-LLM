@@ -297,13 +297,21 @@ tier that largely duplicates TensorRT-LLM's native host offload. Confirm this on
 any run by grouping the master's `allocation_succeeded ... segment=<ip>:<port>`
 lines by host: a single host means a prefill-only pool.
 
-`mooncake_segment_donor.py` closes that gap. One donor per generation node opens
-a handle, contributes memory, and then idles forever without a single put or get,
-so the pool spans both sides while the generation engine stays connector-free
-and keeps its cache transceiver for the KV handoff. A donor is deliberately not
-a `StoreRole`: the roles describe traffic (`producer` writes, `consumer` reads,
-`both`), and none of them means "contribute memory only", so capacity and
-traffic have to be separate processes.
+`trtllm-serve mooncake_donor` closes that gap. One donor per generation node
+opens a handle, contributes memory, and then idles forever without a single put
+or get, so the pool spans both sides while the generation engine stays
+connector-free and keeps its cache transceiver for the KV handoff. Donation is
+deliberately not a `StoreRole`: the roles describe traffic (`producer` writes,
+`consumer` reads, `both`), and none of them means "contribute memory only", so
+capacity and traffic have to be separate processes.
+
+Being a subcommand rather than a script, it is also how a deployment outside
+this harness lends memory:
+
+```bash
+trtllm-serve mooncake_donor --master_server_address 10.0.0.1:50051 \
+    --segment_size 160GiB --protocol rdma --device_name mlx5_0
+```
 
 `disaggr_torch.slurm` starts the donors automatically, reading the generation
 nodes off the generated worker commands and waiting for each segment to mount
@@ -339,8 +347,10 @@ allocation, waits for its port to accept connections, and writes
 `MOONCAKE_CONFIG_PATH` from the log directory, which is why the harness config
 does not set it. Defaults are the bring-up ones (TCP, 16GiB per worker);
 `MOONCAKE_PROTOCOL`, `MOONCAKE_DEVICE_NAME`, `MOONCAKE_GLOBAL_SEGMENT_SIZE` and
-`MOONCAKE_LOCAL_BUFFER_SIZE` in the submitting environment override them, and
-the master's own log lands in `<log_dir>/2_mooncake_master.log`.
+`MOONCAKE_LOCAL_BUFFER_SIZE` in the submitting environment override them. The
+master itself is `trtllm-serve mooncake_master`, so its own log lands in
+`<log_dir>/mooncake_master.log` and the launching command's output in
+`<log_dir>/2_mooncake_master.log`.
 
 That master dies with the job, so read on if you need a pool that outlives one
 allocation -- which experiment 3 does, by construction. Run it as its own
@@ -358,27 +368,39 @@ config pointing at yours.
 
 srun --container-image=$CONTAINER_IMAGE \
      --container-mounts=$WORK_DIR:$WORK_DIR \
-     bash -lc '
-       hostname -i | awk "{print \$1}" > '"$WORK_DIR"'/master.addr
-       exec mooncake_master \
-         --rpc_port=50051 \
-         --metrics_port=9004 \
-         --eviction_ratio=0.05
-     '
+     trtllm-serve mooncake_master \
+       --rpc_port 50051 \
+       --metrics_port 9004 \
+       --address_file $WORK_DIR/master.addr \
+       --run_dir $WORK_DIR
 ```
 
-Flag names above were read out of the shipped `mooncake_master` binary. Run
-`mooncake_master --help` inside the container to confirm defaults and to see the
-rest (`--rpc_address`, `--rpc_thread_num`, `--default_kv_lease_ttl`,
+The master runs for as long as the command does, and `--address_file` receives
+`host:port` **once it accepts connections** — so waiting for that file is
+waiting for readiness, and its absence after the job starts is a failure rather
+than a slow start. It is removed on exit, so a stale address is never dialed.
+`--run_dir` keeps the master's log at `$WORK_DIR/mooncake_master.log`, which is
+where pool occupancy and eviction are read from.
+
+`TRTLLM_MOONCAKE_MASTER_BINARY` overrides the binary this runs, and
+`TRTLLM_MOONCAKE_MASTER_TIMEOUT` (default 60s) how long it waits for the port.
+Run `mooncake_master --help` inside the container for the flags this does not
+surface (`--rpc_address`, `--rpc_thread_num`, `--default_kv_lease_ttl`,
 `--eviction_high_watermark_ratio`, `--enable_http_metadata_server`,
 `--cluster_id`, `--root_fs_dir`).
 
 Keeping the master in a separate job is what makes experiment 3 (§7) possible:
 the pool outlives the engines, so a second benchmark job finds a warm store.
 
-Then write the client config, substituting the address the master job just
-recorded -- or let `disaggr_torch.slurm` generate it, as above. The schema is
-vLLM's, so one pool can serve both engines:
+Workers can now be pointed at it without anyone writing the address down:
+`master_server_address: file://$WORK_DIR/master.addr` in a config's
+`mooncake_store` block makes each server read it during bringup and wait if the
+master job has not started yet. That is what makes a master whose host the
+scheduler chose usable from a config settled beforehand.
+
+Failing that, write the client config, substituting the address the master job
+just recorded -- or let `disaggr_torch.slurm` generate it, as above. The schema
+is vLLM's, so one pool can serve both engines:
 
 ```bash
 MASTER_IP=$(cat $WORK_DIR/master.addr)
@@ -765,8 +787,9 @@ and being read back from there. `disaggr_torch.slurm` writes this breakdown into
 `9_mooncake_summary.log` at the end of every run, alongside the donor hosts, so
 it needs running by hand only when diagnosing a partial run.
 
-Requires `GLOG_v=1` on the master, which `disaggr_torch.slurm` sets; raise it
-with `MOONCAKE_MASTER_GLOG_V`.
+Requires `GLOG_v=1` on the master, which `trtllm-serve mooncake_master` sets
+unless `GLOG_v` is already in its environment -- so raise it by exporting
+`GLOG_v` to that command.
 
 ### Which reuse number means what
 

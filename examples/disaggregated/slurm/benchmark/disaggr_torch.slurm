@@ -138,36 +138,42 @@ else
     echo "TensorRT-LLM environment variables saved to ${full_logdir}/env_vars.json"
 fi
 
-# Install the Mooncake Python store bindings, but only when a worker config asks
-# for the mooncake-store KV connector. The bindings shipped in the container
-# images are unusable (see mooncake_disagg/README.md section 2), and the fix has
-# to be reapplied per job: --container-name gives each node a container that
-# lives for the job, so anything installed here survives to the worker sruns but
-# not into the next job.
+# The Mooncake store bindings, when a worker config asks for the connector.
+# Images built from this repo bake them in (docker/common/install_mooncake.sh),
+# so the install below is only a fallback for images that predate it. Either
+# way it is per job: --container-name gives each node a container that lives
+# for the job, so anything installed here survives to the worker sruns but not
+# into the next job.
 mooncake_enabled=false
 if grep -qs "mooncake-store" "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"; then
     mooncake_enabled=true
-    mooncake_install_script=""
-    mooncake_donor_script=""
-    if [ -n "${trtllm_repo:-}" ]; then
-        mooncake_install_script="${trtllm_repo}/mooncake_disagg/install_mooncake_runtime.sh"
-        mooncake_donor_script="${trtllm_repo}/mooncake_disagg/mooncake_segment_donor.py"
-    fi
-    if [ -z "${mooncake_install_script}" ] || [ ! -f "${mooncake_install_script}" ]; then
-        cleanup_on_failure "A worker config requests the mooncake-store connector, but mooncake_disagg/install_mooncake_runtime.sh was not found under trtllm_repo='${trtllm_repo:-}'. Set environment.trtllm_repo to a checkout that contains it, or bake the bindings into the container image."
-    fi
-    if [ "${MOONCAKE_DONOR_SEGMENT_SIZE:-32GiB}" != "0" ] && [ ! -f "${mooncake_donor_script}" ]; then
-        cleanup_on_failure "mooncake_disagg/mooncake_segment_donor.py was not found under trtllm_repo='${trtllm_repo:-}'. It contributes the generation nodes' host memory to the pool; without it the pool is prefill-node memory only. Set MOONCAKE_DONOR_SEGMENT_SIZE=0 to accept that and skip the donors."
-    fi
-    echo "Installing Mooncake store bindings on all nodes..."
-    if ! srun --container-name=${container_name} \
+    # Both halves of the wheel are load-bearing and fail at different times:
+    # the connector needs mooncake.store in every context rank, and
+    # 'trtllm-serve mooncake_master' needs the binary on PATH.
+    if srun --container-name=${container_name} \
         --container-mounts=${container_mount} --no-container-mount-home \
-        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "MOONCAKE_WHEEL='${MOONCAKE_WHEEL:-}' bash ${mooncake_install_script}" \
+        --mpi=pmix --overlap -N 1 -n 1 \
+        bash -c 'python3 -c "import mooncake.store" && command -v mooncake_master' \
         &> ${full_logdir}/2_install_mooncake.log; then
-        cleanup_on_failure "Mooncake store bindings installation failed. Check ${full_logdir}/2_install_mooncake.log for details"
+        echo "Mooncake store bindings already in the image; nothing to install"
+    else
+        mooncake_install_script=""
+        if [ -n "${trtllm_repo:-}" ]; then
+            mooncake_install_script="${trtllm_repo}/mooncake_disagg/install_mooncake_runtime.sh"
+        fi
+        if [ -z "${mooncake_install_script}" ] || [ ! -f "${mooncake_install_script}" ]; then
+            cleanup_on_failure "A worker config requests the mooncake-store connector, this image does not have the bindings, and mooncake_disagg/install_mooncake_runtime.sh was not found under trtllm_repo='${trtllm_repo:-}'. Use an image built from this repo, or set environment.trtllm_repo to a checkout that contains the script."
+        fi
+        echo "Installing Mooncake store bindings on all nodes..."
+        if ! srun --container-name=${container_name} \
+            --container-mounts=${container_mount} --no-container-mount-home \
+            --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+            bash -c "MOONCAKE_WHEEL='${MOONCAKE_WHEEL:-}' bash ${mooncake_install_script}" \
+            &>> ${full_logdir}/2_install_mooncake.log; then
+            cleanup_on_failure "Mooncake store bindings installation failed. Check ${full_logdir}/2_install_mooncake.log for details"
+        fi
+        echo "Mooncake store bindings installation completed successfully"
     fi
-    echo "Mooncake store bindings installation completed successfully"
 fi
 
 # Get node lists and replace the placeholder with the actual node names
@@ -209,52 +215,37 @@ if [ "${mooncake_enabled}" = "true" ]; then
         # --overlap because every GPU on this node is already claimed by a
         # worker; the master is a CPU-only process sharing the node with them.
         #
-        # mooncake_master logs through glog, which writes to files under /tmp
-        # inside the container unless told otherwise -- so without
-        # GLOG_logtostderr the log below would be empty. GLOG_v=1 adds the
-        # per-RPC lines that show workers registering segments and putting and
-        # getting keys, which is the only view of the pool's side of the
-        # conversation short of scraping the metrics port.
+        # The command owns the glog settings the master needs to log at all,
+        # the wait for its port, and the address file, so none of that is
+        # repeated here. --run_dir keeps the master's own log next to the job's
+        # rather than in a temporary directory removed at shutdown.
         srun -l --container-name=${container_name} \
             --container-mounts=${container_mount} --no-container-mount-home \
             --mpi=pmix --overlap --nodelist=${mooncake_master_node} -N 1 -n 1 \
-            bash -c "export GLOG_logtostderr=1 GLOG_v=\"${MOONCAKE_MASTER_GLOG_V:-1}\"; \
-                addr=\$(hostname -I 2>/dev/null | awk '{print \$1}'); \
-                [ -n \"\${addr}\" ] || addr=\$(hostname -f); \
-                echo \"\${addr}\" > ${mooncake_addr_file}; \
-                echo \"mooncake_master starting on \$(hostname) at \${addr}:${mooncake_master_port} (metrics ${mooncake_master_metrics_port})\"; \
-                exec mooncake_master --rpc_port=${mooncake_master_port} --metrics_port=${mooncake_master_metrics_port} --eviction_ratio=0.05" \
+            trtllm-serve mooncake_master \
+                --rpc_port ${mooncake_master_port} \
+                --metrics_port ${mooncake_master_metrics_port} \
+                --address_file ${mooncake_addr_file} \
+                --run_dir ${full_logdir} \
             &> ${full_logdir}/2_mooncake_master.log &
 
-        for _ in $(seq 1 60); do
+        # The address is published only once the master accepts connections,
+        # so this is the readiness wait as well. A worker that opens its store
+        # handle before then fails outright.
+        for _ in $(seq 1 120); do
             if [ -s "${mooncake_addr_file}" ]; then
                 break
             fi
             sleep 1
         done
         if [ ! -s "${mooncake_addr_file}" ]; then
-            cleanup_on_failure "mooncake_master did not report its address within 60s. Check ${full_logdir}/2_mooncake_master.log for details"
+            cleanup_on_failure "mooncake_master did not publish an address to ${mooncake_addr_file} within 120s. Check ${full_logdir}/2_mooncake_master.log for details"
         fi
-        mooncake_master_addr="$(tr -d '[:space:]' < ${mooncake_addr_file}):${mooncake_master_port}"
-
-        # A worker that opens its store handle before the master accepts
-        # connections fails at startup, so wait for the port rather than the
-        # process. /dev/tcp keeps this dependency-free.
-        mooncake_master_ready=false
-        mooncake_wait_start=${SECONDS}
-        for _ in $(seq 1 60); do
-            if (exec 3<>/dev/tcp/${mooncake_master_addr%:*}/${mooncake_master_port}) 2>/dev/null; then
-                mooncake_master_ready=true
-                break
-            fi
-            sleep 1
-        done
-        if [ "${mooncake_master_ready}" != "true" ]; then
-            cleanup_on_failure "mooncake_master at ${mooncake_master_addr} is not accepting connections. Check ${full_logdir}/2_mooncake_master.log for details"
-        fi
-        echo "mooncake_master ready at ${mooncake_master_addr} on node ${mooncake_master_node} after $((SECONDS - mooncake_wait_start))s of waiting"
+        # Published as host:port, so the port is not appended here.
+        mooncake_master_addr="$(tr -d '[:space:]' < ${mooncake_addr_file})"
+        echo "mooncake_master ready at ${mooncake_master_addr} on node ${mooncake_master_node}"
         echo "mooncake_master metrics: http://${mooncake_master_addr%:*}:${mooncake_master_metrics_port}"
-        echo "mooncake_master log: ${full_logdir}/2_mooncake_master.log"
+        echo "mooncake_master log: ${full_logdir}/mooncake_master.log"
     else
         echo "Using externally managed mooncake_master at ${mooncake_master_addr}"
     fi
@@ -292,7 +283,9 @@ EOF
     #
     # A donor is a separate process rather than a connector role because the
     # roles describe traffic, not capacity: producer/consumer/both all read or
-    # write, and none of them means "contribute memory only".
+    # write, and none of them means "contribute memory only". It is a
+    # subcommand of trtllm-serve rather than a script, so a deployment outside
+    # this harness can lend memory the same way.
     #
     # The donated memory is charged to the donor process and competes with the
     # generation worker's own kv_cache_config.host_cache_size on that node, so
@@ -328,10 +321,10 @@ EOF
             srun -l --container-name=${container_name} \
                 --container-mounts=${container_mount} --no-container-mount-home \
                 --mpi=pmix --overlap --nodelist=${donor_node} -N 1 -n 1 \
-                python3 ${mooncake_donor_script} \
+                trtllm-serve mooncake_donor \
                     --config ${full_logdir}/mooncake.json \
-                    --segment-size ${mooncake_donor_size} \
-                    --ready-file ${donor_ready_file} \
+                    --segment_size ${mooncake_donor_size} \
+                    --ready_file ${donor_ready_file} \
                 &> ${full_logdir}/2_mooncake_donor_${donor_node}.log &
         done
 
@@ -389,7 +382,7 @@ if [ "${mooncake_enabled}" = "true" ]; then
     if ! grep -h "mooncake-store" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null; then
         echo "  WARNING: no mooncake-store lines found. The connector may not have" \
              "loaded; check ${full_logdir}/3_output_CTX_*.log and" \
-             "${full_logdir}/2_mooncake_master.log. The benchmark will still run," \
+             "${full_logdir}/mooncake_master.log. The benchmark will still run," \
              "but without the store."
     fi
 fi
@@ -432,7 +425,7 @@ if [ "${mooncake_enabled}" = "true" ]; then
         echo "== block placement by segment host =="
         echo "(donor hosts: $(cat "${full_logdir}"/mooncake_donor_*.ready 2>/dev/null | awk '{print $1}' | paste -sd, - || echo none))"
         grep -o "allocation_succeeded size=[0-9]* segment=[0-9.]*:[0-9]*" \
-            "${full_logdir}/2_mooncake_master.log" 2>/dev/null \
+            "${full_logdir}/mooncake_master.log" 2>/dev/null \
             | awk '{
                     sub(/size=/, "", $2); sub(/segment=/, "", $3);
                     split($3, parts, ":"); host = parts[1]; port = parts[2];
@@ -457,11 +450,13 @@ if [ "${mooncake_enabled}" = "true" ]; then
         for donor_log in "${full_logdir}"/2_mooncake_donor_*.log; do
             [ -f "${donor_log}" ] || continue
             echo "--- $(basename "${donor_log}") ---"
-            grep -h "donating\|mounted\|failed\|exited" "${donor_log}" 2>/dev/null || tail -n 5 "${donor_log}"
+            grep -h "donating\|part of the pool\|withdrew\|failed" "${donor_log}" 2>/dev/null || tail -n 5 "${donor_log}"
         done
         echo
+        # The master's own log, which is glog and separate from the launching
+        # command's output in 2_mooncake_master.log.
         echo "== master =="
-        tail -n 50 "${full_logdir}/2_mooncake_master.log" 2>/dev/null || echo "(no master log)"
+        tail -n 50 "${full_logdir}/mooncake_master.log" 2>/dev/null || echo "(no master log)"
     } > "${mooncake_summary}" 2>&1
     echo "Mooncake store summary written to ${mooncake_summary}"
     cat "${mooncake_summary}"
