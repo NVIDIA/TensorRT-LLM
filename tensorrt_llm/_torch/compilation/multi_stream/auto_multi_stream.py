@@ -208,6 +208,20 @@ class MultiStreamDAG:
                 elif isinstance(arg, torch.fx.Node) and arg.op != "placeholder":
                     in_edges[arg] = self.nodes[arg]
 
+            if node.op == "output":
+                # An in-place op may mutate a graph input without returning a
+                # value (Eagle3 captures hidden states into a preallocated
+                # buffer with inplace_slice_copy), so the FX output does not
+                # reach that side effect. Make graph exit depend on the last
+                # mutation of every touched tensor: the scheduled graph then
+                # emits the mutation before `output` (a node emitted after
+                # `output` is dead code once the module is recompiled), and
+                # with live auxiliary streams the exit waits on the mutating
+                # stream before a graph-external consumer reads the buffer.
+                for mutated_arg, mutator in latest_inplace_stat.items():
+                    if isinstance(mutated_arg, torch.fx.Node):
+                        in_edges[mutated_arg] = mutator
+
             # For node without in edge, connect it to the entry
             if len(in_edges) == 0:
                 in_edges[None] = self.entry_node
