@@ -72,8 +72,10 @@ Configuration for MoE load balancing, users can directly set `num_slots` and `la
 EPLB is only set up when all of the following hold. Otherwise the `load_balancer` section is silently ignored:
 
 * The model architecture is listed in `moe_model_arch_list` in [`moe_load_balancer.py`](../../tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py) — DeepSeek-V3/V3.2/V4, GLM MoE DSA, GPT-OSS, Kimi K2.5, Mixtral, Llama 4, Nemotron-H, Qwen2/Qwen3/Qwen3.5 MoE, and the Qwen3-VL / Qwen3.5 MoE conditional-generation wrappers.
-* Expert parallelism is enabled (`moe_expert_parallel_size` greater than 1) together with attention DP (`enable_attention_dp: true`).
+* Expert parallelism is enabled (`moe_expert_parallel_size` greater than 1).
 * The MoE smart router is not in use (`moe_cluster_size` equal to 1).
+
+Attention DP (`enable_attention_dp: true`) is not part of this gate, so EPLB is also set up without it. It is nonetheless the configuration wide-EP deployments normally use, and it is enabled throughout the [EP Load Balancer examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer).
 
 #### `num_slots`
 

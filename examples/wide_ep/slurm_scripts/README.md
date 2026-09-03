@@ -123,4 +123,4 @@ Process generation iteration logs to extract performance metrics:
 python3 process_gen_iterlog.py --dir_prefix <benchmark_run_dir_prefix>
 ```
 
-`--dir_prefix` is a path prefix for the benchmark run directories, not a single log file: the script globs `<dir_prefix>*/concurrency_*/gen_only.txt`. Run it from `work_dir` or pass an absolute prefix. Only runs submitted with `benchmark.mode: gen_only` produce these logs.
+`--dir_prefix` is a path prefix for the benchmark run directories, not a single log file: the script globs `<dir_prefix>*/concurrency_*/gen_only.txt`. Pass an absolute prefix, or one relative to the directory you run the script from. Only runs submitted with `benchmark.mode: gen_only` produce these logs.
