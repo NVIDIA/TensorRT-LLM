@@ -24,7 +24,7 @@ import torch
 pytest.importorskip("fla")
 
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (
     get_production_decode_kernel_path,
@@ -136,7 +136,7 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
             return layer_cache
 
     manager = KdaCacheManager()
-    mamba_metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
+    mamba_metadata = KimiK3MambaMetadata(max_batch_size=2, chunk_size=8, max_num_tokens=4)
     metadata = SimpleNamespace(
         num_contexts=1,
         num_ctx_tokens=1,
