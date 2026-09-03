@@ -62,15 +62,9 @@ from ..modules.linear import (
 )
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
+from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
-from ..utils import (
-    ActivationType,
-    AuxStreamType,
-    EventType,
-    get_model_extra_attrs,
-    is_torch_compiling,
-)
+from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .modeling_utils import (
@@ -303,33 +297,6 @@ def _build_swiglu_oai_dense_mlp(
     )
 
 
-def _resolve_minimax_m3_expert_size_per_partition(
-    num_experts: int,
-    mapping: Mapping,
-    moe_load_balancer_config,
-) -> int:
-    """Compute the local expert/slot count the MoE module will resolve.
-
-    Sizes the per-expert SwiGLU parameter tensors we hand to
-    ``create_moe`` to match what the backend sees. Some backends assert
-    ``swiglu_alpha.shape == (expert_size_per_partition,)`` at construct
-    time; a mismatch surfaces as an opaque CUDA-side shape failure.
-
-    Priority:
-      1. EPLB config → ``num_slots // moe_ep_size``.
-      2. Plain EP    → ``num_experts // moe_ep_size`` (with ``max(1, ...)``
-                        for tiny test configs).
-    """
-    ep_size = mapping.moe_ep_size
-    if moe_load_balancer_config is not None and moe_load_balancer_config.num_slots:
-        # Mirror ``MoeLoadBalancerConfig.num_local_slots`` without
-        # requiring ``.setup(ep_rank, ep_size)`` to have been called
-        # (the ``num_local_slots`` property raises otherwise).
-        return moe_load_balancer_config.num_slots // ep_size
-
-    return max(1, num_experts // ep_size)
-
-
 class MiniMaxM3Gate(nn.Module):
     """MiniMax-M3 router gate: float32 sigmoid scoring + per-expert bias correction.
 
@@ -460,31 +427,14 @@ class MiniMaxM3MoE(nn.Module):
         self.swiglu_beta_value = 1.0  # SGLang's ``(up + 1)`` offset in swiglu_no_interleaved.
         self.swiglu_limit_value = float(getattr(config, "swiglu_limit", 7.0))
 
-        # Size the per-expert SwiGLU parameter tensors from the same
-        # ``expert_size_per_partition`` the MoE module will resolve, not
-        # from a hand-rolled ``num_slots // ep_size`` guess. EPLB and
-        # DWDP can shift the local slot count (see
-        # :func:`_resolve_minimax_m3_expert_size_per_partition` for the
-        # priority order), and some backends assert
-        # ``swiglu_alpha.shape == (expert_size_per_partition,)``.
-        moe_load_balancer_config = model_config.moe_load_balancer
-        self.expert_size_per_partition = _resolve_minimax_m3_expert_size_per_partition(
-            num_experts=self.num_experts,
-            mapping=model_config.mapping,
-            moe_load_balancer_config=moe_load_balancer_config,
+        # One value per layer, not per expert: the MoE backend broadcasts these
+        # to whatever per-expert shape its kernels index (or bakes them as
+        # scalars), sized by the slot count it actually resolved.
+        self.moe_activation = SwigluBiasActivation(
+            gate_sigmoid_scale=self.swiglu_alpha_value,
+            linear_offset=self.swiglu_beta_value,
+            clamp=self.swiglu_limit_value,
         )
-        self.swiglu_alpha = torch.tensor(
-            [self.swiglu_alpha_value] * self.expert_size_per_partition,
-            dtype=torch.float32,
-        ).cuda()
-        self.swiglu_beta = torch.tensor(
-            [self.swiglu_beta_value] * self.expert_size_per_partition,
-            dtype=torch.float32,
-        ).cuda()
-        self.swiglu_limit = torch.tensor(
-            [self.swiglu_limit_value] * self.expert_size_per_partition,
-            dtype=torch.float32,
-        ).cuda()
 
         # Router gate owns the float32 projection weight, the per-expert
         # ``e_score_correction_bias``, and the ``routing_method`` it
@@ -511,24 +461,8 @@ class MiniMaxM3MoE(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             override_quant_config=experts_quant_config,
-            swiglu_alpha=self.swiglu_alpha,
-            swiglu_beta=self.swiglu_beta,
-            swiglu_limit=self.swiglu_limit,
-            activation_type=ActivationType.SwigluBias,
+            activation=self.moe_activation,
         )
-        # Defensive: if a future MoE-resolution path (new load-balancer
-        # mode, new DWDP variant) shifts the local expert count in a
-        # way our resolver doesn't yet model, fail here with a
-        # diagnostic message instead of inside a CUDA-side shape
-        # assertion deep in a backend kernel dispatch.
-        resolved = getattr(self.experts, "expert_size_per_partition", None)
-        assert resolved is None or resolved == self.expert_size_per_partition, (
-            f"MiniMax-M3 SwiGLU sizing mismatch: pre-create_moe estimate "
-            f"{self.expert_size_per_partition} != MoE-resolved {resolved}. "
-            f"Update _resolve_minimax_m3_expert_size_per_partition to "
-            f"match the MoE module's resolved layout."
-        )
-
         # Shared expert: dense MLP fused into MoE output. Constructed
         # with ``is_shared_expert=True`` so ``reduce_output=False``
         # (the external AllReduce below performs the combined

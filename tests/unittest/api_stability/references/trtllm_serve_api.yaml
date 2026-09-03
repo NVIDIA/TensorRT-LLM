@@ -1471,11 +1471,29 @@ models:
         default: null
         status: stable
         required: false
+      image_reference:
+        kind: extension
+        type: Optional[Union[UploadFile, MediaReferenceItem, List[MediaReferenceItem]]]
+        default: null
+        status: prototype
+        required: false
+      video_reference:
+        kind: extension
+        type: Optional[Union[UploadFile, MediaReferenceItem, List[MediaReferenceItem]]]
+        default: null
+        status: prototype
+        required: false
+      audio_reference:
+        kind: extension
+        type: Optional[Union[UploadFile, MediaReferenceItem, List[MediaReferenceItem]]]
+        default: null
+        status: prototype
+        required: false
       input_reference:
         kind: extension
         type: Optional[Union[str, UploadFile]]
         default: null
-        status: prototype
+        status: deprecated
         required: false
       size:
         kind: extension
@@ -1548,4 +1566,24 @@ models:
         type: Optional[str]
         default: null
         status: stable
+        required: false
+  MediaReferenceItem:
+    fields:
+      content:
+        kind: extension
+        type: str
+        default: null
+        status: prototype
+        required: true
+      format:
+        kind: extension
+        type: Literal['path', 'url', 'base64']
+        default: null
+        status: prototype
+        required: true
+      role:
+        kind: extension
+        type: Optional[MediaRole]
+        default: null
+        status: prototype
         required: false
