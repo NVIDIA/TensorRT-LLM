@@ -17,9 +17,4 @@ l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8:
   # deepseek-v4-pro-fp4 8k1k con4301 (max throughput)
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL] TIMEOUT (120)
-  # Same workload as the e2e case above, run once, with per-request lifecycle
-  # spans additionally uploaded as d_tb_<span>_<stat>. It sets
-  # num_postprocess_workers: 0 to keep the breakdown intact, so its aggregate
-  # throughput is deliberately NOT comparable to the e2e case -- it lands on its
-  # own s_test_case_name series and its own baselines.
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-time_breakdown-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL] TIMEOUT (120)
