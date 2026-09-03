@@ -223,6 +223,53 @@ def test_row_kv_lens_length_is_validated():
         )
 
 
+@pytest.mark.parametrize(
+    ("compress_ratio", "invalid_extent"),
+    [
+        (1, -1),
+        (1, NUM_COLUMNS + 1),
+        (4, (NUM_COLUMNS + 1) * 4),
+    ],
+)
+def test_invalid_row_kv_extent_fails_closed(compress_ratio: int, invalid_extent: int) -> None:
+    """Device-selected extents must never address outside a logits row.
+
+    Two rows of width 8192 select four blocks per row on supported GPUs, so
+    this also pins the fail-closed behavior through the split/merge path.
+    """
+    logits = _make_logits(2, NUM_COLUMNS, seed=5)
+    row_kv_lens = torch.tensor([KV_LENS[0], invalid_extent], dtype=torch.int32, device="cuda")
+
+    actual = _run(
+        logits,
+        KV_LENS[:2],
+        next_n=1,
+        row_kv_lens=row_kv_lens,
+        compress_ratio=compress_ratio,
+    )
+
+    assert torch.all(actual[1] == -1)
+
+
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_full_width_row_kv_extent_is_valid(compress_ratio: int) -> None:
+    """The exact logical row width is valid, not an out-of-range extent."""
+    logits = _make_logits(2, NUM_COLUMNS, seed=6)
+    full_width_extent = NUM_COLUMNS * compress_ratio
+    seq_lens = [full_width_extent, full_width_extent]
+
+    uniform = _run(logits, seq_lens, next_n=1, compress_ratio=compress_ratio)
+    ragged = _run(
+        logits,
+        seq_lens,
+        next_n=1,
+        row_kv_lens=torch.tensor(seq_lens, dtype=torch.int32, device="cuda"),
+        compress_ratio=compress_ratio,
+    )
+
+    _assert_same_topk(ragged, uniform)
+
+
 def test_cuda_graph_capture_replays_with_new_lens():
     """The ragged path must be capturable and must honor rewritten lengths.
 

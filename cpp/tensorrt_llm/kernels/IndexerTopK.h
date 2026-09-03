@@ -48,7 +48,10 @@ int computeIndexerTopKDecodeBlocksPerRow(int numRows, int numColumns, int splitW
 ///   requests by `rowIdx / next_n`, so the extent every row may attend to is
 ///   supplied directly instead of being reconstructed from `next_n`. Null keeps
 ///   the uniform arithmetic, bit-identical to before. Mutually exclusive with
-///   `preIdx` (GVR's hint is request-indexed through `next_n` as well).
+///   `preIdx` (GVR's hint is request-indexed through `next_n` as well). A
+///   negative extent or one whose compressed length exceeds `numColumns` fails
+///   closed as an empty row, so device-updated graph inputs cannot read beyond
+///   the corresponding logits row.
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK = 2048, int const* preIdx = nullptr, int const preIdxStride = 0,
