@@ -17,6 +17,7 @@ from unittest.mock import Mock, call
 import pytest
 
 from tensorrt_llm._torch.disaggregation.executor.transfer_manager import AsyncTransferManager
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import CtxTransferStatus
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 
@@ -76,6 +77,8 @@ def _finished_ctx_only_request(request_id: int = 1) -> SimpleNamespace:
         is_context_finished=True,
         is_finished_due_to_length=False,
         is_finished_due_to_cancellation=False,
+        is_child=False,
+        parent_request_id=None,
         py_request_id=request_id,
         py_kv_transfer_start_time=None,
     )
@@ -85,6 +88,7 @@ def test_disagg_send_leg_stores_blocks_before_sending() -> None:
     executor = _stub_executor()
     transceiver = Mock()
     transceiver.kv_transfer_timeout_ms = 1000
+    transceiver.has_retired_send_session.return_value = False
     executor.kv_cache_transceiver = transceiver
     executor.kv_cache_manager = Mock(spec=[])  # no release_index_slot
     executor.async_transfer_manager = Mock()
@@ -103,6 +107,7 @@ def test_disagg_send_leg_skips_timeout_stamp_when_disabled() -> None:
     executor = _stub_executor()
     transceiver = Mock()
     transceiver.kv_transfer_timeout_ms = None
+    transceiver.has_retired_send_session.return_value = False
     executor.kv_cache_transceiver = transceiver
     executor.kv_cache_manager = Mock(spec=[])
     executor.async_transfer_manager = Mock()
@@ -117,6 +122,8 @@ def test_disagg_send_leg_skips_timeout_stamp_when_disabled() -> None:
 def test_disagg_send_leg_skips_cancelled_and_unfinished_requests() -> None:
     executor = _stub_executor()
     transceiver = Mock()
+    transceiver.has_retired_send_session.return_value = False
+    transceiver.pipeline_transfer_enabled = False
     executor.kv_cache_transceiver = transceiver
     executor.kv_cache_manager = Mock(spec=[])
     executor.async_transfer_manager = Mock()
@@ -193,6 +200,7 @@ def _dual_claim_executor() -> PyExecutor:
     executor.async_transfer_manager = AsyncTransferManager(resource_manager)
     transceiver = Mock()
     transceiver.kv_transfer_timeout_ms = None
+    transceiver.has_retired_send_session.return_value = False
     executor.kv_cache_transceiver = transceiver
     executor.kv_connector_manager = Mock()
     executor.disable_overlap_scheduler = True
@@ -223,7 +231,9 @@ def test_reap_keeps_request_still_claimed_by_connector() -> None:
     executor.kv_connector_manager.request_finished.return_value = True
     req = _dual_claim_request(9)
     # The send completes instantly, so the reap sees it in the same call.
-    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([9], [])
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = CtxTransferStatus(
+        [9], []
+    )
 
     PyExecutor._send_kv_async(executor, [req])
 
@@ -240,7 +250,9 @@ def test_reap_releases_request_once_connector_declines() -> None:
     executor = _dual_claim_executor()
     executor.kv_connector_manager.request_finished.return_value = False
     req = _dual_claim_request(9)
-    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([9], [])
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = CtxTransferStatus(
+        [9], []
+    )
 
     PyExecutor._send_kv_async(executor, [req])
 

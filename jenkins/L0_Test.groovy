@@ -1731,6 +1731,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
     def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
     def aggMultiNodeMode = !disaggMultiNodeMode && nodeCount > 1 && stageName.contains("PerfSanity")
+    def singleNvlinkDomainMode = stageName.contains("SingleNvlinkDomain")
     def infraDryRun = isInfraDryRun()
     if (infraDryRun) {
         testList = INFRA_DRY_RUN_TEST_CONTEXT
@@ -1752,6 +1753,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         withCredentials([
             string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
+            string(credentialsId: 'github_read_public_only_token', variable: 'GITHUB_CLONE_TOKEN'),
         ]) {
             CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
@@ -1976,7 +1978,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                 }
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
+                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode || singleNvlinkDomainMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
                 }
@@ -2097,6 +2099,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     srunArgs.add("--container-env=S3_SECRET_KEY")
                 }
+                srunArgs.add("--container-env=GITHUB_CLONE_TOKEN")
                 envVarsToExport.each { varName, varValue ->
                     srunArgs.add("--container-env=${varName}")
                 }
@@ -2145,7 +2148,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    # Keep xtrace off around the token exports so they are not echoed into the Slurm job log.
+                    set +x
                     export HF_TOKEN=$HF_TOKEN
+                    export GITHUB_CLONE_TOKEN=$GITHUB_CLONE_TOKEN
+                    set -x
                     if [ -f "${s3SecretKeyPathNode}" ]; then
                         set +x
                         export S3_SECRET_KEY="\$(cat "${s3SecretKeyPathNode}")"
@@ -2929,6 +2936,12 @@ def stageMatchesAnyPattern(String key, List patterns) {
     return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
 }
 
+// Return the OpenSearch regexp for sibling shards and their CBTS variants.
+String getTestReuseStagePattern(String stageName) {
+    def stageNamePrefix = stageName.replaceFirst(/-\d+(-cbts)?$/, "")
+    return "${stageNamePrefix}-[0-9]+(-cbts)?"
+}
+
 // Test filter flags
 // Multi-GPU stages matching any entry here run inside the single-GPU job
 // instead of waiting for the separate multi-GPU dispatch (which requires
@@ -2979,7 +2992,8 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-// Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
+// Suffix for CBTS-narrowed stages so they cannot be reused as whole non-CBTS stages.
+// Their individual passed testcases may still be reused through an OpenSearch query.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
 def CBTS_STAGE_SUFFIX = "-cbts"
@@ -4667,12 +4681,14 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
         sh "mkdir -p ${workDir}"
 
         // 1. OpenSearch lookup -- tests that PASSED in a previous pipeline run
-        //    for this commit + stage.
+        //    for this commit + sibling stage shards. CBTS and non-CBTS results
+        //    are merged only at testcase granularity.
         def passedTestListFile = "${workDir}/passed_test_list.txt"
+        def stageNamePattern = getTestReuseStagePattern(stageName)
         sh """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
-            --stage-name ${stageName} \
+            --stage-name-pattern '${stageNamePattern}' \
             --output-file ${passedTestListFile}
         """
         if (fileExists(passedTestListFile)) {
@@ -5744,6 +5760,7 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
                 // Minus 10 minutes to avoid the Slurm job being stopped earlier.
                 timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                     docker.image(image).inside(dockerArgs) {
+                        trtllm_utils.setupGithubFetchAuth()
                         runner()
                     }
                 }
@@ -5762,6 +5779,7 @@ def runInEnrootOnNode(label, partitionTimeout)
 {
     return {
         runner -> node(label) {
+            trtllm_utils.setupGithubFetchAuth()
             // We submit the Slurm job with the Slurm partition's time spec.
             // Minus 10 minutes to avoid the Slurm job being stopped earlier.
             timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
@@ -6137,6 +6155,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_H100-4_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_B200-CPP-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 9, 1, 1, true],
         "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 9, 1, 1, true],
         "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 9, 1, 1, true],
@@ -6271,13 +6290,19 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
-        // Each testcase uses 8 GPUs and 2 nodes.
+        // Each GB200 testcase below uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
         "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 2, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 2, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex", "l0_gb200_multi_nodes", 3, 3, 8, 2],
+        // GB300 accuracy post-merge aggregated (4 GPUs per node). One test list per topology,
+        // spelled out here rather than via buildStageConfigs: test_to_stage_mapping.py resolves
+        // stage <-> test by list name with a line-based parser, so a shared list or a helper's
+        // output breaks the mapping. For SingleNvlinkDomain see singleNvlinkDomainMode.
+        "GB300-8_GPUs-2_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node2_gpu8", 1, 1, 8, 2],
+        "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 1, 1, 16, 4],
     ]
     // PerfSanity post-merge aggregated
     // 2 Nodes
@@ -6493,6 +6518,19 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
     // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
     // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
+    // GB300 DeepSeek-V4-Pro-DSpark, AgentX agentic trace replay.
+    // These lanes replay a ~1M-token multi-turn conversation trace for a fixed
+    // wall-clock duration instead of a fixed prompt count, so they are pinned to
+    // aws-cmh where the DSpark checkpoint and the trace corpus are staged.
+    // 6 Nodes: ctx2 (2 nodes, 8 GPUs each) + gen1 (2 nodes, 8 GPUs) = 24 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX2-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
+        "gb300-flex-aws-cmh",
+        "l0_gb300_multi_nodes_perf_sanity_ctx2_node2_gpu8_gen1_node2_gpu8",
+        1,
+        24,
+        6
+    )
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 

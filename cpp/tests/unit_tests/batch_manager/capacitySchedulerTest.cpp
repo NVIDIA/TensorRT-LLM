@@ -35,7 +35,9 @@
 
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <memory>
+#include <numeric>
 #include <vector>
 
 using namespace tensorrt_llm::runtime;
@@ -109,6 +111,28 @@ private:
     SizeType32 mNumPages;
     SizeType32 mMaxDevicePages;
     SizeType32 mMaxHostPages;
+};
+
+/// @brief Peft mock whose page demand varies per request id.
+/// @details PeftCacheManager::determineNumPages resolves the LoRA task id against the host cache and
+/// falls back to the request's own LoraConfig, so two requests carrying the same task id can report
+/// different page counts.
+class PerRequestMockPeftCacheManager : public MockPeftCacheManager
+{
+public:
+    PerRequestMockPeftCacheManager(std::map<uint64_t, SizeType32> pagesByRequestId, SizeType32 maxDevicePages)
+        : MockPeftCacheManager(0, maxDevicePages)
+        , mPagesByRequestId(std::move(pagesByRequestId))
+    {
+    }
+
+    [[nodiscard]] SizeType32 determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const override
+    {
+        return mPagesByRequestId.at(llmRequest->mRequestId);
+    }
+
+private:
+    std::map<uint64_t, SizeType32> mPagesByRequestId;
 };
 
 class CapacitySchedulerTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -1864,6 +1888,113 @@ TEST_F(CapacitySchedulerTest, PrefixAwareSchedulingDisabledDoesNotDelayDuplicate
             EXPECT_EQ(req->getEstimatedReusableTokens(), 0);
         }
     }
+}
+
+// A request must never be deferred on behalf of a contributor that was not scheduled in the same
+// iteration. beneficialToSkip used to register the checked request's own firstNewBlock before any
+// budget check had run, so a contribution could be recorded for a request that never got admitted.
+
+TEST_F(CapacitySchedulerTest, MaxUtilizationPauseRetryDoesNotSelfSkip)
+{
+    // On a failed admission MaxUtilization pauses a started request and retries the *same* request
+    // without advancing reqIt. If the first attempt already registered that request's firstNewBlock,
+    // the retry finds its own key in the set and skips itself -- evicting a running request for
+    // nobody and wasting the capacity the pause just freed.
+    //
+    // Block budget, chosen so that *both* assertions below discriminate:
+    //   pool                        7 blocks
+    //   requestG holds              5 blocks (45-token prompt)  -> 2 free on entry
+    //   requestA / requestB need    3 blocks each (21-token prompt)
+    // A's first attempt fails (3 > 2) and forces the pause; after it, 7 blocks are free, so A fits
+    // (3) and B would fit too (3 + 3 = 6 <= 7). B is therefore absent from `scheduled` only because
+    // it deferred to A's contribution -- not because it ran out of blocks.
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokens = 70; // 7 blocks
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 3;
+    bool enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens,
+        kvCacheMaxNumTokensPerSeq, /*sinkTokenLength=*/0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION, kvCacheManager != nullptr);
+
+    // requestA and requestB are duplicates: same tokens, so the same firstNewBlock.
+    int32_t promptLen = 2 * kvCacheTokensPerBlock + 1;
+    auto sharedTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+    std::iota(sharedTokens->begin(), sharedTokens->end(), 0);
+    auto requestA = createRequest(sharedTokens, /*maxNewTokens=*/5, /*optionalReqId=*/0);
+    auto requestB = createRequest(sharedTokens, /*maxNewTokens=*/5, /*optionalReqId=*/1);
+
+    // requestG is started and holds real blocks. It is the only eviction victim the reverse search
+    // over [reqIt, reqItEnd) can find, so it must sit *after* A and B in the active list.
+    // 45 tokens -> 5 blocks, leaving 2 of the 7 free: not enough for A's 3.
+    int32_t genPromptLen = 45;
+    auto genTokens = std::make_shared<std::vector<int32_t>>(genPromptLen);
+    std::iota(genTokens->begin(), genTokens->end(), 1000); // distinct prefix: not a duplicate of A/B
+    auto requestG = createRequest(genTokens, /*maxNewTokens=*/5, /*optionalReqId=*/2);
+    kvCacheManager->addSequenceBatch(
+        {{{requestG->mRequestId, requestG->mPromptLen, requestG->mSamplingConfig.beamWidth}}}, {std::ref(*requestG)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*requestG);
+    requestG->addNewTokens({7});
+    requestG->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+
+    RequestList activeRequests;
+    activeRequests.push_back(requestA);
+    activeRequests.push_back(requestB);
+    activeRequests.push_back(requestG);
+
+    auto [scheduled, disaggInit, paused] = capacityScheduler(activeRequests, *kvCacheManager, peftCacheManager);
+
+    // requestG is evicted to make room, so requestA must actually be admitted on the retry.
+    // Before the fix: paused == {G}, scheduled == {} -- the pause bought nothing.
+    ASSERT_EQ(paused.size(), 1u);
+    EXPECT_EQ(paused.front()->mRequestId, requestG->mRequestId);
+    ASSERT_EQ(scheduled.size(), 1u);
+    EXPECT_EQ(scheduled.front()->mRequestId, requestA->mRequestId);
+    // requestB correctly defers: it will reuse the blocks requestA is about to contribute. The
+    // post-pause budget leaves room for it (see the block budget above), so its absence here is the
+    // beneficial-to-skip decision and nothing else -- drop the skip check and this becomes {A, B}.
+    EXPECT_TRUE(disaggInit.empty());
+}
+
+TEST_F(CapacitySchedulerTest, GuaranteedNoEvictUnscheduledRequestDoesNotDeferDuplicate)
+{
+    // In GUARANTEED_NO_EVICT a PEFT-page shortage is the one admission failure that neither breaks
+    // the loop nor is caught by the block-shortage branch, so a contribution registered at check
+    // time outlives the request that failed. A later request sharing that block must still be
+    // admitted.
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 3;
+    bool enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens,
+        kvCacheMaxNumTokensPerSeq, /*sinkTokenLength=*/0, enableReuse);
+    // Request 0 demands more PEFT pages than are available; request 1 fits.
+    std::shared_ptr<BasePeftCacheManager> peftCacheManager
+        = std::make_shared<PerRequestMockPeftCacheManager>(std::map<uint64_t, SizeType32>{{0, 20}, {1, 5}},
+            /*maxDevicePages=*/10);
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+
+    // Same tokens *and* same LoRA task id, so both requests map to the same BlockKey.
+    int32_t promptLen = 2 * kvCacheTokensPerBlock + 1;
+    auto sharedTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+    std::iota(sharedTokens->begin(), sharedTokens->end(), 0);
+
+    RequestList activeRequests;
+    activeRequests.push_back(createRequest(sharedTokens, /*maxNewTokens=*/5, /*optionalReqId=*/0, /*loraTaskId=*/7));
+    activeRequests.push_back(createRequest(sharedTokens, /*maxNewTokens=*/5, /*optionalReqId=*/1, /*loraTaskId=*/7));
+
+    auto [scheduled, disaggInit, paused] = capacityScheduler(activeRequests, *kvCacheManager, peftCacheManager);
+
+    ASSERT_EQ(scheduled.size(), 1u);
+    EXPECT_EQ(scheduled.front()->mRequestId, 1u);
+    EXPECT_TRUE(disaggInit.empty());
+    EXPECT_TRUE(paused.empty());
 }
 
 TEST_F(CapacitySchedulerTest, DelayDuplicateRequestChunked)

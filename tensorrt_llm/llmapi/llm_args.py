@@ -308,27 +308,35 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         min_length=1,
         description=
         "List of total token counts (sum of all per-request sequence lengths "
-        "in a batch) to create encoder CUDA graphs for.")
+        "in a batch) to create encoder CUDA graphs for. Required for an "
+        "encoder that packs a variable number of tokens per request; ignored "
+        "by an encoder whose input is a fixed-shape per-request feature "
+        "tensor, which derives this from the model.")
 
     max_num_token: NonNegativeInt = Field(
         default=0,
         description="Maximum total number of tokens for encoder CUDA graphs. If "
         "`num_tokens` is provided, must equal max(num_tokens); otherwise "
-        "`num_tokens` is generated from this value.")
+        "`num_tokens` is generated from this value. Ignored by a fixed-shape "
+        "feature encoder.")
 
     seq_lens: Optional[List[PositiveInt]] = Field(
         default=None,
         min_length=1,
         description=
         "List of max per-request sequence lengths to create encoder CUDA "
-        "graphs for.")
+        "graphs for. Required for an encoder that packs a variable number of "
+        "tokens per request; ignored by an encoder whose input is a "
+        "fixed-shape per-request feature tensor, which derives this from the "
+        "model.")
 
     max_seq_len: NonNegativeInt = Field(
         default=0,
         description=
         "Maximum per-request sequence length for encoder CUDA graphs. If "
         "`seq_lens` is provided, must equal max(seq_lens); otherwise "
-        "`seq_lens` is generated from this value.")
+        "`seq_lens` is generated from this value. Ignored by a fixed-shape "
+        "feature encoder.")
 
     @model_validator(mode='after')
     def validate_encoder_cuda_graph_config(self) -> 'EncodeCudaGraphConfig':
@@ -444,6 +452,36 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
             sizes.append(max_seq_len)
 
         return sizes
+
+
+def validate_token_encoder_bucket_config(
+        num_tokens: Optional[List[int]],
+        seq_lens: Optional[List[int]],
+        *,
+        stays_eager: bool = False) -> Optional[str]:
+    """Why a packed-token encoder cannot capture with these buckets, or None.
+
+    Answers for token encoders (T5, BART) only; a fixed-shape feature encoder
+    derives both dimensions from the model, so the caller establishes which
+    kind it has first. Returned rather than raised because callers differ:
+    encode-only warns and stays eager (`stays_eager`), the rest raise.
+    """
+    missing = []
+    if not num_tokens:
+        missing.append("num_tokens/max_num_token")
+    if not seq_lens:
+        missing.append("seq_lens/max_seq_len")
+    if not missing:
+        return None
+    head = (f"Encoder CUDA graph configuration has {' and '.join(missing)} "
+            "unset. This model's encoder consumes packed tokens, so it needs "
+            "both dimensions")
+    if stays_eager:
+        return f"{head}; the encode step stays eager."
+    return (f"{head}: specify e.g. EncodeCudaGraphConfig(max_batch_size=64, "
+            "num_tokens=[128, 256, 512], max_seq_len=128, "
+            "enable_padding=True), or drop encoder_cuda_graph_config to run "
+            "the encoder eagerly.")
 
 
 # For CudaGraphConfig's backward compatibility
@@ -3747,9 +3785,10 @@ class KvCacheCompressionConfig(StrictBaseModel):
     algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
 
     Kept separate from SparseAttentionConfig by design -- compression changes
-    which KV is stored, not the attention computation. The manager is registered
-    as a resource manager in create_py_executor (_util.py), like the KV cache
-    manager itself. Concrete algorithms subclass this and add their parameters.
+    which KV is stored, not the attention computation. Iteration-driven methods
+    use the resource-manager cycle; storage-bound managers provide a native
+    codec that KVCacheManagerV2 retains and invokes. Concrete algorithms
+    subclass this and add their parameters.
     """
 
     changes_physical_kv_length: ClassVar[bool] = False
@@ -3768,6 +3807,37 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
+_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY = TelemetryField.categorical(
+    "quantization_for_cold_page", "triattention")
+
+
+class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
+    """Quantize Host and Disk KV pages without changing the active GPU cache."""
+
+    algorithm: Literal["quantization_for_cold_page"] = Field(
+        default="quantization_for_cold_page",
+        telemetry=False,
+    )
+    quant: Literal["nvfp4"] = Field(
+        default="nvfp4",
+        description="Quantization format stored in the compressed cache tier.")
+    scale_checkpoint_path: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        telemetry=False,
+        description=
+        "Optional local ModelOpt NVFP4 checkpoint directory supplying per-layer "
+        "K/V global scales. Omit it to use identity global scales.")
+
+    def supports_block_reuse(self) -> bool:
+        """Block reuse is unchanged because token identity is preserved."""
+        return True
+
+    def supports_speculative_decoding(self) -> bool:
+        """Target and draft KVCMs encode their own cold pages independently."""
+        return True
+
+
 class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     """TriAttention KV-cache compression: periodic decode-time eviction.
 
@@ -3778,7 +3848,10 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
     changes_physical_kv_length: ClassVar[bool] = True
 
-    algorithm: Literal["triattention"] = "triattention"
+    algorithm: Literal["triattention"] = Field(
+        default="triattention",
+        telemetry=_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY,
+    )
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
         description=
@@ -3820,7 +3893,8 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
 
 KvCacheCompressionConfigType: TypeAlias = Annotated[
-    Union[TriAttentionKvCacheCompressionConfig],
+    Union[ColdPageQuantizationCompressionConfig,
+          TriAttentionKvCacheCompressionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -3897,6 +3971,18 @@ class MambaStateConfig(StrictBaseModel):
         "the end of each prompt. An offset of 0 selects the prompt end. "
         "Offsets that do not resolve inside the prompt are ignored. These "
         "snapshots require KV cache manager V2.")
+
+    enable_branch_snapshot: bool = Field(
+        default=False,
+        status="prototype",
+        telemetry=True,
+        description=
+        "Snapshot the Mamba recurrent state where a request's content "
+        "diverges from the prefix cache, so that later requests sharing the "
+        "same prefix can reuse up to the fork instead of being truncated to "
+        "an earlier snapshot. The prompt end is always snapshotted as well. "
+        "Independent of periodic_snapshot_interval. Requires KV cache "
+        "manager V2.")
 
 
 class BlockReuseConfig(StrictBaseModel):
@@ -4312,6 +4398,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.mamba_state_config additional snapshot "
                 "offsets require kv_cache_config.use_kv_cache_manager_v2=True.")
+        if (state_config.enable_branch_snapshot
+                and self.use_kv_cache_manager_v2 is False):
+            raise ValueError(
+                "kv_cache_config.mamba_state_config.enable_branch_snapshot "
+                "requires kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @field_validator('max_attention_window')
@@ -4448,6 +4539,16 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
     )
 
+    enable_pipelined_transfer: bool = Field(
+        default=False,
+        description=
+        "Transfer each completed prefill chunk's KV cache while later chunks "
+        "compute. Requires Python NIXL, generation-first scheduling, chunked "
+        "prefill, pipeline_parallel_size=1, context_parallel_size=1 on both "
+        "peers, beam_width=1, no bounce buffer or Mamba/hybrid cache, and block "
+        "reuse disabled or set to all_reusable. Invalid static settings fail at "
+        "startup; per-request constraints reject the request.")
+
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
 
@@ -4463,6 +4564,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         return "NIXL", None
 
     def _to_pybind(self):
+        # Python-transceiver-only option.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
@@ -5208,13 +5310,6 @@ class GmsConfig(StrictBaseModel):
         return self
 
 
-class SamplerType(StrEnum):
-    """Enum for sampler type options."""
-    TRTLLMSampler = "TRTLLMSampler"
-    TorchSampler = "TorchSampler"
-    auto = "auto"
-
-
 class PrefillCudaGraphBackend(StrEnum):
     """CUDA graph implementation used for prefill requests."""
 
@@ -5406,15 +5501,11 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.encoder_max_batch_size is None:
             raise ValueError(
                 "encoder_cuda_graph_config requires encoder_max_batch_size.")
-        missing = []
-        if not self.encoder_cuda_graph_config.num_tokens:
-            missing.append("num_tokens/max_num_token")
-        if not self.encoder_cuda_graph_config.seq_lens:
-            missing.append("seq_lens/max_seq_len")
-        if missing:
-            raise ValueError("encoder_cuda_graph_config requires "
-                             f"{' and '.join(missing)}.")
-
+        # `num_tokens` / `seq_lens` are checked by the model engine rather than
+        # here: an encoder whose input is a fixed-shape per-request feature
+        # tensor derives both from the model, and only the engine knows which
+        # kind of encoder the model has. It still raises for the token encoders
+        # that require them.
         return self
 
     attn_backend: str = Field(
@@ -5425,16 +5516,32 @@ class TorchLlmArgs(BaseLlmArgs):
         # tensorrt_llm/_torch/attention_backend/utils.py.
         telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER"))
 
-    sampler_type: Union[str, SamplerType] = Field(
-        default=SamplerType.auto,
+    enable_mla_skip_correction: bool = Field(
+        default=False,
         description=
-        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler. "
-        "TRTLLMSampler is deprecated and will be removed in release 1.4.",
-        status="deprecated",
-        deprecated=
-        "This parameter will be removed in release 1.4. TorchSampler will be the default sampler.",
-        telemetry=TelemetryField.categorical('TRTLLMSampler', 'TorchSampler',
-                                             'auto'))
+        ("Enable threshold-based skip-correction for trtllm-gen MLA attention "
+         "kernels on SM100 and SM103. When enabled, "
+         "mla_skip_correction_threshold controls the optimization threshold."),
+        status="prototype")
+
+    mla_skip_correction_threshold: float = Field(
+        default=8.0,
+        gt=0.0,
+        le=32.0,
+        description=
+        ("Threshold for threshold-based skip-correction. This is used only "
+         "when enable_mla_skip_correction is True. The default is 8. The maximum "
+         "supported value depends on the selected kernel's BMM2 dtype: 8 for "
+         "E4M3, 15 for FP16, and 32 for BF16."),
+        status="prototype")
+
+    @model_validator(mode="after")
+    def validate_mla_skip_correction_config(self) -> 'TorchLlmArgs':
+        if self.enable_mla_skip_correction and self.attn_backend.upper(
+        ) != "TRTLLM":
+            raise ValueError(
+                "enable_mla_skip_correction requires attn_backend='TRTLLM'.")
+        return self
 
     sampler_force_async_worker: bool = Field(
         default=False,
@@ -5532,6 +5639,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
         status="prototype")
 
+    use_fine_grained_sync: bool = Field(
+        default=False,
+        description=
+        "Enable fine-grained synchronization for MoE kernels on SM107. The FC1 producer kernel signals "
+        "per-tile completion flags in device memory and the FC2 consumer kernel waits on them, so the "
+        "two GEMMs overlap instead of serializing at kernel launch boundaries.",
+        status="prototype")
+
     enable_layerwise_nvtx_marker: bool = Field(
         default=False,
         description="If true, enable layerwise nvtx marker.",
@@ -5598,6 +5713,31 @@ class TorchLlmArgs(BaseLlmArgs):
         "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
         status="prototype",
     )
+
+    checkpoint_io_policy: Literal[
+        "auto", "native", "rank_striped_read_ahead"] = Field(
+            default="auto",
+            description=
+            "Controls checkpoint storage I/O independently of checkpoint format. "
+            "'auto' selects rank-striped read-ahead for compatible built-in "
+            "PyTorch/HF loads and selects native I/O otherwise. "
+            "'native' preserves the existing loader. "
+            "'rank_striped_read_ahead' lets node-local ranks read disjoint "
+            "SafeTensors extents while native mapping, materialization, and H2D "
+            "continue. Incompatible configurations select native I/O before "
+            "optimized reader or collective setup. Runtime-ineligible loads fall "
+            "back to native before model mutation.",
+            status="prototype",
+            json_schema_extra={
+                "type": "Literal['auto', 'native', 'rank_striped_read_ahead']"
+            },
+        )
+
+    @property
+    def is_partial_model_loading(self) -> bool:
+        """Whether model overrides request loading only part of the model."""
+        return (self.model_kwargs is not None
+                and "num_hidden_layers" in self.model_kwargs)
 
     mx_config: ModelExpressConfig = Field(
         default_factory=ModelExpressConfig,
@@ -6239,6 +6379,20 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
+        return self
+
+    @model_validator(mode="after")
+    def warn_non_pytorch_checkpoint_io_policy_fallback(self) -> 'TorchLlmArgs':
+        # AutoDeploy does not construct a checkpoint loader. Preserve the
+        # requested policy for telemetry while reporting its native selection.
+        # PyTorch requests are resolved at loader construction, where the actual
+        # format and registered loader implementations are known.
+        if (self.checkpoint_io_policy == "rank_striped_read_ahead"
+                and self.backend != "pytorch"):
+            logger.warning(
+                "Checkpoint I/O policy resolved before loading: "
+                "requested=rank_striped_read_ahead, selected=native, "
+                "reason=rank-striped read-ahead requires the PyTorch backend.")
         return self
 
     @model_validator(mode="after")

@@ -68,10 +68,17 @@ struct KernelParams {
   float* ptrDebugO;
   // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor, only for epilogue fusion
   float const* ptrDsv4InvRopeCosSinCache;
-  // Dsv4 output block-scaled tensor, only for epilogue fusion
-  float* ptrDsv4OScaleFp32;
+  // DSv4 output scale buffer: FP32 values or packed UE8M0 words, only for epilogue fusion.
+  float* ptrDsv4OScale;
   // The first sparseMask offsets in the Kv sequence dimension.
   int32_t const* ptrFirstSparseMaskOffsetsKv;
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+  // The output pointer for invalidation used only to test the FineGrained producer feature. This has
+  // the same data type and shape as ptrO and will be filled with the invalid sentinel value.
+  void* ptrInvalidate;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
   // The counter for the multiCtasKv mode.
   int32_t* ptrMultiCtasKvCounter;
   // The device output scale for FP8 quantization. Only needed by trt-llm fp8 kernels as the sca-
@@ -119,7 +126,7 @@ struct KernelParams {
   int32_t mBatchSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
-  // Padded token dimension for the DSv4 fused FP32 scale layout.
+  // Padded token dimension for the DSv4 fused FP32 or packed UE8M0 scale layout.
   int64_t mDsv4ScaleBufM;
   // The factor to add to the maximum value to increase the probability
   //   of skip correction during next iterations.
@@ -179,6 +186,10 @@ struct KernelParams {
   bool mUseBlockSparseAttention;
   // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
   bool mUsesSharedPagedKvIdx{false};
+
+  // Skip correction for row-max increases up to this base-2 threshold. 0 disables; use 8 for E4M3.
+  // Keep runtime parameters at the end to preserve the existing cubin ABI prefix.
+  float mSkipCorrThreshold;
 
   // Note: No implementation functions here as they use STL which is not available in NVRTC
 };

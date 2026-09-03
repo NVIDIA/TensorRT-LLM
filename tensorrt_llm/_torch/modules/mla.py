@@ -564,6 +564,7 @@ class MLA(nn.Module):
             rope_append=(self.sparse_attn_hooks is None or self.sparse_attn_hooks.mqa_rope_append),
             kv_cache_dtype=self.kv_cache_dtype,
             flashinfer_mla_backend=flashinfer_mla_backend,
+            skip_correction_threshold=config.skip_correction_threshold,
         )
         if self.mqa is None:
             raise RuntimeError("MLA requires a non-null MQA attention backend")
@@ -592,6 +593,7 @@ class MLA(nn.Module):
                 predicted_tokens_per_seq=self.predicted_tokens_per_seq,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 sparse_params=mha_sparse_params,
+                skip_correction_threshold=config.skip_correction_threshold,
             )
         else:
             self.mha = None

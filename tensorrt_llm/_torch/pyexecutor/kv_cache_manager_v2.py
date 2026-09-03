@@ -819,6 +819,7 @@ class KVCacheManagerV2(BaseResourceManager):
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
         is_estimating_kv_cache: bool = False,
+        cold_page_codec_provider: Optional[object] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -1134,14 +1135,34 @@ class KVCacheManagerV2(BaseResourceManager):
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
 
+        def create_cold_page_codec(cache_config: object) -> Optional[object]:
+            if cold_page_codec_provider is None:
+                return None
+            return cold_page_codec_provider.create_cold_page_codec(
+                cache_config,
+                runtime_dtype=self.dtype,
+                pp_layers=self.pp_layers,
+                num_kv_heads_per_layer=self.num_kv_heads_per_layer,
+                head_dim_per_layer=self.head_dim_per_layer,
+                is_draft=self.is_draft,
+            )
+
         candidate: Optional[KVCacheManagerPy] = None
         if not has_host_cache_tier:
-            candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
+            candidate = KVCacheManagerPy(
+                config,
+                event_manager=self.event_manager,
+                cold_page_codec=create_cold_page_codec(config),
+            )
         else:
             init_error: Optional[Exception] = None
             local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
             try:
-                candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
+                candidate = KVCacheManagerPy(
+                    config,
+                    event_manager=self.event_manager,
+                    cold_page_codec=create_cold_page_codec(config),
+                )
             except Exception as error:
                 if isinstance(error, (CuError, KVCacheOutOfMemoryError)):
                     local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
@@ -1177,7 +1198,11 @@ class KVCacheManagerV2(BaseResourceManager):
                             if not isinstance(tier, HostCacheTierConfig)
                         ],
                     )
-                    candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
+                    candidate = KVCacheManagerPy(
+                        config,
+                        event_manager=self.event_manager,
+                        cold_page_codec=create_cold_page_codec(config),
+                    )
                 except Exception as error:
                     fallback_error = error.with_traceback(None)
 
@@ -2530,11 +2555,19 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return self._prepare_context_impl(req)
 
+    def _record_branch_snapshot_point(
+        self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
+    ) -> None:
+        """Hook for recurrent-state managers; attention-only caches have no snapshots."""
+
     def _prepare_context_impl(self, req: LlmRequest) -> bool:
         if req.is_first_context_chunk:
             if self.conversation_manager is not None:
                 self.conversation_manager.prepare_request(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
+            # Stays None when the cache was resumed rather than freshly
+            # matched, which is also the case where no branch point applies.
+            num_lookup_tokens = None
             if kv_cache is None:
                 all_tokens = self._reuse_token_source(req)
                 # Last token cannot be recovered, so we don't include it in
@@ -2545,6 +2578,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                 else:
                     tokens = None
+                # Taken from the augmented sequence rather than derived as
+                # prompt_len - 1, because augmentation can change the length
+                # for multimodal requests.
+                num_lookup_tokens = len(tokens) if tokens is not None else None
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -2568,6 +2605,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.set_prepopulated_prompt_len(
                     kv_cache.num_committed_tokens, self.tokens_per_block
                 )
+                self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
@@ -3301,6 +3339,9 @@ class KVCacheManagerV2(BaseResourceManager):
         windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
         raw_ssm_snapshot_iteration_stats = self.impl.get_and_reset_ssm_snapshot_iteration_stats()
+        suspended_requests, resumed_requests = (
+            self.impl.get_and_reset_iteration_suspend_resume_stats()
+        )
         primary_peak_stats = self._get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
         num_cache_levels = len(self.impl.cache_tier_list)
         secondary_peak_stats_by_level = [
@@ -3386,6 +3427,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 primary_peak_stats,
                 secondary_peak_stats_by_level,
             ),
+            suspended_requests=suspended_requests,
+            resumed_requests=resumed_requests,
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:

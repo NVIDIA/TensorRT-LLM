@@ -19,6 +19,8 @@ l0_a10:
   - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_torch_multi_arange.py
   - unittest/_torch/test_fused_relu2.py
+  - unittest/_torch/test_mnnvl_alltoall_workspace.py
+  - unittest/_torch/test_mnnvl_memory_lifecycle.py
   - unittest/utils/test_util.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
@@ -27,14 +29,13 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_radio.py
   - unittest/_torch/modeling/test_modeling_minicpmv4_6.py
   - unittest/_torch/modeling/test_multimodal_encoder_mixin.py
-  - unittest/_torch/sampler/test_trtllm_sampler.py
   - unittest/_torch/sampler/test_token_ban.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
   - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/executor/test_resource_manager.py
-  - unittest/_torch/modules/moe/test_communication_factory.py
+  - unittest/_torch/moe/test_communication_factory.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints
@@ -174,8 +175,6 @@ l0_a10:
       stage: post_merge
       backend: pytorch
   tests:
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_examples.py::test_llmapi_server_example
   - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen3/Qwen3-0.6B]
