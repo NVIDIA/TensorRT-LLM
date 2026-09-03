@@ -421,8 +421,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             row_stride = msl_c
             if row_stride % 4:
                 return
-        # helper takes max_seq_len in kv-token space (get_indexer_max_seq_len
-        # is compressed — same multiply-back as the dispatch seam)
+        # The helper takes max_seq_len in KV-token space;
+        # get_indexer_max_seq_len is compressed, so multiply it back as at
+        # the dispatch seam.
         try:
             _ss_host.warmup_varlen(
                 int(top_k),
