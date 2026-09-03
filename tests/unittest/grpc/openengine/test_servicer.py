@@ -128,7 +128,7 @@ def test_sampling_params_from_request_preserves_portable_options() -> None:
         guided=generation_pb2.GuidedDecoding(regex="[a-z]+"),
     )
 
-    params = sampling_params_from_request(request)
+    params = sampling_params_from_request(request, "xgrammar")
 
     assert params.temperature == 0.0
     assert params.top_p == pytest.approx(0.9)

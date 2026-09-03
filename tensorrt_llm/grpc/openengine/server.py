@@ -15,6 +15,7 @@ from openengine.v1 import openengine_pb2_grpc
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.logger import logger
 
+from .control import OpenEngineControlServicer
 from .servicer import OpenEngineInferenceServicer
 
 __all__ = ["OpenEngineServer", "launch_server"]
@@ -64,15 +65,18 @@ class OpenEngineServer:
         self.host = host
         self.port = port
         self._server = grpc.aio.server(options=_SERVER_OPTIONS)
-        openengine_pb2_grpc.add_InferenceServicer_to_server(
-            OpenEngineInferenceServicer(llm, model, kv_transfer_backend=_kv_transfer_backend(llm)),
-            self._server,
+        kv_transfer_backend = _kv_transfer_backend(llm)
+        inference = OpenEngineInferenceServicer(
+            llm, model, kv_transfer_backend=kv_transfer_backend
         )
-        # Control RPCs (including Abort) are intentionally not implemented yet and
-        # return UNIMPLEMENTED via the base servicer. Request cancellation is
-        # supported through gRPC channel close (see OpenEngineInferenceServicer).
+        openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
+        # Control shares the inference servicer's in-flight request table so
+        # Abort and GetLoad see the same requests Generate is serving.
         openengine_pb2_grpc.add_ControlServicer_to_server(
-            openengine_pb2_grpc.ControlServicer(), self._server
+            OpenEngineControlServicer(
+                llm, model, inference, kv_transfer_backend=kv_transfer_backend
+            ),
+            self._server,
         )
         bind_address = _format_bind_address(host, port)
         bound_port = self._server.add_insecure_port(bind_address)

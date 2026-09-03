@@ -47,6 +47,7 @@ l0_a10:
   - unittest/others/test_tracing.py
   - unittest/grpc/test_grpc_optional.py
   - unittest/grpc/smg/test_smg.py
+  - unittest/grpc/openengine
   - unittest/disaggregated/test_coordinator_e2e.py
   - unittest/disaggregated/test_coordinator_worker.py
   - unittest/disaggregated/test_agent_multi_backends.py

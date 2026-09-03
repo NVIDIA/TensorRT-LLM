@@ -43,6 +43,14 @@ class UnsupportedFeatureError(ValueError):
     """Raised when OpenEngine requests a feature this adapter cannot map."""
 
 
+class AbortFailedError(RuntimeError):
+    """Raised when an active request could not be aborted on the engine."""
+
+    def __init__(self, request_id: str, cause: BaseException) -> None:
+        super().__init__(f"failed to abort request '{request_id}': {cause}")
+        self.request_id = request_id
+
+
 def _top_n_candidates(selection: Any, name: str) -> int:
     kind = selection.WhichOneof("selection")
     if kind is None:
@@ -54,8 +62,34 @@ def _top_n_candidates(selection: Any, name: str) -> int:
     )
 
 
+# Guides each grammar backend can build, keyed by the `GuidedDecoding` oneof
+# field name. Control advertises from this table and Generate enforces it, so
+# the two cannot disagree. llguidance has no structural-tag matcher.
+GUIDE_SUPPORT_BY_BACKEND: dict[str, frozenset[str]] = {
+    "xgrammar": frozenset(
+        {"json_schema", "regex", "ebnf_grammar", "structural_tag", "json_object"}
+    ),
+    "llguidance": frozenset({"json_schema", "regex", "ebnf_grammar", "json_object"}),
+}
+
+
+def supported_guides(backend: str | None) -> frozenset[str]:
+    """Guides `backend` can build; empty when none can be.
+
+    With no backend configured the engine never builds a grammar and drops the
+    per-request guided params silently, so accepting the request would return
+    unconstrained text as a success. Failing closed here also keeps Generate
+    aligned with GetModelInfo, which reports guided decoding unsupported for
+    that engine.
+    """
+    if not backend:
+        return frozenset()
+    return GUIDE_SUPPORT_BY_BACKEND.get(backend.lower(), frozenset())
+
+
 def _guided_decoding_from_request(
     request: generation_pb2.GenerateRequest,
+    guided_backend: str | None = None,
 ) -> GuidedDecodingParams | None:
     if not request.HasField("guided"):
         return None
@@ -69,6 +103,13 @@ def _guided_decoding_from_request(
     guide = guided.WhichOneof("guide")
     if guide is None:
         return None
+    # Reject here rather than letting the grammar compiler fail it in-band, so
+    # the client gets an actionable status.
+    if guide not in supported_guides(guided_backend):
+        raise UnsupportedFeatureError(
+            f"guided decoding mode '{guide}' is not supported by the "
+            f"'{guided_backend or 'configured'}' grammar backend"
+        )
     if guide == "json_schema":
         return GuidedDecodingParams(json=guided.json_schema)
     if guide == "regex":
@@ -82,7 +123,10 @@ def _guided_decoding_from_request(
     raise UnsupportedFeatureError(f"guided decoding mode '{guide}' is not supported")
 
 
-def sampling_params_from_request(request: generation_pb2.GenerateRequest) -> SamplingParams:
+def sampling_params_from_request(
+    request: generation_pb2.GenerateRequest,
+    guided_backend: str | None = None,
+) -> SamplingParams:
     """Translate portable OpenEngine generation options to TensorRT-LLM."""
     kwargs: dict[str, Any] = {}
     num_sequences = 1
@@ -144,7 +188,7 @@ def sampling_params_from_request(request: generation_pb2.GenerateRequest) -> Sam
         if response.HasField("return_output_logprobs") and response.return_output_logprobs:
             kwargs["logprobs"] = _top_n_candidates(response.output_candidates, "output")
 
-    guided_decoding = _guided_decoding_from_request(request)
+    guided_decoding = _guided_decoding_from_request(request, guided_backend)
     if guided_decoding is not None:
         kwargs["guided_decoding"] = guided_decoding
 
@@ -864,7 +908,45 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         # a generation worker/orchestrator can see which KV transfer backend the
         # context worker uses. The actual transfer is driven by opaque_state.
         self._kv_transfer_backend = kv_transfer_backend
+        self._guided_backend = getattr(getattr(llm, "args", None), "guided_decoding_backend", None)
         self._active_requests: dict[str, Any] = {}
+
+    def active_request_count(self) -> int:
+        """Requests accepted and not yet completed."""
+        return len(self._active_requests)
+
+    def abort_request_by_id(self, request_id: str) -> bool:
+        """Abort one in-flight request. Returns False when it is not active.
+
+        Does not pop the id: the Generate stream's ``finally`` owns cleanup, and
+        removing it here would let a duplicate request_id past the ALREADY_EXISTS
+        check while the original stream is still draining.
+
+        Raises:
+            AbortFailedError: the request is active but the engine refused to
+                abort it, so it is still running.
+        """
+        handle = self._active_requests.get(request_id)
+        if handle is None:
+            return False
+        try:
+            handle.abort()
+        except Exception as error:
+            logger.warning(f"Failed to abort OpenEngine request {request_id}: {error}")
+            raise AbortFailedError(request_id, error) from error
+        return True
+
+    def abort_all_requests(self) -> tuple[int, int]:
+        """Abort every in-flight request; returns (aborted, failed) counts."""
+        aborted = 0
+        failed = 0
+        for request_id in list(self._active_requests):
+            try:
+                if self.abort_request_by_id(request_id):
+                    aborted += 1
+            except AbortFailedError:
+                failed += 1
+        return aborted, failed
 
     async def Generate(
         self,
@@ -896,7 +978,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                     raise UnsupportedFeatureError("prefix cache bypass is not supported")
 
             inputs = _input_from_request(request)
-            sampling_params = sampling_params_from_request(request)
+            sampling_params = sampling_params_from_request(request, self._guided_backend)
             trace_headers = _trace_headers(context)
             cache_salt = (
                 request.kv.cache_salt
@@ -1106,4 +1188,10 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             self._active_requests.pop(request_id, None)
 
 
-__all__ = ["OpenEngineInferenceServicer", "sampling_params_from_request"]
+__all__ = [
+    "AbortFailedError",
+    "GUIDE_SUPPORT_BY_BACKEND",
+    "OpenEngineInferenceServicer",
+    "sampling_params_from_request",
+    "supported_guides",
+]
