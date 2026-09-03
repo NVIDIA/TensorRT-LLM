@@ -258,8 +258,8 @@ class MultiStreamDAG:
             return (-distance) * num_nodes + node_id
 
         streams = [Stream(i) for i in range(max_num_streams)]
-        # Scope stacks are stream-local; output dependencies make the end op wait
-        # for any auxiliary-stream producer before it runs on the primary stream.
+        # Scope boundaries stay on the primary stream; output dependencies make the
+        # end op wait for auxiliary-stream producers before releasing their leases.
         primary_stream_ops = {
             torch.ops.trtllm.begin_nccl_window_tensor_scope.default,
             torch.ops.trtllm.end_nccl_window_tensor_scope.default,
