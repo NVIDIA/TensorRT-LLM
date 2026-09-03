@@ -118,14 +118,14 @@ def test_flag_unset_generation_timeout_uses_rank_uniform_cleanup():
 
     executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
     assert executor.active_requests == []
-    executor.dist.tp_allgather_int64.assert_called_once_with([1])
+    executor.dist.tp_allgather_int64.assert_called_once_with([True])
     executor._handle_errors.assert_called_once_with(
         error_msg="Request timed out (KV transfer)",
         requests=[request],
         charge_budget=False,
     )
     assert executor._timeout_cleanup_order.mock_calls == [
-        call.vote([1]),
+        call.vote([True]),
         call.handle(
             error_msg="Request timed out (KV transfer)",
             requests=[request],
@@ -141,14 +141,14 @@ def test_flag_unset_generation_timeout_peer_enters_cleanup():
     PyExecutor._handle_kv_transfer_timeouts_synced(executor)
 
     executor.kv_cache_transceiver.cancel_request.assert_not_called()
-    executor.dist.tp_allgather_int64.assert_called_once_with([0])
+    executor.dist.tp_allgather_int64.assert_called_once_with([False])
     executor._handle_errors.assert_called_once_with(
         error_msg="Request timed out (KV transfer)",
         requests=[],
         charge_budget=False,
     )
     assert executor._timeout_cleanup_order.mock_calls == [
-        call.vote([0]),
+        call.vote([False]),
         call.handle(
             error_msg="Request timed out (KV transfer)",
             requests=[],

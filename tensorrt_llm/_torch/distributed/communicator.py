@@ -8,6 +8,7 @@ from typing import Any, Callable, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+from numpy.typing import ArrayLike
 from torch.distributed.distributed_c10d import (_object_to_tensor,
                                                 _tensor_to_object)
 
@@ -236,28 +237,31 @@ class Distributed(ABC):
         # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...]
         return [entry for tp_group in obj for entry in tp_group]
 
-    # Fixed-size int64 exchanges: one collective, no pickle. Defaults use the
-    # object paths so every backend works; MPIDist overrides with buffer calls.
+    # Fixed-size int64 exchanges. MPIDist does each as one buffer collective
+    # (no pickle); the defaults below reuse the object paths, sending plain
+    # int lists so the pickled payload stays small on every backend.
 
-    def tp_allgather_int64(self, values) -> np.ndarray:
+    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
         """All-gather a fixed-size int64 vector across the TP group.
 
         Returns an int64 array of shape ``[tp_size, len(values)]`` whose row
         *i* is rank *i*'s vector. Every rank must pass the same length.
         """
-        gathered = self.tp_allgather([int(v) for v in values],
-                                     small_payload=True)
+        vec = np.asarray(values, dtype=np.int64).reshape(-1)
+        gathered = self.tp_allgather(vec.tolist(), small_payload=True)
         return np.asarray(gathered, dtype=np.int64).reshape(len(gathered), -1)
 
-    def cp_allgather_int64(self, values) -> np.ndarray:
-        gathered = self.cp_allgather([int(v) for v in values],
-                                     small_payload=True)
+    def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+        """All-gather a fixed-size int64 vector across the CP group; rows are
+        ordered by CP rank."""
+        vec = np.asarray(values, dtype=np.int64).reshape(-1)
+        gathered = self.cp_allgather(vec.tolist(), small_payload=True)
         return np.asarray(gathered, dtype=np.int64).reshape(len(gathered), -1)
 
-    def tp_cp_allgather_int64(self, values) -> np.ndarray:
+    def tp_cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
         """Fixed-size int64 all-gather across TP x CP; rows are ordered like
         :meth:`tp_cp_allgather` (tp-major, cp-minor)."""
-        vec = np.asarray([int(v) for v in values], dtype=np.int64)
+        vec = np.asarray(values, dtype=np.int64).reshape(-1)
         n = vec.size
         if self.cp_size > 1:
             vec = self.cp_allgather_int64(vec).reshape(-1)
@@ -265,15 +269,19 @@ class Distributed(ABC):
             vec = self.tp_allgather_int64(vec).reshape(-1)
         return vec.reshape(-1, n)
 
-    def broadcast_int64(self, values, root=0) -> np.ndarray:
+    def broadcast_int64(self, values: ArrayLike, root: int = 0) -> np.ndarray:
         """Broadcast a fixed-size int64 vector from *root* to every rank.
         Non-root ranks pass a placeholder vector of the same length."""
-        return np.asarray(self.broadcast([int(v) for v in values], root=root),
+        vec = np.asarray(values, dtype=np.int64).reshape(-1)
+        return np.asarray(self.broadcast(vec.tolist(), root=root),
                           dtype=np.int64)
 
-    def tp_cp_broadcast_int64(self, values, root=0) -> np.ndarray:
-        return np.asarray(self.tp_cp_broadcast([int(v) for v in values],
-                                               root=root),
+    def tp_cp_broadcast_int64(self,
+                              values: ArrayLike,
+                              root: int = 0) -> np.ndarray:
+        """Broadcast a fixed-size int64 vector from *root* across TP and CP."""
+        vec = np.asarray(values, dtype=np.int64).reshape(-1)
+        return np.asarray(self.tp_cp_broadcast(vec.tolist(), root=root),
                           dtype=np.int64)
 
 
@@ -832,7 +840,7 @@ class MPIDist(Distributed):
         return self.tp_comm.allreduce(obj, reduce_op)
 
     @staticmethod
-    def _allgather_int64_comm(comm, values) -> np.ndarray:
+    def _allgather_int64_comm(comm, values: ArrayLike) -> np.ndarray:
         sendbuf = np.ascontiguousarray(
             np.asarray(values, dtype=np.int64).reshape(-1))
         size = comm.Get_size()
@@ -841,22 +849,24 @@ class MPIDist(Distributed):
         return recvbuf.reshape(size, sendbuf.size)
 
     @staticmethod
-    def _broadcast_int64_comm(comm, values, root) -> np.ndarray:
+    def _broadcast_int64_comm(comm, values: ArrayLike, root: int) -> np.ndarray:
         buf = np.ascontiguousarray(
             np.asarray(values, dtype=np.int64).reshape(-1))
         comm.Bcast([buf, MPI.INT64_T], root=root)
         return buf
 
-    def tp_allgather_int64(self, values) -> np.ndarray:
+    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
         return self._allgather_int64_comm(self.tp_comm, values)
 
-    def cp_allgather_int64(self, values) -> np.ndarray:
+    def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
         return self._allgather_int64_comm(self.cp_comm, values)
 
-    def broadcast_int64(self, values, root=0) -> np.ndarray:
+    def broadcast_int64(self, values: ArrayLike, root: int = 0) -> np.ndarray:
         return self._broadcast_int64_comm(mpi_comm(), values, root)
 
-    def tp_cp_broadcast_int64(self, values, root=0) -> np.ndarray:
+    def tp_cp_broadcast_int64(self,
+                              values: ArrayLike,
+                              root: int = 0) -> np.ndarray:
         buf = np.asarray(values, dtype=np.int64).reshape(-1)
         if self.tp_size > 1:
             buf = self._broadcast_int64_comm(self.tp_comm, buf, root)

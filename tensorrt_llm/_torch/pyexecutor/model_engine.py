@@ -4301,12 +4301,12 @@ class PyTorchModelEngine(ModelEngine):
             # two exchanges separate.
             gathered = self.dist.tp_cp_allgather_int64(list(spec_counts))
             return (self._get_all_rank_num_tokens(attn_metadata),
-                    [gathered[:, i].tolist() for i in range(gathered.shape[1])])
+                    gathered.T.tolist())
         num_tokens = attn_metadata.num_tokens
         if self.mapping.has_cp_helix():
             num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
         gathered = self.dist.tp_cp_allgather_int64([num_tokens, *spec_counts])
-        cols = [gathered[:, i].tolist() for i in range(gathered.shape[1])]
+        cols = gathered.T.tolist()
         return cols[0], cols[1:]
 
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
@@ -4329,7 +4329,7 @@ class PyTorchModelEngine(ModelEngine):
                 and spec_metadata.use_rejection_sampling):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
-        all_flags = self.dist.tp_allgather_int64([int(local_flag)])[:, 0]
+        all_flags = self.dist.tp_allgather_int64([local_flag])[:, 0]
         spec_metadata.group_all_greedy_sample = bool(all_flags.all())
         # Also overwrite the live flag directly: this iteration's scan already
         # ran (update_is_all_greedy_sample just returned) and the CUDA graph

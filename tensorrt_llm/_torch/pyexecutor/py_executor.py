@@ -1135,7 +1135,7 @@ class PyExecutor:
         timed_out = self._pending_timed_out_requests
         self._pending_timed_out_requests = []
         any_timed_out = bool(
-            self.dist.tp_allgather_int64([int(bool(timed_out))]).any())
+            self.dist.tp_allgather_int64([bool(timed_out)]).any())
         if any_timed_out:
             self._handle_errors(error_msg="Request timed out (KV transfer)",
                                 requests=timed_out,

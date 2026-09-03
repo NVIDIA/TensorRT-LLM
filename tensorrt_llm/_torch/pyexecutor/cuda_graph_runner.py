@@ -251,8 +251,10 @@ class CUDAGraphRunner:
         One fixed-size exchange, entered by every rank unconditionally.
         """
         gathered = self.config.dist.tp_allgather_int64(
-            [int(bool(can_run_cuda_graph)), batch.batch_size])
-        return [(bool(int(row[0])), int(row[1])) for row in gathered]
+            [bool(can_run_cuda_graph), batch.batch_size])
+        flags = gathered[:, 0].astype(bool).tolist()
+        sizes = gathered[:, 1].tolist()
+        return list(zip(flags, sizes))
 
     def _get_seq_len_mode(
         self,
