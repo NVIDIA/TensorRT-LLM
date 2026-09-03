@@ -506,12 +506,16 @@ def _serialize_first_gen_log_probs(first_gen_log_probs: Sequence[Any]) -> list[A
         if isinstance(pos, dict):
             positions.append(
                 [
-                    [int(token_id), float(lp.logprob), (lp.rank if lp.rank is not None else None)]
+                    [
+                        int(token_id),
+                        _clamp_logprob(lp.logprob),
+                        (lp.rank if lp.rank is not None else None),
+                    ]
                     for token_id, lp in pos.items()
                 ]
             )
         else:
-            positions.append(float(pos))
+            positions.append(_clamp_logprob(pos))
     return positions
 
 
@@ -523,13 +527,13 @@ def _deserialize_first_gen_log_probs(positions: Sequence[Any]) -> list[Any]:
             result.append(
                 {
                     int(token_id): Logprob(
-                        logprob=float(logprob), rank=None if rank is None else int(rank)
+                        logprob=_clamp_logprob(logprob), rank=None if rank is None else int(rank)
                     )
                     for token_id, logprob, rank in pos
                 }
             )
         else:
-            result.append(float(pos))
+            result.append(_clamp_logprob(pos))
     return result
 
 
@@ -1067,6 +1071,13 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         def rpc_done(_: grpc.aio.ServicerContext) -> None:
             abort_request("RPC completed before generation")
 
+        def untrack() -> None:
+            # Once this id is dropped a resubmission is admitted, so both
+            # removal sites must check they still own the registration --
+            # otherwise the loser untracks the newer request's handle.
+            if self._active_requests.get(request_id) is result_handle:
+                del self._active_requests[request_id]
+
         def stall_watchdog() -> None:
             # Single self-rescheduling watchdog (no per-message timer alloc/cancel).
             nonlocal stall_timer, consumer_stalled
@@ -1085,7 +1096,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 # its `finally` may never run. Drop the registration here or the
                 # id stays in flight forever: GetLoad over-reports it and the id
                 # is permanently unusable.
-                self._active_requests.pop(request_id, None)
+                untrack()
                 stall_timer = None
             else:
                 stall_timer = loop.call_later(
@@ -1180,7 +1191,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             cancel_watchdog()
             if not engine_terminal:
                 abort_request("response stream closed")
-            self._active_requests.pop(request_id, None)
+            untrack()
 
 
 __all__ = [

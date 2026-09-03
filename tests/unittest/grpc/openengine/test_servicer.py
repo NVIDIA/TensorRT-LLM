@@ -720,3 +720,214 @@ def test_generate_rejects_malformed_numeric_metadata(key: str, value: str) -> No
         asyncio.run(collect_responses())
 
     assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_generate_context_only_ends_at_prefill_ready() -> None:
+    """A context request terminates with PrefillReady and no `finished` event.
+
+    The handoff is the terminal event for the context leg. A `finished` after it
+    reads as "the request is complete" to a client, which drops the handoff so
+    the decode leg never runs.
+    """
+    disagg = openengine_servicer.DisaggregatedParams(
+        request_type="context_only",
+        ctx_request_id=99,
+        ctx_info_endpoint="tcp://1.2.3.4:5555",
+        first_gen_tokens=[10],
+    )
+    streaming_output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="A",
+        logprobs=[],
+        finish_reason=None,
+        stop_reason=None,
+        disaggregated_params=None,
+    )
+    final_output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="A",
+        logprobs=[],
+        finish_reason="length",
+        stop_reason=None,
+        disaggregated_params=disagg,
+    )
+    results = [
+        SimpleNamespace(
+            prompt_token_ids=[1, 2], outputs=[streaming_output], cached_tokens=0, error=None
+        ),
+        SimpleNamespace(
+            prompt_token_ids=[1, 2], outputs=[final_output], cached_tokens=0, error=None
+        ),
+    ]
+    servicer = OpenEngineInferenceServicer(_FakeLlm(results), model="test-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="request-ctx",
+        model="test-model",
+        prompt="hello",
+        stopping=generation_pb2.StoppingOptions(max_tokens=1),
+    )
+    request.extra.update({"request_type": "context_only"})
+
+    async def collect_responses() -> list[generation_pb2.GenerateResponse]:
+        return [response async for response in servicer.Generate(request, _FakeContext())]
+
+    responses = asyncio.run(collect_responses())
+    events = [response.WhichOneof("event") for response in responses]
+
+    assert events.count("prefill_ready") == 1
+    assert "finished" not in events
+    assert events[-1] == "prefill_ready"
+    assert responses[-1].prefill_ready.kv_session.session_id == "99"
+
+
+def _set_priority_metadata(request: generation_pb2.GenerateRequest) -> None:
+    del request
+
+
+def _set_lora_name(request: generation_pb2.GenerateRequest) -> None:
+    request.lora_name = "adapter-a"
+
+
+def _set_media(request: generation_pb2.GenerateRequest) -> None:
+    request.media.add(url="http://example.invalid/img.png")
+
+
+def _set_bypass_prefix_cache(request: generation_pb2.GenerateRequest) -> None:
+    request.kv.bypass_prefix_cache = True
+
+
+@pytest.mark.parametrize(
+    ("field", "mutate"),
+    [
+        ("priority", _set_priority_metadata),
+        ("lora_name", _set_lora_name),
+        ("media", _set_media),
+        ("bypass_prefix_cache", _set_bypass_prefix_cache),
+    ],
+)
+def test_generate_rejects_unsupported_features_as_unimplemented(field, mutate) -> None:
+    """A well-formed request for a feature this adapter cannot map is UNIMPLEMENTED.
+
+    INVALID_ARGUMENT would tell the client its request is malformed and not worth
+    retrying elsewhere; UNIMPLEMENTED says this engine cannot serve it, which is
+    what lets a router try another worker. UnsupportedFeatureError subclasses
+    ValueError, so the two map to the same status if the except arms are ordered
+    wrongly.
+    """
+    servicer = OpenEngineInferenceServicer(_FakeLlm([]), model="test-model")
+    # Priority arrives as metadata rather than a request field.
+    metadata = (("openengine-priority", "5"),) if field == "priority" else ()
+    context = _FakeContext(metadata=metadata)
+    request = generation_pb2.GenerateRequest(
+        request_id="request-unsupported",
+        model="test-model",
+        prompt="hello",
+    )
+    mutate(request)
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(_AbortError):
+        asyncio.run(collect_responses())
+
+    assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+
+
+def test_first_gen_log_probs_clamp_masked_candidates() -> None:
+    """Masked candidates carry -inf, which a protobuf Struct cannot hold.
+
+    Guided decoding masks disallowed tokens to -inf. The handoff packs the first
+    generated position's logprobs into a Struct, so an unclamped -inf makes the
+    whole PrefillReady unserializable and the disaggregated request fails.
+    """
+    positions = [{7: _logprob(float("-inf"), 2), 9: _logprob(-0.5, 1)}, float("-inf")]
+
+    packed = openengine_servicer._serialize_first_gen_log_probs(positions)
+
+    assert packed[0][0][1] == openengine_servicer._MIN_LOGPROB
+    assert packed[1] == openengine_servicer._MIN_LOGPROB
+
+    params = openengine_servicer.DisaggregatedParams(
+        request_type="context_only",
+        ctx_request_id=99,
+        ctx_info_endpoint="tcp://1.2.3.4:5555",
+        first_gen_log_probs=positions,
+    )
+    resp = openengine_servicer._prefill_ready_response("req-1", params, transfer_backend="NIXL")
+    stored = resp.prefill_ready.kv_session.attributes_struct["first_gen_log_probs"]
+    assert stored[1] == openengine_servicer._MIN_LOGPROB
+
+    restored = openengine_servicer._deserialize_first_gen_log_probs(packed)
+    assert restored[0][7].logprob == openengine_servicer._MIN_LOGPROB
+    assert restored[0][9].logprob == -0.5
+
+
+def test_stalled_stream_cleanup_does_not_untrack_a_resubmission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled stream's cleanup must not untrack a newer request reusing its id.
+
+    The watchdog drops the id so the client can retry, but the stalled generator
+    is still suspended and its `finally` runs later. If that cleanup is not
+    identity-guarded it removes the *replacement*, so Control.Abort reports the
+    live request as already finished and shutdown skips it.
+    """
+
+    def make_result() -> SimpleNamespace:
+        output = SimpleNamespace(
+            index=0,
+            token_ids=[10],
+            text="A",
+            logprobs=[],
+            prompt_logprobs=[],
+            finish_reason=None,
+            stop_reason=None,
+        )
+        return SimpleNamespace(prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None)
+
+    class _PerCallHandleLlm:
+        """Unlike _FakeLlm, hands out a distinct handle per call."""
+
+        def __init__(self) -> None:
+            self.tokenizer = _FakeTokenizer()
+            self.handles: list[_FakeResultHandle] = []
+
+        def generate_async(self, **kwargs: Any) -> _FakeResultHandle:
+            kwargs["sampling_params"]._validate()
+            handle = _FakeResultHandle([make_result()])
+            self.handles.append(handle)
+            return handle
+
+    llm = _PerCallHandleLlm()
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    request = generation_pb2.GenerateRequest(request_id="dup", model="test-model", prompt="hello")
+
+    async def scenario() -> int:
+        monkeypatch.setattr(openengine_servicer, "_RESPONSE_STALL_TIMEOUT_SECONDS", 0.0)
+        first = servicer.Generate(request, _FakeContext())
+        assert (await first.__anext__()).HasField("token")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # The watchdog released the id so the client may retry it.
+        assert servicer.active_request_count() == 0
+
+        # Large timeout so the replacement's own watchdog cannot fire here.
+        monkeypatch.setattr(openengine_servicer, "_RESPONSE_STALL_TIMEOUT_SECONDS", 3600.0)
+        second = servicer.Generate(request, _FakeContext())
+        assert (await second.__anext__()).HasField("token")
+        assert servicer.active_request_count() == 1
+
+        await first.aclose()
+        tracked_after_cleanup = servicer.active_request_count()
+        aborted = servicer.abort_request_by_id("dup")
+        await second.aclose()
+        assert aborted, "the replacement must still be abortable"
+        return tracked_after_cleanup
+
+    assert asyncio.run(scenario()) == 1
+    # The replacement's handle was aborted, not the stalled one's.
+    assert llm.handles[1].aborted
