@@ -92,6 +92,9 @@ def _runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
         "tied_word_embeddings": False,
         "rope_type": "default",
         "rope_fusion": True,
+        # Constrained rows in this file pin full attention, so the base config
+        # realizes it; the loader tests default to `None` for real tiny models.
+        "sliding_window": "none",
     }
     values.update(overrides)
     return PostTransformRuntimeConfig(**values)
@@ -273,6 +276,7 @@ def test_runtime_constraints_qualify_only_declared_rows() -> None:
         pytest.param({"dtype": "float16"}, "dtype", id="dtype"),
         pytest.param({"tp_size": 4}, "tp_size", id="tp-size"),
         pytest.param({"rope_type": "yarn"}, "rope_type", id="rope-type"),
+        pytest.param({"sliding_window": "uniform"}, "sliding_window", id="sliding-window"),
     ],
 )
 def test_runtime_constraints_report_unsupported_dimension(
@@ -284,6 +288,7 @@ def test_runtime_constraints_report_unsupported_dimension(
             dtypes=frozenset({"bfloat16"}),
             tp_sizes=frozenset({1, 2}),
             rope_types=frozenset({"default"}),
+            sliding_windows=frozenset({"none"}),
         )
     )
     registry = PostTransformProfileRegistry((profile,))
@@ -414,6 +419,7 @@ def test_runtime_config_is_captured_from_final_model_config() -> None:
         moe_tp_size=2,
         attention_tp_size=2,
         rope_fusion=None,
+        sliding_window=None,
     )
 
 
@@ -455,6 +461,64 @@ def test_runtime_config_uses_mapping_multi_node_contract() -> None:
     )
 
     assert runtime_config.multi_node is True
+
+
+class _WindowedAttention(nn.Module):
+    def __init__(self, attention_window_size: object) -> None:
+        super().__init__()
+        self.attention_window_size = attention_window_size
+
+
+def _model_with_windows(*windows: object) -> nn.Module:
+    model = nn.Module()
+    model.layers = nn.ModuleList(_WindowedAttention(window) for window in windows)
+    return model
+
+
+@pytest.mark.parametrize(
+    "windows, expected",
+    [
+        pytest.param((None, None), "none", id="full-attention"),
+        pytest.param((4096, 4096), "uniform", id="uniform-window"),
+        pytest.param((4096, None), "mixed", id="windowed-and-full"),
+        pytest.param((4096, 8192), "mixed", id="different-windows"),
+        pytest.param((), None, id="no-window-state"),
+        pytest.param(("4096",), None, id="string-window"),
+        pytest.param((True,), None, id="bool-window"),
+        pytest.param((4096.0,), None, id="float-window"),
+        pytest.param((0,), None, id="zero-window"),
+        pytest.param((-1,), None, id="negative-window"),
+    ],
+)
+def test_runtime_config_realizes_sliding_window_from_model(
+    windows: tuple[object, ...],
+    expected: str | None,
+) -> None:
+    runtime_config = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(),
+        model=_model_with_windows(*windows),
+    )
+
+    assert runtime_config.sliding_window == expected
+
+
+def test_runtime_config_leaves_sliding_window_unrealized_without_model() -> None:
+    runtime_config = PostTransformRuntimeConfig.from_model_config(SimpleNamespace())
+
+    assert runtime_config.sliding_window is None
+
+
+@pytest.mark.parametrize("sliding_window", ["uniform", "mixed", None])
+def test_full_attention_constraint_rejects_other_sliding_windows(
+    sliding_window: str | None,
+) -> None:
+    constraints = PostTransformRuntimeConstraints(sliding_windows=frozenset({"none"}))
+
+    assert constraints.unsupported_dimensions(_runtime_config()) == frozenset()
+    assert constraints.unsupported_dimensions(
+        _runtime_config(sliding_window=sliding_window)
+    ) == frozenset({"sliding_window"})
+    assert "sliding_window" in constraints.unsupported_dimensions(None)
 
 
 def test_registry_rejects_duplicate_profile_id() -> None:

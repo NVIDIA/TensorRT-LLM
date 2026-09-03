@@ -169,6 +169,14 @@ def test_ctx_info_endpoint_rejects_tampered_payload():
         validate_internal_disagg_request("secret", request, headers)
 
 
+def test_protected_fields_reject_non_ascii_auth_header():
+    request = _make_request(ctx_info_endpoint="tcp://10.0.0.1:5000")
+    headers = {INTERNAL_DISAGG_AUTH_HEADER: "\xff"}
+
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_request("secret", request, headers)
+
+
 def test_protected_fields_reject_missing_auth_header():
     request = _make_request(ctx_info_endpoint="tcp://10.0.0.1:5000")
 

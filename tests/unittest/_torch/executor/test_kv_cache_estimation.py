@@ -10,6 +10,7 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -22,6 +23,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModel
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
@@ -647,6 +649,58 @@ def test_v2_cache_size_per_token_models_generation_swa_cost():
     assert scratch_size_per_token == expected
 
 
+def test_v2_dflash_draft_cost_covers_context_and_generation_slots():
+    class FakeDraftModelConfig:
+        quant_config = None
+        pretrained_config = SimpleNamespace(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+
+        def get_num_attention_layers(self):
+            return 1
+
+    spec_config = SimpleNamespace(
+        spec_dec_mode=SpeculativeDecodingMode.DFLASH,
+        max_draft_len=4,
+        tokens_per_gen_step=5,
+    )
+    mapping = Mock(enable_attention_dp=False, tp_size=1)
+    mapping.pp_layers.return_value = [0]
+    tokens_per_block = 32
+    max_batch_size = 128
+    max_num_tokens = 4096
+
+    cost = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            FakeDraftModelConfig(),
+            mapping,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=4096,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            kv_cache_config=KvCacheConfig(max_attention_window=[512]),
+            spec_config=spec_config,
+            is_draft=True,
+        )
+    )
+
+    # One layer stores K+V * 2 KV heads * 8 head dim * BF16 = 64 B/token.
+    slot_bytes = tokens_per_block * 64
+    # Runtime generation capacity can lead history by max_draft_len - 1
+    # (get_num_extra_kv_tokens) plus tokens_per_gen_step: 3 + 5 = 8.
+    generation_blocks_per_request = math.ceil((512 + 8 - 1) / tokens_per_block) + 1
+    assert generation_blocks_per_request == 18
+    context_slots = max_num_tokens // tokens_per_block
+    expected_usable_slots = max_batch_size * generation_blocks_per_request + context_slots
+    assert expected_usable_slots == 2_432
+    # float32(0.95) requires 2561 configured slots for 2432 slots to remain
+    # resumable. The estimator owns this manager-specific quota normalization.
+    expected_configured_slots = 2_561
+    assert cost == CacheCost(slope=0, intercept=expected_configured_slots * slot_bytes)
+
+
 def test_creator_uses_v2_affine_cache_cost():
     class FakeV2Manager(KVCacheManagerV2):
         @staticmethod
@@ -1026,8 +1080,13 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
             return_value=Mock(),
         ) as create_manager,
     ):
-        creator._create_one_model_draft_kv_cache_manager(creator._max_seq_len)
+        codec_provider = object()
+        creator._create_one_model_draft_kv_cache_manager(
+            creator._max_seq_len,
+            cold_page_codec_provider=codec_provider,
+        )
 
     draft_config = create_manager.call_args.kwargs["kv_cache_config"]
     assert draft_config.pool_ratio == [1.0]
+    assert create_manager.call_args.kwargs["cold_page_codec_provider"] is codec_provider
     assert creator._kv_cache_config.pool_ratio == target_pool_ratio

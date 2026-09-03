@@ -324,7 +324,7 @@ def _make_wan22_i2v(quant_config=None, attention_config=None):
     return PipelineLoader(VisualGenArgs(**kwargs)).load(skip_warmup=True, skip_components=_SKIP_AUX)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def wan22_i2v_fp8():
     pipeline = _make_wan22_i2v(quant_config={"quant_algo": "FP8", "dynamic": True})
     yield pipeline
@@ -333,7 +333,7 @@ def wan22_i2v_fp8():
     torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def wan22_i2v_trtllm():
     pipeline = _make_wan22_i2v(attention_config=AttentionConfig(backend="TRTLLM"))
     yield pipeline

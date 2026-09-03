@@ -1,0 +1,133 @@
+metadata:
+  model_name: deepseek_v4_pro_dspark
+  precision: fp4
+  model_dir_name: DeepSeek-V4-Pro-DSpark
+  supported_gpus:
+  - GB300
+  script_file: disaggr_torch.slurm
+  benchmark_type: agentx
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 04:00:00
+  job_name: unified-benchmark
+  extra_args: --gres=gpu:4
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  benchmark_client: agentx
+  multi_round: 1
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: '1456'
+  input_length: 990016
+  output_length: 6579
+  dataset_file: semianalysis_cc_traces_weka_062126
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 3
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  client_env_var: AGENTX_MAX_CTX=996579 AGENTX_DURATION=3600 AGENTX_WARMUP_PER_LANE=3
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0 MIMALLOC_ARENA_RESERVE=0 OMP_NUM_THREADS=1 TRTLLM_PINNED_WEIGHT_STAGING=1
+  ctx_worker_env_var: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_SCALE_LAUNCH_QUEUES=4x TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET=1073741824 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.74
+  gen_worker_env_var: TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.74
+  server_env_var: TRTLLM_SERVER_DISABLE_GC=1
+profiling:
+  nsys_on: false
+ctx_router_config:
+  type: conversation
+server_config_extra:
+  gen_strip_message_history: true
+  gen_tokids_ctxbytes: true
+  server_keep_alive_timeout: 3600
+worker_config:
+  gen:
+    print_iter_log: true
+    max_batch_size: 32
+    max_num_tokens: 192
+    max_seq_len: 996595
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    pipeline_parallel_size: 1
+    enable_attention_dp: true
+    enable_lm_head_tp_in_adp: true
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 4, 8, 16, 24, 32]
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.7
+      dtype: fp8
+      tokens_per_block: 128
+      event_buffer_max_size: 0
+      avg_seq_len: 200000
+      host_cache_size: 0
+    moe_config:
+      backend: CUTEDSL
+      use_low_precision_moe_combine: true
+    cache_transceiver_config:
+      backend: NIXL
+      kv_transfer_timeout_ms: 600000
+      transceiver_runtime: PYTHON
+    stream_interval: 20
+    num_postprocess_workers: 4
+    speculative_config:
+      decoding_type: DSpark
+      max_draft_len: 5
+      block_size: 5
+      speculative_model: DeepSeek-V4-Pro-DSpark
+    custom_tokenizer: deepseek_v4
+    return_perf_metrics: true
+    perf_metrics_max_requests: 100000
+    perf_metrics_output_dir: perf_metrics/gen
+    sparse_attention_config:
+      algorithm: deepseek_v4
+      enable_heuristic_topk: true
+    num_serve_frontends: 4
+  ctx:
+    print_iter_log: true
+    max_batch_size: 256
+    max_num_tokens: 8192
+    max_seq_len: 990016
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    enable_attention_dp: true
+    cuda_graph_config: null
+    disable_overlap_scheduler: false
+    kv_cache_config:
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.8
+      dtype: fp8
+      tokens_per_block: 128
+      event_buffer_max_size: 0
+      block_reuse_config:
+        policy: per_conversation
+        max_num_turns: 5
+      pool_ratio: [0.55, 0.22, 0.23]
+      host_cache_size: 193273528320
+    moe_config:
+      backend: CUTEDSL
+    cache_transceiver_config:
+      backend: NIXL
+      kv_transfer_timeout_ms: 600000
+      transceiver_runtime: PYTHON
+    custom_tokenizer: deepseek_v4
+    return_perf_metrics: true
+    perf_metrics_max_requests: 100000
+    perf_metrics_output_dir: perf_metrics/ctx
+    enable_chunked_prefill: true
+    attention_dp_config:
+      kv_cache_routing_conversation_affinity: true
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+    num_serve_frontends: 8

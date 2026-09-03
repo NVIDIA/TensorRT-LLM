@@ -26,9 +26,6 @@ llm_spark_func:
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-32b-nvfp4-Qwen3/nvidia-Qwen3-32B-NVFP4]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_nvfp4_hf-Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.3-70B-FP8-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.3-70B-FP4-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama-4-Scout-17B-16E-FP4-llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4]
   - test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-9B-v2-nvfp4-NVIDIA-Nemotron-Nano-9B-v2-NVFP4]
   - test_e2e.py::test_ptp_quickstart_advanced_eagle3[GPT-OSS-120B-Eagle3-gpt_oss/gpt-oss-120b-gpt_oss/gpt-oss-120b-Eagle3]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype
@@ -58,10 +55,6 @@ llm_spark_func:
         gte: 2
         lte: 2
   tests:
-  - test_e2e.py::test_ptp_quickstart_advanced_multinode[llama-3.3-models/Llama-3.3-70B-Instruct-tp2]
   - test_e2e.py::test_ptp_quickstart_advanced_multinode[Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf-tp2]
-  - test_e2e.py::test_ptp_quickstart_advanced_multinode[llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8-tp2]
-  - test_e2e.py::test_ptp_quickstart_advanced_multinode[llama4-models/Llama-4-Scout-17B-16E-Instruct-tp2]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_auto_dtype_tp2
   - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_2gpus[latency_moe_cutlass]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_2gpus[latency_moe_cutlass_eagle3]

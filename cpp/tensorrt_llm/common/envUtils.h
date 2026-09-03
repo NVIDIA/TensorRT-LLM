@@ -65,6 +65,12 @@ bool getEnvEnableCascadeMmha();
 // Set TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL=1 to re-enable.
 bool getEnvEnableTrtllmgenMoeRoutingRenormPDL();
 
+// Set TLLM_USE_FINE_GRAINED_SYNC=1 to select fine-grained sync MoE kernel variants on SM107.
+bool getEnvUseFineGrainedSync();
+
+// Forces getEnvUseFineGrainedSync() to false while set; used by the autotuner during profiling.
+void setFineGrainedSyncDisabledOverride(bool disabled);
+
 template <typename KernelFn, typename... Args>
 inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
     cudaStream_t stream, Args&&... args)

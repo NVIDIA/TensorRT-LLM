@@ -20,7 +20,7 @@ from ....functional import PositionEmbeddingType
 from ....logger import logger
 from ....mapping import Mapping
 from ....models.modeling_utils import QuantConfig
-from ...attention_backend import AttentionMetadata, TrtllmAttention, TrtllmAttentionMetadata
+from ...attention_backend import TrtllmAttention, TrtllmAttentionMetadata
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
@@ -59,6 +59,34 @@ def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
         )
         return "trtllm-gen"
     return backend
+
+
+def _validate_mla_generation_backend(backend: str, num_heads: int) -> None:
+    """Fail fast when `backend` can never run at this per-rank head count.
+
+    FlashInfer's `trtllm_batch_decode_with_kv_cache_mla` rejects
+    `64 < num_heads_q < 128` for every batch shape, and the per-batch policy
+    never demotes away from an explicit `trtllm-gen` selection (the
+    FP8-KV-cache override or a `TLLM_K3_MLA_GEN_BACKEND=trtllm-gen` request).
+    Without this check the conflict only surfaces as a FlashInfer error deep
+    in attention warmup.
+
+    The bound mirrors FlashInfer's validation gate verbatim: it predicts
+    FlashInfer's rejection, it is not a verified support claim for the head
+    counts outside the range. For Kimi K3 the open side above 128 is
+    unreachable anyway — per-rank Q heads never exceed 96 (all heads
+    replicated under attention-DP, `96 / tp_size` under TEP head sharding).
+    """
+    if backend == "trtllm-gen" and 64 < num_heads < 128:
+        raise ValueError(
+            "Kimi K3 MLA: the trtllm-gen generation backend cannot run with "
+            f"{num_heads} query heads per rank (trtllm-gen MLA decode rejects "
+            "64 < num_heads_q < 128; under attention-DP every rank keeps all "
+            "heads). trtllm-gen was selected explicitly — by the FP8-KV-cache "
+            f"override or by {_KIMI_K3_MLA_GEN_BACKEND_ENV}=trtllm-gen. Use "
+            "tensor-parallel head sharding (TEP) so each rank has <= 64 "
+            "heads, or a BF16 KV cache with the default cute-dsl backend."
+        )
 
 
 def _kimi_k3_mla_decode_backend_policy(
@@ -263,9 +291,9 @@ class KimiK3MLAAttention(MLA):
             rms_norm_eps=rms_norm_eps,
             flashinfer_mla_backend=_select_mla_generation_backend(model_config.get_quant_config()),
         )
-        # K3 calls forward_impl() directly to insert its output gate before
-        # the base row-parallel o_proj. The original executor metadata remains
-        # intact, so MLA performs its native mixed context/generation split.
+        # Run MLA eagerly instead of through the registered custom op: K3's
+        # accuracy is validated against the eager path. The output gate is a
+        # base hook (_apply_output_gate) and works on either branch.
         self.register_to_config = False
 
         self.use_output_gate = use_output_gate
@@ -298,6 +326,11 @@ class KimiK3MLAAttention(MLA):
         # Only the absorbed-generation backend (mqa) requests CuTe-DSL, so
         # only it needs K3's per-batch fallback policy; mha keeps the
         # default trtllm-gen selection.
+        # Validate here rather than in _select_mla_generation_backend: the
+        # per-rank head count (replicated under attention-DP, sharded under
+        # TEP) is only authoritative once the base MLA module has built its
+        # generation backend.
+        _validate_mla_generation_backend(self.mqa.flashinfer_mla_backend, self.mqa.num_heads)
         self.mqa.mla_backend_policy = partial(
             _kimi_k3_mla_decode_backend_policy,
             num_heads=self.mqa.num_heads,
@@ -308,29 +341,14 @@ class KimiK3MLAAttention(MLA):
         if dtype is not None:
             _meta_safe_cast_dtype(self, dtype)
 
-    def _apply_output_gate_and_o_proj(
+    def _apply_output_gate(
         self,
         hidden_states: torch.Tensor,
-        attn_out: torch.Tensor,
+        attn_output: torch.Tensor,
     ) -> torch.Tensor:
+        # Sigmoid gate on o_proj's input. g_proj matches o_proj's input
+        # sharding, so the multiply composes with the helix-CP output
+        # projection.
         if self.use_output_gate:
-            attn_out = attn_out * self.g_proj(hidden_states).sigmoid()
-        return self.o_proj(attn_out)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
-        # _create_outputs() rather than create_output(): the base implementation
-        # takes a list so a sparse-attention backend can append its own buffers,
-        # and it routes through the sparse hooks when they are installed. The
-        # dense path this module uses is element 0.
-        attn_outputs = self._create_outputs(hidden_states, attn_metadata)
-        super().forward_impl(
-            None,
-            hidden_states,
-            attn_metadata,
-            attn_output=attn_outputs,
-        )
-        return self._apply_output_gate_and_o_proj(hidden_states, attn_outputs[0])
+            return attn_output * self.g_proj(hidden_states).sigmoid()
+        return attn_output

@@ -34,7 +34,8 @@
       "git_repository": "https://github.com/deepseek-ai/DeepGEMM",
       "git_tag": "8b1392b978f5a03c828dd1711090d7fb50958b8a",
       "git_submodules_recurse": true,
-      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+      "source_subdir": "dont-add-this-project-with-add-subdirectory",
+      "patch_file": "patches/deepgemm_configurable_barrier_timeout.patch"
     },
     {
       "name": "eigen",

@@ -29,7 +29,11 @@ from tensorrt_llm.mapping import Mapping
 @pytest.mark.parametrize("backend", ["pytorch"])
 @pytest.mark.parametrize("model_name", ["llama-3.1-model/Llama-3.1-8B-Instruct"])
 @pytest.mark.parametrize("attention_backend", ["VANILLA", "TRTLLM"])
-def test_model(backend, model_name, attention_backend):
+def test_model(backend, model_name, attention_backend, monkeypatch):
+    # RocketKV is a single-GPU path. Keep this test independent of MPI
+    # dynamic-process bootstrap so a cluster launch failure cannot mask the
+    # attention result.
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     model_dir = str(llm_models_root() / model_name)
     max_batch_size = 16
     max_output_tokens = 128

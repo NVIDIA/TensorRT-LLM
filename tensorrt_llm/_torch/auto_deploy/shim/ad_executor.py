@@ -22,7 +22,6 @@ from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.pyexecutor._util import get_decoding_mode
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
@@ -39,7 +38,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
-from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler, TRTLLMSampler
+from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
@@ -51,7 +50,7 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
 from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
-from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, MultimodalConfig, SamplerType
+from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, MultimodalConfig
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.mapping import Mapping
 
@@ -1079,17 +1078,6 @@ class ADEngine(ModelEngine):
         return outputs
 
 
-class TRTLLMSamplerModelConfig:
-    def __init__(self, vocab_size_padded: int):
-        self.config = SimpleNamespace()
-        self.config.vocab_size = vocab_size_padded
-
-        # Initialized to dummy values as they are not used in the C++ code underlying TRTLLMSampler.
-        self.config.num_hidden_layers = 42
-        self.config.hidden_size = 42
-        self.config.num_attention_heads = 42
-
-
 def instantiate_sampler(
     ad_config: LlmArgs,
     max_num_sequences: int,
@@ -1115,42 +1103,16 @@ def instantiate_sampler(
         )
         return SpecSampler(sampler_args)
 
-    sampler_type = ad_config.sampler_type
-    if sampler_type == SamplerType.auto:
-        sampler_type = SamplerType.TorchSampler
-
-    if sampler_type == SamplerType.TorchSampler:
-        # Regular TorchSampler for non-speculative decoding.
-        sampler_args = TorchSampler.Args(
-            max_seq_len=ad_config.max_seq_len,
-            max_draft_len=max_draft_len,
-            max_total_draft_tokens=max_total_draft_tokens,
-            max_num_sequences=max_num_sequences,
-            max_beam_width=ad_config.max_beam_width,
-            disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
-        )
-        sampler = TorchSampler(sampler_args)
-
-    elif sampler_type == SamplerType.TRTLLMSampler:
-        vocab_size_padded: int = engine.cache_seq_interface.info.vocab_size_padded
-        sampler_model_config = TRTLLMSamplerModelConfig(vocab_size_padded)
-        decoding_mode = get_decoding_mode(ad_config.decoding_config, ad_config.max_beam_width)
-        sampler = TRTLLMSampler(
-            model=sampler_model_config,
-            model_dtype=torch.bfloat16,  # hardcoded as bfloat16; does not seem necessary in C++ code.
-            mapping=dist_mapping,
-            decoding_mode=decoding_mode,
-            disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
-            max_seq_len=ad_config.max_seq_len,
-            max_batch_size=ad_config.max_batch_size,
-            max_beam_width=ad_config.max_beam_width,
-            decoding_config=ad_config.decoding_config,
-            kv_cache_config=ad_config.kv_cache_config,
-        )
-    else:
-        raise ValueError(f"Sampler type {sampler_type} is not supported.")
-
-    return sampler
+    # Regular TorchSampler for non-speculative decoding.
+    sampler_args = TorchSampler.Args(
+        max_seq_len=ad_config.max_seq_len,
+        max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
+        max_num_sequences=max_num_sequences,
+        max_beam_width=ad_config.max_beam_width,
+        disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
+    )
+    return TorchSampler(sampler_args)
 
 
 def create_autodeploy_executor(

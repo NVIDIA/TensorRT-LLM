@@ -244,8 +244,8 @@ class PenaltyHandler:
     force a logit to -inf (min_length, bad words, no-repeat-ngram) are a different
     kind of transform and live in ``TokenBanHandler``.
 
-    The implementation follows the C++ ``batchApplyPenalty`` kernel
-    (``cpp/tensorrt_llm/kernels/penaltyKernels.cu``) as driven by ``PenaltyLayer``.
+    The implementation follows the semantics of the former C++
+    ``batchApplyPenalty`` kernel as driven by ``PenaltyLayer``.
     Its persistent device state lives in :class:`PenaltyStore`, which documents the
     workspace semantics. Per-slot parameter buffers are filled once per request,
     batched across all requests admitted in a step (``prepare_for_new_request``

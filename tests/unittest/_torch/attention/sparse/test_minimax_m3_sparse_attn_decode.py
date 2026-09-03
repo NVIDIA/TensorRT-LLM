@@ -226,6 +226,54 @@ def test_sparse_decode_matches_reference(kv_dtype, num_kv_heads, group, decode_q
     torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
 
 
+@pytest.mark.parametrize(
+    ("num_kv_heads", "group", "decode_query_len"),
+    [(1, 8, 1), (2, 16, 1), (4, 4, 3)],
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[128], [1, 128, 129], [300, 1500, 2049, 4096]],
+    ids=["one-block", "short-mixed", "batch4"],
+)
+def test_sparse_decode_fp8_q_matches_prewidened_q(num_kv_heads, group, decode_query_len, seq_lens):
+    """FP8 q must give bitwise the same answer as a caller-widened BF16 q.
+
+    A fused QK-norm/RoPE producer emits E4M3 q, which the kernel widens
+    in-register so that no standalone widening kernel runs per sparse layer.
+    E4M3 -> BF16 is exact, so this is an equality rather than a tolerance; a
+    regression that let the narrow q reach tl.dot would run the whole attention
+    in FP8 and show up here immediately.
+    """
+    seq_lens = [max(s, decode_query_len) for s in seq_lens]
+    q, *rest = _make_inputs(
+        seq_lens,
+        kv_dtype=torch.float8_e4m3fn,
+        q_dtype=torch.float8_e4m3fn,
+        num_kv_heads=num_kv_heads,
+        group=group,
+        decode_query_len=decode_query_len,
+        seed=61,
+    )
+    k_paged, v_paged, topk_idx, block_table, seq_lens_dev = rest
+
+    def run(query):
+        out = torch.empty(q.shape, device="cuda", dtype=torch.bfloat16)
+        minimax_m3_sparse_attn_decode(
+            query,
+            k_paged,
+            v_paged,
+            topk_idx,
+            block_table,
+            seq_lens_dev,
+            sm_scale=HEAD_DIM**-0.5,
+            output=out,
+            decode_query_len=decode_query_len,
+        )
+        return out
+
+    torch.testing.assert_close(run(q), run(q.to(torch.bfloat16)), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("num_topk_chunks", [1, 2, 4, 8, 16])
 def test_sparse_decode_split_k_invariant(num_topk_chunks):
     """Flash-decoding must merge to the same answer for any split-K factor.

@@ -443,6 +443,9 @@ class KimiK3InputProcessor(KimiK25InputProcessor):
             "image": "<|kimi_image_placeholder|>",
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        # K3's reference renderer concatenates content parts with no
+        # separator; the default "\n" join skews prompt-token parity.
+        placeholders_separator="",
     ),
 )
 class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
@@ -455,6 +458,7 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     """
 
     _VISION_MODEL_CLS = KimiK3VisionModel
+    mamba_metadata_cls = KimiLinearForCausalLM.mamba_metadata_cls
 
     def __init__(
         self,

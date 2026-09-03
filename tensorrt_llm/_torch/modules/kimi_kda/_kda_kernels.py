@@ -27,9 +27,10 @@ from types import ModuleType
 from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from ..fla.index import prepare_chunk_indices
-from ..fla.l2norm import l2norm_fwd
 from . import _kda_decode
 
 try:
@@ -66,6 +67,202 @@ def get_kda_sm_version() -> int:
 def is_kda_optimized_supported() -> bool:
     """The optimized prefill/decode kernels are Blackwell sm_100 only."""
     return get_kda_sm_version() in (100, 103)
+
+
+@triton.jit(do_not_specialize=["num_tokens"])
+def _fused_kda_post_conv_kernel(
+    packed_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    num_tokens,
+    l2_norm_eps,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Normalize and transpose channel-major packed Q/K/V in one launch."""
+    token_offsets = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+    head_idx = tl.program_id(1)
+    dim_offsets = tl.arange(0, BLOCK_DIM)
+    token_mask = token_offsets < num_tokens
+    dim_mask = dim_offsets < HEAD_DIM
+    mask = token_mask[:, None] & dim_mask[None, :]
+
+    feature_offsets = head_idx * HEAD_DIM + dim_offsets
+    projection_size = NUM_HEADS * HEAD_DIM
+    num_tokens_i64 = num_tokens.to(tl.int64)
+    source_offsets = feature_offsets[None, :].to(tl.int64) * num_tokens_i64 + token_offsets[
+        :, None
+    ].to(tl.int64)
+    section_stride = projection_size * num_tokens_i64
+    output_offsets = (
+        token_offsets[:, None].to(tl.int64) * projection_size + feature_offsets[None, :]
+    )
+
+    q = tl.load(packed_ptr + source_offsets, mask=mask, other=0.0).to(tl.float32)
+    q /= tl.sqrt(tl.sum(q * q, axis=1) + l2_norm_eps)[:, None]
+    tl.store(q_out_ptr + output_offsets, q, mask=mask)
+
+    k = tl.load(
+        packed_ptr + section_stride + source_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    k /= tl.sqrt(tl.sum(k * k, axis=1) + l2_norm_eps)[:, None]
+    tl.store(k_out_ptr + output_offsets, k, mask=mask)
+
+    v = tl.load(
+        packed_ptr + 2 * section_stride + source_offsets,
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(v_out_ptr + output_offsets, v, mask=mask)
+
+
+def fused_kda_post_conv(
+    packed: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    l2_norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert packed channel-major convolution output to KDA Q/K/V.
+
+    ``packed`` has shape ``[3 * num_heads * head_dim, tokens]``. The
+    returned tensors are contiguous ``[1, tokens, num_heads, head_dim]``;
+    Q and K are L2-normalized along the head dimension.
+    """
+    projection_size = num_heads * head_dim
+    if packed.ndim != 2 or packed.shape[0] != 3 * projection_size:
+        raise ValueError(
+            "Packed KDA post-conv expected shape "
+            f"[{3 * projection_size}, tokens], got {tuple(packed.shape)}"
+        )
+    if not packed.is_contiguous():
+        raise ValueError("Packed KDA post-conv requires a contiguous tensor")
+
+    num_tokens = packed.shape[1]
+    output_shape = (1, num_tokens, num_heads, head_dim)
+    q_out = torch.empty(output_shape, dtype=packed.dtype, device=packed.device)
+    k_out = torch.empty_like(q_out)
+    v_out = torch.empty_like(q_out)
+    if num_tokens == 0:
+        return q_out, k_out, v_out
+
+    block_tokens = 16
+    block_dim = triton.next_power_of_2(head_dim)
+    grid = (triton.cdiv(num_tokens, block_tokens), num_heads)
+    _fused_kda_post_conv_kernel[grid](
+        packed,
+        q_out,
+        k_out,
+        v_out,
+        num_tokens,
+        l2_norm_eps,
+        num_heads,
+        head_dim,
+        block_tokens,
+        block_dim,
+        num_warps=8,
+        num_stages=3,
+    )
+    return q_out, k_out, v_out
+
+
+@triton.jit
+def _copy_kda_replay_conv_window_kernel(
+    conv_ptr,
+    q_cache_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    state_indices_ptr,
+    conv_stride_slot,
+    conv_stride_dim,
+    conv_stride_window,
+    cache_stride_slot,
+    cache_stride_dim,
+    cache_stride_window,
+    PROJECTION_SIZE: tl.constexpr,
+    COMMITTED: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    request = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < PROJECTION_SIZE * COMMITTED
+    dim = offsets // COMMITTED
+    window = offsets % COMMITTED
+    slot = tl.load(state_indices_ptr + request).to(tl.int64)
+
+    conv_offset = slot * conv_stride_slot + dim * conv_stride_dim + window * conv_stride_window
+    cache_offset = slot * cache_stride_slot + dim * cache_stride_dim + window * cache_stride_window
+    section_offset = PROJECTION_SIZE * conv_stride_dim
+    tl.store(q_cache_ptr + cache_offset, tl.load(conv_ptr + conv_offset, mask=mask), mask=mask)
+    tl.store(
+        k_cache_ptr + cache_offset,
+        tl.load(conv_ptr + conv_offset + section_offset, mask=mask),
+        mask=mask,
+    )
+    tl.store(
+        v_cache_ptr + cache_offset,
+        tl.load(conv_ptr + conv_offset + 2 * section_offset, mask=mask),
+        mask=mask,
+    )
+
+
+def copy_kda_replay_conv_window(
+    conv_pool: torch.Tensor,
+    q_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+) -> None:
+    """Copy selected packed ``W - 1`` rows into KDA replay caches.
+
+    The live convolution pool is ``[slots, 3D, W - 1]``. Replay caches are
+    ``[slots, D, W - 1 + num_spec]`` with a dim-contiguous inner layout.
+    """
+    if conv_pool.ndim != 3 or conv_pool.shape[1] % 3:
+        raise ValueError(f"Expected packed rank-3 KDA convolution pool, got {conv_pool.shape}")
+    projection_size = conv_pool.shape[1] // 3
+    committed = conv_pool.shape[2]
+    caches = (q_cache, k_cache, v_cache)
+    expected_prefix = (conv_pool.shape[0], projection_size)
+    if any(cache.ndim != 3 or cache.shape[:2] != expected_prefix for cache in caches):
+        raise ValueError("KDA replay convolution caches do not match the live pool geometry")
+    if any(cache.shape[2] < committed for cache in caches):
+        raise ValueError("KDA replay convolution caches are shorter than the committed window")
+    if any(cache.stride() != q_cache.stride() for cache in caches[1:]):
+        raise ValueError("KDA replay convolution caches must share one layout")
+    if state_indices.ndim != 1 or state_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("KDA replay state indices must be a rank-1 int32 or int64 tensor")
+    if any(tensor.device != conv_pool.device for tensor in (*caches, state_indices)):
+        raise ValueError("KDA replay convolution tensors must be on one device")
+    if state_indices.numel() == 0:
+        return
+
+    block_size = 256
+    grid = (
+        state_indices.numel(),
+        triton.cdiv(projection_size * committed, block_size),
+    )
+    with torch.cuda.device(conv_pool.device.index):
+        _copy_kda_replay_conv_window_kernel[grid](
+            conv_pool,
+            q_cache,
+            k_cache,
+            v_cache,
+            state_indices,
+            conv_pool.stride(0),
+            conv_pool.stride(1),
+            conv_pool.stride(2),
+            q_cache.stride(0),
+            q_cache.stride(1),
+            q_cache.stride(2),
+            PROJECTION_SIZE=projection_size,
+            COMMITTED=committed,
+            BLOCK_SIZE=block_size,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -304,8 +501,8 @@ class KDAKernelDispatch:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run KDA chunked prefill.
 
-        On the optimized path, beta sigmoid runs inside the in-tree CuTe DSL
-        op. Q/K L2 normalization uses the in-tree Triton kernels.
+        Q and K must be L2-normalized by the caller. On the optimized path,
+        beta sigmoid runs inside the in-tree CuTe DSL op.
 
         On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
         matching flags so the semantics are byte-equivalent.
@@ -349,9 +546,6 @@ class KDAKernelDispatch:
 
         if use_optimized:
             import torch.nn.functional as F
-
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
 
             real_T = q.shape[1]
             if cu_seqlens is not None:
@@ -411,7 +605,7 @@ class KDAKernelDispatch:
             scale=scale,
             initial_state=initial_state,
             output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
+            use_qk_l2norm_in_kernel=False,
             use_gate_in_kernel=True,
             use_beta_sigmoid_in_kernel=True,
             safe_gate=safe_gate,

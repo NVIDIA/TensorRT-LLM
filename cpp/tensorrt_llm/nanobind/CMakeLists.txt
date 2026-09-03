@@ -6,7 +6,6 @@ set(TRTLLM_NB_MODULE
 set(SRCS
     batch_manager/algorithms.cpp
     batch_manager/bindings.cpp
-    batch_manager/buffers.cpp
     batch_manager/cacheTransceiver.cpp
     batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
@@ -17,6 +16,7 @@ set(SRCS
     executor/bindings.cpp
     executor/executorConfig.cpp
     executor/request.cpp
+    kvCacheCompression/bindings.cpp
     process_group/bindings.cpp
     runtime/bindings.cpp
     runtime/hostfunc.cpp

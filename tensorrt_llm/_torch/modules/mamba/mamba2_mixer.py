@@ -177,6 +177,23 @@ class Mamba2Mixer(nn.Module):
         self._use_mtp_custom_op = os.environ.get(
             "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
 
+        # in_proj emits token-major and the SSD consumes token-major; the two
+        # transposes around the prefill conv exist only to satisfy the
+        # channel-major kernel's layout. The channel-last kernel takes its
+        # strides off the tensors, so feeding it a channel-last view of the
+        # projection removes both transposes without adding a kernel.
+        #
+        # The transposes, not the convolution, are the bulk of that block: on
+        # B300 at ISL 32k they cost as much as the conv itself, so dropping them
+        # takes the block from 27.5ms to 12.9ms per prefill (23 layers), of which
+        # only 0.8ms comes from the kernel swap itself.
+        #
+        # Results move by up to one bf16 ulp -- the layout change is bit-exact,
+        # the accumulation order is not. Set TRTLLM_MAMBA_TOKEN_MAJOR_CONV=0 to
+        # fall back to the channel-major kernel plus transposes.
+        self._token_major_conv = os.environ.get("TRTLLM_MAMBA_TOKEN_MAJOR_CONV",
+                                                "1") == "1"
+
         if self._use_flashinfer:
             logger.info_once("Using flashinfer for selective state update",
                              key="selective_state_update")
@@ -348,28 +365,71 @@ class Mamba2Mixer(nn.Module):
             has_initial_states = mamba_metadata.has_initial_states[:
                                                                    num_prefills]
 
-            # Fused kernel to avoid expensive .contiguous() call in causal_conv1d_fn.
-            xbc_p_t = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens,
-                                                    self.tp_d_inner,
-                                                    self.tp_conv_dim)
-            xbc_p = causal_conv1d_fn(xbc_p_t,
-                                     self.conv1d.weight,
-                                     self.conv1d.bias,
-                                     activation="silu",
-                                     conv_states=conv_states,
-                                     has_initial_state=has_initial_states,
-                                     query_start_loc=cu_seqlens,
-                                     cache_indices=state_indices_p)
+            if self._token_major_conv:
+                # in_proj emits token-major, and the SSD wants token-major, so
+                # the two transposes around the conv only exist to satisfy the
+                # channel-major kernel's layout. The channel-last kernel takes
+                # its strides off the tensors, so feeding it a channel-last
+                # *view* of the projection and asking it to write token-major
+                # removes both transposes without adding any kernel.
+                #
+                # `out` must not alias `x`: the kernel splits each sequence into
+                # token chunks and every chunk reads a halo the previous one
+                # wrote, so writing back over the input would race across blocks.
+                xbc_p_t = zxbcdt[:num_prefill_tokens,
+                                 self.tp_d_inner:self.tp_d_inner +
+                                 self.tp_conv_dim].t()
+                xbc_p_out = torch.empty(num_prefill_tokens,
+                                        self.tp_conv_dim,
+                                        dtype=zxbcdt.dtype,
+                                        device=zxbcdt.device).t()
+                causal_conv1d_fn(
+                    xbc_p_t,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    query_start_loc=cu_seqlens,
+                    cache_indices=state_indices_p,
+                    has_initial_state=has_initial_states,
+                    conv_states=conv_states,
+                    activation="silu",
+                    out=xbc_p_out,
+                )
+                # Token-major result: x/B/C are plain views, no split kernel.
+                xbc_p_tm = xbc_p_out.t()
+                bc = self.tp_ngroups * self.d_state
+                x_p = xbc_p_tm[:, :self.tp_d_inner].view(
+                    num_prefill_tokens, self.tp_nheads,
+                    self.head_dim).unsqueeze(0)
+                B_p = xbc_p_tm[:, self.tp_d_inner:self.tp_d_inner + bc].view(
+                    num_prefill_tokens, self.tp_ngroups,
+                    self.d_state).unsqueeze(0)
+                C_p = xbc_p_tm[:, self.tp_d_inner + bc:].view(
+                    num_prefill_tokens, self.tp_ngroups,
+                    self.d_state).unsqueeze(0)
+            else:
+                # Fused kernel to avoid expensive .contiguous() call in causal_conv1d_fn.
+                xbc_p_t = extract_transpose_xbc_prefill(zxbcdt,
+                                                        num_prefill_tokens,
+                                                        self.tp_d_inner,
+                                                        self.tp_conv_dim)
+                xbc_p = causal_conv1d_fn(xbc_p_t,
+                                         self.conv1d.weight,
+                                         self.conv1d.bias,
+                                         activation="silu",
+                                         conv_states=conv_states,
+                                         has_initial_state=has_initial_states,
+                                         query_start_loc=cu_seqlens,
+                                         cache_indices=state_indices_p)
 
-            # Fused kernel to avoid expensive .contiguous() calls after split/rearrange.
-            x_p, B_p, C_p = fused_split_rearrange_after_conv1d(
-                xbc_p,
-                self.tp_d_inner,
-                self.tp_ngroups,
-                self.d_state,
-                self.tp_nheads,
-                self.head_dim,
-            )
+                # Fused kernel to avoid expensive .contiguous() calls after split/rearrange.
+                x_p, B_p, C_p = fused_split_rearrange_after_conv1d(
+                    xbc_p,
+                    self.tp_d_inner,
+                    self.tp_ngroups,
+                    self.d_state,
+                    self.tp_nheads,
+                    self.head_dim,
+                )
             dt_p = dt_p.unsqueeze(0)
 
             initial_states = None

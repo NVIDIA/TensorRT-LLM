@@ -16,12 +16,12 @@ from tensorrt_llm._torch.models.modeling_qwen3_next import (
     Qwen3NextSparseMoeBlock,
 )
 from tensorrt_llm._torch.modules.attention import Attention
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.mamba.mamba2_mixer import Mamba2Mixer
 from tensorrt_llm._torch.modules.mhc.hyper_connection import mHC
 from tensorrt_llm._torch.modules.mla import MLA
+from tensorrt_llm._torch.moe.fused_moe.interface import MoE
 
 
 def mark_ranges():
@@ -36,9 +36,10 @@ def mark_ranges():
         Qwen3NextSparseMoeBlock.forward
     )
     # Kimi K3. KDA runs directly through `KimiKDALinearAttention`.
-    # `KimiK3MLAAttention` overrides `MLA.forward`, so its range is on the
-    # `KimiMLARuntime` wrapper. The gate is entered through `compute_logits`,
-    # not `forward`. Its MLPs are the shared `GatedMLP`.
+    # `KimiK3MLAAttention` runs the shared `MLA.forward`, annotated below; the
+    # `KimiMLARuntime` range bounds the attention-plus-reduction around it. The
+    # gate is entered through `compute_logits`, not `forward`. Its MLPs are the
+    # shared `GatedMLP`.
     KimiKDALinearAttention.forward = nvtx.annotate("KimiKDALinearAttention")(
         KimiKDALinearAttention.forward
     )

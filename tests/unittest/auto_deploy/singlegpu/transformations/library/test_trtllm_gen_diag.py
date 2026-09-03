@@ -88,7 +88,7 @@ def test_compare_module_vs_ad_weight_processing():
     """Compare processed weights/scales from AD fusion with module processing."""
     import torch
 
-    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+    from tensorrt_llm._torch.moe.fused_moe.quantization import (
         trtllmgen_maybe_get_cached_w3_w1_permute_indices,
     )
     from tensorrt_llm.quantization.utils.fp4_utils import (
@@ -192,11 +192,11 @@ def test_direct_kernel_call():
     """Call fp4_block_scale_moe_runner directly with module-processed weights."""
     import torch
 
-    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+    from tensorrt_llm._torch.moe.fused_moe.quantization import (
         trtllmgen_maybe_get_cached_w2_permute_indices,
         trtllmgen_maybe_get_cached_w3_w1_permute_indices,
     )
-    from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
+    from tensorrt_llm._torch.moe.fused_moe.routing import RoutingMethodType
 
     device = "cuda"
     dtype = torch.bfloat16
@@ -393,7 +393,7 @@ def test_verify_actual_ad_tensors():
     """Extract and verify the actual tensors the AD fusion produces."""
     import torch
 
-    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+    from tensorrt_llm._torch.moe.fused_moe.quantization import (
         trtllmgen_maybe_get_cached_w2_permute_indices,
         trtllmgen_maybe_get_cached_w3_w1_permute_indices,
     )

@@ -147,6 +147,7 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+openengine_deps, _ = parse_requirements(Path("requirements-openengine.txt"))
 mx_deps = ["modelexpress>=0.4.1,<0.6.0"]
 # Gateway protocol adapters are opt-in extras: the default installation must
 # not carry any gateway protobuf package. Each gateway owns a dedicated
@@ -563,6 +564,7 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps + grpc_smg_deps,
+        "openengine": openengine_deps,
         "mx": mx_deps,
         "grpc-smg": grpc_smg_deps,
     },

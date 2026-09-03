@@ -105,7 +105,9 @@ def _infer_generation_mode(client_config: dict[str, Any]) -> str:
         except json.JSONDecodeError:
             extra_body = None
 
-    if isinstance(extra_body, dict) and "input_reference" in extra_body:
+    if isinstance(extra_body, dict) and (
+        "image_reference" in extra_body or "video_reference" in extra_body
+    ):
         return "i2v"
 
     if backend == "openai-videos":

@@ -245,7 +245,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     # the overall TRT-LLM test quality metrics. Skip per-sub-test reporting
     # for MoE by prefixing with "moe-" (CI only collects files starting
     # with "results" for JUnit reporting).
-    if case.startswith("unittest/_torch/modules/moe/"):
+    case_path = case.rstrip("/")
+    if case_path == "unittest/_torch/moe" or case_path.startswith(
+            "unittest/_torch/moe/"):
         output_xml = os.path.join(output_dir,
                                   f'moe-results-sub-unittests-{case_fn}.xml')
     else:

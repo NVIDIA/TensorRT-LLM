@@ -185,10 +185,11 @@ def request_random_seed(request: LlmRequest) -> Optional[int]:
 def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     sampling_config = request.sampling_config
     # These sampling fields live on the C++ SamplingConfig as optional<vector<T>>
-    # (a shape designed for the batched TRT-LLM sampler); the torch sampler consumes
-    # them per request, so we unwrap the singleton lists into scalars here. When the
-    # TRT-LLM sampler is removed, this SamplingConfig-based plumbing should be removed
-    # too in favor of reading the values directly from the per-request params.
+    # (a shape inherited from the batched C++ decoder that has since been
+    # removed); the torch sampler consumes them per request, so we unwrap the
+    # singleton lists into scalars here.
+    # TODO: drop this SamplingConfig-based plumbing in favor of reading the
+    # values directly from the per-request params.
     temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
     top_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p))
     top_k = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_k))

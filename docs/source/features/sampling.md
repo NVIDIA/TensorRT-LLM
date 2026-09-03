@@ -17,27 +17,7 @@ The PyTorch backend supports a wide variety of features, listed below:
 
 ## General usage
 
-There are two sampling backends available.
-
-* Torch Sampler
-* TRTLLM Sampler (deprecated)
-
-Torch Sampler is used by default and supports a superset of features of TRTLLM Sampler. TRTLLM Sampler will be removed in release 1.4.
-One can specify which sampler to use explicitly with:
-
-```python
-from tensorrt_llm import LLM
-
-# Chooses TorchSampler explicitly
-llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
-          sampler_type="TorchSampler")
-
-# Chooses TRTLLMSampler explicitly
-llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
-          sampler_type="TRTLLMSampler")
-```
-
-By default, the sampling backend is chosen to be `auto`. This will use Torch Sampler for all requests.
+TorchSampler is the only sampler; the `sampler_type` argument and the TRTLLM Sampler it selected have been removed. `sampler_type="auto"` and `sampler_type="TorchSampler"` are still accepted and ignored, while `sampler_type="TRTLLMSampler"` is rejected. When migrating off TRTLLM Sampler, also review the settings tuned for it, notably `logprobs`: under TorchSampler, `logprobs=0` returns the sampled token's log probability.
 
 Here is an example to run a model with basic usage of sampling parameters. This example prepares two identical prompts which will give different results due to the sampling parameters chosen:
 

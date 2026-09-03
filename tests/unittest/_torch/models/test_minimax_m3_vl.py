@@ -47,6 +47,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
     reanchor_multimodal_checkpoint_keys,
     split_multimodal_weights,
 )
+from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 
 # ---------------------------------------------------------------------------
 # Shared helpers (mirror the conventions used by test_minimax_m3.py).
@@ -230,6 +231,24 @@ def test_minimax_vl_vision_model_param_shapes_match_checkpoint():
     pm2 = state_dict["patch_merge_mlp.linear_2.weight"]
     assert tuple(pm1.shape) == (6144, 6144 * 4)
     assert tuple(pm2.shape) == (6144, 6144)
+
+
+def test_minimax_vl_vision_model_supports_meta_init():
+    config_dict = _make_vision_config_dict()
+    config_dict["num_hidden_layers"] = 2
+    cfg = CLIPVisionConfig.from_dict_or_obj(config_dict)
+
+    with MetaInitMode():
+        model = MiniMaxVLVisionModel(
+            config=cfg,
+            text_hidden_size=6144,
+            projector_hidden_size=6144,
+            dtype=torch.bfloat16,
+        )
+
+    parameters = list(model.parameters())
+    assert parameters
+    assert all(parameter.is_meta for parameter in parameters)
 
 
 # ---------------------------------------------------------------------------

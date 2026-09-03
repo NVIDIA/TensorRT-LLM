@@ -18,11 +18,11 @@ Key differences from FLUX.1:
 - 4-axis RoPE: (32, 32, 32, 32) instead of 3-axis
 """
 
-import io
 import json
 import os
 import time
 from contextlib import contextmanager
+from io import BytesIO
 from typing import Any, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
@@ -44,7 +44,7 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     register_extractor_from_config,
 )
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.logger import logger
 
@@ -370,12 +370,24 @@ class Flux2Pipeline(BasePipeline):
             "max_sequence_length": 512,
         }
 
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        # Unbounded: one prompt can reference several subjects. FLUX.2 also
+        # runs plain text-to-image with no reference at all.
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="reference", min=0, max=None)],
+            )
+        }
+
     def prepare_request(self, req: Any) -> None:
         """Load and preprocess reference images before warmup bookkeeping."""
-        if req.params.image is None:
+        refs = req.params.image_reference
+        if not refs:
             return
 
-        reference_images = self._load_reference_images(req.params.image)
+        reference_images = self._load_reference_images([r.content for r in refs])
         condition_images = self._preprocess_reference_images(reference_images)
         req.params.height, req.params.width = self._resolve_target_dimensions(
             req.params.height,
@@ -386,6 +398,7 @@ class Flux2Pipeline(BasePipeline):
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""
+        refs = req.params.image_reference
         return self.forward(
             prompt=req.prompt,
             height=req.params.height,
@@ -395,7 +408,7 @@ class Flux2Pipeline(BasePipeline):
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             num_images_per_prompt=req.params.num_images_per_prompt,
-            image=req.params.image,
+            image=[r.content for r in refs] if refs else None,
             _condition_images=req.prepared_inputs.get("condition_images"),
         )
 
@@ -413,9 +426,8 @@ class Flux2Pipeline(BasePipeline):
         image: Optional[
             Union[
                 PIL.Image.Image,
-                str,
                 bytes,
-                List[Union[PIL.Image.Image, str, bytes]],
+                List[Union[PIL.Image.Image, bytes]],
             ]
         ] = None,
         _condition_images: Optional[List[torch.Tensor]] = None,
@@ -438,8 +450,9 @@ class Flux2Pipeline(BasePipeline):
                 Each prompt's embeddings are repeated and independent noise is
                 sampled, producing N different images per prompt.
             image: Reference image or shared list of reference images for
-                image conditioning. Public ``VisualGenParams`` requests use
-                file paths or encoded bytes; direct calls may also use PIL images.
+                image conditioning. References arrive here as encoded bytes,
+                whatever wire form the request declared; direct calls may also
+                use PIL images.
 
         Returns:
             PipelineOutput with image tensor (B, H, W, C) where
@@ -741,12 +754,11 @@ class Flux2Pipeline(BasePipeline):
     def _load_reference_images(
         image: Union[
             PIL.Image.Image,
-            str,
             bytes,
-            List[Union[PIL.Image.Image, str, bytes]],
+            List[Union[PIL.Image.Image, bytes]],
         ],
     ) -> List[PIL.Image.Image]:
-        """Normalize supported reference-image inputs to materialized RGB images."""
+        """Normalize supported reference-image inputs to decoded RGB images."""
         inputs = image if isinstance(image, list) else [image]
         if not inputs:
             raise ValueError("`image` must contain at least one reference image.")
@@ -756,15 +768,11 @@ class Flux2Pipeline(BasePipeline):
             try:
                 if isinstance(item, PIL.Image.Image):
                     images.append(item.convert("RGB"))
-                elif isinstance(item, str):
-                    with PIL.Image.open(item) as loaded:
-                        images.append(loaded.convert("RGB"))
                 elif isinstance(item, bytes):
-                    with PIL.Image.open(io.BytesIO(item)) as loaded:
-                        images.append(loaded.convert("RGB"))
+                    images.append(PIL.Image.open(BytesIO(item)).convert("RGB"))
                 else:
                     raise ValueError(
-                        "Reference images must be PIL images, file paths, or encoded bytes; "
+                        "Reference images must be PIL images or encoded bytes; "
                         f"item {index} has type {type(item).__name__}."
                     )
             except OSError as exc:

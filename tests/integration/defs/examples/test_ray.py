@@ -19,6 +19,7 @@ except ImportError:
 import pytest
 from defs.common import venv_check_call, wait_for_server
 from defs.conftest import get_device_count, llm_models_root
+from defs.disaggregated.test_disaggregated import get_ucx_tls
 from defs.trt_test_alternative import popen
 
 
@@ -188,7 +189,12 @@ def _run_ray_disaggregated_serving(ray_example_root, tp_size,
         env_copy = os.environ.copy()
         env_copy.update({
             "RAY_ADDRESS": f"localhost:{ray_port}",
-            "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0"
+            "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0",
+            # UCX transport allowlist must match test_disaggregated.py: with
+            # UCX auto-selection the NIXL agent AM channel can pick an IB
+            # loopback path that times out on some DGX nodes, turning into a
+            # permanent request hang (https://nvbugs/6670614).
+            "UCX_TLS": get_ucx_tls(),
         })
         with popen(
             [

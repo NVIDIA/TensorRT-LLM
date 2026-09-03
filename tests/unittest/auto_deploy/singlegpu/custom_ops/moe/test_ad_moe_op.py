@@ -20,7 +20,7 @@ from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_availab
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
-from tensorrt_llm._torch.modules.fused_moe import MoE  # noqa: F401
+from tensorrt_llm._torch.moe.fused_moe import MoE  # noqa: F401
 
 
 def setup_moe_test(dtype, num_experts):

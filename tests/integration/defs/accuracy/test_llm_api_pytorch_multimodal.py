@@ -33,6 +33,7 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (
     get_sm_version,
+    is_sm_100f,
     llm_models_root,
     skip_post_blackwell_ultra,
     skip_pre_blackwell,
@@ -227,7 +228,10 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
-@pytest.mark.skip_device_not_contain(["B200"])
+@pytest.mark.skipif(
+    not is_sm_100f(),
+    reason="Gemma4 shared-KV MTP requires FlashInfer trtllm-gen on the SM100 family",
+)
 class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"

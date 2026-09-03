@@ -50,6 +50,10 @@ verl_config:
     - "PATH=\"${NVSHMEM_DIR}/bin:$PATH\""
     - "TRTLLM_TEST_MODEL_PATH_ROOT=/tmp/verl-models"
     - "TORCH_CUDA_ARCH_LIST="
+    # A verl-side switch that TRT-LLM never reads. Besides the removed
+    # sampler_type, it also selects verl's rollout config (end_id, detokenize,
+    # logprobs), so it must be set for that config to match TorchSampler.
+    - "TLLM_USE_TORCHSAMPLER=1"
 
   # Read-only CI model cache (flat layout: /scratch.../ModelName)
   ci_model_cache: "/scratch.trt_llm_data/llm-models"

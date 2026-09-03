@@ -41,7 +41,7 @@ from typing import Optional
 
 from blocks import Stage, YAMLIndex, _entry_target
 
-from ._helpers import resolve_affected_stages, stages_by_yaml_stem
+from ._helpers import is_perf_stem, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 
 # VG source-path prefixes the rule may claim, mirroring the VisualGen
@@ -98,10 +98,6 @@ def _entry_is_vg(entry: str) -> bool:
 
 def _vg_entries(block) -> list[str]:
     return [t for t in block.tests if _entry_is_vg(t)]
-
-
-def _is_perf_stem(stem: str) -> bool:
-    return stem == "l0_perf" or "perf_sanity" in stem
 
 
 class VisualGenRule(Rule):
@@ -162,7 +158,7 @@ class VisualGenRule(Rule):
             )
 
         affected = resolve_affected_stages(block_filters, self.yaml_index, self._stages_by_yaml)
-        perfsanity_relevant = any(_is_perf_stem(stem) for stem, _ in block_filters)
+        perfsanity_relevant = any(is_perf_stem(stem) for stem, _ in block_filters)
 
         return RuleResult(
             handled_files=claimed,

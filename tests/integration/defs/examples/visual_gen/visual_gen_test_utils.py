@@ -411,7 +411,7 @@ def _cleanup_cuda():
 
 @contextlib.contextmanager
 def _lpips_pinned_fp32_matmul_precision() -> Iterator[None]:
-    """Pin fp32-matmul arithmetic so LPIPS goldens are portable across hosts.
+    """Pin fp32-matmul arithmetic so LPIPS goldens are portable across torch stacks.
 
     NGC PyTorch containers default matmul TF32 on (``float32_matmul_precision
     == "high"``); PyPI torch defaults it off (``"highest"``). A model with fp32
@@ -420,9 +420,17 @@ def _lpips_pinned_fp32_matmul_precision() -> Iterator[None]:
     ``transformer_cosmos3.py``) therefore produces a different trajectory under
     each default, and a golden cut under one fails under the other -- measured
     LPIPS-to-golden moved 0.132 -> 0.054 from this single flag. Pin "highest"
-    (IEEE fp32, measured bit-stable across torch 2.11/2.12 and B200/B300), and
-    pin cuDNN TF32 to its universal default so the second knob cannot drift.
-    bf16 compute -- all of the heavy kernels -- is unaffected by either knob.
+    (IEEE fp32, measured bit-stable across torch 2.11/2.12), and pin cuDNN TF32
+    to its universal default so the second knob cannot drift. bf16 compute --
+    all of the heavy kernels -- is unaffected by either knob.
+
+    The pin's contract stops at the torch stack: it does NOT make trajectories
+    bit-stable across GPU steppings. Kernel selection differs between sm100 and
+    sm103, and the divergence compounds along the denoising trajectory --
+    B300-cut Cosmos3-Nano media measured LPIPS 0.02 (1 frame) to 0.15 (189
+    frames) on B200 with everything else held fixed (nvbugs/6655359). Golden
+    thresholds must therefore sit above the measured cross-stepping floor of
+    their own trajectory, or the media must be cut on the gating lane's GPU.
 
     Applied per generation path rather than from
     ``_lpips_deterministic_algorithms``: that helper also wraps generation for

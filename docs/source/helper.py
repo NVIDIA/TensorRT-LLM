@@ -1,13 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import importlib.util
+import inspect
 import logging
 import os
 import re
 from dataclasses import dataclass
 from itertools import chain, groupby
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import pygit2
+
+if TYPE_CHECKING:
+    from sphinx.application import Sphinx
+
+LLMAPI_REFERENCE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _is_llmapi_search_entry(name: str, options: object) -> bool:
+    return (name.startswith("tensorrt_llm.llmapi.")
+            and getattr(options, "no_index", False) is True)
+
+
+def compact_llmapi_search_signature(
+        app: "Sphinx", what: str, name: str, obj: object, options: object,
+        signature: Optional[str], return_annotation: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """Keep only parameter names in the searchable LLM API index."""
+    if not _is_llmapi_search_entry(name, options):
+        return signature, return_annotation
+
+    try:
+        object_signature = inspect.signature(obj)
+    except (TypeError, ValueError):
+        return signature, return_annotation
+
+    empty = inspect.Parameter.empty
+    parameters = [
+        parameter.replace(annotation=empty, default=empty)
+        for parameter in object_signature.parameters.values()
+    ]
+    return str(
+        object_signature.replace(parameters=parameters,
+                                 return_annotation=empty)), None
+
+
+def strip_llmapi_search_docstrings(app: "Sphinx", what: str, name: str,
+                                   obj: object, options: object,
+                                   lines: list[str]) -> None:
+    """Leave full docstrings on detail pages, not the searchable index."""
+    if _is_llmapi_search_entry(name, options):
+        lines.clear()
 
 
 def underline(title: str, character: str = "=") -> str:
@@ -338,6 +383,13 @@ def generate_llmapi():
     doc_dir = root_dir / "docs/source/llm-api"
     doc_dir.mkdir(exist_ok=True)
     doc_path = doc_dir / "reference.rst"
+    reference_dir = doc_dir / "reference"
+    reference_dir.mkdir(exist_ok=True)
+
+    # This directory contains generated API pages only. Remove stale pages when
+    # public symbols are renamed or removed between builds.
+    for old_page in reference_dir.glob("*.rst"):
+        old_page.unlink()
 
     llmapi_all_file = root_dir / "tensorrt_llm/llmapi/__init__.py"
     public_classes_names = extract_all_and_eval(llmapi_all_file)['__all__']
@@ -350,6 +402,33 @@ def generate_llmapi():
     content += '    3. :tag:`beta` - The item is in beta and approaching stability.\n'
     content += '    4. :tag:`deprecated` - The item is deprecated and will be removed in a future release.\n'
     content += "\n"
+    content += """.. raw:: html
+
+    <script>
+      (() => {
+        const prefix = "#tensorrt_llm.llmapi.";
+        if (!window.location.hash.startsWith(prefix)) {
+          return;
+        }
+
+        const symbol = window.location.hash.slice(prefix.length).split(".", 1)[0];
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(symbol)) {
+          return;
+        }
+
+        const target = new URL(
+          `reference/${symbol}.html${window.location.hash}`,
+          window.location.href,
+        );
+        window.location.replace(target);
+      })();
+    </script>
+
+"""
+    content += ".. toctree::\n"
+    content += "    :hidden:\n"
+    content += "    :maxdepth: 1\n\n"
+    search_content = ""
 
     for cls_name in public_classes_names:
         cls_name = cls_name.strip()
@@ -367,10 +446,49 @@ def generate_llmapi():
             options.append(
                 f"    :exclude-members: {','.join(get_pydantic_methods())}")
 
-        content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
-        content += "\n".join(options) + "\n\n"
+        page_content = underline(cls_name) + "\n\n"
+        page_content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
+        page_content += "\n".join(options) + "\n"
+        with open(reference_dir / f"{cls_name}.rst", "w+") as f:
+            f.write(page_content)
+
+        content += f"    reference/{cls_name}\n"
+
+        # Keep compact signatures on the landing page so browser find can
+        # search parameter names. Sphinx callbacks remove class docstrings and
+        # annotations and defaults here; detail pages retain the complete
+        # documentation.
+        search_content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
+        search_content += "    :no-index:\n\n"
+        search_content += (
+            f"    :doc:`View the full {cls_name} reference <reference/{cls_name}>`\n\n"
+        )
+
+    content += "\n" + (
+        "This page provides a searchable index of API names and parameters. "
+        "Open an entry's full reference for complete member and inheritance "
+        "documentation.\n\n")
+    content += search_content
+
     with open(doc_path, "w+") as f:
         f.write(content)
+
+
+def check_llmapi_reference_size(app: "Sphinx",
+                                exception: Optional[Exception]) -> None:
+    """Prevent the searchable LLM API landing page from growing too large."""
+    if exception is not None or app.builder.name != "html":
+        return
+
+    reference_path = Path(app.outdir) / "llm-api/reference.html"
+    if not reference_path.is_file():
+        return
+
+    reference_size = reference_path.stat().st_size
+    if reference_size > LLMAPI_REFERENCE_MAX_BYTES:
+        raise RuntimeError(
+            f"{reference_path} is {reference_size} bytes; the maximum is "
+            f"{LLMAPI_REFERENCE_MAX_BYTES} bytes")
 
 
 def update_version():

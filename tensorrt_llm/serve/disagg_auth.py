@@ -97,5 +97,7 @@ def validate_internal_disagg_request(
 
     expected = _sign_request(internal_disagg_auth_key, request)
     provided = None if headers is None else headers.get(INTERNAL_DISAGG_AUTH_HEADER)
-    if provided is None or not hmac.compare_digest(provided, expected):
+    if provided is None or not hmac.compare_digest(
+        provided.encode("utf-8"), expected.encode("utf-8")
+    ):
         raise ValueError("Invalid internal disaggregated request authentication")

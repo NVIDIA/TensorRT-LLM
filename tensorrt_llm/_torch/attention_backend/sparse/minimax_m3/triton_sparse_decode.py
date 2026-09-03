@@ -41,6 +41,12 @@ SPARSE_BLOCK_SIZE = 128
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
+_TL_DTYPES = {
+    torch.bfloat16: tl.bfloat16,
+    torch.float16: tl.float16,
+    torch.float32: tl.float32,
+}
+
 # Total CTAs the split-K partitioning aims for before it stops splitting.
 _TARGET_GRID = 256
 
@@ -99,6 +105,8 @@ def _gqa_sparse_decode_kernel(
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     USE_SCALE: tl.constexpr,  # apply the scalar dequant scale to an fp8 cache
+    WIDEN_Q: tl.constexpr,  # q arrives FP8 and is widened in-register
+    COMPUTE_DTYPE: tl.constexpr,  # dtype q is widened to; drives the QK/PV math
     USE_PDL: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -147,6 +155,12 @@ def _gqa_sparse_decode_kernel(
         mask=hd_mask,
         other=0.0,
     )
+    # Widen before anything reads q.dtype: K, V and p are all cast to it below,
+    # so leaving q narrow would silently run the whole attention in FP8 and
+    # quantize the softmax probabilities. E4M3 -> BF16 is exact, so the result
+    # matches a caller that widened q itself before the call.
+    if WIDEN_Q:
+        q = q.to(COMPUTE_DTYPE)
     kv_scale = tl.load(kv_scale_ptr) if USE_SCALE else 1.0
 
     cur_idx_ptr = t_ptr + pid_kh * stride_th + pid_b * stride_tn + chunk_start * stride_tk
@@ -289,6 +303,11 @@ def minimax_m3_sparse_attn_decode(
 ) -> None:
     """Block-sparse GQA decode attention, written into output in place.
 
+    q may be FP8, as a fused QK-norm/RoPE producer emits it. The kernel widens
+    it to output.dtype in-register rather than making the caller materialize a
+    widened copy, which would cost a standalone kernel on every sparse layer.
+    The attention math is unchanged either way, since E4M3 widens exactly.
+
     kv_scale is an optional scalar dequantization factor for an FP8 cache;
     MiniMax-M3 stores unscaled E4M3, so it is normally None. num_topk_chunks
     overrides the split-K factor and exists for tests: the merged result must
@@ -311,6 +330,14 @@ def minimax_m3_sparse_attn_decode(
     use_scale = k_paged.dtype in _FP8_DTYPES and kv_scale is not None
     # Triton needs a real pointer even for the unused argument.
     scale_arg = kv_scale if use_scale else output
+
+    widen_q = q.dtype in _FP8_DTYPES
+    if widen_q and output.dtype not in _TL_DTYPES:
+        raise ValueError(
+            f"MiniMax-M3 sparse decode cannot widen FP8 q into {output.dtype}; "
+            f"supported compute dtypes are {sorted(d.__str__() for d in _TL_DTYPES)}."
+        )
+    compute_dtype = _TL_DTYPES[output.dtype] if widen_q else tl.float32
 
     if num_topk_chunks is None:
         num_topk_chunks = resolve_num_topk_chunks(total_q, num_kv_heads, max_topk)
@@ -379,6 +406,8 @@ def minimax_m3_sparse_attn_decode(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
         USE_SCALE=use_scale,
+        WIDEN_Q=widen_q,
+        COMPUTE_DTYPE=compute_dtype,
         USE_PDL=use_pdl,
         **pdl_launch,
     )

@@ -25,8 +25,8 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.attention_backend.interface import RopeParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import (
-    DFlashForCausalLM,
     Eagle3ForCausalLM,
     SpecDecOneEngineForCausalLM,
 )
@@ -301,7 +301,7 @@ def test_dflash_attention_mask_args():
     assert wrapper._get_attention_mask_args(1) == (False, (-1, -1))
     assert wrapper._get_attention_mask_args(2) == (True, (4095, 0))
 
-    with patch("tensorrt_llm._torch.models.modeling_speculative.logger.warning") as warning:
+    with patch("tensorrt_llm._torch.models.modeling_dflash.logger.warning") as warning:
         wrapper._warn_inferred_attention_windows()
     warning.assert_not_called()
 
@@ -344,7 +344,7 @@ def test_dflash_attention_mask_args():
     for layer_idx in range(5):
         assert laguna_wrapper._get_attention_mask_args(layer_idx) == (True, (511, 0))
 
-    with patch("tensorrt_llm._torch.models.modeling_speculative.logger.warning") as warning:
+    with patch("tensorrt_llm._torch.models.modeling_dflash.logger.warning") as warning:
         laguna_wrapper._warn_inferred_attention_windows()
     warning.assert_called_once_with(
         "DFlash inferred pooled-context sliding-window attention from checkpoint "

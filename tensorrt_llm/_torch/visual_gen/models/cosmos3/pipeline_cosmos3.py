@@ -18,10 +18,12 @@ import json
 import math
 import os
 import time
+from io import BytesIO
 from typing import Any, Iterable, List, Optional, Union
 
 import PIL.Image
 import torch
+import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer
@@ -36,7 +38,7 @@ except ImportError:  # pragma: no cover - tqdm is optional at runtime.
 
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import load_wan_vae
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import (
     classify_worker_error,
@@ -44,7 +46,7 @@ from tensorrt_llm._torch.visual_gen.utils import (
     synchronize_media_prepare_status,
 )
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.inputs.utils import load_image
+from tensorrt_llm.inputs.media_io import convert_image_mode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.decoding import decode_video_reference_window, video_stream_info
 
@@ -136,6 +138,22 @@ COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolutio
 
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
+# Public offload component names for the two transformer towers. The "reasoner"
+# (understanding) pathway is the causal language model that processes text; the
+# "generator" (generation) pathway is the stack of cross-attention layers that
+# produces video tokens. Only the heavy decoder-layer ModuleLists are offloaded;
+# the small shared embeddings/projections/norms stay resident on GPU.
+COSMOS3_REASONER_OFFLOAD_COMPONENT = "reasoner"
+COSMOS3_GENERATOR_OFFLOAD_COMPONENT = "generator"
+# Opt-in guardrail offload components (rank 0 only): the Qwen3Guard text checker and
+# the RetinaFace video face-blur model. Kept out of the CPU defaults below.
+COSMOS3_TEXT_GUARDRAIL_OFFLOAD_COMPONENT = "text_guardrail"
+COSMOS3_VIDEO_GUARDRAIL_OFFLOAD_COMPONENT = "video_guardrail"
+_COSMOS3_DEFAULT_OFFLOAD_STAGES = (
+    (COSMOS3_REASONER_OFFLOAD_COMPONENT,),
+    (COSMOS3_GENERATOR_OFFLOAD_COMPONENT,),
+)
+
 # ``W,H`` bucket names the reference builds requests from. A request there starts
 # as a (resolution, bucket) pair and the bucket string is carried into the prompt
 # verbatim; we only ever see the resolved height/width, so map back to the nearest
@@ -219,7 +237,7 @@ def _condition_pixel_frame_count(
     return max(condition_video_latent_indexes) * int(temporal_compression) + 1
 
 
-def _load_reference_image(path: str):
+def _load_reference_image(data: bytes):
     """Load an I2V reference, reporting unreadable content as a client error.
 
     The worker's load is the acceptance check — the serve boundary only
@@ -229,7 +247,13 @@ def _load_reference_image(path: str):
     upload would be reported as a server fault.
     """
     try:
-        return load_image(path, format="pil")
+        image = PIL.Image.open(BytesIO(data))
+        # open() reads the header only. Truncated pixel data raises here and
+        # nowhere else: an already-RGB image never reaches a decoding convert.
+        image.load()
+        # convert_image_mode composites RGBA onto white, which is what this
+        # pipeline's references went through before.
+        return convert_image_mode(image, "RGB")
     except OSError as exc:
         raise ValueError(
             f"Image reference could not be decoded; it may be truncated, "
@@ -355,6 +379,69 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         model_config = self.pipeline_config.model_configs["transformer"]
         self.transformer = Cosmos3VFMTransformer(model_config)
 
+    # =========================================================================
+    # Offloading
+    # =========================================================================
+
+    def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
+        """Offload the reasoner and generator towers as separate stages.
+
+        Only invoked when ``cpu_offload_config.enable`` is true (the base class
+        short-circuits before calling this). Stages are held in CPU storage
+        while inactive and moved onto the pipeline GPU when active.
+        """
+        return _COSMOS3_DEFAULT_OFFLOAD_STAGES
+
+    def offload_pipeline_components(self) -> dict[str, nn.Module]:
+        """Expose the two transformer towers, VAE, and guardrails as offload components.
+
+        Cosmos3 packs both pathways into a single ``transformer`` module, so the
+        default ``BasePipeline.offload_pipeline_components`` (which looks for a
+        ``transformer.blocks`` ModuleList) does not apply. We expose the heavy
+        decoder-layer ModuleLists of each tower individually so they can be
+        brought on/off the GPU independently. The opt-in guardrail components wrap
+        the underlying safety nn.Modules (loaded on rank 0 only).
+        """
+        components: dict[str, nn.Module] = {}
+
+        transformer = getattr(self, "transformer", None)
+        if transformer is not None:
+            language_model = getattr(transformer, "language_model", None)
+            reasoner_layers = (
+                getattr(language_model, "layers", None) if language_model is not None else None
+            )
+            if reasoner_layers is not None:
+                components[COSMOS3_REASONER_OFFLOAD_COMPONENT] = reasoner_layers
+
+            generator_layers = getattr(transformer, "gen_layers", None)
+            if generator_layers is not None:
+                components[COSMOS3_GENERATOR_OFFLOAD_COMPONENT] = generator_layers
+
+        vae = getattr(self, PipelineComponent.VAE.value, None)
+        if vae is not None:
+            components[PipelineComponent.VAE.value] = vae
+
+        # Guardrails (rank 0 only). CosmosSafetyChecker is an nn.Module but its
+        # GuardrailRunner children are plain objects, so expose the real safety
+        # nn.Modules (Qwen3Guard, RetinaFaceFilter) wrapped in a ModuleList.
+        safety_checker = getattr(self, "safety_checker", None)
+        if safety_checker is not None:
+            for component_name, runner in (
+                (COSMOS3_TEXT_GUARDRAIL_OFFLOAD_COMPONENT, safety_checker.text_guardrail),
+                (COSMOS3_VIDEO_GUARDRAIL_OFFLOAD_COMPONENT, safety_checker.video_guardrail),
+            ):
+                modules = [m for m in runner.models if isinstance(m, nn.Module)]
+                if modules:
+                    components[component_name] = nn.ModuleList(modules)
+
+        return components
+
+    def extra_offload_component_names(self) -> set[str]:
+        # Guardrails load on rank 0 only; treat their names as valid on all ranks
+        # so explicit multi-GPU stages don't fail during validation. Other ranks
+        # drop them later via the offloader's stage filtering.
+        return {COSMOS3_TEXT_GUARDRAIL_OFFLOAD_COMPONENT, COSMOS3_VIDEO_GUARDRAIL_OFFLOAD_COMPONENT}
+
     def load_weights(self, weights: dict) -> None:
         if self.transformer is not None and hasattr(self.transformer, "load_weights"):
             transformer_weights = weights.get("transformer", weights)
@@ -406,9 +493,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
+            vae_device = (
+                torch.device("cpu")
+                if PipelineComponent.VAE.value in self.offloader.requested_components()
+                else device
+            )
             self.vae = load_wan_vae(
                 checkpoint_dir,
-                device,
+                vae_device,
                 dtype=torch.bfloat16,
             )
 
@@ -516,6 +608,20 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # resolve it by mode. The checkpoint value is exposed separately as
         # ``default_use_system_prompt``.
         return dict(COSMOS3_EXTRA_SPECS)
+
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        return {
+            # Both optional: Cosmos3 also runs T2V with neither.
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="first_frame", min=0, max=1)],
+            ),
+            "video_reference": RefSlotSpec(
+                modality="video",
+                roles=[RoleSpec(role="reference", min=0, max=1)],
+            ),
+        }
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;
@@ -657,7 +763,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             value = getattr(req.params, field_name)
             return value if field_name in specified else None
 
-        video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
+        refs_v = req.params.video_reference
+        # Container and modality are already checked at the coordinator's
+        # reference choke point, so the bytes reaching here are known video.
+        video = refs_v[0].content if refs_v else None
         is_action = extra_params.get("action_mode") is not None
         if is_action:
             # Action resolves its whole recipe in forward() -- the canvas from
@@ -722,11 +831,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             width = resolved["width"]
             num_inference_steps = resolved["num_inference_steps"]
             guidance_scale = resolved["guidance_scale"]
+        refs_i = req.params.image_reference
 
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
-            image=req.params.image,
+            image=refs_i[0].content if refs_i else None,
             height=height,
             width=width,
             num_frames=req.params.num_frames,
@@ -1064,7 +1174,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
             latents = latents / scaling_factor
 
-        return self.vae.decode(latents, return_dict=False)[0]
+        with self.offloader.context_if_requested(PipelineComponent.VAE.value):
+            return self.vae.decode(latents, return_dict=False)[0]
 
     @nvtx_range("_decode_latents", color="blue")
     def _decode_latents(self, latents):
@@ -1107,7 +1218,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
 
         video = video_tensor.to(device=self.device, dtype=self.vae.dtype)
-        latent = self.vae.encode(video).latent_dist.mode()
+        with self.offloader.context_if_requested(PipelineComponent.VAE.value):
+            latent = self.vae.encode(video).latent_dist.mode()
 
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
             latents_mean = (
@@ -1337,7 +1449,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self,
         prompt: Union[str, List[str]],
         negative_prompt: Optional[str] = None,
-        image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_frames: Optional[int] = None,
@@ -1645,9 +1757,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             raise ValueError("Batch generation is not supported for Cosmos3")
 
         # Validate image input — only single image is supported for batch generation
-        if image is not None and not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
+        if image is not None and not isinstance(image, (PIL.Image.Image, torch.Tensor, bytes)):
             raise ValueError(
-                f"`image` must be a PIL.Image, torch.Tensor, or file path string, "
+                f"`image` must be a PIL.Image, torch.Tensor, or encoded bytes, "
                 f"got {type(image)}. Batch of different images is not supported; "
                 f"use a single image with multiple prompts instead."
             )
@@ -1659,12 +1771,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             prompts_to_check = list(prompt)
             if negative_prompt is not None:
                 prompts_to_check.append(negative_prompt)
-            for p in prompts_to_check:
-                is_safe = self.safety_checker.check_text_safety(p)
-                if not is_safe:
-                    logger.warning("Text guardrail blocked prompt")
-                    text_blocked.fill_(1)
-                    break
+            with self.offloader.context_if_requested(COSMOS3_TEXT_GUARDRAIL_OFFLOAD_COMPONENT):
+                for p in prompts_to_check:
+                    is_safe = self.safety_checker.check_text_safety(p)
+                    if not is_safe:
+                        logger.warning("Text guardrail blocked prompt")
+                        text_blocked.fill_(1)
+                        break
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.broadcast(text_blocked, src=0)
@@ -1900,7 +2013,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         elif image is not None:
             prepare_error: Optional[Exception] = None
             try:
-                if isinstance(image, str):
+                if isinstance(image, bytes):
                     image = _load_reference_image(image)
 
                 if isinstance(image, PIL.Image.Image):
@@ -2067,6 +2180,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 fps=frame_rate,
                 noisy_frame_mask=velocity_mask,
                 audio_latents=current_audio,
+                offload_context=self.offloader.context_if_requested,
                 action_latents=current_action,
                 action_domain_ids=action_domain_ids,
                 action_noisy_mask=action_velocity_mask,
@@ -2194,7 +2308,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
             if use_guardrails and self.safety_checker is not None:
-                video = check_video_safety(video, self.safety_checker)
+                with self.offloader.context_if_requested(COSMOS3_VIDEO_GUARDRAIL_OFFLOAD_COMPONENT):
+                    video = check_video_safety(video, self.safety_checker)
 
         timer.mark_end()
 
@@ -2359,6 +2474,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 text_ids=text_ids,
                 text_mask=text_mask,
                 control_latents=branch_control_latents,
+                offload_context=self.offloader.context_if_requested,
                 **shared_kwargs,
             )
             branch_caches[cache_key] = (
@@ -2796,7 +2912,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # input tensor's device.
         video = host_output
         if self.rank == 0 and use_guardrails and self.safety_checker is not None:
-            video = check_video_safety(video, self.safety_checker)
+            with self.offloader.context_if_requested(COSMOS3_VIDEO_GUARDRAIL_OFFLOAD_COMPONENT):
+                video = check_video_safety(video, self.safety_checker)
         # Back to the device the other pipelines hand back, now that denoising
         # has released its working set.
         if video is not None:

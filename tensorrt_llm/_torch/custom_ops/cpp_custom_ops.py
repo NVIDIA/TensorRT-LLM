@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import List, Optional, Tuple
 
 import torch
@@ -361,41 +364,20 @@ def _register_fake():
                                 dtype=torch.int32)
 
     @torch.library.register_fake("trtllm::kda_decode")
-    def _(x_q: torch.Tensor,
-          x_k: torch.Tensor,
-          x_v: torch.Tensor,
-          w_q_t: torch.Tensor,
-          w_k_t: torch.Tensor,
-          w_v_t: torch.Tensor,
-          bias_q: torch.Tensor,
-          bias_k: torch.Tensor,
-          bias_v: torch.Tensor,
-          conv_state_q: torch.Tensor,
-          conv_state_k: torch.Tensor,
-          conv_state_v: torch.Tensor,
-          a_log: torch.Tensor,
-          g: torch.Tensor,
-          dt_bias: torch.Tensor,
-          beta: torch.Tensor,
-          onorm_g: torch.Tensor,
-          onorm_weight: torch.Tensor,
-          ssm_state_indices: Optional[torch.Tensor],
-          cu_seqlens: torch.Tensor,
-          state: torch.Tensor,
-          apply_onorm: bool,
-          update_conv_cache: bool,
-          use_lower_bound: bool,
-          apply_beta_sigmoid: bool,
-          lower_bound: float,
-          scale: float,
-          onorm_eps: float,
-          output: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Mirror the CUDA impl: write into the caller-provided output when
-        # given (schema returns Tensor(e!)), else allocate.
-        if output is not None:
-            return output
-        # x_q is [1, tokens, H, 128]; the kernel emits one row per token.
-        return x_q.new_empty((x_q.size(1), 1, x_v.size(2), x_v.size(3)))
+    def _(x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor,
+          w_q_t: torch.Tensor, w_k_t: torch.Tensor, w_v_t: torch.Tensor,
+          bias_q: torch.Tensor, bias_k: torch.Tensor, bias_v: torch.Tensor,
+          conv_state_q: torch.Tensor, conv_state_k: torch.Tensor,
+          conv_state_v: torch.Tensor, a_log: torch.Tensor, g: torch.Tensor,
+          dt_bias: torch.Tensor, beta: torch.Tensor, onorm_g: torch.Tensor,
+          onorm_weight: torch.Tensor, ssm_state_indices: Optional[torch.Tensor],
+          cu_seqlens: torch.Tensor, state: torch.Tensor, apply_onorm: bool,
+          update_conv_cache: bool, use_lower_bound: bool,
+          apply_beta_sigmoid: bool, lower_bound: float, scale: float,
+          onorm_eps: float, output: torch.Tensor) -> None:
+        # Inplace-only: the kernel writes into ``output``, so there is nothing
+        # to allocate and nothing to return.
+        return None
 
     @torch.library.register_fake("trtllm::minimax_m3_fp8_indexer_qk_norm_rope")
     def minimax_m3_fp8_indexer_qk_norm_rope_fake(
@@ -863,15 +845,18 @@ def _register_fake():
         return packed, scale
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
-    def _(input: torch.Tensor):
-        # Returns (fp8_e4m3 [m, k], packed_ue8m0_int32 [m, packed_sf_k])
-        # matching deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor's return shape.
+    def _(input: torch.Tensor,
+          use_r128c4_layout: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         m, k = input.shape[0], input.shape[1]
         num_n_blocks = (k + 127) // 128
         num_packed_sf_k = (num_n_blocks + 3) // 4
-        return torch.empty_like(input,
-                                dtype=torch.float8_e4m3fn), input.new_empty(
-                                    (m, num_packed_sf_k), dtype=torch.int32)
+        if use_r128c4_layout:
+            m_padded = (m + 127) // 128 * 128
+            sf_k_padded = ((k + 31) // 32 + 3) // 4 * 4
+            scale = input.new_empty((m_padded * sf_k_padded), dtype=torch.uint8)
+        else:
+            scale = input.new_empty((m, num_packed_sf_k), dtype=torch.int32)
+        return torch.empty_like(input, dtype=torch.float8_e4m3fn), scale
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_cutedsl_ue8m0")
     def _(input: torch.Tensor):
@@ -893,6 +878,7 @@ def _register_fake():
         has_initial_state: Optional[torch.Tensor],
         silu_activation: bool,
         pad_slot_id: int,
+        out: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -1620,6 +1606,31 @@ def _register_fake():
           token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,
           stride_factor: int, layer_id: int) -> torch.Tensor:
         return torch.empty_like(token_indices)
+
+    @torch.library.register_fake("trtllm::convert_req_index_to_global_grouped")
+    def _(req_id: torch.Tensor, block_table: torch.Tensor,
+          token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,
+          stride_factor: int, layer_ids: torch.Tensor) -> torch.Tensor:
+        # Grouped fan-out: one [num_tokens, num_topk] slice per layer id.
+        return token_indices.new_empty(
+            (layer_ids.shape[0], *token_indices.shape))
+
+    @torch.library.register_fake("trtllm::nvfp4_mla_kv_cache_gather")
+    def _(host_pool_pointers: torch.Tensor, host_pool_mapping: torch.Tensor,
+          global_indices: torch.Tensor, output: torch.Tensor,
+          compact_indices: torch.Tensor, global_dequant_scale: torch.Tensor,
+          layer_idx: int, residual_dim: int, num_pool_tokens: int) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::nvfp4_mla_context_kv_cache_gather")
+    def _(host_pool_pointers: torch.Tensor, host_pool_mapping: torch.Tensor,
+          local_topk_indices: torch.Tensor, query_req_indices: torch.Tensor,
+          block_table: torch.Tensor, cu_kv_lengths: torch.Tensor,
+          output: torch.Tensor, compact_indices: torch.Tensor,
+          global_dequant_scale: torch.Tensor, layer_idx: int,
+          total_kv_tokens: int, tokens_per_block: int, page_stride: int,
+          layer_id: int, residual_dim: int, num_pool_tokens: int) -> None:
+        return None
 
     @torch.library.register_fake("trtllm::indexer_k_cache_gather_op")
     def _(k_cache: torch.Tensor, slot_mapping_fp8: torch.Tensor,

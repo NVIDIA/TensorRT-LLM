@@ -134,7 +134,7 @@ LayoutDetails getLayoutDetailsForTransform(QuantType quant_type, int arch)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm90>(quant_type);
     }
-    else if (arch == 100)
+    else if (isSM100Family(arch) && arch != 103)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm100>(quant_type);
     }
@@ -619,7 +619,7 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, in
         src_buf.swap(dst_buf);
     }
 
-    if (arch != 100 && arch != 103)
+    if (!isSM100Family(arch))
     {
         TLLM_LOG_INFO("add_bias_and_interleave_quantized_tensor_inplace");
         add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);

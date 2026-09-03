@@ -750,6 +750,8 @@ class TestStrictLoading:
 
 def _bare_pipeline(family: str) -> Cosmos3OmniMoTPipeline:
     pipeline = object.__new__(Cosmos3OmniMoTPipeline)
+    # __new__ skips BasePipeline.__init__, which is where ``_device`` is set.
+    pipeline._device = torch.device("cpu")
     pipeline.family = family
     pipeline.sampling = Cosmos3SamplingPolicy()
     pipeline.audio_gen = False
@@ -959,6 +961,7 @@ class TestSchedulerCacheBounds:
         self, family: str = "nemotron_dense", checkpoint_shift: float = 3.0
     ) -> "pipeline_module.Cosmos3OmniMoTPipeline":
         pipeline = object.__new__(pipeline_module.Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.family = family
         pipeline.sampling = SimpleNamespace(
             checkpoint_flow_shift=checkpoint_shift,

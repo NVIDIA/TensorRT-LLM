@@ -405,7 +405,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
     int const hidden_idx = head_idx * params.size_per_head + head_dim_idx;
     int const kv_head_idx = head_idx / params.qheads_per_kv_head;
     int const hidden_idx_kv = kv_head_idx * params.size_per_head + head_dim_idx;
-    int const hidden_size = params.hidden_size;
+    int const input_hidden_size = params.q_only_input ? params.q_hidden_size : params.hidden_size;
     int const src_k_offset = params.q_hidden_size;
     int const src_v_offset = src_k_offset + params.kv_head_num * params.size_per_head;
 
@@ -456,11 +456,14 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             //   src QKV: [batch, time, 3, head_num, size_per_head]
             // head_num != kv_head_num:
             //   src QKV: [batch, time, head_num * size_per_head + 2 * kv_head_num * size_per_head]
-            auto const src_q_idx = static_cast<size_t>(global_token_idx) * hidden_size + hidden_idx;
-            auto const src_k_idx = static_cast<size_t>(global_token_idx) * hidden_size + src_k_offset + hidden_idx_kv;
-            auto const src_v_idx = static_cast<size_t>(global_token_idx) * hidden_size + src_v_offset + hidden_idx_kv;
+            auto const src_q_idx = static_cast<size_t>(global_token_idx) * input_hidden_size + hidden_idx;
+            auto const src_k_idx
+                = static_cast<size_t>(global_token_idx) * input_hidden_size + src_k_offset + hidden_idx_kv;
+            auto const src_v_idx
+                = static_cast<size_t>(global_token_idx) * input_hidden_size + src_v_offset + hidden_idx_kv;
 
-            VecType q, k, v, q_pair, k_pair;
+            VecType q, q_pair;
+            VecType k, v, k_pair;
             // key without position embedding
             VecType k_wo_pos;
 
@@ -468,28 +471,40 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             if (valid_head_dim_idx)
             {
                 q = *reinterpret_cast<VecType const*>(&params.qkv_input[src_q_idx]);
-                k = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx]);
-                v = *reinterpret_cast<VecType const*>(&params.qkv_input[src_v_idx]);
                 q_pair = *reinterpret_cast<VecType const*>(&params.qkv_input[src_q_idx + rotated_head_dim_offset]);
-                k_pair = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+                if (!params.q_only_input)
+                {
+                    k = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx]);
+                    v = *reinterpret_cast<VecType const*>(&params.qkv_input[src_v_idx]);
+                    k_pair = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+                }
+                else
+                {
+                    // The rotary helpers update Q and K together. Reuse Q as the ignored K input.
+                    k = q;
+                    k_pair = q_pair;
+                }
 
                 if constexpr (ADD_BIAS)
                 {
                     auto const q_bias = *reinterpret_cast<VecType const*>(&params.qkv_bias[hidden_idx]);
-                    auto const k_bias
-                        = *reinterpret_cast<VecType const*>(&params.qkv_bias[hidden_idx_kv + src_k_offset]);
-                    auto const v_bias
-                        = *reinterpret_cast<VecType const*>(&params.qkv_bias[hidden_idx_kv + src_v_offset]);
                     auto const q_pair_bias
                         = *reinterpret_cast<VecType const*>(&params.qkv_bias[hidden_idx + rotated_head_dim_offset]);
-                    auto const k_pair_bias = *reinterpret_cast<VecType const*>(
-                        &params.qkv_bias[hidden_idx_kv + src_k_offset + rotated_head_dim_offset]);
 
                     q = mmha::add(q, q_bias);
-                    k = mmha::add(k, k_bias);
-                    v = mmha::add(v, v_bias);
                     q_pair = mmha::add(q_pair, q_pair_bias);
-                    k_pair = mmha::add(k_pair, k_pair_bias);
+                    if (!params.q_only_input)
+                    {
+                        auto const k_bias
+                            = *reinterpret_cast<VecType const*>(&params.qkv_bias[hidden_idx_kv + src_k_offset]);
+                        auto const v_bias
+                            = *reinterpret_cast<VecType const*>(&params.qkv_bias[hidden_idx_kv + src_v_offset]);
+                        auto const k_pair_bias = *reinterpret_cast<VecType const*>(
+                            &params.qkv_bias[hidden_idx_kv + src_k_offset + rotated_head_dim_offset]);
+                        k = mmha::add(k, k_bias);
+                        v = mmha::add(v, v_bias);
+                        k_pair = mmha::add(k_pair, k_pair_bias);
+                    }
                 }
                 k_wo_pos = k;
             }
@@ -550,7 +565,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             }
             auto const channelIdx{tidx};
 
-            bool const useKVCache = params.kv_cache_buffer.data != nullptr;
+            bool const useKVCache = !params.q_only_input && params.kv_cache_buffer.data != nullptr;
             auto token_idx_in_kv_cache = token_idx_in_seq;
             bool valid_kv_cache_pos = useKVCache;
 
@@ -593,7 +608,9 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 {
                     *q_ptr = q;
                 }
-                if ((params.head_num == params.kv_head_num) || (head_idx == (kv_head_idx * params.qheads_per_kv_head)))
+                if (!params.q_only_input
+                    && ((params.head_num == params.kv_head_num)
+                        || (head_idx == (kv_head_idx * params.qheads_per_kv_head))))
                 {
                     if constexpr (STORE_QKV)
                     {
@@ -807,6 +824,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
     int const hidden_idx_kv = kv_head_idx * params.size_per_head + head_dim_idx;
     int const src_k_offset = params.q_hidden_size;
     int const src_v_offset = src_k_offset + params.kv_hidden_size;
+    int const input_hidden_size = params.q_only_input ? params.q_hidden_size : params.hidden_size;
 
     int const rotated_head_dim_offset = first_half ? params.half_rotary_dim : -params.half_rotary_dim;
     // Make sure there are multiple of tokens_per_block otherwise syncthreads will lead to deadlocks.
@@ -869,36 +887,50 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         //   src QKV: [batch, time, 3, head_num, size_per_head]
         // head_num != kv_head_num:
         //   src QKV: [batch, time, head_num * size_per_head + 2 * kv_head_num * size_per_head]
-        auto const src_q_idx = static_cast<size_t>(bounded_global_token_idx) * params.hidden_size + hidden_idx;
+        auto const src_q_idx = static_cast<size_t>(bounded_global_token_idx) * input_hidden_size + hidden_idx;
         auto const src_k_idx
-            = static_cast<size_t>(bounded_global_token_idx) * params.hidden_size + src_k_offset + hidden_idx_kv;
+            = static_cast<size_t>(bounded_global_token_idx) * input_hidden_size + src_k_offset + hidden_idx_kv;
         auto const src_v_idx
-            = static_cast<size_t>(bounded_global_token_idx) * params.hidden_size + src_v_offset + hidden_idx_kv;
+            = static_cast<size_t>(bounded_global_token_idx) * input_hidden_size + src_v_offset + hidden_idx_kv;
 
         auto q = *reinterpret_cast<VecT const*>(&params.qkv_input[src_q_idx]);
-        auto k = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx]);
-        auto v = *reinterpret_cast<VecT const*>(&params.qkv_input[src_v_idx]);
+        VecT k;
+        VecT v;
         [[maybe_unused]] auto q_pair
             = *reinterpret_cast<VecT const*>(&params.qkv_input[src_q_idx + rotated_head_dim_offset]);
-        [[maybe_unused]] auto k_pair
-            = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+        [[maybe_unused]] VecT k_pair;
+        if (!params.q_only_input)
+        {
+            k = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx]);
+            v = *reinterpret_cast<VecT const*>(&params.qkv_input[src_v_idx]);
+            k_pair = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+        }
+        else
+        {
+            // The rotary helpers update Q and K together. Reuse Q as the ignored K input.
+            k = q;
+            k_pair = q_pair;
+        }
 
         // Bias should have been fused with QKV projection, but we keep the logic here for unit tests.
         if constexpr (ADD_BIAS)
         {
             auto const q_bias = *reinterpret_cast<VecT const*>(&params.qkv_bias[hidden_idx]);
-            auto const k_bias = *reinterpret_cast<VecT const*>(&params.qkv_bias[hidden_idx_kv + src_k_offset]);
-            auto const v_bias = *reinterpret_cast<VecT const*>(&params.qkv_bias[hidden_idx_kv + src_v_offset]);
             auto const q_pair_bias
                 = *reinterpret_cast<VecT const*>(&params.qkv_bias[hidden_idx + rotated_head_dim_offset]);
-            auto const k_pair_bias = *reinterpret_cast<VecT const*>(
-                &params.qkv_bias[hidden_idx_kv + src_k_offset + rotated_head_dim_offset]);
 
             q = mmha::add(q, q_bias);
-            k = mmha::add(k, k_bias);
-            v = mmha::add(v, v_bias);
             q_pair = mmha::add(q_pair, q_pair_bias);
-            k_pair = mmha::add(k_pair, k_pair_bias);
+            if (!params.q_only_input)
+            {
+                auto const k_bias = *reinterpret_cast<VecT const*>(&params.qkv_bias[hidden_idx_kv + src_k_offset]);
+                auto const v_bias = *reinterpret_cast<VecT const*>(&params.qkv_bias[hidden_idx_kv + src_v_offset]);
+                auto const k_pair_bias = *reinterpret_cast<VecT const*>(
+                    &params.qkv_bias[hidden_idx_kv + src_k_offset + rotated_head_dim_offset]);
+                k = mmha::add(k, k_bias);
+                v = mmha::add(v, v_bias);
+                k_pair = mmha::add(k_pair, k_pair_bias);
+            }
         }
 
         // Cos/sin cache.
@@ -967,7 +999,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         }
 
         auto const channelIdx = head_dim_vec_idx;
-        bool const useKVCache = GEN_PHASE || params.kv_cache_buffer.data != nullptr;
+        bool const useKVCache = !params.q_only_input && (GEN_PHASE || params.kv_cache_buffer.data != nullptr);
         bool valid_kv_cache_pos = useKVCache;
 
         auto kDst = useKVCache
@@ -1011,7 +1043,8 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             {
                 *q_ptr = q;
             }
-            if ((params.head_num == params.kv_head_num) || (head_idx == (kv_head_idx * params.qheads_per_kv_head)))
+            if (!params.q_only_input
+                && ((params.head_num == params.kv_head_num) || (head_idx == (kv_head_idx * params.qheads_per_kv_head))))
             {
                 if constexpr (STORE_QKV)
                 {
@@ -1646,6 +1679,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     case 192: kernelV2DispatchHeadSize<192, 192, T, TCache, KVCacheBuffer>(params, stream); break;
     case 224: kernelV2DispatchHeadSize<224, 224, T, TCache, KVCacheBuffer>(params, stream); break;
     case 256: kernelV2DispatchHeadSize<256, 256, T, TCache, KVCacheBuffer>(params, stream); break;
+    case 512: kernelV2DispatchHeadSize<512, 512, T, TCache, KVCacheBuffer>(params, stream); break;
     case 576: kernelV2DispatchHeadSize<576, 576, T, TCache, KVCacheBuffer>(params, stream); break;
     default:
         // Fall back to v1 kernel.

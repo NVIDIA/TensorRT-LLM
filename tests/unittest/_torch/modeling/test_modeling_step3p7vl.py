@@ -183,7 +183,7 @@ def _vision_attn_metadata(seq_lens):
 
 
 def _setup_encoder_attn_metadata(module, max_num_tokens: int = _ENCODER_TEST_MAX_NUM_TOKENS):
-    """Mirror the engine's ``_set_up_multimodal_encoder_attn_metadata`` walk.
+    """Mirror the engine's ``setup_mm_encoder_attn_metadata`` walk.
 
     The encoder builds its ``AttentionMetadata`` via the engine-driven
     ``MultimodalEncoderMixin.setup_attn_metadata`` after model load; standalone

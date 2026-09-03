@@ -354,6 +354,8 @@ struct TllmGenFmhaRunnerParams
     int mSfStartTokenIdx;
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactor;
+    // Skip correction when the row-max increase is within this base-2 threshold.
+    float mSkipCorrThreshold{0.0F};
     // Sparse attention type.
     SparseType mSparseAttention;
     // The top k value for sparse attention.

@@ -16,16 +16,25 @@
 """Smoke tests for disaggregated launcher telemetry environment propagation."""
 
 import os
+import signal
+import subprocess
 import sys
 from collections.abc import Callable
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from click.testing import CliRunner
 
 from tensorrt_llm.commands import serve
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(autouse=True)
+def _isolate_prometheus_multiproc_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent launcher tests from reusing a deleted Prometheus temp dir."""
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
 
 
 def _mock_llmapi_modules(
@@ -65,6 +74,7 @@ def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
     with (
         mock.patch.object(serve.uuid, "uuid4", return_value=deployment_id),
         mock.patch.object(serve, "parse_disagg_config_file", return_value=disagg_config),
+        mock.patch.object(serve._command_telemetry, "apply_disaggregated_telemetry_config"),
         mock.patch.object(serve.socket, "socket", return_value=fake_socket),
         mock.patch.object(serve, "parse_metadata_server_config_file", return_value=None),
         mock.patch.object(serve, "OpenAIDisaggServer"),
@@ -78,10 +88,77 @@ def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
             log_level="info",
             metrics_log_interval=0,
             schedule_style=None,
+            telemetry=True,
         )
 
     assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] == "deploy123"
+    assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE] == "server_coordinator"
     fake_socket.bind.assert_called_once_with(("127.0.0.1", 0))
+
+
+def test_disaggregated_command_identifies_coordinator(monkeypatch) -> None:
+    """A multi-frontend deployment labels its coordinator process explicitly."""
+    disagg_config = SimpleNamespace(
+        hostname="127.0.0.1",
+        port=8000,
+        schedule_style=None,
+        num_workers=2,
+        disagg_coordinator_url=None,
+    )
+
+    with (
+        mock.patch.object(serve, "parse_disagg_config_file", return_value=disagg_config),
+        mock.patch.object(serve._command_telemetry, "apply_disaggregated_telemetry_config"),
+        mock.patch.object(serve, "parse_metadata_server_config_file", return_value=None),
+        mock.patch.object(serve, "_serve_coordinator_and_fleet") as serve_coordinator,
+    ):
+        serve.disaggregated.callback(
+            config_file="disagg.yaml",
+            metadata_server_config_file=None,
+            server_start_timeout=180,
+            request_timeout=180,
+            log_level="info",
+            metrics_log_interval=0,
+            schedule_style=None,
+            telemetry=True,
+        )
+
+    assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE] == "coordinator"
+    serve_coordinator.assert_called_once()
+
+
+def test_disaggregated_command_accepts_no_telemetry() -> None:
+    """The public disaggregated command has an effective CLI opt-out."""
+    disagg_config = SimpleNamespace(
+        hostname="127.0.0.1",
+        port=0,
+        schedule_style=None,
+        num_workers=1,
+        disagg_coordinator_url=None,
+    )
+    fake_socket = mock.MagicMock()
+    fake_socket.__enter__.return_value = fake_socket
+
+    with (
+        mock.patch.object(serve, "parse_disagg_config_file", return_value=disagg_config),
+        mock.patch.object(
+            serve._command_telemetry, "apply_disaggregated_telemetry_config"
+        ) as apply_config,
+        mock.patch.object(serve.socket, "socket", return_value=fake_socket),
+        mock.patch.object(serve, "parse_metadata_server_config_file", return_value=None),
+        mock.patch.object(serve, "OpenAIDisaggServer"),
+        mock.patch.object(serve.uvloop, "run"),
+    ):
+        result = CliRunner().invoke(
+            serve.disaggregated,
+            ["--no-telemetry", "--config", "disagg.yaml"],
+        )
+
+    assert result.exit_code == 0, result.output
+    apply_config.assert_called_once_with(
+        "disagg.yaml",
+        telemetry=False,
+    )
 
 
 @pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
@@ -90,16 +167,31 @@ def test_launch_disagg_fleet_propagates_resolved_schedule_style(
     schedule_style,
 ) -> None:
     """Fleet children receive the resolved CLI-or-config schedule style."""
+    real_popen = subprocess.Popen
     observed_envs = []
+    fleet_processes = []
+    registered_cleanups = []
+    signal_handlers = {}
 
     class _FakePopen:
         pid = 12345
 
         def __init__(self, _command, **kwargs):
             observed_envs.append(kwargs["env"])
+            fleet_processes.append(self)
+            self.returncode = None
 
         def poll(self):
-            return None
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -signal.SIGTERM
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -signal.SIGKILL
 
     disagg_config = SimpleNamespace(
         hostname="127.0.0.1",
@@ -107,8 +199,14 @@ def test_launch_disagg_fleet_propagates_resolved_schedule_style(
         schedule_style=schedule_style,
     )
     monkeypatch.setattr(serve.subprocess, "Popen", _FakePopen)
-    monkeypatch.setattr(serve.atexit, "register", lambda *_: None)
-    monkeypatch.setattr(serve.signal, "signal", lambda *_: None)
+    monkeypatch.setattr(serve.atexit, "register", registered_cleanups.append)
+    monkeypatch.setattr(
+        serve.signal,
+        "signal",
+        lambda signal_number, handler: signal_handlers.__setitem__(signal_number, handler),
+    )
+    monkeypatch.setenv("TRTLLM_NO_USAGE_STATS", "1")
+    monkeypatch.setenv(serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE, "coordinator")
 
     serve._launch_disagg_fleet(
         disagg_config,
@@ -121,6 +219,24 @@ def test_launch_disagg_fleet_propagates_resolved_schedule_style(
     )
 
     assert observed_envs[0][serve.DisaggWorkerEnvs.TLLM_DISAGG_SCHEDULE_STYLE] == schedule_style
+    assert observed_envs[0]["TRTLLM_NO_USAGE_STATS"] == "1"
+    assert serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE not in observed_envs[0]
+    assert signal_handlers[signal.SIGTERM] is serve._command_telemetry.raise_signal_exit
+    with pytest.raises(serve._command_telemetry.SignalExit):
+        signal_handlers[signal.SIGTERM](signal.SIGTERM, None)
+    assert fleet_processes[0].poll() is None
+    registered_cleanups[0]()
+    assert fleet_processes[0].poll() == -signal.SIGTERM
+
+    child = real_popen(
+        [
+            sys.executable,
+            "-c",
+            "import os,sys; sys.exit(0 if os.environ.get('TRTLLM_NO_USAGE_STATS') == '1' else 1)",
+        ],
+        env=observed_envs[0],
+    )
+    assert child.wait(timeout=10) == 0
 
 
 @pytest.mark.parametrize(
@@ -158,51 +274,83 @@ def test_build_fleet_worker_applies_resolved_schedule_style(
     assert mock_server.call_args.kwargs["config"] is disagg_config
 
 
-def test_launch_disaggregated_leader_propagates_deployment_id(monkeypatch) -> None:
-    """Leader subprocess env keeps the shared telemetry deployment id."""
+@pytest.mark.parametrize("signal_number", [signal.SIGTERM, signal.SIGINT])
+def test_launch_disaggregated_leader_signal_cleans_up_and_reports(
+    monkeypatch,
+    signal_number,
+) -> None:
+    """The leader preserves env and unwinds signals through normal cleanup."""
     observed = {}
+    installed_handlers = {}
+    handler_registrations = []
+    original_handlers = {
+        signal.SIGTERM: signal.SIG_DFL,
+        signal.SIGINT: signal.SIG_IGN,
+    }
 
-    class _FakeComm:
-        def Get_rank(self):
-            return 0
+    child = mock.MagicMock(pid=12345)
+    child.poll.side_effect = [None, -signal.SIGTERM]
+    child.wait.return_value = -signal.SIGTERM
 
-    class _FakePopen:
-        pid = 12345
+    def _fake_popen(command, **kwargs):
+        observed.update(command=command, env=kwargs["env"])
+        return child
 
-        def __init__(self, command, **kwargs):
-            observed["command"] = command
-            observed["env"] = kwargs["env"]
-            self._status = None
+    def _install_handler(signum, handler):
+        installed_handlers[signum] = handler
+        handler_registrations.append((signum, handler))
 
-        def poll(self):
-            return self._status
-
-        def terminate(self):
-            self._status = -15
-
-        def wait(self, timeout=None):
-            self._status = -15
-            return self._status
-
-        def kill(self):
-            self._status = -9
-
-    def _fake_split_mpi_env():
-        return dict(os.environ), {}
+    def _raise_installed_signal(_sub_comm):
+        installed_handlers[signal_number](signal_number, None)
 
     monkeypatch.setenv(
         serve.DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID,
         "deploy123",
     )
+    monkeypatch.setenv("TRTLLM_NO_USAGE_STATS", "1")
+    monkeypatch.setattr(serve, "_child_p_global", None)
     monkeypatch.setattr(serve, "find_free_ipc_addr", lambda: "ipc://fake-proxy")
-    monkeypatch.setattr(serve.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(serve.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(
+        serve.signal,
+        "getsignal",
+        lambda signum: original_handlers[signum],
+    )
+    monkeypatch.setattr(serve.signal, "signal", _install_handler)
     monkeypatch.setattr(serve.sys, "argv", ["trtllm-serve"])
-    _mock_llmapi_modules(monkeypatch, _fake_split_mpi_env)
+    _mock_llmapi_modules(monkeypatch, lambda: (dict(os.environ), {}))
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm.llmapi.mgmn_leader_node",
+        SimpleNamespace(launch_server_main=_raise_installed_signal),
+    )
 
-    serve._launch_disaggregated_leader(_FakeComm(), 2, "disagg.yaml", "info")
+    with (
+        mock.patch.object(
+            serve._command_telemetry.usage,
+            "get_observed_signal",
+            return_value=0,
+        ),
+        mock.patch.object(
+            serve._command_telemetry.usage,
+            "record_observed_signal",
+        ) as record_signal,
+        mock.patch.object(
+            serve._command_telemetry.usage,
+            "report_exit",
+        ) as report_exit,
+        pytest.raises(serve._command_telemetry.SignalExit) as raised,
+    ):
+        serve._command_telemetry.run_with_terminal_reporting(
+            lambda: serve._launch_disaggregated_leader(
+                SimpleNamespace(Get_rank=lambda: 0), 2, "disagg.yaml", "info"
+            ),
+            default_usage_context="disaggregated",
+        )
 
     assert observed["env"][serve.DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] == "deploy123"
     assert observed["env"][serve.DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] == "2"
+    assert observed["env"]["TRTLLM_NO_USAGE_STATS"] == "1"
     assert (
         observed["env"][serve.DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT] == "1"
     )
@@ -215,6 +363,50 @@ def test_launch_disaggregated_leader_propagates_deployment_id(monkeypatch) -> No
         "--log_level",
         "info",
     ]
+    assert handler_registrations[:2] == [
+        (signal.SIGTERM, serve._command_telemetry.raise_signal_exit),
+        (signal.SIGINT, serve._command_telemetry.raise_signal_exit),
+    ]
+    assert raised.value.signal_number == signal_number
+    assert raised.value.code == 128 + signal_number
+    child.terminate.assert_called_once_with()
+    child.wait.assert_called_once_with(timeout=30)
+    child.kill.assert_not_called()
+    assert installed_handlers == original_handlers
+    record_signal.assert_called_once_with(signal_number)
+    outcome = report_exit.call_args.args[0]
+    assert outcome.termination_kind == "signal"
+    assert outcome.exit_code == 128 + signal_number
+    assert outcome.signal_number == signal_number
+
+
+def test_fleet_worker_uses_process_wide_telemetry_setting() -> None:
+    """The direct fleet boundary does not construct an enabled override."""
+    with (
+        mock.patch.object(serve, "apply_usage_session_config") as apply_config,
+        mock.patch.object(serve, "_run_fleet_worker_impl"),
+        mock.patch.object(
+            serve._command_telemetry.usage,
+            "get_observed_signal",
+            return_value=0,
+        ),
+        mock.patch.object(serve._command_telemetry.usage, "set_lifecycle_phase"),
+        mock.patch.object(
+            serve._command_telemetry.usage,
+            "report_exit",
+        ) as report_exit,
+    ):
+        serve._run_fleet_worker()
+
+    assert apply_config.call_args.args == ()
+    assert report_exit.call_args.kwargs["telemetry_config"] is None
+    assert report_exit.call_args.kwargs["default_usage_context"] == "disaggregated"
+
+
+def test_disaggregated_mpi_worker_exposes_telemetry_option() -> None:
+    """Independent MPI deployment roots can apply the same CLI opt-out."""
+    parameter_names = {parameter.name for parameter in serve.disaggregated_mpi_worker.params}
+    assert "telemetry" in parameter_names
 
 
 @pytest.mark.parametrize(
@@ -253,4 +445,5 @@ def test_launch_disaggregated_server_sets_worker_role(
         port=8000,
         llm_args=llm_args,
         allow_request_chat_template=False,
+        multi_frontend_enabled=False,
     )

@@ -4,8 +4,7 @@ from torch import nn
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
-from tensorrt_llm._torch.modules.fused_moe.weight_owner import \
-    is_moe_weight_owner
+from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 
 
 def _unfuse_moe_expert_weights(weights: dict) -> dict:

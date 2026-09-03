@@ -19,7 +19,7 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_sm_version, llm_models_root, parametrize_with_ids,
                         skip_no_nvls, skip_post_blackwell, skip_pre_ada,
-                        skip_pre_blackwell, skip_pre_hopper)
+                        skip_pre_hopper)
 from .accuracy_core import (MMLU, CliFlowAccuracyTestHarness, CnnDailymail,
                             Humaneval, PassKeyRetrieval64k, ZeroScrolls)
 
@@ -110,103 +110,6 @@ class TestNemotronMini4BInstruct(CliFlowAccuracyTestHarness):
             f"{llm_models_root()}/nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export"
         )
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
-
-
-# TODO: Remove the CLI tests once NIMs use PyTorch backend
-@pytest.mark.timeout(5400)
-class TestLlama3_3NemotronSuper49Bv1(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
-    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1"
-    EXAMPLE_FOLDER = "models/core/nemotron_nas"
-
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_auto_dtype_tp2(self):
-        self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=2, dtype='auto')
-
-
-class TestLlama3_1NemotronNano8Bv1(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
-    MODEL_PATH = f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-    def test_auto_dtype(self):
-        self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
-
-    @skip_pre_hopper
-    @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
-    def test_fp8_prequantized(self, mocker):
-        mocker.patch.object(
-            self.__class__, "MODEL_PATH",
-            f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1-FP8")
-
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8)
-
-
-@pytest.mark.timeout(10800)
-class TestNemotronUltra(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"
-    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1"
-    EXAMPLE_FOLDER = "models/core/nemotron_nas"
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("cuda_graph", [False, True])
-    @pytest.mark.parametrize("tp_size,pp_size", [(8, 1)], ids=["tp8"])
-    def test_auto_dtype(self, cuda_graph, tp_size, pp_size):
-        extra_summarize_args = []
-        if cuda_graph:
-            extra_summarize_args.append("--cuda_graph_mode")
-
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 tp_size=tp_size,
-                 pp_size=pp_size,
-                 extra_build_args=["--gemm_plugin=auto"],
-                 extra_summarize_args=extra_summarize_args)
-
-    @pytest.mark.skip(
-        reason="nemotron-nas scripts have to accommodate fp8 flags")
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
-    @parametrize_with_ids("cuda_graph", [False, True])
-    @pytest.mark.parametrize("tp_size,pp_size", [(8, 1)], ids=["tp8"])
-    def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, mocker):
-        mocker.patch.object(
-            self.__class__, "MODEL_PATH",
-            f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8"
-        )
-
-        extra_summarize_args = []
-        if cuda_graph:
-            extra_summarize_args.append("--cuda_graph_mode")
-
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=tp_size,
-                 pp_size=pp_size,
-                 extra_build_args=["--gemm_plugin=auto"],
-                 extra_summarize_args=extra_summarize_args)
-
-
-@skip_post_blackwell
-class TestPhi2(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/phi-2"
-    MODEL_PATH = f"{llm_models_root()}/phi-2"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    @skip_post_blackwell
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-    @skip_post_blackwell
-    @pytest.mark.skip_less_device(2)
-    def test_tp2(self):
-        self.run(tp_size=2)
 
 
 # Long sequence length test:
@@ -327,55 +230,6 @@ class TestTinyLlama1_1BChat(CliFlowAccuracyTestHarness):
         self.run(extra_acc_spec="pp_size=4", pp_size=4)
 
 
-class TestLlama3_8BInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/llama-models-v3/llama-v3-8b-instruct-hf"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-    @skip_pre_ada
-    def test_fp8(self):
-        self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
-
-    @skip_pre_blackwell
-    def test_nvfp4(self):
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.NVFP4,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 extra_build_args=["--gemm_plugin=disable"])
-
-    @pytest.mark.skip(
-        reason="Broken by modelopt. Will be fixed in next release")
-    @skip_pre_blackwell
-    @pytest.mark.parametrize("fuse_fp4_quant", [False, True],
-                             ids=["disable_fused_quant", "enable_fused_quant"])
-    @pytest.mark.parametrize(
-        "norm_quant_fusion", [False, True],
-        ids=["disable_norm_quant_fusion", "enable_norm_quant_fusion"])
-    def test_nvfp4_gemm_plugin(self, fuse_fp4_quant: bool,
-                               norm_quant_fusion: bool):
-        extra_build_args = ["--gemm_plugin=nvfp4"]
-        if fuse_fp4_quant:
-            extra_build_args.extend([
-                "--use_paged_context_fmha=enable",
-                "--use_fp8_context_fmha=enable", "--fuse_fp4_quant=enable"
-            ])
-        if norm_quant_fusion:
-            extra_build_args.append("--norm_quant_fusion=enable")
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.NVFP4,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 extra_build_args=extra_build_args)
-
-
-class TestLlama3_8BInstructGradient1048k(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "gradientai/Llama-3-8B-Instruct-Gradient-1048k"
-    MODEL_PATH = f"{llm_models_root()}/llama-models-v3/Llama-3-8B-Instruct-Gradient-1048k"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-
 class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
@@ -466,84 +320,6 @@ class TestLlama3_1_8BInstruct(CliFlowAccuracyTestHarness):
                  model_fields["decoding_type"].default,
                  extra_build_args=["--speculative_decoding_mode=medusa"],
                  extra_summarize_args=extra_summarize_args)
-
-
-class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.2-1B"
-    MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-    @skip_pre_ada
-    def test_fp8(self):
-        self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
-
-    @skip_pre_ada
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize(
-        "fp8_context_fmha", [False, True],
-        ids=["disable_fp8_context_fmha", "enable_fp8_context_fmha"])
-    @pytest.mark.parametrize(
-        "reduce_fusion", [False, True],
-        ids=["disable_reduce_fusion", "enable_reduce_fusion"])
-    def test_fp8_tp2(self, fp8_context_fmha: bool, reduce_fusion: bool):
-        if fp8_context_fmha:
-            extra_build_args = [
-                "--use_fp8_context_fmha=enable",
-                "--use_paged_context_fmha=enable"
-            ]
-        else:
-            extra_build_args = [
-                "--use_fp8_context_fmha=disable",
-                "--use_paged_context_fmha=disable"
-            ]
-
-        if reduce_fusion:
-            extra_build_args.append("--reduce_fusion=enable")
-        else:
-            extra_build_args.append("--reduce_fusion=disable")
-
-        self.run(quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=2,
-                 extra_build_args=extra_build_args)
-
-    @skip_pre_ada
-    @skip_post_blackwell
-    def test_fp8_rowwise(self):
-        self.run(quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
-
-    @skip_pre_ada
-    @skip_post_blackwell
-    def test_fp8_rowwise_meta_recipe(self):
-        self.run(quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
-                 extra_acc_spec="meta_recipe",
-                 extra_convert_args=["--use_meta_fp8_rowwise_recipe"])
-
-    @pytest.mark.parametrize("max_gpu_percent", [0.1, 1.0])
-    def test_weight_streaming(self, max_gpu_percent: float):
-        self.run(extra_build_args=["--weight_streaming"],
-                 extra_summarize_args=["--gpu_weights_percent=0"])
-
-        for gpu_percent in [0.1, 0.5, 0.9, 1]:
-            if gpu_percent > max_gpu_percent:
-                break
-            self.extra_summarize_args = [f"--gpu_weights_percent={gpu_percent}"]
-            self.evaluate()
-
-
-# TODO: Remove the CLI tests once NIMs use PyTorch backend
-@pytest.mark.skip_less_device_memory(80000)
-class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-    @pytest.mark.skip_less_device(8)
-    def test_auto_dtype_tp8(self):
-        self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=8, dtype='auto')
 
 
 class TestGemma2B(CliFlowAccuracyTestHarness):

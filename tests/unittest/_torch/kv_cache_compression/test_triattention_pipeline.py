@@ -69,16 +69,24 @@ def _make_hf_config(**values):
     return SimpleNamespace(get_text_config=lambda: text_config)
 
 
+def _factory_model_engine(pretrained_config: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        mapping=SimpleNamespace(has_cp_helix=lambda: False),
+        spec_config=None,
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                pretrained_config=pretrained_config,
+                quant_config=None,
+            )
+        ),
+    )
+
+
 class TestConfigAndFactory:
-    def test_factory_allows_block_reuse_and_propagates_config_fields(self):
+    def test_factory_allows_block_reuse_and_propagates_config_fields(self) -> None:
         # The factory contract is independent of GPU-owned persistent buffers.
         fake_v2 = _make_fake_v2(enable_block_reuse=True)
         cfg = _make_tri_config(budget=32, beta=16, eviction_mode="per_head")
-        validate_kv_cache_compression_compatibility(
-            cfg,
-            SimpleNamespace(enable_block_reuse=True),
-            None,
-        )
         with (
             mock.patch(
                 "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
@@ -90,9 +98,10 @@ class TestConfigAndFactory:
         ):
             mgr = create_kv_cache_compression_manager(
                 cfg,
-                kv_cache_manager=fake_v2,
-                pretrained_config=_make_test_pretrained_config(),
+                model_engine=_factory_model_engine(_make_test_pretrained_config()),
+                kv_cache_config=SimpleNamespace(enable_block_reuse=True),
             )
+            mgr.bind_kv_cache_managers(fake_v2)
         assert isinstance(mgr, TriAttentionCompressionManager)
         assert mgr.budget == 32
         assert mgr.beta == 16
@@ -286,7 +295,7 @@ class TestEvictionLifecycle:
     @staticmethod
     def _make_due_decode_request(seq_len, *, num_extra_kv_tokens=0, kv_reserve_draft_tokens=0):
         # The growth and protected-tail capacity constants snapshot the
-        # manager at construction, so the reserve widths are set up front.
+        # manager at binding, so the reserve widths are set up front.
         request = _make_request(
             7,
             py_prompt_len=1024,
@@ -299,9 +308,9 @@ class TestEvictionLifecycle:
         with mock.patch.object(TriAttentionCompressionManager, "_initialize_eviction_state"):
             mgr = TriAttentionCompressionManager(
                 _make_tri_config(budget=8),
-                fake_v2,
                 pretrained_config=_make_test_pretrained_config(),
             )
+            mgr.bind_kv_cache_managers(fake_v2)
         cache = SimpleNamespace(
             capacity=seq_len,
             history_length=1024,
@@ -441,14 +450,12 @@ class TestEvictionLifecycle:
     def test_one_model_draft_co_compression_is_accepted(self, spec_mode):
         draft_manager = _make_fake_v2(is_draft=True)
         with mock.patch.object(TriAttentionCompressionManager, "_initialize_eviction_state"):
-            TriAttentionCompressionManager(
+            manager = TriAttentionCompressionManager(
                 _make_tri_config(budget=8),
-                _make_fake_v2(),
-                draft_kv_cache_manager=draft_manager,
                 pretrained_config=_make_test_pretrained_config(),
             )
+            manager.bind_kv_cache_managers(_make_fake_v2(), draft_manager)
 
-        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_compatibility
         from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
 
         spec_config = (
@@ -461,11 +468,15 @@ class TestEvictionLifecycle:
             )
         )
 
-        validate_kv_cache_compression_compatibility(
-            _make_tri_config(budget=8),
-            SimpleNamespace(enable_block_reuse=False),
-            spec_config,
-        )
+        with mock.patch(
+            "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
+            return_value=True,
+        ):
+            validate_kv_cache_compression_compatibility(
+                _make_tri_config(budget=8),
+                SimpleNamespace(enable_block_reuse=False),
+                spec_config,
+            )
 
 
 class TestFixedScoreMetadata:

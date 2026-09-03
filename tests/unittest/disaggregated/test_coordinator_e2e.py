@@ -58,6 +58,7 @@ from tensorrt_llm.serve.coordinator_server import CoordinatorServer
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_server import _MsgspecRequest
 
 GEN_TEXT = "HELLO_FROM_GEN"
 
@@ -131,7 +132,7 @@ def _mock_worker_app(role: str) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(raw: Request):
-        body = await raw.json()
+        body = await _MsgspecRequest(raw.scope, raw.receive).json()
         dp = body.get("disaggregated_params") or {}
         model = body.get("model", "m")
         if dp.get("request_type") == "context_only":

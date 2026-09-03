@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,6 +59,7 @@ struct MlaRopeGenArgs
     int32_t max_context_q_len;
     int const* block_ids_per_seq_ptr;
     tk::KvCacheDataType cache_type;
+    tk::KVBlockArray kv_scale_cache_buffer;
     int* cu_q_seqlens_ptr;
     int* cu_kv_seqlens_ptr;
     uint32_t* fmha_tile_counter_ptr;
@@ -71,6 +72,7 @@ struct MlaRopeGenArgs
     float const* quant_scale_o_ptr;
     float const* kv_scale_orig_quant_ptr;
     float const* kv_scale_quant_orig_ptr;
+    float const* kv_cache_scale_orig_quant_ptr;
     float host_bmm1_scale;
     int32_t const* helix_position_offsets_ptr;
     bool const* helix_is_inactive_rank_ptr;
@@ -112,6 +114,7 @@ void invokeMLARopeGenerationHelper(T const* latent_cache_ptr, T* q_pe_ptr, T* fu
     mla_params.block_ids_per_seq = args.block_ids_per_seq_ptr;
 
     mla_params.cache_type = args.cache_type;
+    mla_params.kv_cache_block_scales_buffer = args.kv_scale_cache_buffer;
 
     mla_params.seqQOffset = args.cu_q_seqlens_ptr;
     mla_params.cu_kv_seqlens = args.cu_kv_seqlens_ptr;
@@ -124,7 +127,7 @@ void invokeMLARopeGenerationHelper(T const* latent_cache_ptr, T* q_pe_ptr, T* fu
 
     mla_params.quant_scale_o = args.quant_scale_o_ptr;
     mla_params.quant_scale_q = args.kv_scale_orig_quant_ptr;
-    mla_params.quant_scale_kv = args.kv_scale_orig_quant_ptr;
+    mla_params.quant_scale_kv = args.kv_cache_scale_orig_quant_ptr;
     mla_params.dequant_scale_q = args.kv_scale_quant_orig_ptr;
     mla_params.dequant_scale_kv = args.kv_scale_quant_orig_ptr;
     mla_params.host_bmm1_scale = args.host_bmm1_scale;
@@ -159,12 +162,13 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
     torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths, torch::Tensor host_context_lengths,
     int64_t const num_contexts, std::optional<torch::Tensor> kv_cache_block_offsets,
     std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
-    torch::optional<torch::Tensor> kv_scale_orig_quant, // [1] q,k quant scale
-    torch::optional<torch::Tensor> kv_scale_quant_orig, // [1] bmm quant scale
-    torch::optional<torch::Tensor> out_scale,           // [1] output quant scale
+    torch::optional<torch::Tensor> kv_scale_orig_quant,       // [1] q,k quant scale
+    torch::optional<torch::Tensor> kv_scale_quant_orig,       // [1] bmm quant scale
+    torch::optional<torch::Tensor> kv_cache_scale_orig_quant, // [1] KV-cache quant scale
+    torch::optional<torch::Tensor> out_scale,                 // [1] output quant scale
     std::optional<torch::Tensor> block_ids_per_seq, std::vector<std::optional<torch::Tensor>> helix_tensor_params,
     int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
-    int64_t const num_kv_heads, int64_t const head_size,
+    int64_t const num_kv_heads, int64_t const head_size, int64_t const residual_dim,
 
     int64_t const tokens_per_block, int64_t const attention_window_size, int64_t const beam_width,
     int64_t const quant_mode, double const q_scaling, int64_t q_lora_rank, int64_t kv_lora_rank,
@@ -182,13 +186,18 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
     TLLM_CHECK_WITH_INFO(num_kv_heads == 1, "num_kv_heads must = 1");
+    TLLM_CHECK_WITH_INFO(residual_dim == 0 || residual_dim == qk_rope_head_dim,
+        "MLA KV residual_dim must be 0 or qk_rope_head_dim (%ld), got %ld", qk_rope_head_dim, residual_dim);
     TORCH_CHECK(helix_tensor_params.size() == 2,
         "Expecting 2 tensors for helix_tensor_params: helix_position_offsets and helix_is_inactive_rank.");
 
     auto stream = at::cuda::getCurrentCUDAStream(latent_cache.get_device());
     auto const kv_cache_quant_mode = tc::QuantMode(uint32_t(quant_mode));
+    TLLM_CHECK_WITH_INFO(kv_cache_quant_mode.hasFp4KvCache() || residual_dim == 0,
+        "MLA KV residual quantization requires an NVFP4 KV cache.");
     bool const use_gen_flash_mla = tc::getSMVersion() == 90 && tokens_per_block == 64;
-    TLLM_CHECK_WITH_INFO(!kv_cache_quant_mode.hasFp4KvCache(), "FP4 KV cache is not supported for MLA generation.");
+    TLLM_CHECK_WITH_INFO(!(kv_cache_quant_mode.hasFp4KvCache() && latent_cache.scalar_type() == torch::kFloat32),
+        "FP32 input is not supported when writing an NVFP4 MLA cache.");
     TLLM_CHECK_WITH_INFO(
         host_kv_cache_pool_mapping.has_value(), "KV cache pool mapping is required for MLA generation.");
 
@@ -243,14 +252,21 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
         q_pe_stride = q_pe->strides()[0];
     }
 
-    bool const fp8_context_fmha = kv_cache_quant_mode.hasFp8KvCache();
+    bool const fp8_context_fmha = kv_cache_quant_mode.hasFp8KvCache() || kv_cache_quant_mode.hasFp4KvCache();
     int32_t const batch_beam = beam_width * num_generations;
 
-    auto kv_cache_buffer = tensorrt_llm::torch_ext::buildPagedKvCacheBuffers(kv_cache_block_offsets,
+    int64_t const storage_head_size = head_size + residual_dim;
+    auto kv_cache_buffers = tensorrt_llm::torch_ext::buildPagedKvCacheBuffers(kv_cache_block_offsets,
         host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, kv_cache_quant_mode, layer_idx, batch_beam,
-        tokens_per_block, num_kv_heads, head_size, attention_window_size, attention_window_size, beam_width, seq_offset,
-        true /*is_mla_enable*/, static_cast<size_t>(latent_cache.element_size()))
-                               .kvCacheBuffer;
+        tokens_per_block, num_kv_heads, storage_head_size, attention_window_size, attention_window_size, beam_width,
+        seq_offset, true /*is_mla_enable*/, static_cast<size_t>(latent_cache.element_size()));
+    auto& kv_cache_buffer = kv_cache_buffers.kvCacheBuffer;
+    if (kv_cache_quant_mode.hasFp4KvCache())
+    {
+        TLLM_CHECK_WITH_INFO(
+            kv_cache_buffers.kvScaleCacheBuffer.data != nullptr, "NVFP4 MLA cache requires a block-scale pool.");
+        TLLM_CHECK_WITH_INFO(kv_only || quant_q_buffer.has_value(), "NVFP4 MLA decode requires an FP8 query buffer.");
+    }
 
     tk::KvCacheDataType cache_type = tk::cacheTypeFromQuantMode(kv_cache_quant_mode);
 
@@ -260,6 +276,11 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
     {
         kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
         kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
+    }
+    float const* kv_cache_scale_orig_quant_ptr = kv_scale_orig_quant_ptr;
+    if (kv_cache_scale_orig_quant.has_value())
+    {
+        kv_cache_scale_orig_quant_ptr = kv_cache_scale_orig_quant.value().data_ptr<float>();
     }
 
     float const* quant_scale_o_ptr
@@ -302,14 +323,14 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
         kv_norm_weight_ptr = kv_norm_weight->data_ptr();
     }
 
-    // Currently NVFP4 KV cache is not supported for MLA
     MlaRopeGenArgs args{q_pe_ld, q_pe_stride, rotary_cos_sin_ptr, num_generations, num_gen_tokens,
         static_cast<int32_t>(num_heads), mla_meta_params, sequence_lengths_ptr, max_context_q_len,
-        block_ids_per_seq_ptr, cache_type, cu_q_seqlens_ptr, cu_kv_seqlens_ptr, fmha_tile_counter_ptr,
-        mla_bmm1_scale_ptr, mla_bmm2_scale_ptr, quant_q_buffer_ptr, quant_scale_qkv_ptr, quant_scale_o_ptr,
-        kv_scale_orig_quant_ptr, kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr,
-        helix_is_inactive_rank_ptr, kv_norm_weight_ptr, static_cast<float>(kv_norm_eps), latent_row_stride,
-        precomputed_cu_seqlens, precomputed_fmha_scheduler, kv_only, kv_done_elsewhere};
+        block_ids_per_seq_ptr, cache_type, kv_cache_buffers.kvScaleCacheBuffer, cu_q_seqlens_ptr, cu_kv_seqlens_ptr,
+        fmha_tile_counter_ptr, mla_bmm1_scale_ptr, mla_bmm2_scale_ptr, quant_q_buffer_ptr, quant_scale_qkv_ptr,
+        quant_scale_o_ptr, kv_scale_orig_quant_ptr, kv_scale_quant_orig_ptr, kv_cache_scale_orig_quant_ptr,
+        host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr, kv_norm_weight_ptr,
+        static_cast<float>(kv_norm_eps), latent_row_stride, precomputed_cu_seqlens, precomputed_fmha_scheduler, kv_only,
+        kv_done_elsewhere};
 
     void* q_pe_ptr = kv_only ? nullptr : q_pe->data_ptr();
     void* fused_q_ptr = kv_only ? nullptr : fused_q->data_ptr();
@@ -365,6 +386,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? host_kv_cache_pool_mapping"
         ", Tensor? kv_scale_orig_quant"
         ", Tensor? kv_scale_quant_orig"
+        ", Tensor? kv_cache_scale_orig_quant"
         ", Tensor? out_scale"
         ", Tensor? block_ids_per_seq"
         ", Tensor?[] helix_tensor_params"
@@ -373,6 +395,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int num_heads"
         ", int num_kv_heads"
         ", int head_size"
+        ", int residual_dim"
         ", int tokens_per_block"
         ", int attention_window_size"
         ", int beam_width"

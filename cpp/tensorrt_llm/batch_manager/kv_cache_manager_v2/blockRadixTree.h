@@ -373,7 +373,11 @@ public:
         // shortens it. Equal to numTokens when the model has no SSM life
         // cycle. Separates "attention prefix matched N tokens" from
         // "recurrent-snapshot pruning cut it to M".
-        int numTokensBeforeHybridPruning;
+        int numReusableTokensBeforeHybridPruning;
+        // Raw token-path walk depth, before any pruning. Locates where this
+        // request's content diverges from the tree, independent of page
+        // residency. Equal to numLookupTokens when there is no fork.
+        int numReusableTokensBeforePruning;
     };
 
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
@@ -421,7 +425,7 @@ private:
         ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const;
     // Shorten `matched` to the prefix that is actually reusable. Passing
     // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
-    // yields the attention-only prefix (used for numTokensBeforeHybridPruning).
+    // yields the attention-only prefix (used for numReusableTokensBeforeHybridPruning).
     std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const;
 
     // Erase any pending empty root blocks from mRoots.

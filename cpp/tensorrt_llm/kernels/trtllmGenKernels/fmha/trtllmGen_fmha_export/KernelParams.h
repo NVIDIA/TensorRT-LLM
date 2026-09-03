@@ -217,6 +217,8 @@ static auto makeTmaShapeStrideQ(FmhaOptions const& options, KernelTraits_ const&
   int32_t tileSizePerCtaQ{options.mTileSizeQ * options.mNumInstsQ};
   // The number of tokensQ per CTA.
   int32_t numTokensPerCtaQ{tileSizePerCtaQ};
+  // The number of tokensQ loaded by one Q tile instance.
+  int32_t numTokensPerTileQ{options.mTileSizeQ};
   // Re-compute the number of tokensQ per CTA if groupsHeadsQ is enabled.
   if (options.mGroupsHeadsQ) {
     if (options.mGroupsTokensHeadsQ) {
@@ -225,15 +227,20 @@ static auto makeTmaShapeStrideQ(FmhaOptions const& options, KernelTraits_ const&
       // tensor to [numTokensQ, numGroupedHeads, numHeads, headDimQ] and we might want to revisit
       // this in the future.
       numTokensPerCtaQ = static_cast<int32_t>(numTokensPerCtaQ / numGroupedHeads);
+      numTokensPerTileQ = static_cast<int32_t>(numTokensPerTileQ / numGroupedHeads);
     } else {
+      // Single-token-per-CTA kernels (SwapsMmaAb generation): the generated kernel expects a
+      // one-token TMA box per Q tile instance (see getNumTokensPerTileQ), so both counts reset
+      // to 1 here.
       numGroupedHeads = tileSizePerCtaQ;
       numTokensPerCtaQ = 1;
+      numTokensPerTileQ = 1;
     }
     tileShapes =
       std::vector<uint32_t>{static_cast<uint32_t>(kernelTraits.mNumEltsInClampedHeadDimQ),
                             static_cast<uint32_t>(numGroupedHeads),
                             1,
-                            static_cast<uint32_t>(numTokensPerCtaQ)};
+                            static_cast<uint32_t>(numTokensPerTileQ)};
   }
 
   return std::make_tuple(shape, stride, tileShapes, numTokensPerCtaQ);
@@ -526,7 +533,7 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                          params.ptrPageIdxKv,
                          params.ptrOutputScale,
                          params.ptrDsv4InvRopeCosSinCache,
-                         params.ptrDsv4OScaleFp32,
+                         params.ptrDsv4OScale,
                          params.ptrScaleSoftmaxLog2,
                          params.ptrScaleSfKv,
                          params.ptrScaleSfO,
@@ -547,8 +554,14 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                          params.ptrSkipSoftmaxStats,
                          params.ptrSoftmaxStats,
                          params.ptrDebugO,
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+                         params.ptrInvalidate,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
                          params.mScaleSoftmaxLog2,
                          params.mInflateMax,
+                         params.mSkipCorrThreshold,
                          params.mScaleSfKv,
                          params.mScaleSfO,
                          params.mStartTokenIdxSfO,
@@ -574,7 +587,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     int const* kvPageIdxD,
                                     float const* outputScaleD,
                                     float const* dsv4InvRopeCosSinCacheD,
-                                    float* dsv4OScaleFp32D,
+                                    float* dsv4OScaleD,
                                     float const* scaleSoftmaxLog2D,
                                     float const* kvSfScaleD,
                                     float const* oSfScaleD,
@@ -595,8 +608,14 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     int* skipSoftmaxStatsPtrD,
                                     float2* softmaxStatsD,
                                     void* oDebugPtrD,
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+                                    void* ptrInvalidate,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
                                     float softmaxScale,
                                     float inflateMax,
+                                    float skipCorrThreshold,
                                     float kvSfScale,
                                     float oSfScale,
                                     int32_t startTokenIdxSfO,
@@ -808,7 +827,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   // when -loadsScalesFromGmem true -dtypeElt e4m3 are specified.
   params.ptrOutputScale = outputScaleD;
   params.ptrDsv4InvRopeCosSinCache = dsv4InvRopeCosSinCacheD;
-  params.ptrDsv4OScaleFp32 = dsv4OScaleFp32D;
+  params.ptrDsv4OScale = dsv4OScaleD;
 
   // The partial buffers' pointers when the multiCtasKv mode is enabled.
   params.ptrMultiCtasKvCounter = multiCtasKvCounterPtrD;
@@ -826,6 +845,11 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   // The sequence lengths for K/V.
   params.ptrSeqLensKv = seqLensKvPtrD;
 
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+  params.ptrInvalidate = ptrInvalidate;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
 
   params.mAttentionWindowSize = options.mAttentionWindowSize;
   if (options.mChunkedAttentionSize > 0) {
@@ -837,6 +861,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   params.mBatchSize = options.mBatchSize;
 
   params.mInflateMax = inflateMax;
+  params.mSkipCorrThreshold = skipCorrThreshold;
 
   // Compute the logs for the numbers of elements in the Sage Attention blocks.
   int32_t logNumEltsPerSageAttnBlkK{-1};
@@ -961,6 +986,7 @@ static KernelParams setKernelParams(FmhaOptions_ const&,
                                     int*,
                                     float2*,
                                     void*,
+                                    float,
                                     float,
                                     float,
                                     float,

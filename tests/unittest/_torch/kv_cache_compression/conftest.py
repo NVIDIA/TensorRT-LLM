@@ -348,11 +348,12 @@ def make_triattention(**overrides):
     )
 
     with mock.patch.object(TriAttentionCompressionManager, "_initialize_eviction_state"):
-        return TriAttentionCompressionManager(
+        manager = TriAttentionCompressionManager(
             make_tri_config(**overrides),
-            make_fake_v2(),
             pretrained_config=make_test_pretrained_config(),
         )
+        manager.bind_kv_cache_managers(make_fake_v2())
+        return manager
 
 
 def make_eviction_request(
