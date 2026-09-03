@@ -6812,7 +6812,8 @@ class TestLagunaXS_2_1(LlmapiAccuracyTestHarness):
             speculative_model=dflash_model_path,
         )
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        use_kv_cache_manager_v2=True)
 
         with LLM(model_path,
                  max_seq_len=4096,
