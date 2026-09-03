@@ -26,6 +26,11 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
 import torch
 
 from flashinfer.api_logging import flashinfer_api
+from flashinfer.trace.templates.attention import (
+    attention_ts_decode_trace_dispatch,
+    prims_ts_decode_trace_dispatch,
+)
+
 from ._tensor_aliasing import (
     _validate_out_does_not_overlap_inputs,
     _validate_tensor_does_not_overlap_inputs,
@@ -2068,7 +2073,7 @@ def _validate_decode_run_metadata_values(
         )
 
 
-@flashinfer_api
+@flashinfer_api(trace=prims_ts_decode_trace_dispatch)
 def prims_ts_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: PagedKVCache,
@@ -2769,7 +2774,7 @@ class BatchDecodePagedTSWrapper:
         )
 
 
-@flashinfer_api
+@flashinfer_api(trace=attention_ts_decode_trace_dispatch)
 def batch_decode_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
