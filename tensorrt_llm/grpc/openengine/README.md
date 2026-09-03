@@ -29,9 +29,17 @@ The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyT
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
 
-Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: OpenEngine KV sessions and prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority or data-parallel-rank metadata. The AutoDeploy backend is rejected at startup until it supports request cancellation. Other `Control` RPCs remain unimplemented.
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: OpenEngine KV sessions and prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority or data-parallel-rank metadata. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `Health` and `Abort`; its LoRA lifecycle and KV-event RPCs return `UNIMPLEMENTED`.
 
 OpenEngine and SMG are independent protocol integrations. This integration does not make a replacement or convergence decision between them.
+
+## Transport security
+
+The listener is plaintext h2c with no authentication. Any client that can reach
+the port can run inference and call `Control.Abort`, including `all_requests`.
+Bind it to loopback alongside its caller, or front it with a proxy that
+terminates TLS and authenticates. The server logs a warning when it binds to a
+non-loopback address.
 
 ## Dependency provenance
 

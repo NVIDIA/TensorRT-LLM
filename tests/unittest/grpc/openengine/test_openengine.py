@@ -88,3 +88,17 @@ def test_openengine_server_serves_the_control_contract() -> None:
             await server.stop(grace=0)
 
     asyncio.run(exercise_server())
+
+
+def test_is_loopback_classifies_bind_hosts() -> None:
+    """The listener is unauthenticated, so a non-loopback bind must be flagged."""
+    from tensorrt_llm.grpc.openengine.server import _is_loopback
+
+    assert _is_loopback("127.0.0.1")
+    assert _is_loopback("::1")
+    assert _is_loopback("[::1]")
+    assert _is_loopback("localhost")
+    assert not _is_loopback("0.0.0.0")
+    assert not _is_loopback("10.0.0.7")
+    # An unresolvable name is not assumed safe.
+    assert not _is_loopback("some-host")

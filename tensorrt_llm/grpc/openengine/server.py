@@ -4,6 +4,7 @@
 """OpenEngine gRPC server lifecycle for TensorRT-LLM."""
 
 import asyncio
+import ipaddress
 import signal
 from typing import Any
 
@@ -44,6 +45,17 @@ def _format_bind_address(host: str, port: int) -> str:
     return f"{host}:{port}"
 
 
+def _is_loopback(host: str) -> bool:
+    """Whether `host` resolves to a loopback address."""
+    cleaned = host.strip("[]")
+    if not cleaned or cleaned in ("localhost",):
+        return True
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
 def _kv_transfer_backend(llm: Any) -> str:
     """Best-effort name of the KV cache transfer backend for disaggregation."""
     cache_config = getattr(getattr(llm, "args", None), "cache_transceiver_config", None)
@@ -77,6 +89,16 @@ class OpenEngineServer:
             self._server,
         )
         bind_address = _format_bind_address(host, port)
+        # Plaintext h2c with no authentication: any client that can reach this
+        # port can run inference and call Control.Abort. It is meant to be
+        # colocated with its caller on loopback, or fronted by a proxy that
+        # terminates TLS and authenticates.
+        if not _is_loopback(host):
+            logger.warning(
+                f"OpenEngine server is binding to {bind_address}, which is not loopback. "
+                "The listener is unauthenticated and unencrypted: restrict it to a trusted "
+                "network or front it with an authenticating TLS proxy."
+            )
         bound_port = self._server.add_insecure_port(bind_address)
         if bound_port == 0:
             raise RuntimeError(f"Failed to bind OpenEngine server to {bind_address}")
