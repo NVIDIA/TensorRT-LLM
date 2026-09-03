@@ -79,7 +79,11 @@ from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
-from tensorrt_llm._torch.moe.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
+from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
+    build_moe_deployment,
+    impl_class_for,
+    resolve_moe_impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
@@ -2406,3 +2410,21 @@ def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
             )
 
             ref_fused_moe.check_accuracy(output, ref_output)
+
+
+def test_build_moe_deployment_carries_finalize_and_locality_domain():
+    """The two fields SM107 eligibility reads must survive ``ModelConfig``."""
+    from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
+
+    default = build_moe_deployment(ModelConfig(), num_experts=8)
+    assert default.fused_finalize_enabled is True
+    assert default.locality_domain_requested is False
+
+    disabled = build_moe_deployment(ModelConfig(moe_disable_finalize_fusion=True), num_experts=8)
+    assert disabled.fused_finalize_enabled is False
+
+    requested = build_moe_deployment(
+        ModelConfig(locality_domain_policy=LocalityDomainPolicy(enabled=True)),
+        num_experts=8,
+    )
+    assert requested.locality_domain_requested is True
