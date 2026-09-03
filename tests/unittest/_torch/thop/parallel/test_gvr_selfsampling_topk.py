@@ -317,7 +317,7 @@ def test_selfsampling_topk_posinf_completeness(pos):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
-def test_selfsampling_topk_posinf_regclus_completeness():
+def test_selfsampling_topk_posinf_regclus_completeness() -> None:
     """A collapsed reg_clus bracket must use its whole-row key-space
     fallback instead of emitting from the lossy float-space histogram."""
     batch_size, n_valid, top_k = 4, 32768, 1024
