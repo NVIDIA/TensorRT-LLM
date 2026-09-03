@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Literal, Optional
 
 from pydantic import Field as PydanticField
+from pydantic import field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
@@ -279,6 +280,45 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
             "time; no pipeline wiring required."
         ),
     )
+
+    @field_validator("dense_layers")
+    @classmethod
+    def _validate_dense_layers(cls, spec: Optional[str]) -> Optional[str]:
+        """Reject malformed specs here rather than deep in the backend.
+
+        Without this a non-numeric token raises from ``_parse_dense_layers``
+        during attention construction, far from the config that caused it, and
+        a descending range such as ``'4-2'`` raises nothing at all -- it yields
+        an empty set, so the layers the user asked to force dense silently stay
+        sparse.
+        """
+        if spec is None:
+            return spec
+        for item in spec.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                if "-" in item:
+                    # A negative index cannot reach here: it also contains '-',
+                    # so it takes this branch and the empty first part fails
+                    # int() below.
+                    start, end = (int(part) for part in item.split("-", 1))
+                    if start > end:
+                        raise ValueError(
+                            f"dense_layers range '{item}' is descending; "
+                            f"write it as '{end}-{start}'"
+                        )
+                else:
+                    int(item)
+            except ValueError as exc:
+                if "descending" in str(exc):
+                    raise
+                raise ValueError(
+                    f"dense_layers entry '{item}' is not a layer index or range; "
+                    "expected a comma-separated list such as '0,2-4'"
+                ) from exc
+        return spec
 
     def to_sparse_params(self, **kwargs):
         # Sol-Attn's knobs are consumed directly by SolAttention.__init__
