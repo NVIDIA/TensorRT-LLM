@@ -362,7 +362,7 @@ class HfWeightLoader(BaseWeightLoader):
         The listed model families ship checkpoints too large to materialize
         in host RAM (Kimi K3 is about 1.5 TB), and their models stream
         rank-local slices (expert-parallel expert ranges) out of the lazy
-        handles during ``load_weights``.
+        handles during `load_weights`.
         """
         config_path = os.path.join(checkpoint_dir, "config.json")
         if not os.path.isfile(config_path):
