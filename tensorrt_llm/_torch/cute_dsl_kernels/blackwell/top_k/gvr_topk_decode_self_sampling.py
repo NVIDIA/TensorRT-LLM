@@ -3713,10 +3713,13 @@ class GvrTopkRegKernel:
             Tv = invkey(lmin)
             GMAX = invkey(lmax)
 
-            # ---- collapse guard, NaN-safe
+            # ---- collapse guard, NaN-safe. w_ < 3.5e38 (> FLT_MAX) also
+            # rejects an infinite bracket width: an in-window +inf (GMAX=+inf)
+            # or -inf (Tv=-inf) makes SC=0 and folds every value into bin 0.
             okc = cutlass.Int32(0)
             if Tv < GMAX:
-                if (GMAX - Tv) > cutlass.Float32(1e-30):
+                w_ = GMAX - Tv
+                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(3.5e38):
                     okc = cutlass.Int32(1)
             if okc == cutlass.Int32(0):
                 Tv = cutlass.Float32(SENT_LO)
@@ -3804,6 +3807,11 @@ class GvrTopkRegKernel:
                 if m > cmp_:
                     esc = cutlass.Int32(1)
             if tot < k:
+                esc = cutlass.Int32(1)
+            # A degenerate bracket (okc==0) collapses the histogram into
+            # bin 0; escape to the bracket-independent key-space rank, where
+            # fkey(+inf) is the maximum key.
+            if okc == cutlass.Int32(0):
                 esc = cutlass.Int32(1)
             if esc == cutlass.Int32(1):
                 if tid == cutlass.Int32(0):

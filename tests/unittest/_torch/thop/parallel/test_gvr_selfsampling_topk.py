@@ -292,6 +292,31 @@ def test_selfsampling_topk_neginf_tail_completeness():
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
+@pytest.mark.parametrize("pos", [1000, 3000], ids=["in_window", "out_of_window"])
+def test_selfsampling_topk_posinf_completeness(pos):
+    """A +inf in the register-family fold window drives the bracket max to
+    +inf, so the bracket width GMAX-Tv=+inf and SC=rcp(+inf)=0 fold every
+    value into bin 0; the whole-bin emit then drops the +inf from the top-k
+    (regression, DKG issue #58). The infinite-width bracket must be rejected
+    by the collapse guard and take the key-space escape, where fkey(+inf) is
+    the maximum key. Both an in-window and an out-of-window +inf are pinned;
+    N=4096 k=1024 keeps the register 'reg' family (not the streaming tiers,
+    which never collapse this way)."""
+    top_k = 1024
+    n_valid = 4096
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((1, n_valid), generator=gen, dtype=torch.float32, device=_DEV) * 2.0
+    logits[0, pos] = float("inf")
+    ref_vals, _ = torch.topk(logits, top_k, dim=1)
+    indices = torch.full((1, top_k), -7, dtype=torch.int32, device=_DEV)
+    kv = torch.full((1,), n_valid, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, kv, indices, max_seq_len=n_valid)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots"
+    assert torch.isinf(logits[0][indices[0].long()]).any(), "+inf dropped from the top-k"
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
 def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False):
     """Build a per-row-poisoned varlen batch, run run_varlen, verify every
     row against its own n_r (production formula) — short rows included."""
