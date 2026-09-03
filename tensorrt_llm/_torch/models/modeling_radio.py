@@ -1159,6 +1159,21 @@ class RADIOVisionModelBase(nn.Module):
         return fmt_feat
 
 
+def split_fused_qkv(name: str, tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Split a fused ``attn.qkv`` weight or bias into its q/k/v projections.
+
+    The row order here is the only place the fusion order is written down, so
+    anything that builds an ``attn.qkv`` tensor for this loader has to match it.
+    """
+    dim_shape = tensor.shape[0] // 3
+    return {
+        name.replace('attn.qkv.', 'attn.q_proj.'): tensor[:dim_shape],
+        name.replace('attn.qkv.', 'attn.k_proj.'):
+        tensor[dim_shape:2 * dim_shape],
+        name.replace('attn.qkv.', 'attn.v_proj.'): tensor[2 * dim_shape:],
+    }
+
+
 class RADIOVisionModel(PreTrainedModel):
     """Modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
 
@@ -1214,11 +1229,12 @@ class RADIOVisionModel(PreTrainedModel):
         img_size = VIT_TIMM_CONFIG_BY_NAME[model_name].img_size
         mlp_ratio = intermediate_size / embed_dim
 
-        # Build the model.
+        # Build the model. C-RADIOv4-H omits `in_chans`, `input_size` and `drop`
+        # from the RADIO argument bag, so these reads tolerate their absence.
         in_chans = 3
-        if args.in_chans is not None:
+        if getattr(args, 'in_chans', None) is not None:
             in_chans = args.in_chans
-        elif args.input_size is not None:
+        elif getattr(args, 'input_size', None) is not None:
             in_chans = args.input_size[0]
         vit_model = VisionTransformer(
             img_size=img_size,
@@ -1228,7 +1244,7 @@ class RADIOVisionModel(PreTrainedModel):
             depth=depth,
             num_heads=num_attention_heads,
             mlp_ratio=mlp_ratio,
-            drop_rate=args.drop,
+            drop_rate=getattr(args, 'drop', 0.0),
             special_args=args,
             model_config=self.model_config,
         )
@@ -1242,30 +1258,41 @@ class RADIOVisionModel(PreTrainedModel):
         input_conditioner = nn.Identity()
         input_conditioner.dtype = config.torch_dtype
 
-        adaptor_names = config.adaptor_names or []
+        # C-RADIOv4 configs omit these three fields; absent means "not configured",
+        # which is the only case these guards accept anyway.
+        adaptor_names = getattr(config, 'adaptor_names', None) or []
         if len(adaptor_names) > 0:
             raise ValueError(
                 "Adaptor names are not supported for RADIO models.")
         adaptors = dict()
 
         feature_normalizer = None
-        if config.feature_normalizer_config is not None:
+        if getattr(config, 'feature_normalizer_config', None) is not None:
             raise ValueError(
                 "Feature normalizer is not supported for RADIO models.")
 
         inter_feature_normalizer = None
-        if config.inter_feature_normalizer_config is not None:
+        if getattr(config, 'inter_feature_normalizer_config', None) is not None:
             raise ValueError(
                 "Intermediate feature normalizer is not supported for RADIO models."
             )
+
+        # C-RADIOv4 renames both: `max_img_size` is `max_resolution`, and
+        # `image_size` the preferred (square) resolution. `vitdet_window_size`
+        # has no v4 counterpart; None is the constructor's own default.
+        max_resolution = (config.max_resolution if hasattr(
+            config, 'max_resolution') else config.max_img_size)
+        preferred_resolution = (config.preferred_resolution if hasattr(
+            config, 'preferred_resolution') else Resolution(
+                config.image_size, config.image_size))
 
         self.radio_model = RADIOVisionModelBase(
             vit_model,
             input_conditioner,
             patch_size=config.patch_size,
-            max_resolution=config.max_resolution,
-            window_size=config.vitdet_window_size,
-            preferred_resolution=config.preferred_resolution,
+            max_resolution=max_resolution,
+            window_size=getattr(config, 'vitdet_window_size', None),
+            preferred_resolution=preferred_resolution,
             adaptors=adaptors,
             feature_normalizer=feature_normalizer,
             inter_feature_normalizer=inter_feature_normalizer,
@@ -1318,14 +1345,8 @@ class RADIOVisionModel(PreTrainedModel):
         for name in model_weights:
             # Handle with weights and bias for vision transformer's qkv projection.
             if "attn.qkv." in name:
-                q_name = name.replace("attn.qkv.", "attn.q_proj.")
-                k_name = name.replace("attn.qkv.", "attn.k_proj.")
-                v_name = name.replace("attn.qkv.", "attn.v_proj.")
-                dim_shape = model_weights[name].shape[0] // 3
-                converted_weights[q_name] = model_weights[name][:dim_shape]
-                converted_weights[k_name] = model_weights[name][dim_shape:2 *
-                                                                dim_shape]
-                converted_weights[v_name] = model_weights[name][2 * dim_shape:]
+                converted_weights.update(
+                    split_fused_qkv(name, model_weights[name]))
             else:
                 converted_weights[name] = model_weights[name]
         pattern_mapping = {

@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from os import environ, getenv
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -13,6 +13,7 @@ from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
                                           CacheTransceiverConfig)
 from tensorrt_llm.mapping import Mapping
 
+from .config_utils import resolve_cache_transceiver_config
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
@@ -142,24 +143,17 @@ def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
 
 def create_kv_cache_transceiver(
-        mapping: Mapping,
-        dist: Distributed,
-        kv_cache_manager: KVCacheManager,
-        attention_type: AttentionTypeCpp,
-        cache_transceiver_config: CacheTransceiverConfig,
-        mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+    mapping: Mapping,
+    dist: Distributed,
+    kv_cache_manager: KVCacheManager,
+    attention_type: AttentionTypeCpp,
+    cache_transceiver_config: CacheTransceiverConfig,
+    mamba_cache_manager: Optional[BaseMambaCacheManager] = None
+) -> Optional["KvCacheTransceiver"]:
+    resolve_cache_transceiver_config(cache_transceiver_config)
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
-
-    # "auto" is normally resolved against the model's preference at config
-    # load time (ModelLoader.load_config_and_apply_defaults); paths that skip
-    # that step (e.g. AutoDeploy) fall back to the C++ transceiver here. This
-    # must run before any consumer of transceiver_runtime below (e.g. the
-    # inflight-cancel validation, which treats non-CPP runtimes as
-    # unsupported).
-    if cache_transceiver_config.transceiver_runtime == "auto":
-        cache_transceiver_config.transceiver_runtime = None
 
     if (cache_transceiver_config.transceiver_runtime != "PYTHON"
             and isinstance(mamba_cache_manager, MixedMambaHybridCacheManager)):
@@ -167,6 +161,7 @@ def create_kv_cache_transceiver(
             "MixedMambaHybridCacheManager requires the Python transceiver "
             "runtime in disaggregated serving.")
 
+    # Runs while backend may still be "DEFAULT", which it rejects as ambiguous.
     _validate_disagg_inflight_cancel_config(cache_transceiver_config)
 
     if cache_transceiver_config.backend == "DEFAULT":
@@ -221,6 +216,7 @@ def create_kv_cache_transceiver(
         from tensorrt_llm._torch.disaggregation.transceiver import \
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
+        # MixedMambaHybridCacheManager contains both the KV and Mamba pools.
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
                                     cache_transceiver_config)
 
@@ -230,44 +226,210 @@ def create_kv_cache_transceiver(
                                   mamba_cache_manager)
 
 
+class CtxTransferStatus(NamedTuple):
+    """Typed result of ``KvCacheTransceiver.check_context_transfer_status``.
+
+    Unpacks positionally as ``(completed_request_ids, error_request_ids)``
+    for backward compatibility; prefer named field access in new code.
+    """
+    # Requests whose KV send settled successfully during this call.
+    completed_request_ids: List[int]
+    # Requests whose KV send failed during this call.
+    error_request_ids: List[int]
+
+
+class GenTransferStatus(NamedTuple):
+    """Typed result of ``KvCacheTransceiver.check_gen_transfer_status``.
+
+    Unpacks positionally as ``(completed_request_ids, error_request_ids,
+    cancelled_requests)`` for backward compatibility; prefer named field
+    access in new code.
+
+    The C++ transceiver runtime reports receive outcomes exclusively through
+    request-state mutation, so its lists are always empty; only the Python
+    (V2) runtime populates them.
+    """
+    # Requests whose KV receive settled successfully during this call.
+    completed_request_ids: List[int]
+    # Requests whose KV receive failed during this call.
+    error_request_ids: List[int]
+    # Requests whose receive session was cancelled (locally via
+    # ``cancel_request`` or by a remote CANCEL message). Their sessions are
+    # closed; the caller decides the final request state, distinguishing
+    # user cancellation from remote-initiated cancellation.
+    cancelled_requests: List[LlmRequest]
+
+
 class KvCacheTransceiver(ABC):
+    """Contract for moving KV cache between disaggregated instances.
+
+    Implementations: ``BindKvCacheTransceiver`` (C++ runtime) and
+    ``KvCacheTransceiverV2`` (Python/NIXL runtime). The executor must not
+    depend on which one it holds beyond this interface.
+
+    Rank symmetry: ``check_context_transfer_status`` and
+    ``check_gen_transfer_status`` participate in intra-instance consensus
+    collectives so that all ranks agree on per-request outcomes. Every rank
+    of an instance must call them the same number of times with the same
+    arguments per iteration; divergence can deadlock the instance.
+
+    Request ids in results are the ids the transceiver tracks: the request's
+    disaggregated unique id when its disaggregated params carry one,
+    otherwise ``request_id``.
+    """
+
+    # KV-transfer timeout budget in milliseconds, taken from
+    # CacheTransceiverConfig. None means no timeout is enforced: transfers
+    # may remain in flight indefinitely and the executor skips its
+    # timeout/cancellation sweeps. Implementations must set this attribute.
+    kv_transfer_timeout_ms: Optional[int]
+
+    @property
+    def pipeline_transfer_enabled(self) -> bool:
+        """Whether pipelined prefill-transfer is enabled."""
+        return False
+
+    def has_inflight_transfer(self, req: LlmRequest) -> bool:
+        """Whether this transceiver still owns transfer resources for req.
+
+        Independent of ``LlmRequestState``: with pipelined transfer a chunk can
+        be in flight while the request is still in its context-compute phase.
+        True means the request's KV pages may be read by the fabric and must
+        not be released.
+        """
+        return False
+
+    def has_retired_send_session(self, req: LlmRequest) -> bool:
+        """Whether the send session closed before its final slice."""
+        return False
 
     @abstractmethod
-    def respond_and_send_async(self, req: LlmRequest):
+    def respond_and_send_async(self, req: LlmRequest) -> None:
+        """Start sending ``req``'s KV cache to the requesting instance.
+
+        Non-blocking. Postcondition: ``req.state`` is
+        ``DISAGG_CONTEXT_TRANS_IN_PROGRESS``. Completion, failure, or
+        cancellation is reported by later
+        ``check_context_transfer_status`` calls.
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def request_and_receive_sync(self, req: LlmRequest):
+    def request_and_receive_sync(self, req: LlmRequest) -> None:
+        """Receive ``req``'s KV cache, blocking until the transfer settles.
+
+        Postcondition: ``req.state`` is
+        ``DISAGG_GENERATION_TRANS_COMPLETE`` on success or
+        ``DISAGG_TRANS_ERROR`` on failure.
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def request_and_receive_async(self, req: LlmRequest):
+    def request_and_receive_async(self, req: LlmRequest) -> None:
+        """Start receiving ``req``'s KV cache without blocking.
+
+        Postcondition: ``req.state`` is
+        ``DISAGG_GENERATION_TRANS_IN_PROGRESS``. Completion, failure, or
+        cancellation is reported by later ``check_gen_transfer_status``
+        calls.
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def check_context_transfer_status(self, at_least_request_num: int):
+    def check_context_transfer_status(
+            self,
+            at_least_request_num: Optional[int],
+            mark_complete: bool = False) -> CtxTransferStatus:
+        """Poll send-side transfers and reap the ones that settled.
+
+        Args:
+            at_least_request_num: None enters the implementation's
+                blocking mode, whose semantics are runtime-specific and
+                NOT portable:
+
+                * C++ runtime: blocks until every in-flight send
+                  completes — potentially unboundedly, since the
+                  transfer timeout is observe-only on this path — and
+                  rejects None outright while in-flight cancellation is
+                  enabled (a finite poll is required).
+                * Python (V2) runtime: a blocking wait bounded by the
+                  session transfer timeout; transfers may still be
+                  pending on return, so draining requires re-polling.
+
+                Runtime-independent callers (e.g. drain loops) must use
+                a finite int in an explicit loop instead: 0 is a
+                non-blocking sweep; N > 0 additionally waits for sends
+                to settle, bounded by
+                ``kv_transfer_sender_future_timeout_ms`` — the C++
+                runtime waits it once per still-pending selected
+                transfer (so a single call may wait it several times),
+                the Python (V2) runtime once per call — and may still
+                report fewer than N when the bound expires.
+            mark_complete: When True, transition requests whose send
+                completed to ``DISAGG_CONTEXT_COMPLETE`` before returning;
+                when False, that transition is the caller's responsibility.
+
+        Cancelled sends are not reported as a distinct category:
+        implementations close them internally and the caller tracks
+        cancellation through its own bookkeeping.
+
+        Participates in rank-consensus collectives; see the class docstring
+        for the symmetry requirement.
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def check_gen_transfer_status(self, at_least_request_num: int):
+    def check_gen_transfer_status(
+            self, at_least_request_num: Optional[int]) -> GenTransferStatus:
+        """Poll receive-side transfers and reap the ones that settled.
+
+        ``at_least_request_num`` follows the same runtime-specific
+        blocking / bounded-polling semantics as
+        ``check_context_transfer_status``, except that on this receive
+        side both runtimes bound N > 0 local readiness polling by
+        ``kv_transfer_poll_interval_ms``, applied as a single deadline
+        per call (unlike the C++ context path); the rank-consensus
+        collectives that follow are outside that local wait bound.
+        Postconditions: requests whose
+        receive completed are transitioned to
+        ``DISAGG_GENERATION_TRANS_COMPLETE`` and failed ones to
+        ``DISAGG_TRANS_ERROR``; cancelled sessions are closed and their
+        requests returned in ``cancelled_requests`` with the state left for
+        the caller to decide. ``cancelled_requests`` is populated only by
+        the Python (V2) runtime — the C++ runtime reports every outcome,
+        cancellation included, through request-state mutation (see
+        ``GenTransferStatus``).
+
+        Participates in rank-consensus collectives; see the class docstring
+        for the symmetry requirement.
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def check_gen_transfer_complete(self):
+    def check_gen_transfer_complete(self) -> bool:
+        """Return True when no receive-side transfer remains in flight."""
         raise NotImplementedError
 
     @abstractmethod
-    def cancel_request(self, req: LlmRequest):
+    def cancel_request(self, req: LlmRequest) -> bool:
+        """Best-effort cancellation of ``req``'s in-flight transfers.
+
+        Returns True when the transfers are cancelled and it is safe to
+        release the request's KV resources; False when a task is mid-write
+        and the caller must retry on a later iteration.
+        """
         raise NotImplementedError
 
     def supports_inflight_request_cancellation(self) -> bool:
+        """Return True when in-flight transfers can be cancelled safely."""
         return False
 
     def has_poisoned_transfer_buffer(self) -> bool:
+        """Return True when a cancelled transfer may have corrupted a shared buffer."""
         return False
 
     @abstractmethod
-    def prepare_context_requests(self, requests: List[LlmRequest]):
+    def prepare_context_requests(self, requests: List[LlmRequest]) -> None:
         """
         Prepare the context request for the cache transceiver in generation-first mode.
         This method should set the context request state to DISAGG_CONTEXT_WAIT_SCHEDULER
@@ -295,7 +457,7 @@ class KvCacheTransceiver(ABC):
         """Return a human-readable dump of transceiver state for debugging hangs."""
         return ""
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """Shut down the transceiver and release registered resources."""
 
 
@@ -374,25 +536,34 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
             cache_transceiver_config._to_pybind(), rnn_layer_num_per_pp_rank,
             indexer_layer_num_per_pp_rank)
 
-    def respond_and_send_async(self, req: LlmRequest):
+    def respond_and_send_async(self, req: LlmRequest) -> None:
         return self.impl.respond_and_send_async(req)
 
-    def request_and_receive_sync(self, req: LlmRequest):
+    def request_and_receive_sync(self, req: LlmRequest) -> None:
         return self.impl.request_and_receive_sync(req)
 
-    def request_and_receive_async(self, req: LlmRequest):
+    def request_and_receive_async(self, req: LlmRequest) -> None:
         return self.impl.request_and_receive_async(req)
 
-    def check_context_transfer_status(self, at_least_request_num: int):
-        return self.impl.check_context_transfer_status(at_least_request_num)
+    def check_context_transfer_status(
+            self,
+            at_least_request_num: Optional[int],
+            mark_complete: bool = False) -> CtxTransferStatus:
+        completed_ids, error_ids = self.impl.check_context_transfer_status(
+            at_least_request_num, mark_complete)
+        return CtxTransferStatus(completed_ids, error_ids)
 
-    def check_gen_transfer_status(self, at_least_request_num: int):
-        return self.impl.check_gen_transfer_status(at_least_request_num)
+    def check_gen_transfer_status(
+            self, at_least_request_num: Optional[int]) -> GenTransferStatus:
+        # The C++ runtime reports outcomes via request-state mutation only,
+        # so the returned lists are empty by design.
+        self.impl.check_gen_transfer_status(at_least_request_num)
+        return GenTransferStatus([], [], [])
 
-    def check_gen_transfer_complete(self):
+    def check_gen_transfer_complete(self) -> bool:
         return self.impl.check_gen_transfer_complete()
 
-    def cancel_request(self, req: LlmRequest):
+    def cancel_request(self, req: LlmRequest) -> bool:
         return self.impl.cancel_request(req)
 
     def supports_inflight_request_cancellation(self) -> bool:
@@ -406,7 +577,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def get_status_dump(self) -> str:
         return self.impl.get_status_dump()
 
-    def prepare_context_requests(self, requests: List[LlmRequest]):
+    def prepare_context_requests(self, requests: List[LlmRequest]) -> None:
         # not implemented, an empty placeholder to allow being invoked unconditionally
         ...
 

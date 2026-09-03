@@ -648,11 +648,11 @@ def _cba_step_math(
     # applied before log_softmax and so never reaches the accumulated score,
     # and vLLM, which ranks purely by cum_logprob / seq_len**length_penalty.
     #
-    # The C++ kernels here diverge from all three: they fold
-    # `diversityRate * source_beam_index` into pLocalLogProbs
-    # (beamSearchKernels.cu), which then flows into normedScoresCBA and
-    # bestAttainableScore (beamSearchKernelsTemplate.h), so with diversity_rate
-    # set they order the pool and reach the done verdict differently. Do not
+    # The former C++ beam-search kernels diverged from all three: they folded
+    # `diversityRate * source_beam_index` into the local log-probs, which then
+    # flowed into the normalized CBA scores and the best-attainable score, so
+    # with diversity_rate set they ordered the pool and reached the done verdict
+    # differently. Do not
     # "fix" this by matching them: a cumulative_logprob carrying
     # `diversity_rate * beam_index` is no longer a log-probability, and the
     # offset depends on which slot the beam happened to occupy (TRTLLM-14792).

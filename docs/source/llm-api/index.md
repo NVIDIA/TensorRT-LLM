@@ -67,22 +67,27 @@ A typical result has the following structure:
     "total_model_loading_seconds":  1.971,
     "checkpoint_preparation_seconds": 1.177,
     "weight_population_seconds": 0.598,
+    "checkpoint_finalization_seconds": 0.031,
     "post_load_processing_seconds": 0.005
   }
 }
 ```
 
-The `model_loader` object contains timings for the main LLM weights. If a draft model is used,
-additional field `draft_checkpoint_preparation_seconds` and `draft_weight_population_seconds` will appear.
-A `draft_model_loader` object can also appear in deprecated 2-model style MTP setting.
+The `model_loader` object contains timings for the main LLM weights. If a draft
+model is used, the additional fields `draft_checkpoint_preparation_seconds`,
+`draft_weight_population_seconds`, and `draft_checkpoint_finalization_seconds`
+appear. A `draft_model_loader` object can also appear in the deprecated
+two-model MTP configuration.
 
 | Metric | Description |
 |--------|-------------|
 | `total_model_loading_seconds` | Overall model construction and loading interval measured after checkpoint configuration validation. It includes the named phases below. |
 | `checkpoint_preparation_seconds` | Time spent warming up, parsing and preparing checkpoint tensors for the model. Some checkpoint formats can populate model storage directly during this phase. |
 | `weight_population_seconds` | Time spent copying prepared checkpoint tensors into model parameters on GPUs. This metric can be absent for formats that populate weights directly during the above checkpoint preparation phase. |
+| `checkpoint_finalization_seconds` | Time spent finalizing the checkpoint session after weight population. This includes loader-specific synchronization and cleanup; rank-striped read-ahead includes waiting for peer ranks and stopping background readers. |
 | `draft_checkpoint_preparation_seconds` | Checkpoint preparation time for draft weights loaded as part of the model loader. |
 | `draft_weight_population_seconds` | Weight population time for draft weights loaded as part of the model loader. |
+| `draft_checkpoint_finalization_seconds` | Checkpoint finalization time for draft weights loaded as part of the model loader. |
 | `post_load_processing_seconds` | Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization and memory cleanup. |
 
 `trtllm-serve` exposes the same rank-0 payload in the `startup_metrics` field of the

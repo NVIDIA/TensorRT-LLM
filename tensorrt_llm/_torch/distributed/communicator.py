@@ -208,14 +208,14 @@ class Distributed(ABC):
         return obj
 
     @abstractmethod
-    def tp_allgather(self, obj):
+    def tp_allgather(self, obj, *, small_payload: bool = False):
         pass
 
     @abstractmethod
-    def cp_allgather(self, obj):
+    def cp_allgather(self, obj, *, small_payload: bool = False):
         pass
 
-    def tp_cp_allgather(self, obj):
+    def tp_cp_allgather(self, obj, *, small_payload: bool = False):
         """Allgather across both TP and CP dimensions.
 
         First gathers within CP group, then across TP groups, returning
@@ -223,13 +223,13 @@ class Distributed(ABC):
         """
         # Gather across CP dimension.
         if self.cp_size > 1:
-            obj = self.cp_allgather(obj)
+            obj = self.cp_allgather(obj, small_payload=small_payload)
         else:
             obj = [obj]  # Wrap to match cp_allgather output format.
 
         # Gather across TP dimension.
         if self.tp_size > 1:
-            obj = self.tp_allgather(obj)
+            obj = self.tp_allgather(obj, small_payload=small_payload)
         else:
             obj = [obj]  # Wrap to match tp_allgather output format.
 
@@ -730,8 +730,16 @@ class MPIDist(Distributed):
             self._cp_comm = mpi_comm().Create_group(new_group)
         return self._cp_comm
 
-    def cp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
+    def cp_allgather(self,
+                     obj,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     *,
+                     small_payload: bool = False):
         comm = self.cp_comm
+        if small_payload:
+            # mpi4py's native object allgather is cheaper for tiny payloads;
+            # callers must guarantee the payload stays small on every rank.
+            return comm.allgather(obj)
         return safe_allgather(comm, obj, chunk_size=chunk_size)
 
     def cp_broadcast(self,
@@ -742,8 +750,14 @@ class MPIDist(Distributed):
         comm = self.cp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
-    def tp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
+    def tp_allgather(self,
+                     obj,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     *,
+                     small_payload: bool = False):
         comm = self.tp_comm
+        if small_payload:
+            return comm.allgather(obj)
         return safe_allgather(comm, obj, chunk_size=chunk_size)
 
     def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
@@ -1034,7 +1048,7 @@ class TorchDist(Distributed):
         return obj
 
     @log_op
-    def tp_allgather(self, obj):
+    def tp_allgather(self, obj, *, small_payload: bool = False):
         if isinstance(obj, torch.Tensor):
             output_list = [
                 torch.empty_like(obj)
@@ -1106,7 +1120,7 @@ class TorchDist(Distributed):
             return ret[0]
 
     @log_op
-    def cp_allgather(self, obj):
+    def cp_allgather(self, obj, *, small_payload: bool = False):
         if isinstance(obj, torch.Tensor):
             output_list = [
                 torch.empty_like(obj)

@@ -70,24 +70,37 @@ PooledPhysMemAllocator::PooledPhysMemAllocator(size_t physMemSize)
     // Get current device.
     cuCheck(cuCtxGetDevice(&mDeviceId));
 
-    // Build the best allocation property.
+    // Build the best allocation property. Prefer shareable handle types so
+    // UCX cuda_ipc can export the memory for intra-node zero-copy transfers:
+    // FABRIC (MNNVL) > POSIX_FILE_DESCRIPTOR (pidfd-based, UCX >= 1.22) > NONE,
+    // and within each handle type prefer gpuDirectRDMACapable over not.
     mProp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     mProp.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     mProp.location.id = mDeviceId;
-    mProp.allocFlags.gpuDirectRDMACapable = 1;
-    mProp.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
 
-    if (!isPropSupported(mProp))
+    constexpr CUmemAllocationHandleType kHandleTypePreference[]
+        = {CU_MEM_HANDLE_TYPE_FABRIC, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, CU_MEM_HANDLE_TYPE_NONE};
+    bool supported = false;
+    for (auto const handleType : kHandleTypePreference)
     {
-        mProp.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
-        if (!isPropSupported(mProp))
+        for (bool const rdmaCapable : {true, false})
         {
-            mProp.allocFlags.gpuDirectRDMACapable = 0;
-            if (!isPropSupported(mProp))
+            mProp.requestedHandleTypes = handleType;
+            mProp.allocFlags.gpuDirectRDMACapable = rdmaCapable ? 1 : 0;
+            if (isPropSupported(mProp))
             {
-                throw std::runtime_error("PooledPhysMemAllocator: no supported physical memory allocation property");
+                supported = true;
+                break;
             }
         }
+        if (supported)
+        {
+            break;
+        }
+    }
+    if (!supported)
+    {
+        throw std::runtime_error("PooledPhysMemAllocator: no supported physical memory allocation property");
     }
 }
 

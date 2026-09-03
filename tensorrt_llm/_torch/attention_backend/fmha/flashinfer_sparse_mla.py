@@ -56,6 +56,16 @@ class FlashInferSparseMlaFmha(Fmha):
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
+        if (
+            getattr(attn, "skip_correction_threshold", 0.0) > 0.0
+            and not cls.supports_skip_correction
+        ):
+            logger.debug(
+                "FlashInfer sparse-MLA FMHA is unavailable: skip-correction is "
+                "enabled and unsupported."
+            )
+            return False
+
         if not attn.is_mla_enable or getattr(attn, "kv_cache_dtype", None) != "fp8_ds_mla":
             return False
         return is_flashinfer_sparse_mla_enabled(getattr(attn.sparse_params, "algorithm", None))

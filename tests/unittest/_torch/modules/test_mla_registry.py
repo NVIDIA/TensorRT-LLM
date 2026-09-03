@@ -40,12 +40,12 @@ class _FakeAttention(nn.Module):
         pass
 
 
-def _make_mla(config: ModelConfig) -> MLA:
+def _make_mla(config: ModelConfig, cls: type[MLA] = MLA) -> MLA:
     position_embedding = PositionalEmbeddingParams(
         type=PositionEmbeddingType.rope_gpt_neox,
         rope=RopeParams(dim=2, max_positions=8),
     )
-    return MLA(
+    return cls(
         hidden_size=8,
         num_attention_heads=2,
         num_key_value_heads=1,
@@ -63,6 +63,110 @@ def _make_mla(config: ModelConfig) -> MLA:
         config=config,
         o_lora_rank=2,
     )
+
+
+class _OutputGateStub:
+    """Minimal ``MLA`` stand-in that records what the output-gate hook sees."""
+
+    forward = MLA.forward
+
+    def __init__(self, register_to_config: bool) -> None:
+        self.mapping = SimpleNamespace(has_cp_helix=lambda: False, enable_attention_dp=False)
+        self.layer_idx = 0
+        self.layer_idx_str = "0"
+        self.register_to_config = register_to_config
+        self.attn_output = torch.zeros(2, 4)
+        self.gate_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.projected: list[torch.Tensor] = []
+
+    def _create_outputs(
+        self, hidden_states: torch.Tensor, attn_metadata: object
+    ) -> list[torch.Tensor]:
+        return [self.attn_output]
+
+    def forward_impl(
+        self,
+        position_ids: object,
+        hidden_states: torch.Tensor,
+        attn_metadata: object,
+        attn_output: list[torch.Tensor],
+        latent_cache_gen: object = None,
+    ) -> None:
+        attn_output[0].fill_(2.0)
+
+    def _forward_custom_op(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: object,
+        attn_output: list[torch.Tensor],
+        latent_cache_gen: object,
+    ) -> None:
+        attn_output[0].fill_(2.0)
+
+    def _apply_output_gate(
+        self, hidden_states: torch.Tensor, attn_output: torch.Tensor
+    ) -> torch.Tensor:
+        self.gate_calls.append((hidden_states, attn_output.clone()))
+        return attn_output * 5.0
+
+    def _project_output(
+        self,
+        attn_output: list[torch.Tensor],
+        position_ids: object,
+        attn_metadata: object,
+        all_reduce_params: object,
+    ) -> torch.Tensor:
+        self.projected.append(attn_output[0])
+        return attn_output[0]
+
+
+def test_base_output_gate_is_identity() -> None:
+    attn_output = torch.randn(2, 4)
+
+    assert MLA._apply_output_gate(None, torch.randn(2, 4), attn_output) is attn_output
+
+
+@pytest.mark.parametrize("register_to_config", [False, True])
+def test_output_gate_runs_between_attention_and_output_projection(
+    register_to_config: bool,
+) -> None:
+    mla_layer = _OutputGateStub(register_to_config)
+    hidden_states = torch.randn(2, 4)
+    attn_metadata = SimpleNamespace(num_contexts=0, num_tokens=2)
+
+    with patch.object(torch.ops.trtllm, "create_mla_outputs", return_value=mla_layer.attn_output):
+        output = mla_layer.forward(None, hidden_states, attn_metadata)
+
+    # The hook receives the module input and the completed attention output.
+    assert len(mla_layer.gate_calls) == 1
+    gate_hidden_states, gate_attn_output = mla_layer.gate_calls[0]
+    assert gate_hidden_states is hidden_states
+    torch.testing.assert_close(gate_attn_output, torch.full((2, 4), 2.0))
+    # Its result, not the raw attention output, is what gets projected.
+    assert mla_layer.projected == [output]
+    torch.testing.assert_close(output, torch.full((2, 4), 10.0))
+
+
+def test_output_gate_override_rejected_with_sparse_hooks() -> None:
+    class _GatedMLA(MLA):
+        def _apply_output_gate(
+            self, hidden_states: torch.Tensor, attn_output: torch.Tensor
+        ) -> torch.Tensor:
+            return attn_output * 2.0
+
+    config = ModelConfig(skip_create_weights_in_init=True)
+    with (
+        patch(
+            "tensorrt_llm._torch.modules.mla.create_attention",
+            side_effect=lambda *args, **kwargs: _FakeAttention(),
+        ),
+        patch(
+            "tensorrt_llm._torch.modules.mla.get_sparse_mla_hooks",
+            return_value=Mock(),
+        ),
+        pytest.raises(NotImplementedError, match="_apply_output_gate"),
+    ):
+        _make_mla(config, cls=_GatedMLA)
 
 
 def test_duplicate_layer_ids_preserve_all_mla_registrations() -> None:

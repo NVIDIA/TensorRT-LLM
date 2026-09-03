@@ -35,7 +35,6 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
-#include "tensorrt_llm/nanobind/batch_manager/buffers.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
@@ -44,6 +43,7 @@
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
+#include "tensorrt_llm/nanobind/kvCacheCompression/bindings.h"
 #include "tensorrt_llm/nanobind/process_group/bindings.h"
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
 #include "tensorrt_llm/nanobind/suffixAutomaton/bindings.h"
@@ -72,14 +72,6 @@ using OptVec = std::optional<std::vector<T>>;
 #if not defined(TRTLLM_NB_MODULE)
 #error "TRTLLM_NB_MODULE must be defined"
 #endif
-
-namespace
-{
-tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& configs)
-{
-    return tr::SamplingConfig(configs);
-}
-} // namespace
 
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
@@ -138,6 +130,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         = mInternalBatchManager.def_submodule("kv_cache_manager_v2_utils", "KV Cache Manager V2 Utils bindings");
     auto mInternalBatchManagerKvCacheV2
         = mInternalBatchManager.def_submodule("kv_cache_manager_v2", "KV Cache Manager V2 bindings");
+    auto mInternalKvCacheCompression
+        = mInternal.def_submodule("kv_cache_compression", "KV cache compression internal bindings");
     tensorrt_llm::nanobind::batch_manager::KvCacheManagerV2Bindings::initBindings(mInternalBatchManagerKvCacheV2);
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
     auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
@@ -145,6 +139,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
     tensorrt_llm::nanobind::common::initExceptionsBindings(mExceptions);
+    tensorrt_llm::nanobind::kv_cache_compression::initBindings(mInternalKvCacheCompression);
     tensorrt_llm::nanobind::thop::initBindings(mInternalThop);
 
     auto buildInfo = m.def_submodule("BuildInfo");
@@ -458,10 +453,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def("__setstate__", SamplingConfigSetState)
         .def("__eq__", &tr::SamplingConfig::operator==);
 
-    nb::bind_vector<std::vector<tr::SamplingConfig>>(m, "SamplingConfigVector");
-
-    m.def("make_sampling_config", &makeSamplingConfig, nb::arg("configs"));
-
     nb::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
         .def(nb::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,
                  tr::ModelConfig, std::optional<tr::RuntimeDefaults>>(),
@@ -514,7 +505,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("uvm", &tr::MemoryCounters::getUVM);
 
     tensorrt_llm::nanobind::process_group::initBindings(mInternalProcessGroup);
-    tpb::Buffers::initBindings(mInternalBatchManager);
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initKvCacheTestUtilBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);

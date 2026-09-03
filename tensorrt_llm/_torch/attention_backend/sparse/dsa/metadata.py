@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
@@ -20,6 +21,7 @@ from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
 from .cache_manager import is_dsa_cache_manager
+from .fused_metadata import fused_dsa_decode_metadata
 from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
     Indexer,
@@ -40,6 +42,21 @@ _INDEXER_LOGITS_DTYPE = torch.float32
 if TYPE_CHECKING:
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
+
+
+@functools.lru_cache(maxsize=1)
+def _fused_dsa_meta_enabled() -> bool:
+    """Read the fused-DSA-metadata env gate (once, process-constant).
+
+    ``TRTLLM_FUSED_DSA_METADATA=1`` replaces the eager slot-mapping + gen-indptr
+    chain in on_update_kv_lens with one fused Triton launch (see
+    fused_metadata.py); any other value keeps the eager chain.
+
+    Cached so the gate is fixed for the whole process: a mid-run flip would
+    otherwise let the first fused launch happen inside CUDA-graph capture,
+    voiding the "pre-compiled at warmup" capture-safety guarantee.
+    """
+    return os.environ.get("TRTLLM_FUSED_DSA_METADATA", "0") == "1"
 
 
 def build_req_idx_per_token(seq_lens: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -122,11 +139,21 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._pool_cache_valid = False
         self._cached_kv_mgr_id = 0
         self._cached_pool_view = None
+        self._cached_num_pool_tokens = 0
         self._cached_tokens_per_block = 0
         self._cached_block_table_ctx = None
         self._cached_block_table_gen = None
         self._cached_req_idx_ctx = None
         self._cached_req_idx_gen = None
+        # Cross-layer fan-out of the DSA index remap (TRTLLM_DISABLE_DSA_GROUP_REMAP).
+        # `_group_remap_struct` is the (static) full+shared indexer
+        # group layout; `_group_remap_batched` holds the current forward's
+        # per-group batched remap output (leader writes, shared members read).
+        self._group_remap_struct = None
+        self._group_remap_struct_kv_id = 0
+        self._group_remap_batched = {}
+        self.num_ctx_mla_kv_tokens = 0
+        self.nvfp4_mla_context_fp8_scratch = None
         super().__init__(*args, **kwargs)
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -179,6 +206,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
+        self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
     def prepare(self):
         super().prepare()
@@ -397,8 +425,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             row_stride = msl_c
             if row_stride % 4:
                 return
-        # helper takes max_seq_len in kv-token space (get_indexer_max_seq_len
-        # is compressed — same multiply-back as the dispatch seam)
+        # The helper takes max_seq_len in KV-token space;
+        # get_indexer_max_seq_len is compressed, so multiply it back as at
+        # the dispatch seam.
         try:
             _ss_host.warmup_varlen(
                 int(top_k),
@@ -434,13 +463,33 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # transform_local_topk_and_prepare_pool_view() call.
         self._invalidate_pool_view_cache()
 
+        # Optional fused path: collapse the eager DSA decode-metadata chain
+        # (req_idx_per_token + slot mappings + the two gen indptr cumsums) into
+        # one fused Triton launch. Only for the pure-decode/generation step
+        # (num_contexts == 0); see fused_metadata.py and
+        # _run_fused_dsa_decode_metadata().
+        #
+        # The fused kernel produces the five shared decode-metadata outputs but
+        # NOT token_positions_cuda, which the eager slot block writes only when
+        # use_fp8_ds_mla is set (consumed by the FlashInfer sparse-attention
+        # paths for RoPE). Exclude that cache mode so the fused path never leaves
+        # it stale; those configs keep the eager chain.
+        fused_eligible = (
+            _fused_dsa_meta_enabled()
+            and self.kv_cache_manager is not None
+            and self.num_tokens > 0
+            and self.num_generations > 0
+            and self.num_contexts == 0
+            and not self.use_fp8_ds_mla
+        )
+
         # The draft loop can rewrite seq_lens after prepare() built this map.
-        if self.num_tokens > 0:
+        if self.num_tokens > 0 and not fused_eligible:
             self.req_idx_per_token[: self.num_tokens] = build_req_idx_per_token(
                 self.seq_lens_cuda[: self.num_seqs], self.num_tokens
             ).to(self.req_idx_per_token.dtype)
 
-        if self.kv_cache_manager is not None and self.num_tokens > 0:
+        if self.kv_cache_manager is not None and self.num_tokens > 0 and not fused_eligible:
             seq_lens = self.seq_lens_cuda[: self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
             start_positions = self.kv_lens_cuda[: self.num_seqs] - seq_lens
@@ -473,21 +522,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.slot_mapping_scale[: self.num_tokens] = scale_indices
 
         if self.num_generations > 0:
-            torch.cumsum(
-                self.kv_lens_cuda[self.num_contexts : self.num_seqs],  # num_contexts should be 0
-                dim=0,
-                dtype=torch.int64,
-                out=self.gen_kv_indptr[1 : self.num_generations + 1],
-            )
-            torch.cumsum(
-                (
-                    self.kv_lens_cuda[self.num_contexts : self.num_seqs]
-                    - self.seq_lens_cuda[self.num_contexts : self.num_seqs]
-                ),
-                dim=0,
-                dtype=torch.int64,
-                out=self.gen_cached_token_indptr[1 : self.num_generations + 1],
-            )
+            if not fused_eligible:
+                torch.cumsum(
+                    self.kv_lens_cuda[
+                        self.num_contexts : self.num_seqs
+                    ],  # num_contexts should be 0
+                    dim=0,
+                    dtype=torch.int64,
+                    out=self.gen_kv_indptr[1 : self.num_generations + 1],
+                )
+                torch.cumsum(
+                    (
+                        self.kv_lens_cuda[self.num_contexts : self.num_seqs]
+                        - self.seq_lens_cuda[self.num_contexts : self.num_seqs]
+                    ),
+                    dim=0,
+                    dtype=torch.int64,
+                    out=self.gen_cached_token_indptr[1 : self.num_generations + 1],
+                )
             gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
             gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
             self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
@@ -536,8 +588,55 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True
                 )
+
+        if fused_eligible:
+            if not getattr(self, "_fused_dsa_meta_armed", False):
+                logger.info(
+                    "[TRTLLM_FUSED_DSA_METADATA] fused DSA decode-metadata "
+                    f"kernel armed (num_seqs={self.num_seqs}, "
+                    f"num_tokens={self.num_tokens})."
+                )
+                self._fused_dsa_meta_armed = True
+            self._run_fused_dsa_decode_metadata()
+
         self._compute_kv_lens_row_reorder()
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
+
+    def _run_fused_dsa_decode_metadata(self):
+        """Fill req_idx_per_token + slot mappings + gen indptrs via one Triton
+        launch (see fused_metadata.py), replacing the eager chain for the
+        pure-decode step. Capture-safe: the launch is pre-compiled at warmup and
+        replays inside the decode CUDA graph."""
+        num_tokens = self.num_tokens
+        num_seqs = self.num_seqs
+        # The fused header writes gen_*_indptr[1 : num_seqs + 1] while the eager
+        # chain writes [1 : num_generations + 1]; they coincide only because the
+        # eligibility gate requires num_contexts == 0 (=> num_seqs ==
+        # num_generations). Pin that coupling down explicitly.
+        assert num_seqs == self.num_generations, (
+            f"fused DSA metadata expects num_seqs ({num_seqs}) == "
+            f"num_generations ({self.num_generations})"
+        )
+        index_head_dim = self.kv_cache_manager.index_head_dim
+        use_fp4 = getattr(self.kv_cache_manager, "use_fp4", False)
+        data_bytes_per_token = index_head_dim // 2 if use_fp4 else index_head_dim
+
+        fused_dsa_decode_metadata(
+            self.seq_lens_cuda[:num_seqs],
+            self.kv_lens_cuda[:num_seqs],
+            self.indexer_k_cache_block_offsets[:num_seqs],
+            self.req_idx_per_token[:num_tokens],
+            self.slot_mapping_fp8[:num_tokens],
+            self.slot_mapping_scale[:num_tokens],
+            self.gen_kv_indptr[: num_seqs + 1],
+            self.gen_cached_token_indptr[: num_seqs + 1],
+            num_tokens=num_tokens,
+            max_query_len=1 + self.max_draft_tokens,
+            tokens_per_block=self._tokens_per_block,
+            index_head_dim=index_head_dim,
+            quant_block_size=self.kv_cache_manager.quant_block_size,
+            data_bytes_per_token=data_bytes_per_token,
+        )
 
     def _compute_kv_lens_row_reorder(self) -> None:
         """Prepare the longest-job-first GVR row order once per forward step."""
@@ -617,6 +716,38 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.gen_kv_indptr,
             device="cpu",
             pin_memory=prefer_pinned(),
+        )
+
+    def _create_nvfp4_mla_generation_buffers(self, capture_graph=False):
+        """Allocate stable NVFP4 gather outputs for all MTP generation rows."""
+        self.nvfp4_mla_fp8_scratch = None
+        self.nvfp4_mla_compact_indices = None
+        if getattr(self.kv_cache_manager, "dtype", None) != tensorrt_llm.bindings.DataType.NVFP4:
+            return
+
+        # MTP verifies the current token and max_draft_tokens draft tokens for
+        # every generation request. Each query row has its own TopK selection,
+        # so the dequantized FP8 rows and compact offsets must cover the full
+        # verification window. The buffers have stable addresses for CUDA
+        # graphs and are reused sequentially by every attention layer.
+        max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
+        self.nvfp4_mla_fp8_scratch = self.get_empty(
+            self.cuda_graph_buffers,
+            (
+                max_gen_tokens,
+                self.num_sparse_topk,
+                self.kv_cache_manager.head_dim,
+            ),
+            cache_name="nvfp4_mla_fp8_scratch",
+            dtype=torch.float8_e4m3fn,
+            capture_graph=capture_graph,
+        )
+        self.nvfp4_mla_compact_indices = self.get_empty(
+            self.cuda_graph_buffers,
+            (max_gen_tokens, self.num_sparse_topk),
+            cache_name="nvfp4_mla_compact_indices",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
         )
 
     def create_buffers_for_indexer(self, capture_graph=False):
@@ -945,6 +1076,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self.max_draft_tokens = max_draft_len
         capture_graph = self.is_cuda_graph
+        max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
+        if (
+            self.nvfp4_mla_fp8_scratch is not None
+            and self.nvfp4_mla_fp8_scratch.shape[0] != max_gen_tokens
+        ):
+            self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
         if self.kv_lens_cuda_2d.shape[1] != 1 + self.max_draft_tokens:
             self._create_kv_lens_2d_buffer(capture_graph=capture_graph)
         init_shape = self.kv_lens_expanded_host.shape[0]
@@ -989,6 +1126,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         _ensure_pool_view_cached() recomputes them for the new batch.
         """
         self._pool_cache_valid = False
+        # The grouped remap batches (leader-written, follower-read) are only
+        # valid within one forward. Drop them at the step boundary so a follower
+        # can never read a previous step's batch, and so the tensors are not
+        # retained across idle steps. Python-only -> safe under graph replay
+        # (replay does not re-run this).
+        self._group_remap_batched.clear()
+        self.nvfp4_mla_context_fp8_scratch = None
 
     def _ensure_pool_view_cached(self):
         """Compute and cache values used by
@@ -1008,9 +1152,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         pool = self.kv_cache_manager.get_unique_primary_pool()
         kv_cache_manager = self.kv_cache_manager
+        num_blocks, num_layers = pool.shape[:2]
         self._cached_tokens_per_block = kv_cache_manager.tokens_per_block
         head_dim = kv_cache_manager.head_dim
-        self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
+        self._cached_num_pool_tokens = num_blocks * num_layers * self._cached_tokens_per_block
+        if kv_cache_manager.dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            # FP4 packs two values per byte and therefore cannot use the
+            # ordinary [token, head_dim] view. Its gather op reads the raw
+            # data/scale pools through their stable host pointers instead.
+            self._cached_pool_view = None
+        else:
+            self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
         self._cached_block_table_ctx = self.block_table[: self.num_contexts]
         self._cached_block_table_gen = self.block_table[self.num_contexts : self.num_seqs]
         self._cached_req_idx_ctx = self.req_idx_per_token[: self.num_ctx_tokens]
@@ -1019,6 +1171,94 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self._cached_kv_mgr_id = id(kv_cache_manager)
         self._pool_cache_valid = True
+
+    def _ensure_group_remap_struct(self):
+        """Build (once) the static full+shared indexer group layout used by the
+        cross-layer fan-out remap (``TRTLLM_DISABLE_DSA_GROUP_REMAP``).
+
+        Groups are runs of consecutive local layers starting at a full-indexer
+        layer (``indexer_k_cache_local_layer_mask[L] == True``, i.e.
+        ``is_full_indexer_layer``); the shared layers that follow reuse the
+        leader's top-k. Within a group, the remap output for each member differs
+        from the leader's only by the additive ``layer_offset * tokens_per_block``
+        term, so one launch (grid.z = group_size) covers the whole group.
+
+        A group is marked active only when it has >= 2 members (a genuine
+        fan-out) and a uniform primary-pool page scale (required for a single
+        stride_factor). Singleton / non-uniform groups fall back to the
+        per-layer single-op path (identical to flag-off behavior).
+        """
+        kvm = self.kv_cache_manager
+        if self._group_remap_struct is not None and self._group_remap_struct_kv_id == id(kvm):
+            return self._group_remap_struct
+
+        # Building the small per-group layer-offset device tensors must happen
+        # eagerly (host->device copy), never inside a CUDA-graph capture. TRT-LLM
+        # runs an eager warmup before capture, so return an uncached empty struct
+        # if somehow reached first during capture; it is (re)built on the next
+        # eager step and grouping simply falls back to per-layer until then.
+        if torch.cuda.is_current_stream_capturing():
+            return {}
+
+        mask = getattr(kvm, "indexer_k_cache_local_layer_mask", None)
+        if mask is None:
+            self._group_remap_struct = {}
+            self._group_remap_struct_kv_id = id(kvm)
+            return self._group_remap_struct
+
+        n = len(mask)
+        leader_of = [-1] * n
+        slot_of = [0] * n
+        members = {}  # leader local idx -> [member local idx, ...]
+        cur_leader = None
+        for local_idx in range(n):
+            if mask[local_idx]:
+                cur_leader = local_idx
+                members[cur_leader] = [local_idx]
+            else:
+                if cur_leader is None:
+                    # Shouldn't happen (layer 0 forced full); be safe.
+                    cur_leader = local_idx
+                    members[cur_leader] = [local_idx]
+                else:
+                    members[cur_leader].append(local_idx)
+            leader_of[local_idx] = cur_leader
+            slot_of[local_idx] = len(members[cur_leader]) - 1
+
+        # Device for the small per-group layer-offset tensors.
+        device = None
+        if self.shared_topk_indices is not None:
+            device = self.shared_topk_indices.device
+        elif self.block_table is not None:
+            device = self.block_table.device
+
+        group_active = {}
+        group_scale = {}
+        group_size = {}
+        group_layer_ids = {}
+        for leader, member_list in members.items():
+            group_size[leader] = len(member_list)
+            params = [kvm.get_primary_pool_page_index_params(m) for m in member_list]
+            scale0 = params[0][0]
+            uniform_scale = all(p[0] == scale0 for p in params)
+            offsets = [int(p[1]) for p in params]
+            active = len(member_list) >= 2 and uniform_scale and device is not None
+            group_active[leader] = active
+            group_scale[leader] = int(scale0)
+            if active:
+                group_layer_ids[leader] = torch.tensor(offsets, dtype=torch.int32, device=device)
+
+        struct = {
+            "leader_of": leader_of,
+            "slot_of": slot_of,
+            "group_active": group_active,
+            "group_scale": group_scale,
+            "group_size": group_size,
+            "group_layer_ids": group_layer_ids,
+        }
+        self._group_remap_struct = struct
+        self._group_remap_struct_kv_id = id(kvm)
+        return struct
 
     @maybe_compile(dynamic=True)
     def _get_dense_topk_indices(self, seq_lens, kv_lens, num_tokens):
@@ -1083,19 +1323,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 )
 
     def prepare_for_spec_decode(self, kv_lens: torch.Tensor):
-        # fp8_paged_mqa_logits supports seq_len 1/2/4 on sm100 and 1/2 on
-        # sm90. Flatten Q and expand kv_lens and block_table for other MTP
-        # configurations.
+        # The DeepGEMM paged-MQA kernel (fp8_paged_mqa_logits) runs a native
+        # next_n >= 1 on sm100+: its scheduler tiles the query tokens into
+        # BLOCK_Q-sized blocks (num_q_blocks = ceil_div(num_q_tokens, BLOCK_Q)),
+        # so any MTP depth is handled without a per-draft-token Q flatten /
+        # kv_lens / block_table expansion on Blackwell. sm90 still lacks native
+        # MTP support (seq_len 1/2 only) and must expand for max_draft_tokens > 1.
         # TODO:
-        # - No distinction between sm90 and sm100 is needed once MTP3 is supported on sm90.
-        # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
+        # - Drop this sm90 branch (and the expanded buffers) once
+        #   fp8_paged_mqa_logits supports an arbitrary next_n on sm90 too.
         use_dsl = self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
-        self.use_expanded_buffers_for_mtp = not use_dsl and (
-            (self.max_draft_tokens > 1 and get_sm_version() == 90)
-            or (
-                (self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                and get_sm_version() >= 100
-            )
+        self.use_expanded_buffers_for_mtp = (
+            not use_dsl and self.max_draft_tokens > 1 and get_sm_version() == 90
         )
         if self.use_expanded_buffers_for_mtp:
             # Expand kv_lens_cuda (only generation)
@@ -1230,6 +1469,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare_for_mla_rope_append(self, cached_token_lens: torch.Tensor, kv_lens: torch.Tensor):
         if self.num_contexts > 0:
             self.num_ctx_cached_tokens = cached_token_lens[: self.num_contexts].sum().item()
+            self.num_ctx_mla_kv_tokens = kv_lens[: self.num_contexts].sum().item()
             self.max_ctx_kv_len = kv_lens[: self.num_contexts].max().item()
             self.max_ctx_seq_len = self.seq_lens[: self.num_contexts].max().item()
             # context cached token indptr
@@ -1254,6 +1494,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         else:
             self.num_ctx_cached_tokens = 0
+            self.num_ctx_mla_kv_tokens = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
 

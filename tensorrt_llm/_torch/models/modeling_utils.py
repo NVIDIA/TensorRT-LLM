@@ -8,8 +8,8 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Dict, Generic, Iterator, List, Literal, Optional,
-                    Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, Dict, Generic, Iterator, List, Literal,
+                    Optional, Tuple, Type, TypeVar, Union)
 
 import torch
 from torch import nn
@@ -28,12 +28,13 @@ from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..speculative import SpecMetadata
-from ._arch_index import MODEL_ARCH_TO_MODULE, is_builtin_zoo_module
+from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
+                          is_builtin_zoo_module)
 
 
 @contextlib.contextmanager
@@ -904,6 +905,7 @@ class DecoderModelForCausalLM(nn.Module,
 
 
 MODEL_CLASS_MAPPING = {}
+DRAFT_MODEL_BUILDER_MAPPING = {}
 MODEL_CLASS_VISION_ENCODER_MAPPING = {}
 MODEL_CLASS_MAPPER_MAPPING = {}
 MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING = {}
@@ -911,17 +913,61 @@ MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING = {}
 CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING = {}
 
 
-# Registration priority under lazy loading: on main the built-in zoo imported
-# first and external code (--custom_module_dirs, user modules) overrode it
-# later. With the zoo imported lazily, built-in modules may run their
-# decorators *after* an external registration, so every registry applies one
-# rule: built-in registrations only fill empty slots, never overwrite.
-# Anything already present outranks a built-in — it is either an external
-# registration (which must keep its main-order priority) or another built-in
-# (no architecture is double-registered among built-ins, so filling empty
-# slots is equivalent to main). External registrations always overwrite.
 def _is_builtin_model_class(cls) -> bool:
     return is_builtin_zoo_module(getattr(cls, "__module__", ""))
+
+
+# The architecture-keyed registries a provider module fills through its
+# decorators, named so a registration can be recorded and replayed without
+# carrying the dict around.
+_MODEL_CLASS_REGISTRY = "model class"
+_VISION_ENCODER_REGISTRY = "vision encoder"
+_ARCH_REGISTRIES = {
+    _MODEL_CLASS_REGISTRY: MODEL_CLASS_MAPPING,
+    _VISION_ENCODER_REGISTRY: MODEL_CLASS_VISION_ENCODER_MAPPING,
+}
+
+# Every architecture registration a module's decorators made, in the order they
+# ran. A module's decorators run once per process, so this is the only way to
+# put a provider back after its slots were released: importing it again is a
+# no-op against ``sys.modules``.
+_MODULE_REGISTRATIONS: Dict[str, List[Tuple[str, str, Any]]] = {}
+
+
+def _describe_provider(value: Any) -> str:
+    cls = value[0] if isinstance(value, tuple) else value
+    module = getattr(cls, "__module__", "?")
+    return f"{module}.{getattr(cls, '__qualname__', cls)}"
+
+
+def _apply_arch_registration(registry_name: str, arch: str, value: Any,
+                             module_name: str) -> None:
+    """Fill one architecture slot, honouring built-in priority.
+
+    Built-in registrations only fill empty slots. With the zoo imported lazily a
+    built-in module can run its decorators after an external registration, and
+    anything already present outranks it: that is either an external
+    registration, which owns the architecture, or another built-in, and no
+    architecture is registered twice among built-ins. External registrations
+    always overwrite.
+    """
+    registry = _ARCH_REGISTRIES[registry_name]
+    existing = registry.get(arch)
+    if (existing is not None and existing != value
+            and is_builtin_zoo_module(module_name)):
+        logger.info(
+            f"Keeping {registry_name} registration {_describe_provider(existing)} "
+            f"for architecture {arch}; built-in "
+            f"{_describe_provider(value)} not registered.")
+        return
+    registry[arch] = value
+
+
+def _record_arch_registration(registry_name: str, arch: str, value: Any,
+                              module_name: str) -> None:
+    _MODULE_REGISTRATIONS.setdefault(module_name, []).append(
+        (registry_name, arch, value))
+    _apply_arch_registration(registry_name, arch, value, module_name)
 
 
 # Architecture names each decorated class declared via ``register_auto_model``,
@@ -941,19 +987,82 @@ def register_auto_model(name: str):
             setattr(cls, _REGISTERED_ARCHS_ATTR, archs)
         archs.add(name)
 
-        existing = MODEL_CLASS_MAPPING.get(name)
-        if (existing is not None and existing is not cls
-                and _is_builtin_model_class(cls)):
-            logger.info(
-                f"Keeping existing registration "
-                f"{existing.__module__}.{existing.__name__} for architecture "
-                f"{name}; built-in {cls.__module__}.{cls.__name__} not "
-                f"registered.")
-            return cls
-        MODEL_CLASS_MAPPING[name] = cls
+        _record_arch_registration(_MODEL_CLASS_REGISTRY, name, cls,
+                                  getattr(cls, "__module__", ""))
         return cls
 
     return decorator
+
+
+# Architectures contributed from outside the built-in zoo (--custom_module_dirs,
+# user modules). The static index cannot know them, so a driver propagates them to
+# its workers as module names; see export_external_model_modules.
+_EXTERNAL_ARCH_TO_MODULE: Dict[str, str] = {}
+
+
+def export_external_model_modules() -> Dict[str, str]:
+    """Architectures a fresh process could not discover on its own.
+
+    Maps architecture -> providing module for externally registered classes only; a
+    built-in is already reachable through the static index. Naming the module rather
+    than handing over the class keeps the receiver's zoo lazy: it imports one module
+    when that architecture is looked up, instead of every module the sender happened
+    to have imported.
+    """
+    external = {
+        arch: cls.__module__
+        for arch, cls in MODEL_CLASS_MAPPING.items()
+        if not _is_builtin_model_class(cls)
+    }
+    # Declarations this process has not resolved yet name a provider no lookup
+    # here has put in the mapping; they still have to reach the receiver.
+    for arch, module_name in _EXTERNAL_ARCH_TO_MODULE.items():
+        external.setdefault(arch, module_name)
+    return external
+
+
+def _replay_provider(module_name: str, declared: Dict[str, str]) -> None:
+    for registry_name, arch, value in _MODULE_REGISTRATIONS.get(
+            module_name, ()):
+        if declared.get(arch, module_name) != module_name:
+            # The declaration hands this architecture to another provider, so
+            # every slot this module filled for it belongs to that one -- and
+            # stays empty until a lookup imports it.
+            continue
+        _apply_arch_registration(registry_name, arch, value, module_name)
+
+
+def _rebuild_arch_registries(declared: Dict[str, str]) -> None:
+    """Restore the architecture registries to what ``declared`` alone produces."""
+    for registry in _ARCH_REGISTRIES.values():
+        registry.clear()
+    for module_name in _MODULE_REGISTRATIONS:
+        if is_builtin_zoo_module(module_name):
+            _replay_provider(module_name, declared)
+    # Declared providers replay last so they overwrite the built-ins, the order
+    # a process sees when it loads the zoo and then the custom modules. A
+    # provider that has not been imported here contributes nothing and is left
+    # to _ensure_model_registered.
+    for module_name in dict.fromkeys(declared.values()):
+        _replay_provider(module_name, declared)
+
+
+def register_external_model_modules(arch_to_module: Dict[str, str]) -> None:
+    """Declare where externally registered architectures live, importing nothing.
+
+    ``arch_to_module`` is the whole set of external providers in effect, so the
+    architecture registries end up holding what a process built from this
+    declaration alone would hold: providers resolved under an earlier declaration
+    release their slots, and one that is named again is restored from what its
+    decorators registered the first time. Every slot is rebuilt, so a provider
+    that only ever filled a sibling registry is released as well.
+    """
+    declared = dict(arch_to_module)
+    if declared == _EXTERNAL_ARCH_TO_MODULE:
+        return
+    _EXTERNAL_ARCH_TO_MODULE.clear()
+    _EXTERNAL_ARCH_TO_MODULE.update(declared)
+    _rebuild_arch_registries(declared)
 
 
 def _ensure_model_registered(model_arch: str) -> None:
@@ -976,10 +1085,12 @@ def _ensure_model_registered(model_arch: str) -> None:
     registration decorator; the import itself is idempotent via
     ``sys.modules``.
     """
-    module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
-    if module_name is None:
-        return
-    full_name = f"tensorrt_llm._torch.models.{module_name}"
+    full_name = _EXTERNAL_ARCH_TO_MODULE.get(model_arch)
+    if full_name is None:
+        module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
+        if module_name is None:
+            return
+        full_name = f"tensorrt_llm._torch.models.{module_name}"
     try:
         importlib.import_module(full_name)
     except ModuleNotFoundError as e:
@@ -988,7 +1099,7 @@ def _ensure_model_registered(model_arch: str) -> None:
         # and must not be masked as "unknown architecture".
         if e.name != full_name:
             raise
-        logger.warning(f"Lazy import of {module_name} for architecture "
+        logger.warning(f"Lazy import of {full_name} for architecture "
                        f"{model_arch} failed: {e!r}")
 
 
@@ -1004,6 +1115,120 @@ def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
     if model_arch not in MODEL_CLASS_MAPPING:
         _ensure_model_registered(model_arch)
     return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def _is_builtin_draft_model_builder(builder) -> bool:
+    return is_builtin_zoo_module(getattr(builder, "__module__", ""))
+
+
+# Speculative-decoding modes each decorated builder declared via
+# ``register_draft_model``, kept per function (``__dict__``, never inherited).
+# Recorded even when the builder loses its ``DRAFT_MODEL_BUILDER_MAPPING`` slot
+# to an external registration, so a builder can be mapped back to its modes
+# without scanning the mapping by identity (which would silently skip exactly
+# those overridden built-ins).
+_REGISTERED_SPEC_MODES_ATTR = "_registered_spec_modes"
+
+
+def register_draft_model(mode):
+    """Register the draft-model builder for a speculative-decoding mode.
+
+    The builder is a plain function
+    ``(model_config, draft_config, lm_head, model) -> nn.Module`` that owns
+    everything its mode needs to construct its draft model, so the generic
+    dispatcher never has to import a concrete draft implementation. Stack the
+    decorator to serve several modes with one builder (vanilla MTP and
+    MTP_EAGLE_ONE_MODEL share theirs, mirroring
+    ``SpeculativeDecodingMode.is_mtp_one_model()``).
+
+    Same registration priority as ``register_auto_model``: built-in builders
+    only fill empty slots and never overwrite, because under lazy loading a
+    built-in module may run its decorators *after* an external registration
+    (e.g. a drafter supplied through ``--custom_module_dirs``) and must not
+    clobber it. External registrations always overwrite.
+
+    The builder belongs in the ``modeling_*.py`` that defines the draft model,
+    never in the factory file, and needs an ``SPEC_MODE_TO_MODULE`` row in
+    ``_arch_index.py`` so it can be found without importing the zoo -- see the
+    "Adding a speculative decoding mode" notes there. Example (DSpark, whose
+    stage count is only knowable from the checkpoint)::
+
+        @register_draft_model(SpeculativeDecodingMode.DSPARK)
+        def _build_dspark_draft(model_config, draft_config, lm_head, model):
+            num_stages = count_dspark_stages(
+                model_config.spec_config.speculative_model)
+            validate_dspark_eplb_layer_base(model_config, draft_config)
+            return DSv4DSparkForCausalLM(
+                draft_config,
+                getattr(model, "aux_stream_dict", None),
+                num_stages=num_stages,
+                block_size=model_config.spec_config.block_size,
+            )
+
+    Args:
+        mode: the ``SpeculativeDecodingMode`` member this builder serves.
+
+    Returns:
+        The decorator binding a builder function to ``mode``.
+    """
+
+    def decorator(builder):
+        modes = builder.__dict__.get(_REGISTERED_SPEC_MODES_ATTR)
+        if modes is None:
+            modes = set()
+            setattr(builder, _REGISTERED_SPEC_MODES_ATTR, modes)
+        modes.add(mode)
+
+        existing = DRAFT_MODEL_BUILDER_MAPPING.get(mode)
+        if (existing is not None and existing is not builder
+                and _is_builtin_draft_model_builder(builder)):
+            logger.info(
+                f"Keeping existing draft-model builder "
+                f"{existing.__module__}.{existing.__qualname__} for "
+                f"speculative decoding mode {mode.name}; built-in "
+                f"{builder.__module__}.{builder.__qualname__} not registered.")
+            return builder
+        DRAFT_MODEL_BUILDER_MAPPING[mode] = builder
+        return builder
+
+    return decorator
+
+
+def _ensure_draft_model_registered(mode) -> None:
+    """Import the module providing ``mode``'s builder, if not yet loaded.
+
+    Mirrors ``_ensure_model_registered``: builders register as an import side
+    effect, and the model zoo is imported lazily, so this turns a mode into
+    "the decorator has run". Modes missing from the static index are left to
+    the caller's normal unsupported-mode handling.
+    """
+    module_name = SPEC_MODE_TO_MODULE.get(mode.name)
+    if module_name is None:
+        return
+    full_name = f"tensorrt_llm._torch.models.{module_name}"
+    try:
+        importlib.import_module(full_name)
+    except ModuleNotFoundError as e:
+        # Only swallow "the providing module itself is missing" (stale index
+        # entry); a missing dependency *inside* the module is a real error and
+        # must not be masked as "unsupported speculative decoding mode".
+        if e.name != full_name:
+            raise
+        logger.warning(f"Lazy import of {module_name} for speculative "
+                       f"decoding mode {mode.name} failed: {e!r}")
+
+
+def get_registered_draft_model_builder(mode) -> Optional[Callable]:
+    """Resolve ``mode`` to its registered draft-model builder, or ``None``.
+
+    The single entry point for builder lookups: the model zoo is imported
+    lazily, so this resolves the providing module on demand before reading the
+    registry. Do not read ``DRAFT_MODEL_BUILDER_MAPPING`` directly — a raw
+    ``.get()`` silently misses every not-yet-imported provider.
+    """
+    if mode not in DRAFT_MODEL_BUILDER_MAPPING:
+        _ensure_draft_model_registered(mode)
+    return DRAFT_MODEL_BUILDER_MAPPING.get(mode)
 
 
 def get_registered_vision_encoder(
@@ -1055,15 +1280,11 @@ def register_vision_encoder(
                 f"via register_auto_model; decorator order must ensure registration occurs first."
             )
         for arch_name in archs:
-            if (arch_name in MODEL_CLASS_VISION_ENCODER_MAPPING
-                    and _is_builtin_model_class(model_cls)):
-                # Built-in registrations only fill empty slots (see the
-                # priority rule above register_auto_model).
-                logger.info(f"Keeping existing vision encoder registration for "
-                            f"architecture {arch_name}.")
-                continue
-            MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (vision_encoder_cls,
-                                                             vlm_base_model)
+            # Attributed to the decorated model class's module: that is the
+            # provider this entry stands or falls with.
+            _record_arch_registration(_VISION_ENCODER_REGISTRY, arch_name,
+                                      (vision_encoder_cls, vlm_base_model),
+                                      getattr(model_cls, "__module__", ""))
 
         return model_cls
 

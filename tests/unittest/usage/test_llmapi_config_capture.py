@@ -85,7 +85,7 @@ def test_collect_llm_api_config_allows_approved_string_converters_only():
     # Path, which is dropped because it is not an allowlisted scalar, while
     # union_backend's allowlisted str is captured. No production telemetry field
     # is Union[str, Path]; the only real Union allowlist fields are
-    # Union[str, Enum] (sampler_type, load_format). See CR-E (declined).
+    # Union[str, Enum] (load_format). See CR-E (declined).
     class _StringConfig(StrictBaseModel):
         backend: Optional[str] = Field(
             default="pytorch",
@@ -144,7 +144,7 @@ def test_sanitize_allowlist_is_value_fail_closed_for_non_scalars():
     (bool/int/float/str) or None. Excluding Union-with-Any/Path from allowlist
     eligibility at the type level is therefore unnecessary for safety, and a
     coarse rule would also break legitimate Union[str, Enum] allowlist fields
-    such as sampler_type and load_format (verified captured elsewhere).
+    such as load_format (verified captured elsewhere).
     """
     from tensorrt_llm.usage import llmapi_config
 
@@ -626,20 +626,6 @@ def test_collect_llm_api_config_captures_none_on_optional_allowlist_field():
     assert meta["unsafe_excluded"] is False
 
 
-def test_collect_llm_api_config_captures_sampler_type_categorical():
-    """sampler_type is a bounded Union[str, SamplerType] categorical allowlist."""
-    args = TorchLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        sampler_type="TorchSampler",
-    )
-
-    config, meta = _loads_payloads(args)
-
-    assert config["sampler_type"] == "TorchSampler"
-    assert meta["capture_succeeded"] is True
-
-
 def test_collect_llm_api_config_captures_transceiver_runtime_categorical():
     """transceiver_runtime is a single Optional[Literal] categorical.
 
@@ -711,6 +697,20 @@ def test_collect_llm_api_config_captures_gms_load_format():
     assert meta["capture_succeeded"] is True
 
 
+def test_collect_llm_api_config_captures_checkpoint_io_policy() -> None:
+    for policy in ("auto", "rank_striped_read_ahead"):
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            checkpoint_io_policy=policy,
+        )
+
+        config, meta = _loads_payloads(args)
+
+        assert config["checkpoint_io_policy"] == policy
+        assert meta["capture_succeeded"] is True
+
+
 def _walk_captured_keys(model) -> set[str]:
     """Capture a single nested config model and return its captured keys."""
     config, _ = _loads_payloads(model)
@@ -776,8 +776,12 @@ def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
     assert _walk_captured_keys(SkipSoftmaxAttentionConfig()) >= {"algorithm"}
 
 
-def test_background_reporter_keeps_initial_report_when_config_capture_fails(monkeypatch):
+def test_background_reporter_keeps_initial_report_when_config_capture_fails(
+    monkeypatch, enable_telemetry
+):
     sent_payloads = []
+
+    assert usage_lib.apply_usage_session_config()
 
     monkeypatch.setattr(usage_lib, "_MAX_HEARTBEATS", 0)
     monkeypatch.setattr(usage_lib, "_get_trtllm_version", lambda: "0.0.0-test")

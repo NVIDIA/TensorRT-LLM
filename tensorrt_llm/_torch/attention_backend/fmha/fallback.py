@@ -17,11 +17,14 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    CustomAttentionMask,
+)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 
-from .interface import Fmha
+from .interface import Fmha, FmhaPhase
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -53,6 +56,8 @@ _THOP_LITERALS: dict = {}
 class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
 
+    supports_skip_correction = True
+
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
         sparse_algorithm = getattr(attn.sparse_params, "algorithm", None)
@@ -62,6 +67,21 @@ class FallbackFmha(Fmha):
             if get_sm_version() in (120, 121):
                 return False
         return True
+
+    def is_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
+    ) -> bool:
+        del q, k, v, phase
+        return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
+            forward_args.update_kv_cache or metadata.is_cross
+        )
 
     def forward(
         self,
@@ -186,6 +206,7 @@ class FallbackFmha(Fmha):
             rope_append=attn.rope_append,
             attention_chunk_size=attn.attention_chunk_size,
             skip_softmax_stat=attn.skip_softmax_stat,
+            skip_correction_threshold=attn.skip_correction_threshold,
             # --- Sparse runtime parameters ---
             sparse_kv_indices=forward_args.sparse_runtime_params.sparse_kv_indices,
             sparse_kv_offsets=forward_args.sparse_runtime_params.sparse_kv_offsets,

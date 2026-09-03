@@ -63,6 +63,11 @@ class DataTransceiverState;
 class SamplingConfig
 {
 public:
+    /// @brief Largest beam width a request may ask for.
+    static constexpr SizeType32 kMaxBeamWidth = 1024;
+    /// @brief Largest variable-beam-width schedule (beamWidthArray) a request may supply.
+    static constexpr SizeType32 kMaxBeamWidthArrayLength = 8;
+
     /// @brief Constructor for SamplingConfig
     /// See description of parameters below
     explicit SamplingConfig(SizeType32 beamWidth = 1, std::optional<SizeType32> const& topK = std::nullopt,

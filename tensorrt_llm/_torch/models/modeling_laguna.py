@@ -34,7 +34,11 @@ from ..distributed import AllReduce, AllReduceParams
 from ..modules.attention import _helix_cp_allgather_input, _helix_cp_output_projection
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (
+from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear, TensorParallelMode
+from ..modules.qk_norm_attention import QKNormRoPEAttention
+from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (
     MiniMaxM2MoeRoutingMethod,
     MoEImplClass,
     RoutingMethodType,
@@ -42,12 +46,8 @@ from ..modules.fused_moe import (
     create_moe,
     resolve_moe_cls,
 )
-from ..modules.fused_moe.interface import MoEWeightLoadingMode
-from ..modules.fused_moe.weight_owner import is_moe_weight_owner
-from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode
-from ..modules.qk_norm_attention import QKNormRoPEAttention
-from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe.interface import MoEWeightLoadingMode
+from ..moe.fused_moe.weight_owner import is_moe_weight_owner
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .checkpoints.hf.weight_mapper import HfWeightMapper

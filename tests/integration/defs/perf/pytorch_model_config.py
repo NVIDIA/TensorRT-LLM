@@ -364,20 +364,6 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Llama-v4 Scout FP4 with cuda graph padding
-        {
-            'patterns': ['llama_v4_scout_17b_16e_instruct_fp4'],
-            'config': {
-                'cuda_graph_config': {
-                    'enable_padding':
-                    True,
-                    'batch_sizes': [
-                        1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048,
-                        4096, 8192
-                    ]
-                }
-            }
-        },
         # GPT-OSS 120B max throughput test
         {
             'patterns': [

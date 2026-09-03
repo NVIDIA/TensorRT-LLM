@@ -292,7 +292,7 @@ class TokenBanHandler(ABC):
         For no-repeat-ngram size ``n``, the last ``n - 1`` tokens of the
         sequence (prompt + generated) form the current prefix; the final token
         of every existing n-gram whose first ``n - 1`` tokens equal that prefix
-        is masked to ``-inf`` (same semantics as the C++ ``banRepeatNgram``
+        is masked to ``-inf`` (same semantics as the former C++ ban-repeat-ngram
         kernel and HF's ``NoRepeatNGramLogitsProcessor``). ``n == 1`` bans every
         token already present. The restriction is per-beam.
 

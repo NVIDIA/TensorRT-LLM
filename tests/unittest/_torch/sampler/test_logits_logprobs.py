@@ -59,11 +59,6 @@ def disable_overlap_scheduler_fixture(request) -> bool:
     return request.param
 
 
-@pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
-def sampler_type_fixture(request) -> str:
-    return request.param
-
-
 @pytest.fixture(scope="module", params=[False, True])
 def enable_early_first_token_response_fixture(request) -> bool:
     return request.param
@@ -92,11 +87,9 @@ class CacheSalter:
 
 @pytest.fixture(scope="module")
 def llm(
-    sampler_type_fixture: str,
     disable_overlap_scheduler_fixture: bool,
     enable_early_first_token_response_fixture: bool,
 ):
-    sampler_type = sampler_type_fixture
     disable_overlap_scheduler = disable_overlap_scheduler_fixture
     enable_early_first_token_response = enable_early_first_token_response_fixture
 
@@ -109,7 +102,6 @@ def llm(
         model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
-        sampler_type=sampler_type,
         disable_overlap_scheduler=disable_overlap_scheduler,
         enable_early_first_token_response=enable_early_first_token_response,
     )

@@ -403,7 +403,7 @@ class TestGemma3(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
-    def test_gemma3_flashinfer_mask(self):
+    def test_gemma3_attention_mask(self):
         config_dict = deepcopy(GEMMA3_1B_CONFIG)
         gemma3_config = Gemma3TextConfig.from_dict(config_dict)
 
@@ -461,7 +461,7 @@ class TestGemma3(unittest.TestCase):
         # First sample has 2 image tokens, second sample has 2 image tokens, third sample has none.
         image_token_mask = torch.tensor(
             [True, True, False, True, True, True, False, False], device=device)
-        causal_mask = gemma3.get_flashinfer_attention_mask(
+        causal_mask = gemma3.get_attention_mask(
             image_token_mask=image_token_mask, attn_metadata=attn_metadata)
         # Causal mask for context request 1.
         ctx_request_1_mask = torch.tensor(

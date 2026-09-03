@@ -13,10 +13,10 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import DefaultMoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import DefaultMoeRoutingMethod, create_moe
 from ..utils import AuxStreamType
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)

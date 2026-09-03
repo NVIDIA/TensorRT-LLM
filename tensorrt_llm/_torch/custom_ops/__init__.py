@@ -79,9 +79,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # importing the module is safe regardless of the result -- it just
     # logs and leaves ``IS_MEGAMOE_OP_AVAILABLE = False`` on partial
     # cutlass-dsl installs so callers can fall back via the factory.
-    from .cute_dsl_megamoe_custom_op import IS_MEGAMOE_OP_AVAILABLE
+    from ..moe.custom_ops.cute_dsl_megamoe_custom_op import \
+        IS_MEGAMOE_OP_AVAILABLE
     if IS_MEGAMOE_OP_AVAILABLE:
-        from .cute_dsl_megamoe_custom_op import cute_dsl_megamoe_nvfp4_blackwell
+        from ..moe.custom_ops.cute_dsl_megamoe_custom_op import \
+            cute_dsl_megamoe_nvfp4_blackwell
         __all__ += ['cute_dsl_megamoe_nvfp4_blackwell']
 
 if IS_CUTLASS_DSL_AVAILABLE and IS_FLASHINFER_AVAILABLE:

@@ -4,7 +4,6 @@
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_python_scheduler[tp4-mtp_nextn=0]": 293.95560641004704,
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-tp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]": 275.8909912491217,
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-tp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=True-torch_compile=False]": 266.709816042101,
-   "accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=True-enable_gemm_allreduce_fusion=False]": 908.2052957660053,
    "accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=CUTEDSL]": 641.9124943269417,
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_kv_cache_aware_routing[mtp_nextn=0]": 287.03202630905434,
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_kv_cache_aware_routing[mtp_nextn=2]": 350.3160223159939,
@@ -15,8 +14,6 @@
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-tp2pp2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=True]": 430.816315329168,
    "accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-dp4-cutlass-auto]": 1067.7517247761134,
    "accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus_online_eplb[fp8]": 813.0690455089789,
-   "accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4[torch_compile=False]": 702.5942377618048,
-   "accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4[torch_compile=False]": 848.7312017090153,
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_online_eplb[mtp_nextn=2-moe_backend=CUTLASS]": 413.68237058399245,
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=True]": 319.0723833630327,
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=TRTLLM-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]": 332.56335388694424,
@@ -47,10 +44,10 @@
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus_online_eplb[fp8kv=True-moe_backend=TRTLLM]": 432.65749452402815,
    "accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-trtllm-one_model-overlap_scheduler]": 491.4517015229212,
    "accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=False]": 132.3602316979086,
-   "test_unittests.py::test_unittests_v2[unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm]": 1953.8634579040809,
+   "test_unittests.py::test_unittests_v2[unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm]": 1953.8634579040809,
    "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-ep4-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-low_precision_combine=False-torch_compile=True]": 295.83772118296474,
    "accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-one_model-overlap_scheduler]": 550.6863905609935,
    "accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[TEP4_ADP_MTP]": 759.9382735569961,
-   "test_unittests.py::test_unittests_v2[unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary]": 418.16275210899767,
-   "test_unittests.py::test_unittests_v2[unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant]": 211.54122115299106
+   "test_unittests.py::test_unittests_v2[unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary]": 418.16275210899767,
+   "test_unittests.py::test_unittests_v2[unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant]": 211.54122115299106
 }
