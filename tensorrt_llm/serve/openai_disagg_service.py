@@ -139,6 +139,16 @@ class OpenAIDisaggregatedService(OpenAIService):
                 if hooks:
                     hooks.on_ctx_dispatch(request)
                 ctx_req = self._get_ctx_request(request, disagg_request_id)
+                # Ctx-only sub-agent affinity: route the CONTEXT
+                # request by the parent-session id, on its OWN conversation_params
+                # copy so gen_req (built from `request`) keeps the default
+                # conversation_id and load-balances across the gen fleet. Set by
+                # the frontend only when subagent_affinity_scope == "context".
+                _cp = ctx_req.conversation_params
+                if _cp is not None and getattr(_cp, "subagent_ctx_affinity_id", None):
+                    ctx_req.conversation_params = _cp.model_copy(
+                        update={"conversation_id": _cp.subagent_ctx_affinity_id}
+                    )
                 # ctx generator is empty
                 ctx_server, _ = await self._ctx_router.get_next_server(
                     ctx_req, exclude_server=gen_server, req_id=disagg_request_id

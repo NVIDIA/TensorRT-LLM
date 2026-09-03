@@ -37,7 +37,8 @@ from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
-from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
+                                                resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
@@ -311,20 +312,43 @@ class OpenAIDisaggServer:
     def _extract_conversation_id(
             req: UCompletionRequest,
             raw_req: Request,
-            subagent_affinity_header: Optional[str] = None):
+            subagent_affinity_header: Optional[str] = None,
+            subagent_affinity_scope: str = "context"):
         """Populate conversation_params.conversation_id from supported headers.
 
         Body ``conversation_params.conversation_id`` is canonical. Headers are
         used only when the body does not provide an id. When
         ``subagent_affinity_header`` is set, a sub-agent's parent-session header
-        takes precedence over X-Session-ID so the sub-agent co-locates with its
-        parent (see ``resolve_request_conversation_id``).
+        co-locates it with its parent; the fleets it applies to are set by
+        ``subagent_affinity_scope``:
+
+        - "context" (default): only the CONTEXT request pins to the parent
+          (shared prefill KV reuse). The GEN request keeps the sub-agent's own
+          id and load-balances across the gen fleet -- avoiding a whole
+          sub-agent tree piling onto one small-batch gen instance (the
+          gen-queue TTFT regression). The parent id is carried in
+          ``conversation_params.subagent_ctx_affinity_id`` and applied to the
+          ctx request only, in the disagg service.
+        - "both": the parent header overrides the conversation id for BOTH the
+          ctx and gen fleets.
         """
-        resolve_request_conversation_id(
-            req,
-            raw_req.headers,
-            subagent_affinity_header=subagent_affinity_header,
-        )
+        if subagent_affinity_header and subagent_affinity_scope == "context":
+            # Resolve to the DEFAULT (own X-Session-ID) so ctx+gen both start
+            # from the sub-agent's own id, then stash the parent id so only the
+            # ctx request is re-pinned to it downstream.
+            resolve_request_conversation_id(req, raw_req.headers)
+            parent = extract_subagent_parent_id(raw_req.headers,
+                                                subagent_affinity_header)
+            if parent and req.conversation_params is not None:
+                req.conversation_params.subagent_ctx_affinity_id = parent
+        else:
+            # scope == "both" (or feature off when the header is None): the
+            # parent header overrides the conversation id for both fleets.
+            resolve_request_conversation_id(
+                req,
+                raw_req.headers,
+                subagent_affinity_header=subagent_affinity_header,
+            )
 
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
@@ -346,7 +370,8 @@ class OpenAIDisaggServer:
                     raise HTTPException(status_code=400, detail=str(e)) from e
                 self._extract_conversation_id(
                     req, raw_req,
-                    self._config.conversation_affinity_header_for_subagents)
+                    self._config.conversation_affinity_header_for_subagents,
+                    self._config.subagent_affinity_scope)
                 hooks = RawRequestResponseHooks(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)

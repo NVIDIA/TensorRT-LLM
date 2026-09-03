@@ -39,6 +39,28 @@ def get_request_conversation_id(request: RequestWithConversationParams) -> Optio
     return None if conversation_params is None else conversation_params.conversation_id
 
 
+def extract_subagent_parent_id(
+    headers: Optional[Mapping[str, str]],
+    subagent_affinity_header: Optional[str],
+) -> Optional[str]:
+    """Return the sub-agent parent-session header value, stripped, or None.
+
+    When a deployment configures ``conversation_affinity_header_for_subagents``
+    (e.g. the Dynamo header ``X-Dynamo-Parent-Session-ID`` that an agent gateway
+    attaches to every sub-agent request but NOT to a main-agent request), this
+    returns that header's value -- the id a sub-agent should co-locate on. A
+    main-agent request lacks the header and yields None.
+    """
+    if not subagent_affinity_header or headers is None:
+        return None
+    lower_headers = {str(key).lower(): value for key, value in headers.items()}
+    parent_id = lower_headers.get(str(subagent_affinity_header).strip().lower())
+    if parent_id is None:
+        return None
+    parent_id = str(parent_id).strip()
+    return parent_id or None
+
+
 def extract_conversation_id_from_headers(
     headers: Optional[Mapping[str, str]],
     subagent_affinity_header: Optional[str] = None,
@@ -47,22 +69,16 @@ def extract_conversation_id_from_headers(
         return None
     lower_headers = {str(key).lower(): value for key, value in headers.items()}
 
-    # Sub-agent parent-session affinity. When a deployment configures
-    # ``conversation_affinity_header_for_subagents`` (e.g. the Dynamo header
-    # ``X-Dynamo-Parent-Session-ID`` that an agent gateway attaches to every
-    # sub-agent request but NOT to a main-agent request), prefer that header's
-    # value as the conversation id. This pins a sub-agent to its parent's
-    # conversation -- and therefore its parent's server/rank -- so the shared
-    # prefill prefix (parent context/tools/system prompt) is reused instead of
-    # being recomputed on a different instance/rank. A main-agent request lacks
+    # Sub-agent parent-session affinity. When configured, prefer the parent
+    # header's value as the conversation id so a sub-agent pins to its parent's
+    # conversation -- and therefore its parent's server/rank -- reusing the
+    # shared prefill prefix (parent context/tools/system prompt) instead of
+    # recomputing it on a different instance/rank. A main-agent request lacks
     # this header and falls through to the default X-Session-ID resolution
     # below, preserving the pre-existing behaviour.
-    if subagent_affinity_header:
-        parent_id = lower_headers.get(str(subagent_affinity_header).strip().lower())
-        if parent_id is not None:
-            parent_id = str(parent_id).strip()
-            if parent_id:
-                return parent_id
+    parent_id = extract_subagent_parent_id(headers, subagent_affinity_header)
+    if parent_id:
+        return parent_id
 
     for header_name in CONVERSATION_ID_HEADERS:
         conversation_id = lower_headers.get(header_name)

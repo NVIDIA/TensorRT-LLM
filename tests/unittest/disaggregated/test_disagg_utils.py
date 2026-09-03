@@ -234,6 +234,55 @@ def test_extract_disagg_cfg_rejects_non_string_internal_request_auth_key():
         extract_disagg_cfg(internal_request_auth_key=123)
 
 
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_subagent_affinity_defaults(sample_yaml_config):
+    # Feature is off by default; the scope defaults to "context".
+    config = extract_disagg_cfg(**sample_yaml_config)
+    assert config.conversation_affinity_header_for_subagents is None
+    assert config.subagent_affinity_scope == "context"
+
+
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_subagent_affinity_opt_in(sample_yaml_config):
+    sample_yaml_config[
+        "conversation_affinity_header_for_subagents"] = "X-Dynamo-Parent-Session-ID"
+    sample_yaml_config["subagent_affinity_scope"] = "both"
+
+    config = extract_disagg_cfg(**sample_yaml_config)
+
+    assert (config.conversation_affinity_header_for_subagents ==
+            "X-Dynamo-Parent-Session-ID")
+    assert config.subagent_affinity_scope == "both"
+    # Consumed at the config level, not pushed into per-engine server args.
+    assert all(
+        "subagent_affinity_scope" not in server.other_args and
+        "conversation_affinity_header_for_subagents" not in server.other_args
+        for server in config.server_configs)
+
+
+def test_subagent_affinity_scope_survives_yaml_file(tmp_path):
+    cfg = get_yaml_config()
+    cfg["conversation_affinity_header_for_subagents"] = "X-Dynamo-Parent-Session-ID"
+    cfg["subagent_affinity_scope"] = "both"
+    yaml_file = tmp_path / "scope_config.yaml"
+    with open(yaml_file, "w") as f:
+        yaml.dump(cfg, f)
+
+    config = parse_disagg_config_file(yaml_file)
+
+    assert config.subagent_affinity_scope == "both"
+    assert (config.conversation_affinity_header_for_subagents ==
+            "X-Dynamo-Parent-Session-ID")
+
+
+@pytest.mark.parametrize("value", ["ctx", "gen", "", "BOTH", None])
+def test_extract_disagg_cfg_rejects_invalid_subagent_affinity_scope(value):
+    cfg = get_yaml_config()
+    cfg["subagent_affinity_scope"] = value
+    with pytest.raises(ValueError, match="subagent_affinity_scope must be"):
+        extract_disagg_cfg(**cfg)
+
+
 def test_extract_ctx_gen_cfgs():
     configs = extract_ctx_gen_cfgs(
         type="ctx",

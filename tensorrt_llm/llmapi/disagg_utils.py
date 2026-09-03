@@ -174,6 +174,15 @@ class DisaggServerConfig():
     # parent -- maximizing shared-prefix KV reuse. A main-agent request lacks
     # this header and falls back to the default X-Session-ID resolution.
     conversation_affinity_header_for_subagents: Optional[str] = None
+    # Which disagg fleets honor conversation_affinity_header_for_subagents.
+    #   "context" (default): only the CONTEXT request pins to the parent id
+    #     (shared prefill KV reuse); the GEN request keeps the sub-agent's own
+    #     id and load-balances across the gen fleet. Avoids collapsing a whole
+    #     sub-agent tree onto one small-batch gen instance, whose few decode
+    #     slots would then queue and inflate TTFT.
+    #   "both": the parent header overrides the conversation id for BOTH fleets.
+    # No effect unless conversation_affinity_header_for_subagents is set.
+    subagent_affinity_scope: Literal['context', 'both'] = 'context'
 
 
 @dataclass
@@ -266,6 +275,7 @@ def extract_disagg_cfg(
         server_keep_alive_timeout: int = 10,
         internal_request_auth_key: Optional[str] = None,
         conversation_affinity_header_for_subagents: Optional[str] = None,
+        subagent_affinity_scope: str = 'context',
         **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -340,6 +350,11 @@ def extract_disagg_cfg(
     config.internal_request_auth_key = internal_request_auth_key
     config.conversation_affinity_header_for_subagents = (
         conversation_affinity_header_for_subagents)
+    if subagent_affinity_scope not in ('context', 'both'):
+        raise ValueError(
+            "subagent_affinity_scope must be 'context' or 'both', got "
+            f"{subagent_affinity_scope!r}")
+    config.subagent_affinity_scope = subagent_affinity_scope
     return config
 
 

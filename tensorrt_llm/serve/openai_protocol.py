@@ -260,6 +260,16 @@ class ConversationParams(OpenAIBaseModel):
     conversation_id: str = Field(
         description=("Stable multi-turn conversation id used for routing"), )
 
+    # Ctx-only sub-agent affinity (subagent_affinity_scope="context"):
+    # the parent-session id used to co-locate ONLY the context request with its
+    # parent. When set, the disagg edge routes the ctx request by this id while
+    # the gen request keeps the default conversation_id, so sub-agent trees share
+    # ctx prefill KV without piling a whole tree onto one small-batch gen instance.
+    # None => not a ctx-only sub-agent request (default routing for both fleets).
+    subagent_ctx_affinity_id: Optional[str] = Field(
+        default=None,
+        description=("Parent-session id for ctx-only sub-agent co-location."))
+
     @field_validator("conversation_id", mode="before")
     @classmethod
     def validate_conversation_id(cls, value: Any) -> str:
