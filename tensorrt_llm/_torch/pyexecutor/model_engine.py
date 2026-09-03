@@ -813,9 +813,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self._torch_compile_enabled = torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
-        # Set by _run_autotuner_warmup when MiniMax-M3 MXFP8 layers tune their
-        # quantization and GEMM backends per generation-graph bucket.
-        self._use_mxfp8_graph_backend_selection = False
 
         prefill_cuda_graph_num_tokens = self.llm_args.prefill_capture_num_tokens
         if prefill_cuda_graph_num_tokens is None:
@@ -1593,11 +1590,6 @@ class PyTorchModelEngine(ModelEngine):
                         self._run_cuda_graph_warmup(resource_manager)
                 finally:
                     self.cuda_graph_runner.is_warmup_only = False
-                if self._use_mxfp8_graph_backend_selection:
-                    # Drop the MXFP8 backend-profiling intermediates before
-                    # allocating capture graphs.
-                    gc.collect()
-                    torch.cuda.empty_cache()
                 self.cuda_graph_runner.padding_dummy_requests = {}
                 self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
@@ -2136,14 +2128,12 @@ class PyTorchModelEngine(ModelEngine):
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
         """Runs forward passes to populate the autotuner cache."""
-        from ..custom_ops.torch_custom_ops import MXFP8GemmRunner
+        from ..custom_ops.torch_custom_ops import (
+            MXFP8GemmRunner, is_flashinfer_mxfp8_cute_dsl_available)
         from ..modules.linear import (MXFP8LinearMethod,
                                       flashinfer_mxfp8_autotune)
 
         enable_trtllm_autotuner = self.llm_args.enable_autotuner
-        # Per-stage MXFP8 backend tuning runs inside generation-graph warmup
-        # and is part of startup autotuning, so the global switch disables it.
-        self._use_mxfp8_graph_backend_selection = False
         if not enable_trtllm_autotuner:
             return
 
@@ -2170,49 +2160,40 @@ class PyTorchModelEngine(ModelEngine):
                 getattr(module, "_use_flashinfer_mxfp8_decode_graph_default",
                         False) for module in self.model.modules()))
         if use_mxfp8_flashinfer_graph_default:
-            # Prefer tuning the quantization and GEMM backends per generation
-            # graph bucket over the eager FlashInfer tuner. Graph warmup has
-            # no pipeline-parallel cache handoff, so PP keeps the eager tuner.
+            # Generation-graph warmup also profiles the MXFP8 quantizer and
+            # GEMM backends (native/CUTLASS vs. CuTeDSL) per token bucket.
+            # Pipeline parallelism keeps the plain FlashInfer path: the graph
+            # pass has no PP cache handoff, so a tuning cache miss there would
+            # block in the AutoTuner's cache_pp_recv.
+            tune_graph_backends = (is_flashinfer_mxfp8_cute_dsl_available()
+                                   and not self.mapping.has_pp())
             for quant_method in mxfp8_methods:
-                quant_method.configure_default_graph_dispatch(
-                    enable_backend_tuning=not self.mapping.has_pp())
+                if quant_method.enable_flashinfer_auto():
+                    quant_method.tune_graph_backends = tune_graph_backends
         flashinfer_mxfp8_methods = [
             method for method in mxfp8_methods
             if method.needs_flashinfer_autotune
         ]
-        graph_selection_methods = [
-            method for method in mxfp8_methods
-            if method.uses_graph_backend_selection
-        ]
 
         # Every TP and PP rank must make the same backend decision before any
         # rank returns or enters a tuning forward with model collectives.
-        # Per-stage graph tuning replaces the eager FlashInfer forward, so the
-        # ranks also have to agree on that mode: 0 = native, 1 = eager
-        # FlashInfer tuner, 2 = per-stage graph backend tuning.
         if self.mapping.tp_size > 1 or self.mapping.has_pp():
-            if graph_selection_methods:
-                local_mxfp8_mode = 2
-            elif flashinfer_mxfp8_methods:
-                local_mxfp8_mode = 1
-            else:
-                local_mxfp8_mode = 0
-            all_mxfp8_modes = [local_mxfp8_mode]
+            local_flashinfer_enabled = int(bool(flashinfer_mxfp8_methods))
+            all_flashinfer_enabled = [local_flashinfer_enabled]
             if self.mapping.tp_size > 1:
-                all_mxfp8_modes = list(self.dist.tp_allgather(local_mxfp8_mode))
+                all_flashinfer_enabled = list(
+                    self.dist.tp_allgather(local_flashinfer_enabled))
             if self.mapping.has_pp():
-                all_mxfp8_modes = [
-                    mode
-                    for stage_modes in self.dist.pp_allgather(all_mxfp8_modes)
-                    for mode in stage_modes
+                all_flashinfer_enabled = [
+                    enabled for stage_flags in self.dist.pp_allgather(
+                        all_flashinfer_enabled) for enabled in stage_flags
                 ]
-            if any(all_mxfp8_modes) and not all(all_mxfp8_modes):
+            if any(all_flashinfer_enabled) and not all(all_flashinfer_enabled):
                 forced_flashinfer = any(method.backend == "flashinfer"
                                         for method in mxfp8_methods)
                 for method in mxfp8_methods:
                     method.disable_flashinfer_auto()
                 flashinfer_mxfp8_methods = []
-                graph_selection_methods = []
                 if forced_flashinfer:
                     raise RuntimeError(
                         "FlashInfer MXFP8 was explicitly requested but is not "
@@ -2220,31 +2201,18 @@ class PyTorchModelEngine(ModelEngine):
                 logger.warning(
                     "FlashInfer MXFP8 availability differs across TP/PP ranks; "
                     "using the native TensorRT-LLM GEMM backend on every rank.")
-            elif graph_selection_methods and any(mode != 2
-                                                 for mode in all_mxfp8_modes):
-                for method in graph_selection_methods:
-                    method.disable_graph_backend_selection()
-                flashinfer_mxfp8_methods = [
-                    method for method in mxfp8_methods
-                    if method.needs_flashinfer_autotune
-                ]
-                graph_selection_methods = []
-                logger.warning(
-                    "FlashInfer CuTeDSL MXFP8 availability differs across "
-                    "TP/PP ranks; tuning the eager FlashInfer backend on every "
-                    "rank.")
-        self._use_mxfp8_graph_backend_selection = bool(graph_selection_methods)
 
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
+        tune_mxfp8_graph_backends = any(method.tune_graph_backends
+                                        for method in mxfp8_methods)
 
         AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info(
             f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
             f"native MXFP8={enable_native_mxfp8_autotuner}, "
             f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner}, "
-            f"MXFP8 graph backend tuning="
-            f"{self._use_mxfp8_graph_backend_selection})...")
+            f"MXFP8 graph backend tuning={tune_mxfp8_graph_backends})...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
@@ -2620,11 +2588,8 @@ class PyTorchModelEngine(ModelEngine):
                                       flashinfer_mxfp8_decode_graph_capture)
 
         # The automatic MiniMax-M3 MXFP8 selection is decode-graph-only.
-        # Tune every generation graph shape during the warmup-only pass: the
-        # eager-tuned FlashInfer path re-enters its autotuner, while per-stage
-        # backend tuning profiles each token bucket once and the capture pass
-        # reuses the winners. Keep piecewise context/prefill graph capture on
-        # the native backend.
+        # Tune every generation graph shape during the warmup-only pass. Keep
+        # piecewise context/prefill graph capture on the native backend.
         flashinfer_methods = [
             quant_method for module in self.model.modules()
             if isinstance((quant_method := getattr(module, "quant_method", None)
@@ -2634,12 +2599,8 @@ class PyTorchModelEngine(ModelEngine):
         flashinfer_autotune_context = (
             flashinfer_mxfp8_autotune() if self.cuda_graph_runner.is_warmup_only
             and flashinfer_methods else contextlib.nullcontext())
-        # getattr: warmup unit tests build engines with object.__new__.
-        tune_mxfp8_backends = (
-            self.cuda_graph_runner.is_warmup_only
-            and getattr(self, "_use_mxfp8_graph_backend_selection", False))
         with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture(
-                tune_backends=tune_mxfp8_backends):
+        ):
             self._capture_generation_cuda_graphs(resource_manager)
         self._capture_mixed_encoder_decoder_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the

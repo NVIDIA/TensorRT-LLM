@@ -218,25 +218,20 @@ def test_mxfp8_auto_fallback_does_not_rearm_native_autotuning(monkeypatch):
     autotuned_gemm.assert_not_called()
 
 
-def test_mxfp8_graph_backend_selection_is_an_explicit_opt_in(monkeypatch):
-    """Per-stage graph tuning replaces FlashInfer dispatch only inside decode capture."""
+def test_mxfp8_graph_backend_tuning_routes_only_decode_capture(monkeypatch):
+    """Per-bucket backend tuning replaces the FlashInfer graph path only inside decode capture."""
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
-    monkeypatch.setattr(linear_module, "is_flashinfer_mxfp8_cute_dsl_available", lambda: True)
     mm_mxfp8 = Mock()
     monkeypatch.setitem(
         sys.modules,
         "flashinfer",
-        SimpleNamespace(mm_mxfp8=mm_mxfp8, autotune=Mock()),
+        SimpleNamespace(mm_mxfp8=mm_mxfp8, autotune=Mock(return_value=contextlib.nullcontext())),
     )
-    quantized, activation_scale, quantize, native_gemm, native_output, _, _ = _mock_mxfp8_ops(
-        monkeypatch
-    )
+    _, _, quantize, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
     graph_output = torch.empty((2, 3), dtype=torch.bfloat16)
-    graph_quantize = Mock(return_value=(quantized, activation_scale))
-    graph_gemm = Mock(return_value=graph_output)
-    monkeypatch.setattr(linear_module, "mxfp8_quantize_autotuned", graph_quantize)
-    monkeypatch.setattr(linear_module, "flashinfer_mxfp8_gemm_autotuned", graph_gemm)
+    graph_linear = Mock(return_value=graph_output)
+    monkeypatch.setattr(linear_module, "mxfp8_graph_tuned_linear", graph_linear)
 
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
@@ -245,96 +240,52 @@ def test_mxfp8_graph_backend_selection_is_an_explicit_opt_in(monkeypatch):
     )
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
     method = MXFP8LinearMethod()
-    method.configure_default_graph_dispatch(enable_backend_tuning=True)
-    assert method.backend == "auto"
-    assert method.uses_graph_backend_selection
-    assert not method.needs_flashinfer_autotune
+    assert method.enable_flashinfer_auto()
+    method.tune_graph_backends = True
 
     # Eager execution stays on the native op.
     assert method.apply(module, activation, bias=None) is native_output
     native_gemm.assert_called_once()
     quantize.assert_called_once_with(activation, True)
+    graph_linear.assert_not_called()
 
-    # The warmup-only pass tunes both stages for this bucket.
-    with flashinfer_mxfp8_decode_graph_capture(tune_backends=True):
+    # The eager FlashInfer tuning pass is not graph capture.
+    with flashinfer_mxfp8_autotune():
+        method.apply(module, activation, bias=None)
+    mm_mxfp8.assert_called_once()
+    graph_linear.assert_not_called()
+
+    # The warmup-only graph pass tunes both stages for this bucket.
+    with flashinfer_mxfp8_autotune(), flashinfer_mxfp8_decode_graph_capture():
         assert method.apply(module, activation, bias=None) is graph_output
-    graph_quantize.assert_called_once_with(activation, tune=True)
-    graph_gemm.assert_called_once_with(
-        quantized,
-        activation_scale,
-        module.weight,
-        module.weight_scale,
-        module.dtype,
-        tune=True,
+    graph_linear.assert_called_once_with(
+        activation, module.weight, module.weight_scale, module.dtype, tune=True
     )
-    mm_mxfp8.assert_not_called()
 
     # The capture pass reuses the winners without tuning.
     with flashinfer_mxfp8_decode_graph_capture():
         assert method.apply(module, activation, bias=None) is graph_output
-    assert graph_quantize.call_args.kwargs == {"tune": False}
-    assert graph_gemm.call_args.kwargs == {"tune": False}
-    mm_mxfp8.assert_not_called()
+    assert graph_linear.call_args.kwargs == {"tune": False}
+    mm_mxfp8.assert_called_once()
 
     # Leaving the decode-capture scope restores the eager/native path.
     assert method.apply(module, activation, bias=None) is native_output
     assert native_gemm.call_count == 2
 
-
-def test_mxfp8_graph_backend_selection_needs_cute_dsl_and_backend_tuning(monkeypatch):
-    """The model default only tunes per stage when CuTeDSL and the engine allow it."""
-    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
-    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
-    monkeypatch.setitem(
-        sys.modules,
-        "flashinfer",
-        SimpleNamespace(mm_mxfp8=Mock(), autotune=Mock()),
-    )
-
-    monkeypatch.setattr(linear_module, "is_flashinfer_mxfp8_cute_dsl_available", lambda: False)
-    method = MXFP8LinearMethod()
-    method.configure_default_graph_dispatch(enable_backend_tuning=True)
-    assert method.backend == "auto"
-    assert not method.uses_graph_backend_selection
-    assert method.needs_flashinfer_autotune
-
-    monkeypatch.setattr(linear_module, "is_flashinfer_mxfp8_cute_dsl_available", lambda: True)
-    method = MXFP8LinearMethod()
-    method.configure_default_graph_dispatch(enable_backend_tuning=False)
-    assert method.backend == "auto"
-    assert not method.uses_graph_backend_selection
-    assert method.needs_flashinfer_autotune
-
-    method = MXFP8LinearMethod()
-    method.configure_default_graph_dispatch(enable_backend_tuning=True)
-    assert method.uses_graph_backend_selection
-    method.disable_graph_backend_selection()
-    assert method.backend == "auto"
-    assert not method.uses_graph_backend_selection
-    assert method.needs_flashinfer_autotune
-
-    method = MXFP8LinearMethod()
-    method.configure_default_graph_dispatch(enable_backend_tuning=True)
+    # Falling back to the native backend disarms graph tuning as well.
     method.disable_flashinfer_auto()
     assert method.backend == "trtllm"
-    assert not method.uses_graph_backend_selection
-    assert not method.needs_flashinfer_autotune
-
-    # An explicit backend override is left untouched.
-    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
-    method = MXFP8LinearMethod()
-    method.configure_default_graph_dispatch(enable_backend_tuning=True)
-    assert method.backend == "trtllm"
-    assert not method.uses_graph_backend_selection
+    assert not method.tune_graph_backends
+    with flashinfer_mxfp8_decode_graph_capture():
+        assert method.apply(module, activation, bias=None) is native_output
+    assert graph_linear.call_count == 2
 
 
 def test_mxfp8_quantize_runner_dispatches_backends(monkeypatch):
     expected = (object(), object())
     cute_dsl_quantize = Mock(return_value=expected)
     monkeypatch.setattr(
-        torch_custom_ops,
-        "_get_flashinfer_mxfp8_cute_dsl_ops",
-        lambda: (cute_dsl_quantize, Mock(), Mock()),
+        torch_custom_ops, "_flashinfer_mxfp8_quantize", cute_dsl_quantize, raising=False
     )
     native_quantize = Mock(return_value=(object(), object()))
     monkeypatch.setattr(
@@ -365,14 +316,13 @@ def test_mxfp8_quantize_runner_dispatches_backends(monkeypatch):
 
 
 def test_flashinfer_mxfp8_gemm_runner_dispatches_backends(monkeypatch):
-    """Both tactics reuse the eager call contract; only CuTeDSL pins FlashInfer tuning off."""
+    """Both tactics reuse the eager call contract; only CuTeDSL skips FlashInfer's own tuning."""
     output = object()
     flashinfer_gemm = Mock(return_value=output)
     flashinfer_autotune = Mock(return_value=contextlib.nullcontext())
+    monkeypatch.setattr(torch_custom_ops, "_flashinfer_mm_mxfp8", flashinfer_gemm, raising=False)
     monkeypatch.setattr(
-        torch_custom_ops,
-        "_get_flashinfer_mxfp8_cute_dsl_ops",
-        lambda: (Mock(), flashinfer_gemm, flashinfer_autotune),
+        torch_custom_ops, "_flashinfer_autotune", flashinfer_autotune, raising=False
     )
     act = torch.empty((2, 4), dtype=torch.float8_e4m3fn)
     act_scale = torch.empty(512, dtype=torch.uint8)
@@ -404,8 +354,8 @@ def test_flashinfer_mxfp8_gemm_runner_dispatches_backends(monkeypatch):
     flashinfer_autotune.assert_called_once_with(tune_mode=False, skip_ops="mxfp8_gemm")
 
 
-def test_mxfp8_graph_backend_tactic_selection_profiles_each_bucket_once(monkeypatch):
-    """Tuning mode is entered only for buckets without an in-process winner."""
+def test_mxfp8_graph_tuned_linear_tunes_both_stages_only_when_asked(monkeypatch):
+    """Each stage selects its backend through the AutoTuner; ``tune`` gates tuning mode."""
     tuning_modes = []
 
     @contextlib.contextmanager
@@ -414,42 +364,53 @@ def test_mxfp8_graph_backend_tactic_selection_profiles_each_bucket_once(monkeypa
         tuning_modes.append(tune_mode)
         yield
 
-    expected = (object(), object())
-    cute_dsl_quantize = Mock(return_value=expected)
-    flashinfer_autotune = Mock(return_value=contextlib.nullcontext())
+    quantized, scale, output = object(), object(), object()
+    monkeypatch.setattr(torch_custom_ops, "autotune", trtllm_autotune)
     monkeypatch.setattr(
         torch_custom_ops,
-        "_get_flashinfer_mxfp8_cute_dsl_ops",
-        lambda: (cute_dsl_quantize, Mock(), flashinfer_autotune),
+        "_flashinfer_mxfp8_quantize",
+        Mock(return_value=(quantized, scale)),
+        raising=False,
     )
-    monkeypatch.setattr(torch_custom_ops, "autotune", trtllm_autotune)
-    cache_hits = iter([False, True])
-    search_cache = Mock(side_effect=lambda *args, **kwargs: (next(cache_hits), 0, -1, 0.0))
-    tuner = SimpleNamespace(
-        profiling_cache=SimpleNamespace(search_cache=search_cache),
-        choose_one=Mock(return_value=(None, MXFP8QuantizeRunner.CUTE_DSL)),
+    flashinfer_gemm = Mock(return_value=output)
+    monkeypatch.setattr(torch_custom_ops, "_flashinfer_mm_mxfp8", flashinfer_gemm, raising=False)
+    monkeypatch.setattr(
+        torch_custom_ops,
+        "_flashinfer_autotune",
+        Mock(return_value=contextlib.nullcontext()),
+        raising=False,
     )
-    monkeypatch.setattr(torch_custom_ops.AutoTuner, "get", lambda: tuner)
+    choose_one = Mock(
+        side_effect=lambda op, runners, config, inputs: (runners[0], runners[0].CUTE_DSL)
+    )
+    monkeypatch.setattr(
+        torch_custom_ops.AutoTuner, "get", lambda: SimpleNamespace(choose_one=choose_one)
+    )
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
+    weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.empty(512, dtype=torch.uint8)
 
-    # First call for the bucket profiles; the second reuses the cached winner.
-    assert torch_custom_ops.mxfp8_quantize_autotuned(activation, tune=True) is expected
-    assert torch_custom_ops.mxfp8_quantize_autotuned(activation, tune=True) is expected
-    # Capture never consults the tuning switch.
-    assert torch_custom_ops.mxfp8_quantize_autotuned(activation, tune=False) is expected
+    tuned = torch_custom_ops.mxfp8_graph_tuned_linear
+    assert tuned(activation, weight, weight_scale, torch.bfloat16, tune=True) is output
+    assert tuned(activation, weight, weight_scale, torch.bfloat16) is output
 
-    assert tuning_modes == [True, False, False]
-    assert search_cache.call_count == 2
-    assert tuner.choose_one.call_count == 3
-    custom_op, runners, tuning_config, inputs = tuner.choose_one.call_args.args
-    assert custom_op == "trtllm::mxfp8_quantize_autotuned::quantize"
-    assert isinstance(runners[0], MXFP8QuantizeRunner)
-    assert tuning_config is MXFP8QuantizeRunner.tuning_config
-    assert tuning_config.exclude_from_cache
-    assert inputs == [activation]
-    assert cute_dsl_quantize.call_count == 3
-    # The quantizer has no FlashInfer-side tuning to enable.
-    flashinfer_autotune.assert_not_called()
+    assert tuning_modes == [True, True, False, False]
+    quantize_call, gemm_call = choose_one.call_args_list[:2]
+    assert [call.args[0] for call in choose_one.call_args_list] == [
+        "trtllm::mxfp8_quantize_autotuned::quantize",
+        "trtllm::flashinfer_mxfp8_gemm_autotuned::gemm",
+    ] * 2
+    assert isinstance(quantize_call.args[1][0], MXFP8QuantizeRunner)
+    assert quantize_call.args[2] is MXFP8QuantizeRunner.tuning_config
+    assert quantize_call.args[3] == [activation]
+    assert isinstance(gemm_call.args[1][0], FlashInferMXFP8GemmRunner)
+    assert gemm_call.args[2] is FlashInferMXFP8GemmRunner.tuning_config
+    assert gemm_call.args[3] == [quantized, scale, weight, weight_scale]
+    assert flashinfer_gemm.call_args.kwargs["backend"] == "cute-dsl"
+    # Winners are ordinary AutoTuner entries: repeated buckets hit the cache
+    # instead of re-profiling, and nothing is excluded from persistence.
+    assert not MXFP8QuantizeRunner.tuning_config.exclude_from_cache
+    assert not FlashInferMXFP8GemmRunner.tuning_config.exclude_from_cache
 
 
 @pytest.mark.parametrize(
@@ -775,8 +736,8 @@ def test_mxfp8_flashinfer_decode_graph_matches_native(monkeypatch, batch_size):
     reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100",
 )
 @pytest.mark.parametrize("batch_size", (1, 8, 16, 32))
-def test_mxfp8_graph_backend_selection_matches_native(monkeypatch, batch_size):
-    """Per-stage tuned decode graphs must match the native op.
+def test_mxfp8_graph_backend_tuning_matches_native(monkeypatch, batch_size):
+    """Per-bucket tuned decode graphs must match the native op.
 
     Profile the quantizer and GEMM backends for a decode bucket during the
     warmup-only pass, then capture the same shape and replay it. This covers
@@ -814,12 +775,11 @@ def test_mxfp8_graph_backend_selection_matches_native(monkeypatch, batch_size):
 
     method = tuned.quant_method
     assert isinstance(method, MXFP8LinearMethod)
-    method.configure_default_graph_dispatch(enable_backend_tuning=True)
-    assert method.uses_graph_backend_selection
-    assert not method.needs_flashinfer_autotune
+    assert method.enable_flashinfer_auto()
+    method.tune_graph_backends = True
 
     # Warmup-only pass: profile both backends of each stage for this bucket.
-    with flashinfer_mxfp8_decode_graph_capture(tune_backends=True):
+    with flashinfer_mxfp8_autotune(), flashinfer_mxfp8_decode_graph_capture():
         warmup_output = tuned(x)
     torch.testing.assert_close(warmup_output, native_output, rtol=2e-2, atol=2e-2)
 
