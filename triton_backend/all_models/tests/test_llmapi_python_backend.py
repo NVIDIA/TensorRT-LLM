@@ -45,8 +45,7 @@ from helpers import (convert_request_input_to_dict,
                      get_sampling_params_from_request,
                      get_streaming_from_request)
 # Use PYTHONPATH=../llmapi/tensorrt_llm/1/
-from model import *
-from model import MultimodalContext, TritonPythonModel  # explicit: avoids F405
+from model import MultimodalContext, TritonPythonModel
 
 
 @dataclass
