@@ -119,14 +119,14 @@ def _is_anthropic_billing_system_block(text: str) -> bool:
     return _ANTHROPIC_BILLING_SYSTEM_BLOCK.fullmatch(text) is not None
 
 
-def _system_text_parts(system: Optional[Union[str, List[Any]]]) -> List[str]:
+def _system_text_parts(system: Optional[Union[str, List[AnthropicTextBlock]]]) -> List[str]:
     if system is None:
         return []
     if isinstance(system, str):
         return [system] if system else []
     parts = []
     for index, block in enumerate(system):
-        text = getattr(block, "text", None)
+        text = block.text
         # Only position 0, which is where the client puts it. Restricting by
         # position keeps a genuine user system block that happens to look like
         # telemetry from being silently dropped.
@@ -161,7 +161,7 @@ def _tool_result_text(content: Any) -> str:
         return content
     parts = []
     for block in content:
-        block_type = getattr(block, "type", None)
+        block_type = block.type
         if block_type == "text":
             parts.append(block.text)
         else:
@@ -188,11 +188,7 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
             if isinstance(message.content, str):
                 system_parts.append(message.content)
             else:
-                system_parts.extend(
-                    block.text
-                    for block in message.content
-                    if getattr(block, "type", None) == "text"
-                )
+                system_parts.extend(block.text for block in message.content if block.type == "text")
             continue
 
         in_leading_system_run = False
@@ -221,7 +217,7 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
                 parts.clear()
 
         for block in message.content:
-            block_type = getattr(block, "type", None)
+            block_type = block.type
             if block_type == "text":
                 parts.append({"type": "text", "text": block.text})
             elif block_type == "image":
@@ -639,7 +635,7 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
             )
         stop_reason, stop_sequence = _map_stop_result(choice.finish_reason, choice.stop_reason)
 
-    if any(getattr(block, "type", None) == "tool_use" for block in content):
+    if any(block.type == "tool_use" for block in content):
         # A response carrying tool_use blocks must say stop_reason="tool_use";
         # the client's tool loop keys off exactly that and treats anything else
         # as the end of the turn, so the tools would never run. The upstream

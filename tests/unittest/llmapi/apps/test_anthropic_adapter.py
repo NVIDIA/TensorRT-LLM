@@ -1367,6 +1367,38 @@ def test_unknown_content_block_is_named_in_the_error():
         convert_anthropic_request(request)
 
 
+def test_every_known_block_type_selects_its_own_model():
+    """Guards the union's Tag strings against drifting from the models.
+
+    The discriminator maps a block's `type` to a Tag, and a Tag that no longer
+    matches its model's literal would route every block of that type to the
+    catch-all -- where it would be reported as unsupported even though the
+    server models it. Nothing else would notice.
+    """
+    from tensorrt_llm.serve.anthropic_protocol import (
+        _CONTENT_BLOCK_MODELS,
+        AnthropicMessage,
+        AnthropicUnknownBlock,
+    )
+
+    samples = {
+        "text": {"type": "text", "text": "hi"},
+        "image": {"type": "image", "source": {"type": "url", "url": "http://x/y.png"}},
+        "tool_use": {"type": "tool_use", "id": "t1", "name": "get_weather", "input": {}},
+        "tool_result": {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+        "thinking": {"type": "thinking", "thinking": "hmm"},
+        "redacted_thinking": {"type": "redacted_thinking", "data": "xx"},
+    }
+    # Every modelled type must have a sample, or the guard silently skips it.
+    assert set(samples) == {model.model_fields["type"].default for model in _CONTENT_BLOCK_MODELS}
+
+    for model in _CONTENT_BLOCK_MODELS:
+        block_type = model.model_fields["type"].default
+        block = AnthropicMessage(role="user", content=[samples[block_type]]).content[0]
+        assert type(block) is model, f"{block_type} selected {type(block).__name__}"
+        assert not isinstance(block, AnthropicUnknownBlock)
+
+
 def test_image_block_without_url_or_data_is_rejected():
     """Url and data are both Optional, so a source can validate yet carry none.
 

@@ -118,6 +118,10 @@ def _streaming_chat_response():
 
 def _make_route_client(server_kind, openai_response):
     app = FastAPI()
+    # Body validation fails before the route function runs, so without the
+    # server's own handler these tests would see FastAPI's 422 instead of the
+    # 400 + Anthropic envelope a client actually gets.
+    _anthropic_validation_handler(app)
     if server_kind == "standard":
         server = object.__new__(OpenAIServer)
         server.model = MODEL
@@ -174,6 +178,67 @@ def test_messages_route_rejects_anthropic_server_tools(server_kind):
     assert response.json()["type"] == "error"
     assert response.json()["error"]["type"] == "invalid_request_error"
     assert "server tool" in response.json()["error"]["message"]
+    backend.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "block,tag,field",
+    [
+        pytest.param({"type": "text"}, "text", "text", id="text_without_text"),
+        pytest.param({"type": "text", "text": 123}, "text", "text", id="text_with_non_string_text"),
+        pytest.param({"type": "image"}, "image", "source", id="image_without_source"),
+        pytest.param({"type": "tool_use", "id": "a"}, "tool_use", "name", id="tool_use_no_name"),
+        pytest.param(
+            {"type": "tool_result", "content": "x"},
+            "tool_result",
+            "tool_use_id",
+            id="tool_result_without_tool_use_id",
+        ),
+    ],
+)
+def test_malformed_known_block_is_a_400_against_its_own_type(block, tag, field):
+    """A known type with bad fields must fail as that type, not as the catch-all.
+
+    The union is tagged on `type`, so the block is checked against the model the
+    client asked for and the error points at the field it is missing. Trying
+    members in order instead let these validate as AnthropicUnknownBlock, reach
+    the adapter's dispatch on `type`, and raise AttributeError on an attribute
+    the block never had -- a 500 for a plain client error.
+
+    Errors carry `loc` as a tuple, so the tag and field appear adjacent.
+    """
+    client, backend = _make_route_client("standard", _json_chat_response())
+
+    response = client.post(
+        "/v1/messages",
+        json=_request(messages=[{"role": "user", "content": [block]}]),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    message = response.json()["error"]["message"]
+    assert f"'{tag}', '{field}'" in message
+    # The catch-all must not have absorbed it; that is the regression itself.
+    assert "'unknown'," not in message
+    backend.assert_not_awaited()
+
+
+def test_unknown_block_type_still_reaches_the_adapter():
+    """The catch-all exists for types this server does not model; keep it working.
+
+    Tagging the union must not close it: an unmodelled type has to validate and
+    be named by the adapter, rather than returning a wall of failed members.
+    """
+    client, backend = _make_route_client("standard", _json_chat_response())
+
+    response = client.post(
+        "/v1/messages",
+        json=_request(messages=[{"role": "user", "content": [{"type": "document", "source": {}}]}]),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "document" in response.json()["error"]["message"]
     backend.assert_not_awaited()
 
 
@@ -770,7 +835,10 @@ class _FakeSession:
             status = session._status
             reason = "Bad Request"
             headers = {}
-            request_info = None
+            # ClientResponseError.__str__ dereferences request_info.real_url, so
+            # a bare None here fails while formatting the error rather than
+            # while raising it.
+            request_info = SimpleNamespace(real_url=url)
             history = ()
 
             async def json(self):

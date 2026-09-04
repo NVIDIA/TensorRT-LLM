@@ -25,9 +25,9 @@ models emit only the fields this server populates.
 
 import time
 import uuid
-from typing import Annotated, Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union, get_args
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag
 
 
 class AnthropicBaseModel(BaseModel):
@@ -94,15 +94,49 @@ class AnthropicUnknownBlock(AnthropicBaseModel):
     type: str
 
 
-AnthropicContentBlock = Union[
+# Tag names must equal each model's ``type`` literal, so derive them from the
+# models rather than restating the list here.
+_CONTENT_BLOCK_MODELS = (
     AnthropicTextBlock,
     AnthropicImageBlock,
     AnthropicToolUseBlock,
     AnthropicToolResultBlock,
     AnthropicThinkingBlock,
     AnthropicRedactedThinkingBlock,
-    # Last: pydantic tries members in order, so the typed ones win.
-    AnthropicUnknownBlock,
+)
+_KNOWN_CONTENT_BLOCK_TYPES = frozenset(
+    get_args(model.model_fields["type"].annotation)[0] for model in _CONTENT_BLOCK_MODELS
+)
+
+
+def _content_block_tag(value: Any) -> str:
+    """Pick the block model from ``type`` before any field is validated.
+
+    An order-based union accepts the first member that validates, which sends
+    a *malformed known* block to the catch-all: ``{"type": "text"}`` with no
+    ``text`` fails AnthropicTextBlock, validates as AnthropicUnknownBlock, and
+    then reaches the adapter, which dispatches on ``type`` and raises
+    AttributeError on ``block.text`` -- a 500 for what is a client error.
+
+    Selecting on ``type`` first makes that block fail as a text block and name
+    the field it is missing, and leaves the catch-all for the case it exists
+    for: a block type this server does not model at all.
+    """
+    block_type = value.get("type") if isinstance(value, dict) else getattr(value, "type", None)
+    return block_type if block_type in _KNOWN_CONTENT_BLOCK_TYPES else "unknown"
+
+
+AnthropicContentBlock = Annotated[
+    Union[
+        Annotated[AnthropicTextBlock, Tag("text")],
+        Annotated[AnthropicImageBlock, Tag("image")],
+        Annotated[AnthropicToolUseBlock, Tag("tool_use")],
+        Annotated[AnthropicToolResultBlock, Tag("tool_result")],
+        Annotated[AnthropicThinkingBlock, Tag("thinking")],
+        Annotated[AnthropicRedactedThinkingBlock, Tag("redacted_thinking")],
+        Annotated[AnthropicUnknownBlock, Tag("unknown")],
+    ],
+    Discriminator(_content_block_tag),
 ]
 
 AnthropicToolResultBlock.model_rebuild()
