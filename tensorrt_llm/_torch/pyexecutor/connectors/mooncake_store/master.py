@@ -378,7 +378,7 @@ def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
         raise FileNotFoundError(
             f"{binary!r} is not on PATH, so launch_master cannot start a "
             "Mooncake master. It ships with the Mooncake runtime, which "
-            "mooncake_disagg/install_mooncake_runtime.sh installs. Point "
+            "docker/common/install_mooncake.sh installs. Point "
             f"{MASTER_BINARY_ENV} at the binary, or drop launch_master and "
             "set master_server_address to a master you run yourself."
         )

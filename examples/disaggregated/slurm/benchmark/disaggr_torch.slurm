@@ -140,40 +140,22 @@ fi
 
 # The Mooncake store bindings, when a worker config asks for the connector.
 # Images built from this repo bake them in (docker/common/install_mooncake.sh),
-# so the install below is only a fallback for images that predate it. Either
-# way it is per job, since --container-name gives each node a container that
-# lives for the job: anything installed here survives to the worker sruns but
-# not into the next job.
+# so this only confirms they are there: a job that discovers the gap later
+# fails once per rank, deep in engine startup.
 mooncake_enabled=false
 if grep -qs "mooncake-store" "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"; then
     mooncake_enabled=true
     # Both halves of the wheel are checked because they fail at different
     # times: the connector needs mooncake.store in every context rank, and
     # 'trtllm-serve mooncake_master' needs the binary on PATH.
-    if srun --container-name=${container_name} \
+    if ! srun --container-name=${container_name} \
         --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N 1 -n 1 \
         bash -c 'python3 -c "import mooncake.store" && command -v mooncake_master' \
-        &> ${full_logdir}/2_install_mooncake.log; then
-        echo "Mooncake store bindings already in the image; nothing to install"
-    else
-        mooncake_install_script=""
-        if [ -n "${trtllm_repo:-}" ]; then
-            mooncake_install_script="${trtllm_repo}/mooncake_disagg/install_mooncake_runtime.sh"
-        fi
-        if [ -z "${mooncake_install_script}" ] || [ ! -f "${mooncake_install_script}" ]; then
-            cleanup_on_failure "A worker config requests the mooncake-store connector, this image does not have the bindings, and mooncake_disagg/install_mooncake_runtime.sh was not found under trtllm_repo='${trtllm_repo:-}'. Use an image built from this repo, or set environment.trtllm_repo to a checkout that contains the script."
-        fi
-        echo "Installing Mooncake store bindings on all nodes..."
-        if ! srun --container-name=${container_name} \
-            --container-mounts=${container_mount} --no-container-mount-home \
-            --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-            bash -c "MOONCAKE_WHEEL='${MOONCAKE_WHEEL:-}' bash ${mooncake_install_script}" \
-            &>> ${full_logdir}/2_install_mooncake.log; then
-            cleanup_on_failure "Mooncake store bindings installation failed. Check ${full_logdir}/2_install_mooncake.log for details"
-        fi
-        echo "Mooncake store bindings installation completed successfully"
+        &> ${full_logdir}/2_check_mooncake.log; then
+        cleanup_on_failure "A worker config requests the mooncake-store connector, but this image has neither the mooncake.store bindings nor the mooncake_master binary. Build the image from this repo so that docker/common/install_mooncake.sh runs. Check ${full_logdir}/2_check_mooncake.log for details"
     fi
+    echo "Mooncake store bindings found in the image"
 fi
 
 # Get node lists and replace the placeholder with the actual node names
