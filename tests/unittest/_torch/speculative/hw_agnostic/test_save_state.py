@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import os
-import sys
 import tempfile
 import unittest
 
@@ -24,8 +23,6 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SaveHiddenStatesDecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 QWEN3_5_HIDDEN_SIZE = 2560
 
