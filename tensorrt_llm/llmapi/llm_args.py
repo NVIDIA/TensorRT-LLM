@@ -65,6 +65,7 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
 from ..bindings.internal.algorithms import AgentTreeConfig as _AgentTreeConfig  # isort: skip
 # isort: on
+from . import llmman
 
 # yapf: enable
 from ..logger import logger
@@ -4632,8 +4633,13 @@ class _ModelWrapper:
             self.model = model_dir
 
     @property
+    def is_oci_model(self) -> bool:
+        """A CNCF ModelPack artifact, pulled through an llmman daemon."""
+        return isinstance(self.model, str) and llmman.is_oci_ref(self.model)
+
+    @property
     def is_hub_model(self) -> bool:
-        return not self.is_local_model
+        return not self.is_local_model and not self.is_oci_model
 
     @property
     def is_local_model(self) -> bool:
