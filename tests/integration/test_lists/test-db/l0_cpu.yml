@@ -87,6 +87,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
+  - unittest/llmapi/apps/test_request_metrics.py
   - unittest/llmapi/apps/test_responses_custom_tools.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py
   - unittest/llmapi/apps/test_responses_streaming_events.py

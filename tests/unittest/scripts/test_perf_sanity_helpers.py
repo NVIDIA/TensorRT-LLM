@@ -95,6 +95,7 @@ def test_sentinel_timeout_falls_back_to_current_gen_logs(
             "output_index": 0,
             "benchmark_file_path": str(benchmark_log),
             "start_offsets": [10, 20],
+            "end_offsets": [110, 120],
         }
     ]
     commands = perf_sanity.DisaggTestCmds(
@@ -114,14 +115,15 @@ def test_sentinel_timeout_falls_back_to_current_gen_logs(
         "wait_for_gen_log_sentinels",
         lambda self: False,
     )
-    parse_calls: list[tuple[str, int, list[int]]] = []
+    parse_calls: list[tuple[str, int, list[int], list[int]]] = []
 
     def parse_device_step_time(
         output_dir: str,
         num_gen_servers: int,
         start_offsets: list[int],
+        end_offsets: list[int],
     ) -> perf_sanity._DeviceStepTimeStats:
-        parse_calls.append((output_dir, num_gen_servers, start_offsets))
+        parse_calls.append((output_dir, num_gen_servers, start_offsets, end_offsets))
         return perf_sanity._DeviceStepTimeStats(mean=7.25, median=7.2, std=0.115, p75=7.3, p99=7.42)
 
     monkeypatch.setattr(
@@ -132,7 +134,10 @@ def test_sentinel_timeout_falls_back_to_current_gen_logs(
 
     commands._append_gen_worker_device_step_time(pending, outputs)
 
-    assert parse_calls == [(str(tmp_path), 2, [10, 20])]
+    # Both window bounds must reach the parser: a record whose end_offsets were
+    # dropped on the way through would read to EOF and, in a multi-client mode,
+    # attribute every later client's iterations to this one.
+    assert parse_calls == [(str(tmp_path), 2, [10, 20], [110, 120])]
     expected = (
         "Average Per Iter Device Step Time (ms): 7.25\n"
         "Median Per Iter Device Step Time (ms): 7.2000\n"
@@ -186,6 +191,107 @@ def test_missing_device_step_time_appends_nothing(
     )
 
     commands._append_gen_worker_device_step_time(pending, outputs)
+
+    assert outputs == ["benchmark output"]
+    assert benchmark_log.read_text(encoding="utf-8") == "benchmark output"
+
+
+def test_append_time_breakdown_metrics_reads_the_configured_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The breakdown directory is a DisaggTestCmds *field*, not a method.
+
+    PerfSanityTestConfig.time_breakdown_dir() computes the path and hands it over
+    as perf_metrics_output_dir. Calling that method on DisaggTestCmds instead
+    raises AttributeError -- and this runs after benchmark_status is written, so
+    the whole measurement would be thrown away at the very last step.
+    """
+    breakdown_dir = tmp_path / "perf_metrics"
+    breakdown_dir.mkdir()
+    benchmark_log = tmp_path / "trtllm-benchmark.0.0.log"
+    benchmark_log.write_text("benchmark output", encoding="utf-8")
+    outputs = ["benchmark output"]
+    pending = [
+        {
+            "output_index": 0,
+            "benchmark_file_path": str(benchmark_log),
+            "benchmark_mode": "e2e",
+        }
+    ]
+    commands = perf_sanity.DisaggTestCmds(
+        server_cmds=[],
+        client_cmds={},
+        timeout=1,
+        hostname="localhost",
+        disagg_serving_type="BENCHMARK",
+        num_ctx_servers=1,
+        num_gen_servers=2,
+        output_dir=str(tmp_path),
+        test_output_dir=str(tmp_path),
+        perf_metrics_output_dir=str(breakdown_dir),
+    )
+
+    discover_calls: list[str] = []
+
+    def wait_for_files(directory: str, **kwargs: object) -> tuple[list[str], dict]:
+        discover_calls.append(directory)
+        return (
+            [str(breakdown_dir / "perf_metrics-server-0.jsonl")],
+            {"stable": True, "waited_seconds": 0.0, "line_counts": {}, "warnings": []},
+        )
+
+    monkeypatch.setattr(perf_sanity, "wait_for_perf_metrics_files", wait_for_files)
+    monkeypatch.setattr(
+        perf_sanity,
+        "compute_time_breakdown_metrics",
+        lambda paths, case_type, **kwargs: (
+            {"d_tb_ctx_queue_mean": 4.5},
+            {"warnings": [], "counts": {"ctx": 1}, "warmup_dropped": {}},
+        ),
+    )
+
+    commands._append_time_breakdown_metrics(pending, outputs)
+
+    assert discover_calls == [str(breakdown_dir)]
+    assert "Time Breakdown ctx_queue mean (ms): 4.500000" in outputs[0]
+    assert "Time Breakdown ctx_queue mean (ms): 4.500000" in benchmark_log.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_append_time_breakdown_metrics_without_any_jsonl_is_not_fatal(tmp_path: Path) -> None:
+    """The real discovery path over an empty directory, with no stubs.
+
+    Deliberately unmonkeypatched so the attribute access on self is exercised for
+    real: a stubbed discover would still pass if the directory came from nowhere.
+    """
+    benchmark_log = tmp_path / "trtllm-benchmark.0.0.log"
+    benchmark_log.write_text("benchmark output", encoding="utf-8")
+    outputs = ["benchmark output"]
+    commands = perf_sanity.DisaggTestCmds(
+        server_cmds=[],
+        client_cmds={},
+        timeout=1,
+        hostname="localhost",
+        disagg_serving_type="BENCHMARK",
+        num_ctx_servers=1,
+        num_gen_servers=2,
+        output_dir=str(tmp_path),
+        test_output_dir=str(tmp_path),
+        perf_metrics_output_dir=str(tmp_path / "perf_metrics"),
+    )
+
+    commands._append_time_breakdown_metrics(
+        [
+            {
+                "output_index": 0,
+                "benchmark_file_path": str(benchmark_log),
+                "benchmark_mode": "e2e",
+            }
+        ],
+        outputs,
+    )
 
     assert outputs == ["benchmark output"]
     assert benchmark_log.read_text(encoding="utf-8") == "benchmark output"
@@ -521,6 +627,123 @@ def test_parse_gen_worker_device_step_time_reports_none_with_no_logs(
     assert perf_sanity.parse_gen_worker_device_step_time(str(tmp_path), 2) is None
 
 
+def _two_segment_gen_log(tmp_path: Path) -> int:
+    """One gen log holding two clients' iterations. Returns the split offset.
+
+    Both segments use the same iter numbers and the same ngen, exactly as two
+    clients against one long-lived gen worker would: the only thing telling them
+    apart is the byte range, which is the whole point of the window.
+    """
+    first = [_iter_line(n, 1, "7.0ms") for n in range(5, 15)]
+    second = [_iter_line(n, 1, "70.0ms") for n in range(5, 15)]
+    path = tmp_path / "gen_server_0.log"
+    first_text = "\n".join(first) + "\n"
+    path.write_text(first_text + "\n".join(second) + "\n", encoding="utf-8")
+    return len(first_text.encode())
+
+
+def test_invalid_utf8_in_the_log_does_not_abort_the_scan(tmp_path: Path) -> None:
+    """Tqdm progress bars write partial multibyte sequences during model load.
+
+    The scan reads bytes and decodes per line (so end_offsets can be accounted
+    exactly), which moves where errors="replace" applies. Without it a single
+    malformed byte anywhere in a multi-hundred-MB worker log would raise
+    UnicodeDecodeError and lose the whole metric.
+    """
+    path = tmp_path / "gen_server_0.log"
+    lines = [_iter_line(n, 1, "7.0ms").encode() for n in range(5, 15)]
+    # A truncated 3-byte UTF-8 sequence, mid-file, on its own line.
+    path.write_bytes(b"\n".join(lines[:5] + [b"loading \xe2\x96"] + lines[5:]) + b"\n")
+
+    stats = perf_sanity.parse_gen_worker_device_step_time(str(tmp_path), 1)
+
+    assert stats.mean == pytest.approx(7.0)
+
+
+def test_crlf_line_endings_still_parse(tmp_path: Path) -> None:
+    r"""Binary reads keep the \r that text mode stripped.
+
+    None of the iteration-line regexes are end-anchored, so this holds -- but it
+    holds by a property of those patterns rather than by construction, so it is
+    pinned here: adding a trailing anchor to any of them would silently zero the
+    metric on a log that ever carries CRLF.
+    """
+    path = tmp_path / "gen_server_0.log"
+    path.write_bytes(b"".join(_iter_line(n, 1, "7.0ms").encode() + b"\r\n" for n in range(5, 15)))
+
+    stats = perf_sanity.parse_gen_worker_device_step_time(str(tmp_path), 1)
+
+    assert stats.mean == pytest.approx(7.0)
+
+
+def test_end_offsets_confines_a_client_to_its_own_segment(tmp_path: Path) -> None:
+    """Without an end bound the first client would report the whole run.
+
+    A multi-client mode appends every client's iterations to the same
+    gen_server_{i}.log, and the parse is deferred until after teardown, so at
+    parse time all segments are already on disk. An unbounded read would give
+    client 0 a mean averaged over client 1's iterations too -- silently wrong
+    rather than absent, which is why this is pinned.
+    """
+    split = _two_segment_gen_log(tmp_path)
+
+    first = perf_sanity.parse_gen_worker_device_step_time(
+        str(tmp_path), 1, start_offsets=[0], end_offsets=[split]
+    )
+    second = perf_sanity.parse_gen_worker_device_step_time(
+        str(tmp_path), 1, start_offsets=[split], end_offsets=None
+    )
+
+    assert first.mean == pytest.approx(7.0)
+    assert second.mean == pytest.approx(70.0)
+
+
+def test_no_end_offsets_reads_to_eof(tmp_path: Path) -> None:
+    """Backward compatibility: the single-client gen_only lane passes None.
+
+    That lane must stay byte-identical to before the window existed, so this
+    asserts the unbounded read still spans both segments (mean of 7 and 70).
+    """
+    _two_segment_gen_log(tmp_path)
+
+    stats = perf_sanity.parse_gen_worker_device_step_time(str(tmp_path), 1)
+
+    assert stats.mean == pytest.approx(38.5)
+
+
+def test_an_end_offset_past_eof_is_harmless(tmp_path: Path) -> None:
+    """The bound comes from a getsize() snapshot of a file still being written.
+
+    It can therefore sit past what a later reader sees only if the log were
+    truncated, but it must degrade to "read everything" rather than raise.
+    """
+    _two_segment_gen_log(tmp_path)
+
+    stats = perf_sanity.parse_gen_worker_device_step_time(
+        str(tmp_path), 1, start_offsets=[0], end_offsets=[10**9]
+    )
+
+    assert stats.mean == pytest.approx(38.5)
+
+
+def test_a_line_straddling_the_end_offset_is_dropped(tmp_path: Path) -> None:
+    """A bound mid-line means the worker was flushing; drop that one row.
+
+    The dropped row belongs to the earlier client, so failing this direction
+    costs one iteration out of hundreds. Reading on instead would pull in every
+    later client's rows, which is unbounded error.
+    """
+    split = _two_segment_gen_log(tmp_path)
+
+    stats = perf_sanity.parse_gen_worker_device_step_time(
+        str(tmp_path), 1, start_offsets=[0], end_offsets=[split - 20]
+    )
+
+    # 9 of the first segment's 10 rows, none of the second's.
+    assert stats.mean == pytest.approx(7.0)
+    assert stats.std == pytest.approx(0.0)
+
+
 def test_every_written_line_parses_and_none_shadows_another(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -563,6 +786,7 @@ def test_every_written_line_parses_and_none_shadows_another(
                 "output_index": 0,
                 "benchmark_file_path": str(benchmark_log),
                 "start_offsets": None,
+                "end_offsets": None,
             }
         ],
         outputs,
@@ -570,7 +794,7 @@ def test_every_written_line_parses_and_none_shadows_another(
 
     metrics: dict[str, float] = {}
     for line in outputs[0].split("\n"):
-        for name, regex in perf_sanity.GEN_ONLY_PERF_METRIC_LOG_QUERIES.items():
+        for name, regex in perf_sanity.DEVICE_STEP_TIME_LOG_QUERIES.items():
             if name in metrics:
                 continue
             match = regex.search(line)
@@ -578,14 +802,14 @@ def test_every_written_line_parses_and_none_shadows_another(
                 metrics[name] = float(match.group(1))
                 break
 
-    assert set(metrics) == set(perf_sanity.GEN_ONLY_DEVICE_STEP_TIME_METRICS)
+    assert set(metrics) == set(perf_sanity.DEVICE_STEP_TIME_METRICS)
     assert metrics["mean_gen_worker_per_iter_device_step_time"] == pytest.approx(7.17, abs=0.01)
     assert metrics["std_gen_worker_per_iter_device_step_time"] > 0.0
 
 
 def test_every_device_step_time_metric_is_a_minimize_metric() -> None:
     """A metric absent from both lists raises ValueError in check_regression."""
-    for name in perf_sanity.GEN_ONLY_DEVICE_STEP_TIME_METRICS:
+    for name in perf_sanity.DEVICE_STEP_TIME_METRICS:
         assert f"d_{name}" in perf_sanity.MINIMIZE_METRICS
 
 
@@ -602,15 +826,54 @@ def test_add_perf_metric_value_skips_absent_statistics() -> None:
     assert "d_p99_gen_worker_per_iter_device_step_time" not in new_data
 
 
-def test_add_perf_metric_value_omits_the_family_outside_gen_only() -> None:
-    """e2e and ctx_only never emit these lines, so they must not be uploaded."""
+@pytest.mark.parametrize("mode", ["gen_only", "e2e"])
+def test_add_perf_metric_value_uploads_the_family_for_every_gen_worker_mode(
+    mode: str,
+) -> None:
+    """Every mode with a gen worker publishes all five statistics."""
+    metrics = dict.fromkeys(perf_sanity.PERF_METRIC_LOG_QUERIES, 1.0)
+    for name in perf_sanity.DEVICE_STEP_TIME_METRICS:
+        metrics[name] = 7.0
+
+    new_data: dict = {}
+    perf_sanity.add_perf_metric_value(new_data, metrics, False, mode)
+
+    for name in perf_sanity.DEVICE_STEP_TIME_METRICS:
+        assert new_data[f"d_{name}"] == pytest.approx(7.0)
+
+
+def test_add_perf_metric_value_omits_the_family_without_a_benchmark_mode() -> None:
+    """ctx_only and the aggregated lanes call this with benchmark_mode=None.
+
+    ctx_only runs the *aggregated* runtime from a disagg YAML, so it has no gen
+    worker and no gen_server_*.log; its call site passes no benchmark_mode at
+    all. Pinned because ``None in DEVICE_STEP_TIME_MODES`` being False is the
+    only thing keeping the family off those rows.
+    """
     metrics = dict.fromkeys(perf_sanity.PERF_METRIC_LOG_QUERIES, 1.0)
     metrics["mean_gen_worker_per_iter_device_step_time"] = 7.0
 
     new_data: dict = {}
-    perf_sanity.add_perf_metric_value(new_data, metrics, False, "e2e")
+    perf_sanity.add_perf_metric_value(new_data, metrics, False, None)
 
     assert not [key for key in new_data if "gen_worker_per_iter" in key]
+    assert "ctx_only" not in perf_sanity.DEVICE_STEP_TIME_MODES
+
+
+def test_the_family_gates_only_in_gen_only() -> None:
+    """The executable form of "upload in e2e, but never gate on it there".
+
+    Modes outside gen_only take the ``else`` branch in
+    get_regression_check_config and get REGRESSION_METRICS, so the only way a
+    device-step-time name could ever set b_is_regression for e2e is by leaking
+    into that default list. MINIMIZE_METRICS membership still buys each name a
+    baseline and an s_regression_info diff line, which is the diagnostic value --
+    the two lists are independent.
+    """
+    for name in perf_sanity.DEVICE_STEP_TIME_METRICS:
+        assert f"d_{name}" not in perf_sanity.REGRESSION_METRICS
+        assert f"d_{name}" in perf_sanity.MINIMIZE_METRICS
+    assert not set(perf_sanity.GEN_ONLY_REGRESSION_METRICS) & set(perf_sanity.REGRESSION_METRICS)
 
 
 def test_every_gated_metric_is_checkable() -> None:
@@ -626,5 +889,5 @@ def test_every_gated_metric_is_checkable() -> None:
 
 def test_every_gated_metric_is_actually_emitted() -> None:
     """A gated metric the log never carries is skipped by 'not in new_data'."""
-    emitted = {f"d_{name}" for name in perf_sanity.GEN_ONLY_DEVICE_STEP_TIME_METRICS}
+    emitted = {f"d_{name}" for name in perf_sanity.DEVICE_STEP_TIME_METRICS}
     assert set(perf_sanity.GEN_ONLY_REGRESSION_METRICS) <= emitted
