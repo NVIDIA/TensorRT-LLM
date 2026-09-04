@@ -12,29 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Backend dispatch for the one-model speculative sampling calls.
-
-Two backends implement the same three call shapes:
-
-* the **flashinfer chain** (:mod:`.flashinfer`) for ``FULL`` / ``NO_TOPK`` / ``NO_TOPP`` /
-  ``NO_TOPK_NO_TOPP``, which resolves each filter away at deploy time so the op omits that
-  kernel entirely;
-* the **fused universal kernel** (:mod:`.universal`) for ``UNIVERSAL``, which takes every
-  filter as a per-row tensor and decides on device which of them to do any work for.
-
-The choice lives here rather than at the call sites so that ``interface.py`` does not grow
-five copies of the same branch, and so the two backends cannot leak into each other. Only
-``UNIVERSAL`` honors ``min_p``; on the other modes it cannot arrive, because
-``SpecSampler.validate_request`` rejects it at admission off the same
-``AdvancedSamplingMode.is_universal`` predicate these functions read.
-"""
+"""Backend dispatch for one-model speculative sampling."""
 
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from . import flashinfer as fi
-from . import universal as uni
+from . import fused
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
@@ -52,8 +37,8 @@ def spec_sample_from_logits(
     offset: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Sample one token per logits row. Returns ``[num_rows]``."""
-    if advanced_sampling_mode.is_universal:
-        return uni.universal_sample_from_logits(
+    if advanced_sampling_mode.is_fused:
+        return fused.fused_sample_from_logits(
             logits, temperatures, top_ks, top_ps, min_ps, seed=seed, offset=offset
         )
     eff_top_k, eff_top_p = fi.resolve_advanced_sampling_filters(
@@ -81,8 +66,8 @@ def spec_sample_from_logits_with_probs(
     rejection path divides the target's probability by the draft's, so a token sampled
     under one distribution and scored under another silently corrupts the acceptance test.
     """
-    if advanced_sampling_mode.is_universal:
-        return uni.universal_sample_from_logits_with_probs(
+    if advanced_sampling_mode.is_fused:
+        return fused.fused_sample_from_logits_with_probs(
             logits, temperatures, top_ks, top_ps, min_ps, seed=seed, offset=offset
         )
     eff_top_k, eff_top_p = fi.resolve_advanced_sampling_filters(
@@ -102,8 +87,8 @@ def spec_compute_probs_from_logits(
     min_ps: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """The filtered, renormalized distribution. Returns ``[num_rows, vocab]`` float32."""
-    if advanced_sampling_mode.is_universal:
-        return uni.universal_compute_probs_from_logits(logits, temperatures, top_ks, top_ps, min_ps)
+    if advanced_sampling_mode.is_fused:
+        return fused.fused_compute_probs_from_logits(logits, temperatures, top_ks, top_ps, min_ps)
     eff_top_k, eff_top_p = fi.resolve_advanced_sampling_filters(
         advanced_sampling_mode, top_ks, top_ps
     )

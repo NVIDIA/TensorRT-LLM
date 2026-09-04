@@ -148,7 +148,7 @@ modes.
     modes that route draft tokens through the Torch Sampler; such requests are rejected.
 
 * With one-model speculative decoding, positive Min-P requires
-  `advanced_sampling_mode: universal` in the speculative decoding config (see
+  `advanced_sampling_mode: fused` in the speculative decoding config (see
   [Advanced sampling mode](#advanced-sampling-mode-speculative-decoding)). That mode's
   fused kernel is the only one that applies `min_p`; under the other modes such a request
   is rejected at admission rather than decoded without it.
@@ -229,11 +229,11 @@ disabled, so this is a lossless throughput optimization for advanced use cases:
 | `no_topk` | **skipped** | applied | not supported |
 | `no_topp` | applied | **skipped** | not supported |
 | `no_topk_no_topp` | **skipped** | **skipped** | not supported |
-| `universal` | per row | per row | **supported** |
+| `fused` | per row | per row | **supported** |
 
-`universal` works differently from the other four. Those each name one *combination* of
+`fused` works differently from the other four. Those each name one *combination* of
 enabled filters, chosen for the whole deployment, so every additional sampling parameter
-doubles the number of modes. `universal` instead runs a single fused kernel that takes
+doubles the number of modes. `fused` instead runs a single fused kernel that takes
 `temperature`, `min_p`, `top_k` and `top_p` together as per-request tensors and decides
 **per row, on device**, which of them to do any work for. A row that leaves a filter at its
 neutral value (`top_k = 0`, `top_p = 1`, `min_p = 0`) does not pay for it.
@@ -259,7 +259,7 @@ Notes:
   sampling batches without a special case.
 * `advanced_sampling_mode` is a deploy-time choice; it is *not* part of the CUDA
   graph key, so it adds no extra warmup graphs.
-* `universal` is lossless in the same sense as the others: it reproduces the standard
+* `fused` is lossless in the same sense as the others: it reproduces the standard
   sampler's distribution, applying `min_p` first, then `top_k`, then `top_p`.
 
 ```python

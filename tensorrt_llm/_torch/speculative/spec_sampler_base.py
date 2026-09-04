@@ -91,28 +91,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         return True
 
     def validate_request(self, request: LlmRequest) -> None:
-        """Reject sampling parameters the one-model speculative path cannot honor.
-
-        min_p is honored only by advanced_sampling_mode=UNIVERSAL, whose fused kernel
-        takes it as a per-row tensor alongside temperature/top_k/top_p. The other modes
-        route to the flashinfer chain, which has no min_p buffer and no min_p kernel, so
-        the value would be silently dropped and the request would decode from a different
-        distribution than the user asked for -- reject instead.
-
-        Both this guard and the op dispatch read AdvancedSamplingMode.is_universal, so
-        what min_p is admitted for and what actually applies it cannot drift apart.
-
-        Raised from validate_request (request admission), so only the offending request
-        fails rather than the whole executor step.
-        """
+        """Reject sampling parameters the configured backend cannot honor."""
         sampling_config = request.sampling_config
         if sampling_config is None:
             return
-        # min_p lives on the C++ SamplingConfig as an optional singleton list.
         min_p = sampling_config.min_p
-        if min_p and min_p[0] > 0.0 and not self._universal_sampling:
+        if min_p and min_p[0] > 0.0 and not self._fused_sampling:
             raise ValueError(
-                "min_p requires 'advanced_sampling_mode: universal' in the speculative "
+                "min_p requires 'advanced_sampling_mode: fused' in the speculative "
                 "decoding config when using one-model speculative decoding. Set that "
                 "mode, drop min_p from the request, or disable speculative decoding."
             )
@@ -204,7 +190,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         accepted_path_len: Optional[int] = None,
         enable_penalty: bool = False,
         penalty_supported: bool = True,
-        universal_sampling: bool = False,
+        fused_sampling: bool = False,
     ):
         """
         Initialize the speculative sampler.
@@ -220,14 +206,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 the penalties themselves are applied inside the worker.
             penalty_supported: whether this speculation mode's row layout is one
                 the penalties can map (linear modes yes, tree modes not yet).
-            universal_sampling: whether the deploy selected
-                advanced_sampling_mode=UNIVERSAL, the only mode whose kernel applies
-                min_p. Only used to decide whether a min_p request is admitted; the
-                filtering itself happens in the worker.
+            fused_sampling: whether the configured sampler supports min_p.
         """
         self._enable_penalty = enable_penalty
         self._penalty_supported = penalty_supported
-        self._universal_sampling = universal_sampling
+        self._fused_sampling = fused_sampling
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len

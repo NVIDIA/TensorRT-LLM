@@ -12,18 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Python interface to the fused "universal" sampling op.
+"""Python interface to the fused sampling op.
 
-One CUDA kernel applies temperature, min-p, top-k and top-p together and skips, per row
-on device, whichever of them that row leaves neutral. The three entry points below differ
-only in which outputs they ask for, so each gets a kernel instantiated without the half it
-does not need:
+A fused CUDA implementation applies temperature, min-p, top-k and top-p together and
+skips, per row on device, whichever of them that row leaves neutral. Its internal
+dispatcher selects a single-CTA or multi-CTA execution family. The three entry points
+below differ only in which outputs they ask for, so each family is instantiated without
+the half it does not need:
 
-============================================  =========================================
-``universal_sample_from_logits``              tokens -- the target/draft samplers
-``universal_compute_probs_from_logits``       probs  -- target probs for rejection
-``universal_sample_from_logits_with_probs``   both   -- draft sampler + its draft probs
-============================================  =========================================
+=========================================  =========================================
+``fused_sample_from_logits``               tokens -- the target/draft samplers
+``fused_compute_probs_from_logits``        probs  -- target probs for rejection
+``fused_sample_from_logits_with_probs``    both   -- draft sampler + its draft probs
+=========================================  =========================================
 
 Unlike the flashinfer chain in :mod:`.flashinfer`, no filter is resolved away on the host:
 every parameter is passed as a per-row tensor and neutrality is decided on device. That is
@@ -39,9 +40,9 @@ from typing import Optional
 import torch
 
 _OP_NAMES = (
-    "universal_sample_from_logits",
-    "universal_sample_from_logits_with_probs",
-    "universal_compute_probs_from_logits",
+    "fused_sample_from_logits",
+    "fused_sample_from_logits_with_probs",
+    "fused_compute_probs_from_logits",
 )
 
 
@@ -58,12 +59,12 @@ def ensure_available() -> None:
     if is_available():
         return
     raise RuntimeError(
-        "the universal sampling op is not available in this build; it is compiled into "
+        "the fused sampling op is not available in this build; it is compiled into "
         "the C++ extension, so a build that predates it will not have it."
     )
 
 
-def universal_sample_from_logits(
+def fused_sample_from_logits(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: torch.Tensor,
@@ -74,12 +75,12 @@ def universal_sample_from_logits(
     offset: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Sample one token per row. Returns ``[num_rows]`` int32."""
-    return torch.ops.trtllm.universal_sample_from_logits(
+    return torch.ops.trtllm.fused_sample_from_logits(
         logits, temperatures, top_ks, top_ps, min_ps, seed, offset
     )
 
 
-def universal_sample_from_logits_with_probs(
+def fused_sample_from_logits_with_probs(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: torch.Tensor,
@@ -94,12 +95,12 @@ def universal_sample_from_logits_with_probs(
     The rejection path needs both, and needs them to come from the *same* filtering, or
     acceptance is computed against a distribution neither side sampled from.
     """
-    return torch.ops.trtllm.universal_sample_from_logits_with_probs(
+    return torch.ops.trtllm.fused_sample_from_logits_with_probs(
         logits, temperatures, top_ks, top_ps, min_ps, seed, offset
     )
 
 
-def universal_compute_probs_from_logits(
+def fused_compute_probs_from_logits(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: torch.Tensor,
@@ -107,7 +108,7 @@ def universal_compute_probs_from_logits(
     min_ps: torch.Tensor,
 ) -> torch.Tensor:
     """The filtered, renormalized distribution. Returns ``[num_rows, vocab]`` float32."""
-    return torch.ops.trtllm.universal_compute_probs_from_logits(
+    return torch.ops.trtllm.fused_compute_probs_from_logits(
         logits, temperatures, top_ks, top_ps, min_ps
     )
 
@@ -118,18 +119,18 @@ def _register_fake_impls() -> None:
     Registered once the op exists, since a fake for an unregistered schema is an error.
     """
 
-    @torch.library.register_fake("trtllm::universal_sample_from_logits")
+    @torch.library.register_fake("trtllm::fused_sample_from_logits")
     def _(logits, temperatures, top_ks, top_ps, min_ps, seed=None, offset=None):
         return logits.new_empty((logits.shape[0],), dtype=torch.int32)
 
-    @torch.library.register_fake("trtllm::universal_sample_from_logits_with_probs")
+    @torch.library.register_fake("trtllm::fused_sample_from_logits_with_probs")
     def _(logits, temperatures, top_ks, top_ps, min_ps, seed=None, offset=None):
         return (
             logits.new_empty((logits.shape[0],), dtype=torch.int32),
             logits.new_empty(logits.shape, dtype=torch.float32),
         )
 
-    @torch.library.register_fake("trtllm::universal_compute_probs_from_logits")
+    @torch.library.register_fake("trtllm::fused_compute_probs_from_logits")
     def _(logits, temperatures, top_ks, top_ps, min_ps):
         return logits.new_empty(logits.shape, dtype=torch.float32)
 

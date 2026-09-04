@@ -1744,47 +1744,30 @@ class AdvancedSamplingMode(StrEnum):
     NO_TOPK - top_k disabled, top_p honored. Skips the top_k mask kernel.
     NO_TOPP - top_p disabled, top_k honored. Skips the top_p renorm kernel.
     NO_TOPK_NO_TOPP - both disabled (pure temperature sampling). Skips both kernels.
-    UNIVERSAL - one fused kernel applies temperature, min_p, top_k and top_p together and
-        decides per row, on device, which of them to do any work for.
-
-    The first four each name one *combination* of enabled filters, so every new sampling
-    parameter doubles the space. UNIVERSAL exists so that stops: the skip decision moves
-    into the kernel. That is also why it is the only mode that can honor min_p.
+    FUSED - applies temperature, min_p, top_k and top_p in one kernel.
     """
     FULL = "full"
     NO_TOPK = "no_topk"
     NO_TOPP = "no_topp"
     NO_TOPK_NO_TOPP = "no_topk_no_topp"
-    UNIVERSAL = "universal"
+    FUSED = "fused"
 
     @property
     def skips_top_k(self) -> bool:
-        """Single source of truth: does this mode disable the top_k filter?
-
-        False for UNIVERSAL, which does not disable it deploy-wide -- it skips the work per
-        row, for the rows that left top_k neutral.
-        """
+        """Whether this mode disables the top_k filter."""
         return self in (AdvancedSamplingMode.NO_TOPK,
                         AdvancedSamplingMode.NO_TOPK_NO_TOPP)
 
     @property
     def skips_top_p(self) -> bool:
-        """Single source of truth: does this mode disable the top_p filter?
-
-        False for UNIVERSAL, for the same reason as ``skips_top_k``.
-        """
+        """Whether this mode disables the top_p filter."""
         return self in (AdvancedSamplingMode.NO_TOPP,
                         AdvancedSamplingMode.NO_TOPK_NO_TOPP)
 
     @property
-    def is_universal(self) -> bool:
-        """Whether this mode routes to the fused universal sampling kernel.
-
-        Single source of truth for the backend choice: the admission guard
-        (``SpecSampler.validate_request``) and the op dispatch both read this, so what
-        min_p is admitted for and what actually applies it cannot drift apart.
-        """
-        return self is AdvancedSamplingMode.UNIVERSAL
+    def is_fused(self) -> bool:
+        """Whether this mode routes to the fused sampling kernel."""
+        return self is AdvancedSamplingMode.FUSED
 
 
 class _MTPDraftCheckpointType(StrEnum):
@@ -1884,7 +1867,7 @@ class DecodingBaseConfig(StrictBaseModel):
         description=
         "Deploy-time specialization of the one-model advanced sampler that skips disabled "
         "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
-        "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both. UNIVERSAL: one fused kernel for "
+        "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both. FUSED: one fused kernel for "
         "temperature/min_p/top_k/top_p that skips per row rather than per deploy; it is "
         "the only mode that supports min_p, which is otherwise rejected at admission."
     )

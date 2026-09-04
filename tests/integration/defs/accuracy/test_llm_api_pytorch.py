@@ -509,15 +509,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_eagle3_one_model_min_p_is_greedy_at_one(self):
-        """min_p == 1.0 keeps only the argmax, so it must reproduce greedy exactly.
-
-        Scope, because it is narrower than it looks: min_p == 1.0 is classified as
-        explicit greedy, so the request normalizes to the disable sentinel and takes the
-        argmax fast path. This asserts the greedy classification end to end; it does NOT
-        exercise the min_p buffers or the fused kernel, and it passes whether or not the
-        filter itself works. The tests that cover the filter are the op-level ones and the
-        min_p ladder in the task's e2e harness.
-        """
+        """min_p == 1.0 must reproduce greedy decoding."""
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
         prompts = [
             "The capital of France is",
@@ -536,7 +528,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                      speculative_model=eagle_model_dir,
                      eagle3_one_model=True,
                      use_rejection_sampling=True,
-                     advanced_sampling_mode=AdvancedSamplingMode.UNIVERSAL,
+                     advanced_sampling_mode=AdvancedSamplingMode.FUSED,
                  )) as llm:
             min_p_one = [
                 out.outputs[0].token_ids for out in llm.generate(
@@ -551,13 +543,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         assert min_p_one == greedy
 
     @skip_pre_hopper
-    def test_eagle3_one_model_min_p_requires_universal_mode(self):
-        """The admission guard this ticket narrows rather than removes.
-
-        Every mode other than UNIVERSAL leaves the min_p buffers at their neutral
-        sentinel, so accepting the request would drop the filter silently. Rejecting is
-        the only honest answer, and the message has to name the fix.
-        """
+    def test_eagle3_one_model_min_p_requires_fused_mode(self):
+        """Positive min_p requires the fused sampling mode."""
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
         with LLM(model=self.MODEL_PATH,
                  max_batch_size=1,
