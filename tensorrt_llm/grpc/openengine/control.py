@@ -13,6 +13,7 @@ no runtime adapter load/unload, and KV events are published out of band.
 
 import asyncio
 import time
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Optional
 
 import grpc
@@ -34,7 +35,19 @@ __all__ = ["OpenEngineControlServicer"]
 
 _SCHEMA_REVISION = 1
 _MINIMUM_CLIENT_REVISION = 1
-_SCHEMA_RELEASE = "768a93c7b44e"
+# BSR commit of the openengine schema this server was generated against. Derived
+# from the installed bindings rather than hand-copied: the version is
+# "<v>+<bsr commit>", and a hardcoded copy would keep advertising a stale
+# release after requirements-openengine.txt is bumped.
+_SCHEMA_PACKAGE = "openengine-openengine-protocolbuffers-python"
+
+
+def _schema_release() -> str:
+    try:
+        return version(_SCHEMA_PACKAGE).rpartition("+")[2]
+    except PackageNotFoundError:
+        logger.warning(f"OpenEngine schema package '{_SCHEMA_PACKAGE}' is not installed")
+        return ""
 
 _ENGINE_NAME = "tensorrt_llm"
 
@@ -97,6 +110,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         self._model = model
         self._inference = inference
         self._kv_transfer_backend = kv_transfer_backend
+        self._probe: Optional[asyncio.Future] = None
 
     @property
     def _args(self) -> Any:
@@ -115,10 +129,14 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         """
         check = getattr(self._llm, "_check_health", None)
         if callable(check):
+            # Only the engine's own failure modes mean "not ready". A TypeError
+            # or AttributeError here is _check_health's contract drifting, and
+            # reporting that as an unhealthy engine is the worst answer a health
+            # endpoint can give: it looks like the thing it is meant to detect.
             try:
                 return bool(check())
-            except Exception as error:
-                logger.warning(f"OpenEngine health check raised: {error}")
+            except (RuntimeError, ValueError, OSError) as error:
+                logger.warning(f"OpenEngine health check reported a failure: {error}")
                 return False
         executor = getattr(self._llm, "_executor", None)
         return executor is not None and not executor.is_shutdown()
@@ -139,7 +157,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             supported_models=[self._model],
             schema_revision=_SCHEMA_REVISION,
             minimum_client_revision=_MINIMUM_CLIENT_REVISION,
-            schema_release=_SCHEMA_RELEASE,
+            schema_release=_schema_release(),
         )
 
         parallelism = server_pb2.ParallelismInfo()
@@ -162,7 +180,12 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                     # KV moves via the context worker's opaque_state, not a
                     # separate decode-pull channel.
                     supports_decode_pull=False,
-                    supports_abort_cleanup=True,
+                    # Abort(kv_session) is UNIMPLEMENTED: KvSessionRef.session_id
+                    # is the engine's context request id, not a Generate
+                    # request_id, so it cannot be resolved to an in-flight
+                    # request. Advertising cleanup a client cannot invoke would
+                    # have it drop a prefill whose KV blocks stay pinned.
+                    supports_abort_cleanup=False,
                     schema_version=_SCHEMA_REVISION,
                 )
             )
@@ -306,16 +329,34 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         A stuck scheduler is what the probe exists to detect, so an unbounded
         wait would hang the RPC in the one case that matters; every non-success
         exit aborts the request so a repeating probe cannot leak one per attempt.
+
+        Concurrent callers share one probe. A readiness loop polling faster than
+        the timeout would otherwise stack a fresh engine request per attempt --
+        against exactly the wedged engine that makes them slow -- and those
+        requests occupy scheduler slots that GetLoad does not report, so a
+        load-balancing router would send the engine more traffic, not less.
         """
+        probe = self._probe
+        if probe is None or probe.done():
+            probe = asyncio.ensure_future(self._run_inference_probe(model))
+            self._probe = probe
+        return await asyncio.shield(probe)
+
+    async def _run_inference_probe(self, model: str) -> lifecycle_pb2.HealthCheck:
         from tensorrt_llm.sampling_params import SamplingParams
 
         handle = None
+        # Counted by GetLoad and reachable by Abort(all_requests): a probe
+        # occupies a scheduler slot like any other request, and a router sizing
+        # itself on running_requests must see it.
+        probe_id = f"__openengine_health_probe__{time.time_ns()}"
         try:
             handle = self._llm.generate_async(
                 [1],
                 sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
                 streaming=False,
             )
+            self._inference.track_request(probe_id, handle)
             await asyncio.wait_for(handle.aresult(), timeout=_INFERENCE_PROBE_TIMEOUT_SECONDS)
             return lifecycle_pb2.HealthCheck(
                 name="inference_probe",
@@ -341,6 +382,8 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                 state=lifecycle_pb2.HEALTH_STATE_DEGRADED,
                 message=str(error),
             )
+        finally:
+            self._inference.untrack_request(probe_id, handle)
 
     async def Abort(
         self,

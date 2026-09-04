@@ -57,10 +57,19 @@ def _is_loopback(host: str) -> bool:
 
 
 def _kv_transfer_backend(llm: Any) -> str:
-    """Best-effort name of the KV cache transfer backend for disaggregation."""
+    """Name of the KV cache transfer backend, or "" when disaggregation is off.
+
+    Presence is decided by the config object, not by `backend`: that field is
+    Optional and defaults to None, and leaving it unset is the documented way to
+    take the default transceiver. Keying on it would make a correctly configured
+    disagg worker advertise kv_connector.enabled=False, so a router doing
+    capability discovery would never send it a remote prefill.
+    """
     cache_config = getattr(getattr(llm, "args", None), "cache_transceiver_config", None)
+    if cache_config is None:
+        return ""
     backend = getattr(cache_config, "backend", None)
-    return str(backend) if backend is not None else ""
+    return str(backend) if backend else "DEFAULT"
 
 
 class OpenEngineServer:
@@ -145,15 +154,13 @@ def launch_server(
         backend = llm_args.get("backend")
         model = served_model_name or llm_args.get("model", "")
         llm_args.pop("build_config", None)
-        if backend == "pytorch":
-            llm = PyTorchLLM(**llm_args)
-        elif backend == "_autodeploy":
+        if backend == "_autodeploy":
             raise click.BadParameter(
                 "OpenEngine generation does not support the AutoDeploy backend because "
                 "AutoDeploy requests cannot currently be cancelled.",
                 param_hint="backend",
             )
-        else:
+        if backend != "pytorch":
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
                 param_hint="backend",
@@ -162,26 +169,39 @@ def launch_server(
         loop = asyncio.get_running_loop()
         stop_event = asyncio.Event()
         server = None
+        llm = None
 
         def signal_handler() -> None:
             logger.info("Received shutdown signal")
             stop_event.set()
 
+        # Installed before the engine is built, not after. Loading a model takes
+        # minutes and spawns MPI workers; a SIGTERM in that window -- a rolling
+        # restart, a failed startup probe, an operator ^C -- would otherwise hit
+        # Python's default handler with no shutdown, orphaning workers that hold
+        # GPU memory.
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, signal_handler)
 
         try:
+            llm = PyTorchLLM(**llm_args)
             logger.info("Model loaded successfully")
             server = OpenEngineServer(host=host, port=port, llm=llm, model=model)
             await server.start()
             await stop_event.wait()
         finally:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.remove_signal_handler(sig)
             try:
                 if server is not None:
                     await server.stop()
             finally:
-                if hasattr(llm, "shutdown"):
-                    llm.shutdown()
+                if llm is not None and hasattr(llm, "shutdown"):
+                    # Synchronous and potentially slow (it joins the MPI
+                    # session), so it runs off the event loop: blocking here
+                    # would freeze any generator still finalizing its abort and
+                    # make the process deaf to a second signal.
+                    await asyncio.to_thread(llm.shutdown)
                 logger.info("LLM engine stopped")
 
     uvloop.run(serve())

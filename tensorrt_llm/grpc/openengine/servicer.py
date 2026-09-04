@@ -232,16 +232,6 @@ def sampling_params_from_request(
     return sampling_params
 
 
-def _parse_metadata_integer(value: str, name: str, minimum: int, maximum: int) -> int:
-    digits = value[1:] if value.startswith(("+", "-")) else value
-    if not digits or not digits.isascii() or not digits.isdecimal():
-        raise ValueError(f"gRPC metadata key '{name}' must be a base-10 integer")
-    parsed = int(value)
-    if not minimum <= parsed <= maximum:
-        raise ValueError(f"gRPC metadata key '{name}' is outside its supported integer range")
-    return parsed
-
-
 def _trace_headers(context: grpc.aio.ServicerContext) -> Mapping[str, str] | None:
     headers: dict[str, str] = {}
     openengine_keys: set[str] = set()
@@ -255,11 +245,9 @@ def _trace_headers(context: grpc.aio.ServicerContext) -> Mapping[str, str] | Non
             if key == "openengine-routing-key":
                 if not value:
                     raise ValueError("openengine-routing-key must be non-empty")
-            elif key == "openengine-priority":
-                _parse_metadata_integer(value, key, -(2**31), 2**31 - 1)
-                raise UnsupportedFeatureError(f"gRPC metadata key '{key}' is not supported")
-            elif key == "openengine-target-dp-rank":
-                _parse_metadata_integer(value, key, 0, 2**32 - 1)
+            elif key in ("openengine-priority", "openengine-target-dp-rank"):
+                # Control advertises both as unsupported; the value is never
+                # read, so it is not worth parsing to decide the status code.
                 raise UnsupportedFeatureError(f"gRPC metadata key '{key}' is not supported")
         elif key in ("traceparent", "tracestate"):
             headers[key] = value
@@ -898,6 +886,27 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         """Requests accepted and not yet completed."""
         return len(self._active_requests)
 
+    def track_request(self, request_id: str, handle: Any) -> bool:
+        """Register an in-flight request. False when the id is already active.
+
+        Callers with no request_id of their own (the Control health probe) pass
+        a synthetic one, so their engine work is still counted by GetLoad and
+        reachable by Abort(all_requests).
+        """
+        if request_id in self._active_requests:
+            return False
+        self._active_requests[request_id] = handle
+        return True
+
+    def untrack_request(self, request_id: str, handle: Any) -> None:
+        """Drop the registration, but only if `handle` still owns it.
+
+        Once an id is dropped a resubmission is admitted, so every removal site
+        must check ownership -- otherwise the loser untracks the newer handle.
+        """
+        if self._active_requests.get(request_id) is handle:
+            del self._active_requests[request_id]
+
     def abort_request_by_id(self, request_id: str) -> bool:
         """Abort one in-flight request. Returns False when it is not active.
 
@@ -1016,8 +1025,16 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 disaggregated_params=disaggregated_params,
                 _postproc_params=postproc_params,
             )
-        except (TypeError, ValueError) as error:
+        except ValueError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+            return
+        # A TypeError here is generate_async's signature drifting under us, not
+        # a malformed request. Reporting it as INVALID_ARGUMENT would make a
+        # router treat a totally broken worker as a fleet of bad clients: it
+        # would not retry elsewhere, eject the engine, or alarm.
+        except TypeError as error:
+            logger.error(f"OpenEngine request {request_id} could not be submitted: {error}")
+            await context.abort(grpc.StatusCode.INTERNAL, str(error))
             return
         # Broad by design: request submission can fail in engine-specific ways we
         # cannot enumerate here; any such failure must become a clean INTERNAL
@@ -1056,11 +1073,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             abort_request("RPC completed before generation")
 
         def untrack() -> None:
-            # Once this id is dropped a resubmission is admitted, so both
-            # removal sites must check they still own the registration --
-            # otherwise the loser untracks the newer request's handle.
-            if self._active_requests.get(request_id) is result_handle:
-                del self._active_requests[request_id]
+            self.untrack_request(request_id, result_handle)
 
         def stall_watchdog() -> None:
             # Single self-rescheduling watchdog (no per-message timer alloc/cancel).
@@ -1116,7 +1129,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             # still holds, while an exception before streaming can no longer leak
             # the id in _active_requests (which would make it permanently
             # un-reusable, since re-submits are rejected with ALREADY_EXISTS).
-            self._active_requests[request_id] = result_handle
+            self.track_request(request_id, result_handle)
             stall_timer = loop.call_later(_RESPONSE_STALL_TIMEOUT_SECONDS, stall_watchdog)
             async for result in result_handle:
                 if context.cancelled():

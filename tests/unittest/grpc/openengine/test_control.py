@@ -124,6 +124,28 @@ async def test_server_info_reports_identity_parallelism_and_capacity():
     assert info.capacity.kv_block_size == 32
     assert info.kv_connector.enabled is True
     assert info.kv_connector.transfer_backend == "NIXL"
+    # Abort(kv_session) is UNIMPLEMENTED, so cleanup must not be advertised: a
+    # router that believed it would drop a prefill whose blocks stay pinned.
+    assert info.kv_connector.supports_abort_cleanup is False
+
+
+def test_kv_transfer_backend_detects_an_unset_backend_field():
+    """cache_transceiver_config.backend is Optional and defaults to None.
+
+    Leaving it unset is the documented way to take the default transceiver, so
+    presence must be decided by the config object. Keying on the field made a
+    correctly configured disagg worker advertise kv_connector.enabled=False.
+    """
+    from tensorrt_llm.grpc.openengine.server import _kv_transfer_backend
+
+    unset = SimpleNamespace(args=SimpleNamespace(cache_transceiver_config=SimpleNamespace(backend=None)))
+    assert _kv_transfer_backend(unset) == "DEFAULT"
+
+    named = SimpleNamespace(args=SimpleNamespace(cache_transceiver_config=SimpleNamespace(backend="NIXL")))
+    assert _kv_transfer_backend(named) == "NIXL"
+
+    absent = SimpleNamespace(args=SimpleNamespace(cache_transceiver_config=None))
+    assert _kv_transfer_backend(absent) == ""
 
 
 @pytest.mark.asyncio
@@ -461,3 +483,70 @@ async def test_text_input_is_not_advertised_without_a_tokenizer():
 async def test_text_input_is_advertised_when_a_tokenizer_exists():
     info = await _servicer().GetModelInfo(model_pb2.GetModelInfoRequest(), _FakeContext())
     assert info.supports_text_input is True
+
+
+@pytest.mark.asyncio
+async def test_health_probe_is_counted_by_get_load_and_released():
+    """A probe occupies a scheduler slot, so GetLoad must report it.
+
+    A router sizing itself on running_requests would otherwise send more traffic
+    to an engine whose probes are already queued behind real work.
+    """
+    import asyncio
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    handle = _FakeHandle()
+
+    async def _blocking() -> None:
+        started.set()
+        await release.wait()
+
+    handle.aresult = _blocking
+    llm = _llm()
+    llm.generate_async = lambda *a, **k: handle
+
+    inference = _inference()
+    servicer = OpenEngineControlServicer(llm, MODEL, inference, kv_transfer_backend="")
+
+    probe = asyncio.ensure_future(
+        servicer.Health(lifecycle_pb2.HealthRequest(include_inference_probe=True), _FakeContext())
+    )
+    await started.wait()
+    assert inference.active_request_count() == 1
+
+    release.set()
+    await probe
+    assert inference.active_request_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_health_probes_share_one_engine_request():
+    """A readiness loop must not stack one engine request per poll."""
+    import asyncio
+
+    release = asyncio.Event()
+    handle = _FakeHandle()
+    calls = 0
+
+    async def _blocking() -> None:
+        await release.wait()
+
+    handle.aresult = _blocking
+    llm = _llm()
+
+    def _generate(*a, **k):
+        nonlocal calls
+        calls += 1
+        return handle
+
+    llm.generate_async = _generate
+
+    servicer = OpenEngineControlServicer(llm, MODEL, _inference(), kv_transfer_backend="")
+    request = lifecycle_pb2.HealthRequest(include_inference_probe=True)
+    probes = [asyncio.ensure_future(servicer.Health(request, _FakeContext())) for _ in range(5)]
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(*probes)
+
+    assert calls == 1

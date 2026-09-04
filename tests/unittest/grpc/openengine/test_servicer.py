@@ -743,12 +743,19 @@ def test_generate_does_not_abort_slow_engine(monkeypatch: pytest.MonkeyPatch) ->
 @pytest.mark.parametrize(
     ("key", "value"),
     [
+        ("openengine-priority", "7"),
         ("openengine-priority", "not-an-integer"),
+        ("openengine-target-dp-rank", "0"),
         ("openengine-target-dp-rank", "-1"),
     ],
 )
-def test_generate_rejects_malformed_numeric_metadata(key: str, value: str) -> None:
-    """Malformed OpenEngine numeric metadata returns INVALID_ARGUMENT."""
+def test_generate_rejects_unsupported_numeric_metadata(key: str, value: str) -> None:
+    """Unsupported OpenEngine metadata returns UNIMPLEMENTED, whatever the value.
+
+    Control advertises both headers as unsupported and Generate never reads the
+    value, so the status must tell the client to stop sending the header rather
+    than to correct it.
+    """
     servicer = OpenEngineInferenceServicer(_FakeLlm([]), model="test-model")
     context = _FakeContext(metadata=((key, value),))
     request = generation_pb2.GenerateRequest(
@@ -764,7 +771,7 @@ def test_generate_rejects_malformed_numeric_metadata(key: str, value: str) -> No
     with pytest.raises(_AbortError):
         asyncio.run(collect_responses())
 
-    assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+    assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
 
 
 def test_generate_context_only_ends_at_prefill_ready() -> None:
