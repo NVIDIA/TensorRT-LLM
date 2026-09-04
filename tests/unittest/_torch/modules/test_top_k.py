@@ -298,14 +298,25 @@ def test_gvr_v2_decode_rejects_output_width_mismatch(monkeypatch) -> None:
     runner.assert_not_called()
 
 
-def test_update_gvr_prior_from_prefill_uses_last_request_rows() -> None:
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
+        ),
+    ],
+)
+def test_update_gvr_prior_from_prefill_uses_last_request_rows(device) -> None:
     top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
-    prefill_indices = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32)
-    prior_indices = torch.zeros(3, 2, dtype=torch.int32)
+    prefill_indices = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32, device=device)
+    prior_indices = torch.zeros(3, 2, dtype=torch.int32, device=device)
 
+    # Production passes the device seq_lens twin so the row gather stays async.
     top_k.update_gvr_prior_from_prefill(
         prefill_indices,
-        torch.tensor([2, 1], dtype=torch.int32),
+        torch.tensor([2, 1], dtype=torch.int32, device=device),
         prior_indices,
         request_offset=1,
     )

@@ -28,6 +28,7 @@ from torch import nn
 from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
 from ..mamba.causal_conv1d import causal_conv1d_fn
+from ..mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
 from ..mamba.recurrent_state_cache import reset_recurrent_state_rows
 from ..multi_stream_utils import maybe_execute_in_parallel
@@ -384,6 +385,44 @@ class KimiKDALinearAttention(nn.Module):
             return
         layer_cache.commit_conv_window(slot_indices, conv_pool)
 
+    def _project_packed_conv_input(
+        self, x: torch.Tensor, x2d: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Project the block input into the ``[3D, T]`` the convolution needs.
+
+        Returns ``(packed_conv, onorm_g)``; ``onorm_g`` is None for
+        configurations without a full-rank gate.
+        """
+        d = self.proj_size
+        if self._qkvg_proj_weight is not None:
+            # Transposing the GEMM skips the repack the paths below still need.
+            weight = self._qkvg_proj_weight
+            packed_conv = torch.mm(weight[: 3 * d], x2d.t())
+            onorm_g = torch.nn.functional.linear(x, weight[3 * d : 4 * d])
+            return packed_conv, onorm_g
+
+        onorm_g = None
+        fused_qkvg = self.qkvg_proj
+        if fused_qkvg is not None:
+            qkvg = fused_qkvg(x)
+            qkvg_split_sizes = self.qkvg_split_sizes
+            if (
+                self.use_full_rank_gate
+                and qkvg_split_sizes is not None
+                and len(qkvg_split_sizes) == 4
+            ):
+                onorm_g = qkvg[..., 3 * d : 4 * d]
+        else:
+            qkvg = torch.cat((self.q_proj(x), self.k_proj(x), self.v_proj(x)), dim=-1)
+
+        # These have no transposed-output form, so they repack -- through the
+        # fused kernel GDN and Mamba2 use here, not a strided copy.
+        qkvg_2d = qkvg.squeeze(0)
+        return (
+            extract_transpose_prefill_slice(qkvg_2d, qkvg_2d.shape[0], 0, 3 * d),
+            onorm_g,
+        )
+
     def forward_prefill(
         self,
         x2d,
@@ -400,27 +439,9 @@ class KimiKDALinearAttention(nn.Module):
         single_sequence_length = getattr(mamba_metadata, "kda_single_sequence_length", None)
         from einops import rearrange
 
-        d = self.proj_size
         x = x2d.unsqueeze(0)  # [1, T, hidden]
 
-        onorm_g = None
-        fused_qkvg = self.qkvg_proj
-        if self._qkvg_proj_weight is not None:
-            qkvg = torch.nn.functional.linear(x, self._qkvg_proj_weight)
-            qkv = qkvg[..., : 3 * d]
-            onorm_g = qkvg[..., 3 * d : 4 * d]
-        elif fused_qkvg is not None:
-            qkvg = fused_qkvg(x)
-            qkv = qkvg[..., : 3 * d]
-            qkvg_split_sizes = self.qkvg_split_sizes
-            if (
-                self.use_full_rank_gate
-                and qkvg_split_sizes is not None
-                and len(qkvg_split_sizes) == 4
-            ):
-                onorm_g = qkvg[..., 3 * d : 4 * d]
-        else:
-            qkv = torch.cat((self.q_proj(x), self.k_proj(x), self.v_proj(x)), dim=-1)
+        packed_conv, onorm_g = self._project_packed_conv_input(x, x2d)
 
         # Initial states: present for continuation chunks (chunked prefill)
         # and for prefix-cache hits (block reuse), where the previous
@@ -447,7 +468,6 @@ class KimiKDALinearAttention(nn.Module):
         # Reuse GDN's packed variable-length causal convolution. It reads
         # and writes the live [slots, 3D, W - 1] pool directly and honors
         # has_initial_state for fresh versus continuation requests.
-        packed_conv = qkv.squeeze(0).transpose(0, 1).contiguous()
         assert self._packed_conv_weight is not None
         causal_conv1d_fn(
             packed_conv,
