@@ -652,6 +652,7 @@ common-files: &common_files |
         tests/unittest/bindings/test_bindings_ut.py |
         tests/unittest/bindings/test_executor_bindings.py |
         tests/unittest/bindings/test_hostfunc.py |
+        tests/unittest/check_pip_install.py |
         tests/unittest/conftest.py |
         tests/unittest/disaggregated/test_cluster_storage.py |
         tests/unittest/disaggregated/test_disagg_cluster_manager_worker.py |
@@ -735,7 +736,6 @@ common-files: &common_files |
         tests/unittest/scaffolding/test_scaffolding.py |
         tests/unittest/scaffolding/test_task_collection.py |
         tests/unittest/scaffolding/test_worker.py |
-        tests/unittest/test_pip_install.py |
         tests/unittest/tools/__init__.py |
         tests/unittest/tools/test_prepare_dataset.py |
         tests/unittest/tools/test_test_to_stage_mapping.py |
@@ -1415,6 +1415,7 @@ legacy-files: &legacy_files |
         tests/unittest/bindings/test_bindings_ut.py |
         tests/unittest/bindings/test_executor_bindings.py |
         tests/unittest/bindings/test_hostfunc.py |
+        tests/unittest/check_pip_install.py |
         tests/unittest/conftest.py |
         tests/unittest/disaggregated/test_cluster_storage.py |
         tests/unittest/disaggregated/test_disagg_cluster_manager_worker.py |
@@ -1498,7 +1499,6 @@ legacy-files: &legacy_files |
         tests/unittest/scaffolding/test_scaffolding.py |
         tests/unittest/scaffolding/test_task_collection.py |
         tests/unittest/scaffolding/test_worker.py |
-        tests/unittest/test_pip_install.py |
         tests/unittest/tools/__init__.py |
         tests/unittest/tools/test_prepare_dataset.py |
         tests/unittest/tools/test_test_to_stage_mapping.py |
