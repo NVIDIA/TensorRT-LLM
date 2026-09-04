@@ -490,6 +490,71 @@ def test_fmha_cache_separates_cuda_graph_mode(graph_first: bool) -> None:
     assert events.count(("support", "fallback", None)) == 1
 
 
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_fmha_cache_separates_qkv_input_modes(reverse_order: bool) -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    fused_fmha = FakeFmha(
+        attn,
+        "fused",
+        events,
+        support_predicate=lambda forward_args: forward_args.is_fused_qkv,
+    )
+    unfused_fmha = FakeFmha(
+        attn,
+        "unfused",
+        events,
+        support_predicate=lambda forward_args: (
+            not forward_args.is_fused_qkv and forward_args.update_kv_cache
+        ),
+    )
+    q_only_fmha = FakeFmha(
+        attn,
+        "q-only",
+        events,
+        support_predicate=lambda forward_args: (
+            not forward_args.is_fused_qkv and not forward_args.update_kv_cache
+        ),
+    )
+    manager.fmha_libs = [fused_fmha, unfused_fmha, q_only_fmha]
+    metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
+    request_order = [(True, True), (False, True), (False, False)]
+    if reverse_order:
+        request_order.reverse()
+
+    def select(is_fused_qkv: bool, update_kv_cache: bool) -> FakeFmha | None:
+        q = torch.empty((1, 8 if is_fused_qkv else 4))
+        k = torch.empty((1, 2)) if update_kv_cache and not is_fused_qkv else None
+        v = torch.empty((1, 2)) if update_kv_cache and not is_fused_qkv else None
+        return manager.select(
+            attn,
+            q,
+            k,
+            v,
+            metadata,
+            AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                is_fused_qkv=is_fused_qkv,
+                update_kv_cache=update_kv_cache,
+            ),
+        )
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        selected_by_input_mode = {input_mode: select(*input_mode) for input_mode in request_order}
+        for input_mode in request_order:
+            assert select(*input_mode) is selected_by_input_mode[input_mode]
+
+    assert selected_by_input_mode == {
+        (True, True): fused_fmha,
+        (False, True): unfused_fmha,
+        (False, False): q_only_fmha,
+    }
+    assert len(manager._cache) == 3
+    assert events.count(("support", "fused", None)) == 3
+    assert events.count(("support", "unfused", None)) == 2
+    assert events.count(("support", "q-only", None)) == 1
+
+
 @pytest.mark.parametrize("generation_first", [False, True])
 def test_fmha_cache_separates_compacted_mla_phases(generation_first: bool) -> None:
     events: list[tuple] = []
