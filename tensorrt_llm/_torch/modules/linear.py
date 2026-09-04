@@ -33,6 +33,10 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..cute_dsl_kernels.blackwell.w4a16_nvfp4_m1 import \
+    DenseGemmW4A16CuteM1Kernel as _W4A16_NVFP4_CUTE_M1_KERNEL_CLS
+from ..cute_dsl_kernels.blackwell.w4a16_nvfp4_m1 import \
+    w4a16_nvfp4_cute_m1_gemv as _w4a16_nvfp4_cute_m1_gemv
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
@@ -2178,7 +2182,33 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
 
 
 class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
-    """W4A16 NVFP4 linear backed by Marlin."""
+    """W4A16 NVFP4 linear with CuTe for selected M=1 shapes."""
+
+    # These are the only shapes where CuTe beat Marlin in the SM121/GB10
+    # CUDA-event sweep. Keep unmeasured architectures and shapes on Marlin.
+    _CUTE_M1_PREFERRED_SHAPES: ClassVar[Dict[int,
+                                             frozenset[tuple[int, int]]]] = {
+                                                 121: frozenset(
+                                                     ((4096, 2688), (2688,
+                                                                     131072))),
+                                             }
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        super().create_weights(module, in_features, out_features, bias, dtype)
+        # The Marlin transform replaces ``weight`` and ``weight_scale`` with
+        # its repacked layouts. Register placeholders up front so GMS readers
+        # know about the original-layout tensors materialized by the writer.
+        module.register_buffer("_w4a16_cute_weight",
+                               torch.empty(0,
+                                           dtype=torch.uint8,
+                                           device=module.weight.device),
+                               persistent=False)
+        module.register_buffer("_w4a16_cute_weight_scale",
+                               torch.empty(0,
+                                           dtype=torch.uint8,
+                                           device=module.weight_scale.device),
+                               persistent=False)
 
     # ``apply`` always allocates a plain output buffer (the Marlin GEMM has no
     # NCCL-window output path) and ``apply_linear_allreduce`` is unsupported, so
@@ -2228,9 +2258,14 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
 
         size_k_pad = fp4_utils.pad_up(size_k, 64)
         size_n_pad = fp4_utils.pad_up(size_n, 128)
+        # Preserve the checkpoint weight layout for the CUDA-core M=1 kernel
+        # before replacing the public parameters with Marlin-packed tensors.
+        module._w4a16_cute_weight = weight
         num_groups = size_k // group_size
         scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
             weight_scale.view(size_n_pad, -1))
+        # Materialize the row-major scale layout once during weight transform.
+        module._w4a16_cute_weight_scale = scale_unswizzled.contiguous()
         scale_2d = scale_unswizzled[:size_n, :num_groups]
 
         if size_k_pad != size_k or size_n_pad != size_n:
@@ -2283,9 +2318,37 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
         module._marlin_size_k = fp4_utils.pad_up(module.in_features, 64)
         module._marlin_size_n = fp4_utils.pad_up(module.out_features, 128)
 
+    def _can_use_cute_m1(self, module: Linear, input: torch.Tensor) -> bool:
+        sm_version = get_sm_version()
+        if (input.dim() != 2 or input.shape[0] != 1
+                or sm_version not in self._CUTE_M1_PREFERRED_SHAPES
+                or input.dtype != torch.bfloat16
+                or module.dtype != torch.bfloat16):
+            return False
+        shape = (int(input.shape[1]), int(module.out_features))
+        if shape not in self._CUTE_M1_PREFERRED_SHAPES[sm_version]:
+            return False
+        weight = getattr(module, "_w4a16_cute_weight", None)
+        weight_scale = getattr(module, "_w4a16_cute_weight_scale", None)
+        if (weight is None or weight_scale is None or weight.numel() == 0
+                or weight_scale.numel() == 0):
+            return False
+        return _W4A16_NVFP4_CUTE_M1_KERNEL_CLS.is_supported(
+            1, input.shape[1], module.out_features)
+
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         input, original_shape = self._prepare_input(module, input)
+        if self._can_use_cute_m1(module, input):
+            output = _w4a16_nvfp4_cute_m1_gemv(
+                input.contiguous(),
+                module._w4a16_cute_weight,
+                module._w4a16_cute_weight_scale,
+                module.weight_scale_2,
+                out=None,
+            )
+            return self._restore_output(output, original_shape, bias)
+
         size_k = module.in_features
         size_n = module.out_features
         size_k_pad = getattr(module, "_marlin_size_k", size_k)

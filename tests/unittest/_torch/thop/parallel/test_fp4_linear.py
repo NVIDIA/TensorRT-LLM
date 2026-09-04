@@ -765,6 +765,72 @@ def test_fp4_linear_cuda_core(dtype, mnk):
     )
 
 
+@pytest.mark.skipif(sys.version_info < (3, 12),
+                    reason="cutlass-dsl 4.1.0 requires Python 3.12+")
+@pytest.mark.skipif(
+    get_sm_version() != 121,
+    reason="CuTe W4A16 M=1 production dispatch is enabled only on SM121",
+)
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE,
+                    reason="cutlass-dsl is not available")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "mnk",
+    [
+        (1, 2688, 4096),
+        (1, 131072, 2688),
+    ],
+)
+def test_w4a16_nvfp4_linear_cute_m1(dtype, mnk):
+    """Run the production CuTe M=1 path and compare with dequantized matmul."""
+    seq_len, output_size, hidden_size = mnk
+    torch.manual_seed(0)
+
+    w_float = torch.randn((output_size, hidden_size), dtype=torch.float32)
+    w_fp4, w_sf_swizzled, w_dequant = (
+        torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
+            w_float,
+            scaling_vector_size,
+            1,
+            True,
+        ))
+    w_sf_2d = torch.ops.trtllm.block_scale_interleave_reverse(
+        w_sf_swizzled.view(pad_up(output_size, 128),
+                           -1)).view(torch.float8_e4m3fn)
+
+    with model_extra_attrs({'nvfp4_gemm_allowed_backends': ['marlin']}):
+        linear = Linear(
+            in_features=hidden_size,
+            out_features=output_size,
+            bias=False,
+            dtype=dtype,
+            quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4),
+            nvfp4_allowed_backends=['marlin'],
+        )
+        linear.load_weights([{
+            'weight':
+            w_fp4,
+            'weight_scale':
+            w_sf_2d,
+            'weight_scale_2':
+            torch.tensor(1.0, dtype=torch.float32),
+        }])
+        linear = linear.cuda()
+        linear.post_load_weights()
+
+        x = torch.randn((seq_len, hidden_size), dtype=dtype).cuda()
+        assert linear.quant_method._can_use_cute_m1(linear, x)
+        with torch.inference_mode():
+            output = linear(x)
+
+    w_dequant_bf16 = w_dequant.to(dtype).cuda()
+    with torch.inference_mode():
+        ref_output = torch.mm(x, w_dequant_bf16.T)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, ref_output, atol=0.5, rtol=2e-2)
+
+
 @pytest.mark.skipif(
     not (89 <= get_sm_version() < 100 or get_sm_version() in (120, 121)),
     reason="Dense Marlin NVFP4 runs on SM89-99 and SM120/121",

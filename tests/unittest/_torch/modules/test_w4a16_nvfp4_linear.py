@@ -389,6 +389,103 @@ def test_w4a16_nvfp4_linear_uses_marlin_op_after_weight_transform():
     assert output.shape == (1, 3)
 
 
+def test_w4a16_nvfp4_linear_uses_marlin_for_m_greater_than_one():
+    method = MarlinNVFP4LinearMethod()
+    input_tensor = torch.ones((2, 32), dtype=torch.bfloat16)
+    module = SimpleNamespace(
+        weight=torch.empty((8, 16), dtype=torch.int32),
+        weight_scale=torch.empty((2, 128), dtype=torch.float8_e4m3fn),
+        weight_scale_2=torch.tensor([0.25], dtype=torch.float32),
+        weight_global_scale=torch.tensor([0.5], dtype=torch.bfloat16),
+        _w4a16_cute_weight=torch.empty((3, 16), dtype=torch.uint8),
+        _w4a16_cute_weight_scale=torch.empty((128, 4), dtype=torch.uint8),
+        dtype=torch.bfloat16,
+        in_features=32,
+        out_features=3,
+        pre_quant_scale=None,
+        _marlin_size_k=32,
+        _marlin_size_n=32,
+    )
+    captured = {}
+
+    def fake_marlin(input_arg, weight, **kwargs):
+        captured["input"] = input_arg
+        captured["weight"] = weight
+        captured.update(kwargs)
+        return torch.ones((input_arg.shape[0], kwargs["size_n"]), dtype=kwargs["out_dtype"])
+
+    with (
+        patch(
+            "tensorrt_llm._torch.modules.linear._w4a16_nvfp4_cute_m1_gemv",
+            side_effect=AssertionError("M>1 must not dispatch to CuTe M=1"),
+        ),
+        patch("torch.ops.trtllm.marlin_nvfp4_gemm", side_effect=fake_marlin, create=True),
+    ):
+        output = method.apply(module, input_tensor, bias=None)
+
+    assert captured["input"] is input_tensor
+    assert captured["weight"] is module.weight
+    assert captured["size_k"] == 32
+    assert captured["size_n"] == 32
+    assert output.shape == (2, 3)
+
+
+def test_w4a16_nvfp4_linear_uses_cute_m1_with_original_weight_layout():
+    method = MarlinNVFP4LinearMethod()
+    input_tensor = torch.ones((1, 4096), dtype=torch.bfloat16)
+    cute_weight = torch.empty((64, 32), dtype=torch.uint8)
+    cute_weight_scale = torch.empty((128, 4), dtype=torch.uint8)
+    weight_scale_2 = torch.tensor([0.5], dtype=torch.float32)
+    module = SimpleNamespace(
+        weight=torch.empty((16, 128), dtype=torch.int32),
+        weight_scale=torch.empty((4, 128), dtype=torch.float8_e4m3fn),
+        weight_scale_2=weight_scale_2,
+        weight_global_scale=torch.tensor([0.5], dtype=torch.bfloat16),
+        _w4a16_cute_weight=cute_weight,
+        _w4a16_cute_weight_scale=cute_weight_scale,
+        dtype=torch.bfloat16,
+        in_features=4096,
+        out_features=2688,
+        pre_quant_scale=None,
+        _marlin_size_k=4096,
+        _marlin_size_n=2688,
+    )
+    captured = {}
+
+    def fake_cute_m1(input_arg, weight, weight_scale, global_scale, *, out):
+        captured["input"] = input_arg
+        captured["weight"] = weight
+        captured["weight_scale"] = weight_scale
+        captured["global_scale"] = global_scale
+        captured["out"] = out
+        return torch.ones((1, 2688), dtype=torch.bfloat16)
+
+    with (
+        patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=121),
+        patch(
+            "tensorrt_llm._torch.modules.linear._W4A16_NVFP4_CUTE_M1_KERNEL_CLS.is_supported",
+            return_value=True,
+        ),
+        patch(
+            "tensorrt_llm._torch.modules.linear._w4a16_nvfp4_cute_m1_gemv",
+            side_effect=fake_cute_m1,
+        ),
+        patch(
+            "torch.ops.trtllm.marlin_nvfp4_gemm",
+            side_effect=AssertionError("M=1 must not dispatch to Marlin"),
+            create=True,
+        ),
+    ):
+        output = method.apply(module, input_tensor, bias=None)
+
+    assert captured["input"] is input_tensor
+    assert captured["weight"] is cute_weight
+    assert captured["weight_scale"] is cute_weight_scale
+    assert captured["global_scale"] is weight_scale_2
+    assert captured["out"] is None
+    torch.testing.assert_close(output, torch.ones_like(output))
+
+
 def test_w4a16_nvfp4_linear_marlin_restores_high_rank_input_shape():
     method = MarlinNVFP4LinearMethod()
     input_tensor = torch.ones((2, 9, 32), dtype=torch.bfloat16)
