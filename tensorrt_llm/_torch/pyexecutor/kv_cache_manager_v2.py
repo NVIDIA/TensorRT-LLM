@@ -2842,18 +2842,15 @@ class KVCacheManagerV2(BaseResourceManager):
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         return kv_cache.resize(max(kv_cache.capacity, target))
 
-    def prepare_disagg_gen_init(self, req: LlmRequest, reuse_limit: int | None = None) -> bool:
+    def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
 
         Allocates capacity for the full prompt (+ draft) and sets
         ``kv_cache.history_length`` to ``prompt_len``. Returns True on
         success, False if preparation or resize failed (cache is suspended
         on resize failure).
-
-        ``reuse_limit`` caps the claimed depth as in ``prepare_context_cache``, so
-        the scheduler can hold this path to the depth the draft pool can honour.
         """
-        reused = self.prepare_context_cache(req, reuse_limit)
+        reused = self.prepare_context_cache(req)
         if reused is None:
             return False
         if self.enable_block_reuse:
