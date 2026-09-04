@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
-from typing import List, Optional, Protocol, Sequence, Union, cast
+from typing import List, Optional, Protocol, Sequence, Union
 
 import torch
 import transformers
@@ -11,25 +11,12 @@ from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.logger import logger
 
-_GEMMA4_TEXT_MODEL_TYPES = {"gemma4_text", "gemma4_unified_text"}
-
 
 class _NamedLayerType(Protocol):
     name: str
 
 
 _LayerType = Union[str, _NamedLayerType]
-
-
-class _Gemma4LayerGeometry(Protocol):
-    head_dim: int
-    num_key_value_heads: int
-
-
-class _Gemma4GeometryConfig(Protocol):
-    head_dim: int
-    num_key_value_heads: int
-    layer_types: Sequence[_LayerType]
 
 
 def resolve_cache_transceiver_config(
@@ -97,46 +84,6 @@ def _is_sliding_attention_layer(layer_type: _LayerType) -> bool:
     return "sliding" in layer_type_name
 
 
-def _get_gemma4_per_layer_config(
-    config: _Gemma4GeometryConfig,
-    layer_idx: int,
-) -> Optional[_Gemma4LayerGeometry]:
-    """Return a concrete Gemma4 layer config when Transformers provides one."""
-    per_layer_config = getattr(config, "per_layer_config", None)
-    if per_layer_config is None:
-        return None
-    return cast(Sequence[_Gemma4LayerGeometry], per_layer_config)[layer_idx]
-
-
-def get_gemma4_layer_head_dim(config: _Gemma4GeometryConfig,
-                              layer_idx: int) -> int:
-    """Return Gemma4's head dimension for one layer across HF config schemas."""
-    layer_config = _get_gemma4_per_layer_config(config, layer_idx)
-    if layer_config is not None:
-        return layer_config.head_dim
-
-    head_dim = config.head_dim
-    if _is_sliding_attention_layer(config.layer_types[layer_idx]):
-        return head_dim
-    global_head_dim = getattr(config, "global_head_dim", None)
-    return global_head_dim if global_head_dim is not None else head_dim
-
-
-def get_gemma4_layer_num_kv_heads(config: _Gemma4GeometryConfig,
-                                  layer_idx: int) -> int:
-    """Return Gemma4's KV-head count for one layer across HF config schemas."""
-    layer_config = _get_gemma4_per_layer_config(config, layer_idx)
-    if layer_config is not None:
-        return layer_config.num_key_value_heads
-
-    num_kv_heads = config.num_key_value_heads
-    is_sliding = _is_sliding_attention_layer(config.layer_types[layer_idx])
-    if not is_sliding and getattr(config, "attention_k_eq_v", False):
-        return getattr(config, "num_global_key_value_heads",
-                       None) or num_kv_heads
-    return num_kv_heads
-
-
 def get_layer_attention_window(
     config: object,
     layer_idx: int,
@@ -181,23 +128,6 @@ def get_layer_attention_window(
         raise ValueError(
             "Sliding attention requires a positive integer sliding_window.")
     return sliding_window
-
-
-def is_gemma4_hybrid(config: transformers.PretrainedConfig) -> bool:
-    """True when Gemma4 requires per-layer attention geometry."""
-    model_type = str(getattr(config, "model_type", "")).lower()
-    if model_type not in _GEMMA4_TEXT_MODEL_TYPES:
-        return False
-
-    per_layer_attributes = getattr(config, "per_layer_attributes", None)
-    if per_layer_attributes is not None:
-        return not {"head_dim", "num_key_value_heads"
-                    }.isdisjoint(per_layer_attributes)
-
-    global_head_dim = getattr(config, 'global_head_dim', None)
-    head_dim = getattr(config, 'head_dim', None)
-    return (global_head_dim is not None and isinstance(head_dim, int)
-            and global_head_dim != head_dim)
 
 
 def is_hybrid_linear(config):
