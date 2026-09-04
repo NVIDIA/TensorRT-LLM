@@ -10,7 +10,7 @@ Currently TRT-LLM supports `disaggregated-service`, where the context and genera
 
 For more information on disaggregated service in LLM inference, one can refer to papers such as [DistServe](https://arxiv.org/abs/2401.09670), [SplitWise](https://arxiv.org/abs/2311.18677).
 
-An [architectural and performance overview](../../../docs/source/blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.md), as well as [usage examples](../../../examples/disaggregated/README.md), are provided.
+An [architectural and performance overview](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.md), as well as [usage examples](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/disaggregated/README.md), are provided.
 
 ## Environment Variables
 
