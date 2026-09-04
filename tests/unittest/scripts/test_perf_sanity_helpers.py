@@ -257,6 +257,34 @@ def test_checkpoint_io_fallback_reason_is_bounded(tmp_path: Path) -> None:
     assert status["fallback_category"] == "other"
 
 
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("", "none"),
+        ("none", "none"),
+        ("requires open_weight_session()", "sessionless"),
+        ("unsupported backend", "backend"),
+        ("explicit checkpoint loader", "custom_loader"),
+        ("registered HF weight loader", "custom_loader"),
+        ("unsupported checkpoint_format", "checkpoint_format"),
+        ("unsupported load_format", "load_format"),
+        ("partial model loading was requested", "partial_model_loading"),
+        ("lazy safetensors model", "model_specific_loader"),
+        ("raw HF weight cache is enabled", "weight_cache"),
+        ("no safetensors checkpoint files", "checkpoint_files"),
+        ("backing files are unavailable", "checkpoint_discovery"),
+        ("checkpoint discovery mismatch", "checkpoint_discovery"),
+        ("insufficient host memory", "host_memory"),
+        ("communicator setup failed", "communication"),
+        ("reader setup failed", "reader_setup"),
+        ("model materialization failed", "materialization"),
+        ("unrecognized failure", "other"),
+    ],
+)
+def test_checkpoint_io_fallback_category_is_bounded(reason: str, expected: str) -> None:
+    assert perf_sanity.checkpoint_io_fallback_category(reason) == expected
+
+
 def test_make_startup_observation_combines_checkpoint_phases(
     tmp_path: Path,
 ) -> None:
@@ -501,6 +529,41 @@ def test_startup_observation_bundle_and_primary_row_are_deduplicatable(
     assert second_row["b_startup_observation_primary_row"] is False
     assert first_row["s_checkpoint_io_experiment_assigned_arm"] == "auto"
     assert first_row["l_checkpoint_io_experiment_bucket"] == 1
+
+
+@pytest.mark.parametrize("contents", ["", "{"])
+def test_read_startup_observations_handles_invalid_artifact(tmp_path: Path, contents: str) -> None:
+    (tmp_path / "startup_metrics.0.json").write_text(contents, encoding="utf-8")
+
+    bundle = perf_sanity.read_startup_observations(str(tmp_path), 0)
+
+    assert bundle["startup_observation_id"].startswith("startup-invalid-")
+    assert bundle["observations"] == []
+
+
+def test_startup_fallback_reasons_are_deduplicated_and_capped() -> None:
+    policies = [
+        {
+            "requested": "auto",
+            "selected": "native",
+            "activated": False,
+            "effective": "native",
+            "fallback_category": "other",
+            "fallback_reason": reason,
+        }
+        for reason in ("reason-5", "reason-1", "reason-2", "reason-2", "reason-3", "reason-4")
+    ]
+    new_data = {}
+
+    perf_sanity.add_startup_metric_values(
+        new_data,
+        [{"role": "aggregate", "metrics": {}, "checkpoint_io_policies": policies}],
+        _assignment(),
+    )
+
+    assert new_data["s_checkpoint_io_fallback_reason"] == (
+        "reason-1 | reason-2 | reason-3 | reason-4"
+    )
 
 
 def test_worker_startup_collection_handles_directory_failure(

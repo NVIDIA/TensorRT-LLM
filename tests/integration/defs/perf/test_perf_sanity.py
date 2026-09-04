@@ -915,8 +915,15 @@ def read_startup_observations(test_output_dir: str, server_idx: int) -> dict:
             "startup_observation_id": f"startup-missing-{secrets.token_hex(16)}",
             "observations": [],
         }
-    with open(path, "r", encoding="utf-8") as input_file:
-        payload = json.load(input_file)
+    try:
+        with open(path, "r", encoding="utf-8") as input_file:
+            payload = json.load(input_file)
+    except (OSError, json.JSONDecodeError) as error:
+        print_warning(f"Failed to read startup observations from {path}: {error}")
+        return {
+            "startup_observation_id": f"startup-invalid-{secrets.token_hex(16)}",
+            "observations": [],
+        }
     if not isinstance(payload, dict):
         return {
             "startup_observation_id": f"startup-invalid-{secrets.token_hex(16)}",
