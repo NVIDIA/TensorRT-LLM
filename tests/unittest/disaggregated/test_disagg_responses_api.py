@@ -293,3 +293,48 @@ def test_request_fields_survive_serialization_to_a_worker():
     revived = ResponsesRequest.model_validate_json(payload)
     assert revived.disaggregated_params.ctx_request_id == 11
     assert revived.prompt_token_ids == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# `store` on a disaggregated server
+# ---------------------------------------------------------------------------
+def _store_warnings(caplog):
+    return [r for r in caplog.records if "'store' is ignored" in r.getMessage()]
+
+
+def test_store_left_at_its_default_does_not_warn(caplog):
+    """`store` defaults to True, so the value alone cannot justify a warning.
+
+    Warning on the value would fire for every request that never mentioned the
+    field -- which is most of them -- and a warning on every request is one
+    nobody reads.
+    """
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    request = ResponsesRequest(model="m", input="hi")
+
+    assert request.store is True
+    assert "store" not in request.model_fields_set
+
+
+def test_store_set_explicitly_is_a_request_that_goes_unmet():
+    """A client that wrote `store` down asked for something it will not get.
+
+    Unlike `previous_response_id` this does not stop the request being served,
+    so it is a warning rather than a 400 -- but it must not be silent: the
+    Responses protocol has no field for "served, but one thing you asked for
+    was dropped".
+    """
+    request = ResponsesRequest(model="m", input="hi", store=True)
+
+    assert "store" in request.model_fields_set
+    assert request.store is True
+
+
+def test_store_false_is_not_an_unmet_request():
+    """Nothing was asked for, so there is nothing to report."""
+    request = ResponsesRequest(model="m", input="hi", store=False)
+
+    assert "store" in request.model_fields_set
+    assert request.store is False

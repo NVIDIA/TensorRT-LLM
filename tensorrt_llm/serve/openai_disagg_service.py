@@ -215,6 +215,35 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ),
             )
 
+        # `store` has the same cause as the rejection above and a different
+        # consequence, so it gets a different answer. A stored response is
+        # unreachable here -- whichever worker holds it, this orchestrator
+        # exposes no route to read it back and refuses the
+        # `previous_response_id` that is the only other way in. But unlike
+        # `previous_response_id`, `store` does not stop the request being
+        # served correctly: only a side effect is lost. Refusing an otherwise
+        # valid request over a side effect would break clients that set the
+        # flag by default and never read a response back.
+        #
+        # So warn rather than reject, matching how the aggregated server treats
+        # `background`. What must not happen is silence: the client asked for
+        # persistence and is not getting it, and a log line is the only place
+        # that can currently say so -- the Responses protocol has no field for
+        # "served, but one thing you asked for was dropped".
+        #
+        # Gated on model_fields_set because `store` DEFAULTS TO TRUE. Warning on
+        # the value alone would fire for every request that simply never
+        # mentioned the field, which is most of them, and a warning on every
+        # request is one nobody reads. Only a client that wrote `store` down is
+        # making a request that goes unmet.
+        if "store" in request.model_fields_set and request.store:
+            logger.warning(
+                "'store' is ignored on a disaggregated server: response "
+                "storage is per-worker in-process state and this orchestrator "
+                "exposes no route to read a stored response back. The request "
+                "is served normally; nothing is persisted."
+            )
+
         return await self._send_disagg_request(request, hooks)
 
     async def _send_disagg_request_ctx_first(

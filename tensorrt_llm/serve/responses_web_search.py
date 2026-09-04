@@ -64,8 +64,36 @@ _QUERY_ARG = "query"
 
 
 def is_web_search_tool(tool: Any) -> bool:
+    """Whether this tool entry is a web_search tool, object- or dict-shaped.
+
+    Both shapes reach here. A validated request carries model objects, but
+    tools also travel as plain dicts -- `get_chat_completion_tool_dicts`
+    produces them, and a raw body inspected before validation is dicts all the
+    way down.
+
+    Reading only attributes made this gate reject every dict, so the helpers
+    behind it -- which do handle dicts -- never ran, and
+    `web_search_rejection_reason` returned None for a tool it should have had
+    an opinion about. None then flowed to callers that expected a string.
+    """
     tool_type = getattr(tool, "type", None)
+    if tool_type is None and isinstance(tool, dict):
+        tool_type = tool.get("type")
     return bool(tool_type) and str(tool_type).startswith(_WEB_SEARCH_TYPE_PREFIX)
+
+
+def _tool_field(tool: Any, name: str, default: Any = None) -> Any:
+    """Read a field from a tool that may be an object or a plain dict.
+
+    Reading attributes alone silently yields None for every dict-shaped tool,
+    which does not fail -- it produces a spec describing nothing, and a
+    rejection message that names ``tool type None`` for a tool whose type was
+    right there in the payload.
+    """
+    value = getattr(tool, name, None)
+    if value is None and isinstance(tool, dict):
+        value = tool.get(name)
+    return default if value is None else value
 
 
 def web_search_tool_spec(tools: Optional[Sequence[Any]]) -> Optional[WebSearchToolSpec]:
@@ -73,13 +101,13 @@ def web_search_tool_spec(tools: Optional[Sequence[Any]]) -> Optional[WebSearchTo
     for tool in tools or []:
         if not is_web_search_tool(tool):
             continue
-        filters = getattr(tool, "filters", None)
-        allowed = getattr(filters, "allowed_domains", None) if filters else None
-        blocked = getattr(filters, "blocked_domains", None) if filters else None
+        filters = _tool_field(tool, "filters")
+        allowed = _tool_field(filters, "allowed_domains") if filters else None
+        blocked = _tool_field(filters, "blocked_domains") if filters else None
         return WebSearchToolSpec(
-            name=getattr(tool, "name", None) or WEB_SEARCH_PUBLIC_NAME,
-            type=str(getattr(tool, "type", "")) or None,
-            max_uses=getattr(tool, "max_uses", None),
+            name=_tool_field(tool, "name") or WEB_SEARCH_PUBLIC_NAME,
+            type=str(_tool_field(tool, "type", "")) or None,
+            max_uses=_tool_field(tool, "max_uses"),
             allowed_domains=tuple(allowed or ()),
             blocked_domains=tuple(blocked or ()),
         )
