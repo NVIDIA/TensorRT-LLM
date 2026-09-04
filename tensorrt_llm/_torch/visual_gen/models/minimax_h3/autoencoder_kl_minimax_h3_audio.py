@@ -580,7 +580,9 @@ class AutoencoderKLMiniMaxH3Audio(MiniMaxH3ModelMixin):
         return MiniMaxH3AudioEncoderOutput(latent_dist=posterior)
 
     @identity_forward_hook
-    def decode(self, latents: torch.Tensor, return_dict: bool = True) -> MiniMaxH3DecoderOutput | tuple[torch.Tensor]:
+    def decode(
+        self, latents: torch.Tensor, return_dict: bool = True
+    ) -> MiniMaxH3DecoderOutput | tuple[torch.Tensor]:
         if latents.ndim != 3:
             raise ValueError(
                 f"`latents` must have shape [batch_size, latent_channels, num_frames], got {tuple(latents.shape)}."

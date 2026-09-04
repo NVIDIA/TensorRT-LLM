@@ -837,7 +837,9 @@ class AutoencoderKLMiniMaxH3(MiniMaxH3ModelMixin):
         return MiniMaxH3AutoencoderKLOutput(latent_dist=posterior)
 
     @identity_forward_hook
-    def decode(self, z: torch.Tensor, return_dict: bool = True) -> MiniMaxH3DecoderOutput | tuple[torch.Tensor]:
+    def decode(
+        self, z: torch.Tensor, return_dict: bool = True
+    ) -> MiniMaxH3DecoderOutput | tuple[torch.Tensor]:
         if self.use_slicing and z.shape[0] > 1:
             decoded = torch.cat([self._decode(z_slice) for z_slice in z.split(1)])
         else:
