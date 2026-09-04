@@ -191,21 +191,72 @@ def _run_command_with_captured_output(cmd: list[str],
     last_output_time = [time.monotonic()]
     has_error = [False]
 
-    def _reader():
+    def _reader() -> None:
+        """Drain the child's stdout, tracking liveness and fatal errors.
+
+        Reads raw chunks rather than whole lines: liveness must be judged on
+        *any* output, not on newlines. A workload can be perfectly healthy and
+        still emit no newline for a long time -- a tqdm progress bar redraws
+        with a carriage return, and a run with print_iter_log disabled produces
+        nothing else in between. readline() would block through all of that,
+        leaving last_output_time stale until the stall detector SIGKILLs a live
+        process (https://nvbugs/6620324).
+
+        Updates last_output_time, output_lines and has_error in place; all
+        three are guarded by lock.
+        """
+        # Records split on carriage return as well as newline, so a progress
+        # bar's redraws surface separately instead of accumulating into one
+        # huge line.
+        buf = bytearray()
+        scanned = 0  # bytes of buf already searched for a terminator
+        # Longest fatal pattern minus one: the most a match can straddle two
+        # reads, so that is how far back the unterminated-tail scan must reach.
+        overlap = max(len(p) for p in _FATAL_PATTERNS) - 1
+        tail_checked = 0
         try:
             while True:
-                raw = proc.stdout.readline()
-                if not raw:
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
                     break
-                line = raw.decode('utf-8', errors='replace')
+                now = time.monotonic()
+                buf += chunk
+                # Only inspect bytes appended since the last pass; rescanning
+                # the whole buffer makes an undelimited stream quadratic.
+                cut = max(buf.rfind(b'\n'), buf.rfind(b'\r'), scanned - 1) + 1
+                decoded = []
+                if cut > scanned:
+                    records = re.split(rb'(?<=[\r\n])', bytes(buf[:cut]))
+                    decoded = [
+                        r.decode('utf-8', errors='replace') for r in records
+                        if r
+                    ]
+                    del buf[:cut]
+                    scanned = tail_checked = 0
+                else:
+                    scanned = len(buf)
                 with lock:
-                    output_lines.append(line)
-                    last_output_time[0] = time.monotonic()
+                    last_output_time[0] = now
+                    output_lines.extend(decoded)
                     if not has_error[0]:
-                        for pat in _FATAL_PATTERNS:
-                            if pat in line:
-                                has_error[0] = True
-                                break
+                        if any(pat in line for line in decoded
+                               for pat in _FATAL_PATTERNS):
+                            has_error[0] = True
+                        elif buf:
+                            # A fatal message that never gets a terminator must
+                            # still arm _ERROR_STALL_TIMEOUT instead of waiting
+                            # out the much longer _STALL_TIMEOUT.
+                            start = max(tail_checked - overlap, 0)
+                            window = bytes(buf[start:])
+                            has_error[0] = any(pat.encode() in window
+                                               for pat in _FATAL_PATTERNS)
+                            tail_checked = len(buf)
+            if buf:
+                tail = bytes(buf).decode('utf-8', errors='replace')
+                with lock:
+                    output_lines.append(tail)
+                    if not has_error[0]:
+                        has_error[0] = any(p in tail for p in _FATAL_PATTERNS)
         except (ValueError, OSError):
             pass
 
