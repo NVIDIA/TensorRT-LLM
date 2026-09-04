@@ -39,17 +39,18 @@ import sys
 import time
 import traceback
 from argparse import ArgumentParser as FlexibleArgumentParser
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, get_args
+from typing import Any, Literal, Optional, get_args
 
 import aiohttp
 import numpy as np
 import yaml
-from pydantic import ValidationError
+from pydantic import Field, PrivateAttr, ValidationError, create_model, model_validator
 from tqdm.asyncio import tqdm
 
+from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.serve.visual_gen_metrics import (
     SERVER_TIMING_HEADER,
     VISUAL_GEN_DENOISE_TIMING,
@@ -70,11 +71,9 @@ MODALITY_BY_BACKEND = {
     VIDEO_BACKEND: "video",
 }
 
-WORKLOAD_DOC_KEYS = ("backend", "common_params", "requests")
 # Reference slots the loader resolves itself, so the document can name a local file
 # and the read happens once, before the run. VisualGenParams rejects a bare path.
 REFERENCE_KEYS = ("image_reference", "video_reference")
-# Input-layer keys: accepted in both layers, but not VisualGenParams fields.
 # Input keys a request and common_params both take. A reference takes neither: it
 # is the input to one generation, so it belongs to the request it conditions.
 COMMON_INPUT_KEYS = ("prompt", "prompt_file")
@@ -111,30 +110,79 @@ PATH_DISABLED_HINT = (
 )
 
 
+def _reject_misplaced_reference(cls, data: Any) -> Any:
+    """``extra_forbidden`` would say it is not allowed, not where it belongs."""
+    if isinstance(data, dict):
+        misplaced = sorted(key for key in data if key.endswith("_reference"))
+        if misplaced:
+            raise ValueError(
+                f"{', '.join(misplaced)} belongs to a request, not to every request. "
+                "Move it into the 'requests' entry it conditions."
+            )
+    return data
+
+
+class _ResolvedFields(StrictBaseModel):
+    """What resolution records, which the document does not contain.
+
+    Resolution replaces what the document named with what a request carries --
+    a reference path with its body, a prompt file with its text -- so the
+    locator worth recording is kept here. A result naming the bytes rather than
+    the file would be useless, and megabytes wide.
+    """
+
+    _original_prompt_file: Optional[str] = PrivateAttr(default=None)
+    _original_image_reference: Optional[str] = PrivateAttr(default=None)
+    _original_video_reference: Optional[str] = PrivateAttr(default=None)
+
+
+def _document_model(name: str, extra: dict[str, Any], **kwargs: Any) -> type[StrictBaseModel]:
+    """A document layer, carrying ``VisualGenParams``' fields plus ``extra``.
+
+    Derived rather than declared so the document cannot name a field the API
+    does not have, and a new parameter is expressible without an edit here.
+    Every reference slot is dropped: a request adds back the two the loader
+    resolves, and ``common_params`` gets none, so the schema itself says a
+    reference conditions one generation rather than every one.
+    """
+    fields: dict[str, Any] = {
+        field_name: (spec.annotation, spec)
+        for field_name, spec in VisualGenParams.model_fields.items()
+        if not field_name.endswith("_reference")
+    }
+    fields.update(extra)
+    return create_model(name, __base__=kwargs.pop("base", StrictBaseModel), **kwargs, **fields)
+
+
+_PROMPT_FIELDS: dict[str, Any] = {key: (Optional[str], None) for key in COMMON_INPUT_KEYS}
+VisualGenBenchCommon = _document_model(
+    "VisualGenBenchCommon",
+    _PROMPT_FIELDS,
+    __validators__={
+        "_reject_misplaced_reference": model_validator(mode="before")(
+            classmethod(_reject_misplaced_reference)
+        )
+    },
+)
+# A reference is a local path, or the ``{content, format}`` object
+# ``MediaReferenceItem`` declares; both are resolved after the merge.
+VisualGenBenchRequest = _document_model(
+    "VisualGenBenchRequest",
+    {**_PROMPT_FIELDS, **{slot: (Any, None) for slot in REFERENCE_KEYS}},
+    base=_ResolvedFields,
+)
+
+
+class VisualGenBenchWorkload(StrictBaseModel):
+    """The --workload document, and what the CLI spells out."""
+
+    backend: Literal["openai-images", "openai-image-edits", "openai-videos"]
+    common_params: VisualGenBenchCommon = Field(default_factory=VisualGenBenchCommon)
+    requests: list[VisualGenBenchRequest] = Field(min_length=1)
+
+
 def _warn(message: str) -> None:
     print(f"WARNING: {message}", file=sys.stderr)
-
-
-@dataclass
-class VisualGenSampleRequest:
-    """One dispatchable request with its merge already materialized."""
-
-    prompt: str
-    prompt_file: Optional[str] = None
-    image_reference: Optional[str] = None
-    video_reference: Optional[str] = None
-    # A MediaReferenceItem object, or a list of them; None when there is no reference.
-    image_reference_wire: Any = None
-    video_reference_wire: Any = None
-    params: VisualGenParams = field(default_factory=VisualGenParams)
-
-
-@dataclass
-class VisualGenWorkload:
-    """Everything --workload resolves to."""
-
-    backend: str
-    requests: list[VisualGenSampleRequest]
 
 
 @dataclass
@@ -189,22 +237,6 @@ def _sniff_workload_source(value: str) -> tuple[Any, Path]:
         return yaml.safe_load(f), path.parent
 
 
-def _normalize_requests_doc(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, list):
-        raw = {"requests": raw}
-    if not isinstance(raw, dict):
-        raise ValueError("--workload must be a mapping or a list of requests.")
-    unknown = sorted(set(raw) - set(WORKLOAD_DOC_KEYS))
-    if unknown:
-        raise ValueError(
-            f"Unknown key(s) {unknown} in --workload; allowed: {list(WORKLOAD_DOC_KEYS)}."
-        )
-    requests = raw.get("requests")
-    if not isinstance(requests, list) or not requests:
-        raise ValueError("A workload needs a non-empty 'requests' list.")
-    return raw
-
-
 def _resolve_scalar(name: str, cli_value: Optional[str], doc_value: Optional[str]) -> Optional[str]:
     """CLI supplies what the document omits; a disagreement is an error."""
     if cli_value is not None and doc_value is not None and cli_value != doc_value:
@@ -231,13 +263,15 @@ def _merge_extra_params(base: Optional[dict], override: Any) -> Optional[dict]:
 
 
 def _merge_request(
-    common: dict[str, Any], request_raw: dict[str, Any], index: int
+    common: dict[str, Any], request: VisualGenBenchRequest, index: int
 ) -> dict[str, Any]:
-    """Overlay one raw request onto the common_params layer.
+    """Overlay one request onto the common_params layer.
 
-    ``request_raw`` keeps its nulls: stripping them here would let the common
-    value win over a request that explicitly asked for the pipeline default.
+    ``exclude_unset`` keeps a request's explicit ``null`` while never inventing
+    a default, so a request can send a field back to the pipeline's own value
+    even when common_params names it.
     """
+    request_raw = request.model_dump(exclude_unset=True)
     present = sorted({"width", "height"} & set(request_raw))
     if len(present) == 1:
         raise ValueError(
@@ -291,8 +325,8 @@ def _resolve_reference(slot: str, reference: Any, base_dir: Path, index: int) ->
 
 
 def _resize_requests(
-    requests: list[VisualGenSampleRequest], total: int
-) -> list[VisualGenSampleRequest]:
+    requests: list[VisualGenBenchRequest], total: int
+) -> list[VisualGenBenchRequest]:
     """Cycle or truncate the expanded list to exactly ``total`` requests.
 
     Cycling repeats the list in order, so a mixed-shape workload keeps its
@@ -304,8 +338,7 @@ def _resize_requests(
         return requests[:total]
     out = list(requests)
     while len(out) < total:
-        source = requests[len(out) % len(requests)]
-        out.append(replace(source, params=source.params.model_copy(deep=True)))
+        out.append(requests[len(out) % len(requests)].model_copy(deep=True))
     return out
 
 
@@ -345,40 +378,44 @@ def _resolve_prompt_file(reference: Any, base_dir: Path, index: int) -> tuple[st
     return str(path.resolve()), prompt
 
 
-def _build_sample_request(
-    merged: dict[str, Any], index: int, base_dir: Path
-) -> VisualGenSampleRequest:
+def _resolve_request(merged: dict[str, Any], index: int, base_dir: Path) -> VisualGenBenchRequest:
+    """Turn one merged request into the dispatchable form.
+
+    Files are read here rather than at dispatch, so a missing one fails before
+    a multi-minute run instead of part-way through it.
+    """
     merged = dict(merged)
-    prompt = merged.pop("prompt", None)
     prompt_file = merged.pop("prompt_file", None)
-    references = {slot: merged.pop(slot) for slot in REFERENCE_KEYS if slot in merged}
     if prompt_file is not None:
-        if prompt is not None:
+        if merged.get("prompt") is not None:
             raise ValueError(
                 f"requests[{index}]: set 'prompt' or 'prompt_file', not both — which one "
                 "the run measured would depend on a precedence rule rather than the document."
             )
-        prompt_file, prompt = _resolve_prompt_file(prompt_file, base_dir, index)
-    if not isinstance(prompt, str):
+        prompt_file, merged["prompt"] = _resolve_prompt_file(prompt_file, base_dir, index)
+    if not isinstance(merged.get("prompt"), str):
         raise ValueError(
             f"requests[{index}]: 'prompt' (or 'prompt_file') is required and must be a string."
         )
+
+    located: dict[str, str] = {}
+    for slot in REFERENCE_KEYS:
+        if merged.get(slot) is not None:
+            located[slot], merged[slot] = _resolve_reference(slot, merged[slot], base_dir, index)
+
     try:
-        params = VisualGenParams(**merged)
+        request = VisualGenBenchRequest(**merged)
     except ValidationError as e:
-        raise ValueError(f"requests[{index}]: invalid generation parameters:\n{e}") from e
-    if (params.width is None) != (params.height is None):
+        raise ValueError(f"requests[{index}]: invalid request:\n{e}") from e
+    if (request.width is None) != (request.height is None):
         raise ValueError(
-            f"requests[{index}]: resolved width={params.width!r} height={params.height!r}; the "
+            f"requests[{index}]: resolved width={request.width!r} height={request.height!r}; the "
             "server rejects exactly one of them (HTTP 422). Set both, or neither."
         )
-    resolved: dict[str, Any] = {}
-    for slot, reference in references.items():
-        if reference is None:
-            continue
-        label, wire = _resolve_reference(slot, reference, base_dir, index)
-        resolved[slot], resolved[f"{slot}_wire"] = label, wire
-    return VisualGenSampleRequest(prompt=prompt, prompt_file=prompt_file, params=params, **resolved)
+    request._original_prompt_file = prompt_file
+    for slot, locator in located.items():
+        setattr(request, f"_original_{slot}", locator)
+    return request
 
 
 def _document_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -410,7 +447,7 @@ def _cli_json(flag: str, value: str) -> Any:
         raise ValueError(f"{flag} is not JSON: {e}") from e
 
 
-def load_workload(args: argparse.Namespace) -> VisualGenWorkload:
+def load_workload(args: argparse.Namespace) -> VisualGenBenchWorkload:
     """Resolve the workload from --workload, or from the request named on the CLI.
 
     Merging here rather than at dispatch is what makes a bad parameter fail
@@ -429,47 +466,37 @@ def load_workload(args: argparse.Namespace) -> VisualGenWorkload:
         raise ValueError("Pass --workload <document>, or spell one on the CLI.")
 
     if args.workload:
-        doc, base_dir = _sniff_workload_source(args.workload)
+        raw, base_dir = _sniff_workload_source(args.workload)
     else:
-        doc, base_dir = _document_from_args(args), Path.cwd()
-    doc = _normalize_requests_doc(doc)
+        raw, base_dir = _document_from_args(args), Path.cwd()
+    if isinstance(raw, list):
+        raw = {"requests": raw}
+    if not isinstance(raw, dict):
+        raise ValueError("A workload is a mapping, or the bare list of requests.")
 
-    backend = _resolve_scalar("backend", args.backend, doc.get("backend"))
+    backend = _resolve_scalar("backend", args.backend, raw.get("backend"))
     if backend is None:
         raise ValueError(
             "backend is required: set 'backend' in --workload, or pass --backend. There is "
             "no default, because it selects the route and so what the run measures: a "
             "checkpoint serving both modes answers the wrong one without complaining."
         )
-    if backend not in BACKEND_ENDPOINTS:
-        raise ValueError(f"backend must be one of {sorted(BACKEND_ENDPOINTS)}; got {backend!r}.")
-
-    common_raw = dict(doc.get("common_params") or {})
-    misplaced = sorted(set(REFERENCE_KEYS) & set(common_raw))
-    if misplaced:
-        raise ValueError(
-            f"common_params: {', '.join(misplaced)} belongs to a request, not to every "
-            "request. Move it into the 'requests' entry it conditions."
-        )
-    common_input = {key: common_raw.pop(key) for key in COMMON_INPUT_KEYS if key in common_raw}
     try:
-        common_params = VisualGenParams(**common_raw)
+        document = VisualGenBenchWorkload(**{**raw, "backend": backend})
     except ValidationError as e:
-        raise ValueError(f"common_params: invalid generation parameters:\n{e}") from e
-    common = {**common_input, **common_params.model_dump(exclude_unset=True)}
+        raise ValueError(f"invalid workload:\n{e}") from e
 
-    requests: list[VisualGenSampleRequest] = []
-    for index, raw in enumerate(doc["requests"]):
-        if not isinstance(raw, dict):
-            raise ValueError(f"requests[{index}] must be a mapping, got {type(raw).__name__}.")
-        requests.append(_build_sample_request(_merge_request(common, raw, index), index, base_dir))
+    common = document.common_params.model_dump(exclude_unset=True)
+    requests = [
+        _resolve_request(_merge_request(common, request, index), index, base_dir)
+        for index, request in enumerate(document.requests)
+    ]
 
     if args.num_requests is not None:
         requests = _resize_requests(requests, args.num_requests)
 
-    workload = VisualGenWorkload(
-        backend=backend,
-        requests=requests,
+    workload = document.model_copy(
+        update={"common_params": VisualGenBenchCommon(), "requests": requests}
     )
     _validate_workload(workload)
     return workload
@@ -480,7 +507,7 @@ def load_workload(args: argparse.Namespace) -> VisualGenWorkload:
 # --------------------------------------------------------------------------- #
 
 
-def _validate_reference_backend(workload: VisualGenWorkload) -> None:
+def _validate_reference_backend(workload: VisualGenBenchWorkload) -> None:
     """Reject the two reference/backend pairings that are a guaranteed 422.
 
     ``ImageGenerationRequest`` declares neither ``image`` nor
@@ -504,7 +531,7 @@ def _validate_reference_backend(workload: VisualGenWorkload) -> None:
                     f"requests[{index}]: backend 'openai-image-edits' requires image_reference "
                     "(/v1/images/edits has a required 'image' field)."
                 )
-            wire = request.image_reference_wire
+            wire = request.image_reference
             if not (isinstance(wire, dict) and wire.get("format") == "base64"):
                 raise ValueError(
                     f"requests[{index}]: 'openai-image-edits' takes a single base64 image, so "
@@ -513,7 +540,7 @@ def _validate_reference_backend(workload: VisualGenWorkload) -> None:
                 )
 
 
-def _validate_output_type(workload: VisualGenWorkload) -> None:
+def _validate_output_type(workload: VisualGenBenchWorkload) -> None:
     """Reject an ``extra_params.output_type`` that contradicts the backend.
 
     Gate on the value, not the model: Cosmos3 uses image/video to select its
@@ -522,7 +549,7 @@ def _validate_output_type(workload: VisualGenWorkload) -> None:
     """
     expected = MODALITY_BY_BACKEND[workload.backend]
     for index, request in enumerate(workload.requests):
-        value = (request.params.extra_params or {}).get("output_type")
+        value = (request.extra_params or {}).get("output_type")
         if value in ("image", "video") and value != expected:
             raise ValueError(
                 f"requests[{index}]: extra_params.output_type={value!r} contradicts backend "
@@ -530,7 +557,7 @@ def _validate_output_type(workload: VisualGenWorkload) -> None:
             )
 
 
-def _validate_workload(workload: VisualGenWorkload) -> None:
+def _validate_workload(workload: VisualGenBenchWorkload) -> None:
     _validate_reference_backend(workload)
     _validate_output_type(workload)
 
@@ -540,21 +567,21 @@ def _validate_workload(workload: VisualGenWorkload) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _params_dump(params: VisualGenParams) -> dict[str, Any]:
-    """Dump the merged params as sent.
+def _params_dump(request: VisualGenBenchRequest) -> dict[str, Any]:
+    """The generation parameters as sent, without the input layer.
 
     ``exclude_unset`` keeps a request's explicit ``null`` (the server treats an
     omitted field and an explicit null identically) while never inventing a
-    default. ``image`` is a server-side artifact; the client carries the
-    reference in the payload's own reference field.
+    default.
     """
-    dump = params.model_dump(exclude_unset=True)
-    dump.pop("image", None)
+    dump = request.model_dump(exclude_unset=True)
+    for key in ("prompt", *REFERENCE_KEYS):
+        dump.pop(key, None)
     return dump
 
 
 def build_payload(
-    request: VisualGenSampleRequest,
+    request: VisualGenBenchRequest,
     backend: str,
     model: str,
     response_format: str,
@@ -573,16 +600,15 @@ def build_payload(
         "model": model,
         "response_format": response_format,
     }
-    params = _params_dump(request.params)
+    params = _params_dump(request)
     num_images = params.pop("num_images_per_prompt", None)
 
     if backend == VIDEO_BACKEND:
-        if request.image_reference_wire is not None:
-            # Typed field with a declared wire form -- the deprecated
-            # ``input_reference`` sniffs the content to guess the modality.
-            payload["image_reference"] = request.image_reference_wire
-        if request.video_reference_wire is not None:
-            payload["video_reference"] = request.video_reference_wire
+        # Typed fields -- the deprecated ``input_reference`` sniffs the
+        # content to guess the modality instead.
+        for slot in REFERENCE_KEYS:
+            if getattr(request, slot) is not None:
+                payload[slot] = getattr(request, slot)
         if output_format is not None:
             payload["format"] = output_format
     else:
@@ -591,7 +617,7 @@ def build_payload(
         if num_images is not None:
             payload["n"] = num_images
         if backend == "openai-image-edits":
-            payload["image"] = request.image_reference_wire["content"]
+            payload["image"] = request.image_reference["content"]
             if output_format is not None:
                 # ImageEditRequest's canonical name; ``format`` is only an alias.
                 payload["output_format"] = output_format
@@ -793,16 +819,19 @@ _NON_PARAM_PAYLOAD_KEYS = frozenset({"prompt", "model", "image", *REFERENCE_KEYS
 
 
 def _make_record(
-    index: int, request: VisualGenSampleRequest, payload: dict[str, Any]
+    index: int, request: VisualGenBenchRequest, payload: dict[str, Any]
 ) -> VisualGenRequestRecord:
-    """Record the parameters as sent -- a backend drops the ones it cannot carry."""
+    """Record the parameters as sent -- a backend drops the ones it cannot carry.
+
+    References are recorded by locator: a video reference is tens of MB, and a
+    result that carried the bytes would dwarf the numbers it annotates.
+    """
     return VisualGenRequestRecord(
         index=index,
         prompt=request.prompt,
-        prompt_file=request.prompt_file,
+        prompt_file=request._original_prompt_file,
         params={k: v for k, v in payload.items() if k not in _NON_PARAM_PAYLOAD_KEYS},
-        image_reference=request.image_reference,
-        video_reference=request.video_reference,
+        **{slot: getattr(request, f"_original_{slot}") for slot in REFERENCE_KEYS},
     )
 
 
@@ -811,7 +840,7 @@ async def benchmark(
     backend: str,
     base_url: str,
     model: str,
-    workload: VisualGenWorkload,
+    workload: VisualGenBenchWorkload,
     response_format: str,
     output_format: Optional[str],
     disable_tqdm: bool,

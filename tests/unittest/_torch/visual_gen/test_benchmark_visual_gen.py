@@ -75,7 +75,7 @@ def test_cli_fields_are_the_documents_common_params():
     request = workload.requests[0]
 
     assert request.prompt == "p"
-    assert request.params.model_dump(exclude_unset=True) == {"width": 64, "height": 64}
+    assert request.model_dump(exclude_unset=True) == {"prompt": "p", "width": 64, "height": 64}
     assert {"width", "height", "num_frames", "frame_rate"} <= set(SCALAR_PARAM_FIELDS)
 
 
@@ -99,10 +99,10 @@ def test_cli_requests_override_the_fields_per_key():
     )
 
     assert [r.prompt for r in workload.requests] == ["a fox", "a cat"]
-    assert workload.requests[0].params.width == 1280
-    assert workload.requests[1].params.width == 720
+    assert workload.requests[0].width == 1280
+    assert workload.requests[1].width == 720
     # From common_params, so the override does not drop the rest.
-    assert [r.params.num_frames for r in workload.requests] == [81, 81]
+    assert [r.num_frames for r in workload.requests] == [81, 81]
 
 
 def test_cli_spelling_resolves_to_the_document_spelling(reference_file):
@@ -154,7 +154,7 @@ def test_a_reference_in_common_params_is_rejected():
 
 def test_cli_needs_its_requests_list_just_as_a_file_does():
     """The CLI is the same document, so it cannot skip the key a file must state."""
-    with pytest.raises(ValueError, match="non-empty 'requests' list"):
+    with pytest.raises(ValueError, match="requests\n  Field required"):
         load_workload(_args("--backend", "openai-videos", "--prompt", "p"))
 
 
@@ -177,11 +177,11 @@ def test_local_path_is_encoded_before_the_run(slot, reference_file):
     """A bare path is the recipe ergonomics; VisualGenParams rejects one itself."""
     request = _workload(**{slot: str(reference_file)}).requests[0]
 
-    assert getattr(request, slot) == str(reference_file)
-    assert getattr(request, f"{slot}_wire") == {
+    assert getattr(request, slot) == {
         "content": base64.b64encode(PNG).decode("ascii"),
         "format": "base64",
     }
+    assert getattr(request, f"_original_{slot}") == str(reference_file)
 
 
 @pytest.mark.parametrize("slot", ["image_reference", "video_reference"])
@@ -190,8 +190,8 @@ def test_typed_object_passes_through(slot):
     typed = {"content": "aGk=", "format": "base64", "role": "first_frame"}
     request = _workload(**{slot: typed}).requests[0]
 
-    assert getattr(request, f"{slot}_wire") == typed
-    assert getattr(request, slot) == "<base64>"
+    assert getattr(request, slot) == typed
+    assert getattr(request, f"_original_{slot}") == "<base64>"
 
 
 @pytest.mark.parametrize("slot", ["image_reference", "video_reference"])
