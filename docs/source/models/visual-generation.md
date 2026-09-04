@@ -196,8 +196,8 @@ Linear-layer, attention, and VAE quantization are selected independently. Use
 `quant_config` for transformer linear layers,
 `attention_config.quant_attention_config` for attention, and
 `vae_config.quant_conv_config` for VAE convolutions.
-NVFP4 VAE execution currently supports native Wan-family VAEs on SM100, SM103,
-and SM120 GPUs. Unsupported pipelines and algorithms fail before
+NVFP4 VAE execution currently supports native Wan-family VAEs on SM100 and
+SM103 GPUs. Unsupported pipelines and algorithms fail before
 pipeline construction. On an unsupported device, an explicit NVFP4 request
 fails; checkpoint-driven NVFP4 instead uses dequantized BF16 operators.
 
