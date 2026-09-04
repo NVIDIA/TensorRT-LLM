@@ -1938,8 +1938,7 @@ class TxSession(TxSessionBase):
                 SessionStatus.FULLY_TRANSFERRED,
             )
         return logically_completed and (
-            not getattr(self, "_enforce_physical_ownership", False)
-            or self.resources_drained()
+            not getattr(self, "_enforce_physical_ownership", False) or self.resources_drained()
         )
 
     def has_failed(self) -> bool:
@@ -1959,8 +1958,7 @@ class TxSession(TxSessionBase):
     def _failed_wait_result(self) -> Optional[WaitResult]:
         return (
             None
-            if getattr(self, "_enforce_physical_ownership", False)
-            and not self.resources_drained()
+            if getattr(self, "_enforce_physical_ownership", False) and not self.resources_drained()
             else WaitResult.FAILED
         )
 
@@ -2122,10 +2120,7 @@ class TxSession(TxSessionBase):
         with self.lock:
             if self._closed:
                 return True
-            if (
-                getattr(self, "_enforce_physical_ownership", False)
-                and not self.resources_drained()
-            ):
+            if getattr(self, "_enforce_physical_ownership", False) and not self.resources_drained():
                 return False
             self._closed = True
         if self._aux_buffer is not None and self.aux_slot is not None:
