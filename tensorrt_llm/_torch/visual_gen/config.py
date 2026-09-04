@@ -74,7 +74,14 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 
 
 def create_attention_metadata_state() -> Dict[str, Any]:
-    """Create model-scoped state shared by visual-gen attention layers."""
+    """Create state shared by attention layers in one model component.
+
+    The state outlives individual forwards and CUDA Graph captures. It owns the
+    shape-keyed TRTLLM metadata cache, and the TRTLLM attention wrapper adds the
+    shared PrimTS block-sparse plan caches on demand so one static profile is
+    planned once per component instead of once per layer. Each model component
+    receives a distinct state and must not execute concurrent forwards.
+    """
     return {"metadata_cache": {}}
 
 
@@ -123,6 +130,7 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Per-component metadata cache shared by VisualGen TRTLLM attention layers.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
@@ -196,6 +204,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Seed state copied into each model component before attention metadata is created.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None

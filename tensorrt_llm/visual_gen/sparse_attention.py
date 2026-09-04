@@ -222,11 +222,13 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
 
 class VideoSparseAttentionConfig(StrictBaseModel):
-    """Video Sparse Attention (VSA) sparse-attention recipe (CUTEDSL backend only).
+    """Video Sparse Attention (VSA) sparse-attention recipe.
 
     Two-stage hybrid attention: a coarse mean-pooled stage over (4,4,4) cubes
     and a block-sparse fine stage over the top-K cubes selected per head.
     vsa_sparsity controls the fraction of cubes dropped on the fine stage.
+    The fine stage may run on either the CuTeDSL backend or the TRTLLM PrimTS
+    backend, while the user-facing sparsity semantics stay the same.
     """
 
     algorithm: Literal["vsa"] = PydanticField(
