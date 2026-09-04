@@ -17,7 +17,7 @@ CuTe DSL (NVIDIA kernels) FMHA Backend for Visual Generation Models
 
 JIT-compiles dense or SkipSoftmax FMHA and caches the compiled artifact for each kernel
 configuration. Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16 inputs. The VSA
-sparse path uses VSAAttention from vsa.py instead.
+sparse backend uses `VSACuTeDSLAttention` in `attention_backend.sparse.vsa` instead.
 """
 
 import math
@@ -72,20 +72,6 @@ def _resolve_skip_softmax_threshold_scale_factor(
 ) -> float | None:
     """Resolve the active CuTeDSL threshold for the current denoising phase."""
     if sparse_params is not None:
-        if timestep is None and sparse_params.scheduler.disabled_until_timestep is not None:
-            # Fail-open: a missing timestep resolves to the full (unthrottled)
-            # threshold, i.e. skip-softmax runs during the high-noise steps
-            # `disabled_until_timestep` exists to protect. This is silent
-            # elsewhere (a quality regression, not an error), so surface it
-            # once per process instead of only in this function's return value.
-            logger.warning_once(
-                "SkipSoftmax scheduler has disabled_until_timestep="
-                f"{sparse_params.scheduler.disabled_until_timestep} configured, but no "
-                "`timestep` was passed to the CuTeDSL attention forward call. Skip-softmax "
-                "will run unthrottled (as if past the cutoff) until `timestep` is threaded "
-                "through.",
-                key="cute_dsl_skip_softmax_missing_timestep",
-            )
         runtime_params = sparse_params.scheduler.get_runtime_params(timestep=timestep)
         threshold_scale_factor = runtime_params.threshold_scale_factor_prefill
     if threshold_scale_factor is None or threshold_scale_factor <= 0.0:

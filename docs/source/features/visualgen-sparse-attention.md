@@ -13,14 +13,14 @@ This feature is in **beta** stage. APIs, supported models, and optimization opti
 
 Visual generation models naturally operate on long image or video token sequences. Each denoising step is closer to a full-context prefill pass than to autoregressive decoding, and attention can dominate runtime for high-resolution image generation or long video generation.
 
-Sparse attention in VisualGen is configured through `VisualGenArgs.attention_config.sparse_attention_config`. The user-facing config stays in VisualGen args or model config. Checkpoint calibration metadata remains internal and is lowered into per-attention-backend `SparseParams` when each attention module is constructed.
+Sparse attention in VisualGen is configured through `VisualGenArgs.attention_config.sparse_attention_config`. The user-facing config stays in VisualGen args or model config, while `attention_config.backend` selects the kernel family. Algorithms produce their block-sparse routes through the core `block_sparse_attn_predict` hook: a backend either predicts inside that hook from the flattened Q/K/V, or predicts before the core forward and hands the complete `BlockSparseForwardInputs` through `AttentionForwardArgs.sparse_backend_args`, which the default hook passes through. `SparseRuntimeParams` is the single lowered runtime carrier passed as `AttentionForwardArgs.sparse_runtime_params`; its optional `block_sparse_inputs` field nests the algorithm-neutral routes for the general block-sparse FMHA. `None` means prediction has not run, while an empty `SparseRuntimeParams()` records that prediction ran without a sparse payload.
 
 ### Algorithms
 
 | `algorithm` | Config class | Status |
 |---|---|---|
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Supported |
-| VSA | TBD | TODO |
+| `vsa` | `VideoSparseAttentionConfig` | Supported (`CUTEDSL`, `TRTLLM`) |
 
 ## Skip Softmax Attention
 
@@ -216,4 +216,17 @@ Graphs are captured lazily. The first denoising step seen for a given tensor sha
 
 ## Video Sparse Attention (VSA)
 
-TODO
+VSA combines a coarse mean-pooled branch with a top-K block-sparse fine branch. Select either `CUTEDSL` for the CuTe DSL kernel or `TRTLLM` for PrimTS block-sparse attention. If the selected sparse kernel is unavailable or the known VSA tensor envelope is not met, the fine branch uses the compact Q/K/V tensors with that backend's dense path. VSA cannot be combined with `quant_attention_config`.
+
+VSA retains shape-dependent metadata and route tensors so CUDA Graph replay can reuse stable addresses. A pipeline instance accepts up to 16 distinct VSA shape profiles; reuse configured resolution/frame profiles or restart the pipeline before serving additional shapes.
+
+Both VSA backends use the same VisualGen-owned predictor implementation, one
+instance per attention layer, and identical post-processing. The `TRTLLM` path runs the coarse stage before the core
+forward, hands the predicted `BlockSparseForwardInputs` (including the
+tile-padding validity bits only the VSA predictor knows) through
+`sparse_backend_args`, lets the default core prediction hook pass them to the
+general block-sparse FMHA, and then blends the fine and coarse outputs. Its
+compact dense fallback passes no sparse inputs, so the core runs dense attention
+and VSA post-processing still runs. `CUTEDSL` retains only its backend-specific
+fine-attention execution. The core FMHA registry owns the reusable block-sparse
+implementation rather than a VSA-specific lifecycle.
