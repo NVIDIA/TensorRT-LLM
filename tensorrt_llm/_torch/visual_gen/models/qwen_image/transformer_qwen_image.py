@@ -20,13 +20,18 @@ from __future__ import annotations
 import functools
 import math
 from collections.abc import Callable
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.linear import (
+    Linear,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+)
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import gelu_tanh, maybe_compile
@@ -38,6 +43,10 @@ from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.modules.packed_qkv import (
+    build_packed_qkv,
+    select_packed_qkv_recipe,
+)
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -46,6 +55,20 @@ _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
     (".net.2.", ".down_proj."),
 ]
+
+# Checkpoint routing for the per-stream MERGED-QKV Linears (general form of
+# the packed joint-QKV candidate). The model owns one merged [3D, D] Linear
+# per stream (img_qkv_proj / add_qkv_proj, WeightMode.FUSED_QKV_LINEAR); the
+# diffusers checkpoint keeps six separate projections. This map is consumed
+# by DynamicLinearWeightLoader (the same in-tree mechanism the FUSE_QKV LLM
+# stack and LTX-2/WAN/FLUX use): for a fused module `<parent>.<key>`, the
+# loader pulls `<parent>.<src>.{weight,bias,...}` for each src and the
+# Linear's own `load_weights_fused_qkv_linear` concatenates them along dim 0
+# (bitwise torch.cat at TP=1).
+_FUSED_QKV_PARAMS_MAP = {
+    "img_qkv_proj": ["to_q", "to_k", "to_v"],
+    "add_qkv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
+}
 
 # Parameters created by the shared FP8/NVFP4 Linear methods that ModelOpt does
 # not serialize. ``alpha`` and ``inv_input_scale`` are derived from serialized
@@ -470,10 +493,14 @@ class QwenEmbedRope(nn.Module):
 class QwenJointAttention(Attention):
     """Double-stream joint attention.
 
-    Holds the image-stream (to_q/k/v), text-stream (add_q/k/v_proj),
-    per-stream QK-norms, and the two output projections (to_out.0 for
-    image, to_add_out for text) as direct submodules so the HF state_dict
-    loads with the checkpoint remapping in ``load_weights``. The common
+    Holds one MERGED QKV Linear per stream — ``img_qkv_proj`` (image,
+    replaces to_q/to_k/to_v) and ``add_qkv_proj`` (text, replaces
+    add_q/k/v_proj) — both first-class ``WeightMode.FUSED_QKV_LINEAR``
+    Linears so quantization methods can own the merged weights. The six
+    diffusers checkpoint keys are routed into the two merged parameters by
+    ``DynamicLinearWeightLoader`` via ``_FUSED_QKV_PARAMS_MAP`` (bitwise
+    torch.cat at load). Per-stream QK-norms and the two output projections
+    (to_out.0 for image, to_add_out for text) are unchanged. The common
     unmasked path uses the VisualGen attention backend; the masked path
     falls back to torch SDPA because VisualGen's backend mask contract is
     currently limited to predefined masks.
@@ -513,45 +540,22 @@ class QwenJointAttention(Attention):
         )
         self._uses_sequence_parallel_attention = _is_qwen_sequence_parallel_attention(self.attn)
 
-        tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
+        # Text-stream MERGED QKV (checkpoint keys add_q/k/v_proj are routed
+        # into this one parameter by the fused loader). Same construction
+        # shape as the image-stream merged Linear in `_init_qkv_proj`.
+        self.add_qkv_proj = self._build_merged_qkv_linear()
 
-        # Text-stream QKV (diffusers names).
-        self.add_q_proj = Linear(
-            dim,
-            dim,
-            bias=True,
-            dtype=dtype,
-            mapping=self.mapping,
-            quant_config=self.quant_config,
-            skip_create_weights_in_init=self.skip_create_weights_in_init,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-            tensor_parallel_mode=tp_mode,
-            reduce_output=False,
-        )
-        self.add_k_proj = Linear(
-            dim,
-            dim,
-            bias=True,
-            dtype=dtype,
-            mapping=self.mapping,
-            quant_config=self.quant_config,
-            skip_create_weights_in_init=self.skip_create_weights_in_init,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-            tensor_parallel_mode=tp_mode,
-            reduce_output=False,
-        )
-        self.add_v_proj = Linear(
-            dim,
-            dim,
-            bias=True,
-            dtype=dtype,
-            mapping=self.mapping,
-            quant_config=self.quant_config,
-            skip_create_weights_in_init=self.skip_create_weights_in_init,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-            tensor_parallel_mode=tp_mode,
-            reduce_output=False,
-        )
+        # Fused joint-QKV packing (concat elimination). When engaged, the two
+        # per-stream merged projections write straight into the packed joint
+        # QKV buffer through the selected recipe's functional leaf op (see
+        # `visual_gen/modules/packed_qkv.py`), eliminating the torch.cat's in
+        # `_prepare_qkv_fused` with no functionalization copy-back under the
+        # per-block torch.compile. Engine-internal gating only (no public
+        # knob); the leaf ops consume the merged Linears' native parameters
+        # DIRECTLY (no post-load packing or repointing), so this is just the
+        # recipe key selected post-load in `finalize_fused_qkv_pack()`
+        # (None = merged forward + seq-dim cat fallback).
+        self._qkv_pack_recipe: Optional[str] = None
 
         # QK-norms, applied per-head on the head_dim.
         self.norm_added_q = RMSNorm(
@@ -575,6 +579,105 @@ class QwenJointAttention(Attention):
             allreduce_strategy=self.allreduce_strategy,
         )
 
+    def _build_merged_qkv_linear(self) -> Linear:
+        """One merged [q_dim + 2*kv_dim, hidden] QKV Linear (one per stream).
+
+        Same construction as the in-tree ``QKVMode.FUSE_QKV`` branch of
+        ``Attention._init_qkv_proj`` (visual_gen/modules/attention.py):
+        ``WeightMode.FUSED_QKV_LINEAR`` + ``fused_weight_shard_indices_mapping``
+        drive the fused checkpoint load (three source tensors concatenated
+        into the one parameter), ``override_tp_sharding`` keeps TP>1 shard
+        math identical to the separate projections it replaces.
+        """
+        tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
+        qkv_out_dim = self.q_dim + 2 * self.kv_dim
+        return Linear(
+            self.hidden_size,
+            qkv_out_dim,
+            bias=self.bias,
+            dtype=self.dtype,
+            mapping=self.mapping,
+            quant_config=self.quant_config,
+            skip_create_weights_in_init=self.skip_create_weights_in_init,
+            force_dynamic_quantization=self.force_dynamic_quantization,
+            weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.FUSED_QKV_LINEAR),
+            fused_weight_shard_indices_mapping={
+                "q": (0, self.local_q_dim),
+                "k": (self.local_q_dim, self.local_kv_dim),
+                "v": (self.local_q_dim + self.local_kv_dim, self.local_kv_dim),
+            },
+            tensor_parallel_mode=tp_mode,
+            reduce_output=False,
+            override_tp_sharding={
+                "q": (self.local_q_dim_start, self.local_q_dim_end),
+                "k": (self.local_kv_dim_start, self.local_kv_dim_end),
+                "v": (self.local_kv_dim_start, self.local_kv_dim_end),
+            },
+        )
+
+    def _init_qkv_proj(self) -> None:
+        """Image-stream MERGED QKV Linear (bypasses the base SEPARATE trio).
+
+        Overrides the base class hook called from ``Attention.__init__`` so
+        the separate to_q/to_k/to_v Linears are never created (no double
+        weight memory, no orphaned params). ``qkv_mode`` stays SEPARATE_QKV
+        so every other mode-dependent decision in the base class (backend
+        selection, sequence-parallel checks, NVFP4 shared-quantize census)
+        keeps the exact behavior of the filed candidate; only the projection
+        storage changes to the merged form.
+        """
+        self.img_qkv_proj = self._build_merged_qkv_linear()
+
+    def get_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Image-stream Q/K/V via the merged projection + split.
+
+        Joint attention is self-attention over the concatenated sequence
+        (``separate_qkv_is_self_attention=True``); ``encoder_hidden_states``
+        is never a KV source here, the text stream has its own
+        ``add_qkv_proj``.
+        """
+        qkv = self.img_qkv_proj(hidden_states)
+        return qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
+
+    def _qkv_pack_linears(self) -> Tuple[Linear, ...]:
+        return (self.img_qkv_proj, self.add_qkv_proj)
+
+    def _qkv_pack_recipe_census(self) -> Optional[str]:
+        """Post-load recipe selection for the packed joint-QKV path.
+
+        Model-level preconditions first (the fused path only ever runs
+        inside `_prepare_qkv_fused`, so fused QK-norm+RoPE being configured
+        and TP=1; the runtime bf16/cuda/head-dim gate stays
+        `_use_fused_qk_norm_rope`); the per-Linear capability census and
+        recipe dispatch are the shared `select_packed_qkv_recipe` seam.
+        """
+        if not (self.fuse_qk_norm_rope and self.qk_norm):
+            return None
+        if self.tp_size != 1:
+            return None
+        packed_dim = self.local_q_dim + 2 * self.local_kv_dim
+        return select_packed_qkv_recipe(
+            self._qkv_pack_linears(),
+            out_features=packed_dim,
+            in_features=self.hidden_size,
+        )
+
+    def finalize_fused_qkv_pack(self) -> None:
+        """Select the packed joint-QKV recipe after weight loading.
+
+        Called from `QwenImageTransformer2DModel.post_load_weights()` (after
+        every Linear's own `post_load_weights`, so quant methods and weight
+        placement are final). There is nothing to build: the recipe leaf ops
+        read the merged Linears' own parameters, so this is a pure
+        eligibility census. Any later weight reload stays coherent
+        automatically.
+        """
+        self._qkv_pack_recipe = self._qkv_pack_recipe_census()
+
     @staticmethod
     def _apply_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
         return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
@@ -593,6 +696,31 @@ class QwenJointAttention(Attention):
             and self.head_dim in (64, 128, 256)
         )
 
+    def _build_packed_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Concat-free packed joint QKV via the selected recipe's leaf op.
+
+        Dispatches through `visual_gen/modules/packed_qkv.py`, which houses
+        every recipe (functional custom op + census + builder) in one place.
+        The recipe's registered leaf op allocates the packed buffer and
+        projects both streams into its ``out=`` row slices; going through
+        the op registry (instead of inlining the ``out=`` writes here) keeps
+        the buffer ownership opaque to inductor under the production
+        per-block torch.compile, so no functionalization copy-back kernel is
+        emitted. The weights are the merged Linears' own parameters — no
+        packed shadow copies.
+        """
+        return build_packed_qkv(
+            self._qkv_pack_recipe,
+            encoder_hidden_states,
+            hidden_states,
+            self.add_qkv_proj,
+            self.img_qkv_proj,
+        )
+
     def _prepare_qkv_fused(
         self,
         hidden_states: torch.Tensor,
@@ -600,14 +728,27 @@ class QwenJointAttention(Attention):
         image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        img_q, img_k, img_v = self.get_qkv(hidden_states)
-        txt_q = self.add_q_proj(encoder_hidden_states)
-        txt_k = self.add_k_proj(encoder_hidden_states)
-        txt_v = self.add_v_proj(encoder_hidden_states)
-
-        txt_qkv = torch.cat([txt_q, txt_k, txt_v], dim=-1)
-        img_qkv = torch.cat([img_q, img_k, img_v], dim=-1)
-        qkv = torch.cat([txt_qkv, img_qkv], dim=1)
+        # Trace-time constants under the per-block torch.compile: the recipe
+        # is frozen post-load, shapes/dtypes recompile-guarded. B == 1 is the
+        # production CFG shape (two sequential B=1 calls); B > 1 falls back.
+        use_packed = (
+            self._qkv_pack_recipe is not None
+            and isinstance(hidden_states, torch.Tensor)
+            and isinstance(encoder_hidden_states, torch.Tensor)
+            and hidden_states.shape[0] == 1
+            and encoder_hidden_states.shape[0] == 1
+            and hidden_states.dtype == torch.bfloat16
+            and encoder_hidden_states.dtype == torch.bfloat16
+        )
+        if use_packed:
+            qkv = self._build_packed_qkv(hidden_states, encoder_hidden_states)
+        else:
+            # General fallback, correct for any quant method: per-stream
+            # merged Linear forward (full Linear.forward semantics, so any
+            # quantized apply/backends are honored) + one seq-dim concat.
+            txt_qkv = self.add_qkv_proj(encoder_hidden_states)
+            img_qkv = self.img_qkv_proj(hidden_states)
+            qkv = torch.cat([txt_qkv, img_qkv], dim=1)
 
         if fused_rotary_emb is None:
             fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb)
@@ -629,12 +770,13 @@ class QwenJointAttention(Attention):
         encoder_hidden_states: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Image QKV.
+        # Image QKV (merged projection + split).
         img_q, img_k, img_v = self.get_qkv(hidden_states)
-        # Text QKV.
-        txt_q = self.add_q_proj(encoder_hidden_states)
-        txt_k = self.add_k_proj(encoder_hidden_states)
-        txt_v = self.add_v_proj(encoder_hidden_states)
+        # Text QKV (merged projection + split).
+        txt_qkv = self.add_qkv_proj(encoder_hidden_states)
+        txt_q, txt_k, txt_v = txt_qkv.split(
+            [self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1
+        )
 
         # Reshape to (B, S, H, D).
         img_q = img_q.unflatten(-1, (self.local_num_attention_heads, -1))
@@ -1199,11 +1341,40 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
 
         expected = {name for name, _ in self.named_parameters()}
         provided = set(weights)
+        # MERGED-QKV Linears: the model owns one fused parameter per stream
+        # (img_qkv_proj / add_qkv_proj) while the checkpoint serializes the
+        # six separate projections. Map each fused model param to the source
+        # checkpoint keys the loader will consume so strict validation still
+        # holds: the source keys are REQUIRED (missing if absent) and never
+        # "unexpected", and the fused params are satisfied by their sources.
+        fused_param_sources: Dict[str, List[str]] = {}
+        for name, module in self.named_modules():
+            if not isinstance(module, Linear):
+                continue
+            wlc = getattr(module, "weights_loading_config", None)
+            if wlc is None or wlc.weight_mode != WeightMode.FUSED_QKV_LINEAR:
+                continue
+            src_names = _FUSED_QKV_PARAMS_MAP.get(name.split(".")[-1])
+            if src_names is None:
+                raise RuntimeError(f"No _FUSED_QKV_PARAMS_MAP entry for fused module '{name}'")
+            parent = ".".join(name.split(".")[:-1])
+            parent_prefix = f"{parent}." if parent else ""
+            for param_name, param in module._parameters.items():
+                if param is None or param_name in _NON_SERIALIZED_QUANT_PARAM_NAMES:
+                    continue
+                fused_param_sources[f"{name}.{param_name}"] = [
+                    f"{parent_prefix}{src}.{param_name}" for src in src_names
+                ]
+        fused_expected = set(fused_param_sources)
+        fused_source_keys = {key for sources in fused_param_sources.values() for key in sources}
         # WAN uses the same shared Linear methods but does not perform this
         # model-vs-checkpoint key check. Exempt only their known non-serialized
         # parameters while retaining strict validation for real Qwen weights.
-        missing = sorted((expected - provided) - self._non_serialized_quant_parameter_names())
-        unexpected = sorted(provided - expected)
+        missing = sorted(
+            ((expected - provided) - self._non_serialized_quant_parameter_names() - fused_expected)
+            | (fused_source_keys - provided)
+        )
+        unexpected = sorted(provided - expected - fused_source_keys)
         # Dynamic quantization creates scale parameters while loading Linear
         # modules, so those keys are expected to be absent from BF16 checkpoints.
         if missing and not self.model_config.dynamic_weight_quant:
@@ -1211,7 +1382,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         if unexpected:
             raise RuntimeError(f"Unexpected keys when loading transformer: {unexpected[:5]}...")
 
-        loader = DynamicLinearWeightLoader(self.model_config)
+        loader = DynamicLinearWeightLoader(self.model_config, params_map=_FUSED_QKV_PARAMS_MAP)
         for name, module in self.named_modules():
             if isinstance(module, Linear):
                 weight_dicts = loader.get_linear_weights(module, name, weights)
@@ -1266,6 +1437,12 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                         f"weight_scale_shape={scale_shape}, "
                         f"weight_scale_dtype={scale_dtype}"
                     ) from exc
+        # Post-load eligibility census for the concat-free joint-QKV path.
+        # Must run after every Linear's post_load_weights (weights final);
+        # named_modules() keeps this robust to block wrappers (Cache-DiT).
+        for _, module in self.named_modules():
+            if isinstance(module, QwenJointAttention):
+                module.finalize_fused_qkv_pack()
 
     def forward(
         self,
@@ -1326,6 +1503,25 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             hidden_states, image_rotary_emb
         ):
             fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb)
+
+        # Keep the TEXT-side sequence dims symbolic under the per-block
+        # torch.compile, matching the baseline compile dynamics: the baseline
+        # block fxgraph carries the txt length and rope row counts as SymInt
+        # inputs (s31 txt tokens, s98/s69 rope rows), while a single-shape
+        # attempt otherwise specializes the whole block graph static on the
+        # first prompt length seen (observed in the gelu-mqkv e2e: txt=7 and
+        # rope rows 6896 baked in, 29 static call args vs baseline's 40 with
+        # SymInts). Image tokens stay static, exactly like baseline (6889
+        # hard-coded there too). Marking is a per-forward no-op in eager and
+        # when compile is disabled.
+        torch._dynamo.mark_dynamic(encoder_hidden_states, 1)
+        if isinstance(image_rotary_emb, (tuple, list)) and len(image_rotary_emb) == 2:
+            txt_freqs = image_rotary_emb[1]
+            if isinstance(txt_freqs, torch.Tensor):
+                torch._dynamo.mark_dynamic(txt_freqs, 0)
+        if fused_rotary_emb is not None:
+            torch._dynamo.mark_dynamic(fused_rotary_emb[0], 0)
+            torch._dynamo.mark_dynamic(fused_rotary_emb[1], 0)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
