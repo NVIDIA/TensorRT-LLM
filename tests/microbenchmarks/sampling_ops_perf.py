@@ -262,27 +262,6 @@ def available_impls() -> dict[str, Impl]:
         raise ValueError(f"unknown call shape: {shape}")
 
     impls["fused"] = Impl(name="fused", call=call, supports_min_p=True)
-
-    # Measure the production dispatcher separately from the bare op.
-    from tensorrt_llm._torch.pyexecutor.sampler.ops import spec_dispatch as disp
-
-    fused_mode = AdvancedSamplingMode.FUSED
-
-    def call_dispatch(shape: str, inp: Inputs) -> Callable[[], Any]:
-        args = (inp.logits, inp.temperatures, inp.top_ks, inp.top_ps, inp.min_ps)
-        if shape == "tokens":
-            return lambda: disp.spec_sample_from_logits(
-                fused_mode, *args, seed=inp.seed, offset=inp.offset
-            )
-        if shape == "probs":
-            return lambda: disp.spec_compute_probs_from_logits(fused_mode, *args)
-        if shape == "tokens_probs":
-            return lambda: disp.spec_sample_from_logits_with_probs(
-                fused_mode, *args, seed=inp.seed, offset=inp.offset
-            )
-        raise ValueError(f"unknown call shape: {shape}")
-
-    impls["fused_dispatch"] = Impl(name="fused_dispatch", call=call_dispatch, supports_min_p=True)
     return impls
 
 

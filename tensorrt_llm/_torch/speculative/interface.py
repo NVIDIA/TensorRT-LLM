@@ -44,9 +44,8 @@ if IS_FLASHINFER_AVAILABLE:
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 from ..pyexecutor.sampler import penalties as penalty_ops
-from ..pyexecutor.sampler.ops.spec_dispatch import (
-    spec_compute_probs_from_logits, spec_sample_from_logits,
-    spec_sample_from_logits_with_probs)
+from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
+from ..pyexecutor.sampler.ops import fused as fused_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
 
@@ -1997,6 +1996,78 @@ class SpecWorkerBase(nn.Module, ABC):
         from ..distributed.ops import allgather
         return allgather(logits, self.mapping, dim=-1)
 
+    @staticmethod
+    def _sample_from_logits(
+        advanced_sampling_mode: AdvancedSamplingMode,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: Optional[torch.Tensor],
+        *,
+        seed: Optional[torch.Tensor] = None,
+        offset: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if advanced_sampling_mode.is_fused:
+            return fused_sampling.fused_sample_from_logits(logits,
+                                                           temperatures,
+                                                           top_ks,
+                                                           top_ps,
+                                                           min_ps,
+                                                           seed=seed,
+                                                           offset=offset)
+        top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
+            advanced_sampling_mode, top_ks, top_ps)
+        return flashinfer_sampling.sample_from_logits_op(logits,
+                                                         temperatures,
+                                                         top_ks,
+                                                         top_ps,
+                                                         seed=seed,
+                                                         offset=offset)
+
+    @staticmethod
+    def _sample_from_logits_with_probs(
+        advanced_sampling_mode: AdvancedSamplingMode,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: Optional[torch.Tensor],
+        *,
+        seed: Optional[torch.Tensor] = None,
+        offset: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if advanced_sampling_mode.is_fused:
+            return fused_sampling.fused_sample_from_logits_with_probs(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed=seed,
+                offset=offset)
+        top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
+            advanced_sampling_mode, top_ks, top_ps)
+        return flashinfer_sampling.sampling_batch_spec_dec_one_model_for_rejection(
+            logits, temperatures, top_ks, top_ps, seed=seed, offset=offset)
+
+    @staticmethod
+    def _compute_probs_from_logits(
+        advanced_sampling_mode: AdvancedSamplingMode,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if advanced_sampling_mode.is_fused:
+            return fused_sampling.fused_compute_probs_from_logits(
+                logits, temperatures, top_ks, top_ps, min_ps)
+        top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
+            advanced_sampling_mode, top_ks, top_ps)
+        return flashinfer_sampling.compute_probs_from_logits(
+            logits, temperatures, top_ks, top_ps)
+
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
                               spec_metadata: "SpecMetadata",
@@ -2026,7 +2097,7 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    step_offset=1 +
                                                    (draft_step or 0))
         if spec_metadata.use_rejection_sampling and draft_step is not None:
-            draft_tokens, probs = spec_sample_from_logits_with_probs(
+            draft_tokens, probs = self._sample_from_logits_with_probs(
                 spec_metadata.advanced_sampling_mode,
                 logits,
                 temperatures,
@@ -2046,7 +2117,7 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata.draft_probs[batch_slots, draft_step, :vocab] = probs
             spec_metadata.draft_probs_last_dim = vocab
         else:
-            draft_tokens = spec_sample_from_logits(
+            draft_tokens = self._sample_from_logits(
                 spec_metadata.advanced_sampling_mode,
                 logits,
                 temperatures,
@@ -2199,9 +2270,9 @@ class SpecWorkerBase(nn.Module, ABC):
             temperatures = spec_metadata.temperatures[gen_start:gen_end]
             # The target distribution the acceptance test divides by. It must be
             # filtered exactly as the draft probs were (see advanced_sample_draft),
-            # which is why both go through the same dispatcher on the same mode --
+            # which is why both use the same backend selection on the same mode --
             # a mismatch here corrupts acceptance silently rather than raising.
-            target_probs_flat = spec_compute_probs_from_logits(
+            target_probs_flat = self._compute_probs_from_logits(
                 spec_metadata.advanced_sampling_mode, gen_logits, temperatures,
                 spec_metadata.top_ks[gen_start:gen_end],
                 spec_metadata.top_ps[gen_start:gen_end],
@@ -2473,7 +2544,7 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    step_offset=1)
 
         if getattr(spec_metadata, "use_rejection_sampling", False):
-            flat_tokens, flat_probs = spec_sample_from_logits_with_probs(
+            flat_tokens, flat_probs = self._sample_from_logits_with_probs(
                 spec_metadata.advanced_sampling_mode,
                 flat_logits,
                 temps,
@@ -2493,7 +2564,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 spec_metadata.draft_probs[gen_slot_ids, :K, :vocab] = probs
                 spec_metadata.draft_probs_last_dim = vocab
         else:
-            flat_tokens = spec_sample_from_logits(
+            flat_tokens = self._sample_from_logits(
                 spec_metadata.advanced_sampling_mode,
                 flat_logits,
                 temps,
@@ -2746,7 +2817,7 @@ class SpecWorkerBase(nn.Module, ABC):
             # One row per logits row here, the same slice the per-token
             # sampling params above use.
             seed, offset = self._rng_state_per_token(spec_metadata, num_tokens)
-            sampled_tokens = spec_sample_from_logits(
+            sampled_tokens = self._sample_from_logits(
                 spec_metadata.advanced_sampling_mode,
                 logits,
                 temperatures,
