@@ -338,3 +338,89 @@ def test_store_false_is_not_an_unmet_request():
 
     assert "store" in request.model_fields_set
     assert request.store is False
+
+
+# ---------------------------------------------------------------------------
+# /v1/models on a disaggregated server
+# ---------------------------------------------------------------------------
+class _StubCtxClient:
+    """Records what the service asked a worker for."""
+
+    def __init__(self, result=None, error=None):
+        self.result, self.error = result, error
+        self.calls = []
+
+    async def get_json(self, endpoint, response_type, server):
+        self.calls.append((endpoint, server))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class _StubRouter:
+    def __init__(self, servers):
+        self.servers = servers
+
+
+def _service_with(ctx_client, servers=("w0:8001", "w1:8001"), ready=True):
+    """A service object with only the pieces get_model touches."""
+    from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
+    from tensorrt_llm.serve.openai_protocol import ModelCard, ModelList
+
+    svc = OpenAIDisaggregatedService.__new__(OpenAIDisaggregatedService)
+    svc._ctx_client = ctx_client
+    svc._ctx_router = _StubRouter(list(servers))
+    svc._count_tokens_rr_counter = 0
+
+    async def _ready():
+        return ready
+
+    svc.is_ready = _ready
+    return svc, ModelList, ModelCard
+
+
+def test_get_model_asks_a_context_worker():
+    """The orchestrator has no model of its own to report.
+
+    DisaggServerConfig carries no model name -- the working deployments on hand
+    do not set one -- so answering from config would work for some clusters and
+    404 for the rest. The worker knows the name requests are served under.
+    """
+    from tensorrt_llm.serve.openai_protocol import ModelCard, ModelList
+
+    expected = ModelList(data=[ModelCard(id="GLM-5.3")])
+    client = _StubCtxClient(result=expected)
+    svc, _, _ = _service_with(client)
+
+    got = asyncio.run(svc.get_model())
+
+    assert got.data[0].id == "GLM-5.3"
+    assert client.calls == [("v1/models", "w0:8001")]
+
+
+def test_get_model_round_robins_context_workers():
+    """Shares the counter with count-tokens, so two calls hit two workers."""
+    from tensorrt_llm.serve.openai_protocol import ModelCard, ModelList
+
+    client = _StubCtxClient(result=ModelList(data=[ModelCard(id="m")]))
+    svc, _, _ = _service_with(client)
+
+    asyncio.run(svc.get_model())
+    asyncio.run(svc.get_model())
+
+    assert [s for _, s in client.calls] == ["w0:8001", "w1:8001"]
+
+
+def test_get_model_without_a_context_worker_is_an_error_not_an_empty_list():
+    """An empty list would read as "this server has no models", which is false.
+
+    The model exists; there is currently nobody to ask. The server turns this
+    into a 503 so the client retries rather than concluding the deployment is
+    empty.
+    """
+    client = _StubCtxClient(result=None)
+    svc, _, _ = _service_with(client, servers=())
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(svc.get_model())
+    assert client.calls == []

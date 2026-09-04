@@ -157,6 +157,22 @@ class OpenAIClient(ABC):
         """
         ...
 
+    @abstractmethod
+    async def get_json(
+        self,
+        endpoint: str,
+        response_type: Type[_ResponseT],
+        server: str,
+    ) -> _ResponseT:
+        """Read a worker's bodyless GET endpoint.
+
+        The counterpart to post_json for endpoints that describe the worker
+        rather than ask it to do anything -- /v1/models being the one that
+        matters. Same exemption from routing state, and no request body to
+        serialise.
+        """
+        ...
+
     async def shutdown(self) -> None: ...
 
     @abstractmethod
@@ -240,6 +256,26 @@ class OpenAIHttpClient(OpenAIClient):
         body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
         headers = dict(MSGPACK_HEADERS)
         async with self._session.post(url, data=body, headers=headers) as response:
+            if response.status >= 400:
+                error_body = await response.text()
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=f"{response.reason}: {error_body[:2048]}",
+                    headers=response.headers,
+                )
+            return response_type(**await response.json())
+
+    async def get_json(
+        self,
+        endpoint: str,
+        response_type: Type[_ResponseT],
+        server: str,
+    ) -> _ResponseT:
+        server_url = server if server.startswith("http") else f"http://{server}"
+        url = f"{server_url.rstrip('/')}/{endpoint}"
+        async with self._session.get(url) as response:
             if response.status >= 400:
                 error_body = await response.text()
                 raise aiohttp.ClientResponseError(

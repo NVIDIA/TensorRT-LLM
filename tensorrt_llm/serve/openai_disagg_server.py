@@ -345,6 +345,12 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
         self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
         self.app.add_api_route("/v1/responses", self._wrap_entry_point(self._service.openai_responses, ResponsesRequest), methods=["POST"])
+        # GET, and forwarded to a worker rather than answered from config:
+        # the orchestrator has no model of its own and DisaggServerConfig
+        # carries no model name. Clients that do model discovery -- Codex
+        # among them -- got a 404 here and had to be told the name out of
+        # band.
+        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -496,6 +502,39 @@ class OpenAIDisaggServer:
                                             "api_error", 500)
         return JSONResponse(content=anthropic_response.model_dump(
             exclude_none=True))
+
+    async def get_model(self) -> Response:
+        """List the served model, asking a context worker for the name.
+
+        Error shape is OpenAI's, not Anthropic's, because this is an OpenAI
+        route -- a client that model-discovers here parses OpenAI errors.
+        """
+        try:
+            response = await self._service.get_model()
+        except aiohttp.ClientResponseError as error:
+            return JSONResponse(
+                status_code=error.status or 500,
+                content={
+                    "object": "error",
+                    "message": _upstream_error_message(error),
+                    "type": ("invalid_request_error"
+                             if 400 <= (error.status or 500) < 500 else "api_error"),
+                    "code": error.status or 500,
+                },
+            )
+        except (RuntimeError, ValueError) as error:
+            # No worker to ask yet. 503 says "retry", which is true: the answer
+            # exists as soon as a context worker registers.
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "object": "error",
+                    "message": str(error),
+                    "type": "api_error",
+                    "code": 503,
+                },
+            )
+        return JSONResponse(content=response.model_dump())
 
     async def anthropic_count_tokens(
             self, request: AnthropicCountTokensRequest) -> Response:

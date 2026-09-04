@@ -31,6 +31,7 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     DisaggregatedParams,
     DisaggScheduleStyle,
+    ModelList,
     ResponsesRequest,
     ResponsesResponse,
     UCompletionRequest,
@@ -169,6 +170,30 @@ class OpenAIDisaggregatedService(OpenAIService):
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
+
+    async def get_model(self) -> ModelList:
+        """Report the model by asking a worker, since the proxy holds none.
+
+        An aggregated server answers from `self.model`, which it has because it
+        loaded the weights. This orchestrator has no model, no tokenizer and no
+        engine, and `DisaggServerConfig` carries no model name either -- the
+        working deployments on hand do not set one, so reading it from config
+        would answer for some clusters and 404 for the rest.
+
+        Asking a worker gives the name the requests will actually be served
+        under, which is the answer a client doing model discovery wants. Context
+        workers are used for the same reason count-tokens uses them: they are
+        the half that owns the tokenizer and the prompt-facing view of the
+        model.
+        """
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+        servers = self._ctx_router.servers
+        if not servers:
+            raise RuntimeError("No context servers are available")
+        server = servers[self._count_tokens_rr_counter % len(servers)]
+        self._count_tokens_rr_counter += 1
+        return await self._ctx_client.get_json("v1/models", ModelList, server)
 
     async def anthropic_count_tokens(
         self, request: AnthropicCountTokensRequest
