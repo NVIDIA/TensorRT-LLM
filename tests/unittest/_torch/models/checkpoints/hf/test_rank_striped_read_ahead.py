@@ -380,7 +380,8 @@ def test_disabled_weight_cache_does_not_force_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES", "0")
 
     loader = _rank_striped_loader()
-    loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+    with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()):
+        pass
 
     assert loader.last_checkpoint_io_status.activated
 
@@ -409,7 +410,8 @@ def test_reader_start_failure_cleans_up_and_falls_back(tmp_path, monkeypatch):
         mock.Mock(side_effect=RuntimeError("start failed")),
     )
 
-    weights = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+    with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()) as weights:
+        pass
 
     assert weights is native_weights
     assert close_file_descriptors
@@ -455,7 +457,8 @@ def test_advisory_read_failure_keeps_materialized_weights(tmp_path, monkeypatch)
         mock.Mock(side_effect=OSError("injected read failure")),
     )
 
-    weights = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+    with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()) as weights:
+        pass
 
     assert torch.equal(weights["model.norm.weight"], expected["model.norm.weight"])
     native_load.assert_not_called()
@@ -475,7 +478,8 @@ def test_mapping_and_materialization_failures_never_retry(tmp_path, monkeypatch)
     )
 
     with pytest.raises(RuntimeError, match="mapping failed"):
-        loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+        with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()):
+            pass
     native_load.assert_not_called()
 
     loader = _rank_striped_loader()
@@ -507,9 +511,12 @@ def test_native_and_rank_striped_outputs_match(tmp_path, monkeypatch):
     checkpoint_dir, expected = _write_checkpoint(tmp_path)
     native_loader = HfWeightLoader()
     native = native_loader.load_weights(str(checkpoint_dir), mapping=Mapping())
-    striped = _rank_striped_loader().load_weights(str(checkpoint_dir), mapping=Mapping())
+    striped_loader = _rank_striped_loader()
+    with striped_loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()) as striped:
+        pass
 
     assert native_loader.last_checkpoint_io_status.effective == "native"
+    assert striped_loader.last_checkpoint_io_status.effective == "rank_striped_read_ahead"
     assert set(native) == set(striped) == set(expected)
     for name, expected_tensor in expected.items():
         assert torch.equal(native[name], expected_tensor)
@@ -528,7 +535,8 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
     rank_striped_read_ahead._CHUNK_SIZE = 8
 
     success_loader = _rank_striped_loader()
-    success_weights = success_loader.load_weights(checkpoint_dir, mapping=mapping)
+    with success_loader.open_weight_session(checkpoint_dir, mapping=mapping) as success_weights:
+        pass
     success = success_loader.last_checkpoint_io_status.effective
     communicator.Barrier()
 
@@ -543,9 +551,10 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         fallback_failure_loader._load_weights_native = fail_after_native_load
     fallback_failure_error = None
     try:
-        fallback_failure_loader.load_weights(
+        with fallback_failure_loader.open_weight_session(
             checkpoint_dir, mapping=Mapping(world_size=1, rank=0, tp_size=1)
-        )
+        ):
+            pass
     except BaseException as error:
         fallback_failure_error = str(error)
     communicator.Barrier()
@@ -555,9 +564,10 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
     subgroup_error = None
     try:
         subgroup_loader = _rank_striped_loader(partial_model_loading=rank == 0)
-        subgroup_weights = subgroup_loader.load_weights(
+        with subgroup_loader.open_weight_session(
             checkpoint_dir, mapping=Mapping(world_size=1, rank=0, tp_size=1)
-        )
+        ) as subgroup_weights:
+            pass
         subgroup_effective = subgroup_loader.last_checkpoint_io_status.effective
     except BaseException as error:
         subgroup_error = f"{type(error).__name__}: {error}"
