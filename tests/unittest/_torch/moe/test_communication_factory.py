@@ -17,12 +17,18 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.moe.fused_moe import nccl_ep_utils
 from tensorrt_llm._torch.moe.fused_moe.communication import communication_factory
+from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided as one_sided_module
+from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_two_sided as two_sided_module
+from tensorrt_llm._torch.moe.fused_moe.communication import (
+    nvlink_two_sided_flashinfer as flashinfer_module,
+)
 from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter import (
     AllGatherReduceScatter,
 )
@@ -39,6 +45,7 @@ def _make_model_config(
         moe_tp_size=1,
         moe_ep_size=2,
         moe_ep_rank=0,
+        has_cp_helix=Mock(return_value=False),
     )
     return SimpleNamespace(
         mapping=mapping,
@@ -55,6 +62,116 @@ def _make_model_config(
 
 def _strategy_unavailable(*args, **kwargs):
     raise RuntimeError("strategy unavailable")
+
+
+@pytest.mark.parametrize("use_flashinfer", [False, True])
+def test_forced_two_sided_rejects_helix_before_workspace_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+    use_flashinfer: bool,
+) -> None:
+    model_config = _make_model_config()
+    model_config.mapping.has_cp_helix = Mock(return_value=True)
+    monkeypatch.setattr(
+        communication_factory.NVLinkTwoSided,
+        "is_platform_supported",
+        Mock(return_value=True),
+    )
+    monkeypatch.setattr(
+        communication_factory.NVLinkTwoSidedFlashinfer,
+        "is_platform_supported",
+        Mock(return_value=True),
+    )
+    native_initialize = Mock(side_effect=AssertionError("native allocation reached"))
+    flashinfer_symbols = Mock(side_effect=AssertionError("FlashInfer allocation reached"))
+    monkeypatch.setattr(two_sided_module.MnnvlMemory, "initialize", native_initialize)
+    monkeypatch.setattr(flashinfer_module, "_flashinfer_mnnvl", flashinfer_symbols)
+
+    with pytest.raises(ValueError, match="does not support Helix context parallelism"):
+        communication_factory.CommunicationFactory._create_forced_method(
+            "NVLINK_TWO_SIDED",
+            model_config,
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+            payload_in_workspace=False,
+            alltoall_result_do_sum=True,
+            use_flashinfer=use_flashinfer,
+            hidden_size=4096,
+        )
+
+    native_initialize.assert_not_called()
+    flashinfer_symbols.assert_not_called()
+
+
+def test_forced_one_sided_rejects_helix_before_workspace_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_config = _make_model_config()
+    model_config.mapping.world_size = model_config.mapping.moe_ep_size
+    model_config.mapping.has_cp_helix = Mock(return_value=True)
+    monkeypatch.setattr(
+        communication_factory.NVLinkOneSided,
+        "is_platform_supported",
+        Mock(return_value=True),
+    )
+    native_initialize = Mock(side_effect=AssertionError("native allocation reached"))
+    monkeypatch.setattr(one_sided_module.MnnvlMemory, "initialize", native_initialize)
+
+    with pytest.raises(ValueError, match="does not support Helix context parallelism"):
+        communication_factory.CommunicationFactory._create_forced_method(
+            "NVLINK_ONE_SIDED",
+            model_config,
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+            payload_in_workspace=False,
+            alltoall_result_do_sum=True,
+            use_flashinfer=False,
+            hidden_size=4096,
+        )
+
+    native_initialize.assert_not_called()
+
+
+def test_auto_selection_rejects_unrepurposed_helix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_config = _make_model_config()
+    model_config.mapping.world_size = model_config.mapping.moe_ep_size
+    model_config.mapping.has_cp_helix = Mock(return_value=True)
+    monkeypatch.setattr(
+        communication_factory.NVLinkOneSided,
+        "is_platform_supported",
+        Mock(return_value=True),
+    )
+    monkeypatch.setattr(
+        communication_factory.NVLinkTwoSided,
+        "is_platform_supported",
+        Mock(return_value=True),
+    )
+    monkeypatch.setattr(
+        communication_factory.NVLinkTwoSidedFlashinfer,
+        "is_platform_supported",
+        Mock(return_value=True),
+    )
+    native_initialize = Mock(side_effect=AssertionError("native allocation reached"))
+    flashinfer_symbols = Mock(side_effect=AssertionError("FlashInfer allocation reached"))
+    monkeypatch.setattr(one_sided_module.MnnvlMemory, "initialize", native_initialize)
+    monkeypatch.setattr(flashinfer_module, "_flashinfer_mnnvl", flashinfer_symbols)
+    with pytest.raises(ValueError, match="repurpose_helix_cp_to_tp"):
+        communication_factory.CommunicationFactory.create_strategy(
+            model_config,
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+            hidden_size=4096,
+        )
+
+    native_initialize.assert_not_called()
+    flashinfer_symbols.assert_not_called()
 
 
 def _install_failing_nccl_module(monkeypatch: pytest.MonkeyPatch, error: BaseException):

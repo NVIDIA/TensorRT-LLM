@@ -697,6 +697,20 @@ def test_collect_llm_api_config_captures_gms_load_format():
     assert meta["capture_succeeded"] is True
 
 
+def test_collect_llm_api_config_captures_checkpoint_io_policy() -> None:
+    for policy in ("auto", "rank_striped_read_ahead"):
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            checkpoint_io_policy=policy,
+        )
+
+        config, meta = _loads_payloads(args)
+
+        assert config["checkpoint_io_policy"] == policy
+        assert meta["capture_succeeded"] is True
+
+
 def _walk_captured_keys(model) -> set[str]:
     """Capture a single nested config model and return its captured keys."""
     config, _ = _loads_payloads(model)
@@ -762,8 +776,12 @@ def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
     assert _walk_captured_keys(SkipSoftmaxAttentionConfig()) >= {"algorithm"}
 
 
-def test_background_reporter_keeps_initial_report_when_config_capture_fails(monkeypatch):
+def test_background_reporter_keeps_initial_report_when_config_capture_fails(
+    monkeypatch, enable_telemetry
+):
     sent_payloads = []
+
+    assert usage_lib.apply_usage_session_config()
 
     monkeypatch.setattr(usage_lib, "_MAX_HEARTBEATS", 0)
     monkeypatch.setattr(usage_lib, "_get_trtllm_version", lambda: "0.0.0-test")

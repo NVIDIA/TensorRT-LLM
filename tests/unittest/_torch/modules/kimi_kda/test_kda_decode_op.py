@@ -11,12 +11,13 @@ from torch.profiler import ProfilerActivity, profile
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention, _kda_decode  # noqa: E402
-from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (  # noqa: E402
+from kimi_kda_test_utils import (  # noqa: E402
     KimiKDAReference,
     KimiKDATestCachedState,
     get_production_decode_kernel_path,
 )
+
+from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention, _kda_decode  # noqa: E402
 
 # 73: deliberately odd and > 64 to cover non-power-of-two batched decode.
 BATCH_SIZE = 73
@@ -466,6 +467,90 @@ def _make_direct_decode_args(
         "cu_seqlens": torch.arange(batch_size + 1, dtype=torch.int32, device=device),
         "lower_bound": -5.0,
     }
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("num_heads", [2, 32], ids=["compact-heads", "many-heads"])
+def test_decode_reads_row_strided_projection_slices(num_heads: int) -> None:
+    """Fused-projection views match packed inputs with direct W-1 updates."""
+    torch.manual_seed(2)
+    batch_size = 5
+    args = _make_direct_decode_args(batch_size, num_heads, indexed_state=True)
+    projection_size = num_heads * HEAD_DIM
+    slots = args["state"].shape[0]
+    initial_conv_pool = torch.randn(
+        slots,
+        3 * projection_size,
+        CONV_KERNEL_SIZE - 1,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    for name in ("g", "beta", "onorm_g"):
+        args[name].normal_(std=0.01)
+
+    def clone_args(conv_pool: torch.Tensor) -> dict:
+        cloned = {
+            name: value.clone() if isinstance(value, torch.Tensor) else value
+            for name, value in args.items()
+            if name not in ("cs_q", "cs_k", "cs_v")
+        }
+        cloned.update(
+            cs_q=conv_pool[:, :projection_size],
+            cs_k=conv_pool[:, projection_size : 2 * projection_size],
+            cs_v=conv_pool[:, 2 * projection_size :],
+            update_conv_cache=True,
+        )
+        return cloned
+
+    packed_conv_pool = initial_conv_pool.clone()
+    packed_args = clone_args(packed_conv_pool)
+    packed_output = _kda_decode.run_kda_decode_fusion_cuda(**packed_args)
+
+    # One wide row exercises every supported per-token row stride at once.
+    row_width = 5 * projection_size + num_heads
+    projection = torch.empty(
+        batch_size,
+        row_width,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    for section, name in enumerate(("x_q", "x_k", "x_v", "onorm_g", "g")):
+        projection[:, section * projection_size : (section + 1) * projection_size] = args[
+            name
+        ].view(batch_size, projection_size)
+    projection[:, 5 * projection_size :] = args["beta"].view(batch_size, num_heads)
+
+    qkvg = (
+        projection[:, : 4 * projection_size]
+        .unflatten(-1, (4, num_heads, HEAD_DIM))
+        .permute(1, 0, 2, 3)
+    )
+    strided_g = (
+        projection[:, 4 * projection_size : 5 * projection_size]
+        .unflatten(-1, (num_heads, HEAD_DIM))
+        .unsqueeze(0)
+    )
+    strided_beta = projection[:, 5 * projection_size :].unsqueeze(0)
+    assert not qkvg[0:1].is_contiguous()
+    assert not strided_g.is_contiguous()
+    assert not strided_beta.is_contiguous()
+
+    strided_conv_pool = initial_conv_pool.clone()
+    strided_args = clone_args(strided_conv_pool)
+    strided_args.update(
+        x_q=qkvg[0:1],
+        x_k=qkvg[1:2],
+        x_v=qkvg[2:3],
+        onorm_g=qkvg[3:4],
+        g=strided_g,
+        beta=strided_beta,
+    )
+    strided_output = _kda_decode.run_kda_decode_fusion_cuda(**strided_args)
+
+    torch.testing.assert_close(strided_output, packed_output, rtol=0, atol=0)
+    torch.testing.assert_close(strided_args["state"], packed_args["state"], rtol=0, atol=0)
+    torch.testing.assert_close(strided_conv_pool, packed_conv_pool, rtol=0, atol=0)
+    torch.testing.assert_close(strided_conv_pool[0], initial_conv_pool[0], rtol=0, atol=0)
 
 
 def _profile_decode_backend(kwargs: dict) -> str:
