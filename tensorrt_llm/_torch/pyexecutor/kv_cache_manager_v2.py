@@ -83,12 +83,7 @@ from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to
 from ...logger import logger
 from ...mapping import Mapping
 from ..utils import maybe_compile
-from .config_utils import (
-    get_gemma4_layer_head_dim,
-    get_gemma4_layer_num_kv_heads,
-    is_gemma4_hybrid,
-    uses_vswa_kv_cache_layout,
-)
+from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -412,16 +407,13 @@ def _get_static_cache_size_layer_components(
     kv_cache_config: Optional[KvCacheConfig] = None,
 ) -> tuple[List[int], List[Optional[int]]]:
     config = model_config.pretrained_config
+    layer_specs = getattr(model_config, "kv_cache_layer_specs", None)
 
     mla = hasattr(config, "kv_lora_rank") and config.kv_lora_rank is not None
     if mla:
         cache_sizes_per_token = [config.kv_lora_rank + config.qk_rope_head_dim]
         layer_indices = None
-    elif is_gemma4_hybrid(config):
-        # Static sizing runs before a manager exists. Gemma4 exposes its
-        # variable head and KV-head geometry only through per-layer configs,
-        # so mirror the constructor inputs here instead of reading ambiguous
-        # global attributes.
+    elif layer_specs:
         if num_layers is None:
             layer_indices = mapping.pp_layers(model_config.get_num_attention_layers())
         else:
@@ -432,11 +424,10 @@ def _get_static_cache_size_layer_components(
         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
         cache_sizes_per_token = []
         for layer_idx in layer_indices:
-            config_layer_idx = layer_idx % config.num_hidden_layers
-            num_kv_heads = get_gemma4_layer_num_kv_heads(config, config_layer_idx)
+            layer_spec = layer_specs[layer_idx % len(layer_specs)]
+            num_kv_heads = layer_spec.num_kv_heads
             num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
-            head_dim = get_gemma4_layer_head_dim(config, config_layer_idx)
-            cache_sizes_per_token.append(2 * head_dim * num_kv_heads)
+            cache_sizes_per_token.append(2 * layer_spec.head_dim * num_kv_heads)
     else:
         num_key_value_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
         if isinstance(num_key_value_heads, Iterable):
@@ -473,6 +464,12 @@ def _get_static_cache_size_layer_components(
         layer_sizes = [get_layer_size(size) for size in cache_sizes_per_token]
         assert len(layer_sizes) == num_attention_layers
     window_pattern = kv_cache_config.max_attention_window if kv_cache_config is not None else None
+    if (
+        window_pattern is None
+        and layer_specs
+        and any(spec.attention_window is not None for spec in layer_specs)
+    ):
+        window_pattern = [spec.attention_window for spec in layer_specs]
 
     # Static estimation accepts an unknown max_seq_len and treats recurrent-state
     # sentinels as full-attention cost. Runtime resolution must preserve those

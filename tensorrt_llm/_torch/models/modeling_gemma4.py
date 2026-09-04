@@ -17,7 +17,18 @@
 import copy
 import dataclasses
 import math
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Literal,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import torch
 import torch.nn.functional as F
@@ -50,7 +61,7 @@ from ..attention_backend.interface import (
 )
 from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..model_config import ModelConfig
+from ..model_config import KVCacheLayerSpec, ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
@@ -63,7 +74,6 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
-from ..pyexecutor.config_utils import get_gemma4_layer_head_dim, get_gemma4_layer_num_kv_heads
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
 from .modeling_speculative import (
@@ -87,6 +97,79 @@ if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
     )
 
 from transformers import Gemma4TextConfig  # noqa: E402
+
+
+class _NamedLayerType(Protocol):
+    name: str
+
+
+_LayerType = Union[str, _NamedLayerType]
+
+
+class _Gemma4LayerGeometry(Protocol):
+    head_dim: int
+    num_key_value_heads: int
+
+
+def _is_gemma4_sliding_layer(layer_type: _LayerType) -> bool:
+    """Return whether a Gemma4 layer type denotes sliding attention."""
+    layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
+    return "sliding" in layer_type_name
+
+
+def _get_gemma4_per_layer_config(
+    config: Gemma4TextConfig,
+    layer_idx: int,
+) -> Optional[_Gemma4LayerGeometry]:
+    """Return concrete layer geometry when Transformers provides it."""
+    per_layer_config = getattr(config, "per_layer_config", None)
+    if per_layer_config is None:
+        return None
+    return cast(Sequence[_Gemma4LayerGeometry], per_layer_config)[layer_idx]
+
+
+def _get_gemma4_layer_head_dim(config: Gemma4TextConfig, layer_idx: int) -> int:
+    """Resolve one layer's head dimension across Gemma4 config schemas."""
+    layer_config = _get_gemma4_per_layer_config(config, layer_idx)
+    if layer_config is not None:
+        return layer_config.head_dim
+
+    head_dim = config.head_dim
+    if _is_gemma4_sliding_layer(config.layer_types[layer_idx]):
+        return head_dim
+    global_head_dim = getattr(config, "global_head_dim", None)
+    return global_head_dim if global_head_dim is not None else head_dim
+
+
+def _get_gemma4_layer_num_kv_heads(config: Gemma4TextConfig, layer_idx: int) -> int:
+    """Resolve one layer's KV-head count across Gemma4 config schemas."""
+    layer_config = _get_gemma4_per_layer_config(config, layer_idx)
+    if layer_config is not None:
+        return layer_config.num_key_value_heads
+
+    num_kv_heads = config.num_key_value_heads
+    is_sliding = _is_gemma4_sliding_layer(config.layer_types[layer_idx])
+    if not is_sliding and getattr(config, "attention_k_eq_v", False):
+        return getattr(config, "num_global_key_value_heads", None) or num_kv_heads
+    return num_kv_heads
+
+
+def _get_gemma4_kv_cache_layer_specs(config: Gemma4TextConfig) -> list[KVCacheLayerSpec]:
+    """Translate Gemma4 config schemas into model-agnostic KV geometry."""
+    sliding_window = getattr(config, "sliding_window", None)
+    return [
+        KVCacheLayerSpec(
+            head_dim=_get_gemma4_layer_head_dim(config, layer_idx),
+            num_kv_heads=_get_gemma4_layer_num_kv_heads(config, layer_idx),
+            attention_window=(
+                int(sliding_window)
+                if sliding_window is not None
+                and _is_gemma4_sliding_layer(config.layer_types[layer_idx])
+                else None
+            ),
+        )
+        for layer_idx in range(config.num_hidden_layers)
+    ]
 
 
 def _gemma4_rope_max_positions(model_config: ModelConfig) -> int:
@@ -263,8 +346,8 @@ class Gemma4Attention(QKNormRoPEAttention):
         # per_layer_config, while older versions keep flat global fields.
         # Resolve both schemas without enabling ambiguous global access.
         use_k_eq_v = getattr(config, "attention_k_eq_v", False) and not is_sliding
-        layer_head_dim = get_gemma4_layer_head_dim(config, geometry_layer_idx)
-        layer_num_kv_heads = get_gemma4_layer_num_kv_heads(config, geometry_layer_idx)
+        layer_head_dim = _get_gemma4_layer_head_dim(config, geometry_layer_idx)
+        layer_num_kv_heads = _get_gemma4_layer_num_kv_heads(config, geometry_layer_idx)
 
         # Build RoPE params per layer type
         rope_params = RopeParams()
@@ -1076,6 +1159,9 @@ class Gemma4DecoderLayer(DecoderLayer):
 # ---------------------------------------------------------------------------
 class Gemma4TextModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Gemma4TextConfig]):
+        model_config.set_kv_cache_layer_specs(
+            _get_gemma4_kv_cache_layer_specs(model_config.pretrained_config)
+        )
         super().__init__(model_config)
         config = self.model_config
         pretrained = config.pretrained_config

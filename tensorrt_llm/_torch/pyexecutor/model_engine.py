@@ -58,6 +58,7 @@ from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
+from ..model_config import ModelConfig
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
                                                 _build_request_multimodal_input)
@@ -81,8 +82,7 @@ from ..utils import (get_model_extra_attrs,
                      set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from .config_utils import (get_gemma4_layer_num_kv_heads, is_gemma4_hybrid,
-                           is_mla)
+from .config_utils import is_mla
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
@@ -119,14 +119,13 @@ def resolve_mamba_metadata_cls(model: torch.nn.Module) -> Type[Mamba2Metadata]:
     return getattr(model, 'mamba_metadata_cls', None) or Mamba2Metadata
 
 
-def _get_num_heads_per_kv(config) -> int:
+def _get_num_heads_per_kv(model_config: ModelConfig) -> int:
     """Return the largest GQA ratio required by the model's attention layers."""
+    config = model_config.pretrained_config
     num_attention_heads = getattr(config, "num_attention_heads", None)
-    if is_gemma4_hybrid(config):
-        num_key_value_heads = [
-            get_gemma4_layer_num_kv_heads(config, layer_idx)
-            for layer_idx in range(config.num_hidden_layers)
-        ]
+    layer_specs = model_config.kv_cache_layer_specs
+    if layer_specs:
+        num_key_value_heads = [spec.num_kv_heads for spec in layer_specs]
     else:
         num_key_value_heads = getattr(config, "num_key_value_heads", None)
 
@@ -3484,7 +3483,7 @@ class PyTorchModelEngine(ModelEngine):
                 or self.attn_runtime_features.chunked_prefill)
         cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
         config = self.model.model_config.pretrained_config
-        num_heads_per_kv = _get_num_heads_per_kv(config)
+        num_heads_per_kv = _get_num_heads_per_kv(self.model.model_config)
 
         metadata_cls = self.attn_backend.Metadata
         sparse_metadata_params = (

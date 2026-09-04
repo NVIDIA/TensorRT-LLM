@@ -44,11 +44,7 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4MoeRoutingMethod,
     Gemma4TextModel,
     Gemma4TextScaledWordEmbedding,
-)
-from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_gemma4_layer_head_dim,
-    get_gemma4_layer_num_kv_heads,
-    is_gemma4_hybrid,
+    _get_gemma4_kv_cache_layer_specs,
 )
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -283,23 +279,18 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
     def test_model_instantiation_with_heterogeneous_transformers_config(self):
         """Model construction must use concrete per-layer attention geometry."""
         model_config = _make_heterogeneous_model_config()
-
-        self.assertTrue(is_gemma4_hybrid(model_config.pretrained_config))
         model = Gemma4ForCausalLM(model_config)
+        layer_specs = model.model_config.kv_cache_layer_specs
+        self.assertIsNotNone(layer_specs)
+        self.assertTrue(model.model_config.has_variable_kv_cache_geometry())
 
         for layer_idx, layer in enumerate(model.model.layers):
             expected_head_dim = 64 if layer.is_sliding else 128
             expected_num_kv_heads = 2 if layer.is_sliding else 1
             self.assertEqual(layer.self_attn.head_dim, expected_head_dim)
             self.assertEqual(layer.self_attn.num_key_value_heads, expected_num_kv_heads)
-            self.assertEqual(
-                get_gemma4_layer_head_dim(model_config.pretrained_config, layer_idx),
-                expected_head_dim,
-            )
-            self.assertEqual(
-                get_gemma4_layer_num_kv_heads(model_config.pretrained_config, layer_idx),
-                expected_num_kv_heads,
-            )
+            self.assertEqual(layer_specs[layer_idx].head_dim, expected_head_dim)
+            self.assertEqual(layer_specs[layer_idx].num_kv_heads, expected_num_kv_heads)
 
     def test_model_instantiation_moe(self):
         """Create with MoE enabled and verify MoE layers exist."""
@@ -1014,6 +1005,8 @@ class TestGemma4HeterogeneousKVCacheLayout(unittest.TestCase):
                 self.kwargs = kwargs
 
         model_config = _make_heterogeneous_model_config(GEMMA4_12B_REAL_DIMS_CONFIG)
+        model = Gemma4ForCausalLM(model_config)
+        model_config = model.model_config
         max_seq_len = 8192
         manager = _create_kv_cache_manager(
             model_engine=None,
@@ -1062,9 +1055,8 @@ def _build_gemma4_kv_cache_manager(
 ):
     """Create KVCacheManagerV2 supporting Gemma4 per-layer head_dim / kv_heads.
 
-    Mirrors ``Gemma4Attention``'s layout (global kv heads only for K=V layers)
-    and the ``_util.py::is_gemma4_hybrid`` VSWA pool grouping so the page
-    sizes line up with what the model actually requests at runtime.
+    Uses the model adapter's normalized KV layer specs so the page sizes line
+    up with what the model requests at runtime.
     """
     import tensorrt_llm
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
@@ -1078,12 +1070,9 @@ def _build_gemma4_kv_cache_manager(
         kv_dtype = tensorrt_llm.bindings.DataType.BF16
 
     layer_types = config.layer_types
-    head_dim_per_layer = [
-        get_gemma4_layer_head_dim(config, layer_idx) for layer_idx in range(len(layer_types))
-    ]
-    num_kv_heads_per_layer = [
-        get_gemma4_layer_num_kv_heads(config, layer_idx) for layer_idx in range(len(layer_types))
-    ]
+    layer_specs = _get_gemma4_kv_cache_layer_specs(config)
+    head_dim_per_layer = [spec.head_dim for spec in layer_specs]
+    num_kv_heads_per_layer = [spec.num_kv_heads for spec in layer_specs]
 
     # Use scalar if all layers have same value
     head_dim = head_dim_per_layer if len(set(head_dim_per_layer)) > 1 else head_dim_per_layer[0]

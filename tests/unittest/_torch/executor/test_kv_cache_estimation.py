@@ -18,10 +18,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import KVCacheLayerSpec, ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
-from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window, is_gemma4_hybrid
+from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     _get_static_cache_size_layer_components,
@@ -735,53 +735,56 @@ def test_v2_static_cache_size_preserves_window_pattern_phase_across_pp() -> None
     assert cache_cost == CacheCost(slope=64, intercept=0)
 
 
-def test_gemma4_12b_v2_static_sizing_uses_per_layer_geometry() -> None:
-    gemma_layer_types = [
-        "sliding_attention" if (layer_idx + 1) % 6 else "full_attention" for layer_idx in range(12)
-    ]
+@pytest.mark.parametrize(
+    ("tp_size", "enable_attention_dp", "expected_sliding_layer_size"),
+    [
+        (1, False, 8192),
+        (8, False, 1024),
+        (8, True, 8192),
+    ],
+)
+def test_v2_static_sizing_uses_model_provided_per_layer_geometry(
+    tp_size: int,
+    enable_attention_dp: bool,
+    expected_sliding_layer_size: int,
+) -> None:
+    layer_specs = tuple(
+        KVCacheLayerSpec(
+            head_dim=256 if (layer_idx + 1) % 6 else 512,
+            num_kv_heads=8 if (layer_idx + 1) % 6 else 1,
+            attention_window=128 if (layer_idx + 1) % 6 else None,
+        )
+        for layer_idx in range(12)
+    )
 
-    class StrictGemma4TextConfig:
-        model_type = "gemma4_text"
+    class StrictConfig:
         num_hidden_layers = 12
         num_attention_heads = 16
         hidden_size = 3840
         vocab_size = 262_144
-        layer_types = gemma_layer_types
-        per_layer_attributes = {"head_dim", "num_key_value_heads"}
-        per_layer_config = [
-            SimpleNamespace(
-                head_dim=256 if layer_type == "sliding_attention" else 512,
-                num_key_value_heads=8 if layer_type == "sliding_attention" else 1,
-            )
-            for layer_type in gemma_layer_types
-        ]
 
         def __getattribute__(self, name: str) -> object:
-            if name in {
-                "global_head_dim",
-                "head_dim",
-                "num_global_key_value_heads",
-                "num_key_value_heads",
-            }:
-                raise RuntimeError(f"ambiguous global per-layer attribute: {name}")
+            if name in {"head_dim", "num_key_value_heads"}:
+                raise RuntimeError(f"global geometry must not be read: {name}")
             return super().__getattribute__(name)
 
     class FakeModelConfig:
         quant_config = None
-        pretrained_config = StrictGemma4TextConfig()
+        pretrained_config = StrictConfig()
+        kv_cache_layer_specs = layer_specs
 
         def get_num_attention_layers(self) -> int:
             return self.pretrained_config.num_hidden_layers
 
     model_config = FakeModelConfig()
-    mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    max_seq_len = 8192
-    kv_cache_config = KvCacheConfig(
-        max_attention_window=[
-            128 if layer_type == "sliding_attention" else max_seq_len
-            for layer_type in model_config.pretrained_config.layer_types
-        ]
+    mapping = Mapping(
+        world_size=tp_size,
+        tp_size=tp_size,
+        rank=0,
+        enable_attention_dp=enable_attention_dp,
     )
+    max_seq_len = 8192
+    kv_cache_config = KvCacheConfig()
 
     layer_sizes, attention_windows = _get_static_cache_size_layer_components(
         model_config,
@@ -790,13 +793,10 @@ def test_gemma4_12b_v2_static_sizing_uses_per_layer_geometry() -> None:
         kv_cache_config=kv_cache_config,
     )
     expected_layer_sizes = [
-        8192 if layer_type == "sliding_attention" else 2048
-        for layer_type in model_config.pretrained_config.layer_types
+        expected_sliding_layer_size if spec.attention_window is not None else 2048
+        for spec in layer_specs
     ]
-    expected_windows = [
-        128 if layer_type == "sliding_attention" else None
-        for layer_type in model_config.pretrained_config.layer_types
-    ]
+    expected_windows = [spec.attention_window for spec in layer_specs]
     assert layer_sizes == expected_layer_sizes
     assert attention_windows == expected_windows
     assert CacheCost.from_raw(
@@ -810,21 +810,8 @@ def test_gemma4_12b_v2_static_sizing_uses_per_layer_geometry() -> None:
         )
     ) == CacheCost(
         slope=2 * 2048,
-        intercept=10 * 128 * 8192,
+        intercept=10 * 128 * expected_sliding_layer_size,
     )
-
-
-@pytest.mark.parametrize(
-    "model_type",
-    ["gemma4_unified", "gemma4_unified_audio", "qwen3_text"],
-)
-def test_is_gemma4_hybrid_rejects_non_text_configs(model_type: str) -> None:
-    config = SimpleNamespace(
-        model_type=model_type,
-        per_layer_attributes={"head_dim"},
-        per_layer_config=[SimpleNamespace(head_dim=256), SimpleNamespace(head_dim=512)],
-    )
-    assert not is_gemma4_hybrid(config)
 
 
 def test_creator_uses_v2_affine_cache_cost():

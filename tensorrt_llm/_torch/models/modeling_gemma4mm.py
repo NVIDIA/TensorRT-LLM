@@ -914,6 +914,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        layer_specs = self.llm.model_config.kv_cache_layer_specs
+        if layer_specs is not None:
+            self.model_config.set_kv_cache_layer_specs(layer_specs)
 
     @property
     def draft_config(self):
