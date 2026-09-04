@@ -3012,6 +3012,10 @@ def testFilter = [
     (INFRA_DRY_RUN): false,
 ]
 
+def isPipelineMonitorSingleGpuTestMode() {
+    return env.JOB_NAME ==~ /LLM\/PipelineMonitor\/L0_Test-(x86_64|SBSA)-Single-GPU/
+}
+
 @Field
 def GITHUB_PR_API_URL = "github_pr_api_url"
 @Field
@@ -7207,6 +7211,10 @@ pipeline {
         stage("Test") {
             steps {
                 script {
+                    if (isPipelineMonitorSingleGpuTestMode()) {
+                        echo "[TEST MODE] Skipping GPU test execution in ${env.JOB_NAME} and returning SUCCESS."
+                        return
+                    }
                     // Default scope map so the image-sanity path (which does not
                     // build one) still has a value for runBranchesWithInfraDefer;
                     // launchTestJobs overwrites this with per-stage scopes.
