@@ -230,7 +230,9 @@ public:
     // ---- Page index queries ------------------------------------------------
 
     // Get base page indices (slot_id) for beamIdx × layerGroupId.
-    // Returns a non-owning Span into the internal page-index buffer.
+    // Returns a non-owning Span into the page-index buffer (owned by this KvCache, or by the
+    // caller when set via setBasePageIndexBuf). The span is valid until the next resize(),
+    // setBasePageIndexBuf() or close(); its contents are also rewritten by suspend()/resume().
     Span<int const> getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
 
     // Get aggregated (slot-level) page indices for one layer group + beam.
