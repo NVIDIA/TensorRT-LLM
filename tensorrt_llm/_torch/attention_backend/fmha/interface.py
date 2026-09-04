@@ -99,6 +99,16 @@ class Fmha(ABC):
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
+        """Return whether this library can serve the given attention layer.
+
+        Evaluated once per ``FmhaManager`` construction, currently at the end
+        of ``TrtllmAttention.update_quant_config()``. Conditions must depend
+        only on state finalized before manager construction and invariant for
+        its lifetime. Reading state that a model rewrites later, such as a
+        remapped ``layer_idx``, silently leaves the library list stale because
+        it is not revalidated. Request-varying conditions belong in
+        ``is_supported`` instead.
+        """
         return True
 
     def is_supported(
