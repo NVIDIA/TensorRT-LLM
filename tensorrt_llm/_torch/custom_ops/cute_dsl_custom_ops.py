@@ -43,6 +43,7 @@ except ImportError:
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
 _CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
 _CUTEDSL_FC2_N_TILE_SIZES = (128, 256)
+_CUTEDSL_FC2_DEFAULT_N_TILE_SIZE = 128
 
 
 def _with_input_cuda_device(function):
@@ -125,15 +126,17 @@ def _get_sm107_nvfp4_default_mma_config(
 
 @functools.lru_cache(maxsize=1)
 def _get_cutedsl_fc2_n_tile_size_override() -> Optional[int]:
-    value = os.environ.get(_CUTEDSL_FC2_N_TILE_SIZE_ENV)
-    if value is None:
+    value = os.environ.get(
+        _CUTEDSL_FC2_N_TILE_SIZE_ENV,
+        str(_CUTEDSL_FC2_DEFAULT_N_TILE_SIZE),
+    )
+    if value == "0":
         return None
     valid_values = tuple(
         str(tile_size) for tile_size in _CUTEDSL_FC2_N_TILE_SIZES)
     if value not in valid_values:
-        raise ValueError(
-            f"{_CUTEDSL_FC2_N_TILE_SIZE_ENV} must be unset or one of "
-            f"{', '.join(valid_values)}; got {value!r}")
+        raise ValueError(f"{_CUTEDSL_FC2_N_TILE_SIZE_ENV} must be 0 or one of "
+                         f"{', '.join(valid_values)}; got {value!r}")
     return int(value)
 
 
