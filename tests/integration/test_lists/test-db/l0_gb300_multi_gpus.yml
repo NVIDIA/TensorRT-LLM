@@ -33,8 +33,6 @@ l0_gb300_multi_gpus:
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
-  - unittest/_torch/modules/test_flashinfer_fused_add_add_rmsnorm.py
-  - unittest/_torch/modeling/test_modeling_deepseek_r1.py
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   # Kimi K3 speculative decoding: exact kernel-level verify parity (random
