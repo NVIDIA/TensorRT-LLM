@@ -454,6 +454,15 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend
   - examples/visual_gen/test_visual_gen_wan.py::test_wan21_t2v_lpips_against_golden
   - examples/visual_gen/test_visual_gen_wan.py::test_wan22_t2v_lpips_against_golden
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_authorized_artifact_paths_fail_closed
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_golden_digest_is_pinned
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_golden_runtime_provenance_is_complete
+  # Run real-checkpoint cases only when approved artifacts are explicitly provisioned.
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_loads_and_runs TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_fp8_compile_smoke TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_t2va_diffusers_lpips_and_audio_golden TIMEOUT (60)
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
   # QwenImage ~5 min, Cosmos3-Nano T2I ~3 min, and T2V ~5 min.
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
