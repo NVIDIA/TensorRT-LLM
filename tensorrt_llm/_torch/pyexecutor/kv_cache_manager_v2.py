@@ -986,8 +986,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # left alone and rejected loudly at bring-up.
             #
             # That leaves the scheduler without a tier to spill to, where
-            # suspension frees nothing. What reclaims pages instead is
-            # preemption -- see KVCacheManagerV2.preempt_request.
+            # suspension frees nothing, so pages are reclaimed by preemption
+            # instead. See KVCacheManagerV2.preempt_request.
             host_quota = 0
             logger.info(
                 "KV cache manager v2 host tier disabled: a KV connector is attached "
@@ -1175,7 +1175,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
         self._early_freed_index_requests: set[int] = set()
         # Requests whose pages a connector is still reading from, so the
-        # release half of `preempt_request` has to wait. See that method.
+        # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, LlmRequest] = {}
         self._prepare_page_table_tensor(index_mapper_capacity)
 
@@ -2620,11 +2620,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
     # ---- preemption ----
     #
-    # Suspension is the cheap way to free pages, but it only unpins them: the
-    # eviction controller then migrates them one cache level down. With GPU as
-    # the last level a suspended page stays `HELD`, which
-    # `CacheLevelManager.is_evictable` refuses to evict, so suspension frees
-    # nothing and the scheduler has no way out of a full pool.
+    # Suspension only unpins pages; the eviction controller then migrates them
+    # one cache level down. With GPU as the last level a suspended page stays
+    # `HELD`, which `CacheLevelManager.is_evictable` refuses to evict, so
+    # suspension frees nothing and the scheduler has no way out of a full pool.
     #
     # Preemption is the fallback for that case. It gives the pages up instead
     # of parking them, which costs a re-prefill but always works.
@@ -2642,33 +2641,32 @@ class KVCacheManagerV2(BaseResourceManager):
         """Give up *req*'s KV cache so its pages can be reclaimed.
 
         Unlike :meth:`suspend_request` this does not keep the pages. Closing
-        the request's ``_KVCache`` returns its committed blocks to the radix
-        tree as reusable prefix and leaves their pages ``DROPPABLE``, which is
-        evictable at every level -- including the last, where ``HELD`` is not.
-        So the data is not thrown away: it stays resident and locally matchable
-        until something else actually needs the space.
+        the request's `_KVCache` returns its committed blocks to the radix tree
+        as reusable prefix and leaves their pages `DROPPABLE`, which is
+        evictable at every level, unlike `HELD`. The data is not thrown away:
+        it stays resident and locally matchable until something else needs the
+        space.
 
         The request is reset to context state by the caller and re-prefills
-        whatever it can no longer match. With a connector attached the blocks
-        it already wrote to the store come back through the ordinary prefix
-        load, so the reload is usually cheap, and recompute is the
-        always-correct fallback when the store no longer has them.
+        whatever it can no longer match. With a connector attached, blocks it
+        already wrote to the store come back through the ordinary prefix load,
+        and recompute is the fallback when the store no longer has them.
 
         Returns True when the pages were released. When the connector still has
-        saves in flight the release is deferred and this returns False: those
-        saves read directly out of these pages, so freeing them now would let a
-        later request overwrite the bytes mid-transfer and publish them to the
-        store under a valid hash. Callers must not count on the pages until
+        saves in flight the release is deferred and this returns False, because
+        those saves read directly out of these pages: freeing them now would
+        let a later request overwrite the bytes mid-transfer and publish them
+        under a valid hash. Callers must not count on the pages until
         :meth:`try_complete_preemption` has run for this request.
         """
         if self.kv_connector_manager is None:
             self._release_preempted(req)
             return True
 
-        # Same handshake the finish path uses, for the same reason. The
-        # request lands in DISAGG_CONTEXT_TRANS_IN_PROGRESS, out of the
-        # schedulable range, and its `_KVCache` keeps holding the pages until
-        # every rank reports the save retired through `get_finished`.
+        # The same handshake the finish path uses: the request lands in
+        # DISAGG_CONTEXT_TRANS_IN_PROGRESS, out of the schedulable range, and
+        # its `_KVCache` keeps holding the pages until every rank reports the
+        # save retired through `get_finished`.
         if self.kv_connector_manager.request_finished(
             req, self.get_connector_page_indices(req)
         ):
@@ -2682,8 +2680,8 @@ class KVCacheManagerV2(BaseResourceManager):
         """Release pages for a request whose deferred preemption just cleared.
 
         Returns False when *req* was not awaiting preemption, which is how the
-        caller tells a preempted request apart from an ordinary finished one
-        in the connector's ``get_finished`` output.
+        caller tells a preempted request apart from an ordinary finished one in
+        the connector's `get_finished` output.
         """
         if self._pending_preemption.pop(req.py_request_id, None) is None:
             return False
@@ -2693,8 +2691,8 @@ class KVCacheManagerV2(BaseResourceManager):
     def _release_preempted(self, req: LlmRequest) -> None:
         self.free_resources(req)
         # Ask the connector again on re-admission rather than reusing the
-        # memoised offer: the store has strictly more of this prefix now than
-        # it did when the request was first admitted.
+        # memoised offer, since the store now has more of this prefix than it
+        # did when the request was first admitted.
         req.py_connector_prefix_start = None
         req.py_connector_prefix_end = None
         req.py_connector_load_async = False
@@ -3519,7 +3517,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
         # its saves drain. Dropping the entry here keeps a dead request from
-        # blocking every later preemption via has_pending_preemption().
+        # blocking every later preemption through has_pending_preemption.
         self._pending_preemption.pop(request.py_request_id, None)
         self._release_undelivered_connector_prefix(request)
         if self.conversation_manager is not None:

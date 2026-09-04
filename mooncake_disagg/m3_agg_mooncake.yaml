@@ -46,7 +46,7 @@ kv_cache_config:
     # CONNECTOR: was host_cache_size: 388554555392.
     # _reject_non_gpu_cache_tiers rejects every tier below GPU, because a
     # registered region is only a valid device address while its page stays
-    # pinned to GPU -- eviction reassigns the slot. Both must be an explicit
+    # pinned to GPU, and eviction reassigns the slot. Both must be an explicit
     # 0: V2 provisions a host tier when the field is left at its default of
     # None, which is falsy but still yields a tier.
     host_cache_size: 0

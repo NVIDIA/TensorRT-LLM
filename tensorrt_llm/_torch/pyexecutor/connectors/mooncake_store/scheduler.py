@@ -16,7 +16,7 @@
 
 Runs only on rank 0. It decides what to load and what to save; the workers do
 the moving. Two pieces of bookkeeping make that possible, and both exist because
-``KVCacheManagerV2`` reports ``RequestData.block_hashes`` empty:
+`KVCacheManagerV2` reports `RequestData.block_hashes` empty:
 
 * a hash chain per request, so a block has a content identity at all;
 * the page slot index per block ordinal, accumulated across iterations. The
@@ -63,7 +63,7 @@ class _RequestState:
         self.pages: Dict[int, List[int]] = {}
         #: First block ordinal not yet considered for saving.
         self.saved_upto = 0
-        #: The offer made by ``get_num_new_matched_tokens``, in block ordinals.
+        #: The offer made by `get_num_new_matched_tokens`, in block ordinals.
         self.load_first_block = 0
         self.load_blocks = 0
         self.emitted_saves = False
@@ -106,7 +106,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             num_computed_tokens: Tokens already matched in the local KV cache.
 
         Returns:
-            Tokens the store can supply, and ``False`` for a synchronous load.
+            Tokens the store can supply, and `False` for a synchronous load.
         """
         tokens = request.get_tokens(0)
         state = self._state_for(request, tokens)
@@ -148,7 +148,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         """Drop offered blocks whose tokens the runtime will not consume.
 
         Loads here are synchronous and nothing has been transferred yet, so this
-        is exact: the offer is truncated before ``build_connector_meta`` turns it
+        is exact: the offer is truncated before `build_connector_meta` turns it
         into work.
         """
         state = self._requests.get(request.request_id)
@@ -166,8 +166,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
         """No-op: page indices are read from the scheduler output instead.
 
-        The flat ``block_ids`` here are a single space, but a V2 page index is
-        scoped to a layer group. ``RequestData.new_block_ids_by_layer_group`` is
+        The flat `block_ids` here are a single space, but a V2 page index is
+        scoped to a layer group. `RequestData.new_block_ids_by_layer_group` is
         the form that stays correct for every model, so that is the only source
         this connector uses.
         """
@@ -244,7 +244,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         by_group = request_data.new_block_ids_by_layer_group
         if not by_group:
             # Under a single layer group the manager also mirrors that group's
-            # indices into the flat ``new_block_ids``, but it does not say which
+            # indices into the flat `new_block_ids`, but it does not say which
             # group they belong to, so there is nothing safe to record from it.
             return
         for layer_group_id, indices in by_group.items():
@@ -284,8 +284,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         for layer_group_id, indices in state.pages.items():
             page_index = indices[block]
             if page_index == BAD_PAGE_INDEX:
-                # The block has no page in this group -- a sliding window has
-                # already dropped it. A partial page is not a usable cache entry,
+                # The block has no page in this group, because a sliding window
+                # dropped it. A partial page is not a usable cache entry,
                 # so the whole block is skipped.
                 return
             pages.append(PageTransfer(block_hash, layer_group_id, page_index))

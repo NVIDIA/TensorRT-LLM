@@ -1,7 +1,7 @@
 # MiniMax-M3-NVFP4 GENERATION (decode) worker: does not touch the store.
 #
 # There is deliberately no kv_connector_config. That absence is the whole of
-# "decode-none" -- StoreRole has only producer / consumer / both, so there is
+# "decode-none": StoreRole has only producer, consumer and both, so there is
 # no role value meaning "off".
 #
 # Because no connector runs here, three of the context worker's constraints
@@ -9,7 +9,7 @@
 #
 # It does lend the pool this node's host memory. Capacity comes only from
 # processes that open a store handle, so without this every byte of the pool
-# would be prefill-node DRAM caching prefill's own GPUs -- which is what the
+# would be prefill-node DRAM caching prefill's own GPUs, which is what the
 # native host tier already does. Lending is not a connector: this engine still
 # never reads or writes the store, and keeps its cache transceiver for the
 # prefill-to-decode handoff.
@@ -19,7 +19,7 @@ mooncake_donation:
     master_server_address: file://__LOG_DIR__/master.addr
     # Charged per server process, not per rank as global_segment_size is. Two
     # servers on one node lend twice this, and it competes with this node's own
-    # kv_cache_config.host_cache_size -- size the two together.
+    # kv_cache_config.host_cache_size, so size the two together.
     segment_size: 640GiB
     protocol: rdma
 

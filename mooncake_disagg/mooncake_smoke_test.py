@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Prove that a Mooncake install can actually serve the mooncake-store connector.
 
-Mirrors the ``store.setup(...)`` call in
-``tensorrt_llm/_torch/pyexecutor/connectors/mooncake_store/worker.py`` and then
+Mirrors the `store.setup` call in
+`tensorrt_llm/_torch/pyexecutor/connectors/mooncake_store/worker.py` and then
 does one round trip, so a pass here means the connector's own startup path will
-work. Reads the same ``MOONCAKE_CONFIG_PATH`` file the connector reads.
+work. Reads the same `MOONCAKE_CONFIG_PATH` file the connector reads.
 """
 
 import json

@@ -173,8 +173,7 @@ def make_kv_cache_manager(
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr.suspend_request.return_value = None
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
-    # Preemption is the fallback for a pool with nothing under GPU to spill
-    # to, so the default here (a host tier exists) leaves it switched off.
+    # The default here has a cache tier below GPU, which leaves preemption off.
     mgr.has_cache_tier_below_gpu = has_cache_tier_below_gpu
     mgr.has_pending_preemption.return_value = has_pending_preemption
     mgr.preempt_request.side_effect = preempt_request_fn or (lambda req: True)
@@ -851,10 +850,9 @@ def _out_of_pages_for(request_id):
 class TestContextPreemption:
     """Releasing a started request's pages when suspension cannot help.
 
-    Suspension only unpins pages so the eviction controller can migrate them
-    one level down; with GPU as the last level a suspended page stays HELD and
-    unevictable, so it frees nothing. These tests cover the fallback that
-    gives the pages up instead.
+    With GPU as the last cache level a suspended page stays HELD and
+    unevictable, so suspension frees nothing. These tests cover the fallback
+    that gives the pages up instead.
     """
 
     def test_out_of_pages_preempts_started_request(self):
@@ -934,8 +932,8 @@ class TestContextPreemption:
         out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
 
         mgr.preempt_request.assert_not_called()
-        # Suspension is cheaper and keeps the pages, so that path is left
-        # exactly as it was: the request is simply skipped.
+        # Suspension is cheaper and keeps the pages, so the request is
+        # simply skipped.
         assert ids(out.context_requests) == [99]
 
     def test_one_victim_at_a_time_while_a_release_is_draining(self):
@@ -1033,8 +1031,7 @@ class TestDeadlockDetection:
     """The scheduler must fail loudly rather than spin scheduling nothing.
 
     A stalled pass costs a couple of milliseconds, so an undetected stall
-    burns a job's whole wall clock while the loop still looks healthy to the
-    hang detector and to /health.
+    burns a job's whole wall clock.
     """
 
     def test_raises_after_repeated_stalls_with_context_candidates(self):
@@ -1057,7 +1054,7 @@ class TestDeadlockDetection:
         sched = make_scheduler(mgr, max_num_tokens=100)
         sched._DEADLOCK_STALL_ITERS = 3
         # Self-eviction suspends it on the first pass, which counts as
-        # progress; afterwards it is inactive and nothing can be reclaimed.
+        # progress. Afterwards it is inactive and nothing can be reclaimed.
         reqs = [make_gen_request(0)]
 
         for _ in range(3):

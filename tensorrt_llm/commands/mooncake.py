@@ -14,12 +14,11 @@
 # limitations under the License.
 """The two pieces of a Mooncake pool that outlive any one engine.
 
-A server that owns its pool needs neither of these: it describes the pool in
+A server that owns its pool needs neither: it describes the pool in
 `kv_connector_config.mooncake_store` and `trtllm-serve` provisions it during
-bringup. They exist for the pools it cannot own -- one shared by several
-engines, one that has to survive a restart, one whose capacity has to come from
-nodes that run no connector -- so that those deployments are still assembled
-from things TensorRT-LLM ships rather than from a launch script of one's own.
+bringup. These commands exist for the pools it cannot own, such as one shared by
+several engines, one that has to survive a restart, or one whose capacity comes
+from nodes that run no connector.
 """
 
 import json
@@ -38,9 +37,9 @@ from tensorrt_llm.logger import logger
 def _until_signalled() -> threading.Event:
     """An event that SIGINT and SIGTERM set.
 
-    Both commands hold a resource -- a child process, a mounted segment --
-    whose release is in a ``finally``. Default SIGTERM handling would skip it,
-    leaving the master unreaped or the pool advertising memory that has gone.
+    Both commands hold a resource, a child process or a mounted segment, whose
+    release is in a `finally`. Default SIGTERM handling would skip it, leaving
+    the master unreaped or the pool advertising memory that has gone.
     """
     stopping = threading.Event()
 
@@ -92,13 +91,11 @@ def mooncake_master(rpc_port: int, metrics_port: int, eviction_ratio: float,
                     heartbeat_seconds: int):
     """Run a mooncake_master for as long as this command runs.
 
-    For a pool that must not belong to any one engine: several servers sharing
-    it, or one that has to still be there after a server restarts. A single
-    server with a pool of its own should set `mooncake_store.launch_master`
-    instead and skip this entirely.
+    A single server with a pool of its own should set
+    `mooncake_store.launch_master` instead.
     """
-    # Imported here rather than at module scope so that reaching any other
-    # subcommand, or --help, does not pay for the connector package.
+    # Imported lazily so other subcommands and --help do not pay for the
+    # connector package.
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import \
         running_master
     from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig
@@ -123,15 +120,15 @@ def mooncake_master(rpc_port: int, metrics_port: int, eviction_ratio: float,
         announced = started
         while not stopping.is_set():
             if (code := master.process.poll()) is not None:
-                # Its own death is the interesting outcome: the pool is gone
-                # and every client is about to start failing.
+                # The pool is gone once the master dies, and every client is
+                # about to start failing.
                 raise click.ClickException(
                     f"mooncake_master exited with code {code}. See "
                     f"{master.log_path}")
             stopping.wait(1.0)
             now = time.monotonic()
-            # Says the pool is still there, which is the question asked of
-            # this log when clients start failing: master or fabric?
+            # Distinguishes a dead master from a dead fabric once clients
+            # start failing.
             if heartbeat_seconds > 0 and now - announced >= heartbeat_seconds:
                 announced = now
                 logger.info(
@@ -189,11 +186,8 @@ def mooncake_donor(master_server_address: Optional[str], segment_size: str,
                    ready_file: Optional[str], heartbeat_seconds: int):
     """Lend this node's host memory to a Mooncake pool, for as long as it runs.
 
-    Pool capacity comes only from processes that open a store handle, and in a
-    disaggregated deployment only the context servers do -- so the pool is
-    prefill-node memory, caching prefill's own GPUs. Running this on the
-    generation nodes puts their memory in the same pool while leaving those
-    engines connector-free.
+    Running this on the generation nodes puts their memory into the pool while
+    leaving those engines connector-free.
     """
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import (
         DEFAULT_DONOR_LOCAL_BUFFER_SIZE, donate_segment, master_timeout,
@@ -215,8 +209,7 @@ def mooncake_donor(master_server_address: Optional[str], segment_size: str,
 
     donating = parse_size(segment_size)
     resolved = resolve_master_address(master, master_timeout())
-    # Before setup, so "the master is not up yet" is reported as that and not
-    # as the status code setup returns for every kind of failure.
+    # Before setup, so an absent master is reported as such.
     wait_for_master(resolved)
 
     stopping = _until_signalled()
@@ -237,9 +230,8 @@ def mooncake_donor(master_server_address: Optional[str], segment_size: str,
                         f"{ready_file}, so a launcher waiting on the pool's "
                         "capacity can proceed")
 
-        # Idle by design. A put or get here would make this node a client in
-        # the traffic sense, which is the thing keeping the generation engine
-        # connector-free is meant to avoid.
+        # Idle by design: a put or get here would make this node a traffic
+        # client, which is what donation exists to avoid.
         started = time.monotonic()
         while not stopping.is_set():
             if heartbeat_seconds <= 0:

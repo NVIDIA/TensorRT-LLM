@@ -1,8 +1,8 @@
 # Generation (decode) worker: does not touch the Mooncake store at all.
 #
 # There is deliberately no kv_connector_config here. "Decode none" is the
-# absence of a connector, not a StoreRole -- StoreRole only has
-# producer / consumer / both. Generated tokens are rarely a reused prefix,
+# absence of a connector, not a StoreRole: StoreRole only has producer,
+# consumer and both. Generated tokens are rarely a reused prefix,
 # so writing them would cost bandwidth for no hit rate.
 #
 #   CUDA_VISIBLE_DEVICES=1 trtllm-serve <model> \

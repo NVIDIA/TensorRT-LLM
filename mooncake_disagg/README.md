@@ -6,7 +6,7 @@ disaggregated benchmark harness in
 `examples/disaggregated/slurm/benchmark/`.
 
 The unit tests in `tests/unittest/_torch/executor/test_mooncake_store_connector.py`
-cover the pieces that decide whether a cache hit is *correct* -- key namespacing,
+cover the pieces that decide whether a cache hit is *correct*: key namespacing,
 hash chaining, page addressing, the startup gates. They deliberately do not run
 a store, a model, or two engines. What is untested is everything that decides
 whether the feature is *worth having*: whether a real prefix survives the round
@@ -32,8 +32,8 @@ The residency measurements in `../m3-kv-residency-measurement-README.md` (taken
 on this same model and workload) found that M3 production traffic already serves
 **97.0% of prompt tokens from local cache**, with eviction responsible for under
 0.7% of misses. On a *single* instance there is almost no headroom for the store
-to recover -- over 99% of misses are prefixes never cached anywhere, which no
-store can serve either.
+to recover, since over 99% of misses are prefixes never cached anywhere, which
+no store can serve either.
 
 That is not an argument against the feature; it is an argument about where to
 look. Set expectations accordingly:
@@ -63,7 +63,7 @@ differently:
 | Component | What uses it | How it gets installed | Since |
 |---|---|---|---|
 | C++ transfer engine (`/usr/local/Mooncake`) | the C++ cache transceiver's Mooncake backend | CMake source build in `docker/common/install_mooncake.sh` | PR #8447, Nov 2025 |
-| Python bindings (`mooncake.store.MooncakeDistributedStore`) | **this connector** | pip wheel, added to the same script | commit `d36dae435e`, **this branch** |
+| Python bindings (`mooncake.store.MooncakeDistributedStore`) | **this connector** | pip wheel, added to the same script | commit `d36dae435e` |
 
 So Mooncake has been in the container images for months, but only usefully as
 the C++ library. Three consequences:
@@ -119,7 +119,7 @@ chooses where to put it with:
 COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print([s for s in sys.path if 'packages' in s][0])"
 ```
 
--- the *first* `sys.path` entry whose name merely contains `"packages"`. That
+That is the *first* `sys.path` entry whose name merely contains `"packages"`. It
 gives two different failures depending on what else is installed, and both
 produce the same confusing symptom: an `ImportError` **after a `pip install`
 that reported success**.
@@ -170,7 +170,7 @@ MOONCAKE_WHEEL="mooncake-transfer-engine==0.3.7.post2" \
 ```
 
 Both wheel choices were validated against the full set of store methods the
-connector calls -- see "Validating the install" below.
+connector calls; see "Validating the install" below.
 
 ### How often does the script need to run?
 
@@ -180,10 +180,10 @@ writes into `dist-packages` inside the container, not into your checkout.
 | Situation | How often |
 |---|---|
 | Long-lived container you `docker exec` into | **Once.** It survives until the container is deleted; `docker restart` keeps it. |
-| SLURM via `disaggr_torch.slurm` | **Once per job, per node** -- and the harness now does it for you, see below. |
-| Image built from this branch | **Never.** `install_mooncake.sh` now does it at build time and fails the build if the import does not work. |
+| SLURM via `disaggr_torch.slurm` | **Once per job, per node**, which the harness does for you, see below. |
+| Image built from this repo | **Never.** `install_mooncake.sh` does it at build time and fails the build if the import does not work. |
 
-For the SLURM case this is already wired up: `disaggr_torch.slurm` now runs the
+For the SLURM case this is already wired up: `disaggr_torch.slurm` runs the
 script on every node, right after its `pip install -e .[devel]` step, and gates
 it on whether a worker config actually asks for the connector:
 
@@ -195,7 +195,7 @@ So arms A and B of the run matrix pay nothing, arm C installs automatically, and
 there is no new config key to remember. It resolves the script as
 `${trtllm_repo}/mooncake_disagg/install_mooncake_runtime.sh` and fails the job
 with an explicit message if `environment.trtllm_repo` is unset or does not
-contain it -- which is the case if you benchmark from
+contain it, which is the case if you benchmark from
 `environment.trtllm_wheel_path` instead, so use an image with the bindings baked
 in for that path. Output lands in `<log_dir>/2_install_mooncake.log`. Set
 `MOONCAKE_WHEEL` in the submitting environment to override the wheel; it is
@@ -217,16 +217,16 @@ than a necessity.
 The root cause is upstream in Mooncake's `CMakeLists.txt` and is **not** fixed;
 both scripts clean up after it. Practically:
 
-- **Images built from this branch:** no. The cleanup runs in the same script,
+- **Images built from this repo:** no. The cleanup runs in the same script,
   immediately after `make install` and before the wheel install, and the build
-  now fails if `import mooncake.store` does not work.
+  fails if `import mooncake.store` does not work.
 - **Any pre-existing image**, including the one pinned in
   `jenkins/current_image_tags.properties` (`202607211045`): the broken package is
   baked in, so the runtime script is required.
 - **Inside a running container:** only if something re-runs Mooncake's CMake
-  install. Reinstalling `nvidia-cutlass-dsl` does not recreate it -- that package
-  has never shipped a `mooncake` directory; it only supplies the `.pth` that made
-  CMake choose the wrong destination.
+  install. Reinstalling `nvidia-cutlass-dsl` does not recreate it: that package
+  has never shipped a `mooncake` directory, and only supplies the `.pth` that
+  made CMake choose the wrong destination.
 - **If Mooncake is ever upgraded** to a version that fixes its install path, or
   the `.pth` ordering changes, the cleanup becomes a no-op rather than a hazard.
 
@@ -248,9 +248,9 @@ with the same argument list `worker.py` passes. `mooncake_api_surface_test.py` i
 the one that matters when changing wheel versions: the connector's hot path never
 uses `put`/`get`, it uses `register_buffer` plus the zero-copy
 `batch_put_from_multi_buffers` / `batch_get_into_multi_buffers` / `batch_is_exist`
-calls against registered GPU pages. Those take `list[list[int]]` -- one buffer
+calls against registered GPU pages. Those take `list[list[int]]`, one buffer
 list per key, because `PageAddressing.page_buffers` returns one address per
-layer-group region -- and that is the signature most likely to drift.
+layer-group region, and that is the signature most likely to drift.
 
 Then the unit tests, which need no store and no GPU:
 
@@ -291,9 +291,9 @@ scheduler, both of which the connector would forbid.
 Pool capacity comes only from processes that open a store handle: `setup`
 registers `global_segment_size` bytes of the calling process's host memory, and
 the master then places blocks in it. Since only the context workers configure
-the connector, only they contribute memory — so by default every byte of the
-pool is prefill-node DRAM, and the store is a prefill-DRAM-caches-prefill-GPU
-tier that largely duplicates TensorRT-LLM's native host offload. Confirm this on
+the connector, only they contribute memory, so by default every byte of the pool
+is prefill-node DRAM and the store is a prefill-DRAM-caches-prefill-GPU tier
+that largely duplicates TensorRT-LLM's native host offload. Confirm this on
 any run by grouping the master's `allocation_succeeded ... segment=<ip>:<port>`
 lines by host: a single host means a prefill-only pool.
 
@@ -303,7 +303,7 @@ as long as it runs, so the pool spans both sides while its engine stays
 connector-free and keeps its cache transceiver for the KV handoff:
 
 ```yaml
-# gen worker config -- no kv_connector_config anywhere near it
+# gen worker config: no kv_connector_config anywhere near it
 mooncake_donation:
   master_server_address: file:///$WORK_DIR/master.addr
   segment_size: 640GiB
@@ -314,7 +314,7 @@ Donation is deliberately outside `kv_connector_config`, and not a `StoreRole`
 either: the roles describe traffic (`producer` writes, `consumer` reads,
 `both`), none of them means "contribute memory only", and configuring capacity
 there would start this server using the store. The size is charged **per server
-process, not per rank** — unlike `global_segment_size` — so two servers on one
+process, not per rank**, unlike `global_segment_size`, so two servers on one
 node lend twice this.
 
 The server is ready only once its segment is mounted, which makes readiness the
@@ -336,17 +336,17 @@ the two together. The worker logs its own share as `KV cache manager v2 host
 cache quota set to N GiB`, **per rank**, against the `available host memory` it
 reports on the same line.
 
-## 4. Step 1 -- run the Mooncake master
+## 4. Step 1: run the Mooncake master
 
 `master_server_address` is mandatory, so a master must exist and be reachable
 from every worker.
 
 **Outside SLURM you can skip this section too.** A worker config carrying
 `kv_connector_config.mooncake_store` makes `trtllm-serve` provision the pool
-during its own bringup — `launch_master: true` starts a master for that server
-alone, `master_server_address` joins one that already exists — and write the
-client config itself. That covers aggregated and single-instance runs, which is
-what `m3_agg_mooncake.yaml` now does; `mooncake_usage.md` §2 has the table. The
+during its own bringup, with `launch_master: true` starting a master for that
+server alone and `master_server_address` joining one that already exists, and
+write the client config itself. That covers aggregated and single-instance runs,
+as `m3_agg_mooncake.yaml` does; `mooncake_usage.md` §2 has the table. The
 rest of this section is about the master the experiments below need, which
 outlives any one server and therefore cannot be owned by one.
 
@@ -354,11 +354,11 @@ outlives any one server and therefore cannot be owned by one.
 no master and writes no client config: the context worker's `launch_master:
 true` does both, on the context node, and publishes the address the generation
 workers' `mooncake_donation` reads. `disaggr_torch.slurm` contributes exactly
-two things — it installs the bindings on every node, and it substitutes
+two things: it installs the bindings on every node, and it substitutes
 `__LOG_DIR__` in the worker configs, since the run directory is the one value a
 config written before submission cannot know. Everything else, the pool sizes
-and the HCA included, is in the config; no `MOONCAKE_*` variable is read from
-the submitting environment any more.
+and the HCA included, is in the config, and no `MOONCAKE_*` variable is read
+from the submitting environment.
 
 The master's log lands in `<log_dir>/mooncake_master.log` and its address in
 `<log_dir>/master.addr` while it runs, because `start_worker.sh` sets
@@ -367,7 +367,7 @@ context server's other ranks read the rendered `mooncake.json`: they are
 separate srun tasks that never inherited the leader's environment.
 
 That master dies with the job, so read on if you need a pool that outlives one
-allocation -- which experiment 3 does, by construction. Run it as its own
+allocation, which experiment 3 does by construction. Run it as its own
 long-lived job and export `MOONCAKE_MASTER_ADDRESS=<host>:50051` before
 `submit.py`; the harness then skips launching one and only writes the client
 config pointing at yours.
@@ -390,9 +390,9 @@ srun --container-image=$CONTAINER_IMAGE \
 ```
 
 The master runs for as long as the command does, and `--address_file` receives
-`host:port` **once it accepts connections** — so waiting for that file is
-waiting for readiness, and its absence after the job starts is a failure rather
-than a slow start. It is removed on exit, so a stale address is never dialed.
+`host:port` **once it accepts connections**, so waiting for that file is waiting
+for readiness, and its absence after the job starts is a failure rather than a
+slow start. It is removed on exit, so a stale address is never dialed.
 `--run_dir` keeps the master's log at `$WORK_DIR/mooncake_master.log`, which is
 where pool occupancy and eviction are read from.
 
@@ -406,14 +406,14 @@ surface (`--rpc_address`, `--rpc_thread_num`, `--default_kv_lease_ttl`,
 Keeping the master in a separate job is what makes experiment 3 (§7) possible:
 the pool outlives the engines, so a second benchmark job finds a warm store.
 
-Workers can now be pointed at it without anyone writing the address down:
+Workers are pointed at it without anyone writing the address down:
 `master_server_address: file://$WORK_DIR/master.addr` in a config's
 `mooncake_store` block makes each server read it during bringup and wait if the
 master job has not started yet. That is what makes a master whose host the
 scheduler chose usable from a config settled beforehand.
 
 Failing that, write the client config, substituting the address the master job
-just recorded -- or let `disaggr_torch.slurm` generate it, as above. The schema
+just recorded, or let `disaggr_torch.slurm` generate it, as above. The schema
 is vLLM's, so one pool can serve both engines:
 
 ```bash
@@ -441,8 +441,8 @@ EOF
   behaviour; confirm the port from `--help` rather than assuming.
 - `device_name`: pick from `ibv_devinfo` on a compute node. For first bring-up
   only, `"protocol": "tcp"` with `"device_name": ""` removes RDMA from the
-  variable list -- that is what `mooncake.json` in this directory currently
-  does. Do not draw performance conclusions from a TCP run.
+  variable list, which is what `mooncake.json` in this directory does. Do not
+  draw performance conclusions from a TCP run.
 - `global_segment_size` is contributed **per worker process**, so the pool is
   `global_segment_size x (ctx instances x TP)` = 8 segments here.
 - Sizing: after startup, each worker logs its page geometry (§8). Pool bytes for
@@ -457,13 +457,13 @@ EOF
   prefix whenever you change anything that should not be shared with an earlier
   run's pages.
 
-## 5. Step 2 -- the harness config
+## 5. Step 2: the harness config
 
 Copy `examples/disaggregated/slurm/benchmark/config.yaml` and replace the
 `worker_config` section with M3's. `submit.py` serializes `worker_config.ctx`
 and `worker_config.gen` straight to `ctx_config.yaml`/`gen_config.yaml` with
-`yaml.dump`, so any LLM-API key passes through untouched -- including
-`kv_connector_config`.
+`yaml.dump`, so any LLM-API key passes through untouched, `kv_connector_config`
+included.
 
 The context worker below is `m3_ctx_mooncake.yaml` from this directory; the
 generation worker is `m3_gen_mooncake.yaml`. Every deviation from the production
@@ -499,7 +499,7 @@ hardware:
 
 environment:
   container_mount: "<mounts>"
-  container_image: "<image with the mooncake wheel -- see section 2>"
+  container_image: "<image with the mooncake wheel, see section 2>"
   model_path: "<path to MiniMax-M3-NVFP4>"
   trtllm_repo: "<this checkout>"
   build_wheel: false
@@ -559,7 +559,7 @@ worker_config:
     stream_interval: 20
     print_iter_log: true
     num_postprocess_workers: 8
-    # Required to see any reuse number at all -- see section 8. All three
+    # Required to see any reuse number at all; see section 8. All three
     # default to false, and without them /metrics returns an empty list.
     enable_iter_perf_stats: true
     enable_iter_req_stats: true
@@ -609,8 +609,8 @@ worker_config:
 
 Eagle3 is left off. It is not gated, but `MiniMaxM3KVCacheManagerV2` sets
 `supports_shared_draft_layers`, so draft layers join the unified V2 cache and
-therefore the registered layout -- extra page geometry the store must key
-correctly, on a path with no coverage. Turn it on only after a clean run
+therefore the registered layout. That is extra page geometry the store must key
+correctly, on a path with no coverage, so turn it on only after a clean run
 without it.
 
 Submit with:
@@ -621,7 +621,7 @@ python3 submit.py -c <work_dir>/m3_store_2ctx.yaml --dry-run   # inspect first
 python3 submit.py -c <work_dir>/m3_store_2ctx.yaml
 ```
 
-## 6. Step 3 -- the workload
+## 6. Step 3: the workload
 
 `run_benchmark.sh` invokes `benchmark_serving` with
 `--dataset-name trtllm_custom --dataset-path <dataset_file>`, so you supply a
@@ -678,18 +678,18 @@ Size the file against what the client will actually request.
 `run_benchmark.sh` computes
 `num_prompts = (concurrency x num_gen_servers) x multi_round`, so the §5 config
 (`concurrency_list: "8"`, `multi_round: 8`, one generation server) asks for 64
-prompts -- which is why `P x R` above is 64. Ask for more than the file holds
+prompts, which is why `P x R` above is 64. Ask for more than the file holds
 and the extra is not sampled; write more than you ask for and the tail of your
 repeat structure never runs.
 
 Random token text is deliberate: it defeats any accidental prefix sharing
 between "distinct" prefixes, so the hit rate you measure is the one you
 designed. If you would rather test genuine production traffic, substitute a
-real multi-turn trace -- but keep an eye on whether it actually contains
-repeated prefixes, since without them the store has nothing to do and a flat
-result means nothing.
+real multi-turn trace, but keep an eye on whether it actually contains repeated
+prefixes, since without them the store has nothing to do and a flat result means
+nothing.
 
-## 7. Step 4 -- the run matrix
+## 7. Step 4: the run matrix
 
 Three arms, and the middle one is the one people skip:
 
@@ -707,14 +707,14 @@ worth knowing and they answer different questions.
 
 Then, within that:
 
-**Experiment 1 -- does it work at all (`num_ctx_servers: 1`).**
+**Experiment 1: does it work at all (`num_ctx_servers: 1`).**
 Arm C, one context instance, small `PREFIX_TOKENS` (say 4096) and a short run.
 You are looking for a clean startup, the registration log line, non-zero store
 traffic, no load failures, and coherent output text. Do this before spending an
 allocation on anything larger. Expect no throughput change; local reuse already
 serves this case.
 
-**Experiment 2 -- cross-instance reuse (`num_ctx_servers: 2`).**
+**Experiment 2: cross-instance reuse (`num_ctx_servers: 2`).**
 The router defaults to round-robin, so consecutive requests alternate between
 context instances and roughly half of each prefix's repeats land on the instance
 that did not compute it. Those are the requests local reuse must recompute from
@@ -725,21 +725,21 @@ scratch and the store can serve. Compare arm C against arm B on:
 
 This is the primary result. A store that does not win here does not work.
 
-**Experiment 3 -- survival across restarts.**
+**Experiment 3: survival across restarts.**
 Run experiment 2's arm C twice, same `TRTLLM_MOONCAKE_STORE_PREFIX`, with the
 master job left running between them. The second job starts with an empty local
 cache but a warm pool. First-round TTFT should fall toward the warm steady-state
 value. Local reuse scores zero here by construction, so any improvement is
-attributable to the store alone -- which makes this the cleanest signal in the
+attributable to the store alone, which makes this the cleanest signal in the
 whole matrix, and the cheapest to run.
 
-**Experiment 4 -- the cost when there is nothing to gain.**
+**Experiment 4: the cost when there is nothing to gain.**
 Arm C against arm B on a workload with *no* repeated prefixes (unique prompts).
 This measures pure overhead: lookups, key hashing on the leader, background
 saves competing for host bandwidth. Ideally indistinguishable from arm B. This
 is the arm that catches a feature that helps its benchmark and hurts the fleet.
 
-## 8. Step 5 -- reading the results
+## 8. Step 5: reading the results
 
 ### Did the connector even load?
 
@@ -768,9 +768,9 @@ so:
 TLLM_LOG_LEVEL_BY_MODULE="debug:_torch"
 ```
 
-added to `environment.ctx_worker_env_var`. This is verbose -- it enables DEBUG
-for all of `_torch` -- so use it for experiment 1 and for diagnosis, not for the
-runs you intend to quote numbers from. The lines worth counting:
+added to `environment.ctx_worker_env_var`. This is verbose, since it enables
+DEBUG for all of `_torch`, so use it for experiment 1 and for diagnosis rather
+than for the runs you intend to quote numbers from. The lines worth counting:
 
 ```
 mooncake-store matched N blocks (M tokens) for request R    # leader, a hit
@@ -784,9 +784,9 @@ Scrape it before and after a run and diff.
 ### Where did the pages land?
 
 Page counts alone do not say whether the pool is doing anything the native host
-offload tier could not. For that, group the master's allocations by segment host
-— a segment is one client process's donated memory, so the host tells you which
-node the block physically lives on:
+offload tier could not. For that, group the master's allocations by segment
+host. A segment is one client process's donated memory, so the host tells you
+which node the block physically lives on:
 
 ```bash
 grep -o "allocation_succeeded size=[0-9]* segment=[0-9.]*:[0-9]*" mooncake_master.log \
@@ -802,8 +802,8 @@ and being read back from there. `disaggr_torch.slurm` writes this breakdown into
 it needs running by hand only when diagnosing a partial run.
 
 Requires `GLOG_v=1` on the master, which `trtllm-serve mooncake_master` sets
-unless `GLOG_v` is already in its environment -- so raise it by exporting
-`GLOG_v` to that command.
+unless `GLOG_v` is already in its environment, so raise it by exporting `GLOG_v`
+to that command.
 
 ### Which reuse number means what
 
@@ -814,24 +814,24 @@ This distinction matters and is easy to get backwards:
 | `reused_blocks_per_request`, `kv_cache_hit_rate_per_request` | per-request iteration stats | **Yes.** `_reserve_connector_prefix` calls `set_prepopulated_prompt_len` with the connector-served position, and these derive from `mPrepopulatedPromptLen`. |
 | `kv_cache_iter_reused_blocks`, `kv_cache_iter_reuse_rate` | `GET /prometheus/metrics` | **No.** These come from the local V2 reuse tree's committed stats. |
 
-So **store hits ≈ per-request reuse − local-tree reuse**. Confirm that
+So **store hits are roughly per-request reuse minus local-tree reuse**. Confirm that
 relationship on experiment 3, where the local tree starts empty and the
 difference is unambiguous, before relying on it elsewhere.
 
 Getting at either one requires the three flags added to the worker configs in
 §5, all of which default to false:
 
-- `enable_iter_perf_stats: true` -- without it `get_latest_iteration_stats`
+- `enable_iter_perf_stats: true`, without which `get_latest_iteration_stats`
   short-circuits and `GET /metrics` returns `[]`.
-- `enable_iter_req_stats: true` -- needed for the *per-request* half of the
+- `enable_iter_req_stats: true`, needed for the *per-request* half of the
   table above.
-- `return_perf_metrics: true` -- mounts `/prometheus/metrics`. `GET /metrics`
+- `return_perf_metrics: true`, which mounts `/prometheus/metrics`. `GET /metrics`
   (plain JSON iteration stats) is routed unconditionally but still needs
   `enable_iter_perf_stats`.
 
 `print_iter_log: true` is worth keeping on, but note it prints iteration timing
-and KV *utilization* only -- no reuse counters. Do not go looking for hit rates
-there.
+and KV *utilization* only, with no reuse counters. Do not go looking for hit
+rates there.
 
 Per-request client-side results land in `<log_dir>/concurrency_<N>/result.json`
 with TTFT/TPOT/ITL/E2EL percentiles, which is where the headline numbers for
@@ -845,7 +845,7 @@ with TTFT/TPOT/ITL/E2EL percentiles, which is where the headline numbers for
 | `mooncake-store background save failed` | A save thread exception, re-raised on the executor thread. |
 | `mooncake-store rank K failed to save N of M pages` (warning) | Dropped write. Costs a future miss, not correctness. A trickle is tolerable; a flood means the pool is full or the master is overloaded. |
 | `mooncake-store lookup failed; treating as a miss` (warning) | Probe failed. Degrades to no-store behavior. |
-| `could not reserve connector prefix up to N, falling back to the local match` (debug) | Out of GPU pages. The store offered more than the engine could hold -- expected under pressure, but frequent occurrences mean the offer is outrunning capacity. |
+| `could not reserve connector prefix up to N, falling back to the local match` (debug) | Out of GPU pages. The store offered more than the engine could hold, which is expected under pressure, but frequent occurrences mean the offer is outrunning capacity. |
 
 ### Sanity check that is not a performance number
 
@@ -866,7 +866,7 @@ gives a coarser version of the same check.
   Hold it fixed across every arm, generation workers included, or you are
   comparing two different models.
 - **Key namespace pins world size and rank.** Change TP and every stored page
-  becomes unreachable -- a miss, not an error. Same for `tokens_per_block`, the
+  becomes unreachable, as a miss rather than an error. Same for `tokens_per_block`, the
   layer group set, and `bytes_per_page`.
 - **`model_key` defaults to the checkpoint directory's basename.** Two hosts
   mounting the same checkpoint at different paths still share cache, which is
@@ -879,15 +879,15 @@ gives a coarser version of the same check.
 - **UCX warmup requests hit the store too.** `run_benchmark.sh` sends
   `2 x ctx_instances x gen_instances` 100-token requests before the real run.
   Harmless, but they are in the counters.
-- **A partial local match disables the store for that request entirely,** and
-  this is the dominant failure mode rather than the rare one it was predicted to
-  be here. The connector offers only whole blocks and only when the local match
-  is block-aligned, and `enable_partial_reuse` (default `true`) is exactly what
-  puts the match off a boundary: measured on M3, it declined **97.2% of
-  lookups**, so a 1.6 TB pool measured as if it were absent. Turning it off took
-  actual prompt cache read from 35% to 94%. `py_executor_creator` now forces it
-  off for this connector, so the hazard is gone, but the arithmetic is worth
-  knowing before changing `tokens_per_block`. See `../mooncake_usage.md` §3.
+- **A partial local match disables the store for that request entirely,** and it
+  is the dominant failure mode rather than a rare one. The connector offers only
+  whole blocks and only when the local match is block-aligned, and
+  `enable_partial_reuse` (default `true`) is exactly what puts the match off a
+  boundary: measured on M3, it declined **97.2% of lookups**, so a 1.6 TB pool
+  measured as if it were absent. Turning it off took actual prompt cache read
+  from 35% to 94%. `py_executor_creator` forces it off for this connector, so
+  the hazard cannot be hit, but the arithmetic is worth knowing before changing
+  `tokens_per_block`. See `../mooncake_usage.md` §3.
 - **`block_reuse_policy: per_conversation` is off on the context worker** in
   these configs. It is not gated, but the connector derives its own
   `cache_salt`-seeded hash chain and the interaction is untested. Restore it
@@ -901,5 +901,5 @@ pipeline or context parallelism (both refused); no VSWA or sliding-window model
 (refused); no Eagle3; no shared pool between TensorRT-LLM and vLLM, though the
 config schema is deliberately compatible with it. Load bandwidth under
 contention from many simultaneous large prefixes is exercised only incidentally
-by concurrency, not measured directly -- if experiment 2 shows a TTFT
-regression at high concurrency despite hits, that is the first thing to profile.
+by concurrency, not measured directly. If experiment 2 shows a TTFT regression
+at high concurrency despite hits, that is the first thing to profile.

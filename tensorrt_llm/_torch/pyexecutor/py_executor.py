@@ -3758,10 +3758,10 @@ class PyExecutor:
         """Complete a preemption whose connector saves have now retired.
 
         The scheduler preempts a request by handing it to the connector the
-        same way a finished request is handed over, so that its pages stay put
-        until every rank reports the in-flight saves done. Both kinds come
-        back through ``get_finished``; only the KV cache manager knows which
-        is which.
+        same way a finished request is handed over, so its pages stay put until
+        every rank reports the in-flight saves done. Both kinds come back
+        through `get_finished`, and only the KV cache manager knows which is
+        which.
 
         Returns True when *request* was preempted rather than finished, in
         which case its pages are now released and it is back in context state

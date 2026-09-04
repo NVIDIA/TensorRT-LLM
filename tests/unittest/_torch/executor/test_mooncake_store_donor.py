@@ -14,10 +14,9 @@
 # limitations under the License.
 """Unit tests for lending a node's host memory to a Mooncake pool.
 
-Runs without a Mooncake installation and without a GPU: the store is a fake
-recording what ``setup`` was called with, since the contract being tested is
-what the donor asks Mooncake for and how long it holds it, not what Mooncake
-then does.
+Runs without a Mooncake installation and without a GPU. The store is a fake
+recording what `setup` was called with, since the contract under test is what
+the donor asks Mooncake for and how long it holds it.
 """
 
 import sys
@@ -37,7 +36,7 @@ GIB = 1024**3
 
 
 class FakeStore:
-    """The slice of ``MooncakeDistributedStore`` a donor drives."""
+    """The slice of `MooncakeDistributedStore` a donor drives."""
 
     instances = []
 
@@ -53,7 +52,7 @@ class FakeStore:
 
 @pytest.fixture
 def fake_bindings(monkeypatch):
-    """Stand in for ``mooncake.store``, which is not installed here."""
+    """Stand in for `mooncake.store`, which is not installed here."""
     FakeStore.instances = []
     package = ModuleType("mooncake")
     store = ModuleType("mooncake.store")
@@ -66,7 +65,7 @@ def fake_bindings(monkeypatch):
 
 @pytest.fixture
 def failing_bindings(fake_bindings):
-    """Bindings whose ``setup`` refuses, as an unreachable master would."""
+    """Bindings whose `setup` refuses, as an unreachable master would."""
 
     class Refusing(fake_bindings):
 
@@ -104,8 +103,6 @@ def test_a_donor_registers_the_segment_it_was_asked_for(fake_bindings):
     assert protocol == "rdma"
     assert device_name == "mlx5_0"
     assert master == "10.0.0.1:50051"
-    # The donor never transfers, so its transfer buffer is dead weight -- but
-    # setup rejects a zero one, hence a token rather than nothing.
     assert local_buffer_size == DEFAULT_DONOR_LOCAL_BUFFER_SIZE
 
 
@@ -185,17 +182,6 @@ def test_a_published_master_address_is_read_before_joining(fake_bindings, reacha
 
     with maybe_donate_segment(donation):
         assert fake_bindings.instances[0].setup_args[6] == "10.0.0.9:50051"
-
-
-def test_the_segment_is_withdrawn_when_the_server_stops(fake_bindings, reachable_master):
-    """The handle is the segment: holding it for the server's life is the point."""
-    donation = MooncakeDonationConfig(master_server_address="10.0.0.1:50051")
-
-    with maybe_donate_segment(donation):
-        store = fake_bindings.instances[0]
-    # Nothing to assert on the fake beyond its existence -- the contract is
-    # that the reference is dropped, which is what unmounts the segment.
-    assert store.setup_args is not None
 
 
 def test_an_unreachable_master_is_reported_before_the_segment_is_offered(

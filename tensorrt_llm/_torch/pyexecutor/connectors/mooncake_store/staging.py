@@ -16,25 +16,24 @@
 
 The connector's default path registers the KV pools themselves with Mooncake, so
 the store reads and writes device memory directly. That needs the HCA to be able
-to pin GPU pages -- GPUDirect RDMA, via ``nvidia_peermem`` or dma-buf. Where that
-is unavailable, ``ibv_reg_mr`` fails on every pool range and the connector cannot
-start at all.
+to pin GPU pages, which means GPUDirect RDMA via `nvidia_peermem` or dma-buf.
+Where that is unavailable, `ibv_reg_mr` fails on every pool range and the
+connector cannot start.
 
-Staging trades a copy for that dependency. Mooncake is given a pinned host buffer
-instead of the pools, and each page passes through a slot in it: gathered from its
-device regions before a write, scattered back to them after a read. The store then
-only ever registers host memory, which needs no GPUDirect.
+Staging trades a copy for that dependency. Mooncake is given a pinned host
+buffer instead of the pools, and each page passes through a slot in it: gathered
+from its device regions before a write, scattered back to them after a read. The
+store then only ever registers host memory.
 
-A slot holds the page's regions concatenated in region order, which is precisely
-the payload the zero-copy path would have produced from the same regions. The
-stored bytes are therefore identical either way, so a pool written by one path is
-readable by the other -- including by another engine sharing the pool.
+A slot holds the page's regions concatenated in region order, which is exactly
+the payload the zero-copy path produces from the same regions. The stored bytes
+are therefore identical either way, so a pool written by one path is readable by
+the other, including by another engine sharing the pool.
 
-Copies go through ``cudaMemcpyAsync`` rather than the batched Triton kernel in
-``disaggregation/native/bounce/gather_scatter.py``. That kernel is the better tool
-for device-to-device gather, but here one side is host memory: the copy engines
-move it over the host link by DMA, whereas a kernel would do it with scattered
-stores from the SMs.
+Copies go through `cudaMemcpyAsync` rather than the batched Triton kernel in
+`disaggregation/native/bounce/gather_scatter.py`. That kernel is the better tool
+for device-to-device gather, but here one side is host memory, which the copy
+engines move over the host link by DMA.
 """
 
 from typing import List, Optional, Sequence, Tuple
@@ -51,9 +50,8 @@ from tensorrt_llm.logger import logger
 
 __all__ = ["HostStagingPool", "plan_slot_geometry", "sync_stream"]
 
-#: Stated rather than inferred from the pointers: the direction is known at each
-#: call site, and saying so keeps a copy from being misread if a host pointer is
-#: ever outside the unified address space.
+#: Stated explicitly rather than inferred from the pointers, which would be
+#: wrong for a host pointer outside the unified address space.
 _DEVICE_TO_HOST = cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost
 _HOST_TO_DEVICE = cudart.cudaMemcpyKind.cudaMemcpyHostToDevice
 
@@ -63,9 +61,8 @@ def _memcpy_async(dst: int, src: int, size: int, kind, stream: int) -> None:
     status = cudart.cudaMemcpyAsync(int(dst), int(src), int(size), kind, stream)[0]
     if status == cudart.cudaError_t.cudaSuccess:
         return
-    # Raised here rather than through CUASSERT so the operands are in the
-    # message. A bare cudaErrorInvalidValue from a copy says nothing about which
-    # of the three plausible causes it was.
+    # Raised here rather than through CUASSERT so the operands appear in the
+    # message; a bare cudaErrorInvalidValue names no cause.
     device = torch.cuda.current_device() if torch.cuda.is_available() else None
     raise RuntimeError(
         f"cudaMemcpyAsync failed with {status} staging a KV page: "
@@ -73,7 +70,7 @@ def _memcpy_async(dst: int, src: int, size: int, kind, stream: int) -> None:
         f"stream={int(stream):#x} current_device={device}. An invalid value here "
         "is usually a stream created on a different device than the pages, which "
         "happens when a thread issues the copy without inheriting the rank's "
-        "device -- torch's current device is thread-local."
+        "device, since torch's current device is thread-local."
     )
 
 
@@ -115,9 +112,9 @@ def plan_slot_geometry(
 class HostStagingPool:
     """A registered pinned buffer, sliced into per-page slots.
 
-    One pool serves one direction. Loads run on the executor thread and saves on
-    the connector's background thread, so sharing slots between them would need a
-    lock on the transfer path for no benefit -- the two pools are independent.
+    One pool serves one direction. Loads run on the executor thread and saves
+    on the connector's background thread, so sharing slots between them would
+    need a lock on the transfer path for no benefit.
     """
 
     def __init__(
@@ -132,10 +129,8 @@ class HostStagingPool:
         self._num_slots = int(num_slots)
         self._label = label
 
-        # Pinned unconditionally, unlike the ``prefer_pinned`` heuristic used for
-        # transfer buffers elsewhere: this memory is handed to the store to
-        # register, so page-locking it is a correctness property of the
-        # registration rather than a copy-speed preference.
+        # Page-locking is a correctness requirement here rather than a
+        # copy-speed preference: this memory is handed to the store to register.
         pin = torch.cuda.is_available()
         self._buffer = torch.empty(
             self._slot_bytes * self._num_slots, dtype=torch.uint8, pin_memory=pin
@@ -168,7 +163,7 @@ class HostStagingPool:
         return self._slot_bytes
 
     def slot_address(self, index: int) -> int:
-        """Address of slot ``index``."""
+        """Address of slot `index`."""
         if not 0 <= index < self._num_slots:
             raise IndexError(f"slot {index} out of range [0, {self._num_slots})")
         return self._base + index * self._slot_bytes
@@ -188,12 +183,12 @@ class HostStagingPool:
         sizes: Sequence[int],
         stream: int,
     ) -> Tuple[int, int]:
-        """Copy one page's device regions into slot ``index``, concatenated.
+        """Copy one page's device regions into slot `index`, concatenated.
 
         Args:
             index: Slot to fill.
             addresses: Device addresses of the page's regions, in region order.
-            sizes: Byte counts matching ``addresses``.
+            sizes: Byte counts matching `addresses`.
             stream: CUDA stream handle the copies are issued on.
 
         Returns:
@@ -216,7 +211,7 @@ class HostStagingPool:
         sizes: Sequence[int],
         stream: int,
     ) -> None:
-        """Copy slot ``index`` back out to one page's device regions.
+        """Copy slot `index` back out to one page's device regions.
 
         The inverse of :meth:`gather`, walking the regions in the same order so
         the split matches the concatenation the slot holds.
@@ -229,7 +224,7 @@ class HostStagingPool:
             offset += size
 
     def reserve(self, total: int) -> None:
-        """Assert a page of ``total`` bytes is stageable, without copying."""
+        """Assert a page of `total` bytes is stageable, without copying."""
         self._check_fits(total)
 
 

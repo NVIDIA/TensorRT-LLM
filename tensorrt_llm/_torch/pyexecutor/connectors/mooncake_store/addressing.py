@@ -12,16 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Turning a ``KvCacheLayout`` into addresses Mooncake can transfer.
+"""Turning a `KvCacheLayout` into addresses Mooncake can transfer.
 
-Mooncake's batch APIs take, per key, a list of ``(address, size)`` buffers. That
+Mooncake's batch APIs take, per key, a list of `(address, size)` buffers. That
 is exactly the shape of a V2 page: a layer group's regions each contribute one
-byte range at ``base + stride * page_index``, and the concatenation of those
+byte range at `base + stride * page_index`, and the concatenation of those
 ranges in region order is the page's payload.
 
-Region order is therefore load-bearing -- it is the value's serialization -- and
-``build_kv_cache_layout_v2`` derives it from the allocator's own aggregation, so
-it is stable for a given model and parallel layout. ``bytes_per_page`` goes into
+Region order is therefore the value's serialization, and it is stable for a
+given model and parallel layout because `build_kv_cache_layout_v2` derives it
+from the allocator's own aggregation. `bytes_per_page` goes into
 the key namespace to keep a geometry change from being read as a valid page.
 """
 
@@ -33,7 +33,7 @@ __all__ = ["PageAddressing", "merge_intervals"]
 
 
 def merge_intervals(intervals: Iterable[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    """Collapse ``(start, end)`` byte ranges into a minimal disjoint cover.
+    """Collapse `(start, end)` byte ranges into a minimal disjoint cover.
 
     Registration is per range and a range may not be registered twice, but
     several regions routinely live inside one pool allocation: sliding-window
@@ -53,7 +53,7 @@ def merge_intervals(intervals: Iterable[Tuple[int, int]]) -> List[Tuple[int, int
 
 
 class PageAddressing:
-    """Resolves ``(layer group, page index)`` to the byte ranges of that page."""
+    """Resolves `(layer group, page index)` to the byte ranges of that page."""
 
     def __init__(self, layout: KvCacheLayout):
         self._layout = layout
@@ -95,11 +95,11 @@ class PageAddressing:
         return self._layout.tokens_per_block
 
     def bytes_per_page(self, layer_group_id: int) -> int:
-        """Total payload size of one page of ``layer_group_id``."""
+        """Total payload size of one page of `layer_group_id`."""
         return self._bytes_per_page[layer_group_id]
 
     def num_slots(self, layer_group_id: int) -> int:
-        """Number of page slots addressable in ``layer_group_id``."""
+        """Number of page slots addressable in `layer_group_id`."""
         return self._num_slots[layer_group_id]
 
     def buffers(self, layer_group_id: int, page_index: int) -> Tuple[List[int], List[int]]:
@@ -124,7 +124,7 @@ class PageAddressing:
         return addresses, sizes
 
     def registration_ranges(self) -> List[Tuple[int, int]]:
-        """Byte ranges to hand to ``register_buffer``, deduplicated and merged.
+        """Byte ranges to hand to `register_buffer`, deduplicated and merged.
 
         A region's slots are strided rather than packed, so the range covering it
         is the whole span from the first slot to the end of the last. Registering

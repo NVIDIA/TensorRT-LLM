@@ -51,9 +51,9 @@ CONNECTOR_REGISTRY: dict[str, dict[str, str]] = {
 def uses_connector(kv_connector_config: Optional["KvCacheConnectorConfig"], name: str) -> bool:
     """Report whether a connector config resolves to the named preset.
 
-    Compares the resolved module rather than the ``connector`` field, so a
-    config that names the module explicitly instead of using the preset is
-    still recognized. Accepts ``None`` to save every caller a null check.
+    Compares the resolved module rather than the `connector` field, so a config
+    that names the module explicitly instead of using the preset is still
+    recognized. Accepts `None` to save every caller a null check.
     """
     if kv_connector_config is None:
         return False

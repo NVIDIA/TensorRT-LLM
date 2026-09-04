@@ -1948,25 +1948,20 @@ class DecodingBaseConfig(StrictBaseModel):
 class MooncakeStoreConfig(StrictBaseModel):
     """The Mooncake store pool the `mooncake-store` connector should join.
 
-    Describes the *pool*: which master owns it, how workers reach it, and how
-    much memory each contributes. A worker's own relationship to the pool
-    (read/write role, key namespace, model identity) stays in the
-    ``TRTLLM_MOONCAKE_STORE_*`` environment variables, because it is per
-    process while this is per deployment.
+    Describes the pool: which master owns it, how workers reach it, and how
+    much memory each contributes. A worker's own relationship to the pool, such
+    as its read/write role and key namespace, stays in the
+    `TRTLLM_MOONCAKE_STORE_*` environment variables, since that is per process
+    while this is per deployment.
 
     Setting this makes `trtllm-serve` render the Mooncake client config and
-    export ``MOONCAKE_CONFIG_PATH`` itself, so no external script has to.
-    An inherited ``MOONCAKE_CONFIG_PATH`` still wins, which is how the SLURM
-    harness keeps pointing workers at a pool it manages.
-
-    Every field opts out of telemetry: they describe one site's pool -- its
-    ports, its fabric, how much memory it was given -- rather than which
-    features are in use, which ``kv_connector_config.connector`` already says.
+    export `MOONCAKE_CONFIG_PATH` itself. An inherited `MOONCAKE_CONFIG_PATH`
+    still wins, so an externally managed pool stays reachable.
     """
     master_server_address: Optional[str] = Field(
         None,
         description="Address of an already-running mooncake_master, as "
-        "host:port or file://<path> naming a file that holds one -- which is "
+        "host:port or file://<path> naming a file that holds one. The file is "
         "how to reach a master whose host a scheduler chose, since "
         "'trtllm-serve mooncake_master --address_file' publishes it there "
         "once it answers. Mutually exclusive with launch_master.")
@@ -2064,28 +2059,21 @@ class MooncakeStoreConfig(StrictBaseModel):
 class MooncakeDonationConfig(StrictBaseModel):
     """Host memory this server lends to a Mooncake pool it does not use.
 
-    Pool capacity comes only from processes that open a store handle, and in a
-    disaggregated deployment only the context servers configure the connector.
-    The pool is then entirely prefill-node memory: prefill's DRAM caching
-    prefill's GPUs, which largely duplicates what
-    ``kv_cache_config.host_cache_size`` already does. Setting this on the
-    generation servers puts their memory into the same pool, so prefill writes
-    blocks that land on decode-side DRAM, while the generation engine stays
-    free of any connector and keeps its cache transceiver for the handoff.
+    Pool capacity comes only from processes that open a store handle, which in
+    a disaggregated deployment is the context servers alone. Setting this on
+    the generation servers puts their memory into the same pool, so prefill
+    writes blocks that land on decode-side DRAM while the generation engine
+    stays free of any connector and keeps its cache transceiver for the
+    handoff.
 
-    Lending memory is deliberately separate from
-    ``kv_connector_config``. That config attaches a connector, and a connector
-    reads and writes; there is no setting on it that means "contribute memory
-    only", so expressing capacity there would start this server using the
-    store. Capacity and traffic are different things and are configured
-    separately.
+    Capacity is kept separate from `kv_connector_config` because attaching a
+    connector would also start this server reading and writing the store.
 
-    The memory is charged to this process and competes with everything else on
-    the node, ``kv_cache_config.host_cache_size`` above all, so size the two
-    together.
+    The memory is charged to this process, so size it together with
+    `kv_cache_config.host_cache_size`.
 
-    Every field opts out of telemetry: they describe one site's pool and how
-    much of this node was given to it, not which features are in use.
+    Fields opt out of telemetry because they describe one site's pool rather
+    than which features are in use.
     """
     master_server_address: str = Field(
         ...,

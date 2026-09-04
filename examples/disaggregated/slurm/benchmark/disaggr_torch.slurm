@@ -101,7 +101,7 @@ elif [ -d "${trtllm_repo}" ]; then
 
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
-        build_command="python3 ./scripts/build_wheel.py --use_ccache"
+        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --use_ccache --clean"
         if [ -n "${cuda_architectures:-}" ]; then
             build_command="${build_command} --cuda_architectures \"${cuda_architectures}\""
         fi
@@ -141,14 +141,14 @@ fi
 # The Mooncake store bindings, when a worker config asks for the connector.
 # Images built from this repo bake them in (docker/common/install_mooncake.sh),
 # so the install below is only a fallback for images that predate it. Either
-# way it is per job: --container-name gives each node a container that lives
-# for the job, so anything installed here survives to the worker sruns but not
-# into the next job.
+# way it is per job, since --container-name gives each node a container that
+# lives for the job: anything installed here survives to the worker sruns but
+# not into the next job.
 mooncake_enabled=false
 if grep -qs "mooncake-store" "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"; then
     mooncake_enabled=true
-    # Both halves of the wheel are load-bearing and fail at different times:
-    # the connector needs mooncake.store in every context rank, and
+    # Both halves of the wheel are checked because they fail at different
+    # times: the connector needs mooncake.store in every context rank, and
     # 'trtllm-serve mooncake_master' needs the binary on PATH.
     if srun --container-name=${container_name} \
         --container-mounts=${container_mount} --no-container-mount-home \
@@ -198,9 +198,9 @@ replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds
 # read that address to lend the pool their memory. Nothing here starts, waits
 # for or configures any of it.
 #
-# The one value a config written before submission cannot know is where this
-# job's log directory is, and the master's address is published into it, so a
-# __LOG_DIR__ placeholder in either worker config is filled in here.
+# The one value a config written before submission cannot know is this job's log
+# directory, which the master's address is published into, so a __LOG_DIR__
+# placeholder in either worker config is filled in here.
 if [ "${mooncake_enabled}" = "true" ]; then
     sed -i "s|__LOG_DIR__|${full_logdir}|g" \
         "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"
@@ -229,8 +229,8 @@ done
 echo "Server is ready!"
 
 # A connector that failed to open its store handle does not stop the worker from
-# serving, it just silently never hits, so surface the startup lines here rather
-# than leaving them to be discovered after the benchmark. The registration line
+# serving, it just never hits, so surface the startup lines here rather than
+# leaving them to be discovered after the benchmark. The registration line
 # carries the bytes/page figure the pool sizing depends on.
 if [ "${mooncake_enabled}" = "true" ]; then
     echo "Mooncake store startup lines from the context workers:"
@@ -252,16 +252,15 @@ while read -r cmd <&3; do
     fi
 done 3< "${client_cmds_file}"
 
-# Collect the store's traffic into one file. The per-event lines live at DEBUG in
-# the worker logs (module _torch), so this is only populated when a config asks
-# for that verbosity; the counts are what distinguish "the store ran" from "the
-# store ran and did something".
+# Collect the store's traffic into one file. The per-event lines live at DEBUG
+# in the worker logs (module _torch), so this is only populated when a config
+# asks for that verbosity. The counts are what show the store did work rather
+# than merely started.
 if [ "${mooncake_enabled}" = "true" ]; then
     mooncake_summary="${full_logdir}/9_mooncake_summary.log"
     {
-        # The address file is retracted when the master stops, so a stale
-        # address is never dialed; the context server's log still says which
-        # master the run used.
+        # The address file is retracted when the master stops, so fall back to
+        # the context server's log, which still names the master the run used.
         echo "master: $(tr -d '[:space:]' < "${full_logdir}/master.addr" 2>/dev/null \
             || grep -hoE "master at [0-9.]+:[0-9]+" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null \
                | head -n 1 | awk '{print $3}' || echo unknown)"
@@ -276,12 +275,11 @@ if [ "${mooncake_enabled}" = "true" ]; then
             echo "${pattern}: ${count}"
         done
         echo
-        # Where the blocks physically went. The master names the segment for
-        # every allocation, and a segment is one client process's donated
-        # memory, so grouping by segment host answers the question the donors
-        # exist for: how much of the pool's contents lives on a decode node
-        # rather than on the prefill node that computed it. Without a donor this
-        # section shows a single host, which is the prefill node.
+        # Where the blocks physically went. The master names a segment for
+        # every allocation and a segment is one client process's donated
+        # memory, so grouping by segment host shows how much of the pool lives
+        # on a decode node rather than on the prefill node that computed it.
+        # Without a donor this section shows only the prefill node.
         echo "== block placement by segment host =="
         echo "(lending hosts: $(grep -hoE "GiB of [0-9.]+ is now part of the pool" \
             "${full_logdir}"/3_output_GEN_*.log 2>/dev/null \
@@ -318,7 +316,7 @@ if [ "${mooncake_enabled}" = "true" ]; then
         grep -h "mooncake-store:" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null \
             | head -n 30 || echo "(none)"
         echo
-        # The master's own log, glog rather than anything TensorRT-LLM writes.
+        # The master's own glog output, not anything TensorRT-LLM writes.
         echo "== master =="
         tail -n 50 "${full_logdir}/mooncake_master.log" 2>/dev/null || echo "(no master log)"
     } > "${mooncake_summary}" 2>&1

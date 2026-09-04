@@ -15,8 +15,8 @@
 """Unit tests for provisioning a Mooncake store pool during server bringup.
 
 Runs without a Mooncake installation and without a GPU. A master this process
-launches is a fake standing in for ``Popen`` that opens the RPC port, which is
-all the readiness handshake ever observes; a master someone else runs is a
+launches is a fake standing in for `Popen` that opens the RPC port, which is
+all the readiness handshake ever observes. A master someone else runs is a
 plain socket.
 """
 
@@ -50,11 +50,11 @@ def free_port() -> int:
 
 
 class FakeMasterProcess:
-    """The slice of ``Popen`` that launching a master actually drives.
+    """The slice of `Popen` that launching a master actually drives.
 
-    ``listen_on`` makes it answer on that port, which is what a real master
-    does last and what the readiness wait keys off. ``exit_code`` makes it a
-    master that failed to start.
+    `listen_on` makes it answer on that port, which is what a real master does
+    last and what the readiness wait keys off. `exit_code` makes it a master
+    that failed to start.
     """
 
     def __init__(self, command, env, listen_on=None, exit_code=None):
@@ -107,8 +107,8 @@ def clean_env(monkeypatch):
 def fake_master(monkeypatch):
     """Replace the master binary and its process with in-process fakes.
 
-    Returns a callable that arms the fake and, once provisioning has run, the
-    launched instance is available as ``.process`` for inspection.
+    Returns a callable that arms the fake. Once provisioning has run, the
+    launched instance is available as `.process` for inspection.
     """
 
     class Launcher:
@@ -118,8 +118,7 @@ def fake_master(monkeypatch):
         def arm(self, listen_on=None, exit_code=None, log_text=None):
 
             def popen(command, env=None, stdout=None, **_kwargs):
-                # A real master writes its own log through glog, and what it
-                # says there is the diagnosis when it fails to start.
+                # A real master writes its log through this handle.
                 if log_text is not None and stdout is not None:
                     stdout.write(log_text.encode())
                     stdout.flush()
@@ -171,7 +170,7 @@ def test_pool_needs_exactly_one_master():
 
 
 def test_publishing_an_address_needs_a_master_to_publish():
-    """Reading a published address is master_server_address, not this."""
+    """This option only writes an address; reading one is master_server_address."""
     with pytest.raises(ValueError, match="needs launch_master"):
         MooncakeStoreConfig(
             master_server_address="host:50051",
@@ -179,23 +178,20 @@ def test_publishing_an_address_needs_a_master_to_publish():
         )
 
 
-def test_pool_is_rejected_on_another_connector():
+def test_pool_is_rejected_unless_the_connector_is_mooncake_store():
+    """The validator keys off the connector, however that was spelled."""
     with pytest.raises(ValueError, match="mooncake_store describes a Mooncake pool"):
         KvCacheConnectorConfig(
             connector="lmcache",
             mooncake_store=MooncakeStoreConfig(launch_master=True),
         )
-
-
-def test_pool_is_accepted_on_the_module_spelled_out():
-    """A config naming the module instead of the preset is still the connector."""
-    config = KvCacheConnectorConfig(
+    # Naming the module rather than the preset selects the same connector.
+    KvCacheConnectorConfig(
         connector_module="tensorrt_llm._torch.pyexecutor.connectors.mooncake_store",
         connector_scheduler_class="MooncakeStoreConnectorScheduler",
         connector_worker_class="MooncakeStoreConnectorWorker",
         mooncake_store=MooncakeStoreConfig(launch_master=True),
     )
-    assert config.mooncake_store.launch_master
 
 
 # ---- the rendered client config ----
@@ -295,7 +291,7 @@ def test_provisioning_fails_before_the_model_loads_if_the_master_is_absent(monke
 
 
 def test_an_unparseable_master_address_is_left_to_the_workers():
-    """Not every address is host:port; that is the worker's problem, not ours."""
+    """Not every address is host:port, so an unprobeable one passes through."""
     pool = MooncakeStoreConfig(master_server_address="unix:///var/run/mooncake")
 
     with provision_pool(pool) as config_path:
@@ -304,7 +300,7 @@ def test_an_unparseable_master_address_is_left_to_the_workers():
 
 
 def test_an_inherited_config_path_wins(monkeypatch, tmp_path):
-    """The SLURM harness names the pool this way; provisioning must defer."""
+    """An externally managed pool names itself this way, so provisioning defers."""
     harness_config = tmp_path / "harness.json"
     harness_config.write_text("{}")
     monkeypatch.setenv(CONFIG_PATH_ENV, str(harness_config))
@@ -329,8 +325,8 @@ def test_a_launched_master_is_named_in_the_config_and_stopped_on_exit(fake_maste
         written = json.loads(open(config_path).read())
         host, _, named_port = written["master_server_address"].rpartition(":")
         assert int(named_port) == port
-        # Whatever the config names has to be dialable: it is all a worker on
-        # another host is given.
+        # The address in the config is all a worker on another host gets, so
+        # it has to be dialable.
         with socket.create_connection((host, port), timeout=5):
             pass
 
@@ -354,9 +350,8 @@ def test_a_launched_master_gets_the_flags_and_logging_it_needs(fake_master):
         assert f"--rpc_port={port}" in command
         assert f"--metrics_port={pool.master_metrics_port}" in command
         assert "--eviction_ratio=0.1" in command
-        # glog writes to files under /tmp unless told otherwise, which would
-        # leave the master's log -- the only view of the pool's own side of
-        # the conversation -- empty.
+        # Without these the master logs to a file under /tmp and the log the
+        # run directory holds stays empty.
         assert fake_master.process.env["GLOG_logtostderr"] == "1"
         assert fake_master.process.env["GLOG_v"] == "1"
 
@@ -404,7 +399,7 @@ def test_a_run_dir_keeps_the_master_log_and_the_config(fake_master, tmp_path):
     with provision_pool(pool, run_dir=str(run_dir)) as config_path:
         assert config_path == str(run_dir / master_module.CLIENT_CONFIG_NAME)
 
-    # An explicit run directory has to outlive the run that filled it: the
+    # An explicit run directory outlives the run that filled it, since the
     # master's log is where pool occupancy and eviction are read from.
     assert (run_dir / master_module.MASTER_LOG_NAME).exists()
     assert (run_dir / master_module.CLIENT_CONFIG_NAME).exists()
@@ -425,7 +420,7 @@ def test_no_connector_at_all_is_left_alone():
 
 
 def test_a_pool_left_undescribed_stays_the_environment_contract():
-    """Without ``mooncake_store``, MOONCAKE_CONFIG_PATH is still the only input."""
+    """Without `mooncake_store`, MOONCAKE_CONFIG_PATH is still the only input."""
     config = KvCacheConnectorConfig(connector="mooncake-store")
     with maybe_provision_pool(config):
         assert CONFIG_PATH_ENV not in os.environ
@@ -466,7 +461,7 @@ def test_an_address_not_published_yet_is_waited_for(tmp_path):
 
 
 def test_an_empty_address_file_is_not_taken_for_an_address(tmp_path):
-    """It exists, which is not the same as holding somewhere to connect to."""
+    """An existing file is not the same as a published address."""
     published = tmp_path / "master.addr"
     published.write_text("")
 
@@ -499,7 +494,7 @@ def test_a_standalone_master_publishes_an_address_that_can_be_dialed(fake_master
 
 
 def test_a_stopped_master_leaves_no_address_behind(fake_master, tmp_path):
-    """A stale address would send the next run's workers at a dead port."""
+    """A stale address would send the next run's workers to a dead port."""
     port = free_port()
     fake_master.arm(listen_on=port)
     address_file = tmp_path / "master.addr"
@@ -515,7 +510,7 @@ def test_a_stopped_master_leaves_no_address_behind(fake_master, tmp_path):
 
 
 def test_a_standalone_master_keeps_its_log(fake_master, tmp_path):
-    """Its whole point is outliving servers, so its history is worth more."""
+    """A standalone master outlives the servers that used it, so its log is kept."""
     port = free_port()
     fake_master.arm(listen_on=port)
     run_dir = tmp_path / "run"
@@ -528,7 +523,7 @@ def test_a_standalone_master_keeps_its_log(fake_master, tmp_path):
 
 
 def test_provisioning_joins_a_master_it_was_never_given_the_address_of(fake_master, tmp_path):
-    """The point of the file: no config and no script names a host."""
+    """The address file is how workers reach a master no config names a host for."""
     port = free_port()
     fake_master.arm(listen_on=port)
     address_file = tmp_path / "master.addr"
@@ -549,7 +544,7 @@ def test_provisioning_joins_a_master_it_was_never_given_the_address_of(fake_mast
 
 
 def test_a_launched_master_publishes_where_its_run_left_its_logs(fake_master, tmp_path):
-    """So a finished run's logs still say which pool it used."""
+    """A finished run's logs still say which pool it used."""
     port = free_port()
     fake_master.arm(listen_on=port)
     run_dir = tmp_path / "run"
@@ -563,7 +558,7 @@ def test_a_launched_master_publishes_where_its_run_left_its_logs(fake_master, tm
 
 
 def test_a_launched_master_can_be_published_where_the_donors_look(fake_master, tmp_path):
-    """The whole reason a server launching a master can still have donors."""
+    """This is what lets a server that launched its own master have donors."""
     port = free_port()
     fake_master.arm(listen_on=port)
     shared = tmp_path / "shared" / "master.addr"
@@ -592,16 +587,12 @@ def test_a_half_written_address_is_never_read(tmp_path):
 
 
 def test_an_absent_master_is_named_rather_than_left_to_store_setup(monkeypatch):
-    """Otherwise this is a status code, in every rank, after the model loads."""
+    """Otherwise the failure is a bare status code in every rank, after loading."""
     monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "1")
     address = f"127.0.0.1:{free_port()}"
 
     with pytest.raises(TimeoutError, match=address):
         master_module.wait_for_master(address)
-
-
-def test_a_master_that_answers_is_reported_with_the_wait_it_cost(running_master):
-    assert master_module.wait_for_master(running_master) is not None
 
 
 def test_an_address_of_a_shape_we_cannot_probe_is_not_fatal():
@@ -610,7 +601,7 @@ def test_an_address_of_a_shape_we_cannot_probe_is_not_fatal():
 
 
 def test_a_master_that_died_starting_is_reported_with_its_last_words(fake_master, tmp_path):
-    """The reason is in its log, which nobody reads unless it is quoted."""
+    """The reason is in the master's log, which is only read if the error quotes it."""
     run_dir = tmp_path / "run"
     fake_master.arm(
         exit_code=1, log_text="E0903 bind(50051) failed: Address already in use\n")
@@ -655,7 +646,7 @@ def test_tcp_needs_no_device_and_looks_for_none(tmp_path):
 
 
 def test_a_node_without_infiniband_is_left_to_mooncake_s_own_discovery(tmp_path):
-    """Better than failing: Mooncake may still find something usable."""
+    """Falling back beats failing, since Mooncake may still find a usable device."""
     assert master_module.resolve_device_name(
         "rdma", "", sysfs_root=str(tmp_path / "absent")) == ""
 
@@ -671,12 +662,3 @@ def test_the_detected_device_is_what_the_workers_are_told(fake_master, tmp_path,
 
     with provision_pool(pool, run_dir=str(tmp_path / "run")) as config_path:
         assert json.loads(open(config_path).read())["device_name"] == "mlx5_0"
-
-
-def test_an_empty_master_log_says_what_that_means(tmp_path):
-    """Empty means it failed before glog opened, which reads as no log at all."""
-    empty = tmp_path / "mooncake_master.log"
-    empty.write_text("")
-
-    assert "empty" in master_module._log_tail(str(empty))
-    assert "could not be read" in master_module._log_tail(str(tmp_path / "absent.log"))

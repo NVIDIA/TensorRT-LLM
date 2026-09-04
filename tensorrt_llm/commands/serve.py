@@ -523,21 +523,19 @@ def _provision_kv_cache_pool(llm_args: dict,
                              owns_engine: bool = True) -> Iterator[None]:
     """Bring up the shared cache this server needs or feeds, for its lifetime.
 
-    Two things the engine cannot produce for itself. A connector backed by a
-    cluster-wide pool needs it reachable before any rank opens a handle, and
-    the ranks are spawned by the LLM constructor; entering this around that
-    construction is what makes the pool part of `trtllm-serve` bringup rather
-    than something a launch script has to arrange. A deployment that arranges
-    it anyway is detected and left alone.
+    A connector backed by a cluster-wide pool needs that pool reachable before
+    any rank opens a handle, and the ranks are spawned by the LLM constructor,
+    so this wraps the construction. A deployment that provisions the pool
+    externally is detected and left alone.
 
-    Separately, a server may lend the pool host memory without using it, which
-    is how a pool spans nodes whose engines have no connector. That segment
-    has to be mounted before traffic arrives, and held for as long as the
-    pages placed in it are expected to be there -- so, this context.
+    A server may also lend the pool host memory without using it, which is how
+    a pool spans nodes whose engines have no connector. That segment has to be
+    mounted before traffic arrives and held for as long as the pages placed in
+    it are expected to be there.
 
-    Only the process that owns the engine does either: an attached frontend
+    Only the process that owns the engine does either. An attached frontend
     re-execs this command line but shares the launcher's executor, so it would
-    otherwise stand up a second, private pool and lend a second segment.
+    otherwise stand up a second pool and lend a second segment.
     """
     if not owns_engine:
         yield
@@ -548,9 +546,9 @@ def _provision_kv_cache_pool(llm_args: dict,
 
     connector_config = llm_args.get("kv_connector_config")
     if isinstance(connector_config, dict):
-        # A YAML config section arrives here unvalidated. Coerce it now, since
-        # the pool has to be described before the LLM constructor would do it,
-        # and hand the validated model on so it is not parsed twice.
+        # A YAML config section arrives unvalidated, and the pool has to be
+        # described before the LLM constructor would coerce it. Hand the
+        # validated model on so it is not parsed twice.
         connector_config = KvCacheConnectorConfig(**connector_config)
         llm_args["kv_connector_config"] = connector_config
 
@@ -2547,9 +2545,8 @@ main = DefaultGroup(
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder,
         "embeddings": serve_embedding,
-        # The parts of a Mooncake pool that cannot belong to a server, for the
-        # deployments where a pool outlives or spans them. A server that owns
-        # its pool provisions it from its own config and needs neither.
+        # The parts of a Mooncake pool that cannot belong to a server, for
+        # deployments where a pool outlives or spans them.
         "mooncake_master": mooncake_master,
         "mooncake_donor": mooncake_donor,
     })

@@ -14,22 +14,20 @@
 # limitations under the License.
 """Bring the Mooncake store's pool up as part of a server's own startup.
 
-The connector needs two things that are not the engine's to produce: a
-reachable ``mooncake_master``, and a JSON client config named by
-``MOONCAKE_CONFIG_PATH`` that points every worker at it. Both were the SLURM
-harness's job, which left a single ``trtllm-serve`` unable to use the connector
-without borrowing that harness.
+The connector needs two things that are not the engine's to produce: a reachable
+`mooncake_master`, and a JSON client config named by `MOONCAKE_CONFIG_PATH` that
+points every worker at it.
 
-``provision_pool`` does the same work inside the serving process. It resolves
-the master -- launching one here, or checking that the configured one answers
--- renders the client config, and exports ``MOONCAKE_CONFIG_PATH``, which
-reaches the ranks because the LLM constructor spawns them from this process.
-Everything it started is torn down when the context exits.
+`provision_pool` does that work inside the serving process. It resolves the
+master, either launching one here or checking that the configured one answers,
+renders the client config, and exports `MOONCAKE_CONFIG_PATH`, which reaches the
+ranks because the LLM constructor spawns them from this process. Everything it
+started is torn down when the context exits.
 
-A master launched here lives and dies with the server, so it is only right for
-one engine talking to its own pool. Several engines sharing a pool, or a pool
-meant to survive a restart, need a master with its own lifetime, named by
-``master_server_address``.
+A master launched here lives and dies with the server, so it suits one engine
+talking to its own pool. Several engines sharing a pool, or a pool meant to
+survive a restart, need a master with its own lifetime named by
+`master_server_address`.
 """
 
 import contextlib
@@ -59,7 +57,7 @@ __all__ = [
     "wait_for_master",
 ]
 
-#: Override the binary that ``launch_master`` runs.
+#: Override the binary that `launch_master` runs.
 MASTER_BINARY_ENV = "TRTLLM_MOONCAKE_MASTER_BINARY"
 #: How long to wait for a master to accept connections, in seconds.
 MASTER_TIMEOUT_ENV = "TRTLLM_MOONCAKE_MASTER_TIMEOUT"
@@ -67,15 +65,13 @@ DEFAULT_MASTER_BINARY = "mooncake_master"
 DEFAULT_MASTER_TIMEOUT = 60.0
 MASTER_LOG_NAME = "mooncake_master.log"
 #: Name a launched master's address is always published under in the run
-#: directory, so "which master is this pool on" is answerable from the logs of
-#: a run that named no address file.
+#: directory, so even a run that named no address file records its pool.
 MASTER_ADDRESS_NAME = "master.addr"
-#: Prefix that makes ``master_server_address`` name a file holding the address
+#: Prefix that makes `master_server_address` name a file holding the address
 #: rather than the address itself.
 ADDRESS_FILE_SCHEME = "file://"
-#: Lines of the master's log to quote when startup fails. Its last words are
-#: usually the whole diagnosis -- a port in use, a bad flag -- and they are
-#: otherwise in a file the reader has to be told exists.
+#: Lines of the master's log to quote when startup fails, since its last words
+#: (a port in use, a bad flag) are usually the whole diagnosis.
 LOG_TAIL_LINES = 20
 
 
@@ -98,9 +94,8 @@ def _log_tail(path: str, lines: int = LOG_TAIL_LINES) -> str:
 def local_address() -> str:
     """The address this host is known by inside the pool.
 
-    Deliberately the same derivation the connector worker uses for its own
-    hostname, so the master and the segments registering with it agree on
-    which host they are on.
+    Uses the same derivation as the connector worker's own hostname, so the
+    master and the segments registering with it agree on which host they are on.
     """
     try:
         return socket.gethostbyname(socket.gethostname())
@@ -122,7 +117,7 @@ def master_timeout() -> float:
 
 
 def _split_address(address: str) -> Optional[Tuple[str, int]]:
-    """Split ``host:port``, or return ``None`` if it is not in that form."""
+    """Split `host:port`, or return `None` if it is not in that form."""
     host, separator, port = address.rpartition(":")
     if not separator or not port.isdigit():
         return None
@@ -130,14 +125,14 @@ def _split_address(address: str) -> Optional[Tuple[str, int]]:
 
 
 def resolve_master_address(address: str, timeout: float) -> str:
-    """Read a ``file://`` address through, and pass anything else along.
+    """Read a `file://` address through, and pass anything else along.
 
-    A master with its own lifetime is on whichever host its scheduler gave
-    it, which is not known when the worker configs are written. Naming the
-    file it publishes to instead keeps the address out of the config and out
-    of a launch script: ``trtllm-serve mooncake_master --address-file`` writes
-    it, every worker's ``master_server_address`` names the same path, and the
-    wait here is also the wait for the master to exist at all.
+    A master with its own lifetime runs on whichever host its scheduler gave
+    it, which is not known when the worker configs are written. Naming the file
+    it publishes to keeps the address out of both the config and the launch
+    script: `trtllm-serve mooncake_master --address-file` writes it, every
+    worker's `master_server_address` names the same path, and the wait here
+    doubles as the wait for the master to exist at all.
     """
     if not address.startswith(ADDRESS_FILE_SCHEME):
         return address
@@ -148,8 +143,6 @@ def resolve_master_address(address: str, timeout: float) -> str:
     announced = started
     logger.info(f"mooncake-store: reading the master's address from {path}")
     while True:
-        # Written whole by the master command, so a non-empty file is a
-        # complete address rather than a prefix of one.
         try:
             published = open(path).read().strip()
         except FileNotFoundError:
@@ -160,8 +153,8 @@ def resolve_master_address(address: str, timeout: float) -> str:
         now = time.monotonic()
         if now - announced >= 5.0:
             announced = now
-            # Waiting for a master in another job is the normal case here, so
-            # this is progress rather than trouble -- but only if it is said.
+            # Waiting on a master in another job is normal here, so say so
+            # rather than letting the wait look like a hang.
             logger.info(
                 f"mooncake-store: no master address in {path} yet "
                 f"({now - started:.0f}s of {timeout:g}s); waiting for the "
@@ -188,14 +181,13 @@ def _wait_until_accepting(
     """Block until the master accepts connections, and say how long it took.
 
     A worker that opens its store handle before the master is listening fails
-    outright, so the port -- not the presence of a process -- is what the
-    ordering has to wait on. When the master is ours, its exit is checked first
-    each pass, so a master that died is reported as that rather than as a
+    outright, so the ordering has to wait on the port rather than on the
+    presence of a process. When the master is ours, its exit is checked first
+    each pass, so a master that died is reported as such rather than as a
     timeout.
 
-    The wait is narrated while it happens: silence here is indistinguishable
-    from a hang somewhere else in bringup, and this is one of the two places a
-    Mooncake deployment stalls.
+    The wait is narrated as it happens, since silence here is
+    indistinguishable from a hang elsewhere in bringup.
     """
     started = time.monotonic()
     deadline = started + timeout
@@ -238,10 +230,10 @@ def _highest_rate_ib_devices(sysfs_root: Optional[str] = None) -> List[str]:
     """The active InfiniBand devices on the compute fabric, fastest first.
 
     A node's HCAs are not interchangeable. On GB300 six are exposed, of which
-    four run at 800Gb/s -- two per NUMA node, one per GPU -- while the rest
-    share a PCI device with an Ethernet port and are the storage or management
-    adapter. Taking every device at the highest rate picks the compute fabric
-    on any node type, where a hardcoded name would be wrong on the next one.
+    four run at 800Gb/s (two per NUMA node, one per GPU) while the rest share a
+    PCI device with an Ethernet port and serve storage or management. Taking
+    every device at the highest rate picks the compute fabric on any node type,
+    where a hardcoded name would be wrong on the next one.
     """
     sysfs_root = sysfs_root or IB_SYSFS_ROOT
     rated: Dict[str, int] = {}
@@ -281,9 +273,9 @@ def resolve_device_name(protocol: str,
     """The RDMA devices to transfer over, detected if the config left it open.
 
     Which HCAs a node has is a property of the node, not of the deployment, so
-    requiring it in a config makes that config specific to one machine type.
-    Detecting it keeps ``protocol: rdma`` portable, and leaving ``device_name``
-    set overrides this for a node where the choice has to be made by hand.
+    requiring it in a config would tie that config to one machine type.
+    Detecting it keeps `protocol: rdma` portable; setting `device_name`
+    overrides the detection.
     """
     if configured or protocol != "rdma":
         return configured
@@ -305,15 +297,14 @@ def resolve_device_name(protocol: str,
 
 
 def wait_for_master(master_address: str, timeout: Optional[float] = None) -> Optional[float]:
-    """Block until the master at ``master_address`` accepts connections.
+    """Block until the master at `master_address` accepts connections.
 
-    Every user of a pool it did not start wants this: reaching a master that
-    is not there otherwise fails deep inside ``store.setup``, in every rank,
-    after the model has loaded, as a status code. One socket beforehand turns
-    that into a line that names the address and the wait.
+    Reaching a master that is not there otherwise fails deep inside
+    `store.setup`, in every rank, after the model has loaded, as a bare status
+    code. One socket beforehand turns that into a line naming the address.
 
-    Returns how long it took, or ``None`` if the address was not in
-    ``host:port`` form and could not be checked.
+    Returns how long it took, or `None` if the address was not in `host:port`
+    form and could not be checked.
     """
     timeout = master_timeout() if timeout is None else timeout
     endpoint = _split_address(master_address)
@@ -336,10 +327,9 @@ def _client_config(pool: Any,
                    device_name: Optional[str] = None) -> Dict[str, Any]:
     """Render the Mooncake client config for a pool.
 
-    The schema is vLLM's, so one pool can serve both engines. ``role`` is
-    written as ``both`` because the file describes the pool; which directions
-    of traffic a given process drives is its own
-    ``TRTLLM_MOONCAKE_STORE_ROLE``.
+    The schema is vLLM's, so one pool can serve both engines. `role` is written
+    as `both` because the file describes the pool; the directions of traffic a
+    given process drives come from its own `TRTLLM_MOONCAKE_STORE_ROLE`.
     """
     config: Dict[str, Any] = {
         "metadata_server": pool.metadata_server,
@@ -354,8 +344,8 @@ def _client_config(pool: Any,
     }
     if pool.cache_prefix is not None:
         config["cache_prefix"] = pool.cache_prefix
-    # Left out when unset so the connector's own default applies, rather than
-    # restating it here for the two to drift apart.
+    # Left out when unset so the connector's own default applies instead of a
+    # second copy of it here.
     if pool.staging_buffer_bytes is not None:
         config["staging_buffer_bytes"] = pool.staging_buffer_bytes
     return config
@@ -363,7 +353,7 @@ def _client_config(pool: Any,
 
 @dataclass
 class LaunchedMaster:
-    """A ``mooncake_master`` owned by this process."""
+    """A `mooncake_master` owned by this process."""
 
     process: subprocess.Popen
     address: str
@@ -396,11 +386,11 @@ def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
     host = local_address()
     log_path = os.path.join(run_dir, MASTER_LOG_NAME)
 
-    # mooncake_master logs through glog, which writes files under /tmp unless
-    # told otherwise, so without GLOG_logtostderr the log below stays empty.
-    # GLOG_v=1 adds the per-RPC lines showing segments registering and keys
-    # moving, which is the only view of the pool's side of the conversation
-    # short of scraping the metrics port.
+    # glog writes to files under /tmp unless redirected, so without
+    # GLOG_logtostderr the log opened below stays empty. GLOG_v=1 adds the
+    # per-RPC lines showing segments registering and keys moving, which is the
+    # only view of the pool's own side of the conversation short of scraping
+    # the metrics port.
     env = dict(os.environ, GLOG_logtostderr="1")
     env.setdefault("GLOG_v", "1")
     command = [
@@ -439,20 +429,18 @@ def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
 
 @contextlib.contextmanager
 def _published_address(address: str, paths: Sequence[str]) -> Iterator[None]:
-    """Write ``address`` to every path for the life of the context.
+    """Write `address` to every path for the life of the context.
 
     Publishing is how anything else finds this master: a donor or a second
-    server names the path in ``master_server_address`` as ``file://<path>``
-    and reads it back. Retracting on the way out is as important as writing,
-    since an address that outlives its master sends the next run's workers to
-    a port with nothing behind it.
+    server names the path as `file://<path>` in `master_server_address`.
+    Retracting on the way out matters as much as writing, since an address that
+    outlives its master sends the next run's workers to a dead port.
     """
     for path in paths:
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        # Renamed into place so a reader sees either nothing or the whole
-        # address. A half-written one would be dialed as if it were real.
+        # Renamed into place so a reader never sees a partial address.
         staging = f"{path}.partial"
         with open(staging, "w") as handle:
             handle.write(f"{address}\n")
@@ -470,8 +458,7 @@ def _published_address(address: str, paths: Sequence[str]) -> Iterator[None]:
 def _address_files(run_dir: str, extra: Optional[str] = None) -> List[str]:
     """Where a master this process starts should publish its address.
 
-    Always the run directory, so a reader who was told nothing can still find
-    out which master a run used, plus wherever the deployment asked for.
+    Always the run directory, plus wherever the deployment asked for.
     """
     paths = [os.path.join(run_dir, MASTER_ADDRESS_NAME)]
     if extra and os.path.abspath(extra) not in {os.path.abspath(p) for p in paths}:
@@ -485,14 +472,13 @@ def running_master(
 ) -> Iterator[LaunchedMaster]:
     """Run a master whose lifetime is this process's rather than an engine's.
 
-    ``provision_pool`` covers the server that owns its pool. Everything else --
-    several engines on one pool, a pool that has to survive a restart -- needs
-    the master somewhere that is not any of them, which is what this is for.
+    `provision_pool` covers the server that owns its pool. Several engines on
+    one pool, or a pool that has to survive a restart, need the master
+    somewhere that is not any of them.
 
-    ``address_file`` receives ``host:port`` once the master answers, so the
-    workers can name the file instead of an address nobody knows until the
-    scheduler has placed this process. One is written to ``run_dir`` either
-    way.
+    `address_file` receives `host:port` once the master answers, so workers can
+    name the file instead of an address nobody knows until the scheduler has
+    placed this process. One is written to `run_dir` either way.
     """
     os.makedirs(run_dir, exist_ok=True)
     master = _launch_master(pool, run_dir)
@@ -506,15 +492,15 @@ def running_master(
 
 @contextlib.contextmanager
 def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optional[str]]:
-    """Make ``pool`` reachable and name it in this process's environment.
+    """Make `pool` reachable and name it in this process's environment.
 
-    Yields the path of the client config written, or ``None`` when an inherited
-    ``MOONCAKE_CONFIG_PATH`` was left in charge.
+    Yields the path of the client config written, or `None` when an inherited
+    `MOONCAKE_CONFIG_PATH` was left in charge.
 
     Args:
-        pool: A ``MooncakeStoreConfig``.
+        pool: A `MooncakeStoreConfig`.
         run_dir: Where to write the client config and the master's log.
-            Defaults to ``TRTLLM_MOONCAKE_RUN_DIR``, else a temporary directory
+            Defaults to `TRTLLM_MOONCAKE_RUN_DIR`, else a temporary directory
             that is removed on exit.
     """
     inherited = os.getenv(CONFIG_PATH_ENV)
@@ -546,9 +532,8 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
             if pool.launch_master:
                 master = _launch_master(pool, run_dir)
                 master_address = master.address
-                # Even a master that only this server uses publishes: it is
-                # how its donors reach it, and how the log of a finished run
-                # still says which pool it was.
+                # Published even when only this server uses it, since that is
+                # how its donors reach it.
                 stack.enter_context(
                     _published_address(
                         master_address, _address_files(run_dir, pool.master_address_file)
@@ -567,9 +552,9 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
                 resolve_device_name(pool.protocol, pool.device_name))
             with open(config_path, "w") as handle:
                 json.dump(config, handle, indent=2)
-            # This reaches the ranks the LLM constructor spawns, which
-            # inherit it. A rank the launcher started instead was already
-            # running, and reads the config out of the run directory -- see
+            # Inherited by the ranks the LLM constructor spawns. Ranks an
+            # external launcher started were already running, so they read the
+            # config out of the run directory instead; see
             # provisioned_config_path.
             os.environ[CONFIG_PATH_ENV] = config_path
             exported = True
@@ -577,9 +562,8 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
                 f"mooncake-store: {CONFIG_PATH_ENV}={config_path} "
                 f"({json.dumps(config, sort_keys=True)})"
             )
-            # Capacity is the pool's least obvious property and the one that
-            # explains a low hit rate, so state the arithmetic rather than
-            # leaving it to be done from global_segment_size later.
+            # Capacity is what explains a low hit rate, so state the
+            # arithmetic instead of leaving it to be derived later.
             logger.info(
                 "mooncake-store: this server's ranks will each contribute "
                 f"global_segment_size={pool.global_segment_size} to the pool; "
@@ -601,9 +585,9 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
 def maybe_provision_pool(kv_connector_config: Any) -> Iterator[None]:
     """Provision the pool if this deployment asked the server to.
 
-    A no-op for every other connector, and for a ``mooncake-store`` config
-    that left ``mooncake_store`` unset: that deployment is told about its pool
-    through ``MOONCAKE_CONFIG_PATH``, which is how the SLURM harness drives it.
+    A no-op for every other connector, and for a `mooncake-store` config that
+    left `mooncake_store` unset, since such a deployment is told about its pool
+    through `MOONCAKE_CONFIG_PATH` instead.
     """
     if not uses_connector(kv_connector_config, "mooncake-store"):
         yield

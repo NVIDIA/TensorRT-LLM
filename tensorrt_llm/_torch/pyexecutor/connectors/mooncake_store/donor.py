@@ -14,30 +14,23 @@
 # limitations under the License.
 """Put a node's host memory into a Mooncake pool without reading or writing it.
 
-Pool capacity comes only from processes that open a store handle: ``setup``
-registers ``global_segment_size`` bytes of the caller's host memory and the
-master then places blocks in it. In a disaggregated deployment only the context
-servers configure the connector, so only they call ``setup``, and the pool is
-entirely prefill-node memory -- which makes the store a
-prefill-DRAM-caches-prefill-GPU tier, overlapping what TensorRT-LLM's own host
-offload already does.
+Pool capacity comes only from processes that open a store handle: `setup`
+registers `global_segment_size` bytes of the caller's host memory and the master
+then places blocks in it. In a disaggregated deployment only the context servers
+configure the connector, so the pool is entirely prefill-node memory, which
+overlaps what TensorRT-LLM's own host offload already does.
 
 Donating alongside a generation server puts that node's memory into the same
-pool. Prefill then writes blocks that land on decode-side DRAM and reads them
-back, while the generation engine stays free of any connector: it neither reads
-nor writes the store, so it keeps its single cache transceiver for the
-prefill-to-decode handoff.
+pool, so prefill writes blocks that land on decode-side DRAM. The generation
+engine stays free of any connector and keeps its single cache transceiver for
+the prefill-to-decode handoff.
 
-Donation is deliberately not a ``StoreRole``. The roles describe an engine's
-traffic -- ``producer`` writes, ``consumer`` reads, ``both`` does both -- and
-none of them means "contribute memory only", so attaching a connector to a
-generation server to get its DRAM into the pool would also start it reading or
-writing. Capacity and traffic are separate concerns, which is why this holds a
-handle of its own rather than being a setting on the connector.
+Donation is not a `StoreRole`. The roles describe an engine's traffic and none
+of them means "contribute memory only", so capacity and traffic stay separate
+concerns and a donor holds a store handle of its own.
 
-The memory is charged to the donating process, so it competes with anything
-else on the node -- a generation server's ``kv_cache_config.host_cache_size``
-above all. Size the two together.
+The memory is charged to the donating process, so size it together with that
+node's `kv_cache_config.host_cache_size`.
 """
 
 import contextlib
@@ -56,8 +49,7 @@ __all__ = [
     "maybe_donate_segment",
 ]
 
-#: A donor never transfers, so its transfer buffer is dead weight; ``setup``
-#: still rejects a zero one.
+#: A donor never transfers, but `setup` rejects a zero-sized transfer buffer.
 DEFAULT_DONOR_LOCAL_BUFFER_SIZE = 64 * 1024**2
 
 
@@ -71,15 +63,14 @@ def donate_segment(
     local_buffer_size: int = DEFAULT_DONOR_LOCAL_BUFFER_SIZE,
     hostname: Optional[str] = None,
 ) -> Iterator[str]:
-    """Hold ``segment_size`` bytes of this node's memory in the pool.
+    """Hold `segment_size` bytes of this node's memory in the pool.
 
-    Yields the host the segment is registered under, which is what the master
-    and the engines reading from it identify the capacity by.
+    Yields the host the segment is registered under, which is how the master
+    and the engines reading from it identify the capacity.
 
-    The handle is held for the duration: dropping it unmounts the segment, and
-    the master starts reporting the blocks that lived in it as lost. So the
-    caller must stay inside this context for as long as the capacity is meant
-    to exist, which for a donor is its whole run.
+    Dropping the store handle unmounts the segment and the master starts
+    reporting the blocks that lived in it as lost, so the caller must stay
+    inside this context for as long as the capacity is meant to exist.
     """
     try:
         from mooncake.store import MooncakeDistributedStore
@@ -92,10 +83,8 @@ def donate_segment(
 
     host = hostname or local_address()
     donated = f"{segment_size / 1024 ** 3:.1f}GiB"
-    # Every argument is echoed, with the byte counts spelled out next to the
-    # human-readable form: a segment that is a thousandth of the intended size
-    # is a size string parsed wrong, and it otherwise shows up only as a pool
-    # that evicts far too eagerly, days later.
+    # Byte counts are spelled out next to the human-readable form. A misparsed
+    # size string otherwise surfaces only as a pool that evicts far too eagerly.
     logger.info(
         f"mooncake-store: lending memory to the pool at {master_server_address} "
         f"as capacity only, no reads or writes: host={host} "
@@ -136,8 +125,7 @@ def donate_segment(
     try:
         yield host
     finally:
-        # Explicit because the segment stays mounted for as long as anything
-        # references the handle, and "as long as this context" is the contract.
+        # The segment stays mounted while anything references the handle.
         del store
         logger.info(
             f"mooncake-store: withdrew the {donated} lent from {host}; the "
@@ -150,19 +138,17 @@ def maybe_donate_segment(donation: Any) -> Iterator[Optional[str]]:
     """Lend memory for this process's lifetime if the config asked to.
 
     Args:
-        donation: A ``MooncakeDonationConfig``, or ``None`` to do nothing --
-            which is every deployment that does not lend memory, so callers
-            need no condition of their own.
+        donation: A `MooncakeDonationConfig`, or `None` to do nothing, so
+            callers need no condition of their own.
 
-    Yields the host the segment is registered under, or ``None``.
+    Yields the host the segment is registered under, or `None`.
     """
     if donation is None:
         yield None
         return
 
-    # A generation server has no other reason to resolve a master, so the
-    # address it lends against is worth saying out loud before the wait: this
-    # is the one place bringup blocks on a component from a different job.
+    # Bringup blocks here on a master that may belong to a different job, so
+    # name the address before waiting on it.
     logger.info(
         "mooncake-store: mooncake_donation is set, so this server lends host "
         f"memory to the pool at {donation.master_server_address} without using "
@@ -171,15 +157,13 @@ def maybe_donate_segment(donation: Any) -> Iterator[Optional[str]]:
     master_address = resolve_master_address(
         donation.master_server_address, master_timeout()
     )
-    # Checked before setup so an absent master reads as one, rather than as
-    # the status code setup returns for everything.
+    # Checked before setup so an absent master is reported as such, rather than
+    # as the status code setup returns for every kind of failure.
     wait_for_master(master_address)
     with donate_segment(
         master_server_address=master_address,
         segment_size=parse_size(donation.segment_size),
         protocol=donation.protocol,
-        # Which HCAs this node has is the node's business, so a config that
-        # leaves it open stays usable on every node type in the deployment.
         device_name=resolve_device_name(donation.protocol, donation.device_name),
         metadata_server=donation.metadata_server,
     ) as host:

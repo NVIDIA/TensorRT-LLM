@@ -14,10 +14,10 @@
 # limitations under the License.
 """Worker side of the Mooncake store KV cache connector.
 
-One worker per rank owns a ``MooncakeDistributedStore`` handle and moves pages
+One worker per rank owns a `MooncakeDistributedStore` handle and moves pages
 between that pool and its own GPU KV cache. It is also the only place that knows
-how a page is addressed and how a key is spelled, which is why the leader --
-colocated with rank 0's worker in the same process -- asks it to run prefix
+how a page is addressed and how a key is spelled, which is why the leader,
+colocated with rank 0's worker in the same process, asks it to run prefix
 lookups instead of rebuilding that knowledge.
 
 Loads are synchronous: the runtime has already told the scheduler those tokens
@@ -28,7 +28,7 @@ Saves are asynchronous and gated on a CUDA event. The pages are only complete
 once the forward pass that wrote them has retired, and blocking the executor
 loop on an RDMA write is exactly the cost the store is supposed to avoid. The
 scheduler reports such a request as saving asynchronously, which keeps its pages
-pinned until ``get_finished`` says the writes landed.
+pinned until `get_finished` says the writes landed.
 """
 
 import threading
@@ -63,7 +63,7 @@ __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
 
 #: Set by the worker's constructor so the leader, which the executor builds in
 #: the same process on rank 0, can reach the store handle without a second
-#: connection or an out-of-band channel. See ``py_executor_creator``, which
+#: connection or an out-of-band channel. See `py_executor_creator`, which
 #: constructs scheduler and worker concurrently for exactly this kind of
 #: mutual dependency.
 _LOCAL_WORKER: Optional["MooncakeStoreConnectorWorker"] = None
@@ -141,7 +141,7 @@ def _batched(items: Sequence, size: int):
 def _stream_handle(stream) -> int:
     """The raw CUDA stream handle behind a torch stream, or a handle as given.
 
-    ``None`` maps to 0, the default stream, which is what the runtime passes when
+    `None` maps to 0, the default stream, which is what the runtime passes when
     it has no stream of its own to offer.
     """
     if stream is None:
@@ -175,20 +175,18 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         )
         self._save_thread: Optional[threading.Thread] = None
         self._save_lock = threading.Lock()
-        # Host staging, when the pool cannot register device memory. One pool per
-        # direction so the executor thread and the save thread never share slots.
+        # Host staging, when the pool cannot register device memory.
         self._load_staging: Optional[HostStagingPool] = None
         self._save_staging: Optional[HostStagingPool] = None
         self._save_stream: Optional[torch.cuda.Stream] = None
-        # This rank's device, captured on the executor thread. The save thread
-        # cannot ask for it itself; see _drain_saves.
+        # This rank's device, captured on the executor thread; see _drain_saves.
         self._device_index: Optional[int] = None
         # Pages per store call. Staging narrows this to the slots it can afford.
         self._batch_size = self._config.transfer_batch_size
         # Save submissions still in flight, per request.
         self._outstanding_saves: Dict[int, int] = defaultdict(int)
         # Requests the runtime has told us are done producing KV. Their pages
-        # stay pinned until we report them back through ``get_finished``.
+        # stay pinned until we report them back through `get_finished`.
         self._closed_requests: Set[int] = set()
         self._save_error: Optional[BaseException] = None
 
@@ -227,8 +225,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         validate_layout(layout)
         addressing = PageAddressing(layout)
-        # Read here, on the executor thread, because it is thread-local and the
-        # save thread would otherwise see device 0 rather than this rank's.
+        # Torch's current device is thread-local, so read it here on the
+        # executor thread; the save thread would otherwise see device 0.
         if torch.cuda.is_available():
             self._device_index = torch.cuda.current_device()
         if self._config.stage_through_host:
@@ -274,10 +272,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def _open_staging(self, addressing: PageAddressing) -> None:
         """Allocate and register the pinned slots pages will pass through.
 
-        Only the directions this role drives get a pool, since each one costs its
-        own pinned allocation and a consumer never gathers, nor a producer
-        scatter. The GPU pools are deliberately left unregistered: reaching them
-        is what staging exists to avoid needing.
+        Only the directions this role drives get a pool, since each one costs a
+        pinned allocation of its own. The GPU pools are left unregistered,
+        which is the point of the mode.
         """
         max_bytes_per_page = max(
             addressing.bytes_per_page(layer_group_id)
@@ -336,7 +333,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         return self._addressing is not None
 
     def count_prefix_hit(self, block_hashes: Sequence[bytes]) -> int:
-        """How many leading blocks of ``block_hashes`` are fully present.
+        """How many leading blocks of `block_hashes` are fully present.
 
         A block counts only when every layer group and every rank has its page,
         because a prefix is replayed as a whole. The scan stops at the first
@@ -428,18 +425,17 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                     f"reported as computed. First failure: {failed[:1]}"
                 )
             if staging is not None:
-                # Only reached when every page in the batch landed, so no slot
+                # Only reached once every page in the batch landed, so no slot
                 # holding a failed read is copied over a device page.
                 unstage_batch_after_get(staging, batch_addresses, batch_sizes, handle)
-                # The slots are reused by the next batch and the forward pass
-                # reads these pages, so the scatter has to be complete before
-                # either happens.
+                # The next batch reuses the slots and the forward pass reads
+                # these pages, so the scatter has to complete before either.
                 _sync_stream(handle)
 
         logger.debug(f"mooncake-store rank {self._rank} loaded {total_pages} pages")
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
-        """No-op: loads complete in ``start_load_kv``.
+        """No-op: loads complete in `start_load_kv`.
 
         Transfers are whole pages, so a page's bytes for every layer in a group
         land in one store call rather than layer by layer. There is nothing left
@@ -447,7 +443,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         """
 
     def save_kv_layer(self, layer_idx: int, stream: torch.cuda.Stream):
-        """No-op: saves are submitted once per pass in ``wait_for_save``.
+        """No-op: saves are submitted once per pass in `wait_for_save`.
 
         A page is only complete when every layer of its group has written its
         slice, so there is no correct per-layer submission point.
@@ -481,7 +477,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         Args:
             finished_gen_req_ids: Requests that will produce no further KV.
             started_loading_req_ids: Requests loading asynchronously. Always
-                empty here, since ``get_num_new_matched_tokens`` only ever
+                empty here, since `get_num_new_matched_tokens` only ever
                 offers synchronous loads; echoed back so the runtime does not
                 wait on something that already happened.
 
@@ -503,10 +499,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         return finished_saving, list(started_loading_req_ids)
 
     def _drain_saves(self) -> None:
-        # Torch's current device is thread-local and a new thread starts at 0, so
-        # this has to be the device captured on the executor thread rather than
-        # whatever this one defaults to. Getting it wrong only shows up once the
-        # thread issues CUDA work of its own: the stream would belong to device 0
+        # A new thread starts on device 0, so adopt the device captured on the
+        # executor thread. Otherwise a stream created below belongs to device 0
         # while the KV pointers belong to the rank's device, and the copy fails
         # with cudaErrorInvalidValue on every rank except 0.
         if self._device_index is not None:
@@ -514,8 +508,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if self._save_staging is not None and torch.cuda.is_available():
             # Owned by this thread so the gather never queues behind the
             # executor's work, and created after set_device so it lands on the
-            # rank's device. Without a device there is nothing to order and the
-            # default stream handle stands in, which is what unit tests exercise.
+            # rank's device.
             self._save_stream = torch.cuda.Stream()
         while True:
             item = self._save_queue.get()
@@ -573,13 +566,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             source_addresses = [batch_addresses[i] for i in pending]
             source_sizes = [batch_sizes[i] for i in pending]
             if staging is not None:
-                # Gathering after the existence filter means a page that is
-                # already in the pool costs no copy.
+                # Gathered after the existence filter, so a page already in the
+                # pool costs no copy.
                 source_addresses, source_sizes = stage_batch_for_put(
                     staging, source_addresses, source_sizes, handle
                 )
-                # The store reads the slots on this thread, so they have to be
-                # filled first.
+                # The store reads the slots on this thread, so fill them first.
                 _sync_stream(handle)
             results = self._store.batch_put_from_multi_buffers(
                 [batch_keys[i] for i in pending],
@@ -646,8 +638,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                     f"mooncake-store close failed: {type(exc).__name__}: {exc}\n"
                     f"{traceback.format_exc()}"
                 )
-        # Released only after the store is closed: it holds registrations against
-        # this memory, and the save thread was already joined above.
+        # Released only after the store is closed, since it holds registrations
+        # against this memory.
         self._load_staging = None
         self._save_staging = None
         self._save_stream = None

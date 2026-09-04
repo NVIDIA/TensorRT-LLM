@@ -17,7 +17,7 @@
 Every rejection here is a configuration whose failure mode is a wrong answer
 rather than a slow one: KV that gets replayed without all of the state it was
 computed with. Beam search, attention data parallelism, host and disk cache
-tiers, and Mamba caches are rejected for all connectors in ``py_executor``, so
+tiers, and Mamba caches are rejected for all connectors in `py_executor`, so
 they are not repeated.
 
 Checks run at construction, before any request is admitted, so a bad deployment

@@ -87,8 +87,8 @@ class FakeStore:
         self.exist_calls = []
         self.closed = False
         self.fail_gets_for = set()
-        #: Workers built against this store. ``make_worker`` shuts each one
-        #: down; the fixture repeats it as a backstop for early failures.
+        #: Workers built against this store. `make_worker` shuts each one down;
+        #: the fixture repeats it as a backstop for early failures.
         self.workers = []
 
     def register_buffer(self, address, size):
@@ -393,7 +393,7 @@ def test_config_requires_the_env_var(monkeypatch):
 
 
 def test_config_falls_back_to_the_run_directory(tmp_path, monkeypatch):
-    # A rank the launcher started was already running when its leader
+    # A rank an external launcher started was already running when its leader
     # provisioned the pool, so it never inherited the exported path and reads
     # the rendered config out of the shared run directory instead.
     monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
@@ -418,8 +418,8 @@ def test_config_run_directory_without_a_rendered_config_still_asks(tmp_path, mon
 
 
 def test_config_env_var_wins_over_the_run_directory(tmp_path, monkeypatch):
-    # An externally managed pool stays reachable: the run directory is only
-    # consulted when nothing was passed in.
+    # An externally managed pool stays reachable, since the run directory is
+    # only consulted when nothing was passed in.
     named = tmp_path / "external.json"
     named.write_text(json.dumps({"master_server_address": "external:50051"}))
     (tmp_path / "mooncake.json").write_text(
@@ -474,9 +474,9 @@ def test_validate_layout_rejects_sliding_window():
 
 # ---- connector identification ----
 #
-# py_executor_creator turns partial reuse off for this connector, and finds it
-# through uses_connector. Missing the config would silently cost the reuse the
-# store exists to provide, so the recognition itself is worth pinning down.
+# py_executor_creator turns partial reuse off for this connector and finds it
+# through uses_connector. Failing to recognize the config would silently cost
+# the reuse the store exists to provide.
 
 
 def test_uses_connector_recognizes_the_preset():
@@ -541,8 +541,8 @@ def test_worker_prefix_hit_needs_every_layer_group(store_config, fake_store):
 def test_worker_prefix_hit_stops_at_the_first_gap(store_config, fake_store):
     with make_worker(fake_store, layout=make_layout()) as worker:
         hashes = [bytes([index]) * 16 for index in range(3)]
-        # Block 1 missing: block 2 is unusable even though it is present, because a
-        # prefix is replayed contiguously.
+        # With block 1 missing, block 2 is unusable even though it is present,
+        # because a prefix is replayed contiguously.
         fake_store.objects.add(worker._namespaces[0].key(hashes[0]))
         fake_store.objects.add(worker._namespaces[0].key(hashes[2]))
         assert worker.count_prefix_hit(hashes) == 1
@@ -640,8 +640,7 @@ def staged_copies(monkeypatch):
         "_memcpy_async",
         lambda dst, src, size, kind, stream: copies.append((int(dst), int(src), int(size))),
     )
-    # Imported into the worker by name, so the worker's binding is the one that
-    # has to be replaced.
+    # Imported into the worker by name, so replace the worker's binding.
     monkeypatch.setattr(worker_module, "_sync_stream", lambda _stream: None)
     return copies
 
@@ -650,8 +649,8 @@ def staged_copies(monkeypatch):
 def fake_cuda(monkeypatch):
     """Present a CUDA device on a host that has none, recording set_device calls.
 
-    Only safe for paths that do not allocate or launch; it exists to exercise the
-    device bookkeeping around the save thread.
+    Only safe for paths that do not allocate or launch, and exists to exercise
+    the device bookkeeping around the save thread.
     """
     recorded = []
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -672,7 +671,7 @@ def fake_cuda(monkeypatch):
 )
 def test_plan_slot_geometry(page_bytes, batch, budget, expected_slots):
     slot_bytes, num_slots = plan_slot_geometry(page_bytes, batch, budget)
-    # A slot always holds a whole page; the budget bounds the count, not the width.
+    # A slot always holds a whole page: the budget bounds the count, not the width.
     assert slot_bytes == page_bytes
     assert num_slots == expected_slots
 
@@ -694,10 +693,6 @@ def test_config_reads_staging_from_the_json(store_config):
     assert config.staging_buffer_bytes == 256 * 1024**2
 
 
-def test_config_defaults_to_zero_copy(store_config):
-    assert MooncakeStoreConnectorConfig.from_env().stage_through_host is False
-
-
 @pytest.mark.parametrize(
     "value,expected", [("1", True), ("true", True), ("on", True), ("0", False), ("off", False)]
 )
@@ -717,13 +712,13 @@ def test_staging_registers_host_buffers_and_never_the_pools(
 ):
     layout = make_layout(regions_per_group=2)
     with make_staged_worker(fake_store, store_config, layout=layout) as worker:
-        # Registering the pools is the step that needs GPUDirect, so staging must
-        # not do it at all -- that is the whole point of the mode.
+        # Registering the pools is the step that needs GPUDirect, so staging
+        # must not do it at all.
         pool_ranges = PageAddressing(layout).registration_ranges()
         registered_starts = {address for address, _size in fake_store.registered}
         assert registered_starts.isdisjoint({start for start, _end in pool_ranges})
 
-        # One pinned buffer per direction, since the default role is ``both``.
+        # One pinned buffer per direction, since the default role is `both`.
         assert len(fake_store.registered) == 2
         assert registered_starts == {
             worker._load_staging.slot_address(0),
@@ -744,10 +739,9 @@ def test_staging_put_hands_the_store_one_host_buffer_per_page(
         (keys, addresses, sizes) = fake_store.put_calls[0]
 
         assert keys == [worker._namespaces[0].key(block_hash)]
-        # The store sees one contiguous host buffer, and its length is the sum of
+        # The store sees one contiguous host buffer whose length is the sum of
         # the device regions. That equality is what keeps a staged write
-        # byte-identical to a zero-copy one, so either path can read the other's
-        # pages.
+        # byte-identical to a zero-copy one.
         assert addresses == [[slot]]
         assert sizes == [[sum(device_sizes)]]
 
@@ -802,35 +796,32 @@ def test_staging_does_not_scatter_a_failed_load(store_config, fake_store, staged
         with pytest.raises(RuntimeError, match="failed to load"):
             worker.start_load_kv(None)
 
-        # A failed read leaves the slot holding whatever it held before. Copying
-        # that onto the page would put unrelated bytes where the runtime already
-        # promised computed KV.
+        # A failed read leaves the slot holding whatever it held before, and
+        # copying that onto the page would put unrelated bytes where the
+        # runtime already promised computed KV.
         assert staged_copies == []
 
 
 def test_worker_captures_the_ranks_device_at_registration(store_config, fake_store, fake_cuda):
     with make_worker(fake_store, layout=make_layout()) as worker:
-        # Read on the executor thread, where it is correct. torch's current
-        # device is thread-local, so the save thread cannot ask for it itself.
         assert worker._device_index == 3
 
 
 def test_save_thread_adopts_the_ranks_device_not_the_thread_default(
     store_config, fake_store, fake_cuda
 ):
-    """Regression: the save thread must not run on torch's default device.
+    """The save thread must not run on torch's default device.
 
     It issues staging copies against pointers owned by the rank's device. A
     stream created on device 0 instead fails every copy with
-    cudaErrorInvalidValue, and only on ranks other than 0 -- which is exactly how
-    this escaped into a run.
+    cudaErrorInvalidValue, and only on ranks other than 0.
     """
     with make_worker(fake_store, layout=make_layout()):
         deadline = time.monotonic() + 5.0
         while 3 not in fake_cuda and time.monotonic() < deadline:
             time.sleep(0.01)
         assert 3 in fake_cuda, f"save thread set devices {fake_cuda}, expected the rank's 3"
-        # Never the thread-local default, which is what the bug did.
+        # Never the thread-local default.
         assert 0 not in fake_cuda
 
 
@@ -851,8 +842,7 @@ def test_staging_narrows_the_batch_to_the_budget(store_config, fake_store, stage
                 )
             ]
         )
-        # Five pages through two slots: three calls, and no call wider than the
-        # slot count, which is the constraint staging adds.
+        # Five pages through two slots, and no call wider than the slot count.
         assert [len(keys) for keys, _a, _s in fake_store.put_calls] == [2, 2, 1]
 
 

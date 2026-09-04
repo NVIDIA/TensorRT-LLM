@@ -1,46 +1,30 @@
 #!/bin/bash
 # Make the Mooncake Python store bindings importable inside a TensorRT-LLM
-# container, so the mooncake-store KV connector can start.
+# container, so the mooncake-store KV connector can start. Images built by
+# docker/common/install_mooncake.sh already have this; run it on images that
+# predate that, or to change the wheel.
 #
-# Two things break a plain `pip install mooncake-transfer-engine` in the
-# containers built by docker/common/install_mooncake.sh:
+# Two things break a plain `pip install mooncake-transfer-engine` in those
+# containers, both explained in docker/common/install_mooncake.sh: the CMake
+# source build leaves behind an unusable `mooncake` package that shadows or
+# collides with the wheel, and the default wheel is linked against
+# libcudart.so.12 while these images ship CUDA 13 only. Either way the symptom
+# is `ImportError: libmooncake_store.so` after pip reports success.
 #
-#   1. The CMake source build in that script emits its own, unusable `mooncake`
-#      Python package (it omits libmooncake_store.so). mooncake-integration's
-#      CMakeLists picks the install directory with
-#        python3 -c "import sys; print([s for s in sys.path if 'packages' in s][0])"
-#      -- the first sys.path entry whose name merely contains "packages". With
-#      nvidia-cutlass-dsl installed that is nvidia_cutlass_dsl/dsl_packages,
-#      which nvidia_cutlass_dsl_packages.pth sys.path.insert(0)s, so it shadows
-#      anything pip installs. Without it, the package lands in dist-packages and
-#      collides with the wheel: CMake writes store.cpython-312-<plat>.so, the
-#      wheel writes store.so, and importlib prefers the interpreter-tagged
-#      suffix, so the broken extension still wins. Either way the symptom is
-#      `ImportError: libmooncake_store.so` *after* pip reports success.
-#      Because pip overwrites __init__.py in the collision case, leftovers are
-#      not reliably identifiable after the fact -- so this script removes the
-#      package directory outright and reinstalls, rather than trying to tell
-#      good files from bad.
+# `mooncake-transfer-engine-cuda13` needs no CUDA 12 shim, so it is the default
+# here. Its releases start at 0.3.9 and so cannot match the pin in
+# install_mooncake.sh, which is safe: that CMake-built C++ library backs the
+# cache transceiver's Mooncake backend, a different feature, while the
+# connector only ever talks to the wheel. The wheel also supplies the
+# mooncake_master that lands on PATH, so client and master stay matched.
+# Revisit only if cache_transceiver_config.backend is set to MOONCAKE.
 #
-#   2. The `mooncake-transfer-engine` wheel is linked against libcudart.so.12,
-#      while containers from pytorch-26.05 on ship CUDA 13 only.
-#      `mooncake-transfer-engine-cuda13` is the same project built for CUDA 13
-#      and needs no shim, so it is the default here. Its releases start at 0.3.9,
-#      so it cannot match the 0.3.7.post2 pin in install_mooncake.sh -- see the
-#      note below on why that is safe.
-#
-# Version drift against /usr/local/Mooncake: that CMake-built C++ library backs
-# the *cache transceiver's* Mooncake backend, a different feature. The connector
-# only ever talks to the wheel, and the wheel also supplies the mooncake_master
-# that lands on PATH, so client and master stay matched. Revisit only if you set
-# cache_transceiver_config.backend to MOONCAKE (these configs use NIXL).
-#
-# Set MOONCAKE_WHEEL to override, e.g.
+# Set MOONCAKE_WHEEL to override, for example
 #   MOONCAKE_WHEEL="mooncake-transfer-engine==0.3.7.post2"
-# to match install_mooncake.sh exactly; the libcudart.so.12 shim is then applied
-# automatically.
+# to match install_mooncake.sh exactly; the libcudart.so.12 shim is then
+# applied automatically.
 #
-# Idempotent, and cheap on re-runs: if the install is already correct it exits
+# Idempotent and cheap on re-runs: if the install is already correct it exits
 # without contacting the network, so it is safe in a SLURM prolog on every node.
 
 set -euo pipefail
@@ -59,9 +43,8 @@ if pip3 show "${WHEEL_NAME}" >/dev/null 2>&1 &&
     exit 0
 fi
 
-# Purge every `mooncake` package directory on the search path, whatever wrote it.
-# Distinguishing CMake leftovers from wheel files is unreliable once pip has
-# overwritten __init__.py, so remove and reinstall instead.
+# Purge every `mooncake` package directory on the search path, whatever wrote
+# it, since leftovers cannot be told apart from wheel files reliably.
 python3 - <<'PY'
 import os
 import shutil

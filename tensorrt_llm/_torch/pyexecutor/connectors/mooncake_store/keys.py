@@ -14,12 +14,12 @@
 # limitations under the License.
 """Block identity and store key naming for the Mooncake store connector.
 
-``KVCacheManagerV2`` exposes no block hashes to a connector -- ``RequestData``
-reports them empty -- so content identity is derived here instead. The chain is
+`KVCacheManagerV2` exposes no block hashes to a connector, since `RequestData`
+reports them empty, so content identity is derived here instead. The chain is
 the standard one: a block's hash covers its own tokens *and* every token before
 it, so a key can only be reused by a request whose prefix is byte-identical.
 
-A key is ``<namespace>/<block hash>``. The namespace pins down everything that
+A key is `<namespace>/<block hash>`. The namespace pins down everything that
 would make the stored bytes mean something different: the model, the shard that
 produced them, the layer group inside that shard, the tokens each page holds and
 how many bytes a page is. Anything that changes those reads as a cache miss
@@ -77,7 +77,7 @@ class BlockHashChain:
         return self._hashes
 
     def extend(self, tokens: Sequence[int]) -> Sequence[bytes]:
-        """Grow the chain to cover every full block of ``tokens``.
+        """Grow the chain to cover every full block of `tokens`.
 
         Args:
             tokens: The request's complete token list, prompt first. Must be an

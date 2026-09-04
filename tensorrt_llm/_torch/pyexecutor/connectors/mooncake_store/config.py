@@ -14,13 +14,13 @@
 # limitations under the License.
 """Configuration for the Mooncake store KV cache connector.
 
-Topology settings are read from the JSON file named by ``MOONCAKE_CONFIG_PATH``,
+Topology settings are read from the JSON file named by `MOONCAKE_CONFIG_PATH`,
 the same file and environment variable the vLLM Mooncake store connector uses,
 so one deployment can point both engines at the same pool.
 
-``KvCacheConnectorConfig`` carries no free-form dictionary, so the two settings
-that are TensorRT-LLM's rather than Mooncake's -- the read/write role and the
-key prefix -- are also taken from the environment.
+`KvCacheConnectorConfig` carries no free-form dictionary, so the two settings
+that are TensorRT-LLM's rather than Mooncake's, the read/write role and the key
+prefix, are also taken from the environment.
 """
 
 import json
@@ -82,7 +82,7 @@ _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)\s*$")
 class StoreRole(Enum):
     """Which directions of traffic this engine is allowed to drive.
 
-    A disaggregated deployment typically runs context servers as ``both`` and
+    A disaggregated deployment typically runs context servers as `both` and
     leaves generation servers unconfigured: generated tokens are rarely a reused
     prefix, so writing them costs bandwidth for no hit rate.
     """
@@ -103,7 +103,7 @@ class StoreRole(Enum):
 
 
 def parse_size(value: Any) -> int:
-    """Accept either a byte count or a suffixed string such as ``"4GiB"``."""
+    """Accept either a byte count or a suffixed string such as `"4GiB"`."""
     if isinstance(value, bool):
         raise ValueError(f"expected a size, got {value!r}")
     if isinstance(value, int):
@@ -123,16 +123,13 @@ def parse_size(value: Any) -> int:
 def provisioned_config_path() -> Optional[str]:
     """The client config a server on this node rendered, if there is one.
 
-    ``provision_pool`` writes one and exports ``MOONCAKE_CONFIG_PATH``, which
-    reaches the ranks the LLM constructor spawns, since they inherit that
-    environment. Ranks the launcher started instead -- one task per rank, which
-    is how a server spanning several GPUs is launched under a scheduler -- were
-    already running by then and never see it. Reading the config back from the
-    run directory is what lets those ranks join the pool their own leader
-    provisioned.
+    `provision_pool` writes one and exports `MOONCAKE_CONFIG_PATH`, which the
+    ranks the LLM constructor spawns inherit. Ranks an external launcher
+    started, one task per rank, were already running by then and never see it,
+    so they read the config back from the run directory instead.
 
-    Only possible when the deployment named that directory: it otherwise
-    defaults to a per-process temporary one, which no other rank could read.
+    Only possible when the deployment named that directory, since it otherwise
+    defaults to a per-process temporary one that no other rank could read.
     """
     run_dir = os.getenv(RUN_DIR_ENV)
     if not run_dir:
@@ -164,11 +161,10 @@ class MooncakeStoreConnectorConfig:
     #: RPC without bounding how much a request may transfer.
     transfer_batch_size: int = 64
     #: Pass pages through a pinned host buffer instead of registering the KV
-    #: pools with Mooncake. Costs a copy in each direction and buys independence
-    #: from GPUDirect RDMA, without which registering device memory fails
-    #: outright. Leave off wherever the pool can reach GPU memory.
+    #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
+    #: RDMA, which registering device memory requires.
     stage_through_host: bool = False
-    #: Ceiling on the pinned allocation per direction when staging. The pool is
+    #: Ceiling on the pinned allocation per direction when staging. Slots are
     #: sized from the layout's largest page, so this caps how many pages may be
     #: in flight rather than how large one may be.
     staging_buffer_bytes: int = DEFAULT_STAGING_BUFFER_SIZE
@@ -222,14 +218,14 @@ class MooncakeStoreConnectorConfig:
                 "Mooncake JSON config (metadata_server, master_server_address, "
                 "protocol, device_name, global_segment_size, local_buffer_size), "
                 "or kv_connector_config.mooncake_store set so the server renders "
-                f"one -- into ${RUN_DIR_ENV} if this rank was started by the "
+                f"one, into ${RUN_DIR_ENV} if this rank was started by the "
                 "launcher rather than spawned by the server."
             )
         config = MooncakeStoreConnectorConfig.from_file(path)
         return config.with_env_overrides()
 
     def with_env_overrides(self) -> "MooncakeStoreConnectorConfig":
-        """Apply ``TRTLLM_MOONCAKE_STORE_*`` on top of the file's settings."""
+        """Apply `TRTLLM_MOONCAKE_STORE_*` on top of the file's settings."""
         import dataclasses
 
         updates: dict[str, Any] = {}

@@ -30,11 +30,11 @@ __all__ = ["MooncakeStoreMetadata", "PageTransfer", "RequestTransfers"]
 class PageTransfer:
     """One page of one layer group, to move in either direction."""
 
-    #: Content identity from ``BlockHashChain``; names the key, not the location.
+    #: Content identity from `BlockHashChain`; names the key, not the location.
     block_hash: bytes
     layer_group_id: int
-    #: Page slot index within ``layer_group_id``, as reported by
-    #: ``RequestData.new_block_ids_by_layer_group``.
+    #: Page slot index within `layer_group_id`, as reported by
+    #: `RequestData.new_block_ids_by_layer_group`.
     page_index: int
 
 
@@ -42,7 +42,7 @@ class PageTransfer:
 class RequestTransfers:
     """Pages belonging to one request, kept together for save bookkeeping.
 
-    The worker owes ``get_finished`` an answer per request, so a save's owner has
+    The worker owes `get_finished` an answer per request, so a save's owner has
     to survive the trip from scheduler to worker.
     """
 

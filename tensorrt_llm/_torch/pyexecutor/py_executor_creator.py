@@ -383,8 +383,8 @@ def create_py_executor(
         kv_cache_config.enable_block_reuse = False
         kv_cache_config.enable_partial_reuse = False
 
-    # Must happen before the KV cache manager is built below, since the manager
-    # reads enable_partial_reuse to construct its block pools.
+    # Must happen before the KV cache manager is built, since the manager reads
+    # enable_partial_reuse to construct its block pools.
     if (kv_cache_config.enable_partial_reuse
             and uses_connector(kv_connector_config, "mooncake-store")):
         logger.warning(

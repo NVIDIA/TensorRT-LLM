@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Exercise every MooncakeDistributedStore method the connector calls.
 
-``mooncake_smoke_test.py`` only proves the install loads and can round-trip a
-byte string. The connector's hot path never uses ``put``/``get``: it registers
-the KV pools and then moves pages with the ``batch_*_multi_buffers`` zero-copy
-calls. Those are the calls whose signatures could drift between wheel versions,
-so this checks them against real registered GPU memory, in the same order
-``worker.py`` uses them.
+`mooncake_smoke_test.py` only proves the install loads and can round-trip a byte
+string. The connector's hot path never uses `put` or `get`: it registers the KV
+pools and then moves pages with the `batch_*_multi_buffers` zero-copy calls.
+Those signatures could drift between wheel versions, so this checks them against
+real registered GPU memory, in the same order `worker.py` uses them.
 
 Needs a running mooncake_master and MOONCAKE_CONFIG_PATH, same as the connector.
 """
@@ -57,8 +56,8 @@ print("setup: OK")
 
 # Stand in for a KV pool. PageAddressing.page_buffers returns one address per
 # layer-group region, so a page is scattered across REGIONS buffers rather than
-# contiguous -- which is why the batch calls take list[list[int]]. Model two
-# strided regions so the scatter-gather path is actually exercised.
+# contiguous, which is why the batch calls take list[list[int]]. Two strided
+# regions here so the scatter-gather path is actually exercised.
 PAGES = 8
 REGIONS = 2
 REGION_BYTES = 128 * 1024

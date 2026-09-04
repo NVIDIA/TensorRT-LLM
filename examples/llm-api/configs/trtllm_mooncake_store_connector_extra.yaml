@@ -1,7 +1,7 @@
 # Extra LLM API options for trtllm-serve with the Mooncake store KV connector.
 #
-# Offloads KV pages to a Mooncake distributed store -- a shared CPU memory pool
-# addressed by content -- so a prefix computed by one engine can be replayed by
+# Offloads KV pages to a Mooncake distributed store, a shared CPU memory pool
+# addressed by content, so a prefix computed by one engine can be replayed by
 # another. This is a different component from the Mooncake transfer engine used
 # by the C++ cache transceiver for disaggregated prefill/decode handoff; the two
 # compose rather than conflict.
