@@ -18,8 +18,10 @@ from tensorrt_llm.visual_gen.args import (
     ParallelConfig,
     QuantAttentionConfig,
     RuntimeLoRAConfig,
+    SkipSoftmaxAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
+    VideoSparseAttentionConfig,
     VisualGenArgs,
 )
 
@@ -95,6 +97,49 @@ class TestAttentionConfigQuantValidation:
                     qk_dtype="int8", q_block_size=1, k_block_size=127, v_block_size=1
                 ),
             )
+
+    @pytest.mark.parametrize(
+        ("backend", "quant_config"),
+        [
+            (
+                "TRTLLM",
+                QuantAttentionConfig(
+                    qk_dtype="fp8",
+                    q_block_size=1,
+                    k_block_size=1,
+                    v_block_size=1,
+                ),
+            ),
+            (
+                "CUTEDSL",
+                QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
+            ),
+        ],
+    )
+    def test_vsa_and_quantization_are_mutually_exclusive(self, backend, quant_config):
+        with pytest.raises(
+            ValidationError, match="VSA and quant_attention_config are mutually exclusive"
+        ):
+            AttentionConfig(
+                backend=backend,
+                quant_attention_config=quant_config,
+                sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+            )
+
+    def test_skip_softmax_and_sage_quantization_can_be_combined(self):
+        attention = AttentionConfig(
+            backend="TRTLLM",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="int8",
+                q_block_size=1,
+                k_block_size=4,
+                v_block_size=1,
+            ),
+            sparse_attention_config=SkipSoftmaxAttentionConfig(threshold_scale_factor=0.3),
+        )
+
+        assert attention.sparse_attention_config is not None
+        assert attention.sparse_attention_config.algorithm == "skip_softmax"
 
     @pytest.mark.parametrize(
         ("qk_dtype", "q_block_size", "k_block_size", "v_block_size"),

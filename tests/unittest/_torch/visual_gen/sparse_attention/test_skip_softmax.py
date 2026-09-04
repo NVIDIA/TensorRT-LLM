@@ -7,28 +7,33 @@ import json
 import math
 from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import patch
 
 import pytest
 import torch
 import yaml
 from pydantic import ValidationError
 
+from tensorrt_llm._torch.attention_backend.sparse.params import SparseRuntimeParams
 from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
     SkipSoftmaxParams,
     SkipSoftmaxScheduler,
 )
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention as CoreTrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import fmha as cute_dsl_fmha
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import (
     CuTeDSLAttention,
     _resolve_skip_softmax_threshold_scale_factor,
 )
+from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import (
+    TrtllmAttention as VisualGenTrtllmAttention,
+)
+from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig, VisualGenArgs
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
-
-pytestmark = pytest.mark.cpu_only
 
 
 def _ckpt_sparse_attention_config(
@@ -87,6 +92,7 @@ def _prefill_threshold(
     ).threshold_scale_factor_prefill
 
 
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxUserAPI:
     """User-facing config surface: VisualGen args only expose runtime knobs."""
 
@@ -209,6 +215,7 @@ attention_config:
         assert _prefill_threshold(sparse_params) == pytest.approx(5000.0)
 
 
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxCheckpointConfig:
     """Checkpoint metadata: ModelOpt calibration is consumed at lowering time."""
 
@@ -308,6 +315,7 @@ class TestVisualGenSkipSoftmaxCheckpointConfig:
             config.to_sparse_params(checkpoint_config=checkpoint_config)
 
 
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxLayerFiltering:
     """Layer filtering: checkpoint ignore patterns disable selected modules."""
 
@@ -346,6 +354,7 @@ class TestVisualGenSkipSoftmaxLayerFiltering:
         ) == pytest.approx(5000.0)
 
 
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxTimestepCutoff:
     """Timestep cutoff: early denoising can run with skip-softmax disabled."""
 
@@ -411,6 +420,184 @@ class TestVisualGenSkipSoftmaxTimestepCutoff:
         )
 
 
+@pytest.mark.cpu_only
+class TestVisualGenSkipSoftmaxTrtllm:
+    """VisualGen uses a concrete TRTLLM backend and the shared scheduler."""
+
+    @staticmethod
+    def _patch_visual_trtllm_init(monkeypatch):
+        def _base_init(self, **kwargs):
+            self.sparse_params = kwargs["sparse_params"]
+
+        monkeypatch.setattr(VisualGenTrtllmAttention, "__init__", _base_init)
+
+    def test_factory_builds_concrete_skip_softmax_backend(self, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.skip_softmax.backend import (
+            SkipSoftmaxTrtllmAttention,
+        )
+
+        self._patch_visual_trtllm_init(monkeypatch)
+        attention_config = AttentionConfig(
+            backend="TRTLLM",
+            sparse_attention_config=SkipSoftmaxAttentionConfig(
+                threshold_scale_factor=5000.0,
+            ),
+        )
+        sparse_params = attention_config.sparse_attention_config.to_sparse_params()
+
+        backend = create_attention(
+            backend="TRTLLM",
+            layer_idx=0,
+            num_heads=2,
+            head_dim=8,
+            attention_config=attention_config,
+            attention_metadata_state={},
+            sparse_params=sparse_params,
+        )
+
+        backend_cls = type(backend)
+        assert backend_cls.__name__ == "SkipSoftmaxTrtllmAttention"
+        assert backend_cls.__module__.endswith(".sparse.skip_softmax.backend")
+        assert backend_cls is SkipSoftmaxTrtllmAttention
+        assert backend_cls.__bases__ == (VisualGenTrtllmAttention,)
+        assert backend.sparse_params is sparse_params
+        assert (
+            backend.predict_sparse_attention.__func__
+            is SkipSoftmaxTrtllmAttention.predict_sparse_attention
+        )
+        assert (
+            CoreTrtllmAttention.predict_sparse_attention
+            is not backend.predict_sparse_attention.__func__
+        )
+        assert "predict_sparse_attention" in backend_cls.__dict__
+        assert "block_sparse_attn_predict" not in backend_cls.__dict__
+        assert "forward" not in backend_cls.__dict__
+        assert "scheduler" not in backend_cls.__dict__
+
+    def test_factory_selects_backend_from_runtime_params(self, monkeypatch):
+        self._patch_visual_trtllm_init(monkeypatch)
+        sparse_params = SkipSoftmaxParams(
+            scheduler=SkipSoftmaxScheduler.from_threshold_scale_factor(5000.0)
+        )
+
+        backend = create_attention(
+            backend="TRTLLM",
+            layer_idx=0,
+            num_heads=2,
+            head_dim=8,
+            attention_config=AttentionConfig(backend="TRTLLM"),
+            attention_metadata_state={},
+            sparse_params=sparse_params,
+        )
+
+        assert type(backend).__name__ == "SkipSoftmaxTrtllmAttention"
+        assert backend.sparse_params is sparse_params
+
+    def test_concrete_backend_is_accepted_by_core_constructor(self):
+        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.skip_softmax.backend import (
+            SkipSoftmaxTrtllmAttention,
+        )
+
+        sparse_params = SkipSoftmaxParams(
+            scheduler=SkipSoftmaxScheduler.from_threshold_scale_factor(5000.0)
+        )
+
+        backend = SkipSoftmaxTrtllmAttention(
+            layer_idx=0,
+            num_heads=1,
+            head_dim=128,
+            attention_metadata_state={},
+            sparse_params=sparse_params,
+        )
+
+        assert backend.sparse_params is sparse_params
+
+    def test_concrete_backend_preserves_existing_prediction_payload(self):
+        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.skip_softmax.backend import (
+            SkipSoftmaxTrtllmAttention,
+        )
+
+        sparse_kv_indices = torch.tensor([1], dtype=torch.int32)
+        block_sparse_inputs = object()
+        base_runtime_params = SparseRuntimeParams(
+            sparse_kv_indices=sparse_kv_indices,
+            block_sparse_inputs=block_sparse_inputs,
+        )
+
+        backend = SkipSoftmaxTrtllmAttention.__new__(SkipSoftmaxTrtllmAttention)
+        backend.sparse_params = SkipSoftmaxParams(
+            scheduler=SkipSoftmaxScheduler.from_threshold_scale_factor(5000.0)
+        )
+        with (
+            patch.object(
+                VisualGenTrtllmAttention,
+                "predict_sparse_attention",
+                return_value=base_runtime_params,
+            ) as parent_predict,
+            patch.object(
+                backend.sparse_params.scheduler,
+                "get_runtime_params",
+                wraps=backend.sparse_params.scheduler.get_runtime_params,
+            ) as get_runtime_params,
+        ):
+            runtime_params = backend.predict_sparse_attention(
+                torch.empty(0), None, None, object(), SimpleNamespace(timestep=None)
+            )
+
+        parent_predict.assert_called_once()
+        get_runtime_params.assert_called_once_with(
+            runtime_params=base_runtime_params,
+            timestep=None,
+        )
+        assert runtime_params is not base_runtime_params
+        assert runtime_params.block_sparse_inputs is block_sparse_inputs
+        assert runtime_params.sparse_kv_indices is sparse_kv_indices
+        assert runtime_params.threshold_scale_factor_prefill == 5000.0
+
+    def test_factory_keeps_ignored_skip_softmax_layer_dense(self, monkeypatch):
+        self._patch_visual_trtllm_init(monkeypatch)
+        attention_config = AttentionConfig(
+            backend="TRTLLM",
+            sparse_attention_config=SkipSoftmaxAttentionConfig(
+                threshold_scale_factor=5000.0,
+            ),
+        )
+
+        backend = create_attention(
+            backend="TRTLLM",
+            layer_idx=0,
+            num_heads=2,
+            head_dim=8,
+            attention_config=attention_config,
+            attention_metadata_state={},
+            sparse_params=None,
+        )
+
+        assert type(backend) is VisualGenTrtllmAttention
+        assert backend.sparse_params is None
+
+    def test_factory_rejects_invalid_skip_softmax_params(self, monkeypatch):
+        self._patch_visual_trtllm_init(monkeypatch)
+        attention_config = AttentionConfig(
+            backend="TRTLLM",
+            sparse_attention_config=SkipSoftmaxAttentionConfig(
+                threshold_scale_factor=5000.0,
+            ),
+        )
+
+        with pytest.raises(TypeError, match="requires SkipSoftmaxParams"):
+            create_attention(
+                backend="TRTLLM",
+                layer_idx=0,
+                num_heads=2,
+                head_dim=8,
+                attention_config=attention_config,
+                attention_metadata_state={},
+                sparse_params=object(),
+            )
+
+
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxCuTeDSL:
     """CuTeDSL lowering and runtime scheduling use the shared SkipSoftmax params."""
 
@@ -479,6 +666,7 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
                 sparse_attention_config=sparse_config,
             ),
         )
+
         model = BaseDiffusionModel(model_config)
 
         class _Runner:
@@ -544,6 +732,7 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
         assert captured_kwargs.get("sparse_params") is sparse_params
 
 
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxPipelineConfig:
     """Pipeline config: multi-transformer checkpoints keep metadata separated."""
 

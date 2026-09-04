@@ -12,6 +12,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from utils.util import isSM100Family
 
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
@@ -698,18 +699,19 @@ def test_fast_cross_attention_wan_shapes(
 
 
 # ============================================================================
-# VSA self-attention (CUTEDSL backend, sparse_attention_config.algorithm='vsa')
+# VSA self-attention (CUTEDSL/TRTLLM backends)
 # ============================================================================
 
 
-def _build_vsa_setup(sparsity: float, batch_size: int, seed: int):
+def _build_vsa_setup(backend: str, sparsity: float, batch_size: int, seed: int):
     """Build naive + integrated models, VSA metadata, and inputs for a VSA test.
 
-    latent (8,8,8) -> 512 tokens (divisible by block_size=64), head_dim=128.
+    A ragged latent exercises VSA padding and token-mask lowering on both
+    fine-stage implementations.
     """
-    from tensorrt_llm._torch.visual_gen.attention_backend import VSAMetadataBuilder
+    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import VSAMetadataBuilder
 
-    latent_shape = (8, 8, 8)
+    latent_shape = (9, 9, 9)
     seq_len = latent_shape[0] * latent_shape[1] * latent_shape[2]
     num_heads = 4
     head_dim = 128
@@ -717,17 +719,21 @@ def _build_vsa_setup(sparsity: float, batch_size: int, seed: int):
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
+    torch.manual_seed(seed)
     naive = NaiveWanSelfAttention(hidden_size, num_heads, head_dim, dtype=dtype).to(device)
     cfg_vsa = create_model_config(
-        hidden_size, num_heads, head_dim, attn_backend="CUTEDSL", vsa_sparsity=sparsity
+        hidden_size,
+        num_heads,
+        head_dim,
+        attn_backend=backend,
+        vsa_sparsity=sparsity,
     )
     integrated = Attention(hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=cfg_vsa).to(
         device
     )
-    # Fail loudly if the VSA path silently fell back to dense (which would set
-    # attn_backend to "VANILLA") instead of selecting the CUTEDSL/VSA backend.
-    assert integrated.attn_backend == "CUTEDSL", (
-        f"Expected CUTEDSL (VSA) backend, got {integrated.attn_backend!r}"
+    # Fail loudly if the VSA path silently fell back to the VANILLA backend.
+    assert integrated.attn_backend == backend, (
+        f"Expected {backend} VSA backend, got {integrated.attn_backend!r}"
     )
     copy_weights_self_attention(naive, integrated)
     naive.eval()
@@ -754,12 +760,13 @@ def _build_vsa_setup(sparsity: float, batch_size: int, seed: int):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
-def test_vsa_self_attention_equivalence_at_sparsity_zero():
+@pytest.mark.parametrize("backend", ["CUTEDSL", "TRTLLM"])
+def test_vsa_self_attention_equivalence_at_sparsity_zero(backend: str):
     """VSA at sparsity=0 with G_c=0 reduces to dense attention (top_k=num_cubes,
     output=O_f); must match the naive SDPA reference modulo bf16 rounding."""
-    from tensorrt_llm._torch.visual_gen.attention_backend import set_vsa_forward_context
+    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import set_vsa_forward_context
 
-    s = _build_vsa_setup(sparsity=0.0, batch_size=2, seed=42)
+    s = _build_vsa_setup(backend=backend, sparsity=0.0, batch_size=2, seed=42)
 
     with torch.no_grad():
         out_naive = s.naive(s.hidden_states, *s.freqs_HSD)
@@ -780,22 +787,105 @@ def test_vsa_self_attention_equivalence_at_sparsity_zero():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
-@pytest.mark.parametrize("sparsity", [0.0, 0.5], ids=["s0", "s0p5"])
-def test_vsa_self_attention_finite(sparsity: float):
-    """VSA forward must produce finite output (no NaN/Inf) at any supported sparsity."""
-    from tensorrt_llm._torch.visual_gen.attention_backend import set_vsa_forward_context
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="CuTe DSL and PrimTS block-sparse parity requires SM100 or SM103",
+)
+def test_vsa_sparse_backends_match_on_ragged_input():
+    """CuTeDSL and TRTLLM implement the same sparse VSA fine-stage semantics."""
+    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import set_vsa_forward_context
 
-    s = _build_vsa_setup(sparsity=sparsity, batch_size=1, seed=0)
+    sparsity = 0.5
+    setups = {
+        backend: _build_vsa_setup(backend=backend, sparsity=sparsity, batch_size=1, seed=0)
+        for backend in ("CUTEDSL", "TRTLLM")
+    }
+    sparse_fine_executed = {}
+    for backend, setup in setups.items():
+        if backend == "CUTEDSL":
+            original_execute = setup.integrated.attn._execute_sparse_fine
 
-    with torch.no_grad(), set_vsa_forward_context(s.metadata):
-        out = s.integrated(s.hidden_states, freqs=s.freqs_SHD, gate_compress=s.gate_compress_zero)
+            def checked_execute(*args, _original=original_execute, **kwargs):
+                result = _original(*args, **kwargs)
+                sparse_fine_executed["CUTEDSL"] = True
+                return result
 
-    assert out.shape == s.hidden_states.shape
-    nan_count = torch.isnan(out).sum().item()
-    inf_count = torch.isinf(out).sum().item()
-    assert nan_count == 0 and inf_count == 0, (
-        f"VSA produced non-finite output at sparsity={sparsity}: NaN={nan_count}, Inf={inf_count}"
+            setup.integrated.attn._execute_sparse_fine = checked_execute
+        else:
+            original_predict = setup.integrated.attn.block_sparse_attn_predict
+
+            def checked_predict(*args, _original=original_predict, **kwargs):
+                result = _original(*args, **kwargs)
+                sparse_fine_executed["TRTLLM"] = (
+                    result.sparse_runtime_params.block_sparse_inputs is not None
+                )
+                return result
+
+            setup.integrated.attn.block_sparse_attn_predict = checked_predict
+
+    outputs = {}
+    for backend, setup in setups.items():
+        with torch.no_grad(), set_vsa_forward_context(setup.metadata):
+            outputs[backend] = setup.integrated(
+                setup.hidden_states,
+                freqs=setup.freqs_SHD,
+                gate_compress=setup.gate_compress_zero,
+            )
+
+    assert sparse_fine_executed == {"CUTEDSL": True, "TRTLLM": True}
+    assert torch.isfinite(outputs["CUTEDSL"]).all()
+    assert torch.isfinite(outputs["TRTLLM"]).all()
+    torch.testing.assert_close(
+        outputs["CUTEDSL"],
+        outputs["TRTLLM"],
+        rtol=1e-2,
+        atol=1e-2,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="PrimTS block-sparse CUDA Graph replay requires SM100 or SM103",
+)
+def test_vsa_trtllm_cuda_graph_replays_live_routes():
+    """Captured VSA recomputes routes when graph-stable Q/K/V storage changes."""
+    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import set_vsa_forward_context
+
+    setup = _build_vsa_setup(backend="TRTLLM", sparsity=0.5, batch_size=1, seed=17)
+    static_hidden = setup.hidden_states.clone()
+    static_gate = setup.gate_compress_zero.clone()
+
+    for _ in range(2):
+        with torch.no_grad(), set_vsa_forward_context(setup.metadata):
+            setup.integrated(
+                static_hidden,
+                freqs=setup.freqs_SHD,
+                gate_compress=static_gate,
+            )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph), torch.no_grad(), set_vsa_forward_context(setup.metadata):
+        graph_output = setup.integrated(
+            static_hidden,
+            freqs=setup.freqs_SHD,
+            gate_compress=static_gate,
+        )
+
+    initial_output = graph_output.clone()
+    live_hidden = torch.randn_like(static_hidden)
+    static_hidden.copy_(live_hidden)
+    graph.replay()
+    replay_output = graph_output.clone()
+    with torch.no_grad(), set_vsa_forward_context(setup.metadata):
+        eager_output = setup.integrated(
+            live_hidden,
+            freqs=setup.freqs_SHD,
+            gate_compress=static_gate,
+        )
+
+    assert not torch.equal(initial_output, replay_output)
+    torch.testing.assert_close(replay_output, eager_output, rtol=1e-2, atol=1e-2)
 
 
 def test_trtllm_cached_prepare():

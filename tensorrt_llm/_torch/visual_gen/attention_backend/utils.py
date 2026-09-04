@@ -45,31 +45,35 @@ def get_visual_gen_attention_backend(
     Backend Selection Guide:
         - "VANILLA": Full support for cross-attention (different Q/KV seq lengths)
                      Uses torch SDPA backend
-        - "TRTLLM": Optimized for self-attention (requires same Q/KV seq lengths)
-                    Better performance but requires fused QKV
+        - "TRTLLM": Optimized for self-attention (requires same Q/KV seq lengths).
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
         - "CUTEDSL": CuTe DSL kernels. create_attention selects dense/SkipSoftmax FMHA or VSA
                       from AttentionConfig.sparse_attention_config.
     """
-    # Lazy imports to avoid circular dependency
-    from .cute_dsl import CuTeDSLAttention
-    from .flash_attn4 import FlashAttn4Attention
-    from .trtllm import TrtllmAttention
-    from .vanilla import VanillaAttention
 
     backend_name = backend_name.upper()
 
     if backend_name == "VANILLA":
+        from .vanilla import VanillaAttention
+
         return VanillaAttention
     elif backend_name == "TRTLLM":
+        from .trtllm import TrtllmAttention
+
         return TrtllmAttention
     elif backend_name == "FA4":
+        from .flash_attn4 import FlashAttn4Attention
+
         return FlashAttn4Attention
     elif backend_name == "CUTEDSL":
+        from .cute_dsl import CuTeDSLAttention
+
         return CuTeDSLAttention
     else:
         # Default to VANILLA for maximum compatibility
+        from .vanilla import VanillaAttention
+
         return VanillaAttention
 
 
@@ -106,36 +110,68 @@ def create_attention(
         max_seq_len: Initial sequence length for metadata pre-allocation. The backend
             will automatically reallocate if longer sequences are encountered.
         attention_config: Optional AttentionConfig used to select the attention algorithm and
-            forward its quantization or sparsity configuration.
-        attention_metadata_state: Optional model-scoped metadata state from
-            visual-gen config. Required for TRTLLM backend.
+            forward its quantization configuration.
+        attention_metadata_state: Optional per-component VisualGen TRTLLM state.
+            It keeps shape-stable attention metadata alive across layers and
+            CUDA Graph captures.
         **kwargs: Additional backend-specific arguments
 
     Returns:
         AttentionBackend instance
     """
-    attn_cls = get_visual_gen_attention_backend(backend)
+    sparse_attention_config = (
+        attention_config.sparse_attention_config if attention_config is not None else None
+    )
+    is_vsa = (
+        sparse_attention_config is not None
+        and getattr(sparse_attention_config, "algorithm", None) == "vsa"
+    )
+    is_skip_softmax_config = (
+        sparse_attention_config is not None
+        and getattr(sparse_attention_config, "algorithm", None) == "skip_softmax"
+    )
+    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxParams
+
+    sparse_params = kwargs.get("sparse_params")
+    if (
+        is_skip_softmax_config
+        and sparse_params is not None
+        and not isinstance(sparse_params, SkipSoftmaxParams)
+    ):
+        raise TypeError("SkipSoftmaxTrtllmAttention requires SkipSoftmaxParams")
+    is_skip_softmax = isinstance(sparse_params, SkipSoftmaxParams)
+
+    backend_name = backend.upper()
+    if is_vsa and backend_name == "CUTEDSL":
+        from .sparse.vsa.backend import VSACuTeDSLAttention
+
+        attn_cls = VSACuTeDSLAttention
+    elif is_vsa and backend_name == "TRTLLM":
+        from .sparse.vsa.backend import VSATrtllmAttention
+
+        attn_cls = VSATrtllmAttention
+    elif is_skip_softmax and backend_name == "TRTLLM":
+        from .sparse.skip_softmax.backend import SkipSoftmaxTrtllmAttention
+
+        attn_cls = SkipSoftmaxTrtllmAttention
+    else:
+        attn_cls = get_visual_gen_attention_backend(backend)
+
+    if is_vsa:
+        sparse_params = kwargs.pop("sparse_params", None)
+        if sparse_params is not None:
+            raise ValueError("VSA does not lower through core SparseParams.")
 
     # Forward the validated quantization recipe to TRTLLM or the dense CuTe DSL FMHA backend.
     if attention_config is not None and attention_config.quant_attention_config is not None:
         kwargs["quant_attention_config"] = attention_config.quant_attention_config
-    if backend.upper() == "TRTLLM":
+    if backend_name == "TRTLLM":
         if attention_metadata_state is None:
             raise ValueError(
                 "TRTLLM backend requires `attention_metadata_state` from "
                 "DiffusionModelConfig; creation path must not allocate metadata implicitly."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
-    if backend.upper() == "CUTEDSL" and attention_config is not None:
-        if (
-            attention_config.sparse_attention_config is not None
-            and getattr(attention_config.sparse_attention_config, "algorithm", None) == "vsa"
-        ):
-            from .cute_dsl.vsa import VSAAttention
-
-            attn_cls = VSAAttention
-            kwargs["sparse_attention_config"] = attention_config.sparse_attention_config
-
     return attn_cls(
         layer_idx=layer_idx,
         num_heads=num_heads,

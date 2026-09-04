@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Model loader for diffusion pipelines.
 
@@ -228,13 +243,22 @@ class PipelineLoader:
         _attn_backend = config.attention.backend
         _sa_cfg = config.attention.sparse_attention_config
         if (
-            _attn_backend == "CUTEDSL"
+            _attn_backend in ("CUTEDSL", "TRTLLM")
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         ):
-            kernel_path = "CuTe DSL block-sparse" if CUTE_AVAILABLE else "dense SDPA fallback"
+            if _attn_backend == "CUTEDSL":
+                kernel_path = (
+                    "CuTe DSL block-sparse when supported; dense SDPA fallback otherwise"
+                    if CUTE_AVAILABLE
+                    else "dense SDPA fallback"
+                )
+            else:
+                kernel_path = (
+                    "PrimTS block-sparse when supported; compact dense TRTLLM fallback otherwise"
+                )
             logger.info(
-                f"Attention backend: CUTEDSL (algorithm=vsa, "
+                f"Attention backend: {_attn_backend} (algorithm=vsa, "
                 f"sparsity={_sa_cfg.vsa_sparsity}, fine-stage={kernel_path})"
             )
         else:
