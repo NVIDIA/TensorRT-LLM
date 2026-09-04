@@ -3598,7 +3598,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if point <= reused:
             self._skip_branch_snapshot("already_reused")
             return
-        # The prompt end is snapshotted unconditionally anyway.
+        # A branch point at or beyond the prompt end cannot improve sibling
+        # reuse.
         if point >= req.prompt_len:
             self._skip_branch_snapshot("at_prompt_end")
             return
@@ -3620,12 +3621,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         request: LlmRequest,
         context_current_position: Optional[int] = None,
     ) -> None:
-        # prompt_len is unioned in unconditionally: try_commit_blocks derives
-        # commit_limit from max(snapshot_points), so a lone branch point below
-        # the prompt end would silently stop commits there and lose the
-        # prompt-end snapshot. It also makes the flag usable on its own.
         points = set(request.expect_snapshot_points)
-        points.add(request.prompt_len)
+        # Keep the flag usable without any configured snapshot placement. If a
+        # placement is configured, preserve it: adding prompt_len can replace a
+        # nearby recurrent checkpoint in the same radix-tree block because a
+        # block stores one recurrent page per life cycle.
+        if not points:
+            points.add(request.prompt_len)
         point = self._branch_snapshot_points.get(request.py_request_id)
         current_position = (request.context_current_position
                             if context_current_position is None else
