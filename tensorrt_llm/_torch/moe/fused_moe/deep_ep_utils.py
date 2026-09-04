@@ -188,7 +188,10 @@ class VariableLengthLowLatencyBuffer:
                                          num_max_dispatch_tokens_per_rank: int,
                                          num_experts: int):
         """Pack BF16 to NVFP4 in the DeepEP dispatch send phase."""
-        assert num_experts == self.num_experts
+        if num_experts != self.num_experts:
+            raise ValueError(
+                f"num_experts must match the reserved buffer ({self.num_experts}), got {num_experts}"
+            )
 
         recv_hidden_states, recv_scales, recv_expert_count, handle, event, hook = \
             self.buffer.low_latency_dispatch_bf16_to_fp4(

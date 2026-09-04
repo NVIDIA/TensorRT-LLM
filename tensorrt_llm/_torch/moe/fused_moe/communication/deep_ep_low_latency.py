@@ -297,7 +297,10 @@ class DeepEPLowLatency(Communication):
                             "one FP32 input scale, and supported NVFP4 post-quant DeepEP"
                         )
                     hidden_size = hidden_states.shape[1]
-                    assert hidden_states_sf is None
+                    if hidden_states_sf is not None:
+                        raise ValueError(
+                            "hidden_states_sf must be None for fused BF16-to-NVFP4 dispatch"
+                        )
                     hidden_states, hidden_states_sf, recv_expert_count, deep_ep_handle = (
                         self.deep_ep_buffer.low_latency_dispatch_bf16_to_fp4(
                             hidden_states,
