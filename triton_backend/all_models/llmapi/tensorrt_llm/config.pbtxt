@@ -1,4 +1,4 @@
-# Copyright 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -121,6 +121,14 @@ input [
   {
     name: "sampling_param_return_perf_metrics"
     data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    # Name of a logits post-processor declared under
+    # 'logits_post_processors' in model.yaml.
+    name: "sampling_param_logits_post_processor_name"
+    data_type: TYPE_STRING
     dims: [ 1 ]
     optional: true
   },
