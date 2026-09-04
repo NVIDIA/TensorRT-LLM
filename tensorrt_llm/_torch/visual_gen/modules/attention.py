@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ...utils import Fp4QuantizedTensor
@@ -113,18 +113,26 @@ class Attention(nn.Module):
         base_backend = config.attention.backend
         _sa_cfg = config.attention.sparse_attention_config
         is_vsa = _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        is_sol = _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "sol_attn"
+        is_sparse_self_attention = is_vsa or is_sol
 
         is_separate_qkv = self.qkv_mode == QKVMode.SEPARATE_QKV
         is_separate_qkv_cross_attention = is_separate_qkv and not separate_qkv_is_self_attention
         use_vanilla_cross_attention = is_separate_qkv and (
-            (base_backend == "TRTLLM" and not is_vsa)
-            or (is_vsa and not separate_qkv_is_self_attention)
+            (base_backend == "TRTLLM" and not is_sparse_self_attention)
+            or (is_sparse_self_attention and not separate_qkv_is_self_attention)
         )
 
-        # Cross-attention fallback: dense TRTLLM and every VSA backend are self-attn only.
+        # Cross-attention fallback: dense TRTLLM, VSA, and SOL are self-attn only.
         if use_vanilla_cross_attention:
             backend_name = "VANILLA"
-            requested = f"{base_backend} (VSA)" if is_vsa else base_backend
+            requested = (
+                f"{base_backend} (VSA)"
+                if is_vsa
+                else f"{base_backend} (SOL)"
+                if is_sol
+                else base_backend
+            )
             # Warn once per (module class, requested, resolved) triple so the
             # fallback is visible without per-module-instance log spam.
             logger.warning_once(
@@ -138,6 +146,12 @@ class Attention(nn.Module):
         if is_vsa and cp_size > 1:
             raise ValueError(
                 f"VSA needs the full token sequence per rank, so it is incompatible "
+                f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
+                f"ulysses or cfg parallelism instead."
+            )
+        if is_sol and cp_size > 1:
+            raise ValueError(
+                f"SOL needs the full token sequence per rank, so it is incompatible "
                 f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
                 f"ulysses or cfg parallelism instead."
             )
@@ -250,6 +264,8 @@ class Attention(nn.Module):
                 module_name=self.module_name,
                 pretrained_config=config.pretrained_config,
             )
+        elif isinstance(ss_cfg, SolAttentionConfig) and backend_name == "TRTLLM":
+            sparse_params = ss_cfg.to_sparse_params()
         self.sparse_params = sparse_params
 
         # Create compute backend

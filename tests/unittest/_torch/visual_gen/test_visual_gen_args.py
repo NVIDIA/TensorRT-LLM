@@ -19,6 +19,7 @@ from tensorrt_llm.visual_gen.args import (
     QuantAttentionConfig,
     RuntimeLoRAConfig,
     SkipSoftmaxAttentionConfig,
+    SolAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
     VAEConfig,
@@ -509,6 +510,54 @@ class TestVisualGenArgsFromYaml:
         yaml_path.write_text("model: /tmp/model\nlinear:\n  type: default\n")
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             VisualGenArgs.from_yaml(yaml_path)
+
+    def test_from_yaml_rejects_sol_with_enabled_fullgraph(self, tmp_path):
+        yaml_path = tmp_path / "sol_fullgraph.yml"
+        yaml_path.write_text(
+            "model: /tmp/model\n"
+            "attention_config:\n"
+            "  backend: TRTLLM\n"
+            "  sparse_attention_config:\n"
+            "    algorithm: sol_attn\n"
+            "torch_compile_config:\n"
+            "  enable: true\n"
+            "  enable_fullgraph: true\n"
+        )
+
+        with pytest.raises(ValidationError, match="SOL.*fullgraph"):
+            VisualGenArgs.from_yaml(yaml_path)
+
+
+class TestVisualGenArgsCrossFieldValidation:
+    def test_rejects_sol_with_enabled_fullgraph(self):
+        with pytest.raises(ValidationError, match="SOL.*fullgraph"):
+            VisualGenArgs(
+                model="/tmp/model",
+                attention_config=AttentionConfig(
+                    backend="TRTLLM",
+                    sparse_attention_config=SolAttentionConfig(),
+                ),
+                torch_compile_config=TorchCompileConfig(
+                    enable=True,
+                    enable_fullgraph=True,
+                ),
+            )
+
+    def test_allows_sol_fullgraph_field_when_torch_compile_disabled(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            attention_config=AttentionConfig(
+                backend="TRTLLM",
+                sparse_attention_config=SolAttentionConfig(),
+            ),
+            torch_compile_config=TorchCompileConfig(
+                enable=False,
+                enable_fullgraph=True,
+            ),
+        )
+
+        assert args.torch_compile_config.enable is False
+        assert args.torch_compile_config.enable_fullgraph is True
 
 
 class TestParallelConfigValidation:

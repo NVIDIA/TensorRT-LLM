@@ -36,6 +36,7 @@ from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
     UlyssesAttention,
     wrap_parallel_attention,
 )
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -928,6 +929,8 @@ class BasicAVTransformerBlock(nn.Module):
         text_kv_video: tuple[torch.Tensor, torch.Tensor] | None = None,
         text_kv_audio: tuple[torch.Tensor, torch.Tensor] | None = None,
         step_index=None,
+        video_sol_timestep: torch.Tensor | None = None,
+        audio_sol_timestep: torch.Tensor | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Forward with optional perturbation masking for STG.
 
@@ -938,6 +941,8 @@ class BasicAVTransformerBlock(nn.Module):
                 Required when the video stream runs cross-attn — built by
                 ``LTXModel.prepare_text_cache``.
             text_kv_audio: Pre-projected (K, V) for audio text cross-attention.
+            video_sol_timestep: Raw video modality timestep for SOL phase preparation.
+            audio_sol_timestep: Raw audio modality timestep for SOL phase preparation.
         """
         if video is None and audio is None:
             raise ValueError("At least one of video or audio must be provided")
@@ -991,8 +996,14 @@ class BasicAVTransformerBlock(nn.Module):
                     self._fuse_adaln,
                     fp4_input_scale=get_nvfp4_self_attn_input_scale(self.attn1),
                 )
+                v_attn_timestep = (
+                    video_sol_timestep
+                    if isinstance(self.attn1.sparse_params, SolParams)
+                    and video_sol_timestep is not None
+                    else video.timesteps
+                )
                 v_attn_raw = self.attn1(
-                    norm_vx, pe=video.positional_embeddings, timestep=video.timesteps
+                    norm_vx, pe=video.positional_embeddings, timestep=v_attn_timestep
                 )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx
@@ -1045,11 +1056,17 @@ class BasicAVTransformerBlock(nn.Module):
                     self._fuse_adaln,
                     fp4_input_scale=get_nvfp4_self_attn_input_scale(self.audio_attn1),
                 )
+                a_attn_timestep = (
+                    audio_sol_timestep
+                    if isinstance(self.audio_attn1.sparse_params, SolParams)
+                    and audio_sol_timestep is not None
+                    else audio.timesteps
+                )
                 a_attn_raw = self.audio_attn1(
                     norm_ax,
                     pe=audio.positional_embeddings,
                     key_padding_mask=audio.audio_padding_mask,
-                    timestep=audio.timesteps,
+                    timestep=a_attn_timestep,
                 )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx
@@ -2255,6 +2272,9 @@ class LTXModel(BaseDiffusionModel):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
+        video_sol_timestep = video.timesteps if video is not None else None
+        audio_sol_timestep = audio.timesteps if audio is not None else None
+
         # Audio padding for Ulysses: when self._audio_pad > 0 (set once by
         # configure_audio_ulysses to make T_a divisible by ulysses_size), pad
         # audio on entry to make it shardable. Build a [B, T_a_padded] bool mask
@@ -2333,6 +2353,8 @@ class LTXModel(BaseDiffusionModel):
                     ax,
                     perturbations=perturbations,
                     step_index=step_index,
+                    video_sol_timestep=video_sol_timestep,
+                    audio_sol_timestep=audio_sol_timestep,
                 )
                 if video_args is not None and vx is not None:
                     video_args = replace(video_args, x=vx)
@@ -2347,6 +2369,8 @@ class LTXModel(BaseDiffusionModel):
                     text_kv_video=v_kv[i] if v_kv else None,
                     text_kv_audio=a_kv[i] if a_kv else None,
                     step_index=step_index,
+                    video_sol_timestep=video_sol_timestep,
+                    audio_sol_timestep=audio_sol_timestep,
                 )
 
         # Gather sequences back to full length for output processing.

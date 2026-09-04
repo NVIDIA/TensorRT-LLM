@@ -19,8 +19,31 @@ from types import SimpleNamespace
 from typing import Any, Dict, Literal, Optional
 
 from pydantic import Field as PydanticField
+from pydantic import field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
+
+
+def _parse_dense_layers(spec: Optional[str]) -> frozenset[int]:
+    """Parse comma-separated layer indices and inclusive ranges."""
+    layers: set[int] = set()
+    for raw_item in (spec or "").split(","):
+        item = raw_item.strip()
+        if not item:
+            if spec and spec.strip():
+                raise ValueError("dense_layers must not contain empty entries")
+            continue
+        bounds = item.split("-")
+        if len(bounds) not in (1, 2) or not all(bounds):
+            raise ValueError(f"invalid dense_layers entry: {item!r}")
+        try:
+            start, end = int(bounds[0]), int(bounds[-1])
+        except ValueError as error:
+            raise ValueError(f"invalid dense_layers entry: {item!r}") from error
+        if start < 0 or end < start:
+            raise ValueError(f"invalid dense_layers range: {item!r}")
+        layers.update(range(start, end + 1))
+    return frozenset(layers)
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
@@ -219,6 +242,58 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             if isinstance(sparse_config, dict):
                 return sparse_config
         return None
+
+
+class SolAttentionConfig(BaseSparseAttentionConfig):
+    """Two-stage SOL sparse attention backed by TRTLLM PrimTS.
+
+    TRTLLM predicts an exact block mask from compact Q/K/V tensors, then the
+    generic block-sparse FMHA executes that mask. Unsupported runtime tensor
+    envelopes raise instead of silently falling back to dense attention.
+    """
+
+    algorithm: Literal["sol_attn"] = PydanticField(
+        "sol_attn",
+        description="Sparse attention algorithm discriminator.",
+    )
+    tau: float = PydanticField(
+        1.0,
+        allow_inf_nan=False,
+        description="Standard-deviation multiplier used by the SOL block selector.",
+    )
+    disabled_until_timestep: Optional[float] = PydanticField(
+        None,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Dense-prefix cutoff on the normalized denoising timestep. The "
+            "attention switches to SOL when timestep is below this value."
+        ),
+    )
+    dense_layers: Optional[str] = PydanticField(
+        None,
+        description=(
+            "Comma-separated layer indices and inclusive ranges (for example, "
+            "'0,2-4') that always use dense attention."
+        ),
+    )
+
+    @field_validator("dense_layers")
+    @classmethod
+    def _validate_dense_layers(cls, value: Optional[str]) -> Optional[str]:
+        _parse_dense_layers(value)
+        return value
+
+    def to_sparse_params(self, **kwargs):
+        """Lower the public recipe into immutable SOL runtime parameters."""
+        del kwargs
+        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
+
+        return SolParams(
+            tau=self.tau,
+            disabled_until_timestep=self.disabled_until_timestep,
+            dense_layers=_parse_dense_layers(self.dense_layers),
+        )
 
 
 class VideoSparseAttentionConfig(StrictBaseModel):
