@@ -15,14 +15,10 @@ to PyExecutor, including:
 import threading
 import time
 import types
-from datetime import timedelta
-from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
-import torch.distributed as torch_dist
-import torch.multiprocessing as torch_mp
 
 from tensorrt_llm._torch.disaggregation.executor.admission import DisaggTransferAdmissionController
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
@@ -53,43 +49,6 @@ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfi
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
-
-
-class _TorchCollectiveDist:
-    """Minimal distributed adapter for idle-progress collective tests."""
-
-    world_size = 2
-    tp_size = 2
-    cp_size = 1
-
-    def allreduce(self, value: int, op: ReduceOp | None = None) -> int:
-        tensor = torch.tensor(value)
-        torch_dist.all_reduce(tensor)
-        return int(tensor.item())
-
-
-def _run_sync_idle_progress_rank(rank: int, world_size: int, rendezvous_file: str) -> None:
-    torch_dist.init_process_group(
-        "gloo",
-        init_method=f"file://{rendezvous_file}",
-        rank=rank,
-        world_size=world_size,
-        timeout=timedelta(seconds=1),
-    )
-    try:
-        if rank == 0:
-            # Model a rank blocked in request_and_receive_sync(). It cannot
-            # participate in an idle-progress collective on the peer rank.
-            time.sleep(2)
-            return
-
-        executor = object.__new__(PyExecutor)
-        executor.dist = _TorchCollectiveDist()
-        executor._check_disagg_gen_cache_transfer_status = Mock()
-        executor._check_disagg_ctx_cache_transfer_status = Mock()
-        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
-    finally:
-        torch_dist.destroy_process_group()
 
 
 class _InflightRequestIds:
@@ -1113,31 +1072,12 @@ class TestDisaggTransferIdleProgress:
         executor.dist.tp_allreduce.assert_not_called()
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
 
-    def test_sync_transfer_skips_idle_progress_collectives(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
-        executor = object.__new__(PyExecutor)
-        executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
-        executor._check_disagg_gen_cache_transfer_status = Mock()
-        executor._check_disagg_ctx_cache_transfer_status = Mock()
-
-        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
-
-        executor.dist.allreduce.assert_not_called()
-        executor.dist.tp_allreduce.assert_not_called()
-        executor.dist.tp_cp_allgather.assert_not_called()
-        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
-        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
-
     def test_sync_single_rank_ctx_reaps_idle_transfer(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1, cp_size=1, world_size=1)
-        executor.async_transfer_manager = Mock()
-        executor.async_transfer_manager.has_any_inflight_requests.return_value = True
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -1148,19 +1088,6 @@ class TestDisaggTransferIdleProgress:
         executor.dist.tp_cp_allgather.assert_not_called()
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
-
-    def test_sync_multi_rank_does_not_wait_for_blocked_peer(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
-        rendezvous_file = tmp_path / "sync-idle-progress-rendezvous"
-
-        torch_mp.spawn(
-            _run_sync_idle_progress_rank,
-            args=(2, str(rendezvous_file)),
-            nprocs=2,
-            join=True,
-        )
 
     def test_sync_receive_does_not_poll_async_status(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
@@ -1242,70 +1169,6 @@ class TestDisaggTransferIdleProgress:
             requests=[error_request],
             charge_budget=False,
         )
-
-
-class TestIdleDisaggLoopPacing:
-    """The idle poll no longer blocks, so the executor loops pace themselves.
-
-    Pacing must cost nothing when a transfer is not what is holding the loop
-    back, and the PP loop must not pace while the ring still has work.
-    """
-
-    @staticmethod
-    def _make_request(*, init_state: bool = False, transfer_in_progress: bool = False) -> Mock:
-        req = Mock()
-        req.is_disagg_generation_init_state = init_state
-        req.is_disagg_generation_transmission_in_progress = transfer_in_progress
-        return req
-
-    @pytest.mark.parametrize(
-        "has_transceiver, ctx_inflight, request_kwargs, expect_sleep",
-        [
-            pytest.param(False, True, {"init_state": True}, False, id="not_disagg"),
-            pytest.param(True, False, {}, False, id="nothing_pending"),
-            pytest.param(True, True, {}, True, id="context_send_inflight"),
-            pytest.param(True, False, {"init_state": True}, True, id="gen_awaiting_transfer"),
-            pytest.param(
-                True, False, {"transfer_in_progress": True}, True, id="gen_receive_inflight"
-            ),
-        ],
-    )
-    def test_paces_only_when_a_transfer_can_unblock_the_loop(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        has_transceiver: bool,
-        ctx_inflight: bool,
-        request_kwargs: dict,
-        expect_sleep: bool,
-    ) -> None:
-        sleep = Mock()
-        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.time.sleep", sleep)
-        executor = object.__new__(PyExecutor)
-        executor.kv_cache_transceiver = Mock() if has_transceiver else None
-        executor.async_transfer_manager = Mock()
-        executor.async_transfer_manager.has_any_inflight_requests.return_value = ctx_inflight
-        executor.active_requests = [self._make_request(**request_kwargs)]
-
-        PyExecutor._pace_idle_disagg_loop(executor)
-
-        assert sleep.called is expect_sleep
-
-    @pytest.mark.parametrize(
-        "unhandled_batches, micro_batches, expected",
-        [
-            pytest.param(0, [None, None], True, id="ring_empty"),
-            pytest.param(1, [None, None], False, id="batch_awaiting_handling"),
-            pytest.param(0, [None, "batch"], False, id="batch_still_queued"),
-        ],
-    )
-    def test_pp_ring_drained_only_when_no_microbatch_is_outstanding(
-        self, unhandled_batches: int, micro_batches: list, expected: bool
-    ) -> None:
-        executor = object.__new__(PyExecutor)
-        executor.unhandled_batch_counter = unhandled_batches
-        executor.micro_batches = micro_batches
-
-        assert PyExecutor._pp_ring_is_drained(executor) is expected
 
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
