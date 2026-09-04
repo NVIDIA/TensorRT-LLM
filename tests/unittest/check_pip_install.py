@@ -5,7 +5,13 @@ import sys
 import sysconfig
 
 import requests
-from utils.llm_data import llm_models_root
+
+# Standalone script: ran directly via `python3 check_pip_install.py`, so won't
+# get pythonpath added by pytest. Deliberately not named test_*, so pytest
+# never collects it and this entry cannot reach the pytest process.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from utils.llm_data import llm_models_root  # noqa: E402
 
 
 def get_expected_license_files():

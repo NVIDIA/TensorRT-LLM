@@ -185,9 +185,9 @@ class PlanParams:
     sm_scale: Optional[float] = None
     window_left: Optional[int] = None
     kv_pool_id: Optional[int] = None
-    # Decode wrappers own persistent graph-visible buffers and counters. The speculative query width
-    # and generation batch size must distinguish cache entries; reusing a wrapper across either
-    # dimension can expose stale launch state.
+    # Decode wrappers own persistent graph-visible buffers and counters. Speculative query width
+    # and generation batch size must distinguish cache entries; ordinary single-token decode
+    # reuses max-sized graph buffers across generation batch sizes.
     q_len_per_req: int = 1
     num_generations: int = 0
 
@@ -587,7 +587,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         """Replace evicted SWA pages with a safe in-range page index."""
         window_vec = getattr(self.kv_cache_manager, 'max_attention_window_vec',
                              None)
-        if not window_vec or window_vec[layer_idx % len(window_vec)] is None:
+        if not window_vec:
+            return
+        local_layer_idx = self.kv_cache_manager.layer_offsets[layer_idx]
+        if window_vec[local_layer_idx] is None:
             return
 
         # KVCacheManagerV2 marks evicted out-of-window pages with -1.
@@ -1885,6 +1888,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     "FlashInfer decode requires a uniform query length per "
                     f"request, but got {generation_seq_lens.tolist()}")
 
+        # Ordinary single-token decode reuses max-sized graph buffers as the
+        # generation batch changes. Speculative and draft paths retain the
+        # batch size because it affects graph-visible wrapper state.
+        plan_num_generations = (self.num_generations if
+                                (q_len_per_req > 1
+                                 or self._uses_full_generation_page_table
+                                 or self._is_shared_kv_draft_view
+                                 or self._is_separate_kv_draft_view) else 0)
+
         plan_params = PlanParams(
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -1899,7 +1911,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             multi_item_params=self._multi_item_params,
             kv_pool_id=getattr(self, "_vswa_active_pool_id", None),
             q_len_per_req=q_len_per_req,
-            num_generations=self.num_generations,
+            num_generations=plan_num_generations,
         )
         return self._plan_with_params(plan_params, flashinfer_backend)
 
