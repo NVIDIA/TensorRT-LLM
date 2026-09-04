@@ -151,6 +151,49 @@ class OpenAIBaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
+class SpeculativeDecodingStats(OpenAIBaseModel):
+    """Per-request speculative-decoding acceptance for one generated sequence.
+
+    Opt-in: emitted only when the server sets per_request_spec_decode_stats.
+    Absent entirely when the request drafted nothing. PyTorch backend only.
+
+    ``mean acceptance length`` is deliberately not a field here: it is already
+    reported per choice as ``avg_decoded_tokens_per_iter``, and duplicating it
+    would let the two drift. Consumers derive it as
+    ``1 + total_accepted_draft_tokens / num_spec_steps``.
+
+    Three identities hold on every emitted record, and a consumer may rely on
+    them:
+
+    * ``sum(acceptance_histogram) == num_spec_steps``
+    * ``sum(j * acceptance_histogram[j]) == total_accepted_draft_tokens``
+    * ``total_accepted_draft_tokens <= total_draft_tokens``
+    """
+
+    acceptance_rate: float = Field(
+        description="Accepted draft tokens divided by proposed draft tokens.")
+    total_accepted_draft_tokens: int = Field(
+        description="Draft tokens accepted across the request, excluding the "
+        "always-accepted bonus token.")
+    total_draft_tokens: int = Field(
+        description="Draft tokens proposed across the request. For tree "
+        "drafting this counts paths, not tree nodes, mirroring the "
+        "getMaxDraftPathLen clamp in updateNumTokensPerIteration.")
+    num_spec_steps: int = Field(
+        description="Verify steps performed for the request. Equals the sum of "
+        "acceptance_histogram.")
+    acceptance_histogram: List[int] = Field(
+        description="Dense histogram indexed by accepted-draft count: entry j "
+        "is the number of verify steps that accepted exactly j draft tokens. "
+        "Tree-agnostic -- it records output lengths per step and encodes no "
+        "parent/child structure.")
+    num_spec_tokens: Optional[int] = Field(
+        default=None,
+        description="Maximum draft length per step, when the run has a fixed "
+        "bound. None under draft_len_schedule, where the bound varies by batch "
+        "size.")
+
+
 class StreamOptions(OpenAIBaseModel):
     include_usage: Optional[bool] = True
     continuous_usage_stats: Optional[bool] = False
@@ -312,6 +355,8 @@ class CompletionResponseChoice(OpenAIBaseModel):
     )
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -340,6 +385,8 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
             "including encountering the EOS token"),
     )
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
@@ -868,6 +915,8 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -901,6 +950,8 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
