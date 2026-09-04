@@ -1616,7 +1616,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__init__",
             [](kv::KVCacheManagerConfig* cfg, int tokensPerBlock, std::vector<kv::CacheTierConfig> cacheTiers,
                 nb::list layers, float maxUtilForResume, bool enablePartialReuse, int reuseMatchBackoff,
-                std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
+                std::vector<kv::BatchDesc> constraints, std::optional<kv::BatchDesc> typicalStep,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly)
@@ -1648,8 +1648,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("tokens_per_block"), nb::arg("cache_tiers"), nb::arg("layers"),
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
-            nb::arg("reuse_match_backoff") = 0, nb::arg("typical_step") = std::nullopt,
-            nb::arg("constraints") = std::vector<kv::BatchDesc>{}, nb::arg("initial_pool_ratio").none() = std::nullopt,
+            nb::arg("reuse_match_backoff") = 0, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
+            nb::arg("typical_step") = std::nullopt, nb::arg("initial_pool_ratio").none() = std::nullopt,
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
             nb::arg("enable_stats") = true, nb::arg("text_only") = false)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)

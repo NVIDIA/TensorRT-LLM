@@ -391,9 +391,12 @@ void SharedPageLock::releasePageIndex()
 {
     int oldBaseIndex
         = mUser.kvCache->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, kBadPageIndex.value());
-    // Mirrors Python assertion: old base index must match this page's slot ID.
-    TLLM_CHECK_DEBUG(oldBaseIndex == slotIdToPageIndexValue(page()->slotId()));
+    // SSM pages use kBadBlockOrdinal, for which updateBasePageIndex returns kBadPageIndex.
+    int const expectedBaseIndex
+        = mUser.ordinal == kBadBlockOrdinal ? kBadPageIndex.value() : slotIdToPageIndexValue(page()->slotId());
+    TLLM_CHECK_DEBUG(oldBaseIndex == expectedBaseIndex);
     (void) oldBaseIndex;
+    (void) expectedBaseIndex;
 }
 
 // ---------------------------------------------------------------------------
