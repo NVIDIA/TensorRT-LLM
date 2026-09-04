@@ -1582,6 +1582,7 @@
         "dsa",
         "deepseek_v4",
         "minimax_m3",
+        "qsa",
         "rocket",
         "skip_softmax"
       ],
@@ -1914,9 +1915,7 @@
         "Draft_Target",
         "Eagle3",
         "Eagle",
-        "Lookahead",
         "MTP",
-        "Medusa",
         "NGram",
         "PARD",
         "SA",
@@ -2070,13 +2069,6 @@
     },
     {
       "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.max_ngram_size"
-    },
-    {
-      "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
@@ -2091,27 +2083,6 @@
     },
     {
       "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.max_verification_set_size"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.max_window_size"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "Optional[List[List[int]]]",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.medusa_choices"
-    },
-    {
-      "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
@@ -2123,13 +2094,6 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.num_eagle_layers"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "Optional[int]",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.num_medusa_heads"
     },
     {
       "allowed_values": [],

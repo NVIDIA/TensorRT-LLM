@@ -99,6 +99,16 @@ class Fmha(ABC):
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
+        """Return whether this library can serve the given attention layer.
+
+        Evaluated once per ``FmhaManager`` construction, currently at the end
+        of ``TrtllmAttention.update_quant_config()``. Conditions must depend
+        only on state finalized before manager construction and invariant for
+        its lifetime. Reading state that a model rewrites later, such as a
+        remapped ``layer_idx``, silently leaves the library list stale because
+        it is not revalidated. Request-varying conditions belong in
+        ``is_supported`` instead.
+        """
         return True
 
     def is_supported(
@@ -114,11 +124,10 @@ class Fmha(ABC):
         """Return whether this library supports the request or requested phase.
 
         Forward-varying selection conditions must be represented in
-        ``TrtllmAttention._make_fmha_cache_key``. Conditions omitted
-        from that key must remain invariant for the attention instance. Size-
-        based conditions must also preserve the same result throughout each
-        FMHA cache grid cell or add the relevant boundary to the grid's
-        candidate list.
+        ``FmhaManager._make_cache_key``. Conditions omitted from that key must
+        remain invariant for the attention instance. Size-based conditions
+        must also preserve the same result throughout each FMHA cache grid
+        cell or add the relevant boundary to the grid's candidate list.
         """
         return True
 

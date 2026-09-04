@@ -21,6 +21,8 @@ l0_b300:
   - unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
+  - unittest/_torch/modeling/test_qsa_runtime_wiring.py
+  - unittest/_torch/modeling/test_qwen4_exp_support.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
@@ -34,6 +36,11 @@ l0_b300:
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_rotary_embedding.py
   - unittest/_torch/modules/test_low_m_gemm.py
+  - unittest/_torch/modules/test_top_k.py
+  - unittest/_torch/modules/test_qwen4_exp_hyper_connection.py
+  - unittest/_torch/modules/test_qwen4_exp_ple.py
+  - unittest/_torch/modules/test_qwen4_exp_ple_kernels.py
+  - unittest/_torch/modules/test_qwen4_exp_ple_offload.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
