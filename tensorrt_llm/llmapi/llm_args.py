@@ -6128,6 +6128,13 @@ class TorchLlmArgs(BaseLlmArgs):
         A hard error at construction is the only signal that survives.
         """
         cuda_graph_config = self.cuda_graph_config
+        if self.pipeline_parallel_size > 1:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True does not yet "
+                "support pipeline parallelism. The PP executor's pipelined "
+                "microbatches do not provide the single-iteration host-input "
+                "lifetime boundary required by ragged verification staging. "
+                "Set pipeline_parallel_size=1 or disable confidence scheduling.")
         if self.guided_decoding_backend is not None:
             raise ValueError(
                 "speculative_config.enable_confidence_scheduling=True does not yet "
