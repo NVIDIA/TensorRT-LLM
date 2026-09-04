@@ -424,9 +424,9 @@ class DFlashWorker(SpecWorkerBase):
         is_capturing = torch.cuda.is_current_stream_capturing()
 
         if spec_metadata.is_cuda_graph and not is_capturing:
-            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda", "kv_lens_cuda")
+            self._prepare_attn_metadata_for_spec_dec(attn_metadata, "kv_lens_cuda")
         else:
-            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+            self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
     def _prepare_kv_for_draft_forward(
         self,

@@ -208,6 +208,7 @@ l0_b200:
   # function's leaves on Blackwell, keep the rest of the sampler dir.
   - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
+  - unittest/_torch/speculative/test_metadata_restore.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
   # On-device suffix-automaton spec-dec kernel tests (CUDA graph capture;

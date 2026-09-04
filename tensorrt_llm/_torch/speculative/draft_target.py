@@ -108,9 +108,9 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             and hasattr(attn_metadata, "kv_lens_cuda")
             and isinstance(attn_metadata.kv_lens_cuda, torch.Tensor)
         ):
-            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda", "kv_lens_cuda")
+            self._prepare_attn_metadata_for_spec_dec(attn_metadata, "kv_lens_cuda")
         else:
-            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+            self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
     def _update_kv_after_first_draft_step(
         self,
