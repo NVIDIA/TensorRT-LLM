@@ -22,7 +22,8 @@ from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            StaticDim, TunableRunner,
                                            TuningConfig, autotune)
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.utils import (get_power_of_2_num_tokens_buckets,
+from tensorrt_llm._torch.utils import (deep_gemm_jit_warmup_buckets,
+                                       get_power_of_2_num_tokens_buckets,
                                        next_positive_power_of_2)
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
@@ -1545,3 +1546,29 @@ def test_visual_gen_autotune_dist_world_allgather(mpi_pool_executor):
                               *zip(*[(world_size, )] * world_size)))
     for got in results:
         assert got == ["rank0", "rank1"]
+
+
+def test_deep_gemm_jit_warmup_buckets():
+    # A bucket left out leaves a DeepGemm layout uncompiled, so it compiles
+    # under traffic while holding the GIL. The layout is constant on each
+    # 16-aligned window of M, so every window must hold a bucket.
+    for max_m in (4096, 6144, 8192):
+        b = deep_gemm_jit_warmup_buckets(max_m)
+        assert list(b) == sorted(set(b)), "must be sorted and duplicate-free"
+        assert b[-1] == max_m, "the bound itself must be a bucket"
+
+        assert all(hi - lo <= 16 for lo, hi in zip(b, b[1:])), \
+            "no gap may exceed 16: it would skip a 16-aligned window of M"
+        windows = {(m - 1) // 16 for m in b}
+        missing = [j for j in range((max_m - 1) // 16 + 1) if j not in windows]
+        assert not missing, \
+            f"windows with no bucket (M from {[16 * j + 1 for j in missing]})"
+
+    # Clamping keeps a small bound from skipping warmup for larger M,
+    # and a huge one from exploding the bucket count.
+    assert deep_gemm_jit_warmup_buckets(256) == deep_gemm_jit_warmup_buckets(
+        4096)
+    # But a decode-only worker (M = batch x MTP) stays in the low band.
+    assert max(deep_gemm_jit_warmup_buckets(32)) < 128
+    assert deep_gemm_jit_warmup_buckets(16384) == deep_gemm_jit_warmup_buckets(
+        8192)
