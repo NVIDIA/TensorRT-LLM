@@ -278,7 +278,6 @@ SPEC_MODE_TO_MODULE = {
     "DSPARK": "modeling_dspark",
     "EAGLE3_ONE_MODEL": "modeling_speculative",
     "MTP": "modeling_speculative",
-    "MTP_EAGLE": "modeling_speculative",
     "MTP_EAGLE_ONE_MODEL": "modeling_speculative",
     "PARD": "modeling_speculative",
 }

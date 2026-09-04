@@ -830,8 +830,6 @@ def test_speculative_admission_accepts_verified_one_model_modes(monkeypatch) -> 
     _validate_compression(SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
     for mode in (
         SpeculativeDecodingMode.MTP,
-        SpeculativeDecodingMode.MTP_EAGLE,
-        SpeculativeDecodingMode.EAGLE3,
         SpeculativeDecodingMode.DFLASH,
     ):
         with pytest.raises(ValueError, match="one-model MTP-EAGLE or EAGLE3"):

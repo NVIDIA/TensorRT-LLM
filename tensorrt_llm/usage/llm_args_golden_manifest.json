@@ -1980,13 +1980,6 @@
     },
     {
       "allowed_values": [],
-      "annotation": "Optional[bool]",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.greedy_sampling"
-    },
-    {
-      "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
@@ -2086,13 +2079,6 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.num_nextn_predict_layers"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "Optional[float]",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.posterior_threshold"
     },
     {
       "allowed_values": [],

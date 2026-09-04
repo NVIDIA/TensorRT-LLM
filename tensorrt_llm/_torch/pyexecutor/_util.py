@@ -3647,7 +3647,6 @@ def validate_feature_combination(llm_args, model_engine):
             "chunked_prefill",
             "mtp",
             "eagle3_one_model",
-            "eagle3_two_model",
             "kv_cache_reuse",
             "slide_window_attention",
             "guided_decoding",
@@ -3662,12 +3661,8 @@ def validate_feature_combination(llm_args, model_engine):
         feature_status["chunked_prefill"] = llm_args.enable_chunked_prefill
         feature_status["mtp"] = isinstance(llm_args.speculative_config,
                                            MTPDecodingConfig)
-        feature_status["eagle3_one_model"] = (
-            isinstance(llm_args.speculative_config, EagleDecodingConfig)
-            and llm_args.speculative_config.eagle3_one_model)
-        feature_status["eagle3_two_model"] = (
-            isinstance(llm_args.speculative_config, EagleDecodingConfig)
-            and not llm_args.speculative_config.eagle3_one_model)
+        feature_status["eagle3_one_model"] = isinstance(
+            llm_args.speculative_config, EagleDecodingConfig)
         feature_status[
             "kv_cache_reuse"] = llm_args.kv_cache_config is not None and llm_args.kv_cache_config.enable_block_reuse
         feature_status["slide_window_attention"] = (

@@ -4615,9 +4615,8 @@ class PyTorchModelEngine(ModelEngine):
         if self.spec_config is None:
             return False
 
-        # Not allowed for one-model speculative decoding
-        if not self.spec_config.spec_dec_mode.has_draft_model():
-            return False
+        # Only the (now removed) two-model flow ever used this path.
+        return False
 
         if not self.cuda_graph_runner.enabled:
             return False

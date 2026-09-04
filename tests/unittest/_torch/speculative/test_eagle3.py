@@ -801,7 +801,6 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=False,
     )
 
     if use_cuda_graph:

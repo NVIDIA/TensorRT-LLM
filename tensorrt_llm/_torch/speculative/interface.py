@@ -261,13 +261,10 @@ def get_force_num_accepted_tokens_float() -> float:
 
 class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
-    MTP_EAGLE = auto()
     MTP_EAGLE_ONE_MODEL = auto()
-    EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
     SA = auto()
-    DRAFT_TARGET = auto()
     DRAFT_TARGET_ONE_MODEL = auto()
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
@@ -288,12 +285,6 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_mtp_vanilla(self):
         return self == SpeculativeDecodingMode.MTP
-
-    def is_mtp_eagle(self):
-        return self == SpeculativeDecodingMode.MTP_EAGLE
-
-    def is_eagle3(self):
-        return self == SpeculativeDecodingMode.EAGLE3
 
     def use_one_engine(self):
         return self.is_eagle3_one_model() or self.is_mtp_one_model(
@@ -326,9 +317,6 @@ class SpeculativeDecodingMode(IntEnum):
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
 
-    def is_draft_target(self):
-        return self == SpeculativeDecodingMode.DRAFT_TARGET
-
     def is_draft_target_one_model(self):
         return self == SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
 
@@ -348,8 +336,7 @@ class SpeculativeDecodingMode(IntEnum):
 
     def support_overlap_scheduler(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_sa() or self.has_draft_model() or self.is_external_drafter(
-        )
+        ) or self.is_sa() or self.is_external_drafter()
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
@@ -363,17 +350,6 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_mtp_eagle_one_model() or self.is_pard() or self.is_dflash(
         ) or self.is_draft_target_one_model() or self.is_sa()
 
-    def has_draft_model(self):
-        return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
-
-    def needs_kv_cache_recompute(self):
-        """
-        Whether the draft model needs to recompute the kv cache.
-        If true, the 1st draft model forward will recompute the kv cache for
-        the accepted draft tokens.
-        """
-        return self.is_eagle3() or self.is_mtp_eagle()
-
     def need_load_draft_weights(self):
         """
         Whether the draft model and target model are in the same model engine,
@@ -382,13 +358,11 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_eagle3_one_model() or self.is_external_drafter()
 
     def has_spec_decoder(self):
-        return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
-        ) or self.is_eagle3_one_model() or self.is_external_drafter(
-        ) or self.is_sa()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_external_drafter() or self.is_sa()
 
     def has_spec_drafter(self):
-        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
-        ) or self.is_user_provided() or self.is_mtp_eagle()
+        return self.is_ngram() or self.is_user_provided()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """

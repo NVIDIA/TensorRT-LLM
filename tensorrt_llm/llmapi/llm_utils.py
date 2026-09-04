@@ -576,23 +576,6 @@ def apply_model_defaults_to_llm_args(
     return _compute_applied(model_defaults_dict, user_overrides)
 
 
-def _two_model_spec_dec_decoding_type(
-        llm_args: 'TorchLlmArgs') -> Optional[str]:
-    """Return the decoding type when a separate draft engine is configured.
-
-    ``has_draft_model()`` is the same predicate py_executor_creator uses to
-    decide whether to build a separate draft model engine, which is what forces
-    the second KV cache manager. Returns ``None`` for single-engine runs.
-    """
-    spec_config = llm_args.speculative_config
-    if spec_config is None:
-        return None
-    spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
-    if spec_dec_mode is None or not spec_dec_mode.has_draft_model():
-        return None
-    return getattr(spec_config, "decoding_type", "speculative decoding")
-
-
 def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
                                       model_cls: Optional[type] = None,
                                       pretrained_config: Any = None) -> bool:
@@ -618,17 +601,6 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
     """
     setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
     if setting != "auto":
-        if setting is True:
-            decoding_type = _two_model_spec_dec_decoding_type(llm_args)
-            if decoding_type is not None:
-                raise ValueError(
-                    "kv_cache_config.use_kv_cache_manager_v2=True is not "
-                    f"supported with {decoding_type}: the draft model runs in "
-                    "a separate engine and V2 sizes both KV cache managers "
-                    "from the full max_gpu_total_bytes budget instead of "
-                    "partitioning it between them. Set "
-                    "use_kv_cache_manager_v2 to False or 'auto', or use the "
-                    "one-model variant of this decoding mode.")
         return setting
 
     preferred_version = None
@@ -654,16 +626,6 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
                 "KV cache manager V2 is the model preference, but disaggregated "
                 "serving uses transceiver_runtime=%r with backend=%r; "
                 "falling back to V1.", runtime, effective_backend)
-            use_v2 = False
-
-    if use_v2:
-        decoding_type = _two_model_spec_dec_decoding_type(llm_args)
-        if decoding_type is not None:
-            logger.info(
-                "KV cache manager V2 is the model preference, but %s runs the "
-                "draft model in a separate engine and V2 sizes both KV cache "
-                "managers from the full max_gpu_total_bytes budget; falling "
-                "back to V1.", decoding_type)
             use_v2 = False
 
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = use_v2

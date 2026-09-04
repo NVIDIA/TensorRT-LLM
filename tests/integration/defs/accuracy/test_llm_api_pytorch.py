@@ -1661,25 +1661,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(60000)
-    def test_bfloat16_2_model_mtp(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
-        pytorch_config = dict(
-            disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig(),
-        )
-        mtp_config = MTPDecodingConfig(max_draft_len=3,
-                                       mtp_eagle_one_model=False,
-                                       speculative_model=self.MODEL_PATH)
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 enable_chunked_prefill=False,
-                 max_num_tokens=8192,
-                 **pytorch_config,
-                 speculative_config=mtp_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device_memory(60000)
     # Builds two LLM() instances back-to-back; the MPI-pool-reuse test layer
     # would otherwise hand the second one the first's just-used worker pool.
     @pytest.mark.private_mpi_session
@@ -1687,7 +1668,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         """TRTLLM-14874 regression on the MTP capture path (see test_one_engine_non_greedy_cuda_graph_matches_eager in TestLlama3_1_8BInstruct for the EAGLE3/SA equivalents)."""
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
         mtp_config = MTPDecodingConfig(max_draft_len=3,
-                                       mtp_eagle_one_model=False,
                                        speculative_model=self.MODEL_PATH)
 
         def build_llm_kwargs(cuda_graph_config):
