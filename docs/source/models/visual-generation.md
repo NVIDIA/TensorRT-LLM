@@ -66,7 +66,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **LTX-2** | Yes | Yes | Yes [^4] | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
-| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | No | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
 | **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |

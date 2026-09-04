@@ -230,7 +230,6 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_wan_pipeline_parallel.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py
-  - unittest/_torch/visual_gen/multi_gpu/test_wan_vsa_ulysses.py
 - condition:
     ranges:
       system_gpu_count:
