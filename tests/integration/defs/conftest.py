@@ -573,20 +573,6 @@ def llm_replit_code_v1_5_3b_model_root():
 
 
 @pytest.fixture(scope="module")
-@cached_in_llm_models_root("gpt2", True)
-def llm_gpt2_model_root():
-    "Get gpt2 model root"
-    raise RuntimeError("gpt2 must be cached")
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("gpt2-medium", True)
-def llm_gpt2_medium_model_root():
-    "Get gpt2 medium model root"
-    raise RuntimeError("gpt2-medium must be cached")
-
-
-@pytest.fixture(scope="module")
 @cached_in_llm_models_root("GPT-2B-001_bf16_tp1.nemo", True)
 def llm_gpt2_next_model_root():
     "get gpt-2b-001_bf16_tp1.nemo"

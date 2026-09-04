@@ -83,12 +83,6 @@ models:
 # - name: google/gemma-1.1-7b-it
 #   config_id: default_ws_2
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-- name: google/gemma-2-2b-it
-  config_id: default_ws_1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
-- name: google/gemma-2-9b-it
-  config_id: default_ws_1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # IndexError: list index out of range in AutoDeploy sharding path. See https://github.com/NVIDIA/TensorRT-LLM/issues/14681
 # - name: google/codegemma-7b-it
 #   config_id: default_ws_2
@@ -229,9 +223,6 @@ models:
 - name: Qwen/QwQ-32B
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
-- name: google/gemma-2-27b-it
-  config_id: default_ws_1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # OOM during AutoDeploy run.
 # - name: perplexity-ai/r1-1776-distill-llama-70b
 #   config_id: default_ws_4
