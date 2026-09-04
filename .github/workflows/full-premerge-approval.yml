@@ -44,7 +44,7 @@ jobs:
        (github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success' &&
         startsWith(github.event.workflow_run.display_title,
-                   'Full pre-merge approval candidate for PR #')))
+                   'Review approved for PR #')))
     runs-on: ubuntu-latest
     steps:
       - name: Download full approval signal
@@ -86,14 +86,10 @@ jobs:
               }
             }
             rawPullNumber = rawPullNumber?.trim();
-            if (!/^[1-9]\d*$/.test(rawPullNumber || '')) {
-              core.warning('The full approval signal does not contain a valid pull request number.');
-              return;
-            }
-
             const pullNumber = Number(rawPullNumber);
-            if (!Number.isSafeInteger(pullNumber)) {
-              core.warning('The pull request number is outside the supported integer range.');
+            if (!Number.isSafeInteger(pullNumber) || pullNumber <= 0 ||
+                String(pullNumber) !== rawPullNumber) {
+              core.warning('The full approval signal does not contain a valid pull request number.');
               return;
             }
 
@@ -102,11 +98,6 @@ jobs:
               query($owner: String!, $repo: String!, $number: Int!) {
                 repository(owner: $owner, name: $repo) {
                   pullRequest(number: $number) {
-                    labels(first: 100) {
-                      nodes {
-                        name
-                      }
-                    }
                     reviewDecision
                     state
                   }
@@ -126,12 +117,6 @@ jobs:
               }
               if (pullRequest.reviewDecision !== 'APPROVED') {
                 console.log(`PR #${pullNumber} is not fully approved; skipping auto-labeling.`);
-                return;
-              }
-              if (pullRequest.labels.nodes.some(
-                (label) => label.name.toLowerCase() === approvalLabel.toLowerCase()
-              )) {
-                console.log(`PR #${pullNumber} already has the approval label.`);
                 return;
               }
 
