@@ -27,11 +27,11 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
-// Number of blocks-per-row used by the multi-block split + merge dispatch path
-// of invokeIndexerTopKDecode. Returns 1 when the single-block path is
-// preferred. Callers that allocate aux buffers must use this same helper to
-// size them, and must pass the same splitWorkThreshold they will pass to
-// invokeIndexerTopKDecode (a value <= 0 selects the internal default).
+// Number of blocks-per-row used by the multi-block split + merge dispatch path of
+// invokeIndexerTopKDecode. Returns 1 when the single-block path is preferred.
+// Callers that allocate aux buffers must use this same helper to size them, and
+// must pass the same splitWorkThreshold they will pass to invokeIndexerTopKDecode
+// (a value <= 0 selects the internal default).
 int computeIndexerTopKDecodeBlocksPerRow(int numRows, int numColumns, int splitWorkThreshold = 0);
 
 /// fp32 indexer TopK decode — three dispatch tiers:

@@ -108,32 +108,29 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         self.cu_seq_lens[0] = 0
 
-        # Request-major token prefixes for the fused Q-RoPE kernel. Unlike the
-        # token-major sparse-MLA view, this kernel can consume one arbitrary
-        # query length per request through cu_q_seqlens. Keep separate storage
-        # from both the compressor's prefixes and MLA's Q-row prefixes: those
-        # buffers can be read concurrently or use a different presentation.
-        self.fused_q_gen_cu_seqlens = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_sequences + 1,),
-            cache_name="fused_q_gen_cu_seqlens",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.fused_q_gen_cu_seqlens[:1].zero_()
         self._fused_q_gen_cu_seqlens_valid = False
-
-        # Tokens each generation request appends this step. Only populated for
-        # ragged verification; uniform batches continue to use the scalar
-        # ``num_gen_tokens_per_seq`` loop bound.
-        self.gen_new_tokens_per_seq_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_sequences,),
-            dtype=torch.int,
-            cache_name="gen_new_tokens_per_seq_cuda",
-            capture_graph=capture_graph,
-        )
+        self.fused_q_gen_cu_seqlens = None
+        self.gen_new_tokens_per_seq_cuda = None
         self.gen_new_tokens_per_seq: Optional[torch.Tensor] = None
+        if self.enable_ragged_verification:
+            # The fused Q normalization op consumes request-major token
+            # prefixes, rather than the sparse-MLA token-major row view.
+            self.fused_q_gen_cu_seqlens = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_sequences + 1,),
+                cache_name="fused_q_gen_cu_seqlens",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.fused_q_gen_cu_seqlens[:1].zero_()
+            # Exact tokens appended by each generation request.
+            self.gen_new_tokens_per_seq_cuda = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_sequences,),
+                dtype=torch.int,
+                cache_name="gen_new_tokens_per_seq_cuda",
+                capture_graph=capture_graph,
+            )
 
         # new_comp_kv_lens_cuda is the number of new compressed tokens for the requests
         self.new_comp_kv_lens_cuda = {
@@ -585,9 +582,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         for field in self._DRAFT_SPARSE_FIELDS:
             setattr(self, field, saved_state[field])
 
-    def _prepare_impl(self) -> None:
-        # DSAtrtllmAttentionMetadata.prepare() owns the overlap-scheduler guard
-        # for pinned staging buffers and dispatches here.
+    def prepare(self) -> None:
         assert self.kv_cache_manager is not None
         assert self.request_ids is not None
 
