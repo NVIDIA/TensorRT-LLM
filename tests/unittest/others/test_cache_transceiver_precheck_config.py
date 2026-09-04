@@ -27,20 +27,11 @@ import types
 
 import pytest
 
-_PRECHECK_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "..",
-    "..",
-    "tests",
-    "scripts",
-    "perf-sanity",
-    "cache_transceiver_precheck",
-)
-sys.path.insert(0, os.path.abspath(_PRECHECK_DIR))
+__extra_import_path__ = ["~/tests/scripts/perf-sanity/cache_transceiver_precheck"]
+import precheck_config as pcfg
+import run_precheck as rp
 
-import precheck_config as pcfg  # noqa: E402
-import run_precheck as rp  # noqa: E402  (stdlib-only at import time)
+_PRECHECK_DIR = os.path.dirname(os.path.abspath(pcfg.__file__))
 
 
 def _disagg_yaml(ctx_extra=None, gen_extra=None, **overrides):
@@ -922,7 +913,6 @@ class TestMultiPeerOrchestration:
         fail_ctx=False,
         wave_delay_s=0,
     ):
-        import sys
         import types
 
         # PrecheckRunner.__init__ imports mpi4py only to ensure MPI init.
@@ -1240,7 +1230,6 @@ def test_ctx_run_wave_missing_params_broadcast(tmp_path, monkeypatch):
     delivered via bcast the rank must raise; with a clean (None) broadcast it
     must return normally.
     """
-    import sys
     import types
 
     monkeypatch.setitem(sys.modules, "mpi4py", types.SimpleNamespace(MPI=None))
@@ -1386,3 +1375,70 @@ def test_python_transceiver_bandwidth_csv(tmp_path):
     assert abs(bw - 153600 * 1024 * 1024 / 1e9) < 1e-9
     # no perf files -> None
     assert rp.parse_python_bandwidth_gbps(str(tmp_path / "empty")) is None
+
+
+@pytest.mark.parametrize("mode", ["e2e", "gen_only"])
+def test_parse_args_accepts_every_forwarded_benchmark_mode(tmp_path, mode):
+    """--benchmark-mode must admit every mode submit.py can forward.
+
+    jenkins/scripts/perf/submit.py builds pytestCommandCTXPrecheck /
+    pytestCommandGENPrecheck by pasting the test id's mode token in verbatim, so
+    a mode missing from these choices makes the precheck srun die in argparse --
+    before the workload starts, and for a reason that reads as a launch failure
+    rather than an unsupported mode. resolve_plan only distinguishes gen_only;
+    e2e is accepted precisely because the KV transfer it prechecks is the same.
+
+    An instrumentation modifier such as `time_breakdown` is a separate test-id
+    segment and is never forwarded here, which is what keeps this list closed.
+    """
+    args = rp.parse_args(
+        [
+            "--role",
+            "ctx",
+            "--server-idx",
+            "0",
+            "--config",
+            str(tmp_path / "cfg.yaml"),
+            "--work-dir",
+            str(tmp_path),
+            "--benchmark-mode",
+            mode,
+        ]
+    )
+    assert args.benchmark_mode == mode
+
+
+@pytest.mark.parametrize("mode", ["e2e_time_breakdown", "time_breakdown", "ctx_only"])
+def test_parse_args_still_rejects_an_unknown_benchmark_mode(tmp_path, mode):
+    """The choices list must stay a gate, not become a free-text field.
+
+    A typo'd mode has to fail here, where the message names the argument, rather
+    than silently resolving to the e2e plan. The fused spelling
+    `e2e_time_breakdown` and a bare modifier are rejected for the same reason: a
+    caller passing either is a caller that has not split the axis.
+
+    `ctx_only` is in this list rather than the accepted one, which looks odd next
+    to the harness where ctx_only is a real benchmark mode. It is deliberate and
+    not reachable in production: the precheck gate is spliced only into the
+    *disaggregated* launch draft (jenkins/scripts/perf/submit.py, and
+    slurm_ct_precheck_gate.sh's run_cache_transceiver_precheck), and ctx_only runs
+    on the aggregated runtime, so this script is never invoked with it. There is
+    also nothing for it to precheck -- a ctx_only lane has no gen server, so no KV
+    transfer. Rejecting it keeps that assumption falsifiable: the day someone
+    wires the gate into the aggregated path, this test fails and says so.
+    """
+    with pytest.raises(SystemExit):
+        rp.parse_args(
+            [
+                "--role",
+                "ctx",
+                "--server-idx",
+                "0",
+                "--config",
+                str(tmp_path / "cfg.yaml"),
+                "--work-dir",
+                str(tmp_path),
+                "--benchmark-mode",
+                mode,
+            ]
+        )

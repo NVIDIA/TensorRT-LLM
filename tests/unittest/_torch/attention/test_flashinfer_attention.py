@@ -27,6 +27,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 
 class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
@@ -71,6 +72,30 @@ class CUDAGraphTestScenario:
 
 class TestFlashInferAttention(unittest.TestCase):
 
+    def test_swa_page_sanitization_uses_local_window_order(self) -> None:
+        metadata = object.__new__(FlashInferAttentionMetadata)
+        metadata.kv_cache_manager = SimpleNamespace(
+            layer_offsets={
+                4: 0,
+                5: 1,
+                6: 2
+            },
+            max_attention_window_vec=[128, None, 128],
+        )
+
+        sliding_page_indices = torch.tensor([BAD_PAGE_INDEX, 3],
+                                            dtype=torch.int32)
+        metadata._sanitize_swa_page_indices(sliding_page_indices, layer_idx=4)
+        torch.testing.assert_close(sliding_page_indices,
+                                   torch.tensor([0, 3], dtype=torch.int32))
+
+        full_page_indices = torch.tensor([BAD_PAGE_INDEX, 3], dtype=torch.int32)
+        metadata._sanitize_swa_page_indices(full_page_indices, layer_idx=5)
+        torch.testing.assert_close(
+            full_page_indices,
+            torch.tensor([BAD_PAGE_INDEX, 3], dtype=torch.int32),
+        )
+
     def test_generation_page_table_uses_reserved_block_count(self):
         manager = SimpleNamespace(get_batch_cache_indices=mock.Mock(
             return_value=[list(range(325))]))
@@ -83,7 +108,7 @@ class TestFlashInferAttention(unittest.TestCase):
         )
         manager.get_batch_cache_indices.assert_called_once_with([99])
 
-    def test_decode_launch_shape_is_part_of_plan_params(self):
+    def test_decode_plan_cache_key_reuses_single_token_batches(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
 
@@ -113,6 +138,39 @@ class TestFlashInferAttention(unittest.TestCase):
                 attention_mask_type=AttentionMaskType.causal.value,
                 flashinfer_backend="trtllm-gen",
             )
+            metadata.seq_lens = torch.tensor([1, 1, 1], dtype=torch.int32)
+            larger_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata.seq_lens = torch.tensor([1, 1], dtype=torch.int32)
+            metadata._uses_full_generation_page_table = True
+            full_page_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata._uses_full_generation_page_table = False
+            metadata._is_shared_kv_draft_view = True
+            shared_draft_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata._is_shared_kv_draft_view = False
             metadata.seq_lens = torch.tensor([6, 6], dtype=torch.int32)
             multi_token_plan = metadata.plan(
                 num_heads=32,
@@ -135,6 +193,14 @@ class TestFlashInferAttention(unittest.TestCase):
             )
 
         self.assertEqual(single_token_plan.q_len_per_req, 1)
+        self.assertEqual(single_token_plan.num_generations, 0)
+        self.assertEqual(larger_single_token_plan.q_len_per_req, 1)
+        self.assertEqual(larger_single_token_plan.num_generations, 0)
+        self.assertEqual(single_token_plan, larger_single_token_plan)
+        self.assertEqual(full_page_single_token_plan.num_generations, 2)
+        self.assertNotEqual(single_token_plan, full_page_single_token_plan)
+        self.assertEqual(shared_draft_single_token_plan.num_generations, 2)
+        self.assertNotEqual(single_token_plan, shared_draft_single_token_plan)
         self.assertEqual(multi_token_plan.q_len_per_req, 6)
         self.assertNotEqual(single_token_plan, multi_token_plan)
         self.assertEqual(multi_token_plan.num_generations, 2)
