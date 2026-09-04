@@ -642,8 +642,7 @@ class PyTorchModelEngine(ModelEngine):
         # schema-v2 tables define the positive V keys that must be captured for
         # each G, and are accepted only after matching a separate live-runtime
         # fingerprint. The worker receives this already-validated object when
-        # confidence scheduling starts; legacy curves keep their existing
-        # one-dimensional planner path.
+        # confidence scheduling starts.
         self._dspark_sps_cost_table = None
         self._dspark_exact_candidate_cells = ()
         self._dspark_exact_identity_words = (0, ) * 8
@@ -651,8 +650,7 @@ class PyTorchModelEngine(ModelEngine):
                 self.spec_config, "enable_confidence_scheduling", False) and
                 getattr(self.spec_config, "confidence_sps_table_path", None)):
             from ..speculative.dspark_planner import load_runtime_sps_cost_table
-            top_verify_len = max(
-                int(t) for t in self.spec_config.verify_len_tiers)
+            top_verify_len = int(self.spec_config.max_draft_len)
             self._dspark_sps_cost_table, _ = load_runtime_sps_cost_table(
                 self.spec_config.confidence_sps_table_path,
                 graph_batch_sizes=self._cuda_graph_batch_sizes,
@@ -661,12 +659,10 @@ class PyTorchModelEngine(ModelEngine):
                     self.spec_config, "confidence_sps_live_fingerprint_path",
                     None),
             )
-            from ..speculative.dspark_planner import ExactSpsCostTable
-            if isinstance(self._dspark_sps_cost_table, ExactSpsCostTable):
-                self._dspark_exact_candidate_cells = (
-                    self._dspark_sps_cost_table.candidate_cells())
-                self._dspark_exact_identity_words = (
-                    self._dspark_sps_cost_table.collective_identity_words)
+            self._dspark_exact_candidate_cells = (
+                self._dspark_sps_cost_table.candidate_cells())
+            self._dspark_exact_identity_words = (
+                self._dspark_sps_cost_table.collective_identity_words)
 
         self._encoder_cuda_graph_padding_enabled = (
             encoder_cuda_graph_padding_enabled)
@@ -2634,16 +2630,14 @@ class PyTorchModelEngine(ModelEngine):
             return graphs
 
         # Case 2b: DSpark confidence-scheduled verification. The drafted block
-        # is always full, so draft_len is pinned to the top tier in every
-        # mode; ragged verification moves the tiers to the token axis, while
-        # the static fallback keeps one graph per batch size. Captured graphs
-        # cost KV cache, so capture no tier the runtime cannot select.
+        # is always full, so draft_len stays at max_draft_len. Ragged
+        # verification adds only the exact measured V values to the token
+        # axis, while the static fallback keeps one graph per batch size.
+        # Captured graphs cost KV cache, so capture no cell the runtime cannot
+        # select.
         if (self.spec_config is not None and getattr(
                 self.spec_config, "enable_confidence_scheduling", False)):
-            tiers = sorted({
-                int(t)
-                for t in self.spec_config.verify_len_tiers if int(t) >= 0
-            })
+            max_draft_len = int(self.spec_config.max_draft_len)
             if self._dspark_trims_submitted_tokens:
                 # Keep the ordinary uniform graph for every G. A confidence
                 # decision that resolves to full K deliberately clears the
@@ -2652,38 +2646,32 @@ class PyTorchModelEngine(ModelEngine):
                 # eager even though the equivalent full-token ragged key was
                 # captured. Ragged keys remain separate because their packed
                 # attention metadata cannot safely alias the uniform graph.
-                top_tier = tiers[-1]
-                native_graphs = [(bs, top_tier)
+                native_graphs = [(bs, max_draft_len)
                                  for bs in cuda_graph_batch_sizes]
                 from ..speculative.dspark_planner import ExactSpsCostTable
                 exact_table = getattr(self, "_dspark_sps_cost_table", None)
-                if isinstance(exact_table, ExactSpsCostTable):
-                    ragged_graphs = [
-                        (bs, top_tier, verifier_budget)
-                        for bs in cuda_graph_batch_sizes for verifier_budget in
-                        exact_table.production_candidate_budgets(bs)
-                    ]
-                    bucket_description = "exact measured (G,V) cells"
-                else:
-                    ragged_graphs = [(bs, top_tier, bs * (t + 1))
-                                     for bs in cuda_graph_batch_sizes
-                                     for t in tiers]
-                    bucket_description = f"token buckets from tiers {tiers}"
+                if not isinstance(exact_table, ExactSpsCostTable):
+                    raise RuntimeError(
+                        "DSpark confidence graph capture requires an authenticated "
+                        "exact SPS table")
+                ragged_graphs = [(bs, max_draft_len, verifier_budget)
+                                 for bs in cuda_graph_batch_sizes
+                                 for verifier_budget in
+                                 exact_table.production_candidate_budgets(bs)]
                 graphs = native_graphs + ragged_graphs
                 logger.info(
                     f"DSpark ragged verification: capturing {len(graphs)} graphs "
-                    f"({len(cuda_graph_batch_sizes)} native static-K{top_tier} "
-                    f"graphs + {len(ragged_graphs)} {bucket_description}; "
-                    f"draft_len pinned to {top_tier}).")
+                    f"({len(cuda_graph_batch_sizes)} native static-K{max_draft_len} "
+                    f"graphs + {len(ragged_graphs)} exact measured (G,V) cells; "
+                    f"draft_len pinned to {max_draft_len}).")
                 return graphs
-            # One draft length, not the ladder: nothing varies draft_len at
-            # runtime, so lower tiers would be captured graphs never replayed.
-            top_tier = tiers[-1]
-            graphs = [(bs, top_tier) for bs in cuda_graph_batch_sizes]
+            # Nothing varies draft_len at runtime, so shorter draft graphs
+            # would never be replayed.
+            graphs = [(bs, max_draft_len) for bs in cuda_graph_batch_sizes]
             logger.info(
                 f"DSpark confidence scheduling: capturing {len(graphs)} graphs "
                 f"({len(cuda_graph_batch_sizes)} batch sizes, draft_len pinned "
-                f"to {top_tier}). The drafted block is always full; only "
+                f"to {max_draft_len}). The drafted block is always full; only "
                 f"verification is trimmed.")
             return graphs
 
@@ -5204,20 +5192,16 @@ class PyTorchModelEngine(ModelEngine):
         self.cuda_graph_runner.agreed_ragged_bucket = int(verify_bucket)
 
     def ragged_verify_token_buckets(self, padded_bs: int) -> List[int]:
-        """Captured token totals for a ragged batch of ``padded_bs`` rows.
-
-        One bucket per verify-length tier -- exactly the totals the uniform
-        ladder would produce, so the captured graph set does not grow.
-        """
+        """Measured compact ``V`` cells captured for one exact ``G``."""
         if self.spec_config is None:
             return []
         from ..speculative.dspark_planner import ExactSpsCostTable
         exact_table = getattr(self, "_dspark_sps_cost_table", None)
-        if isinstance(exact_table, ExactSpsCostTable):
-            return list(exact_table.production_candidate_budgets(
-                int(padded_bs)))
-        tiers = sorted({int(t) for t in self.spec_config.verify_len_tiers})
-        return [int(padded_bs) * (t + 1) for t in tiers]
+        if not isinstance(exact_table, ExactSpsCostTable):
+            raise RuntimeError(
+                "DSpark ragged verification requires an authenticated exact SPS table"
+            )
+        return list(exact_table.production_candidate_budgets(int(padded_bs)))
 
     def _get_spec_worker(self):
         """Return the one-model speculative worker when it is initialized."""
@@ -5226,18 +5210,10 @@ class PyTorchModelEngine(ModelEngine):
     def fit_ragged_verify_lens(self,
                                generation_requests,
                                verify_lens: List[int],
+                               exact_shape: Tuple[int, int, int],
                                peer_stats: Optional[List[List[int]]] = None,
-                               exact_shape: Optional[Tuple[int, int,
-                                                           int]] = None,
                                exact_zero_real: bool = False) -> Optional[int]:
-        """Round this batch's verify total onto a captured bucket, in place.
-
-        The flat token count is a CUDA-graph key axis, so the total must land
-        on a captured value *before* the key is built; the rounding slack is
-        spent on real verification (``RaggedVerifyLayout.fill_bucket``).
-        Writes the fitted window onto each request's ``py_verify_len`` and
-        returns the bucket, or None when no captured shape fits (the caller
-        falls back to uniform scheduling).
+        """Validate and publish a globally selected exact ``(G,V)`` shape.
 
         ``peer_stats`` is every attention-DP rank's ``[num_requests,
         total_tokens, all_can_graph]``, including this rank's: the bucket must
@@ -5245,9 +5221,9 @@ class PyTorchModelEngine(ModelEngine):
         and ``all_can_graph`` is the group's answer to whether that maximum
         will be taken at all.
 
-        ``exact_shape`` is an already agreed ``(G,V,pad_tokens)`` from the
-        exact SPS selector. It bypasses bucket rounding: changing V here would
-        execute a different cell from the one the policy priced.
+        ``exact_shape`` is the agreed ``(G,V,pad_tokens)`` from the exact SPS
+        selector. Changing V here would execute a different measured cell from
+        the one the policy priced, so this method only validates the split.
 
         ``exact_zero_real`` means this rank contributes no logical requests
         but carries the one scheduler-owned attention-DP dummy. The dummy is
@@ -5272,18 +5248,11 @@ class PyTorchModelEngine(ModelEngine):
                 f"{len(generation_requests)} generation requests; falling back "
                 f"to uniform scheduling")
             return None
-        tiers = sorted({int(t) for t in self.spec_config.verify_len_tiers})
-        if not tiers:
-            return None
-        max_verify_len = 1 + tiers[-1]
+        max_verify_len = 1 + int(self.spec_config.max_draft_len)
         token_lens = [1 + int(v) for v in verify_lens]
 
-        from ..speculative.dspark_ragged import (choose_ragged_capture_shape,
-                                                 resolve_ragged_pad_split)
+        from ..speculative.dspark_ragged import resolve_ragged_pad_split
 
-        bs_buckets = sorted({int(b) for b in runner.supported_batch_sizes})
-        if not bs_buckets:
-            return None
         # Resolve rows first, then tokens: the bucket grid depends on the
         # widest rank's row count. `all_can_graph` (third peer-stat element;
         # absent means single-rank) says whether _get_padded_batch will take
@@ -5302,16 +5271,13 @@ class PyTorchModelEngine(ModelEngine):
         widest_rows = max(
             [int(s[0]) for s in peer_stats],
             default=len(token_lens)) if peer_stats else len(token_lens)
-        if exact_shape is not None:
-            padded_bs = int(exact_shape[0])
-            expected_padded_bs = runner._round_up_batch_size(widest_rows)
-            if padded_bs != expected_padded_bs:
-                logger.warning(
-                    "DSpark exact ragged shape disagrees with graph ladder: "
-                    f"selected G={padded_bs}, expected G={expected_padded_bs}")
-                return None
-        else:
-            padded_bs = runner._round_up_batch_size(widest_rows)
+        padded_bs = int(exact_shape[0])
+        expected_padded_bs = runner._round_up_batch_size(widest_rows)
+        if padded_bs != expected_padded_bs:
+            logger.warning(
+                "DSpark exact ragged shape disagrees with graph ladder: "
+                f"selected G={padded_bs}, expected G={expected_padded_bs}")
+            return None
         if padded_bs == 0:
             return None
         # The fit assumes the batch will actually be padded to `padded_bs`;
@@ -5328,36 +5294,20 @@ class PyTorchModelEngine(ModelEngine):
         buckets = self.ragged_verify_token_buckets(padded_bs)
         if not buckets:
             return None
-        if exact_shape is not None:
-            bucket = int(exact_shape[1])
-            if bucket not in buckets:
-                logger.warning(
-                    f"DSpark exact V={bucket} was not captured for G={padded_bs}"
-                )
-                return None
-        else:
-            try:
-                shape = choose_ragged_capture_shape(
-                    num_real_requests=len(token_lens),
-                    total_verify_tokens=sum(token_lens),
-                    bs_buckets=bs_buckets,
-                    token_buckets=buckets,
-                    peer_stats=peer_stats,
-                    # With the window cap the chooser also enforces per-rank
-                    # decomposability from the allgathered stats, so accept vs
-                    # decline is identical on every rank -- the local checks
-                    # below become unreachable safety nets instead of the
-                    # group-splitting decision points they used to be.
-                    max_verify_len=max_verify_len)
-            except ValueError as exc:
-                logger.debug(
-                    f"DSpark ragged shape selection failed, falling back "
-                    f"to uniform scheduling: {exc}")
-                return None
-            padded_bs, bucket = shape.padded_bs, shape.bucket
+        bucket = int(exact_shape[1])
+        if bucket not in buckets:
+            logger.warning(
+                f"DSpark exact V={bucket} was not captured for G={padded_bs}")
+            return None
+
+        full_bucket = int(padded_bs) * int(max_verify_len)
+        if bucket == full_bucket:
+            # A full verifier budget has no ragged work reduction. Preserve
+            # the native static-K path and its ordinary multi-G tail handling.
+            return None
 
         if exact_zero_real:
-            if (exact_shape is None or len(generation_requests) != 1
+            if (len(generation_requests) != 1
                     or not generation_requests[0].is_attention_dp_dummy
                     or len(verify_lens) != 1):
                 raise RuntimeError(
@@ -5389,14 +5339,6 @@ class PyTorchModelEngine(ModelEngine):
             generation_requests[0].py_verify_len = expected_scheduled_window
             return int(bucket)
 
-        full_bucket = int(padded_bs) * (int(tiers[-1]) + 1)
-        if bucket == full_bucket:
-            # Cross-rank padding can promote locally compact decisions onto
-            # the full-K graph. At that point ragged execution saves no target
-            # work, so preserve the native static path (and its efficient
-            # multi-G tail handling) rather than paying ragged bookkeeping.
-            return None
-
         # Pad rows are appended later as a *single shared dummy object*, so
         # they all carry the same window and their contribution must be
         # decided here, not left to the fill. They take the minimum (one
@@ -5405,7 +5347,7 @@ class PyTorchModelEngine(ModelEngine):
         n_real = len(token_lens)
         n_pad = padded_bs - n_real
         floor_tokens = sum(token_lens)
-        fixed_pad_len = int(exact_shape[2]) if exact_shape is not None else None
+        fixed_pad_len = int(exact_shape[2])
         split = resolve_ragged_pad_split(
             bucket=int(bucket),
             num_real_requests=n_real,
@@ -5422,34 +5364,15 @@ class PyTorchModelEngine(ModelEngine):
             return None
         pad_len = split.pad_len
         real_target = split.real_target
-        if (exact_shape is not None and real_target != sum(token_lens)):
+        if real_target != sum(token_lens):
             logger.warning(
                 "DSpark exact layout changed between policy and fit: "
                 f"real tokens={sum(token_lens)}, target={real_target}, "
                 f"G={padded_bs}, V={bucket}, pad={pad_len}")
             return None
-        if exact_shape is not None:
-            # The exact selector already returned a bounded split whose real
-            # rows sum to the measured cell. Repacking it through
-            # RaggedVerifyLayout would build two CPU tensors, two prefix sums,
-            # and two host lists without changing a value.
-            published = token_lens
-        else:
-            from ..speculative.dspark_ragged import RaggedVerifyLayout
-            lens_tensor = torch.tensor(token_lens, dtype=torch.int32)
-            layout = RaggedVerifyLayout.from_verify_lens(
-                lens_tensor,
-                graph_num_tokens=real_target,
-                total_verify_tokens=sum(token_lens))
-            try:
-                filled = layout.fill_bucket(max_verify_len=max_verify_len)
-            except ValueError as exc:
-                # A mismatch means this batch has no captured shape; degrade to
-                # uniform rather than run eager.
-                logger.debug(f"DSpark ragged bucket fit failed, falling back "
-                             f"to uniform scheduling: {exc}")
-                return None
-            published = filled.verify_lens.tolist()
+        # The exact selector already returned a bounded split whose real rows
+        # sum to the measured cell; repacking it cannot change a value.
+        published = token_lens
 
         # Published only now, past the last way this fit can fail: a stale
         # published bucket on a fallback step is the state behind the ragged
