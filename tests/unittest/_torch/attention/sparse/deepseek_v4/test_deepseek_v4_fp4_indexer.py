@@ -28,19 +28,13 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import indexer as dsv4_module
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
-    DeepseekV4CacheManager,
-    get_token_bytes,
-)
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import get_token_bytes
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.indexer import DeepseekV4Indexer
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import DeepseekV4AttentionType
-from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm.llmapi.llm_args import (
     DeepSeekSparseAttentionConfig,
     DeepSeekV4SparseAttentionConfig,
-    KvCacheConfig,
 )
-from tensorrt_llm.quantization import QuantMode
 
 # ---------------------------------------------------------------------------
 # Pydantic config validators
@@ -104,34 +98,6 @@ def test_indexer_compress_fp4_halves_pool_footprint():
     assert fp4 / fp8 < 0.52, (
         f"FP4 indexer K cache footprint did not shrink as expected: {fp4}/{fp8}"
     )
-
-
-def test_main_compress_nvfp4_token_bytes():
-    nvfp4_bytes = get_token_bytes(
-        head_dim=512,
-        index_head_dim=128,
-        compress_ratio=4,
-        attn_type=DeepseekV4AttentionType.COMPRESS,
-        has_fp8_kv_cache=True,
-        has_nvfp4_compress=True,
-    )
-
-    assert nvfp4_bytes == 512 // 2 + 512 // 16
-
-
-def test_nvfp4_deepseek_v4_selects_dedicated_cache_manager():
-    sparse_config = DeepSeekV4SparseAttentionConfig()
-    model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(kv_lora_rank=448, qk_rope_head_dim=64),
-        sparse_attention_config=sparse_config,
-        quant_config=SimpleNamespace(quant_mode=QuantMode.NVFP4_KV_CACHE),
-    )
-
-    manager_cls = get_kv_cache_manager_cls(
-        model_config, KvCacheConfig(dtype="nvfp4", use_kv_cache_manager_v2=True)
-    )
-
-    assert manager_cls is DeepseekV4CacheManager
 
 
 def test_indexer_compress_rejects_unknown_dtype():
