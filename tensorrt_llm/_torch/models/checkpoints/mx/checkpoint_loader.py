@@ -36,7 +36,17 @@ import traceback
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterator, MutableMapping, Optional, Protocol, Type, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterator,
+    MutableMapping,
+    Optional,
+    Protocol,
+    Type,
+    Union,
+)
 
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
@@ -47,9 +57,13 @@ from tensorrt_llm._torch.weight_sharing import (
     IdentityCheckPolicy,
     SourceIdentity,
     check_weight_sharing_compatibility,
+    maybe_write_weight_manifest,
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+if TYPE_CHECKING:
+    from torch import nn
 
 # Defensive default for the upstream `MX_SOURCE_QUERY_TIMEOUT` env var.
 # The upstream `MxLiveWeightLoader` polls the MX server every 5 s for up
@@ -183,7 +197,7 @@ def _close_mx_client(client: Any) -> None:
 
 
 def _synchronize_cuda_for_mx_publish() -> None:
-    """Finish pending CUDA writes before exposing source buffers through MX."""
+    """Finish pending CUDA writes at an MX transfer boundary (publish or receive)."""
     import torch
 
     if torch.cuda.is_initialized():
@@ -198,6 +212,16 @@ def _enable_mx_transfer_logging() -> None:
     mx_logger = logging.getLogger("modelexpress")
     if mx_logger.getEffectiveLevel() > logging.INFO:
         mx_logger.setLevel(logging.INFO)
+
+
+def _maybe_write_mx_transfer_manifest(model: "nn.Module", *, rank: int, boundary: str) -> None:
+    """Fingerprint the bytes at an MX transfer boundary when `MX_WEIGHT_MANIFEST_DIR` is set."""
+    maybe_write_weight_manifest(
+        model,
+        family="transfer",
+        rank=rank,
+        context={"boundary": boundary, "checkpoint_format": "MX"},
+    )
 
 
 @register_checkpoint_loader("MX")
@@ -573,6 +597,10 @@ class MXCheckpointLoader(HfCheckpointLoader):
             return fallback_weights
 
         self._p2p_succeeded = True
+        # P2P writes and any upstream dtype casts must be globally visible
+        # before the bytes are fingerprinted or finalized by ModelLoader.
+        _synchronize_cuda_for_mx_publish()
+        _maybe_write_mx_transfer_manifest(model, rank=mapping.rank, boundary="receiver_p2p_success")
         logger.info(
             "MX P2P weight transfer succeeded from %s",
             self._mx_server_url,
@@ -808,13 +836,19 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 "can still observe transient values. Tracked by MX-2.",
                 key="mx_publish_env_threaded_warning",
             )
+        # Post-load transforms may enqueue asynchronous writes. Make the source
+        # buffers globally ready before they are fingerprinted and before MX
+        # publishes their addresses and allows a receiver to issue RDMA reads.
+        # The manifest runs outside the best-effort publish guard below so a
+        # manifest problem is loud; nothing between here and the publish call
+        # touches the weights.
+        _synchronize_cuda_for_mx_publish()
+        _maybe_write_mx_transfer_manifest(
+            model, rank=source_identity.rank, boundary="donor_publish"
+        )
         try:
             with _MX_TRANSFER_STATE_LOCK:
                 resolved_name = self._resolve_publish_name(checkpoint_dir)
-                # Post-load transforms may enqueue asynchronous writes. Make
-                # the source buffers globally ready before MX publishes their
-                # addresses and allows a receiver to issue RDMA reads.
-                _synchronize_cuda_for_mx_publish()
                 with (
                     _temporary_env("MODEL_EXPRESS_URL", self._mx_server_url),
                     _temporary_env("MODEL_NAME", resolved_name),

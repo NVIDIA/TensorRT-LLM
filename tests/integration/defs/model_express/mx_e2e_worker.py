@@ -25,10 +25,32 @@ from pathlib import Path
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
 
+try:  # Run as a script: the worker directory is `sys.path[0]`.
+    from mx_evidence import summarize_transfer_logs
+except ImportError:  # Imported by pytest as part of the `defs` package.
+    from defs.model_express.mx_evidence import summarize_transfer_logs
+
+# Eight prompts of distinct lengths (4-12 tokens). Every ID stays below 30000
+# so the same probe is valid for TinyLlama (32000-token vocabulary), Mistral,
+# and Qwen tokenizers; the leading `1` mirrors a BOS token.
 _PROMPT_TOKEN_IDS = (
     (1, 42, 7, 9),
     (1, 17, 23, 5, 11),
+    (1, 306, 626, 263, 4086, 1904),
+    (1, 450, 4996, 17354, 1701, 29916, 432),
+    (1, 3, 4, 5, 6, 7, 8, 9),
+    (1, 1724, 338, 278, 7483, 310, 3444, 29973, 13),
+    (1, 15043, 3186, 29991, 1128, 526, 366, 2599, 9826, 29973),
+    (1, 12, 34, 56, 78, 910, 1112, 1314, 1516, 1718, 1920, 2122),
 )
+# Greedy tokens generated per prompt; `end_id=-1` keeps every output exactly
+# this long so the orchestrator can compare fixed-length token-ID lists.
+_MAX_NEW_TOKENS = 32
+# Engine limits sized for the probe: the longest prompt plus the generated
+# tokens fits in `_MAX_SEQ_LEN`, and one context iteration schedules the
+# whole batch within `_MAX_NUM_TOKENS`.
+_MAX_SEQ_LEN = 128
+_MAX_NUM_TOKENS = 256
 
 
 def _parse_args() -> argparse.Namespace:
@@ -54,16 +76,16 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
         "attn_backend": "TRTLLM",
         "skip_tokenizer_init": True,
         "max_batch_size": len(_PROMPT_TOKEN_IDS),
-        "max_num_tokens": 64,
-        "max_seq_len": 64,
+        "max_num_tokens": _MAX_NUM_TOKENS,
+        "max_seq_len": _MAX_SEQ_LEN,
         "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.15),
     }
+    env_overrides = _rank_process_env_overrides(args)
+    if env_overrides:
+        kwargs["env_overrides"] = env_overrides
     if args.role != "baseline":
         if not args.mx_url:
             raise ValueError("MX donor and receiver roles require --mx-url")
-        transfer_log_dir = os.environ.get("MX_TRANSFER_LOG_DIR")
-        if transfer_log_dir:
-            kwargs["env_overrides"] = {"MX_TRANSFER_LOG_DIR": transfer_log_dir}
         kwargs["mx_config"] = {
             "server_url": args.mx_url,
             # ModelExpress 0.4.1 skips polling at zero but still sleeps once
@@ -72,6 +94,38 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
             "server_query_timeout_s": 0 if args.role == "donor" else 30,
         }
     return kwargs
+
+
+def _rank_process_env_overrides(args: argparse.Namespace) -> dict[str, str]:
+    """Environment for the executor rank processes.
+
+    MPI-spawned ranks inherit only selected `TRTLLM*`/`TLLM*` variables, so
+    everything the loaders read must travel through `LLM(env_overrides=...)`.
+    The weight-manifest variables apply to every role (the HF baseline too);
+    the MX transfer log only exists for MX roles.
+    """
+    overrides: dict[str, str] = {}
+    manifest_dir = os.environ.get("MX_WEIGHT_MANIFEST_DIR")
+    if manifest_dir:
+        overrides["MX_WEIGHT_MANIFEST_DIR"] = manifest_dir
+        overrides["MX_WEIGHT_MANIFEST_ROLE"] = args.role
+    if args.role != "baseline":
+        transfer_log_dir = os.environ.get("MX_TRANSFER_LOG_DIR")
+        if transfer_log_dir:
+            overrides["MX_TRANSFER_LOG_DIR"] = transfer_log_dir
+    return overrides
+
+
+def _receiver_transfer_evidence() -> dict[str, object] | None:
+    """Summarize this receiver's own MX rank logs with the shared evidence rules."""
+    transfer_log_dir = os.environ.get("MX_TRANSFER_LOG_DIR")
+    if not transfer_log_dir:
+        return None
+    try:
+        summaries = summarize_transfer_logs(Path(transfer_log_dir))
+    except ValueError as error:
+        return {"error": str(error)}
+    return {str(rank): summary.to_dict() for rank, summary in sorted(summaries.items())}
 
 
 def main() -> None:
@@ -86,28 +140,36 @@ def main() -> None:
     with LLM(**llm_kwargs) as llm:
         load_seconds = time.perf_counter() - started
         sampling_params = SamplingParams(
-            max_tokens=8,
+            max_tokens=_MAX_NEW_TOKENS,
             temperature=0.0,
             top_k=1,
             end_id=-1,
             pad_id=0,
         )
+        generate_started = time.perf_counter()
         results = list(
             llm.generate(
                 [list(prompt) for prompt in _PROMPT_TOKEN_IDS],
                 sampling_params=sampling_params,
             )
         )
+        generate_seconds = time.perf_counter() - generate_started
         mx_config = llm_kwargs.get("mx_config")
-        payload = {
+        payload: dict[str, object] = {
             "role": args.role,
             "tp_size": args.tp_size,
             "load_seconds": load_seconds,
+            "generate_seconds": generate_seconds,
             "server_query_timeout_s": (
                 mx_config.get("server_query_timeout_s") if isinstance(mx_config, dict) else None
             ),
+            "max_new_tokens": _MAX_NEW_TOKENS,
+            "prompt_count": len(_PROMPT_TOKEN_IDS),
+            "prompt_lengths": [len(prompt) for prompt in _PROMPT_TOKEN_IDS],
             "token_ids": [list(result.outputs[0].token_ids) for result in results],
         }
+        if args.role == "receiver":
+            payload["transfer_evidence"] = _receiver_transfer_evidence()
         args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
         if args.role == "donor":
