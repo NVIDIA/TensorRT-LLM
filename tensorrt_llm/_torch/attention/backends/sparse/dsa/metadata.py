@@ -39,6 +39,47 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 # CuTe DSL Top-K compile key, so warmup must use the runtime dtype.
 _INDEXER_LOGITS_DTYPE = torch.float32
 
+# ``prepare()`` is allowed to run ahead of the GPU under the overlap scheduler.
+# Every tensor below is persistent CPU storage that prepare (or the virtual
+# DeepSeek-V4 implementation it dispatches to) rewrites before a non-blocking
+# H2D copy, or exposes as a host runtime view. Keep the list explicit: blindly
+# cloning every CPU tensor on the metadata object would also duplicate cache
+# manager storage and unrelated, potentially very large, host buffers.
+_PREPARE_HOST_STAGE_FIELDS = (
+    # TrtllmAttentionMetadata staging/runtime views.
+    "prompt_lens_cpu",
+    "kv_lens",
+    "host_total_kv_lens",
+    "host_request_types",
+    "host_ctx_cached_token_indptr",
+    "host_ctx_uncached_token_indptr",
+    "host_ctx_kv_indptr",
+    # DSA indexer/MLA staging.
+    "host_gen_cached_token_indptr",
+    "host_gen_kv_indptr",
+    "host_indexer_k_cache_block_offsets",
+    "host_slot_mapping_fp8",
+    "host_slot_mapping_scale",
+    "host_req_idx_per_token",
+    "host_topk_indices_buffer",
+    "kv_lens_expanded_host",
+    "host_block_table_expanded",
+    # Ragged verification staging and token-major host views.
+    "host_gen_token_repeats",
+    "row_kv_lens_host",
+    "row_kv_correction_host",
+    "row_req_idx_host",
+    "attn_row_kv_lens_host",
+    "attn_row_kv_correction_host",
+    "attn_row_req_idx_host",
+    "attn_row_request_types_host",
+    "attn_row_prompt_lens_cpu",
+    # DeepseekV4TrtllmAttentionMetadata staging.
+    "cached_token_lens_cpu",
+    "cu_seq_lens",
+)
+_PREPARE_HOST_STAGE_RING_DEPTH = 2
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
@@ -269,21 +310,116 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_indexer(capture_graph=capture_graph)
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
+        # CUDA-graph metadata is made with copy.copy(self) before __post_init__
+        # allocates graph-owned buffers. Do not let that shallow copy share the
+        # live metadata's ring or events.
+        self._reset_prepare_host_stage_ring()
+
     def prepare(self):
-        # Guard pinned staging buffers against reuse while the prior step's
-        # non-blocking H2D copies are still queued by the overlap scheduler.
-        if not torch.cuda.is_current_stream_capturing():
-            event = getattr(self, "_prepare_stage_evt", None)
-            if event is None:
-                self._prepare_stage_evt = torch.cuda.Event()
-            else:
-                event.synchronize()
+        stage_slot = self._acquire_prepare_host_stage_slot()
         try:
             self._prepare_impl()
         finally:
-            event = getattr(self, "_prepare_stage_evt", None)
-            if event is not None and not torch.cuda.is_current_stream_capturing():
-                event.record()
+            self._record_prepare_host_stage_slot(stage_slot)
+
+    def _reset_prepare_host_stage_ring(self) -> None:
+        """Detach this metadata instance from any shallow-copied stage ring."""
+        self._prepare_host_stage_ring = None
+        self._prepare_host_stage_events = None
+        self._prepare_host_stage_slot = -1
+
+    def _current_prepare_host_stage(self) -> dict[str, torch.Tensor]:
+        """Return the prepare-owned persistent CPU tensors present here."""
+        tensors = {}
+        for name in _PREPARE_HOST_STAGE_FIELDS:
+            value = getattr(self, name, None)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                tensors[name] = value
+        return tensors
+
+    def _prepare_host_stage_ring_is_current(self, current: dict[str, torch.Tensor]) -> bool:
+        ring = getattr(self, "_prepare_host_stage_ring", None)
+        if not ring:
+            return False
+        slot = getattr(self, "_prepare_host_stage_slot", -1)
+        slot = 0 if slot < 0 else slot
+        active = ring[slot]
+        return active.keys() == current.keys() and all(
+            current[name] is tensor for name, tensor in active.items()
+        )
+
+    def _drain_prepare_host_stage_ring(self) -> None:
+        """Wait for old ring storage before dropping it after reallocation."""
+        for event in getattr(self, "_prepare_host_stage_events", None) or ():
+            if event is not None and not event.query():
+                event.synchronize()
+
+    def _build_prepare_host_stage_ring(self, current: dict[str, torch.Tensor]) -> None:
+        if not current:
+            self._reset_prepare_host_stage_ring()
+            return
+
+        ring = [current]
+        for _ in range(1, _PREPARE_HOST_STAGE_RING_DEPTH):
+            slot = {}
+            for name, tensor in current.items():
+                replica = torch.empty_like(
+                    tensor,
+                    device="cpu",
+                    pin_memory=tensor.is_pinned(),
+                )
+                replica.copy_(tensor)
+                slot[name] = replica
+            ring.append(slot)
+        self._prepare_host_stage_ring = ring
+        self._prepare_host_stage_events = [None] * len(ring)
+        self._prepare_host_stage_slot = -1
+
+    def _ensure_prepare_host_stage_ring(self) -> bool:
+        current = self._current_prepare_host_stage()
+        if self._prepare_host_stage_ring_is_current(current):
+            return True
+
+        # update_spec_dec_param() may grow expanded buffers after the ring was
+        # first used. That is a rare shape transition, so drain the old slots
+        # before replacing their last references. Steady-state prepare never
+        # takes this path.
+        self._drain_prepare_host_stage_ring()
+        self._build_prepare_host_stage_ring(current)
+        return bool(current)
+
+    def _acquire_prepare_host_stage_slot(self) -> Optional[int]:
+        """Select writable staging storage without waiting on the prior step.
+
+        The producer only blocks if it laps both slots while their H2D copies
+        are still in flight. Event queries are non-blocking, so a normal
+        one-step overlap has no host-side CUDA synchronization.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        if not self._ensure_prepare_host_stage_ring():
+            return None
+
+        ring = self._prepare_host_stage_ring
+        slot = (self._prepare_host_stage_slot + 1) % len(ring)
+        event = self._prepare_host_stage_events[slot]
+        if event is not None and not event.query():
+            # Correctness backpressure only when the bounded ring is exhausted.
+            event.synchronize()
+        for name, tensor in ring[slot].items():
+            setattr(self, name, tensor)
+        self._prepare_host_stage_slot = slot
+        return slot
+
+    def _record_prepare_host_stage_slot(self, slot: Optional[int]) -> None:
+        """Record completion of copies sourced from the active host slot."""
+        if slot is None or torch.cuda.is_current_stream_capturing():
+            return
+        event = self._prepare_host_stage_events[slot]
+        if event is None:
+            event = torch.cuda.Event()
+            self._prepare_host_stage_events[slot] = event
+        event.record()
 
     def _prepare_impl(self) -> None:
         super().prepare()
