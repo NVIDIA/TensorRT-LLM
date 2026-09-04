@@ -1107,6 +1107,7 @@ class MTPEagleDynamicTreeResourceManager(BaseResourceManager):
             max_total_draft_tokens=config.tokens_per_gen_step - 1,
             eagle_choices=None,
             dynamic_tree_max_topK=config.dynamic_tree_max_topK,
+            num_seq_slots=num_seq_slots,
         )
         # MTP hidden-state slot pools (needed by MTPEagleWorker drafter inputs).
         # num_seq_slots is forwarded because those pools are keyed by live-request

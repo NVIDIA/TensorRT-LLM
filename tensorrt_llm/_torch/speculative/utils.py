@@ -593,8 +593,10 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
-                                                max_seq_len)
+            sa_manager = SuffixAutomatonManager(sa_cfg,
+                                                max_num_requests,
+                                                max_seq_len,
+                                                num_seq_slots=num_seq_slots)
         # Dynamic tree combines SpecTreeManager with MTP hidden-state slots.
         if getattr(spec_config, 'use_dynamic_tree', False):
             return MTPEagleDynamicTreeResourceManager(
@@ -617,6 +619,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
                 max_seq_len,
                 max_num_tokens,
                 sa_manager=sa_manager,
+                num_seq_slots=num_seq_slots,
             )
         else:
             return None
@@ -624,8 +627,10 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
-                                                max_seq_len)
+            sa_manager = SuffixAutomatonManager(sa_cfg,
+                                                max_num_requests,
+                                                max_seq_len,
+                                                num_seq_slots=num_seq_slots)
         return MTPHiddenStatesManager(
             spec_config,
             model_config.torch_dtype,
@@ -636,14 +641,16 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         )
     if spec_dec_mode.is_eagle3_one_model() and _is_effective_dynamic_tree(
             spec_config):
-        return Eagle3OneModelDynamicTreeResourceManager(spec_config,
-                                                        max_num_requests)
+        return Eagle3OneModelDynamicTreeResourceManager(
+            spec_config, max_num_requests, num_seq_slots=num_seq_slots)
     if spec_dec_mode.is_eagle3_one_model():
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
-                                                max_seq_len)
+            sa_manager = SuffixAutomatonManager(sa_cfg,
+                                                max_num_requests,
+                                                max_seq_len,
+                                                num_seq_slots=num_seq_slots)
         return Eagle3ResourceManager(
             spec_config,
             model_config.torch_dtype,
@@ -652,6 +659,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_seq_len,
             max_num_tokens,
             sa_manager=sa_manager,
+            num_seq_slots=num_seq_slots,
         )
     if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
         assert draft_model_engine is not None, "Draft model engine is required for Eagle3 and MTP Eagle two model flow."
@@ -662,6 +670,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
             max_seq_len,
             max_num_tokens,
+            num_seq_slots=num_seq_slots,
         )
     if spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesResourceManager(
@@ -674,13 +683,18 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     if spec_dec_mode.is_parallel_draft():
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            return SuffixAutomatonManager(sa_cfg, max_num_requests, max_seq_len)
+            return SuffixAutomatonManager(sa_cfg,
+                                          max_num_requests,
+                                          max_seq_len,
+                                          num_seq_slots=num_seq_slots)
         return None
     if spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
     if spec_dec_mode.is_sa():
-        return SuffixAutomatonManager(spec_config, max_num_requests,
-                                      max_seq_len)
+        return SuffixAutomatonManager(spec_config,
+                                      max_num_requests,
+                                      max_seq_len,
+                                      num_seq_slots=num_seq_slots)
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
     return None

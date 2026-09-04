@@ -106,6 +106,7 @@ class SuffixAutomatonManager(BaseResourceManager):
         config,
         max_num_requests: int,
         max_seq_len: int = 262144,
+        num_seq_slots: Optional[int] = None,
     ):
         if _sa_native is None:
             raise RuntimeError(
@@ -144,14 +145,26 @@ class SuffixAutomatonManager(BaseResourceManager):
         self.max_seq_len = sa_config.max_seq_len
         self.enable_global_pool = sa_config.enable_global_pool
 
-        # Pool sizing: effective_pool_size returns max_num_requests when
-        # global pool is off, or max(64, max_num_requests) / explicit
-        # value when on. All slot-indexed sizing uses pool_size.
-        self.pool_size = sa_config.effective_pool_size
-        if self.pool_size < max_num_requests:
+        # A slot is held for the whole lifetime of a request id, so the pool has to
+        # cover every request that can be simultaneously live -- that is the
+        # executor's sequence-slot pool, which the attention-DP overlap headroom
+        # raises to 2 * max_batch_size so a retiring request can keep its slot for
+        # one more iteration while its replacement is admitted (nvbug-6627795).
+        # None (no headroom) leaves this at max_batch_size, as before.
+        self._num_seq_slots = max(num_seq_slots or 0, max_num_requests)
+
+        # Pool sizing: effective_pool_size returns max_slots when global pool is
+        # off, or max(64, max_slots) / the explicit value when on. All slot-indexed
+        # sizing uses pool_size. An explicit global_pool_size is a user contract
+        # about memory, so it is honoured and validated rather than grown silently.
+        if sa_config.global_pool_size is not None:
+            self.pool_size = sa_config.global_pool_size
+        else:
+            self.pool_size = max(sa_config.effective_pool_size, self._num_seq_slots)
+        if self.pool_size < self._num_seq_slots:
             raise ValueError(
-                f"global_pool_size ({self.pool_size}) must be >= "
-                f"max_batch_size ({max_num_requests})"
+                f"global_pool_size ({self.pool_size}) must be >= the number of "
+                f"sequence slots ({self._num_seq_slots})"
             )
 
         # Calculate per-state size based on max_seq_len
@@ -159,7 +172,7 @@ class SuffixAutomatonManager(BaseResourceManager):
 
         logger.info(
             f"SA pool: {self.pool_size} slots "
-            f"({self.pool_size - max_num_requests} retained capacity, "
+            f"({self.pool_size - self._num_seq_slots} retained capacity, "
             f"{self.pool_size * self.state_size / 1024 / 1024:.1f} MB total)"
         )
 
