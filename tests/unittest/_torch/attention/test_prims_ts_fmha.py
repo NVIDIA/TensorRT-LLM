@@ -135,6 +135,7 @@ def _support_result(
     beam_width: int = 1,
     use_spec_decoding: bool = False,
     is_spec_dec_tree: bool = False,
+    is_cuda_graph: bool = False,
     has_attention_sinks: bool = False,
     has_relative_attention_bias: bool = False,
     has_sparse_attention: bool = False,
@@ -219,6 +220,7 @@ def _support_result(
         helix_position_offsets=None,
         num_sparse_topk=0,
         use_spec_decoding=use_spec_decoding,
+        is_cuda_graph=is_cuda_graph,
         is_spec_dec_tree=is_spec_dec_tree,
         is_spec_dec_dynamic_tree=False,
         is_spec_decoding_enabled=use_spec_decoding,
@@ -374,6 +376,13 @@ def test_is_supported_accepts_and_forwards_phase_keyword(
         (
             {"attention_input_type": AttentionInputType.context_only, "is_cross": True},
             "cross attention",
+        ),
+        (
+            {
+                "attention_input_type": AttentionInputType.context_only,
+                "is_cuda_graph": True,
+            },
+            "context planning is not CUDA-graph capturable",
         ),
         (
             {
@@ -565,6 +574,7 @@ def test_is_supported_accepts_and_forwards_phase_keyword(
         "no-paged-cache",
         "separate-qkv",
         "cross",
+        "context-cuda-graph",
         "sparse",
         "sparse-runtime-metadata",
         "spec-decode",

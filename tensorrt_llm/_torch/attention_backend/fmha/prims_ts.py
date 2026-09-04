@@ -301,7 +301,7 @@ class PrimsTSFmha(PhasedFmha):
         has_generation = num_generations > 0 and input_type != AttentionInputType.context_only
         if not has_context and not has_generation:
             return False, "the request contains no active attention phase."
-        if has_context and torch.cuda.is_current_stream_capturing():
+        if has_context and meta.is_cuda_graph:
             return False, "context planning is not CUDA-graph capturable."
         if has_context and (attn.attention_chunk_size or 0) != 0:
             return False, "chunked context attention is not supported."
