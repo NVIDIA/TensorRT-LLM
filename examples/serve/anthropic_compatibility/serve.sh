@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# launch.sh - bring up trtllm-serve plus the gateway in one command.
+# serve.sh - bring up trtllm-serve plus the gateway in one command.
 #
-#   ./launch.sh <model>                       aggregated
-#   ./launch.sh --disagg <model>              1 context + 1 generation worker
-#   ./launch.sh --no-gateway <model>          server only
+#   ./serve.sh <model>                        aggregated
+#   ./serve.sh --disagg <model>               1 context + 1 generation worker
+#   ./serve.sh --no-gateway <model>           server only
 #
 # On success it prints the URL to point Claude Code at, and keeps running until
 # interrupted. Everything it starts is torn down on exit.
@@ -81,11 +81,11 @@ cleanup() {
     for pid in "${PIDS[@]:-}"; do
         [[ -n "${pid}" ]] && kill -9 "${pid}" 2>/dev/null
     done
-    echo "[launch] stopped; logs kept in ${RUN_DIR}"
+    echo "[serve] stopped; logs kept in ${RUN_DIR}"
 }
 trap cleanup EXIT INT TERM
 
-log() { printf '[launch] %s\n' "$*"; }
+log() { printf '[serve] %s\n' "$*"; }
 
 wait_for_health() {  # wait_for_health <url> <label> <timeout_s>
     local url="$1" label="$2" timeout="$3" waited=0

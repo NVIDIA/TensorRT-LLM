@@ -5,7 +5,7 @@ built on the Claude Agent SDK can run against a local model with no translation
 proxy in between.
 
 ```bash
-./launch.sh /path/to/your/model
+./serve.sh /path/to/your/model
 ```
 
 The script starts the server, starts the gateway in front of it, waits for both
@@ -25,7 +25,7 @@ client cannot tell the two deployments apart.
 
 ## Connecting Claude Code
 
-`launch.sh` prints this for you, filled in:
+`serve.sh` prints this for you, filled in:
 
 ```bash
 ANTHROPIC_BASE_URL=http://<host>:8333 \
@@ -76,7 +76,7 @@ Nothing else couples the two, so an unhealthy or missing registry costs routing
 but never correctness.
 
 That matters most where servers are replaced on a schedule — a batch scheduler
-reclaiming an allocation at its wall clock, for instance. `launch.sh` uses
+reclaiming an allocation at its wall clock, for instance. `serve.sh` uses
 `--no-relay`, which turns off the half of the gateway that submits successor
 jobs, since a local run has no scheduler to submit to.
 
@@ -86,7 +86,7 @@ mind restarting the client with it.
 ## Aggregated vs disaggregated
 
 ```bash
-./launch.sh --disagg /path/to/your/model
+./serve.sh --disagg /path/to/your/model
 ```
 
 Disaggregated mode splits prefill and decode across two workers, each holding a
@@ -103,7 +103,7 @@ tokenizes prompts.
 Tool calling needs a tool parser on the **worker**:
 
 ```bash
-./launch.sh /path/to/your/model -- --tool_parser qwen3
+./serve.sh /path/to/your/model -- --tool_parser qwen3
 ```
 
 Without one the worker never populates `message.tool_calls`, the adapter has
@@ -160,7 +160,7 @@ callers who need results across a restart must re-submit.
 ## Troubleshooting
 
 **`401` on every request** — `ANTHROPIC_AUTH_TOKEN` is not in the gateway's
-users file. `launch.sh` writes your username there; if you set `GATEWAY_USER`,
+users file. `serve.sh` writes your username there; if you set `GATEWAY_USER`,
 the token must match it.
 
 **`503` with `overloaded_error`** — the gateway is up but has no healthy
@@ -178,4 +178,4 @@ explicitly.
 process stays in your shell's process group and goes down with it. Use `setsid`
 to give it its own session.
 
-Logs for everything `launch.sh` starts are in the run directory it prints.
+Logs for everything `serve.sh` starts are in the run directory it prints.
