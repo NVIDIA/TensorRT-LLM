@@ -337,4 +337,32 @@ inline BlockIterator BlockRangeForWindow::begin() const
     return {this, 0};
 }
 
+inline KvCacheTransferLease prepareBlockRangeForTransfer(BaseKVCacheManager& cacheManager, BlockRange const& blockRange,
+    std::vector<SizeType32> const& windowSizes, runtime::BufferManager const& bufferManager,
+    LlmRequest const* llmRequest = nullptr)
+{
+    auto const& allBlockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> blockIdsPerWindow;
+    for (auto const windowSize : windowSizes)
+    {
+        auto const it = allBlockIdsPerWindow.find(windowSize);
+        if (it != allBlockIdsPerWindow.end() && !it->second.empty())
+        {
+            blockIdsPerWindow.emplace(windowSize, it->second);
+        }
+    }
+
+    auto mode = executor::KvCacheTransferMode::DRAM;
+    std::string directory;
+    if (llmRequest != nullptr)
+    {
+        auto const& sequence = cacheManager.getSequence(llmRequest->mRequestId);
+        mode = sequence.getTransferMode();
+        directory = sequence.getDirectory();
+    }
+    auto transferLease = cacheManager.prepareBlocksForTransfer(blockIdsPerWindow, mode, directory);
+    transferLease.syncReadyForFormat(bufferManager);
+    return transferLease;
+}
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
