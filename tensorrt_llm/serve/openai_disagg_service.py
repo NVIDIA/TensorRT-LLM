@@ -146,7 +146,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_response = await self._ctx_client.send_request(
                     ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
                 )
-                await self._verify_ctx_response(ctx_response)
+                await self._verify_ctx_response(
+                    ctx_response, ctx_req.disaggregated_params.disagg_request_id
+                )
                 ctx_response_disagg_params = ctx_response.choices[0].disaggregated_params
                 if ctx_response_disagg_params.disagg_request_id is not None:
                     disagg_request_id = ctx_response_disagg_params.disagg_request_id
@@ -339,7 +341,11 @@ class OpenAIDisaggregatedService(OpenAIService):
         await self._gen_client.shutdown()
         await self._coordinator.stop()
 
-    async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
+    async def _verify_ctx_response(
+        self,
+        ctx_response: UCompletionResponse,
+        expected_disagg_request_id: Optional[int],
+    ) -> None:
         if ctx_response:
             for idx, choice in enumerate(ctx_response.choices):
                 if choice.disaggregated_params is None:
@@ -359,10 +365,21 @@ class OpenAIDisaggregatedService(OpenAIService):
                             f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
                         )
                     if choice.disaggregated_params.disagg_request_id is None:
-                        raise ValueError(
-                            f"Invalid disaggregated params: disagg_request_id is None for choice {idx}."
-                            f" finish_reason={choice.finish_reason!r},"
-                            f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
+                        if choice.disaggregated_params.ctx_request_id != expected_disagg_request_id:
+                            raise ValueError(
+                                f"Invalid disaggregated params: ctx_request_id="
+                                f"{choice.disaggregated_params.ctx_request_id!r} for choice {idx}"
+                                " does not match the successful context attempt's"
+                                f" disagg_request_id={expected_disagg_request_id!r}."
+                            )
+                        logger.warning_once(
+                            f"Context server choice {idx} is missing disagg_request_id; "
+                            f"falling back to verified ctx_request_id="
+                            f"{choice.disaggregated_params.ctx_request_id}.",
+                            key="missing_disagg_request_id_fallback",
+                        )
+                        choice.disaggregated_params.disagg_request_id = (
+                            choice.disaggregated_params.ctx_request_id
                         )
             return ctx_response
 
