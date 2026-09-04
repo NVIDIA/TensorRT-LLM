@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
+from tensorrt_llm._torch.attention_backend.sparse import get_sparse_attn_kv_cache_manager
 from tensorrt_llm._torch.attention_backend.utils import create_attention, get_attention_backend
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -35,7 +36,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch, torch_dtype_to_binding
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -93,6 +94,7 @@ class BackendCase:
     page_size: int = 64
     cache: str = "paged"  # "paged" | "none"
     sparse: str = "off"  # "off" | "degenerate"
+    sparse_attention_config: Optional[SparseAttentionConfig] = None
     # RoPE config: RopeParams kwargs (+ optional "is_neox"), or None to disable.
     rope: Optional[dict] = None
     # When True (and rope set), exercise TRTLLM's in-kernel fused RoPE: TRTLLM
@@ -135,6 +137,26 @@ class BackendCase:
         return self.seq_lens_kv is not None
 
     @property
+    def is_sparse(self) -> bool:
+        return self.sparse_attention_config is not None
+
+    @property
+    def sparse_topk(self) -> Optional[int]:
+        config = self.sparse_attention_config
+        if config is None:
+            return None
+        return config.sparse_topk_blocks
+
+    @property
+    def prompt_lens(self) -> List[int]:
+        return [
+            seq_len if index < self.num_contexts else cached_len
+            for index, (seq_len, cached_len) in enumerate(
+                zip(self.seq_lens, self.num_cached_tokens, strict=True)
+            )
+        ]
+
+    @property
     def is_gen_only(self) -> bool:
         """A uniform pure-decode batch eligible for a captured CUDA graph.
 
@@ -175,6 +197,8 @@ class BackendCase:
     @property
     def max_num_tokens(self) -> int:
         """Metadata token capacity needed by the largest packed tensor in the case."""
+        if self.is_sparse:
+            return max(self.nnz_q, self.nnz_kv, *self.token_nums)
         return max(DEFAULT_MAX_NUM_TOKENS, self.nnz_q, self.nnz_kv, *self.token_nums)
 
     def to_dict(self) -> dict:
@@ -201,6 +225,11 @@ def _rope_params_from_dict(d: dict) -> RopeParams:
     return RopeParams(**kwargs)
 
 
+def _validate_sparse_case(case: BackendCase) -> None:
+    if case.sparse_topk is None or case.sparse_topk <= 0:
+        raise ValueError("Sparse backend cases require a positive top-k")
+
+
 def _randn(gen: torch.Generator, dtype: torch.dtype, *shape) -> torch.Tensor:
     """Seeded random tensor on cuda in ``dtype`` (shared by all input builders)."""
     return torch.randn(*shape, generator=gen, device="cuda").to(dtype)
@@ -222,6 +251,28 @@ def generate_inputs(case: BackendCase, seed: int) -> Dict[str, object]:
     cached_k = [_randn(gen, cdt, c, Hkv, D) for c in case.num_cached_tokens]
     cached_v = [_randn(gen, cdt, c, Hkv, D) for c in case.num_cached_tokens]
     return dict(q=q, new_k=new_k, new_v=new_v, cached_k=cached_k, cached_v=cached_v)
+
+
+def generate_minimax_m3_inputs(case: BackendCase, seed: int = 0) -> Dict[str, object]:
+    inputs = generate_inputs(case, seed)
+    sparse_config = case.sparse_attention_config
+    assert sparse_config is not None
+    sparse_params = sparse_config.to_sparse_params(layer_idx=None, pretrained_config=None)
+    gen = torch.Generator(device="cuda").manual_seed(seed + 1)
+    inputs.update(
+        idx_q=_randn(
+            gen,
+            case.compute_dtype,
+            case.nnz_q,
+            sparse_params.num_index_heads * sparse_params.sparse_index_dim,
+        ),
+        idx_k=_randn(gen, case.compute_dtype, case.nnz_q, sparse_params.sparse_index_dim),
+        cached_idx_k=[
+            _randn(gen, case.compute_dtype, length, 1, sparse_params.sparse_index_dim)
+            for length in case.num_cached_tokens
+        ],
+    )
+    return inputs
 
 
 def _build_kv_cache_manager(case: BackendCase, backend: str, kv_dtype: torch.dtype):
@@ -260,6 +311,53 @@ def _build_kv_cache_manager(case: BackendCase, backend: str, kv_dtype: torch.dty
         dtype=bindings_dtype,
     )
     return mgr
+
+
+def _build_minimax_m3_kv_cache_manager(case: BackendCase):
+    sparse_config = case.sparse_attention_config
+    assert sparse_config is not None
+    sparse_params = sparse_config.to_sparse_params(layer_idx=None, pretrained_config=None)
+    tokens_per_block = case.page_size
+    pages_per_seq = math.ceil(max(case.token_nums) / tokens_per_block)
+    num_blocks = case.num_seqs * pages_per_seq
+    cache_types = tensorrt_llm.bindings.internal.batch_manager.CacheType
+    cls = get_sparse_attn_kv_cache_manager(sparse_config, use_kv_cache_manager_v2=True)
+    return cls(
+        KvCacheConfig(
+            max_tokens=num_blocks * tokens_per_block,
+            enable_block_reuse=False,
+        ),
+        cache_types.SELF,
+        num_layers=1,
+        num_kv_heads=case.num_kv_heads,
+        head_dim=case.head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=pages_per_seq * tokens_per_block,
+        max_batch_size=case.num_seqs,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=torch_dtype_to_binding(case.compute_dtype),
+        max_num_tokens=case.max_num_tokens,
+        sparse_layer_ids=[0],
+        disable_index_value_layer_ids=[0] if sparse_params.disable_index_value else [],
+        sparse_index_dim=sparse_params.sparse_index_dim,
+        sparse_attn_config=sparse_config,
+    )
+
+
+def _fill_minimax_m3_index_cache(mgr, request_ids, cached_idx_k) -> None:
+    buffer = mgr.get_index_k_buffer(0, kv_layout="NHD")
+    buffer.zero_()
+    tokens_per_block = buffer.shape[1]
+    blocks_per_req = mgr.get_batch_cache_indices(list(request_ids), 0)
+    for rows, blocks in zip(cached_idx_k, blocks_per_req, strict=True):
+        blocks = [block for block in blocks if block != -1]
+        written = 0
+        for block in blocks:
+            if written >= rows.shape[0]:
+                break
+            count = min(tokens_per_block, rows.shape[0] - written)
+            buffer[block, :count].copy_(rows[written : written + count].to(buffer.dtype))
+            written += count
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +551,98 @@ def _assert_cache_contains_new_tokens(
         actual = torch.cat(pieces, dim=concat_dim).to(torch.float32)
         expected = expected_per_seq[i].to(buf.dtype).to(torch.float32)
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+def _run_minimax_m3_backend(
+    case: BackendCase,
+    backend: str,
+    inputs: Dict,
+) -> torch.Tensor:
+    sparse_config = case.sparse_attention_config
+    assert sparse_config is not None
+    sparse_params = sparse_config.to_sparse_params(layer_idx=None, pretrained_config=None)
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params(pretrained_config=None)
+    AttentionCls = get_attention_backend(backend, sparse_params=sparse_params)
+    request_ids = list(range(case.num_seqs))
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    attn = create_attention(
+        backend,
+        layer_idx=0,
+        num_heads=case.num_heads,
+        head_dim=case.head_dim,
+        num_kv_heads=case.num_kv_heads,
+        q_scaling=case.q_scaling,
+        sparse_params=sparse_params,
+        dtype=case.compute_dtype,
+    )
+    mgr = _build_minimax_m3_kv_cache_manager(case)
+    try:
+        mgr.add_dummy_requests(request_ids, case.token_nums)
+        fill_kv_cache_logical(
+            mgr,
+            0,
+            request_ids,
+            inputs["cached_k"],
+            inputs["cached_v"],
+            kv_layout="NHD",
+        )
+        _fill_minimax_m3_index_cache(mgr, request_ids, inputs["cached_idx_k"])
+        metadata = AttentionCls.Metadata(
+            num_contexts=case.num_contexts,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=case.num_cached_tokens,
+            ),
+            seq_lens=torch.tensor(case.seq_lens, dtype=torch.int),
+            max_num_requests=case.num_seqs,
+            max_num_tokens=case.max_num_tokens,
+            kv_cache_manager=mgr,
+            request_ids=request_ids,
+            prompt_lens=case.prompt_lens,
+            kv_layout="NHD",
+            mapping=mapping,
+            sparse_metadata_params=sparse_metadata_params,
+        )
+        metadata.prepare()
+        if metadata.minimax_m3 is None:
+            raise RuntimeError("MiniMax-M3 metadata was not prepared")
+        kv_pool = mgr.get_buffers(0, kv_layout="NHD")
+        output = torch.empty(
+            case.nnz_q,
+            case.num_heads * case.head_dim,
+            dtype=case.compute_dtype,
+            device="cuda",
+        )
+        result = attn.forward(
+            inputs["q"].clone(),
+            inputs["new_k"].clone(),
+            inputs["new_v"].clone(),
+            metadata,
+            forward_args=AttentionForwardArgs(output=output),
+            idx_q=inputs["idx_q"].clone(),
+            idx_k=inputs["idx_k"].clone(),
+            idx_v=None,
+            k_cache=kv_pool[:, 0],
+            v_cache=kv_pool[:, 1],
+            idx_k_cache=mgr.get_index_k_buffer(0, kv_layout="NHD"),
+            idx_v_cache=mgr.get_index_v_buffer(0),
+            out_cache_loc=metadata.minimax_m3["out_cache_loc"],
+            m3_metadata=metadata.minimax_m3["metadata"],
+        )
+        assert result.data_ptr() == output.data_ptr()
+        _assert_cache_contains_new_tokens(
+            mgr,
+            0,
+            request_ids,
+            case.seq_lens,
+            case.num_cached_tokens,
+            _expected_standard_cache_tokens(case, inputs["new_k"], inputs["new_v"]),
+            kv_layout="NHD",
+            cache_kind="kv",
+        )
+        return result.contiguous()
+    finally:
+        mgr.shutdown()
 
 
 def _run_mla_gen_backend(
@@ -875,6 +1065,9 @@ def run_backend(
     the caller passes a layout the backend supports (gated by the capability
     matrix). MLA cases are dispatched to the absorbed-generation path.
     """
+    if case.is_sparse:
+        return _run_minimax_m3_backend(case, backend, inputs)
+
     if case.is_mla:
         if case.is_context_only:
             return _run_mla_context_backend(case, backend, inputs, kv_layout=kv_layout)
@@ -1064,7 +1257,10 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
     that want the raw tensors (e.g. the minimizer).
     """
     is_mla = case.is_mla
-    if is_mla:
+    if case.is_sparse:
+        _validate_sparse_case(case)
+        inputs = generate_minimax_m3_inputs(case, seed)
+    elif is_mla:
         if case.is_context_only:
             inputs = generate_mla_context_inputs(case, seed)
         else:

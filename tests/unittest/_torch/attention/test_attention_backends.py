@@ -50,8 +50,7 @@ def get_long_seq_len(window: int) -> int:
     return window + 17
 
 
-def _phases_from_window(window: int) -> dict:
-    long_len = get_long_seq_len(window)
+def _phases(long_len: int) -> dict:
     return {
         "ctx": dict(
             seq_lens=[long_len, 73, 41],
@@ -71,6 +70,10 @@ def _phases_from_window(window: int) -> dict:
     }
 
 
+def _phases_from_window(window: int) -> dict:
+    return _phases(get_long_seq_len(window))
+
+
 # Standard self-attention batch phases. Non-sliding cases use a nominal window
 # only to choose non-tiny, non-power-of-two lengths; the backend still receives
 # sliding_window=None.
@@ -78,6 +81,9 @@ _PHASES = _phases_from_window(_NON_SLIDING_PHASE_WINDOW)
 
 
 def _phases_for(cfg: ModelAttnConfig) -> dict:
+    if cfg.sparse_attention_config is not None:
+        config = cfg.sparse_attention_config
+        return _phases(config.sparse_block_size * (config.sparse_topk_blocks + 1) + 1)
     if cfg.mask != "sliding":
         return _PHASES
 
@@ -118,6 +124,8 @@ def _common(cfg: ModelAttnConfig) -> dict:
             qk_rope_head_dim=cfg.qk_rope_head_dim,
             v_head_dim=cfg.v_head_dim,
         )
+    if cfg.sparse_attention_config is not None:
+        common.update(sparse_attention_config=cfg.sparse_attention_config)
     return common
 
 
@@ -139,6 +147,21 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     """
     common = _common(cfg)
     phases = _phases_for(cfg)
+
+    if cfg.sparse_attention_config is not None:
+        for phase_name in _phases_to_run(cfg, phases):
+            yield (
+                f"{cfg.id}-{phase_name}-bf16-NHD-p64-v2",
+                BackendCase(
+                    page_size=64,
+                    kv_layout="NHD",
+                    dtype="bfloat16",
+                    use_kv_cache_manager_v2=True,
+                    **phases[phase_name],
+                    **common,
+                ),
+            )
+        return
 
     # Bidirectional, KV-cache-free DiT / encoder workloads: only compute dtype.
     if cfg.no_cache:
