@@ -230,6 +230,13 @@ def latency_command(
     # Parameters from CLI
     # Model, experiment, and engine params
     options = get_general_cli_options(params, bench_env)
+
+    if options.num_requests <= 0 and options.duration is None:
+        logger.warning(
+        "No benchmark limit specified. The benchmark will process the entire dataset. "
+        "Consider using --num_requests or --duration to control runtime."
+        )
+
     # Checked before the model is loaded so the mistake is reported in seconds
     # rather than after several minutes of startup.
     if options.duration is not None and options.concurrency <= 0:
