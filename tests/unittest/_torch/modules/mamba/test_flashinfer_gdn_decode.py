@@ -19,7 +19,7 @@ def _fi_decode_available() -> bool:
     if not is_flashinfer_gdn_supported_arch():
         return False
     try:
-        from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule  # noqa: F401
+        from flashinfer.gdn_kernels import gdn_decode_bf16_state as gdn_decode
     except (ImportError, RuntimeError):
         # Mirror the guard in fused_sigmoid_gating_recurrent.py (and
         # FlashInfer's own gdn_kernels/__init__.py): a missing build raises
@@ -27,7 +27,7 @@ def _fi_decode_available() -> bool:
         # cases production falls back to Triton, so the FI path is
         # unavailable and the test must skip.
         return False
-    return True
+    return hasattr(gdn_decode, "gated_delta_rule")
 
 
 SKIP_UNSUPPORTED = pytest.mark.skipif(
@@ -72,10 +72,7 @@ def test_fi_decode_misaligned_index_slice() -> None:
     idx_misaligned = idx_buf[1:]
     assert idx_misaligned.data_ptr() % 32 != 0
 
-    # The decode kernel updates the state pool in place, so give each call
-    # its own copy and compare the final pools as well as the outputs.
-    pool_mis = state_pool.clone()
-    out_mis = _flashinfer_gdn_decode(
+    common_kwargs = dict(
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -85,29 +82,25 @@ def test_fi_decode_misaligned_index_slice() -> None:
         k=k,
         v=v,
         b=b,
-        initial_state_source=pool_mis,
-        initial_state_indices=idx_misaligned,
         scale=K**-0.5,
         use_qk_l2norm_in_kernel=True,
         cu_seqlens=cu_seqlens,
     )
 
+    # The decode kernel updates the state pool in place, so give each call
+    # its own copy and compare the final pools as well as the outputs.
+    pool_mis = state_pool.clone()
+    out_mis = _flashinfer_gdn_decode(
+        initial_state_source=pool_mis,
+        initial_state_indices=idx_misaligned,
+        **common_kwargs,
+    )
+
     pool_ref = state_pool.clone()
     out_ref = _flashinfer_gdn_decode(
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        softplus_beta=1.0,
-        softplus_threshold=20.0,
-        q=q,
-        k=k,
-        v=v,
-        b=b,
         initial_state_source=pool_ref,
         initial_state_indices=idx_misaligned.clone(),
-        scale=K**-0.5,
-        use_qk_l2norm_in_kernel=True,
-        cu_seqlens=cu_seqlens,
+        **common_kwargs,
     )
 
     torch.testing.assert_close(out_mis.float(), out_ref.float())
