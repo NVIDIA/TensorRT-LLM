@@ -174,7 +174,11 @@ def _extract_links(file_path):
             fence = fence_match.group(1)
             if code_fence is None:
                 code_fence = fence
-            elif fence[0] == code_fence[0] and len(fence) >= len(code_fence):
+            elif (
+                fence[0] == code_fence[0]
+                and len(fence) >= len(code_fence)
+                and not line[fence_match.end() :].strip()
+            ):
                 code_fence = None
             continue
 
