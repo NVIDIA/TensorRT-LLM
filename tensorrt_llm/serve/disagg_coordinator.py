@@ -79,6 +79,17 @@ COORDINATOR_RESERVATION_TIMEOUT_ENV = "TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIM
 COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S = 180.0
 COORDINATOR_STATE_SYNC_INTERVAL_S = 3.0
 
+GEN_ONLY_BENCHMARK_ENV = "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"
+# Number of metadata refresh intervals `servers` may go un-refreshed before
+# readiness treats it as stale. Tolerates an occasional missed poll without
+# letting a stopped monitor look healthy.
+_MONITOR_STALENESS_POLL_MULTIPLIER = 3
+
+
+def gen_only_benchmark_enabled() -> bool:
+    """Generation-only benchmark mode, which configures no context servers."""
+    return os.getenv(GEN_ONLY_BENCHMARK_ENV) == "1"
+
 
 def coordinator_reservation_timeout() -> float:
     return float(
@@ -167,6 +178,14 @@ class DisaggCoordinatorService(DisaggCoordinator):
         )
         self._server_start_timeout_secs = server_start_timeout_secs
         self._health_check_interval_secs = health_check_interval_secs
+        # How long `servers` may go un-refreshed before readiness stops
+        # trusting it. A few poll intervals, so an occasional slow or failed
+        # poll does not flap /health, but a monitor that has stopped is caught.
+        self._monitor_staleness_secs = (
+            _MONITOR_STALENESS_POLL_MULTIPLIER * metadata_config.refresh_interval
+            if metadata_config
+            else None
+        )
         self._reservation_timeout_secs = (
             coordinator_reservation_timeout()
             if reservation_timeout_secs is None
@@ -324,7 +343,38 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 self._ctx_router.num_prepared_servers,
                 self._gen_router.num_prepared_servers,
             )
-        return True
+        # A dead worker must stop being reported as ready: otherwise a client
+        # polling /health waits out its whole timeout against a group that can
+        # never answer. Deliberately not sticky -- a metadata-driven
+        # deployment adds and removes workers routinely, so recovery shows up
+        # as recovery.
+        if not self._metadata_server:
+            # Static server list: no monitor, so the lists never shrink and
+            # there is nothing new to report.
+            return True
+
+        # Monitoring is what makes `servers` a statement about the cluster. If
+        # it has stopped, the list is frozen on its last value and must not be
+        # trusted -- report not-ready rather than failing open.
+        # None only if a metadata server exists without its config, which
+        # create_metadata_server() does not produce; skip rather than raise
+        # from a health path if that ever changes.
+        max_age = self._monitor_staleness_secs
+        if max_age is not None and (
+            self._ctx_router.monitoring_is_stale(max_age)
+            or self._gen_router.monitoring_is_stale(max_age)
+        ):
+            logger.warning("Server monitoring is stale or stopped; reporting not-ready")
+            return False
+
+        # Disaggregated serving needs at least one generation server, and at
+        # least one context server unless this is a generation-only benchmark
+        # run, which intentionally configures none.
+        if not self._gen_router.servers:
+            return False
+        if gen_only_benchmark_enabled():
+            return True
+        return bool(self._ctx_router.servers)
 
     async def cluster_info(self) -> Dict[str, Any]:
         info = {
@@ -347,9 +397,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         return info
 
     async def _wait_for_all_servers_ready(self) -> None:
-        import os
-
-        gen_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
+        gen_only = gen_only_benchmark_enabled()
 
         async def check_servers_ready():
             elapsed_time = 0
