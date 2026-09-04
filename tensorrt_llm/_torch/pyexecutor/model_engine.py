@@ -3847,6 +3847,11 @@ class PyTorchModelEngine(ModelEngine):
             self.sparse_attention_config.to_sparse_metadata_params(
                 pretrained_config=config)
             if self.sparse_attention_config is not None else None)
+        ragged_metadata_kwargs = {}
+        if hasattr(metadata_cls, "enable_ragged_verification"):
+            ragged_metadata_kwargs["enable_ragged_verification"] = (
+                self._dspark_confidence_enabled and not self.is_draft_model
+            )
 
         if kv_cache_manager is None:
             # Cache the no-cache metadata.
@@ -3888,6 +3893,7 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection=cache_indirection,
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
+            **ragged_metadata_kwargs,
         )
         if isinstance(kv_cache_manager, BaseMambaCacheManager):
             self.attn_metadata.mamba_chunk_size = getattr(
