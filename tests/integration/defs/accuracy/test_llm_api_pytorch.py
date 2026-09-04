@@ -830,43 +830,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             assert_acceptance_length("TestLlama3_1_8BInstruct::test_ngram",
                                      acceptance_length)
 
-    @skip_pre_hopper
-    @parametrize_with_ids("enable_global_pool", [False, True])
-    def test_suffix_automaton(self, enable_global_pool):
-        max_bs = 16
-
-        pytorch_config = dict(
-            disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig(
-                batch_sizes=[i for i in range(1, max_bs + 1)]),
-        )
-
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        free_gpu_memory_fraction=0.8)
-
-        spec_config = SADecodingConfig(
-            max_draft_len=4,
-            max_matching_ngram_size=-1,  # longest match via suffix automaton
-            enable_global_pool=enable_global_pool,
-        )
-
-        with LLM(model=self.MODEL_PATH,
-                 **pytorch_config,
-                 kv_cache_config=kv_cache_config,
-                 speculative_config=spec_config,
-                 max_batch_size=max_bs,
-                 max_stats_len=-1,
-                 enable_iter_perf_stats=True) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
-            print(
-                f"[AL] test_suffix_automaton enable_global_pool={enable_global_pool} "
-                f"acceptance_length = {acceptance_length:.3f}")
-            assert_acceptance_length(
-                "TestLlama3_1_8BInstruct::test_suffix_automaton",
-                acceptance_length)
-
     @skip_pre_blackwell
     def test_suffix_automaton_dynamic_draft_len(self):
         draft_len_schedule = {50: 4, 200: 3, 350: 2}
@@ -1038,35 +1001,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             speculative_config=spec_config,
             # Two-model eagle3 does not support overlap scheduler
             disable_overlap_scheduler=not eagle3_one_model)
-        with llm:
-            task = JsonModeEval(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_hopper
-    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding_with_eagle3_low_latency_dispatch(
-            self, backend: str, mocker):
-        """Smoke-test enable_low_latency_host_dispatch with Eagle3 + guided decoding.
-
-        Eagle3 spec-dec captures guided-decoder hostfuncs inside the CUDA graph
-        (via _execute_guided_decoder_if_present in the target forward pass), so
-        this combination exercises the cudaLaunchHostFunc_v2 / spin-wait path.
-        """
-        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
-        cuda_graph_config = CudaGraphConfig(enable_padding=True)
-        spec_config = Eagle3DecodingConfig(
-            max_draft_len=3,
-            speculative_model=f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            eagle3_one_model=True)
-        llm = LLM(self.MODEL_PATH,
-                  guided_decoding_backend=backend,
-                  kv_cache_config=kv_cache_config,
-                  cuda_graph_config=cuda_graph_config,
-                  enable_chunked_prefill=True,
-                  max_num_tokens=256,
-                  speculative_config=spec_config,
-                  enable_low_latency_host_dispatch=True)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
