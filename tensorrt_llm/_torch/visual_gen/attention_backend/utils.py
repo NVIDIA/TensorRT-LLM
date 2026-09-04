@@ -138,6 +138,10 @@ def create_attention(
         sparse_attention_config is not None
         and getattr(sparse_attention_config, "algorithm", None) == "vsa"
     )
+    is_sol = (
+        sparse_attention_config is not None
+        and getattr(sparse_attention_config, "algorithm", None) == "sol_attn"
+    )
 
     backend_name = backend.upper()
     if is_vsa and backend_name == "CUTEDSL":
@@ -148,6 +152,10 @@ def create_attention(
         from .sparse.vsa.backend import VSATrtllmAttention
 
         attn_cls = VSATrtllmAttention
+    elif is_sol and backend_name == "TRTLLM":
+        from .sparse.sol.backend import SOLTrtllmAttention
+
+        attn_cls = SOLTrtllmAttention
     else:
         attn_cls = get_visual_gen_attention_backend(backend)
 

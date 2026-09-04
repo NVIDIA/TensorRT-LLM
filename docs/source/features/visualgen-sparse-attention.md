@@ -7,6 +7,7 @@ This feature is in **beta** stage. APIs, supported models, and optimization opti
 - [Overview](#overview)
   - [Algorithms](#algorithms)
 - [Skip Softmax Attention](#skip-softmax-attention)
+- [SOL Attention](#sol-attention)
 - [Video Sparse Attention (VSA)](#video-sparse-attention-vsa)
 
 ## Overview
@@ -21,6 +22,7 @@ Sparse attention in VisualGen is configured through `VisualGenArgs.attention_con
 |---|---|---|
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Supported |
 | `vsa` | `VideoSparseAttentionConfig` | Supported (`CUTEDSL`, `TRTLLM`) |
+| `sol_attn` | `SolAttentionConfig` | Experimental (`TRTLLM`) |
 
 ## Skip Softmax Attention
 
@@ -213,6 +215,67 @@ attention_config:
 `disabled_until_timestep` creates two sparse-attention phases when it is set: the high-timestep disabled phase and the enabled phase after the cutoff. VisualGen includes that phase in CUDA graph keys so graph capture does not reuse a graph across different Skip Softmax Attention settings. See [VisualGen CUDA Graphs](visualgen-cuda-graph.md) for the general capture and replay design.
 
 Graphs are captured lazily. The first denoising step seen for a given tensor shape and sparse-attention phase captures a graph; later steps with the same shape and phase replay that graph. When denoising crosses the cutoff, the phase key changes, so VisualGen captures a second graph for the enabled phase instead of replaying the graph from the disabled phase.
+
+## SOL Attention
+
+SOL is a two-stage self-attention algorithm. A TRT-LLM-owned predictor first
+produces an exact block bitmask and K/V proxy summaries from Q/K/V. The shared
+`PrimsTSBlockSparseFmha` library then executes that route from the shared
+`SparseRuntimeParams`. `SOLTrtllmAttention` is only the VisualGen bridge;
+SOL does not add an algorithm-specific core attention backend or FMHA library.
+
+Configure SOL with `SolAttentionConfig` and the `TRTLLM` backend:
+
+```python
+from tensorrt_llm.visual_gen import AttentionConfig, SolAttentionConfig
+
+attention_config = AttentionConfig(
+    backend="TRTLLM",
+    sparse_attention_config=SolAttentionConfig(
+        tau=1.0,
+        disabled_until_timestep=0.6,
+        dense_layers="0,2-4",
+    ),
+)
+```
+
+The equivalent YAML is:
+
+```yaml
+attention_config:
+  backend: TRTLLM
+  sparse_attention_config:
+    algorithm: sol_attn
+    tau: 1.0
+    disabled_until_timestep: 0.6
+    dense_layers: "0,2-4"
+```
+
+- `tau` is the finite float32 routing threshold consumed by the predictor.
+- `disabled_until_timestep` is an optional normalized cutoff in `(0, 1]`.
+  Attention stays dense while the current timestep is greater than or equal to
+  the cutoff and switches to SOL below it.
+- `dense_layers` is an optional comma-separated list of zero-based layer indices
+  and inclusive ranges that always use dense attention.
+
+The initial SOL envelope is full-mask BF16 self-attention on SM100 or SM103,
+with 4-D BSHD Q/K/V tensors, equal Q/K/V shapes, and head dimension 128.
+`SOLTrtllmAttention` overrides the core `block_sparse_attn_predict` hook, so
+prediction runs inside the core forward from the flattened Q/K/V, the batch
+layout in the attention metadata, and the `timestep` in the forward arguments;
+dense layers and dense timestep phases return no routes. The VisualGen wrapper
+compacts fused projection split views once and shares those tensors between
+prediction and the block-sparse FMHA. Cross-attention, context parallelism,
+attention quantization, and unsupported tensor envelopes raise an error instead
+of silently falling back to dense attention.
+SOL uses a host-side graph break to prepare and own predictor plans, so
+`torch_compile_config.enable_fullgraph=True` is not supported; keep the default
+`False` setting.
+
+When a cutoff is configured, VisualGen includes the dense-or-sparse phase in
+the CUDA Graph key. Each SOL backend prepares that phase during graph warmup
+and reuses it during capture, while predictor route buffers remain stable for
+replay. A dense capture therefore cannot be reused for the sparse phase.
 
 ## Video Sparse Attention (VSA)
 

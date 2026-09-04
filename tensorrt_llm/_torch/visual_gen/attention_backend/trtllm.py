@@ -271,6 +271,24 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         qkv = torch.cat([q, k, v], dim=-1)
         return qkv
 
+    @torch.compile
+    def _compact_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        kv_seq_len: int,
+    ):
+        # Separate Q, K, V stay separate - compact each into a contiguous token-major matrix.
+        # Slices of a fused QKV projection are strided; the compiled copy keeps them on a
+        # vectorized kernel, while already contiguous inputs pass through without a copy.
+        q = q.reshape(batch_size * seq_len, -1).contiguous()
+        k = k.reshape(batch_size * kv_seq_len, -1).contiguous()
+        v = v.reshape(batch_size * kv_seq_len, -1).contiguous()
+        return q, k, v
+
     def forward(
         self,
         q: torch.Tensor,
@@ -338,9 +356,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         sage_kwargs = {}
         if use_separate_qkv:
-            q = q.reshape(batch_size * seq_len, -1).contiguous()
-            k = k.reshape(batch_size * kv_seq_len, -1).contiguous()
-            v = v.reshape(batch_size * kv_seq_len, -1).contiguous()
+            q, k, v = self._compact_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
             quant_cfg = self.quant_attention_config
             if quant_cfg is not None:
                 sage_kwargs = {
