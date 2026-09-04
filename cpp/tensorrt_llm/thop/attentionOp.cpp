@@ -756,13 +756,33 @@ public:
         if (op.mKVCacheQuantMode.hasKvCacheQuant() && kv_scale_orig_quant.has_value()
             && kv_scale_quant_orig.has_value())
         {
-            kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
-            kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
             if (op.mKVCacheQuantMode.hasFp4KvCache())
             {
-                TORCH_CHECK(kv_scale_orig_quant.value().size(0) == 3);
-                TORCH_CHECK(kv_scale_quant_orig.value().size(0) == 3);
+                if (op.isMLAEnabled())
+                {
+                    auto const& origQuantScale = kv_scale_orig_quant.value();
+                    auto const& quantOrigScale = kv_scale_quant_orig.value();
+                    TORCH_CHECK(origQuantScale.scalar_type() == torch::kFloat32,
+                        "kv_scale_orig_quant must have float32 dtype for MLA with FP4 KV cache");
+                    TORCH_CHECK(quantOrigScale.scalar_type() == torch::kFloat32,
+                        "kv_scale_quant_orig must have float32 dtype for MLA with FP4 KV cache");
+                    TORCH_CHECK(origQuantScale.is_contiguous(),
+                        "kv_scale_orig_quant must be contiguous for MLA with FP4 KV cache");
+                    TORCH_CHECK(quantOrigScale.is_contiguous(),
+                        "kv_scale_quant_orig must be contiguous for MLA with FP4 KV cache");
+                    TORCH_CHECK(origQuantScale.dim() == 1 && origQuantScale.size(0) == 1,
+                        "kv_scale_orig_quant must have shape [1] for MLA with FP4 KV cache");
+                    TORCH_CHECK(quantOrigScale.dim() == 1 && quantOrigScale.size(0) == 1,
+                        "kv_scale_quant_orig must have shape [1] for MLA with FP4 KV cache");
+                }
+                else
+                {
+                    TORCH_CHECK(kv_scale_orig_quant.value().size(0) == 3);
+                    TORCH_CHECK(kv_scale_quant_orig.value().size(0) == 3);
+                }
             }
+            kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
+            kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
         }
         // For FP8 output, out_scale represents the output scale.
         float const* out_scale_ptr = (op.mFP8ContextFMHA && !op.mFuseFp4Quant && out_scale.has_value())
@@ -816,8 +836,9 @@ public:
         {
             if (host_kv_cache_pool_pointers.has_value())
             {
-                auto* kvCachePool = reinterpret_cast<char*>(
-                    host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
+                auto* kvCachePool = reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().dim() == 3
+                        ? host_kv_cache_pool_pointers.value().index({pool_index, 0, 0}).item<int64_t>()
+                        : host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
                 if (sparse_attn_kv_lens.has_value())
                 {
                     // Deepseek V4 dynamic sparse MLA always uses the SWA pool for now.
@@ -830,7 +851,9 @@ public:
                 }
                 else
                 {
-                    op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = kvCachePool;
+                    op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = aux_kv_cache_pool_ptr.has_value()
+                        ? reinterpret_cast<char*>(aux_kv_cache_pool_ptr.value())
+                        : kvCachePool;
                 }
             }
         }
@@ -1364,12 +1387,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             static_cast<int>(v_head_dim.value()), static_cast<int>(predicted_tokens_per_seq),
             static_cast<int>(layer_num), static_cast<int>(rope_append_value)};
 
+        op->mUseNvfp4MlaKvCache = op->mKVCacheQuantMode.hasFp4KvCache() && op->mUseTllmGenSparseAttention
+            && !sparse_attn_kv_lens.has_value() && aux_kv_cache_pool_ptr.has_value();
         op->mFP8ContextMLA
             = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::getSMVersion() == 100
                   || tensorrt_llm::common::getSMVersion() == 103 || tensorrt_llm::common::getSMVersion() == 120)
-            && op->mKVCacheQuantMode.hasFp8KvCache();
+            && (op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache);
         op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
-        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
+        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache;
         // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
         op->mUseGenFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && tokens_per_block == 64 && head_size == 576;
 

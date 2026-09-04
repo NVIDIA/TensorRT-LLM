@@ -1182,7 +1182,7 @@ class TestDisaggTransferIdleProgress:
         executor.kv_cache_transceiver.request_and_receive_async.assert_not_called()
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
         executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
-        assert executor._sync_disagg_transfer_made_progress
+        assert executor._disagg_gen_transfer_made_progress
 
     def test_sync_receive_drains_batch_before_rank_aligned_error_vote(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
@@ -1199,7 +1199,7 @@ class TestDisaggTransferIdleProgress:
         ]
         executor._handle_errors = Mock()
         executor._check_cache_transfer_errors = Mock()
-        executor._sync_disagg_transfer_made_progress = False
+        executor._disagg_gen_transfer_made_progress = False
         error_request = Mock(
             py_request_id=1,
             state=LlmRequestState.DISAGG_GENERATION_INIT,
@@ -1232,7 +1232,7 @@ class TestDisaggTransferIdleProgress:
         executor.kv_cache_transceiver.cancel_request.assert_not_called()
         executor._handle_errors.assert_not_called()
         executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
-        assert executor._sync_disagg_transfer_made_progress
+        assert executor._disagg_gen_transfer_made_progress
 
         PyExecutor._handle_disagg_cache_errors_synced(executor)
 
@@ -2185,6 +2185,31 @@ def test_pad_dummy_allocation_failure_skips_padding():
 
     _run_pad(stub)
 
+    assert len(stub.active_requests) == 1
+    assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param({"return_value": None}, id="returns_none"),
+        pytest.param({"side_effect": OutOfPagesError("no pages")}, id="raises_out_of_pages"),
+    ],
+)
+def test_legacy_pad_dummy_allocation_failure_skips_padding(failure):
+    # Ranks without the ADP dummy fixes take the legacy branch, where a
+    # KV-saturated rank still has to survive a refused dummy allocation.
+    # Crashing here kills the event-loop thread and hangs every peer in the
+    # can_queue allgather until the hang detector fires.
+    stub = _StubADPExecutor(enable_adp_dummy_fixes=False)
+    stub.active_requests = [_make_adp_request(_STATE_DISAGG_GENERATION_INIT)]
+    stub.expected_num_active_requests = 1
+    stub.kv_cache_manager.add_dummy_requests.side_effect = None
+    stub.kv_cache_manager.add_dummy_requests.configure_mock(**failure)
+
+    _run_pad(stub)
+
+    assert stub.kv_cache_manager.add_dummy_requests.call_count == 1
     assert len(stub.active_requests) == 1
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
 

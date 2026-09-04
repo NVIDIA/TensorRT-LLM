@@ -1029,6 +1029,11 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
+    # When True, use tunable_fp8_per_token_quant (AutoTuner selects TRT-LLM vs
+    # vectorized kernel). Visual gen pipelines set this to True before model
+    # construction; LLM paths leave it False.
+    use_tunable_quantize: bool = False
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         weight_shape = (out_features, in_features)
@@ -1053,6 +1058,12 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
+        # fp8_rowwise_gemm requires a 2D mat1; flatten here and unflatten the output below.
+        orig_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+
         # FP8 tensor inputs are from attention. Directly use ones as scale.
         if input.dtype == torch.float8_e4m3fn:
             qinput = input
@@ -1061,8 +1072,12 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                                          dtype=torch.float32)
         else:
             # Use dynamic per-token quantization for activation
-            qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
-                input)
+            if FP8RowwiseLinearMethod.use_tunable_quantize:
+                qinput, cur_input_scale = torch.ops.trtllm.tunable_fp8_per_token_quant(
+                    input)
+            else:
+                qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
+                    input)
 
         # This op does not support bias now.
         output_buffer_kind = (
@@ -1086,6 +1101,8 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         )
         if bias is not None:
             output = output + bias
+        if len(orig_shape) > 2:
+            output = output.reshape(*orig_shape[:-1], output.shape[-1])
         return output
 
     def _get_scale_name(self, weights: List[Dict]):

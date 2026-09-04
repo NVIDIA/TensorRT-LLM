@@ -13,6 +13,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     AttentionMetadata,
+    MLAParams,
 )
 from tensorrt_llm._torch.attention_backend.sparse import dsa_flashinfer, inline_scale_kv
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.kernels import (
@@ -27,29 +28,6 @@ from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
-
-
-@pytest.mark.parametrize("algorithm", ["dsa", "deepseek_v4"])
-@pytest.mark.parametrize("sm", [120, 121])
-def test_sm120_sm121_sparse_mla_requires_packed_cache_dtype(algorithm: str, sm: int) -> None:
-    attn = SimpleNamespace(
-        fmha_libs=[],
-        is_mla_enable=True,
-        kv_cache_dtype="auto",
-        sparse_params=SimpleNamespace(algorithm=algorithm),
-    )
-
-    with (
-        patch(
-            "tensorrt_llm._torch.attention_backend.trtllm.get_sm_version",
-            return_value=sm,
-        ),
-        pytest.raises(
-            ValueError,
-            match=r"requires kv_cache_config\.dtype='fp8_ds_mla'",
-        ),
-    ):
-        TrtllmAttention.create_fmha_libs(attn)
 
 
 def test_sparse_mla_split_workspace_follows_kernel_threshold() -> None:
@@ -73,6 +51,33 @@ def test_sparse_mla_split_workspace_follows_kernel_threshold() -> None:
         value_dim=512,
         device=torch.device("cpu"),
     ) == (None, None)
+
+
+@pytest.mark.parametrize("algorithm", ["dsa", "deepseek_v4"])
+@pytest.mark.parametrize("sm", [120, 121])
+def test_sm120_sm121_sparse_mla_requires_packed_cache_dtype(
+    algorithm: str,
+    sm: int,
+) -> None:
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.trtllm.get_sm_version",
+            return_value=sm,
+        ),
+        pytest.raises(
+            ValueError,
+            match=r"requires kv_cache_config\.dtype='fp8_ds_mla'",
+        ),
+    ):
+        TrtllmAttention(
+            layer_idx=0,
+            num_heads=1,
+            head_dim=1,
+            mla_params=MLAParams(),
+            sparse_params=SimpleNamespace(algorithm=algorithm),
+            kv_cache_dtype="auto",
+            skip_create_weights_in_init=True,
+        )
 
 
 def test_flashinfer_sparse_mla_missing_private_op_warns() -> None:
