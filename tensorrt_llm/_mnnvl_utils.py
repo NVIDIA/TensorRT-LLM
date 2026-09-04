@@ -208,6 +208,10 @@ class _MnnvlAllocationRecord:
     start_address: int
     rank_stride: int
     address_offset: int
+    # Parallel layout comm was split for, so _checkpoint_restore_complete() can publish a
+    # replacement communicator together with the layout it serves. Defaults to empty for
+    # records built without one, which only costs a redundant Split() later.
+    comm_signature: tuple[int, ...] = ()
     state: _MnnvlAllocationState = _MnnvlAllocationState.MAPPED
     pending_comm: Any = None
 
@@ -227,7 +231,12 @@ class MnnvlMemory:
         "current_mem_offset": 0,
         "current_rank_stride": 0,  # stride for ranks and also address space size.
         "current_start_address": 0,
+        # Rank count the current address range was reserved for; see
+        # new_mnnvl_memory_address() and _address_window_fits().
+        "current_address_comm_size": 0,
         "comm": None,  # MPI communicator.
+        # Parallel layout "comm" was split for; see comm_layout_signature().
+        "comm_signature": None,
         "allocated_map": dict,  # callable for fresh dict.
         "address_refcnt": dict,  # callable for fresh dict.
         # Derived from get_allocation_prop(), whose handle type differs per class.
@@ -238,7 +247,9 @@ class MnnvlMemory:
     current_mem_offset: int = 0
     current_rank_stride: int = 0
     current_start_address: int = 0
+    current_address_comm_size: int = 0
     comm = None
+    comm_signature = None
     allocated_map = {}
     address_refcnt = {}
     allocation_granularity: int = 0
@@ -268,7 +279,11 @@ class MnnvlMemory:
         return type(self).allocated_map[self.ptr].state is _MnnvlAllocationState.MAPPED
 
     def as_torch_strided_tensor(self, dtype):
-        num_segments = type(self).comm.Get_size()
+        # Describe the allocation with the layout it was created under, recorded at
+        # allocation time, rather than with the current class-level communicator: the
+        # latter is rebuilt when the parallel layout changes (see get_comm), while this
+        # memory keeps the segment count it was actually mapped with.
+        num_segments = type(self).allocated_map[self.ptr].comm_size
         return pack_strided_memory(
             self.ptr, self.segment_size, self.rank_stride, num_segments, dtype, MnnvlMemory.dev_id
         )
@@ -276,9 +291,11 @@ class MnnvlMemory:
     @property
     def local_mem_handle(self) -> int:
         """Return the local rank's CUmemGenericAllocationHandle."""
-        mem_handles = type(self).allocated_map[self.ptr].mem_handles
-        comm_rank = type(self).comm.Get_rank()
-        return int(mem_handles[comm_rank])
+        record = type(self).allocated_map[self.ptr]
+        # mem_handles is indexed by rank within the communicator that exported it, so
+        # the index has to come from the same record and not from the current
+        # class-level communicator, whose rank may refer to a different layout.
+        return int(record.mem_handles[record.comm_rank])
 
     @staticmethod
     def initialize():
@@ -296,18 +313,94 @@ class MnnvlMemory:
         except pynvml.NVMLError_Uninitialized:
             pynvml.nvmlInit()
 
+    @staticmethod
+    def comm_layout_signature(mapping: Mapping) -> tuple[int, ...]:
+        """Summarize the parallel layout that get_comm() splits `mapping` along.
+
+        Only rank-invariant sizes are included, never per-rank ids. MPI_Comm_split is
+        collective, so every rank must reach the same "is the cached communicator still
+        valid" verdict; a signature that could differ between ranks would let some ranks
+        return the cache while the others entered Split(), which deadlocks.
+
+        Every size a comm_split_color_key() implementation reads has to appear here,
+        including the ones it reads only through Mapping: moe_tp_rank is
+        tp_rank // (moe_ep_size * moe_cluster_size). moe_cluster_size does not follow from
+        the other entries either, because Mapping derives moe_world_size as tp_size alone
+        under Ulysses CP and as tp_size * cp_size otherwise, so two mappings can agree on
+        everything else listed here and still split into different groups.
+        """
+        return (
+            mapping.world_size,
+            mapping.pp_size,
+            mapping.cp_size,
+            mapping.tp_size,
+            mapping.moe_tp_size,
+            mapping.moe_ep_size,
+            mapping.moe_cluster_size,
+        )
+
     @classmethod
-    def get_comm(cls, mapping: Mapping):
-        """Get TP-based communicator (ranks grouped by PP+CP+MOE_TP, ordered by TP rank)."""
-        if cls.comm is not None:
-            return cls.comm
-        comm = mpi_comm().Split(
+    def comm_split_color_key(cls, mapping: Mapping) -> tuple[int, int]:
+        """Group ranks by PP+CP+MOE_TP, ordering each group by TP rank."""
+        return (
             (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size
             + mapping.moe_tp_rank,
             mapping.tp_rank,
         )
-        cls.comm = comm
-        return comm
+
+    @classmethod
+    def get_comm(cls, mapping: Mapping) -> MnnvlCheckpointCommunicator:
+        """Get the communicator for `mapping`, creating it on first use.
+
+        The communicator is cached per class, and one process can serve several
+        mappings in sequence (CI reuses an MPI worker pool across tests). Reusing a
+        communicator built for a different parallel layout is not merely suboptimal:
+        its size is recorded at allocation time and becomes the leading dimension of the
+        resulting workspace (see as_torch_strided_tensor), so the mismatch surfaces later
+        as a shape check failing inside a kernel instead of being caught at its source.
+        Rebuild the communicator whenever the layout changes.
+        """
+        signature = cls.comm_layout_signature(mapping)
+        if cls.comm is not None:
+            if cls.comm_signature == signature:
+                return cls.comm
+            logger.warning(
+                f"[{cls.__name__}] cached communicator was created for parallel layout "
+                f"{cls.comm_signature}, but {signature} is requested; recreating it."
+            )
+            cls.drop_cached_comm()
+        color, key = cls.comm_split_color_key(mapping)
+        cls.comm = mpi_comm().Split(color, key)
+        cls.comm_signature = signature
+        return cls.comm
+
+    @classmethod
+    def drop_cached_comm(cls) -> None:
+        """Forget the cached communicator without freeing it.
+
+        MPI_Comm_free is collective, and no local test can decide whether to call it.
+        Allocations enter allocated_map collectively, through the allgathers in
+        open_mnnvl_memory(), but leave it through MnnvlMemory.__del__, that is by per-rank
+        object lifetime. "Is anyone still using this communicator" is therefore a question
+        each rank can answer differently, and one rank would return while another entered
+        the free. A restored communicator is not this class's to free either: it is
+        supplied by its caller and only has to satisfy MnnvlCheckpointCommunicator, which
+        does not include Free() (see _checkpoint_restore_complete).
+
+        Dropping the reference leaks the underlying MPI_Comm, because mpi4py does not free
+        a communicator when its Python object is collected, so the handle lives until
+        MPI_Finalize. That is also what this class did before it could rebuild at all. The
+        leak grows with the number of layout transitions, not with the number of distinct
+        layouts: only one communicator is cached, so returning to an earlier layout splits a
+        fresh one instead of reusing it. That is no transitions outside a reused test worker,
+        and one per layout change inside one. Keying the cache by signature would bound it by
+        distinct layouts instead, and is safe to add later because the signature is rank
+        invariant (see test_comm_layout_signature_is_rank_invariant); reclaiming a
+        communicator would still have to happen on a path that is already collective on every
+        rank, not on this lookup.
+        """
+        cls.comm = None
+        cls.comm_signature = None
 
     @classmethod
     def get_allocation_prop(cls, dev_id: int):
@@ -360,6 +453,25 @@ class MnnvlMemory:
         cls.current_start_address = int(ptr)
         cls.current_rank_stride = current_rank_stride
         cls.current_mem_offset = 0
+        cls.current_address_comm_size = comm_size
+
+    @classmethod
+    def _address_window_fits(cls, aligned_size: int, comm_size: int) -> bool:
+        """Whether the reserved address range can host one more allocation.
+
+        A reservation is one slot of current_rank_stride bytes per rank of the communicator
+        that asked for it (see new_mnnvl_memory_address), so fitting is not only about the
+        bytes left in a slot: an allocation made for a communicator of a different size
+        must not share it. A larger one would map its extra ranks past the end of the range
+        (_create_and_map_handles walks rank_stride * rank for every rank of the current
+        communicator), and either size mixed into one range would leave
+        close_mnnvl_memory() computing the range's length from whichever allocation happens
+        to close last, while cuMemAddressFree requires the exact length that was reserved.
+        """
+        return (
+            cls.current_mem_offset + aligned_size <= cls.current_rank_stride
+            and comm_size == cls.current_address_comm_size
+        )
 
     @classmethod
     def _create_and_map_handles(
@@ -566,12 +678,13 @@ class MnnvlMemory:
             cls.current_start_address,
             cls.current_rank_stride,
             cls.current_mem_offset,
+            cls.current_address_comm_size,
         )
-        reserved_new_address = cls.current_mem_offset + aligned_size > cls.current_rank_stride
+        reserved_new_address = not cls._address_window_fits(aligned_size, comm_size)
         if reserved_new_address:
             cls.new_mnnvl_memory_address(mapping, aligned_size)
 
-        assert cls.current_mem_offset + aligned_size <= cls.current_rank_stride
+        assert cls._address_window_fits(aligned_size, comm_size)
 
         try:
             mem_handles = cls._create_and_map_handles(
@@ -595,6 +708,7 @@ class MnnvlMemory:
                         cls.current_start_address,
                         cls.current_rank_stride,
                         cls.current_mem_offset,
+                        cls.current_address_comm_size,
                     ) = previous_address_state
             raise
         ptr = cls.current_start_address + cls.current_mem_offset
@@ -604,6 +718,7 @@ class MnnvlMemory:
             comm_size=comm_size,
             comm_rank=comm_rank,
             comm_membership=comm_membership,
+            comm_signature=cls.comm_layout_signature(mapping),
             aligned_size=aligned_size,
             mem_handles=mem_handles,
             start_address=cls.current_start_address,
@@ -636,6 +751,9 @@ class MnnvlMemory:
         if cls.address_refcnt[record.start_address] == 0:
             cls.address_refcnt.pop(record.start_address)
             device_ptr = cuda.CUdeviceptr(record.start_address)
+            # cuMemAddressFree wants the exact length that was reserved. Taking it from this
+            # record is sound because _address_window_fits() only lets allocations share a
+            # range when their communicators agree on size.
             _check_cu_result(
                 cuda.cuMemAddressFree(device_ptr, record.comm_size * record.rank_stride)
             )
@@ -643,6 +761,7 @@ class MnnvlMemory:
                 cls.current_start_address = 0
                 cls.current_rank_stride = 0
                 cls.current_mem_offset = 0
+                cls.current_address_comm_size = 0
 
     @classmethod
     def _unmap_and_release_handles(cls, record: _MnnvlAllocationRecord) -> None:
@@ -780,7 +899,17 @@ class MnnvlMemory:
         if record.pending_comm is None:
             raise RuntimeError("Cannot complete MNNVL restore without a replacement communicator")
         record.comm = record.pending_comm
-        type(self).comm = record.pending_comm
+        # Publish the replacement communicator together with the layout it serves.
+        # checkpoint_restore() validates the incoming communicator against this record
+        # alone (same size, rank and ordered membership), never against the class cache,
+        # which may since have been rebuilt for a different layout; setting comm while
+        # comm_signature still described that other layout would make get_comm() report a
+        # hit for it and hand this communicator out instead. An empty record signature
+        # clears the cache signature so the next get_comm() splits again rather than
+        # matching anything. The displaced communicator is dropped without Free(),
+        # because MPI_Comm_free is collective and this path is per-allocation.
+        type(self).comm = record.comm
+        type(self).comm_signature = record.comm_signature or None
         record.pending_comm = None
         record.state = _MnnvlAllocationState.MAPPED
 
@@ -923,16 +1052,12 @@ class HelixCpMnnvlMemory(MnnvlMemory):
     """
 
     @classmethod
-    def get_comm(cls, mapping: Mapping):
-        """Get CP-based communicator (ranks grouped by PP+TP+MOE_TP, ordered by CP rank)."""
-        if cls.comm is not None:
-            return cls.comm
-        comm = mpi_comm().Split(
+    def comm_split_color_key(cls, mapping: Mapping) -> tuple[int, int]:
+        """Group ranks by PP+TP, ordering each group by CP rank."""
+        return (
             mapping.pp_rank * mapping.tp_size + mapping.tp_rank,
             mapping.cp_rank,
         )
-        cls.comm = comm
-        return comm
 
 
 def init_helix_cp_comm(mapping: Mapping) -> None:
