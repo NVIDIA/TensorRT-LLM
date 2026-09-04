@@ -615,3 +615,16 @@ def test_a_context_request_reports_its_usage():
 
     assert response.usage.prompt_tokens == 4
     assert response.usage.cached_prompt_tokens == 2
+
+
+def test_output_budget_is_not_advertised_as_the_context_window(llm, model_info):
+    """max_seq_len is the input+output window, not an output budget.
+
+    Advertising it as max_output_tokens tells a client with a nearly full prompt
+    that it may still ask for a whole window of new tokens, and Generate then
+    rejects the request -- discovery turning into a per-request failure.
+    """
+    assert not model_info.HasField("max_output_tokens"), (
+        "max_output_tokens must stay unset: the real ceiling is "
+        "max_seq_len minus the prompt, which is per request"
+    )

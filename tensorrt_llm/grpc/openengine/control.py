@@ -223,7 +223,13 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         max_seq_len = _positive_int(self._llm.args.max_seq_len)
         if max_seq_len is not None:
             info.max_context_length = max_seq_len
-            info.max_output_tokens = max_seq_len
+        # max_output_tokens stays unset. max_seq_len is the combined input+output
+        # window, not an output budget: the real ceiling is max_seq_len minus the
+        # prompt, which is per request and cannot be advertised statically.
+        # Reporting the window here would tell a client with a 4000-token prompt
+        # that it may ask for 4096 more, and Generate would reject it -- the
+        # discovery-becomes-a-per-request-failure case this service exists to
+        # avoid. Unset means "unknown", which is the honest claim.
 
         generation = model_pb2.GenerationCapabilities()
         # The bound is enforced per request, so it is known rather than unknown.

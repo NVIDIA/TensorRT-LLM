@@ -108,9 +108,9 @@ class OpenEngineServer:
                 "The listener is unauthenticated and unencrypted: restrict it to a trusted "
                 "network or front it with an authenticating TLS proxy."
             )
+        # grpc.aio raises RuntimeError itself when the bind fails, naming the
+        # address, so there is no zero return to check for.
         bound_port = self._server.add_insecure_port(bind_address)
-        if bound_port == 0:
-            raise RuntimeError(f"Failed to bind OpenEngine server to {bind_address}")
         if port == 0:
             self.port = bound_port
 
