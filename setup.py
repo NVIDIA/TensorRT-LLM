@@ -361,7 +361,7 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                     break
             else:
                 raise SetupError(
-                    f"Failed to get wheel file from {precompiled_path}.") from e
+                    f"Failed to get wheel file from {precompiled_path}.")
 
             wheel_path = os.path.join(workspace, member.name)
             tar.extract(member, path=workspace, filter=tarfile.data_filter)
