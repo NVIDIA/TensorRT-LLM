@@ -120,8 +120,7 @@ def test_prims_ts_context_zero_fills_nan_v_tail(
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         qo_indptr: torch.Tensor,
-        paged_kv_indptr: torch.Tensor,
-        paged_kv_indices: torch.Tensor,
+        block_tables: torch.Tensor,
         seq_lens_kv: torch.Tensor,
         **kwargs: object,
     ) -> torch.Tensor:
@@ -129,14 +128,13 @@ def test_prims_ts_context_zero_fills_nan_v_tail(
         # launches, so only the kernel's handling of unused V rows is tested.
         page_size = v_cache.shape[2]
         seq_lens = seq_lens_kv.cpu().tolist()
-        row_offsets = paged_kv_indptr.cpu().tolist()
-        page_indices = paged_kv_indices.cpu()
+        page_indices = block_tables.cpu()
         for batch_idx, seq_len in enumerate(seq_lens):
             logical_last_page = (seq_len - 1) // page_size
             tail_start = (seq_len - 1) % page_size + 1
             if tail_start == page_size:
                 continue
-            physical_page = int(page_indices[row_offsets[batch_idx] + logical_last_page].item())
+            physical_page = int(page_indices[batch_idx, logical_last_page].item())
             v_cache[physical_page, :, tail_start:, :].fill_(float("nan"))
             poisoned_tails.append((batch_idx, tail_start))
 
@@ -146,8 +144,7 @@ def test_prims_ts_context_zero_fills_nan_v_tail(
             k_cache,
             v_cache,
             qo_indptr,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
             seq_lens_kv,
             **kwargs,
         )
@@ -327,9 +324,7 @@ def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
     captured_wrapper = captured_adapter._decode_wrappers[case.num_seqs]
     captured_plan_state = captured_wrapper._plan_state
     assert captured_plan_state is not None
-    control_offset = captured_plan_state.workspace_layout.split_kv_counter.byte_offset
-    control_end = captured_plan_state.workspace_layout.total_bytes
-    assert torch.count_nonzero(captured_workspace[control_offset:control_end]) == 0
+    assert torch.count_nonzero(captured_plan_state.workspace.split_kv_counter) == 0
 
 
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
@@ -425,6 +420,13 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
     qo_indptr = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
     paged_kv_indptr = torch.tensor([0, 2, 4], device=device, dtype=torch.int32)
     paged_kv_indices = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32)
+    trt_block_tables = torch.tensor(
+        [[[0, 1], [2, 3]], [[2, 3], [0, 1]]],
+        device=device,
+        dtype=torch.int32,
+    )
+    block_tables = trt_block_tables[:, 0, :]
+    assert block_tables.stride() == (4, 1)
     seq_lens = torch.tensor([33, 64], device=device, dtype=torch.int32)
     output = torch.empty_like(query)
     wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
@@ -462,8 +464,7 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
         k_cache,
         v_cache,
         qo_indptr,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
         seq_lens,
         out=output,
     )
@@ -474,8 +475,7 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
             k_cache,
             v_cache,
             qo_indptr,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
             seq_lens,
             out=output,
             validate=False,
@@ -485,6 +485,7 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
     qo_indptr.copy_(torch.tensor([0, 2, 5], device=device, dtype=torch.int32))
     seq_lens.copy_(torch.tensor([64, 33], device=device, dtype=torch.int32))
     paged_kv_indices.copy_(torch.tensor([2, 3, 0, 1], device=device, dtype=torch.int32))
+    block_tables.copy_(torch.tensor([[2, 3], [0, 1]], device=device, dtype=torch.int32))
 
     reference = batch_prefill_with_paged_kv_cache(
         query,
@@ -539,8 +540,13 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
         device=device,
         dtype=dtype,
     )
-    paged_kv_indptr = torch.tensor([0, 2, 4], device=device, dtype=torch.int32)
-    paged_kv_indices = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32)
+    trt_block_tables = torch.tensor(
+        [[[0, 1], [2, 3]], [[2, 3], [0, 1]]],
+        device=device,
+        dtype=torch.int32,
+    )
+    block_tables = trt_block_tables[:, 0, :]
+    assert block_tables.stride() == (4, 1)
     seq_lens = torch.tensor([33, 64], device=device, dtype=torch.int32)
     output = torch.empty_like(query)
     workspace_bytes = get_prims_ts_batch_decode_workspace_size(
@@ -590,8 +596,7 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
             aliased_query,
             kv_cache,
             seq_lens,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
             out=output,
         )
 
@@ -600,8 +605,7 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
         query,
         kv_cache,
         seq_lens,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
         out=output,
     )
     graph = torch.cuda.CUDAGraph()
@@ -611,23 +615,20 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
             query,
             kv_cache,
             seq_lens,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
             out=output,
             validate=False,
         )
 
     query.copy_(query.flip(0).clone())
-    paged_kv_indptr.copy_(torch.tensor([0, 1, 4], device=device, dtype=torch.int32))
-    paged_kv_indices.copy_(torch.tensor([2, 0, 1, 3], device=device, dtype=torch.int32))
+    block_tables.copy_(torch.tensor([[2, 3], [0, 1]], device=device, dtype=torch.int32))
     seq_lens.copy_(torch.tensor([32, 64], device=device, dtype=torch.int32))
     reference_workspace = torch.zeros_like(external_workspace)
     reference = prims_ts_batch_decode_with_kv_cache(
         query,
         kv_cache,
         reference_workspace,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
         seq_lens,
         max_seq_len,
         out_dtype=dtype,
@@ -849,10 +850,8 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
     wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
     query_a = torch.randn(1, num_qo_heads, head_dim, device=device, dtype=dtype)
     query_b = torch.randn(2, num_qo_heads, head_dim, device=device, dtype=dtype)
-    indptr_a = torch.tensor([0, 2], device=device, dtype=torch.int32)
-    indptr_b = torch.tensor([0, 128, 256], device=device, dtype=torch.int32)
-    indices_a = torch.tensor([0, 1], device=device, dtype=torch.int32)
-    indices_b = torch.arange(256, device=device, dtype=torch.int32)
+    block_tables_a = torch.tensor([[0, 1]], device=device, dtype=torch.int32)
+    block_tables_b = torch.arange(256, device=device, dtype=torch.int32).view(2, 128)
     seq_lens_a = torch.tensor([33], device=device, dtype=torch.int32)
     seq_lens_b = torch.tensor([2049, 4096], device=device, dtype=torch.int32)
     output_a = torch.empty_like(query_a)
@@ -878,8 +877,7 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
 
     def capture(
         query: torch.Tensor,
-        indptr: torch.Tensor,
-        indices: torch.Tensor,
+        block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         output: torch.Tensor,
     ) -> torch.cuda.CUDAGraph:
@@ -892,8 +890,7 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
             query,
             kv_cache,
             seq_lens,
-            indptr,
-            indices,
+            block_tables,
             out=output,
         )
         graph = torch.cuda.CUDAGraph()
@@ -903,8 +900,7 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
                 query,
                 kv_cache,
                 seq_lens,
-                indptr,
-                indices,
+                block_tables,
                 out=output,
                 validate=False,
             )
@@ -916,14 +912,14 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
     compiled_a = plan_state_a.compiled_main
     layout_a = plan_state_a.workspace_layout
     control_span_a = slice(layout_a.split_kv_counter.byte_offset, layout_a.total_bytes)
-    graph_a = capture(query_a, indptr_a, indices_a, seq_lens_a, output_a)
+    graph_a = capture(query_a, block_tables_a, seq_lens_a, output_a)
     plan(2, max_seq_len_b)
     plan_state_b = wrapper._plan_state
     assert plan_state_b is not None
     layout_b = plan_state_b.workspace_layout
     assert layout_a.split_kv_counter.byte_offset != layout_b.split_kv_counter.byte_offset
     control_span_b = slice(layout_b.split_kv_counter.byte_offset, layout_b.total_bytes)
-    graph_b = capture(query_b, indptr_b, indices_b, seq_lens_b, output_b)
+    graph_b = capture(query_b, block_tables_b, seq_lens_b, output_b)
     plan(1, max_seq_len_a)
 
     reference_workspace = torch.zeros_like(shared_workspace)
@@ -931,8 +927,7 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
         query_a,
         kv_cache,
         reference_workspace,
-        indptr_a,
-        indices_a,
+        block_tables_a,
         seq_lens_a,
         max_seq_len_a,
         out_dtype=dtype,
@@ -945,8 +940,7 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
         query_b,
         kv_cache,
         reference_workspace,
-        indptr_b,
-        indices_b,
+        block_tables_b,
         seq_lens_b,
         max_seq_len_b,
         out_dtype=dtype,
@@ -1014,8 +1008,12 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
         device=device,
         dtype=torch.uint8,
     )
-    paged_kv_indptr = torch.tensor([0, 2, 4], device=device, dtype=torch.int32)
-    paged_kv_indices = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32)
+    trt_block_tables = torch.tensor(
+        [[[0, 1], [2, 3]], [[2, 3], [0, 1]]],
+        device=device,
+        dtype=torch.int32,
+    )
+    block_tables = trt_block_tables[:, 0, :]
     seq_lens = torch.tensor([33, 64], device=device, dtype=torch.int32)
     wrappers = [BatchDecodePagedTSWrapper(kv_layout="HND") for _ in range(2)]
     for wrapper in wrappers:
@@ -1062,8 +1060,7 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
             query,
             kv_cache,
             seq_lens,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
             out=output,
         )
         reference_workspace = torch.zeros_like(shared_workspace)
@@ -1071,8 +1068,7 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
             query,
             kv_cache,
             reference_workspace,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
             seq_lens,
             max_seq_len,
             out_dtype=dtype,

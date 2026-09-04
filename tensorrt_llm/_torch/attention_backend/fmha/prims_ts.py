@@ -67,20 +67,10 @@ class PrimsTSFmha(PhasedFmha):
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
-        # Stable fixed-stride CSR storage shared by context and decode, plus
-        # aligned sequence-length staging shared by context and MLA decode.
-        self._page_indices_buffer: Optional[torch.Tensor] = None
-        self._fixed_indptr_buffer: Optional[torch.Tensor] = None
-        self._sequence_lengths_buffer: Optional[torch.Tensor] = None
-        self._metadata_row_capacity = 0
-        self._metadata_column_capacity = 0
         # Cache each manager/pool's K-to-V page displacement without retaining
         # the manager itself.
         self._kv_page_offset_cache: dict[tuple[int, int], int] = {}
-        # Device geometry is stable, while superseded metadata allocations must
-        # remain alive for CUDA graph nodes that captured their addresses.
         self._multi_processor_count: Optional[int] = None
-        self._retained_metadata_buffers: list[tuple[torch.Tensor, ...]] = []
         # Every other plan attribute is fixed by this layer/model instance.
         # Batch size is the only execution profile that needs its own wrapper.
         self._context_wrappers: dict[int, "BatchPrefillPagedTSWrapper"] = {}
@@ -405,7 +395,7 @@ class PrimsTSFmha(PhasedFmha):
         if attention_window_size < max_seq_len:
             return False, (
                 "sliding-window attention uses cyclic TRT-LLM page tables, which are not "
-                "compatible with the PrimTS native CSR page-table ABI."
+                "compatible with the PrimTS fixed row-strided page-table ABI."
             )
 
         if (
@@ -421,61 +411,12 @@ class PrimsTSFmha(PhasedFmha):
             return False, "the K-to-V page displacement could not be resolved."
         return True, ""
 
-    def _ensure_metadata_buffers(
-        self,
-        device: torch.device,
-        row_capacity: int,
-        column_capacity: int,
-    ) -> None:
-        needs_allocation = (
-            self._page_indices_buffer is None
-            or self._fixed_indptr_buffer is None
-            or self._sequence_lengths_buffer is None
-            or self._page_indices_buffer.device != device
-            or self._metadata_row_capacity < row_capacity
-            or self._metadata_column_capacity != column_capacity
-        )
-        if not needs_allocation:
-            return
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "PrimTS metadata buffers must be allocated before CUDA graph capture."
-            )
-        retained_buffers: list[torch.Tensor] = []
-        if (
-            self._page_indices_buffer is not None
-            and self._fixed_indptr_buffer is not None
-            and self._sequence_lengths_buffer is not None
-        ):
-            retained_buffers.extend(
-                (
-                    self._page_indices_buffer,
-                    self._fixed_indptr_buffer,
-                    self._sequence_lengths_buffer,
-                )
-            )
-        self._page_indices_buffer = torch.empty(
-            (row_capacity, column_capacity), dtype=torch.int32, device=device
-        )
-        self._fixed_indptr_buffer = torch.arange(
-            row_capacity + 1, dtype=torch.int32, device=device
-        ).mul_(column_capacity)
-        self._sequence_lengths_buffer = torch.empty(row_capacity, dtype=torch.int32, device=device)
-        self._metadata_row_capacity = row_capacity
-        self._metadata_column_capacity = column_capacity
-
-        if retained_buffers:
-            # Captured copies and kernel nodes retain these addresses. A replay
-            # still updates the old destinations, so keeping the allocations
-            # alive preserves both pointer validity and per-run metadata values.
-            self._retained_metadata_buffers.append(tuple(retained_buffers))
-
-    def _make_fixed_stride_csr(
-        self,
+    @staticmethod
+    def _get_fixed_block_tables(
         block_tables: torch.Tensor,
         batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Copy the K page table into stable fixed-stride CSR storage."""
+    ) -> torch.Tensor:
+        """Return the live TRT-LLM K-page table as a zero-copy row-strided view."""
         if block_tables.ndim != 3 or block_tables.shape[1] != 2:
             raise RuntimeError(
                 "PrimTS expects block tables with shape [batch, 2, max_blocks], got "
@@ -485,57 +426,17 @@ class PrimsTSFmha(PhasedFmha):
             raise RuntimeError(f"PrimTS expects int32 block tables, got {block_tables.dtype}.")
         if batch_size <= 0 or batch_size > block_tables.shape[0]:
             raise RuntimeError(
-                f"Invalid PrimTS CSR batch size {batch_size} for {block_tables.shape[0]} rows."
+                f"Invalid PrimTS block-table batch size {batch_size} for "
+                f"{block_tables.shape[0]} rows."
             )
-        columns = int(block_tables.shape[-1])
-        self._ensure_metadata_buffers(block_tables.device, batch_size, columns)
-        if self._page_indices_buffer is None or self._fixed_indptr_buffer is None:
-            raise RuntimeError("PrimTS metadata buffers were not allocated.")
-        page_table = self._page_indices_buffer[:batch_size]
-        page_table.copy_(block_tables[:batch_size, 0, :])
-        return self._fixed_indptr_buffer[: batch_size + 1], page_table.reshape(-1)
+        return block_tables[:batch_size, 0, :]
 
-    def _stage_context_csr_metadata(
-        self,
-        block_tables: torch.Tensor,
-        cu_kv_seqlens: torch.Tensor,
-        *,
-        batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Stage graph-stable context CSR metadata on the current stream."""
-        if block_tables.ndim != 3 or block_tables.shape[1] != 2:
-            raise RuntimeError(
-                "PrimTS expects block tables with shape [batch, 2, max_blocks], got "
-                f"{tuple(block_tables.shape)}."
-            )
-        if block_tables.dtype != torch.int32 or cu_kv_seqlens.dtype != torch.int32:
-            raise RuntimeError("PrimTS context metadata must use int32 tensors.")
-        if cu_kv_seqlens.numel() < batch_size + 1:
-            raise RuntimeError("PrimTS context cumulative KV lengths are too short.")
-
-        paged_kv_indptr, paged_kv_indices = self._make_fixed_stride_csr(
-            block_tables,
-            batch_size,
-        )
-        if self._sequence_lengths_buffer is None:
-            raise RuntimeError("PrimTS context metadata storage was not prepared.")
-
-        seq_lens_kv = self._sequence_lengths_buffer[:batch_size]
-        torch.sub(
-            cu_kv_seqlens[1 : batch_size + 1],
-            cu_kv_seqlens[:batch_size],
-            out=seq_lens_kv,
-        )
-        return paged_kv_indptr, paged_kv_indices, seq_lens_kv
-
-    def _get_mla_sequence_lengths(
-        self,
+    @staticmethod
+    def _get_sequence_lengths(
         sequence_lengths: torch.Tensor,
         batch_size: int,
-        *,
-        copy_to_stable_storage: bool = False,
     ) -> torch.Tensor:
-        """Return live MLA lengths with the storage guarantees PrimTS requires."""
+        """Return the live active sequence-length view required by PrimTS."""
         if sequence_lengths.dtype != torch.int32:
             raise RuntimeError(
                 f"PrimTS expects int32 sequence lengths, got {sequence_lengths.dtype}."
@@ -545,22 +446,7 @@ class PrimsTSFmha(PhasedFmha):
                 f"Invalid PrimTS sequence-length batch size {batch_size} for "
                 f"{sequence_lengths.numel()} entries."
             )
-        active_sequence_lengths = sequence_lengths[:batch_size]
-        if not copy_to_stable_storage and active_sequence_lengths.data_ptr() % 16 == 0:
-            return active_sequence_lengths
-
-        buffer = self._sequence_lengths_buffer
-        if buffer is None or buffer.device != sequence_lengths.device:
-            raise RuntimeError("PrimTS sequence-length storage was not prepared.")
-        if batch_size > buffer.numel():
-            raise RuntimeError(
-                "PrimTS sequence-length storage must be sized before kernel execution."
-            )
-        aligned_sequence_lengths = buffer[:batch_size]
-        aligned_sequence_lengths.copy_(active_sequence_lengths)
-        if aligned_sequence_lengths.data_ptr() % 16 != 0:
-            raise RuntimeError("PrimTS sequence-length storage is not 16-byte aligned.")
-        return aligned_sequence_lengths
+        return sequence_lengths[:batch_size]
 
     def _update_workspace_allocation(self, workspace: torch.Tensor) -> None:
         """Invalidate plans that retain views into a reallocated workspace."""
@@ -738,12 +624,6 @@ class PrimsTSFmha(PhasedFmha):
         has_generation = (
             metadata.num_generations > 0 and input_type != AttentionInputType.context_only
         )
-        self._ensure_metadata_buffers(
-            q.device,
-            max(int(metadata.max_num_requests), 1),
-            column_capacity,
-        )
-
         if self._multi_processor_count is None:
             self._multi_processor_count = torch.cuda.get_device_properties(
                 q.device
@@ -937,7 +817,7 @@ class PrimsTSFmha(PhasedFmha):
             _bmm2_scale,
             fmha_workspace,
             cu_q_seqlens,
-            cu_kv_seqlens,
+            _cu_kv_seqlens,
             _max_q_len,
             _max_kv_len,
             window_left,
@@ -1004,10 +884,10 @@ class PrimsTSFmha(PhasedFmha):
         k_cache, v_cache = self._standard_kv_views(kv_pool, kv_page_offset)
         max_seq_len_q = int(meta.max_context_length)
         max_kv_len = int(meta.max_seq_len)
-        paged_kv_indptr, paged_kv_indices, seq_lens_kv = self._stage_context_csr_metadata(
-            block_tables,
-            cu_kv_seqlens,
-            batch_size=params.batch_size,
+        fixed_block_tables = self._get_fixed_block_tables(block_tables, params.batch_size)
+        seq_lens_kv = self._get_sequence_lengths(
+            params.sequence_lengths,
+            params.batch_size,
         )
         mask_type = self._get_prims_mask_type(fwd)
         wrapper = self._get_or_plan_context_wrapper(
@@ -1028,9 +908,8 @@ class PrimsTSFmha(PhasedFmha):
             k_cache,
             v_cache,
             cu_q_seqlens,
-            paged_kv_indptr,
-            paged_kv_indices,
-            seq_lens_kv,
+            block_tables=fixed_block_tables,
+            seq_lens_kv=seq_lens_kv,
             out=params.context_buf,
             validate=False,
         )
@@ -1165,12 +1044,9 @@ class PrimsTSFmha(PhasedFmha):
         if kv_page_offset is None:
             raise RuntimeError("PrimTS could not resolve the K-to-V page displacement.")
         k_cache, v_cache = self._standard_kv_views(kv_pool, kv_page_offset)
-        paged_kv_indptr, paged_kv_indices = self._make_fixed_stride_csr(
-            block_tables,
-            batch_size,
-        )
+        fixed_block_tables = self._get_fixed_block_tables(block_tables, batch_size)
         max_seq_len = int(block_tables.shape[-1]) * params.tokens_per_block
-        seq_lens = params.sequence_lengths[:batch_size]
+        seq_lens = self._get_sequence_lengths(params.sequence_lengths, batch_size)
         query = q_processed.view(
             batch_size,
             params.input_seq_length,
@@ -1201,24 +1077,20 @@ class PrimsTSFmha(PhasedFmha):
         plan_state = wrapper._plan_state
         if plan_state is None:
             raise RuntimeError("PrimTS decode wrapper has no compiled plan.")
-        workspace_layout = plan_state.workspace_layout
-        # Only the fused global-memory reducer consumes the counter/control
-        # tail. Direct, cluster-reduced, and separately reduced plans either
-        # overwrite their scratch or do not read this span.
+        # Only the fused global-memory reducer consumes the split-KV counter.
+        # Direct, cluster-reduced, and separately reduced plans do not read it.
         policy = dict(plan_state.policy)
         requires_control_reset = bool(policy["use_split_kv"]) and not (
             bool(policy["use_separate_reduction_kernel"])
             or bool(policy["use_cluster_smem_reduction"])
         )
         if requires_control_reset:
-            control_offset = workspace_layout.split_kv_counter.byte_offset
-            decode_workspace[control_offset : workspace_layout.total_bytes].zero_()
+            plan_state.workspace.split_kv_counter.zero_()
         wrapper.run(
             query,
             (k_cache, v_cache),
             seq_lens,
-            paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
+            block_tables=fixed_block_tables,
             bmm1_scale=self._get_bmm1_scale(attn),
             bmm2_scale=1.0,
             out=output,
@@ -1267,11 +1139,7 @@ class PrimsTSFmha(PhasedFmha):
         # The returned pool and block table share the THOP flat-page index ABI.
         if kv_cache is None or block_tables is None:
             raise RuntimeError("TRT-LLM did not return PrimTS MLA KV metadata.")
-        _, page_indices = self._make_fixed_stride_csr(
-            block_tables,
-            batch_size,
-        )
-        dense_block_tables = page_indices.view(batch_size, block_tables.shape[-1])
+        fixed_block_tables = self._get_fixed_block_tables(block_tables, batch_size)
         seq_len_q = params.input_seq_length
         query = params.qkv_input.view(
             batch_size,
@@ -1290,7 +1158,7 @@ class PrimsTSFmha(PhasedFmha):
             attn.q_scaling * math.sqrt(int(attn.qk_nope_head_dim) + int(attn.qk_rope_head_dim))
         )
         mask_type = self._get_prims_mask_type(params.fwd)
-        seq_lens = self._get_mla_sequence_lengths(
+        seq_lens = self._get_sequence_lengths(
             params.sequence_lengths,
             batch_size,
         )
@@ -1312,7 +1180,7 @@ class PrimsTSFmha(PhasedFmha):
         wrapper.run(
             query,
             kv_cache,
-            block_tables=dense_block_tables,
+            block_tables=fixed_block_tables,
             seq_lens=seq_lens,
             out=output,
             bmm1_scale=bmm1_scale,

@@ -61,7 +61,6 @@ from ...placeholder_helpers import (
 from .helpers_common import (
     _TASK_CACHE_KV_PAGE_IDX_UB,
     _TASK_CACHE_KV_RAW_TILE_BASE,
-    _TASK_CACHE_KV_REQUEST_BEGIN,
     Constexpr,
     DecodeGenResourceBase,
     ResourceVars,
@@ -1133,8 +1132,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     page_idx_kv: cute.Pointer | None = None
     seqlens_kv: cute.Pointer | None = None
     use_native_paged_kv: Constexpr[bool] = False
-    paged_kv_indptr: cute.Pointer | None = None
-    paged_kv_indices: cute.Pointer | None = None
+    block_tables: cute.Pointer | None = None
+    block_table_row_stride: cutlass.Int64 = None
     max_seq_len_kv: Int32 = None
     h_k_idx: Int32 = None
     b_idx: Int32 = None
@@ -1334,10 +1333,11 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         pages_per_tile = Int32(cfg.tile_size_kv // cfg.num_tokens_per_page)
         if cutlass.const_expr(self.use_native_paged_kv):
             task_cache = _decode_gen_task_cache(stage_info)
-            request_begin = Int32(task_cache[_TASK_CACHE_KV_REQUEST_BEGIN])
             page_idx_ub = Int32(task_cache[_TASK_CACHE_KV_PAGE_IDX_UB])
-            page_table_offset = request_begin
-            page_idx_kv = self.paged_kv_indices
+            page_table_offset = (
+                cutlass.Int64(logical_b_idx) * self.block_table_row_stride
+            )
+            page_idx_kv = self.block_tables
         else:
             if cutlass.const_expr(self.seqlens_kv is None):
                 page_idx_ub = Int32(cfg.max_num_pages_per_seq_kv - 1)

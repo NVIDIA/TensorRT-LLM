@@ -335,8 +335,9 @@ def _build_decode_gen_schedule(
     use_variable_seqlens_kv: bool = False,
     use_native_paged_kv: bool = False,
     use_static_native_seqlens_kv: bool = False,
-    paged_kv_indptr: cute.Pointer | None = None,
-    paged_kv_indices: cute.Pointer | None = None,
+    block_tables: cute.Pointer | None = None,
+    block_table_capacity: Int32 | None = None,
+    block_table_row_stride: Int64 | None = None,
     sparse_row_route_offsets: cute.Pointer | None = None,
     sparse_row_route_counts: cute.Pointer | None = None,
     sparse_route_metadata: cute.Pointer | None = None,
@@ -376,6 +377,14 @@ def _build_decode_gen_schedule(
         )
     if use_native_paged_kv and not cfg.use_paged_kv:
         raise ValueError("native paged-KV ABI requires cfg.use_paged_kv=True")
+    if use_native_paged_kv and (
+        block_tables is None
+        or block_table_capacity is None
+        or block_table_row_stride is None
+    ):
+        raise ValueError(
+            "native paged-KV ABI requires block tables, capacity, and row stride"
+        )
     if cfg.use_paged_kv:
         cfg.validate_paged_kv_staging_config()
     if cfg.use_block_sparse:
@@ -812,8 +821,8 @@ def _build_decode_gen_schedule(
         seq_len_q=seq_len_q,
         name="smemQ",
     )
-    # FlashInfer materializes one canonical sequence-length tensor from its
-    # native CSR metadata, so native mode reuses the existing variable-length
+    # Native callers provide one canonical sequence-length tensor alongside
+    # their fixed page table, so native mode reuses the existing variable-length
     # domain, split, sliding-window, and masking paths.
     use_runtime_seqlens_kv = use_variable_seqlens_kv or (
         use_native_paged_kv and not use_static_native_seqlens_kv
@@ -829,8 +838,8 @@ def _build_decode_gen_schedule(
             page_idx_kv=page_idx_kv,
             seqlens_kv=kv_seqlens,
             use_native_paged_kv=use_native_paged_kv,
-            paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
+            block_tables=block_tables,
+            block_table_row_stride=block_table_row_stride,
             max_seq_len_kv=max_seq_len_kv,
             h_k_idx=h_k_idx,
             b_idx=b_idx,
@@ -850,8 +859,8 @@ def _build_decode_gen_schedule(
                 page_idx_kv=page_idx_kv,
                 seqlens_kv=kv_seqlens,
                 use_native_paged_kv=use_native_paged_kv,
-                paged_kv_indptr=paged_kv_indptr,
-                paged_kv_indices=paged_kv_indices,
+                block_tables=block_tables,
+                block_table_row_stride=block_table_row_stride,
                 max_seq_len_kv=max_seq_len_kv,
                 h_k_idx=h_k_idx,
                 b_idx=b_idx,
@@ -1300,7 +1309,9 @@ def _build_decode_gen_schedule(
                 domain_bias=0,
                 warp_idx=page_offsets_warp_idx,
                 num_warps=cfg.page_offsets_num_warps,
-                paged_kv_indptr=(paged_kv_indptr if use_native_paged_kv else None),
+                block_table_capacity=(
+                    block_table_capacity if use_native_paged_kv else None
+                ),
                 **task_runtime_kwargs,
             )
         else:
@@ -1317,7 +1328,9 @@ def _build_decode_gen_schedule(
                 domain_bias=0,
                 warp_idx=page_offsets_warp_idx,
                 num_warps=cfg.page_offsets_num_warps,
-                paged_kv_indptr=(paged_kv_indptr if use_native_paged_kv else None),
+                block_table_capacity=(
+                    block_table_capacity if use_native_paged_kv else None
+                ),
                 **task_runtime_kwargs,
             )
     if use_one_inst_qkv:
@@ -1963,8 +1976,9 @@ def _run_decode_gen_active(
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
-    g_paged_kv_indptr: cute.Pointer | None = None,
-    g_paged_kv_indices: cute.Pointer | None = None,
+    g_block_tables: cute.Pointer | None = None,
+    g_block_table_capacity: Int32 | None = None,
+    g_block_table_row_stride: Int64 | None = None,
     g_sparse_row_route_offsets: cute.Pointer | None = None,
     g_sparse_row_route_counts: cute.Pointer | None = None,
     g_sparse_route_metadata: cute.Pointer | None = None,
@@ -2082,8 +2096,9 @@ def _run_decode_gen_active(
         use_variable_seqlens_kv=use_variable_seqlens_kv,
         use_native_paged_kv=use_native_paged_kv,
         use_static_native_seqlens_kv=use_static_native_seqlens_kv,
-        paged_kv_indptr=g_paged_kv_indptr,
-        paged_kv_indices=g_paged_kv_indices,
+        block_tables=g_block_tables,
+        block_table_capacity=g_block_table_capacity,
+        block_table_row_stride=g_block_table_row_stride,
         sparse_row_route_offsets=g_sparse_row_route_offsets,
         sparse_row_route_counts=g_sparse_row_route_counts,
         sparse_route_metadata=g_sparse_route_metadata,
@@ -2243,8 +2258,9 @@ def _run_decode_gen_runtime_prefix(
     use_variable_seqlens_kv: cutlass.Constexpr[bool],
     use_native_paged_kv: cutlass.Constexpr[bool],
     use_static_native_seqlens_kv: cutlass.Constexpr[bool],
-    g_paged_kv_indptr: cute.Pointer | None,
-    g_paged_kv_indices: cute.Pointer | None,
+    g_block_tables: cute.Pointer | None,
+    g_block_table_capacity: Int32 | None,
+    g_block_table_row_stride: Int64 | None,
     g_sparse_row_route_offsets: cute.Pointer | None,
     g_sparse_row_route_counts: cute.Pointer | None,
     g_sparse_route_metadata: cute.Pointer | None,
@@ -2306,8 +2322,9 @@ def _run_decode_gen_runtime_prefix(
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
                 use_static_native_seqlens_kv,
-                g_paged_kv_indptr,
-                g_paged_kv_indices,
+                g_block_tables,
+                g_block_table_capacity,
+                g_block_table_row_stride,
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
@@ -2348,8 +2365,9 @@ def _run_decode_gen_runtime_prefix(
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
                 use_static_native_seqlens_kv,
-                g_paged_kv_indptr,
-                g_paged_kv_indices,
+                g_block_tables,
+                g_block_table_capacity,
+                g_block_table_row_stride,
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
@@ -2384,8 +2402,9 @@ def decode_gen_kernel(
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
-    g_paged_kv_indptr: cute.Pointer | None = None,
-    g_paged_kv_indices: cute.Pointer | None = None,
+    g_block_tables: cute.Pointer | None = None,
+    g_block_table_capacity: Int32 | None = None,
+    g_block_table_row_stride: Int64 | None = None,
     g_sparse_row_route_offsets: cute.Pointer | None = None,
     g_sparse_row_route_counts: cute.Pointer | None = None,
     g_sparse_route_metadata: cute.Pointer | None = None,
@@ -2445,8 +2464,9 @@ def decode_gen_kernel(
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
                 use_static_native_seqlens_kv,
-                g_paged_kv_indptr,
-                g_paged_kv_indices,
+                g_block_tables,
+                g_block_table_capacity,
+                g_block_table_row_stride,
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
@@ -2484,8 +2504,9 @@ def decode_gen_kernel(
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
                 use_static_native_seqlens_kv,
-                g_paged_kv_indptr,
-                g_paged_kv_indices,
+                g_block_tables,
+                g_block_table_capacity,
+                g_block_table_row_stride,
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
@@ -2520,8 +2541,9 @@ def fmha_decode_launch(
     seq_len_kv: cutlass.Constexpr[int] = 2048,
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
-    paged_kv_indptr_iter: cute.Pointer | None = None,
-    paged_kv_indices_iter: cute.Pointer | None = None,
+    block_tables_iter: cute.Pointer | None = None,
+    block_table_capacity: Int32 = 0,
+    block_table_row_stride: Int64 = 0,
     num_physical_kv_pages: Int64 = 0,
     k_page_stride: Int64 = 0,
     v_page_stride: Int64 = 0,
@@ -2754,8 +2776,9 @@ def fmha_decode_launch(
         use_variable_seqlens_kv,
         use_native_paged_kv,
         use_static_native_seqlens_kv,
-        paged_kv_indptr_iter,
-        paged_kv_indices_iter,
+        block_tables_iter,
+        block_table_capacity,
+        block_table_row_stride,
         null_sparse_route_ptr,
         null_sparse_route_ptr,
         null_sparse_route_ptr,
@@ -2978,8 +3001,9 @@ def fmha_block_sparse_launch(
         use_variable_seqlens_kv,
         False,  # use_native_paged_kv
         False,  # use_static_native_seqlens_kv
-        null_i32_ptr,  # g_paged_kv_indptr
-        null_i32_ptr,  # g_paged_kv_indices
+        null_i32_ptr,  # g_block_tables
+        Int32(0),  # g_block_table_capacity
+        Int64(0),  # g_block_table_row_stride
         row_route_offsets_iter,
         row_route_counts_iter,
         route_metadata_iter,

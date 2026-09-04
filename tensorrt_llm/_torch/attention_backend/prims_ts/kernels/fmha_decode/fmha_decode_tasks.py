@@ -664,7 +664,7 @@ class DecodeGenTask(Task):
         """Capture decode-specific task config and initialize cache slots."""
         self.cfg = kwargs.pop("cfg", None)
         self.seqlens_kv = kwargs.pop("seqlens_kv", None)
-        self.paged_kv_indptr = kwargs.pop("paged_kv_indptr", None)
+        self.block_table_capacity = kwargs.pop("block_table_capacity", None)
         self.sparse_row_route_offsets = kwargs.pop("sparse_row_route_offsets", None)
         self.sparse_row_route_counts = kwargs.pop("sparse_row_route_counts", None)
         self.num_heads_kv = kwargs.pop("num_heads_kv", None)
@@ -961,17 +961,16 @@ class DecodeGenTask(Task):
         # can use the configured max length; variable-seqlen kernels read the
         # batch-specific length from GMEM.
         b_idx = cutlass.Int32(tile_coord[2])
-        if cutlass.const_expr(self.paged_kv_indptr is not None):
-            request_begin = cutlass.Int32(self.paged_kv_indptr[b_idx])
-            request_end = cutlass.Int32(self.paged_kv_indptr[b_idx + cutlass.Int32(1)])
-            self._kv_request_begin = request_begin
-            self._kv_page_idx_ub = request_end - request_begin - cutlass.Int32(1)
+        if cutlass.const_expr(self.block_table_capacity is not None):
+            self._kv_page_idx_ub = cutlass.Int32(
+                self.block_table_capacity
+            ) - cutlass.Int32(1)
         if self.seqlens_kv is None:
             seq_len_kv = cutlass.Int32(self.max_seq_len_kv)
         else:
             seq_len_kv = cutlass.Int32(self.seqlens_kv[b_idx])
         self._seq_len_kv = seq_len_kv
-        if cutlass.const_expr(self.paged_kv_indptr is not None):
+        if cutlass.const_expr(self.block_table_capacity is not None):
             self._kv_page_idx_ub = cute.math.min(
                 self._kv_page_idx_ub,
                 _runtime_last_valid_page_idx(self.cfg, seq_len_kv),
@@ -1392,7 +1391,7 @@ def create_page_offsets_task(
         smem_page_offsets.init_load_state()
         if hold_page_window:
             # K0's aligned 32-ID window covers every contiguous tile assigned
-            # to this split CTA, and native CSR uses those same IDs for V.
+            # to this split CTA, and the native table uses those IDs for V too.
             _page_offsets_produce(smem_page_offsets, "load_k0", FmhaStage.Head)
             # Preserve the runtime domain contract even though this fast path
             # needs no per-iteration page-window work.

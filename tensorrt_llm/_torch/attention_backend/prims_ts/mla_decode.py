@@ -265,6 +265,7 @@ def _validate_int32_cuda_tensor(
     name: str,
     *,
     ndim: int,
+    require_contiguous: bool = True,
     require_16byte_alignment: bool = True,
 ) -> None:
     if not isinstance(tensor, torch.Tensor):
@@ -275,7 +276,7 @@ def _validate_int32_cuda_tensor(
         raise TypeError(f"{name} must have dtype torch.int32")
     if tensor.device.type != "cuda":
         raise ValueError(f"{name} must be a CUDA tensor")
-    if not tensor.is_contiguous():
+    if require_contiguous and not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
     if require_16byte_alignment:
         _validate_16byte_alignment(tensor, name)
@@ -285,8 +286,19 @@ def _validate_mla_metadata(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
 ) -> tuple[torch.device, int, int]:
-    _validate_int32_cuda_tensor(block_tables, "block_tables", ndim=2)
-    _validate_int32_cuda_tensor(seq_lens, "seq_lens", ndim=1)
+    _validate_int32_cuda_tensor(
+        block_tables,
+        "block_tables",
+        ndim=2,
+        require_contiguous=False,
+        require_16byte_alignment=False,
+    )
+    _validate_int32_cuda_tensor(
+        seq_lens,
+        "seq_lens",
+        ndim=1,
+        require_16byte_alignment=False,
+    )
     if block_tables.device != seq_lens.device:
         raise ValueError("block_tables and seq_lens must be on the same device")
     batch_size = int(seq_lens.numel())
@@ -300,6 +312,17 @@ def _validate_mla_metadata(
     max_num_pages = int(block_tables.shape[1])
     if max_num_pages <= 0:
         raise ValueError("block_tables must contain at least one page column")
+    if block_tables.stride(1) != 1:
+        raise ValueError("block_tables must be contiguous within each row")
+    if block_tables.stride(0) < max_num_pages:
+        raise ValueError(
+            "block_tables rows must not overlap: row stride must be at least "
+            f"the column count ({max_num_pages}), got {block_tables.stride(0)}"
+        )
+    if block_tables.data_ptr() % 4 != 0:
+        raise ValueError("block_tables must be 4-byte aligned")
+    if seq_lens.data_ptr() % 4 != 0:
+        raise ValueError("seq_lens must be 4-byte aligned")
     _validate_mla_int32_extent(batch_size, "batch_size")
     _validate_mla_int32_extent(int(block_tables.numel()), "block_tables elements")
     return seq_lens.device, batch_size, max_num_pages
@@ -1133,8 +1156,8 @@ def _get_compiled_mla_decode(
     runtime_batch = cute.sym_int()
     runtime_total_q = cute.sym_int()
 
-    # These fake tensors pin the compact public ABI while allowing runtime
-    # page counts, table widths, and batch metadata pointers to vary.
+    # These fake tensors pin the public ABI while allowing runtime page counts,
+    # table widths/row strides, and batch metadata pointers to vary.
     q_stride_h = _MLA_QUERY_DIM
     q_stride_q = num_heads * _MLA_QUERY_DIM
     q_latent_shape: tuple[int, ...]
@@ -1175,11 +1198,12 @@ def _get_compiled_mla_decode(
         assumed_align=16,
     )
     runtime_page_columns = cute.sym_int()
+    runtime_page_row_stride = cute.sym_int64(divisibility=1)
     page_offsets_fake = cute.runtime.make_fake_tensor(
         cutlass.Int32,
         (runtime_page_columns, runtime_batch),
-        stride=(1, runtime_page_columns),
-        assumed_align=16,
+        stride=(1, runtime_page_row_stride),
+        assumed_align=4,
     )
     out_stride_row = num_heads * kv_lora_rank
     out_shape: tuple[int, ...]
@@ -1215,7 +1239,7 @@ def _get_compiled_mla_decode(
         cutlass.Int32,
         (runtime_batch,),
         stride_order=(0,),
-        assumed_align=16,
+        assumed_align=4,
     )
     qo_indptr_fake = None
     if packed_query:
@@ -1563,7 +1587,9 @@ def prims_ts_batch_decode_with_kv_cache_mla(
     the 512 latent and 64 RoPE dimensions. ``kv_cache`` accepts compact rank-3
     ``[pages, page_size, 576]`` or rank-4 ``[pages, 1, page_size, 576]``
     storage. ``block_tables`` and ``seq_lens`` follow FlashInfer's native dense
-    paged-cache ABI; ``max_seq_len`` is the exact static policy/JIT maximum.
+    paged-cache ABI. The table is contiguous within each row and may have
+    padding between rows; ``max_seq_len`` is the exact static policy/JIT
+    maximum.
     Causal masking is bottom-right aligned: query row ``i`` can attend through
     KV row ``seq_lens[b] - q_len[b] + i`` for request ``b``.
 
@@ -1592,7 +1618,8 @@ def prims_ts_batch_decode_with_kv_cache_mla(
     kv_lora_rank, qk_rope_head_dim : int
         Latent and RoPE dimensions.
     block_tables : torch.Tensor
-        Dense physical-page table for each request.
+        Dense physical-page table for each request. Rows must be inner
+        contiguous and non-overlapping, but may have padding between them.
     seq_lens : torch.Tensor
         Per-run K/V sequence lengths.
     max_seq_len : int
@@ -1919,7 +1946,8 @@ class BatchMLADecodePagedTSWrapper:
         kv_cache : torch.Tensor
             Runtime compact paged latent K/V cache.
         block_tables : torch.Tensor
-            Runtime physical-page table with one row per request.
+            Runtime physical-page table with one inner-contiguous,
+            non-overlapping row per request. Inter-row padding is accepted.
         seq_lens : torch.Tensor
             Runtime K/V lengths with one element per request.
         qo_indptr : torch.Tensor, optional
@@ -2028,7 +2056,8 @@ def batch_decode_mla_with_paged_kv_cache(
     kv_cache : torch.Tensor
         Compact paged latent K/V cache.
     block_tables : torch.Tensor
-        Dense physical-page table for each request.
+        Dense physical-page table for each request. Rows must be inner
+        contiguous and non-overlapping, but may have padding between them.
     seq_lens : torch.Tensor
         Per-run K/V sequence lengths.
     qo_indptr : torch.Tensor, optional

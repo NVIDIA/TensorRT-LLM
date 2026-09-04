@@ -350,10 +350,10 @@ class FmhaConfig:
     # ------------------------------------------------------------------
     # Paged KV cache (vLLM-style logical->physical page indirection)
     #
-    # Mirrors decode FmhaDecodeConfig: when use_paged_kv is True, K/V live in
-    # a fixed-size page pool [num_pages_in_pool, h_kv, num_tokens_per_page, d]
-    # and the kernel follows paged_kv_indptr/paged_kv_indices CSR metadata to
-    # resolve logical (b, s) -> physical page id at TMA-issue time.
+    # When use_paged_kv is True, K/V live in a fixed-size page pool
+    # [num_pages_in_pool, h_kv, num_tokens_per_page, d] and the kernel follows
+    # a fixed row-strided block table to resolve logical (b, s) -> physical page
+    # id at TMA-issue time.
     #
     # Staged D256 assigns page-offset prefetch to its empty/padding warp.
     # Paired D128 reads page IDs directly from the page table in its load task.
@@ -365,7 +365,7 @@ class FmhaConfig:
     fuse_epilogue_into_correction: bool = False
     num_tokens_per_page: int = 32
     # Static upper bound derived from max_kv_len during kernel construction.
-    # Runtime page-row bounds always come from paged_kv_indptr.
+    # Runtime active-page bounds come from seq_lens_kv.
     max_num_pages_per_seq_kv: int = 1
     page_offsets_num_warps: int = 1
     # Selected internally from the staged topology, static page geometry, and
@@ -790,7 +790,7 @@ class GmemQKVResource(MemoryResource):
     variable_window_q_stride: int | Int32 = field(init=False, default=0)
     q_offset_default: int | Int32 = field(init=False, default=0)
     seqlens_kv: cute.Pointer | None = field(init=False, default=None)
-    paged_kv_indptr: cute.Pointer | None = field(init=False, default=None)
+    block_table_row_stride: int | Int32 = field(init=False, default=0)
     max_seq_len_kv: Optional[Int32 | int] = field(init=False, default=None)
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     seq_coord: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -817,7 +817,7 @@ class GmemQKVResource(MemoryResource):
         q_offset: int | Int32,
         cfg: FmhaConfig,
         seqlens_kv: cute.Pointer | None = None,
-        paged_kv_indptr: cute.Pointer | None = None,
+        block_table_row_stride: int | Int32 = 0,
         max_seq_len_kv: Int32 | int | None = None,
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
@@ -833,7 +833,7 @@ class GmemQKVResource(MemoryResource):
         self.cum_seqlen_k = cum_seqlen_k
         self.q_offset_default = q_offset
         self.seqlens_kv = seqlens_kv
-        self.paged_kv_indptr = paged_kv_indptr
+        self.block_table_row_stride = block_table_row_stride
         self.max_seq_len_kv = max_seq_len_kv
         self.variable_window_token_starts = variable_window_token_starts
         self.variable_window_cta_starts = variable_window_cta_starts
@@ -897,7 +897,7 @@ class GmemQKVResource(MemoryResource):
         self.kv_request_begin = TaskLocalVariable(
             dtype=Int32,
             default=Int32(0),
-            docs="Offset of the request's first page ID in CSR values storage.",
+            docs="Element offset of the request's block-table row.",
         )
         self.kv_page_idx_ub = TaskLocalVariable(
             dtype=Int32,
@@ -971,8 +971,8 @@ class GmemQKVResource(MemoryResource):
                 next_cuseqlen_q = Int32(self.cum_seqlen_q[batch_coord + Int32(1)])
                 seqlen_q = next_cuseqlen_q - cuseqlen_q
             if cutlass.const_expr(self.cfg.use_paged_kv):
-                # Paged K/V is addressed through CSR rather than a packed
-                # token buffer, so it has no cumulative token offset.
+                # Paged K/V is addressed through a block table rather than a
+                # packed token buffer, so it has no cumulative token offset.
                 from .helpers_paged import _load_runtime_seq_len_kv
 
                 seqlen_k = _load_runtime_seq_len_kv(
@@ -993,10 +993,10 @@ class GmemQKVResource(MemoryResource):
             if cutlass.const_expr(
                 self.cfg.use_paged_kv and not self.cfg.stages_page_offsets_in_smem
             ):
-                from .helpers_paged import _load_paged_request_bounds
+                from .helpers_paged import _load_block_table_row_bounds
 
-                kv_request_begin, kv_page_idx_ub = _load_paged_request_bounds(
-                    self.paged_kv_indptr,
+                kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
+                    Int32(self.block_table_row_stride),
                     self.cfg,
                     seqlen_k,
                     batch_coord,
@@ -1070,10 +1070,10 @@ class GmemQKVResource(MemoryResource):
         cached_seqlen_kv = _load_runtime_seq_len_kv(
             self.seqlens_kv, self.max_seq_len_kv, batch_coord
         )
-        from .helpers_paged import _load_paged_request_bounds
+        from .helpers_paged import _load_block_table_row_bounds
 
-        kv_request_begin, kv_page_idx_ub = _load_paged_request_bounds(
-            self.paged_kv_indptr,
+        kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
+            Int32(self.block_table_row_stride),
             self.cfg,
             cached_seqlen_kv,
             batch_coord,
@@ -1343,7 +1343,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
     The staged D256 path uses a dedicated warp to prefetch page-table
     entries for the next K/V tile so the TMA load warp can read SMEM-cached
     offsets. Each pipeline stage holds one topology-derived page-ID window
-    from the request's CSR row; all 32 lanes co-load it. ``page_ids`` slices
+    from the request's fixed-table row; all 32 lanes co-load it. ``page_ids`` slices
     ``pages_per_tile`` entries for the current tile.
 
     Differences from decode:
@@ -1356,7 +1356,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
     """
 
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
-    paged_kv_indices: cute.Pointer | None = field(init=False, default=None)
+    block_tables: cute.Pointer | None = field(init=False, default=None)
     page_table_is_v: Constexpr[bool] = field(init=False, default=False)
     _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
     _smem_page_offsets: cutlass.Array = field(init=False, default=None)
@@ -1364,7 +1364,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
 
     def __init__(
         self,
-        paged_kv_indices: cute.Pointer | None,
+        block_tables: cute.Pointer | None,
         pipeline_config: PipelineConfig,
         cfg: FmhaConfig,
         page_table_is_v: bool = False,
@@ -1376,7 +1376,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
         pipeline_config = replace(pipeline_config, advance_on_wait=True)
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
-        self.paged_kv_indices = paged_kv_indices
+        self.block_tables = block_tables
         self.page_table_is_v = page_table_is_v
         num_stages = pipeline_config.num_stages
         total_entries = num_stages * cfg.page_table_window_entries
@@ -1474,7 +1474,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
         )
         pages_per_tile = Int32(cfg.kv_tile_n // cfg.num_tokens_per_page)
 
-        paged_kv_indices = self.paged_kv_indices
+        block_tables = self.block_tables
         smem_page_offsets = self._smem_page_offsets
         lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
         # Lanes cooperatively fetch one topology-derived aligned window. A
@@ -1493,7 +1493,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
             )
             prims.cp_async_shared_global(
                 smem_page_offsets.data_ptr() + grouped_smem_base + lane_offset,
-                paged_kv_indices + kv_request_begin + grouped_logical_page_idx,
+                block_tables + kv_request_begin + grouped_logical_page_idx,
                 4,
                 "ca",
             )
@@ -1608,7 +1608,7 @@ class SmemKVResource(MemoryResource):
     page_offsets_v: Optional["SmemPageOffsetsKvResource"] = field(
         init=False, default=None
     )
-    paged_kv_indices: cute.Pointer | None = field(init=False, default=None)
+    block_tables: cute.Pointer | None = field(init=False, default=None)
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
     desc_k_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -1622,7 +1622,7 @@ class SmemKVResource(MemoryResource):
         cfg: FmhaConfig,
         page_offsets_kv: Optional["SmemPageOffsetsKvResource"] = None,
         page_offsets_v: Optional["SmemPageOffsetsKvResource"] = None,
-        paged_kv_indices: cute.Pointer | None = None,
+        block_tables: cute.Pointer | None = None,
         **kwargs: Any,
     ) -> None:
         """Bind K/V TMA descriptors and reserve shared SMEM staging."""
@@ -1633,7 +1633,7 @@ class SmemKVResource(MemoryResource):
         self.page_offsets_v = (
             page_offsets_v if page_offsets_v is not None else page_offsets_kv
         )
-        self.paged_kv_indices = paged_kv_indices
+        self.block_tables = block_tables
         self.cfg = cfg
         total_elements = cfg.sK_shape[0] * cfg.sK_shape[1]
         size_bytes = total_elements * cfg.k_dtype.width // 8
@@ -1736,9 +1736,9 @@ class SmemKVResource(MemoryResource):
                         # Reading its four contiguous page IDs directly avoids
                         # a producer warp spinning on an always-full auxiliary
                         # pipeline and leaves that warp available for CLC.
-                        # K and V share the same CSR logical-to-physical page
-                        # row. Clamp both to the row capacity and to the pages
-                        # covered by the request's runtime sequence length.
+                        # K and V share the same fixed logical-to-physical page
+                        # row. Clamp both to the pages covered by the request's
+                        # runtime sequence length so padding IDs are untouched.
                         logical_page_idx = tile_idx * Int32(pages_per_tile)
                         page_ids = cutlass.Array(
                             Int32,
@@ -1750,9 +1750,7 @@ class SmemKVResource(MemoryResource):
                                 logical_page_idx + Int32(frag), kv_page_idx_ub
                             )
                             page_ids[frag] = Int32(
-                                self.paged_kv_indices[
-                                    kv_request_begin + clamped_page_idx
-                                ]
+                                self.block_tables[kv_request_begin + clamped_page_idx]
                             )
                 for frag in cutlass.range_constexpr(pages_per_tile):
                     page_id = Int32(page_ids[frag])

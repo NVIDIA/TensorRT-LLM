@@ -670,8 +670,8 @@ def build_context_task_manager(
     variable_window_q_stride: int | Int32 = 0,
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
-    g_paged_kv_indptr: cute.Pointer | None = None,
-    g_paged_kv_indices: cute.Pointer | None = None,
+    g_block_tables: cute.Pointer | None = None,
+    block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
     num_kv_tiles: int | Int32,
@@ -964,7 +964,7 @@ def build_context_task_manager(
         q_offset=q_offset,
         cfg=cfg,
         seqlens_kv=g_seq_lens_kv,
-        paged_kv_indptr=g_paged_kv_indptr,
+        block_table_row_stride=block_table_row_stride,
         max_seq_len_kv=max_seq_len_kv,
         variable_window_token_starts=variable_window_token_starts,
         variable_window_cta_starts=variable_window_cta_starts,
@@ -981,7 +981,7 @@ def build_context_task_manager(
     smem_page_offsets_v: SmemPageOffsetsKvResource | None = None
     if cfg.stages_page_offsets_in_smem:
         smem_page_offsets_kv = SmemPageOffsetsKvResource(
-            paged_kv_indices=g_paged_kv_indices,
+            block_tables=g_block_tables,
             pipeline_config=smem_page_offsets_pipeline_cfg,
             cfg=cfg,
             name="smem_page_offsets_kv",
@@ -993,7 +993,7 @@ def build_context_task_manager(
             # public paged API supplies one shared page-ID row, so it retains
             # one stage for both sides.
             smem_page_offsets_v = SmemPageOffsetsKvResource(
-                paged_kv_indices=g_paged_kv_indices,
+                block_tables=g_block_tables,
                 pipeline_config=smem_page_offsets_v_pipeline_cfg,
                 cfg=cfg,
                 page_table_is_v=True,
@@ -1006,7 +1006,7 @@ def build_context_task_manager(
         cfg=cfg,
         page_offsets_kv=smem_page_offsets_kv,
         page_offsets_v=smem_page_offsets_v,
-        paged_kv_indices=g_paged_kv_indices,
+        block_tables=g_block_tables,
         name="smem_kv",
     )
 
@@ -2239,8 +2239,8 @@ def build_fmha_task_manager(
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
     q_offset: int | Int32 = 0,
-    g_paged_kv_indptr: cute.Pointer | None = None,
-    g_paged_kv_indices: cute.Pointer | None = None,
+    g_block_tables: cute.Pointer | None = None,
+    block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
     is_persistent: bool = True,
@@ -2330,8 +2330,8 @@ def build_fmha_task_manager(
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
-        g_paged_kv_indptr=g_paged_kv_indptr,
-        g_paged_kv_indices=g_paged_kv_indices,
+        g_block_tables=g_block_tables,
+        block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
         max_seq_len_kv=max_seq_len_kv,
         num_kv_tiles=domain_num_kv_tiles,
@@ -2393,7 +2393,7 @@ class FmhaTs:
     enable_skip_correction : bool, optional
         Enable skip-correction for softmax rescaling (default: True).
     use_paged_kv : bool, optional
-        Read K/V from a physical page pool through CSR page metadata.
+        Read K/V from a physical page pool through a fixed block table.
     num_tokens_per_page : int, optional
         Number of K/V tokens stored in each physical page (default: 32).
     max_kv_len : int, optional
@@ -2630,8 +2630,7 @@ class FmhaTs:
         cum_seqlen_k: cute.Tensor | None = None,
         max_seqlen_q: Int32 | None = None,
         max_seqlen_k: Int32 | None = None,
-        paged_kv_indptr: cute.Tensor | None = None,
-        paged_kv_indices: cute.Tensor | None = None,
+        block_tables: cute.Tensor | None = None,
         seq_lens_kv: cute.Tensor | None = None,
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_token_ends: cute.Tensor | None = None,
@@ -2650,16 +2649,15 @@ class FmhaTs:
             cfg.use_paged_kv
             and (
                 cum_seqlen_q is None
-                or paged_kv_indptr is None
-                or paged_kv_indices is None
+                or block_tables is None
                 or seq_lens_kv is None
                 or max_seqlen_q is None
                 or max_seqlen_k is None
             )
         ):
             raise ValueError(
-                "paged context requires qo_indptr, paged_kv_indptr, "
-                "paged_kv_indices, seq_lens_kv, max_seqlen_q, and max_seqlen_k"
+                "paged context requires qo_indptr, block_tables, seq_lens_kv, "
+                "max_seqlen_q, and max_seqlen_k"
             )
         if cutlass.const_expr(cfg.has_variable_window):
             if cutlass.const_expr(
@@ -2885,18 +2883,18 @@ class FmhaTs:
 
         block_size = cfg.block_warps * 32
 
-        # Paged-KV side-channel data: CSR row offsets/page IDs plus per-batch
-        # K/V lengths. None in the contiguous path; the kernel branches on
-        # ``cfg.use_paged_kv`` so passing None is safe.
-        paged_kv_indptr_iter = (
-            paged_kv_indptr.iterator
-            if cutlass.const_expr(paged_kv_indptr is not None)
+        # Paged-KV side-channel data: one fixed row-strided page table plus
+        # per-batch K/V lengths. None in the contiguous path; the kernel
+        # branches on ``cfg.use_paged_kv`` so passing None is safe.
+        block_tables_iter = (
+            block_tables.iterator
+            if cutlass.const_expr(block_tables is not None)
             else None
         )
-        paged_kv_indices_iter = (
-            paged_kv_indices.iterator
-            if cutlass.const_expr(paged_kv_indices is not None)
-            else None
+        block_table_row_stride = (
+            Int32(block_tables.stride[0])
+            if cutlass.const_expr(block_tables is not None)
+            else Int32(0)
         )
         seq_lens_kv_iter = (
             seq_lens_kv.iterator
@@ -2917,8 +2915,8 @@ class FmhaTs:
             q_offset,
             cum_seqlen_q,
             cum_seqlen_k,
-            paged_kv_indptr_iter,
-            paged_kv_indices_iter,
+            block_tables_iter,
+            block_table_row_stride,
             seq_lens_kv_iter,
             Int32(s_k),
             variable_window_token_starts,
@@ -2957,8 +2955,8 @@ class FmhaTs:
         q_offset: Int32,
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
-        paged_kv_indptr: cute.Pointer | None,
-        paged_kv_indices: cute.Pointer | None,
+        block_tables: cute.Pointer | None,
+        block_table_row_stride: Int32,
         seq_lens_kv: cute.Pointer | None,
         max_seq_len_kv: Int32 | None,
         variable_window_token_starts: cute.Tensor | None,
@@ -3017,8 +3015,8 @@ class FmhaTs:
             tma_o_desc=tma_o_desc.get_ptr(),
             cum_seqlen_q=cum_seqlen_q,
             cum_seqlen_k=cum_seqlen_k,
-            g_paged_kv_indptr=paged_kv_indptr,
-            g_paged_kv_indices=paged_kv_indices,
+            g_block_tables=block_tables,
+            block_table_row_stride=block_table_row_stride,
             g_seq_lens_kv=seq_lens_kv,
             max_seq_len_kv=max_seq_len_kv,
             num_kv_tiles=num_kv_tiles,
