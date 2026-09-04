@@ -117,6 +117,7 @@ add_library(
   sparseKvCacheCompactOp.cpp
   minimaxM3SelectBlocksOp.cpp
   minimaxM3Fp8IndexerOp.cpp
+  hisparseSwapInOp.cpp
   mlaRopeInplaceOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp

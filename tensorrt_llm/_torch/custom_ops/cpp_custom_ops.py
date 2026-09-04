@@ -1561,6 +1561,18 @@ def _register_fake():
         k_scale = k_cache.new_empty([num_tokens, 1], dtype=torch.float32)
         return k_fp8, k_scale
 
+    @torch.library.register_fake("trtllm::hisparse_swap_in_blocks")
+    def _(top_k_blocks: torch.Tensor, device_buffer_blocks: torch.Tensor,
+          host_block_locs: torch.Tensor, device_buffer_locs: torch.Tensor,
+          host_cache_k: torch.Tensor, host_cache_v: torch.Tensor,
+          device_buffer_k: torch.Tensor, device_buffer_v: torch.Tensor,
+          top_k_device_locs: torch.Tensor, req_pool_indices: torch.Tensor,
+          seq_lens_blocks: torch.Tensor, lru_slots: torch.Tensor,
+          num_real_reqs: torch.Tensor, num_top_k: int, hot_buffer_size: int,
+          item_size_bytes: int, cuda_block_size: int) -> None:
+        # In-place swap-in: all outputs are mutated arguments, nothing returned.
+        return None
+
     @torch.library.register_fake("trtllm::allocate_output")
     def _(like: torch.Tensor,
           output_buffer_kind: int,
