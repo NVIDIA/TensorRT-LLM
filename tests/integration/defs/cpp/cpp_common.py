@@ -4,13 +4,7 @@ import logging as _logger
 import os as _os
 import pathlib as _pl
 import subprocess as _sp
-import sys as _sys
 from typing import Generator, List, Optional, Sequence
-
-build_script_dir = _pl.Path(
-    __file__).parent.resolve().parent.parent.parent.parent / "scripts"
-assert build_script_dir.is_dir()
-_sys.path.append(str(build_script_dir))
 
 from build_wheel import get_build_dir as get_trt_llm_build_dir
 
