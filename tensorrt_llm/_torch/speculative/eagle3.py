@@ -819,6 +819,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         attn_metadata.use_spec_decoding = True
 
+        # Commit model-owned target state only after draft preparation has
+        # succeeded; SpecWorkerBase aborts the still-pending snapshots on any
+        # exception above this point.
+        if self._auxiliary_state_handlers:
+            self.commit_auxiliary_speculative_states(
+                num_accepted_tokens,
+                attn_metadata.mamba_metadata.state_indices[:batch_size],
+                num_contexts,
+            )
+
         return {
             'logits': raw_logits,
             'new_tokens': accepted_tokens,
@@ -1048,12 +1058,23 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     elif lm_head_tp_in_adp_configured:
                         # Advanced-sampling bypass: the model's shared_head
                         # would re-apply the LM-head-TP stacked/sharded path
-                        # from config on its own, so call lm_head directly.
-                        # Under ADP the LMHead weight is replicated and
-                        # is_spec_decoding_head defaults to False, so this is
-                        # a plain local full-vocab GEMM over this rank's own
-                        # rows -- the same computation the target head runs.
-                        logits = draft_model.lm_head(hidden_states[gather_ids])
+                        # from config on its own. Under ADP the LMHead weight
+                        # is replicated, so project this rank's own rows to the
+                        # full vocabulary. Model-specific shared heads may need
+                        # preprocessing before that local projection.
+                        shared_head = draft_model.mtp_layers[0].shared_head
+                        local_full_vocab_forward = getattr(
+                            shared_head, "forward_local_full_vocab", None)
+                        if local_full_vocab_forward is None:
+                            logits = draft_model.lm_head(
+                                hidden_states[gather_ids])
+                        else:
+                            logits = local_full_vocab_forward(
+                                hidden_states[gather_ids],
+                                draft_model.lm_head,
+                                attn_metadata,
+                                True,
+                            )
                     else:
                         logits = draft_model.mtp_layers[0].shared_head(
                             hidden_states[gather_ids], draft_model.lm_head,

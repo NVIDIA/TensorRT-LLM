@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Type
+from typing import TYPE_CHECKING, List, Optional, Protocol, Type
 
 import torch
 from packaging.version import Version
@@ -1424,6 +1424,22 @@ class SpecMetadata:
         self._sampling_params_signature[1] = None
 
 
+class AuxiliarySpeculativeStateHandler(Protocol):
+    """Model-side state that verification writes once per draft token.
+
+    Only some draft tokens are accepted. The commit keeps the state written
+    for the accepted ones and undoes the rest.
+    """
+
+    def commit_speculative_states(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_contexts: int,
+    ) -> None:
+        ...
+
+
 class SpecWorkerBase(nn.Module, ABC):
     """
     Base class for speculative decoding workers.
@@ -1455,6 +1471,26 @@ class SpecWorkerBase(nn.Module, ABC):
         # seed/offset pattern in `_sample_tokens_for_batch`).
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
+        self._auxiliary_state_handlers: list[
+            AuxiliarySpeculativeStateHandler] = []
+
+    def register_auxiliary_state_handler(
+            self, handler: AuxiliarySpeculativeStateHandler) -> None:
+        """Register one model-owned state handler without re-parenting the module."""
+        if not any(registered is handler
+                   for registered in self._auxiliary_state_handlers):
+            self._auxiliary_state_handlers.append(handler)
+
+    def commit_auxiliary_speculative_states(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_contexts: int,
+    ) -> None:
+        """Promote registered model-side states using accepted token counts."""
+        for handler in self._auxiliary_state_handlers:
+            handler.commit_speculative_states(num_accepted_tokens,
+                                              state_indices, num_contexts)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
