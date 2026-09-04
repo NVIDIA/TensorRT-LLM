@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstring>
+#include <dlfcn.h>
 #include <filesystem>
 #include <limits>
 #include <linux/limits.h>
@@ -696,10 +697,11 @@ private:
             }
 #endif
 
-            // FIRST, ask the PACKAGE where it is -- not pip where it is recorded.
+            // FIRST, ask the loaded library where IT is -- not pip where the package is
+            // recorded, and not a child interpreter where it merely happens to be importable.
             //
             // `pip show` answers from an install record, and the record can disagree with the
-            // module the running interpreter actually imported:
+            // package this process actually loaded:
             //   * a stale record survives `pip uninstall` when the files it names are already
             //     gone ("Can't uninstall 'tensorrt_llm'. No files were found to uninstall.")
             //     and keeps being reported afterwards;
@@ -709,48 +711,49 @@ private:
             //     not tried at all.
             //
             // Observed: a wheel installed into dist-packages, its headers present at
-            // <dist-packages>/tensorrt_llm/include/trtllm_gen_kernels/fmha, `pip show`
-            // reporting a source tree that had since been removed, and this assertion firing
-            // while the files were on disk in the package being executed.
+            // <package>/include/trtllm_gen_kernels/fmha, `pip show` naming a source tree that
+            // had since been removed, and this assertion firing while the files were on disk
+            // in the package being executed.
             //
-            // __file__ of the imported module cannot disagree with what is imported, so it is
-            // tried first and the pip path below is left exactly as it was as the fallback.
+            // dladdr() names the file this very code was loaded from, so the answer is the
+            // running package by construction: no subprocess, no PATH resolution, and no
+            // second interpreter that could import a different tensorrt_llm than the one this
+            // process already holds. setup.py installs libs/ and include/ as siblings inside
+            // the package directory, so walk up from the library and take the first ancestor
+            // carrying the fmha include directory -- that covers <package>/libs/*.so without
+            // hard-coding how deep the library sits. The pip path below is left exactly as it
+            // was, as the fallback for layouts this does not cover.
             {
-                char const* modCmd
-                    = "python3 -c \"import tensorrt_llm, os; "
-                      "print(os.path.dirname(tensorrt_llm.__file__))\" 2>/dev/null";
-#ifdef _MSC_VER
-                FILE* modPipe = _popen(modCmd, "r");
-#else
-                FILE* modPipe = popen(modCmd, "r");
-#endif
-                if (modPipe)
+                Dl_info dlInfo{};
+                // Any static-storage address declared here lives in the object this code was
+                // linked into, which is precisely the object we want dladdr() to name.
+                if (dladdr(static_cast<void const*>(&execPathStr), &dlInfo) != 0 && dlInfo.dli_fname != nullptr
+                    && dlInfo.dli_fname[0] != '\0')
                 {
-                    std::array<char, 512> modBuf;
-                    std::string modDir;
-                    while (fgets(modBuf.data(), modBuf.size(), modPipe) != nullptr)
+                    std::error_code ec;
+                    auto libPath = std::filesystem::weakly_canonical(dlInfo.dli_fname, ec);
+                    if (ec)
                     {
-                        modDir += modBuf.data();
+                        libPath = std::filesystem::path(dlInfo.dli_fname);
                     }
-#ifdef _MSC_VER
-                    _pclose(modPipe);
-#else
-                    pclose(modPipe);
-#endif
-                    modDir.erase(0, modDir.find_first_not_of(" \n\r\t"));
-                    auto endPos = modDir.find_last_not_of(" \n\r\t");
-                    if (endPos != std::string::npos)
+                    auto fmhaIncludeSuffix = std::filesystem::path("include") / "trtllm_gen_kernels" / "fmha";
+                    // <package>/libs/libtensorrt_llm.so needs two hops; the bound keeps an
+                    // unexpected layout from walking all the way out to the filesystem root.
+                    auto dir = libPath.parent_path();
+                    for (int hops = 0; hops < 3 && !dir.empty(); ++hops)
                     {
-                        modDir.erase(endPos + 1);
-                    }
-                    if (!modDir.empty())
-                    {
-                        auto fromModule = std::filesystem::path(modDir) / "include" / "trtllm_gen_kernels" / "fmha";
-                        if (std::filesystem::exists(fromModule))
+                        auto fromLibrary = dir / fmhaIncludeSuffix;
+                        if (std::filesystem::exists(fromLibrary, ec))
                         {
-                            execPathStr = (fromModule / "numb").string();
+                            execPathStr = (fromLibrary / "numb").string();
                             return execPathStr;
                         }
+                        auto parent = dir.parent_path();
+                        if (parent == dir)
+                        {
+                            break;
+                        }
+                        dir = std::move(parent);
                     }
                 }
             }
