@@ -263,12 +263,15 @@ def _run_worker_containment_coordinator(
         client._monitor_worker_liveness = True
         client._worker_failure = None
         client._shutdown_started = False
+        client._request_to_send = None
         client.shutdown_event = threading.Event()
         client.response_event = threading.Event()
 
         containment_deadline = time.monotonic() + 10.0
         while client._worker_failure is None and time.monotonic() < containment_deadline:
-            client._check_worker_liveness()
+            worker_failure = client._check_worker_liveness()
+            if worker_failure is not None:
+                client._abort_worker_group(worker_failure)
             time.sleep(0.001)
         if client._worker_failure is None:
             raise TimeoutError("coordinator did not detect the killed workers")
@@ -876,7 +879,8 @@ def test_worker_death_during_request_send_is_contained() -> None:
     client.shutdown_event = threading.Event()
     client.response_event = MagicMock()
     client.pending_requests = executor_module.queue.Queue()
-    request = SimpleNamespace(request_id=789)
+    request = MagicMock()
+    request.request_id = 789
     client.pending_requests.put(request)
     client._request_to_send = None
     client.requests_ipc = MagicMock()
@@ -888,13 +892,38 @@ def test_worker_death_during_request_send_is_contained() -> None:
     assert client._worker_failure == (
         "DiffusionClient: local worker processes exited: pid=123, exitcode=-11"
     )
-    assert client._request_to_send is request
+    assert client._request_to_send is None
+    request.refs_from_shm.assert_called_once_with()
     dead_worker.kill.assert_not_called()
     live_worker.kill.assert_called_once_with()
     client._worker_spawner.reap_started_processes.assert_called_once_with()
     assert client.shutdown_event.is_set()
     client.response_event.set.assert_called_once_with()
     client._iter_stats.record_request_started.assert_not_called()
+
+
+def test_worker_liveness_check_does_not_abort_worker_group() -> None:
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    dead_worker = MagicMock()
+    dead_worker.pid = 123
+    dead_worker.exitcode = -signal.SIGSEGV
+    dead_worker.is_alive.return_value = False
+    live_worker = MagicMock()
+    live_worker.is_alive.return_value = True
+    client.worker_processes = [dead_worker, live_worker]
+    client._ext_worker_thread = None
+    client._monitor_worker_liveness = True
+    client._worker_failure = None
+    client._shutdown_started = False
+
+    worker_failure = client._check_worker_liveness()
+
+    assert worker_failure == (
+        "DiffusionClient: local worker processes exited: pid=123, exitcode=-11"
+    )
+    assert client._worker_failure is None
+    dead_worker.kill.assert_not_called()
+    live_worker.kill.assert_not_called()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="zombie state is observed through /proc")
@@ -924,6 +953,7 @@ def test_worker_failure_reaps_dead_and_contained_processes() -> None:
         client._monitor_worker_liveness = True
         client._worker_failure = None
         client._shutdown_started = False
+        client._request_to_send = None
         client.shutdown_event = threading.Event()
         client.response_event = threading.Event()
 
@@ -933,7 +963,9 @@ def test_worker_failure_reaps_dead_and_contained_processes() -> None:
         # that same bounded retry behavior rather than assuming one tick.
         deadline = time.monotonic() + 10.0
         while client._worker_failure is None and time.monotonic() < deadline:
-            client._check_worker_liveness()
+            worker_failure = client._check_worker_liveness()
+            if worker_failure is not None:
+                client._abort_worker_group(worker_failure)
             time.sleep(0.001)
 
         assert client._worker_failure == (
@@ -967,6 +999,7 @@ def test_worker_failure_shutdown_does_not_wait_for_thread_timeout() -> None:
     client._shutdown_error = None
     client._shutdown_thread = None
     client.pending_requests = executor_module.queue.Queue()
+    client._request_to_send = None
     client.shutdown_event = threading.Event()
     client.response_event = threading.Event()
     client.event_loop_ready = threading.Event()

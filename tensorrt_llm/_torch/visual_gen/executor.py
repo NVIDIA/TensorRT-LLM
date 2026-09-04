@@ -1177,6 +1177,17 @@ class DiffusionRemoteClient:
             finally:
                 self._close_socket(self.requests_ipc)
 
+    @staticmethod
+    def _discard_unsent_request(request: Optional[DiffusionRequest]) -> None:
+        if request is None:
+            return
+        try:
+            # Rebuilding an unsent shared-memory handle releases its producer
+            # reference. The restored request is discarded immediately.
+            request.refs_from_shm()
+        except RuntimeError as e:
+            logger.warning(f"DiffusionClient: Failed to release request {request.request_id}: {e}")
+
     def _process_requests(self):
         """Process pending requests."""
         req = None
@@ -1204,7 +1215,9 @@ class DiffusionRemoteClient:
             # A PUSH socket becomes non-writable when its worker peer exits.
             # Keep the request at the head of the coordinator's dispatch path
             # and recheck worker state before the next retry.
-            self._check_worker_liveness()
+            worker_failure = self._check_worker_liveness()
+            if worker_failure is not None:
+                self._abort_worker_group(worker_failure)
         except Exception as e:
             self._request_to_send = None
             logger.error(f"DiffusionClient: Error sending request: {e}")
@@ -1322,7 +1335,9 @@ class DiffusionRemoteClient:
             return
 
         while not self.shutdown_event.is_set():
-            self._check_worker_liveness()
+            worker_failure = self._check_worker_liveness()
+            if worker_failure is not None:
+                self._abort_worker_group(worker_failure)
             if self._worker_failure is None:
                 self._process_requests()
                 self._process_responses()
@@ -1337,26 +1352,23 @@ class DiffusionRemoteClient:
         while self._worker_failure is not None and not self._shutdown_started:
             await asyncio.sleep(POLL_TIMEOUT)
 
-    def _check_worker_liveness(self) -> None:
+    def _check_worker_liveness(self) -> Optional[str]:
         if (
             not self._monitor_worker_liveness
             or self._worker_failure is not None
             or self._shutdown_started
         ):
-            return
+            return None
 
         dead_workers = []
-        live_workers = []
         for process in self.worker_processes:
-            if process.is_alive():
-                live_workers.append(process)
-            else:
+            if not process.is_alive():
                 dead_workers.append((process.pid, process.exitcode))
         external_worker_dead = (
             self._ext_worker_thread is not None and not self._ext_worker_thread.is_alive()
         )
         if not dead_workers and not external_worker_dead:
-            return
+            return None
 
         if dead_workers:
             statuses = ", ".join(
@@ -1365,26 +1377,38 @@ class DiffusionRemoteClient:
             detail = f"local worker processes exited: {statuses}"
         else:
             detail = "external-launch worker thread exited"
-        self._worker_failure = f"DiffusionClient: {detail}"
+        return f"DiffusionClient: {detail}"
+
+    def _abort_worker_group(self, worker_failure: str) -> None:
+        """Record a terminal worker failure, then kill and reap the worker group."""
+        if self._worker_failure is not None or self._shutdown_started:
+            return
+
+        self._worker_failure = worker_failure
+        request_to_discard = self._request_to_send
+        self._request_to_send = None
         logger.error(self._worker_failure)
         self.shutdown_event.set()
         self.response_event.set()
 
-        # A distributed worker group cannot continue after losing a rank.
-        # SIGKILL the remaining local ranks immediately so they cannot retain
-        # model weights while callers observe the failure through result().
-        for process in live_workers:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-
-        worker_spawner = getattr(self, "_worker_spawner", None)
-        if worker_spawner is not None:
-            worker_spawner.reap_started_processes()
-        else:
+        try:
+            # A surviving rank may be blocked in a collective that can never
+            # complete after another rank exits, so containment is immediate.
             for process in self.worker_processes:
-                _reap_worker_process(process)
+                if process.is_alive():
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+
+            worker_spawner = getattr(self, "_worker_spawner", None)
+            if worker_spawner is not None:
+                worker_spawner.reap_started_processes()
+            else:
+                for process in self.worker_processes:
+                    _reap_worker_process(process)
+        finally:
+            self._discard_unsent_request(request_to_discard)
 
     def shutdown(self):
         """Shutdown client and workers."""

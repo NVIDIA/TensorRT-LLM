@@ -116,12 +116,15 @@ def test_sigkill_one_worker_contains_real_multi_gpu_group() -> None:
         client._monitor_worker_liveness = True
         client._worker_failure = None
         client._shutdown_started = False
+        client._request_to_send = None
         client.shutdown_event = threading.Event()
         client.response_event = threading.Event()
 
         deadline = time.monotonic() + 10.0
         while client._worker_failure is None and time.monotonic() < deadline:
-            client._check_worker_liveness()
+            worker_failure = client._check_worker_liveness()
+            if worker_failure is not None:
+                client._abort_worker_group(worker_failure)
             time.sleep(0.001)
 
         assert client._worker_failure == (
