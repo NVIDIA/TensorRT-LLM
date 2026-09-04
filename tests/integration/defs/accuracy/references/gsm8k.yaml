@@ -308,6 +308,13 @@ moonshotai/Kimi-K3:
   # SA spec dec is lossless; scores match the baseline within noise.
   - spec_dec_algo: SA
     accuracy: 96.5
+  # The NVFP4 requant (Kimi-K3-NVFP4), which ships hf_quant_config.json and so
+  # reads as MIXED_PRECISION. Same 96.5 as above on purpose: the MEGAMOE_CUTEDSL
+  # MoE kernel measures ~95.2 where CUTLASS measures 96.209 on these weights,
+  # and that gap belongs in a kernel fix, not in this threshold.
+  - quant_algo: MIXED_PRECISION
+    spec_dec_algo: DSpark
+    accuracy: 96.5
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8

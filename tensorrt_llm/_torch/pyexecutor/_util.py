@@ -1494,7 +1494,18 @@ class KvCacheCreator:
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
-        if self._mapping.enable_attention_dp:
+        if self._speculative_config is None:
+            # No drafter at all, so there is nothing to give a manager to.
+            return False
+        # Narrower than is_external_drafter(): PARD and DRAFT_TARGET_ONE_MODEL
+        # never reach the arena this carve-out exists for.
+        spec_dec_mode = self._speculative_config.spec_dec_mode
+        is_standalone_drafter = (spec_dec_mode.is_dflash()
+                                 or spec_dec_mode.is_dspark())
+        if self._mapping.enable_attention_dp and not is_standalone_drafter:
+            # This bail suits MTP, whose draft layers are target-shaped and
+            # appendable to the target pool. A standalone drafter has nothing to
+            # append, so it would be stranded on the private arena instead.
             logger.info(
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )

@@ -42,3 +42,10 @@ TestKimiK3::test_w4a16_mxfp4:
 TestQwen3_8B::test_dspark:
   ref_al: 6.259
   min_al: 5.946
+# Measured on 8x GB300 with this harness's stock prompt. Higher K3 DSpark
+# figures elsewhere are --apply_chat_template runs, worth ~40% acceptance.
+# min_al is a collapse tripwire: a drafter whose slots collapse scores 1.09
+# with every accuracy gate still green.
+TestKimiK3DSpark::test_gsm8k_tep8:
+  ref_al: 4.323
+  min_al: 4.0
