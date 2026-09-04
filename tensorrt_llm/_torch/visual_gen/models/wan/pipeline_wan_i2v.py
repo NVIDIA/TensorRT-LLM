@@ -16,6 +16,7 @@
 import json
 import os
 import time
+from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
 import diffusers
@@ -36,7 +37,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
 )
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
@@ -157,7 +158,7 @@ class WanImageToVideoPipeline(BasePipeline):
         return self.transformer.device
 
     @property
-    def transformer_components(self) -> list:
+    def transformer_components(self) -> list[str]:
         if self.transformer_2 is not None:
             return ["transformer", "transformer_2"]
         return ["transformer"]
@@ -402,26 +403,34 @@ class WanImageToVideoPipeline(BasePipeline):
 
     @property
     def extra_param_specs(self):
-        specs = get_wan_extra_param_specs(self.is_wan22_14b)
-        specs["last_image"] = ExtraParamSchema(
-            type="str",
-            default=None,
-            description="Last frame path for video interpolation (Wan I2V).",
-        )
-        return specs
+        return get_wan_extra_param_specs(self.is_wan22_14b)
+
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        # The last frame is what interpolation conditions on.
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[
+                    RoleSpec(role="first_frame", min=1, max=1),
+                    RoleSpec(role="last_frame", min=0, max=1),
+                ],
+            )
+        }
 
     def infer(self, req):
         """Run inference with request parameters."""
-        # Extract image from request (can be path, PIL Image, or torch.Tensor)
-        if req.params.image is None:
-            raise ValueError("I2V pipeline requires 'image' parameter")
-
-        image = req.params.image[0] if isinstance(req.params.image, list) else req.params.image
+        refs = req.params.image_reference
+        if not refs:
+            raise ValueError("I2V pipeline requires an image_reference (first_frame)")
+        by_role = {r.role: r for r in refs}
+        first = by_role.get("first_frame") or by_role.get(None)
+        if first is None:
+            raise ValueError("I2V pipeline requires a first_frame image_reference")
+        last = by_role.get("last_frame")
+        image = first.content
+        last_image = last.content if last is not None else None
         extra = req.params.extra_params or {}
-        last_image = extra.get("last_image")
-
-        if last_image is not None and isinstance(last_image, list):
-            last_image = last_image[0] if last_image else None
 
         return self.forward(
             image=image,
@@ -442,7 +451,7 @@ class WanImageToVideoPipeline(BasePipeline):
     @torch.no_grad()
     def forward(
         self,
-        image: Union[PIL.Image.Image, torch.Tensor, str],
+        image: Union[PIL.Image.Image, torch.Tensor, bytes],
         prompt: Union[str, List[str]],
         seed: int,
         negative_prompt: Optional[str] = None,
@@ -454,16 +463,16 @@ class WanImageToVideoPipeline(BasePipeline):
         guidance_scale_2: Optional[float] = None,
         boundary_ratio: Optional[float] = None,
         max_sequence_length: int = 512,
-        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
 
         # Validate image input — only single image is supported for batch generation
-        if not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
+        if not isinstance(image, (PIL.Image.Image, torch.Tensor, bytes)):
             raise ValueError(
-                f"`image` must be a PIL.Image, torch.Tensor, or file path string, "
+                f"`image` must be a PIL.Image, torch.Tensor, or encoded bytes, "
                 f"got {type(image)}. Batch of different images is not supported; "
                 f"use a single image with multiple prompts instead."
             )
@@ -715,14 +724,14 @@ class WanImageToVideoPipeline(BasePipeline):
 
     def _encode_image(
         self,
-        image: Union[PIL.Image.Image, torch.Tensor, str],
-        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        image: Union[PIL.Image.Image, torch.Tensor, bytes],
+        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
     ) -> torch.Tensor:
         """Encode image(s) using CLIP image encoder (Wan 2.1 I2V only)."""
-        if isinstance(image, str):
-            image = PIL.Image.open(image).convert("RGB")
-        if isinstance(last_image, str):
-            last_image = PIL.Image.open(last_image).convert("RGB")
+        if isinstance(image, bytes):
+            image = PIL.Image.open(BytesIO(image)).convert("RGB")
+        if isinstance(last_image, bytes):
+            last_image = PIL.Image.open(BytesIO(last_image)).convert("RGB")
 
         images_to_encode = [image] if last_image is None else [image, last_image]
 
@@ -736,12 +745,12 @@ class WanImageToVideoPipeline(BasePipeline):
     def _prepare_latents(
         self,
         batch_size: int,
-        image: Union[PIL.Image.Image, torch.Tensor, str],
+        image: Union[PIL.Image.Image, torch.Tensor, bytes],
         height: int,
         width: int,
         num_frames: int,
         generator: torch.Generator,
-        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Prepare latents with image conditioning for I2V generation."""
         num_channels_latents = 16
@@ -753,15 +762,15 @@ class WanImageToVideoPipeline(BasePipeline):
         latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
         # Load and preprocess image(s)
-        if isinstance(image, str):
-            image = PIL.Image.open(image).convert("RGB")
+        if isinstance(image, bytes):
+            image = PIL.Image.open(BytesIO(image)).convert("RGB")
         image = self.video_processor.preprocess(image, height=height, width=width).to(
             self.device, dtype=torch.float32
         )
 
         if last_image is not None:
-            if isinstance(last_image, str):
-                last_image = PIL.Image.open(last_image).convert("RGB")
+            if isinstance(last_image, bytes):
+                last_image = PIL.Image.open(BytesIO(last_image)).convert("RGB")
             last_image = self.video_processor.preprocess(last_image, height=height, width=width).to(
                 self.device, dtype=torch.float32
             )

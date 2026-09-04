@@ -991,6 +991,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
+        # Prevent recreation after a send session drops peer registration.
+        self.py_kv_send_session_retired = False
 
         # Encoder-decoder runtime state. ``py_encoder_output`` holds the
         # packed encoder hidden states produced by the encoder iteration as
@@ -1671,7 +1673,7 @@ def executor_request_to_llm_request(
     # No-repeat-ngram size for the TorchSampler path, normalized once here so
     # the per-step sampler gate is a plain attribute read. The C++
     # SamplingConfig rejects negative values up front and 0 means disabled
-    # (same convention as the C++ banRepeatNgram kernel), so falsy == off.
+    # (same convention as the former C++ ban-repeat-ngram kernel), so falsy == off.
     ngram_size = executor_request.sampling_config.no_repeat_ngram_size
     llm_request.py_no_repeat_ngram_size = ngram_size if ngram_size else None
 

@@ -54,7 +54,6 @@ add_library(
   asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
-  convertSpecDecodingMaskToPackedMaskOp.cpp
   cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
@@ -64,7 +63,6 @@ add_library(
   marlinNvfp4MoeMM.cpp
   marlinRepack.cpp
   cudaScaledMM.cpp
-  dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
   fp8PerTensorScalingTrtllmGenGemm.cpp
@@ -97,7 +95,6 @@ add_library(
   fusedGatedRMSNormQuant.cpp
   rmsNormFp4Quant.cpp
   fusedTopkSoftmax.cpp
-  gatherTreeOp.cpp
   groupRmsNormOp.cpp
   helixPostProcessOp.cpp
   llama4MinLatency.cpp
@@ -130,7 +127,6 @@ add_library(
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
   parallelDecodeKVCacheUpdateOp.cpp
-  redrafterCurandOp.cpp
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
@@ -151,6 +147,7 @@ add_library(
   dsv3RopeOp.cpp
   fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
+  nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp
   inplaceSliceCopyOp.cpp
   mhcOp.cpp

@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
@@ -39,6 +39,7 @@ from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
                                                    supports_native_fp8_lora)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
@@ -76,9 +77,6 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         MultimodalScheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
-
-if TYPE_CHECKING:
-    import transformers
 
 GB = 1 << 30
 
@@ -306,15 +304,15 @@ def get_kv_cache_manager_cls(
 # KVCacheManager.get_cache_size_per_token may return either an ``int``
 # (legacy proportional model ``bytes = slope * tokens``) or an affine
 # ``(slope, intercept)`` tuple (CppMambaHybridCacheManager, where mamba
-# state introduces a per-batch fixed cost).  KVCacheManagerV2 reports
-# sliding-window attention fixed cost in the tuple intercept.  CacheCost
-# normalizes the combined shape so the rest of the file does plain attribute
-# access and method calls instead of branching on type.
+# state introduces a per-batch fixed cost). CacheCost normalizes the combined
+# shape so the rest of the file does plain attribute access and method calls
+# instead of branching on type. Managers are responsible for including any
+# pool-specific alignment or capacity headroom in the returned cost.
 
 
 @dataclasses.dataclass(frozen=True)
 class CacheCost:
-    """Affine KV cache cost: ``bytes = slope * tokens + intercept``.
+    """Affine KV cache budget: ``bytes = slope * tokens + intercept``.
 
     The legacy proportional case is just ``intercept = 0``.
     """
@@ -375,16 +373,29 @@ def get_attention_workspace_bytes_per_token(model_config, mapping) -> int:
             model_config, mapping)
 
 
-def get_mla_context_workspace_kv_len_cap(kv_cache_config, max_batch_size,
-                                         max_num_tokens, max_seq_len,
-                                         enable_chunked_prefill):
-    """Max summed attended-KV length (tokens) per forward step the fp8 context-MLA workspace is reserved
-    -- and the scheduler admits -- for, or ``None`` when no reservation is needed.
+def get_attention_workspace_is_chunked_prefill_bounded(model_config) -> bool:
+    """Whether chunked prefill bounds the selected backend's runtime workspace."""
+    from ..attention_backend.utils import get_attention_backend
 
-    Returns ``None`` unless KV-cache reuse can grow the workspace past the floor the profiling forward
-    measures: with block reuse off the summed attended KV is bounded by ``max_num_tokens`` (already
-    profiled), and with chunked prefill each attention launch is independently bounded by its chunk buffer.
-    In both cases reserving would only double-count and needlessly shrink the KV pool, so no cap is returned.
+    return get_attention_backend(
+        model_config.attn_backend).runtime_workspace_is_chunked_prefill_bounded(
+            model_config)
+
+
+def get_mla_context_workspace_kv_len_cap(
+        kv_cache_config,
+        max_batch_size,
+        max_num_tokens,
+        max_seq_len,
+        enable_chunked_prefill,
+        workspace_is_chunked_prefill_bounded=True):
+    """Max summed attended-KV length covered by the context-MLA workspace reserve.
+
+    KV-cache reuse can grow this workspace beyond the fresh-prefill profiling
+    floor. Chunked prefill normally prevents that by staging one bounded KV
+    chunk per launch. An implementation that consumes the complete attended
+    prefix sets ``workspace_is_chunked_prefill_bounded=False`` and receives the
+    same reservation and scheduler admission protection as cache reuse.
 
     Otherwise the default (no override) is the never-stall worst case ``min(max_batch_size, max_num_tokens)
     * max_seq_len``: at most that many context requests run in a step, each attending at most ``max_seq_len``
@@ -392,7 +403,10 @@ def get_mla_context_workspace_kv_len_cap(kv_cache_config, max_batch_size,
     reserves less workspace (freeing KV pool) and lets the scheduler defer over-cap requests; it is floored
     at ``max_seq_len`` (one request must always fit) and capped at the worst case.
     """
-    if not kv_cache_config.enable_block_reuse or enable_chunked_prefill:
+    workspace_can_exceed_profile = (
+        kv_cache_config.enable_block_reuse and not enable_chunked_prefill) or (
+            enable_chunked_prefill and not workspace_is_chunked_prefill_bounded)
+    if not workspace_can_exceed_profile:
         return None
     worst_case = min(max_batch_size, max_num_tokens) * max_seq_len
     override = kv_cache_config.fp8_context_mla_kv_len_cap
@@ -698,6 +712,8 @@ class KvCacheCreator:
                                 manager_cls,
                                 model_config,
                                 kv_cache_config: Optional[KvCacheConfig] = None,
+                                *,
+                                is_draft: bool = False,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -708,8 +724,10 @@ class KvCacheCreator:
                 tokens_per_block=self._tokens_per_block,
                 max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
+                max_num_tokens=self._max_num_tokens if is_draft else 0,
                 kv_cache_config=kv_cache_config,
                 spec_config=self._speculative_config,
+                is_draft=is_draft,
                 **extra_kwargs))
 
     def _get_one_model_draft_layer_mask(self) -> List[bool]:
@@ -767,8 +785,10 @@ class KvCacheCreator:
                     draft_kv_cache_config,
                     is_disagg=self._is_disagg)
                 total += self._per_manager_cache_cost(
-                    draft_kv_cache_manager_cls, effective_draft_config,
-                    draft_kv_cache_config)
+                    draft_kv_cache_manager_cls,
+                    effective_draft_config,
+                    draft_kv_cache_config,
+                    is_draft=True)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 total += self._per_manager_cache_cost(
@@ -1265,13 +1285,11 @@ class KvCacheCreator:
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
 
-        # Reserve headroom for the attention workspace the selected backend declares (today: fp8
-        # context-MLA), which the profiling forward under-measures (fresh-prefill dummies never exercise
-        # KV reuse). This is only needed when KV-cache reuse can push summed attended KV past the profiled
-        # floor: get_mla_context_workspace_kv_len_cap returns None (no reservation) with reuse off -- the
-        # workspace is then bounded by max_num_tokens -- or with chunked prefill -- each attention launch is
-        # then bounded by its chunk buffer -- since reserving in those cases would double-count and
-        # needlessly shrink the KV pool (up to ~37% for Kimi-K2 attention-DP). When it does apply,
+        # Reserve headroom for attention workspace the selected backend declares and the profiling forward
+        # under-measures. KV-cache reuse can push summed attended KV past the profiled floor. Chunked prefill
+        # usually bounds each attention launch by its chunk buffer, except for implementations such as the
+        # NVFP4 DSA context gather that consume the complete attended prefix. The backend declares that
+        # distinction through runtime_workspace_is_chunked_prefill_bounded. When a reserve applies,
         # reserve w * L_cap bytes -- covering the worst-case summed attended KV the scheduler admits
         # (get_mla_context_workspace_kv_len_cap) -- but clamp it to the per-token split budget * w / (k + w)
         # so a memory-constrained node shares the budget at a common token count instead of starving the
@@ -1281,9 +1299,15 @@ class KvCacheCreator:
         # overstates). No cap or w == 0 -> no-op.
         w_bytes_per_token = get_attention_workspace_bytes_per_token(
             self._model_engine.model.model_config, self._mapping)
+        workspace_is_chunked_prefill_bounded = True
+        if w_bytes_per_token > 0:
+            workspace_is_chunked_prefill_bounded = (
+                get_attention_workspace_is_chunked_prefill_bounded(
+                    self._model_engine.model.model_config))
         kv_len_cap = get_mla_context_workspace_kv_len_cap(
             self._kv_cache_config, self._max_batch_size, self._max_num_tokens,
-            self._max_seq_len, self._llm_args.enable_chunked_prefill)
+            self._max_seq_len, self._llm_args.enable_chunked_prefill,
+            workspace_is_chunked_prefill_bounded)
         if w_bytes_per_token > 0 and kv_len_cap:
             budget_before = kv_cache_max_memory
             workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
@@ -1294,7 +1318,7 @@ class KvCacheCreator:
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
                 logger.info(
-                    f"Reserving {workspace_reserve / (GB):.2f} GiB for the fp8 context-MLA attention "
+                    f"Reserving {workspace_reserve / (GB):.2f} GiB for the context-MLA attention "
                     f"workspace (w={w_bytes_per_token} B/token, admitting up to "
                     f"{self._fp8_ctx_mla_kv_len_cap} tokens of summed attended KV): KV cache budget "
                     f"{budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB."
@@ -1361,7 +1385,8 @@ class KvCacheCreator:
         self,
         model_engine: PyTorchModelEngine,
         estimating_kv_cache: bool = False,
-        kv_cache_config_override: Optional[KvCacheConfig] = None
+        kv_cache_config_override: Optional[KvCacheConfig] = None,
+        cold_page_codec_provider: Optional[object] = None,
     ) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -1399,6 +1424,7 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
+            cold_page_codec_provider=cold_page_codec_provider,
         )
 
         if not self._skip_est:
@@ -1515,6 +1541,7 @@ class KvCacheCreator:
         max_seq_len: int,
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
+        cold_page_codec_provider: Optional[object] = None,
     ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
@@ -1586,6 +1613,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
+            cold_page_codec_provider=cold_page_codec_provider,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -1603,11 +1631,11 @@ class KvCacheCreator:
             self._model_engine.model.model_config,
             target_kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
-        # The draft contribution is whatever the aggregate has on top of the
-        # target. Both pieces are CacheCost; subtraction is component-wise.
         draft_kv = CacheCost(slope=total_kv.slope - target_kv.slope,
                              intercept=total_kv.intercept - target_kv.intercept)
-        if target_kv.slope <= 0 or draft_kv.slope <= 0:
+        costs = (target_kv, draft_kv)
+        if any(cost.slope < 0 or cost.intercept < 0 or (
+                cost.slope == 0 and cost.intercept == 0) for cost in costs):
             return None
         return target_kv, draft_kv
 
@@ -1620,14 +1648,21 @@ class KvCacheCreator:
         """Split *total_budget* into (target_budget, draft_budget) byte shares."""
         intercept_total = target_kv.intercept + draft_kv.intercept
         slope_budget = total_budget - intercept_total
-        if slope_budget <= 0:
+        slope_total = target_kv.slope + draft_kv.slope
+        if slope_budget < 0:
             logger.warning(
                 f"KV cache budget {total_budget} is smaller than the fixed "
-                f"mamba state cost {intercept_total}; cannot split between "
+                f"cache cost {intercept_total}; cannot split between "
                 f"target and draft.")
             return None
-        slope_total = target_kv.slope + draft_kv.slope
-        draft_slope_share = int(slope_budget * draft_kv.slope / slope_total)
+        if slope_budget == 0 and slope_total > 0:
+            logger.warning(
+                f"KV cache budget {total_budget} leaves no capacity beyond "
+                f"the fixed cache cost {intercept_total}; cannot split "
+                f"between target and draft with a per-token cache cost.")
+            return None
+        draft_slope_share = (slope_budget * draft_kv.slope //
+                             slope_total if slope_total > 0 else 0)
         draft_budget = draft_kv.intercept + draft_slope_share
         target_budget = total_budget - draft_budget
         return target_budget, draft_budget
@@ -1656,8 +1691,8 @@ class KvCacheCreator:
         GPU-resident state never occupies) the intercept is dropped so the split
         stays proportional to the per-token cost.
 
-        When the split is *infeasible* (the combined fixed cost meets or exceeds
-        the budget — only possible for ``max_gpu_total_bytes`` after the above)
+        When the split is *infeasible* (the combined fixed cost exhausts the
+        budget while either manager has a per-token cost, or exceeds it)
         the shortfall is fatal: both managers need their fixed state resident in
         GPU memory, so the run would OOM. It raises ``ValueError`` rather than
         silently producing an unusable config. A defensive degrade-to-zero path
@@ -1689,7 +1724,7 @@ class KvCacheCreator:
         shares = self._compute_draft_budget_shares(total_budget, target_kv,
                                                    draft_kv)
         if shares is None:
-            # The split is infeasible (combined fixed cost >= total budget).
+            # The split cannot provide each manager with usable GPU capacity.
             intercept_total = target_kv.intercept + draft_kv.intercept
             if budget_attr == "max_gpu_total_bytes":
                 # A GPU budget that cannot even fit the combined fixed cost is
@@ -1698,7 +1733,7 @@ class KvCacheCreator:
                 # guidance rather than producing an unusable zero-budget draft.
                 raise ValueError(
                     f"KV cache GPU budget ({total_budget / GB:.2f} GiB) is "
-                    f"smaller than the combined fixed cost "
+                    f"insufficient after the combined fixed cost "
                     f"({intercept_total / GB:.2f} GiB, e.g. mamba SSM state) "
                     f"for target+draft. Increase free_gpu_memory_fraction or "
                     f"max_gpu_total_bytes, or reduce max_batch_size (the fixed "
@@ -2048,10 +2083,23 @@ class KvCacheCreator:
                         budget_attr, self_kv_cache_config,
                         draft_kv_cache_config))
 
+        compression_config = self._llm_args.kv_cache_compression_config
+        compression_manager = create_kv_cache_compression_manager(
+            compression_config,
+            model_engine=self._model_engine,
+            kv_cache_config=self_kv_cache_config,
+            estimating_kv_cache=estimating_kv_cache and not self._skip_est,
+        )
+        cold_page_codec_provider = (
+            compression_manager if compression_manager is not None
+            and compression_manager.provides_cold_page_codec else None)
+
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine,
             estimating_kv_cache,
-            kv_cache_config_override=self_kv_cache_config)
+            kv_cache_config_override=self_kv_cache_config,
+            cold_page_codec_provider=cold_page_codec_provider,
+        )
 
         # Carry the fp8 context-MLA workspace admission cap (computed in configure_kv_cache_capacity) onto
         # the real KV manager so the scheduler reads it directly instead of re-deriving from pool layout.
@@ -2089,7 +2137,8 @@ class KvCacheCreator:
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
                 original_max_seq_len,
                 estimating_kv_cache,
-                kv_cache_config_override=draft_build_kv_cache_config)
+                kv_cache_config_override=draft_build_kv_cache_config,
+                cold_page_codec_provider=cold_page_codec_provider)
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
@@ -2103,9 +2152,17 @@ class KvCacheCreator:
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
         resources[
             ResourceManagerType.CROSS_KV_CACHE_MANAGER] = cross_kv_cache_manager
+        if (compression_manager is not None
+                and compression_manager.uses_iteration_lifecycle):
+            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
+                compression_manager)
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model, draft model, and cross pool."""
+        compression_manager = resources.pop(
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, None)
+        if compression_manager is not None:
+            compression_manager.shutdown()
         resources[ResourceManagerType.KV_CACHE_MANAGER].shutdown()
         del resources[ResourceManagerType.KV_CACHE_MANAGER]
         draft_kv_cache_manager = resources[
@@ -2217,11 +2274,18 @@ def _create_kv_cache_manager(
         num_kv_heads: Optional[Union[int, List[int]]] = None,
         head_dim: Optional[int] = None,
         kv_cache_type=None,
-        is_disagg: bool = False) -> KVCacheManager:
+        is_disagg: bool = False,
+        cold_page_codec_provider: Optional[object] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
+    if cold_page_codec_provider is not None and not issubclass(
+            kv_cache_manager_cls, KVCacheManagerV2):
+        raise ValueError(
+            "Cold-page quantization requires the resolved KV cache manager "
+            f"to be KVCacheManagerV2; selected {kv_cache_manager_cls.__name__}")
+
     if (estimating_kv_cache
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
             and kv_cache_config.pool_ratio is None
@@ -2348,6 +2412,8 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        manager_extra_kwargs[
+            "cold_page_codec_provider"] = cold_page_codec_provider
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
@@ -2752,6 +2818,21 @@ def validate_kv_cache_compression_compatibility(
     spec_config: Optional[SpeculativeConfig],
 ) -> None:
     """Reject unsupported KV-cache compression feature combinations."""
+    if config.algorithm == "quantization_for_cold_page":
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND
+
+        if _BACKEND == "python":
+            raise ValueError(
+                "Cold-page quantization requires the C++ KVCacheManagerV2 backend"
+            )
+        if config.quant == "nvfp4" and not is_sm_100f():
+            raise RuntimeError(
+                "NVFP4 cold-page quantization requires an SM100-family device "
+                "(SM100 or SM103).")
+    elif config.algorithm == "triattention" and not is_sm_100f():
+        raise RuntimeError(
+            "TriAttention requires an SM100-family device (SM100 or SM103).")
+
     if kv_cache_config.enable_block_reuse and not config.supports_block_reuse():
         raise ValueError(
             f"KV-cache compression algorithm {config.algorithm!r} does not "
@@ -2760,44 +2841,71 @@ def validate_kv_cache_compression_compatibility(
     if spec_config is None:
         return
     if not config.supports_speculative_decoding():
+        guidance = ("; TriAttention requires eviction_mode='union'"
+                    if config.algorithm == "triattention" else "")
         raise ValueError(
             f"KV-cache compression algorithm {config.algorithm!r} does not "
-            "support speculative decoding with its current configuration; "
-            "TriAttention requires eviction_mode='union'")
+            "support speculative decoding with its current configuration"
+            f"{guidance}")
     mode = spec_config.spec_dec_mode
-    if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
+    if config.algorithm == "quantization_for_cold_page":
+        supported = mode.is_mtp_eagle_one_model() or mode.is_eagle3_one_model()
+        guidance = "one-model MTP-EAGLE or EAGLE3"
+    else:
+        supported = mode.is_mtp_one_model() or mode.is_eagle3_one_model()
+        guidance = "one-model MTP or EAGLE3"
+    if not supported:
         raise ValueError(
             f"KV-cache compression does not support speculative decoding "
-            f"mode {mode.name}; use one-model MTP or EAGLE3")
+            f"mode {mode.name}; use {guidance}")
 
 
 def create_kv_cache_compression_manager(
-    config: KvCacheCompressionConfig,
-    kv_cache_manager: KVCacheManagerV2,
-    draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
-    pretrained_config: Optional["transformers.PretrainedConfig"] = None,
+    config: Optional[KvCacheCompressionConfig],
+    *,
+    model_engine: PyTorchModelEngine,
+    kv_cache_config: KvCacheConfig,
+    estimating_kv_cache: bool = False,
 ) -> Optional[KVCacheCompressionManager]:
-    """Build the KV-cache compression manager for ``config.algorithm``, or return
-    None if no algorithm matches.
+    """Validate, select, and construct the configured manager before KVCM."""
+    if config is None:
+        return None
+    if model_engine.mapping.has_cp_helix():
+        # TODO: Revisit after KVCC validates HELIX-sharded Page ownership and migration.
+        raise ValueError(
+            "KV-cache compression does not support HELIX context parallelism.")
 
-    Called from ``create_py_executor`` and registered as a resource manager,
-    like the KV cache manager itself. Concrete algorithms add a dispatch branch
-    here. Feature compatibility is checked before resource-manager construction.
-    """
+    if config.algorithm == "quantization_for_cold_page":
+        if config.quant != "nvfp4":
+            raise NotImplementedError(
+                f"Unsupported cold-page quantization format {config.quant!r}")
+        if estimating_kv_cache:
+            return None
+        quant_config = model_engine.model.model_config.quant_config
+        if (quant_config is not None and getattr(
+                quant_config, "kv_cache_quant_algo", None) == QuantAlgo.NVFP4):
+            logger.info(
+                "Skipping cold-page NVFP4 quantization because the active KV "
+                "cache already uses NVFP4; KVCM will migrate it losslessly.")
+            return None
+
+        validate_kv_cache_compression_compatibility(config, kv_cache_config,
+                                                    model_engine.spec_config)
+        from ..kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import \
+            Nvfp4ColdPageQuantizationCompression
+
+        return Nvfp4ColdPageQuantizationCompression(config)
+
     if config.algorithm == "triattention":
-        if not is_sm_100f():
-            raise RuntimeError(
-                "TriAttention requires an SM100-family device (SM100 or SM103)."
-            )
+        validate_kv_cache_compression_compatibility(config, kv_cache_config,
+                                                    model_engine.spec_config)
         # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
         from ..kv_cache_compression.triattention.triattention import \
             TriAttentionCompressionManager
 
         return TriAttentionCompressionManager(
             config,
-            kv_cache_manager,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-            pretrained_config=pretrained_config,
+            pretrained_config=model_engine.model.model_config.pretrained_config,
         )
 
     logger.warning(
@@ -3067,24 +3175,13 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
-    # Register the compression manager (if one is configured) with the other
-    # managers, before building ResourceManager, so it is part of the manager
-    # set from the start. Reads its own config, not the sparse-attention one.
-    kv_cache_compression_config = getattr(llm_args,
-                                          "kv_cache_compression_config", None)
-    if kv_cache_compression_config is not None:
-        draft_kv_cache_manager = resources.get(
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-        compression_manager = create_kv_cache_compression_manager(
-            kv_cache_compression_config,
-            kv_cache_manager,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-            pretrained_config=model_engine.model.model_config.pretrained_config,
+    compression_manager = resources.get(
+        ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
+    if compression_manager is not None:
+        compression_manager.bind_kv_cache_managers(
+            resources[ResourceManagerType.KV_CACHE_MANAGER],
+            resources.get(ResourceManagerType.DRAFT_KV_CACHE_MANAGER),
         )
-        if compression_manager is not None:
-            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
-                compression_manager)
-
     resource_manager = ResourceManager(resources)
 
     # KV cache manager runs last (others may depend on it), except the
@@ -3097,7 +3194,8 @@ def create_py_executor_instance(
     if cross_kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.CROSS_KV_CACHE_MANAGER, last=True)
-    # Compression is the final reconciler after every native KV manager.
+    # Iteration-driven compression is the final reconciler after every native
+    # KV manager. Cold-page quantization runs only at native storage migration.
     if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
             in resource_manager.resource_managers):
         resource_manager.resource_managers.move_to_end(
@@ -3537,14 +3635,6 @@ def _adjust_torch_mem_fraction():
 
 def validate_feature_combination(llm_args, model_engine):
     # Validate the flags for features' combination
-    compression_config = llm_args.kv_cache_compression_config
-    if compression_config is not None:
-        validate_kv_cache_compression_compatibility(
-            compression_config,
-            llm_args.kv_cache_config,
-            model_engine.spec_config,
-        )
-
     def init_feature_status(llm_args) -> Dict[str, bool]:
         assert isinstance(
             llm_args, TorchLlmArgs

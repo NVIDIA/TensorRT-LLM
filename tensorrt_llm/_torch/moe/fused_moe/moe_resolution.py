@@ -28,6 +28,7 @@ from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from .activation import ActivationParamShape, MoEActivation, activation_constant_names
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
@@ -203,14 +204,21 @@ def build_moe_problem(
     top_k: Optional[int] = None,
     swiglu_gptoss_style: Optional[bool] = None,
     bias: Optional[bool] = None,
-    activation_type: Optional[ActivationType] = None,
+    activation: Optional[MoEActivation] = None,
     routing: Optional["BaseMoeRoutingMethod | RoutingMethodType"] = None,
 ) -> MoEProblem:
     """Assemble the problem half of a selection question.
 
     Explicit args win over ``pretrained_config``. Missing fields stay ``None``
     (unknown): shape gates abstain instead of rejecting on absent info.
+
+    ``activation`` is the whole activation package, and both halves of it are
+    read: the kind, and *which constants* the caller supplies -- a question the
+    kind alone cannot answer, since clamped and unclamped SwiGLU share one
+    ``ActivationType``. Pass it wherever it is in hand; without it the problem
+    says "some activation" and the activation gate abstains.
     """
+    activation_kind = None if activation is None else ActivationType(activation.kind)
     shapes = derive_moe_layer_shapes(
         model_config,
         num_experts=num_experts,
@@ -232,7 +240,8 @@ def build_moe_problem(
         top_k=shapes.top_k,
         swiglu_gptoss_style=swiglu_gptoss_style,
         bias=bias,
-        activation=canonical_activation(activation_type),
+        activation=canonical_activation(activation_kind),
+        activation_constants=activation_constant_names(activation),
         routing=canonical_routing(routing),
     )
 
@@ -240,21 +249,22 @@ def build_moe_problem(
 def infer_swiglu_gptoss_style(
     *,
     bias: bool = False,
-    swiglu_alpha: Optional[torch.Tensor] = None,
-    swiglu_beta: Optional[torch.Tensor] = None,
     activation_type: Optional[Union[ActivationType, int]] = None,
 ) -> bool:
-    """True for the gpt-oss / MiniMax SwiGLU package (bias, alpha/beta, or SwigluBias).
+    """True for the gpt-oss / MiniMax SwiGLU package (expert bias, or SwigluBias).
 
-    ``swiglu_limit`` alone is not enough — DeepSeek-V4 uses a plain clamp and
-    must not be treated as gpt-oss.
+    Keyed off the kind alone. The older form also answered True whenever an
+    alpha/beta constant was merely *present*, which SiTU satisfies too, and that
+    silently downgraded a MegaMoE request to Cutlass. A clamp was never part of
+    it either -- DeepSeek-V4 uses a plain clamp.
 
-    ``activation_type`` is normalized because ``MoE`` stores the activation as a
-    plain ``int``, which no identity check against an enum member can match.
+    ``activation_type`` is still normalized even though ``MoE`` now stores an
+    ``ActivationType``: the parameter is also reached from call sites that pass a
+    bare int, and no identity check against an enum member would match one.
     """
     if activation_type is not None and ActivationType(activation_type) is ActivationType.SwigluBias:
         return True
-    return bool(bias or swiglu_alpha is not None or swiglu_beta is not None)
+    return bool(bias)
 
 
 def build_moe_deployment(
@@ -315,6 +325,59 @@ def _candidates_for(backend: str) -> List[MoEImplClass]:
     return candidates
 
 
+#: ABI register name -> the ``MoEActivationSupport`` field declaring its shape.
+_CONSTANT_SHAPE_FIELDS: Dict[str, str] = {
+    "alpha": "alpha_beta",
+    "beta": "alpha_beta",
+    "clamp": "limit",
+}
+
+
+def _reject_unsupported_activation(
+    candidate: MoEImplClass, problem: MoEProblem
+) -> Optional[MoERejection]:
+    """Decline a candidate whose declaration cannot carry this activation.
+
+    Central rather than repeated in eleven ``can_implement`` gates, because the
+    answer is already written down: ``activation_support`` is the same
+    declaration ``materialize_activation_params`` reads. A backend that forgot
+    to re-derive it would not run the layer anyway -- it would raise from the
+    adapter at construction, well past the point where another candidate could
+    still have been chosen.
+
+    Reads the *class* declaration. TRTLLM-Gen overrides
+    ``resolve_activation_support`` per instance, but only to narrow
+    ``PER_EXPERT_TENSOR`` to ``UNIFORM_SCALAR``; no instance turns a shape into
+    ``UNSUPPORTED``, so no instance refuses a constant its class admits.
+    """
+    support = getattr(candidate, "activation_support", None)
+    if support is None:
+        return None
+
+    kind = problem.activation_type
+    if kind not in support.kinds:
+        executes = ", ".join(sorted(k.name for k in support.kinds))
+        return MoERejection(
+            _legacy_backend_name(candidate),
+            MoERejectReason.ACTIVATION_UNSUPPORTED,
+            f"{candidate.__name__} does not execute {kind.name} (executes: {executes})",
+        )
+
+    # Sorted so the rejection names the same register every run.
+    for constant in sorted(problem.activation_constants):
+        field = _CONSTANT_SHAPE_FIELDS.get(constant)
+        if field is None:
+            continue
+        if getattr(support, field) is ActivationParamShape.UNSUPPORTED:
+            return MoERejection(
+                _legacy_backend_name(candidate),
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                f"{candidate.__name__} kernels take no activation {constant}, "
+                f"which this layer's {kind.name} supplies",
+            )
+    return None
+
+
 def resolve_moe_impl(
     model_config: ModelConfig,
     *,
@@ -327,11 +390,18 @@ def resolve_moe_impl(
     intermediate_size: Optional[int] = None,
     swiglu_gptoss_style: Optional[bool] = None,
     bias: Optional[bool] = None,
-    activation_type: Optional[ActivationType] = None,
+    activation: Optional[MoEActivation] = None,
     routing: Optional["BaseMoeRoutingMethod | RoutingMethodType"] = None,
     layer_idx: Optional[int] = None,
+    allow_degradation: bool = True,
 ) -> MoEResolutionReport:
     """Resolve a MoE backend and return the full eligibility report.
+
+    ``allow_degradation=False`` turns the usual substitution warning into a
+    hard failure. A caller that is measuring one specific backend needs that:
+    silently running the fallback returns numbers attributed to the backend it
+    asked for. The rejection trail says which gate declined and why, so the
+    caller does not have to re-derive the winner and compare classes.
 
     Raises ValueError for unknown or deprecated backend literals.
     """
@@ -345,7 +415,7 @@ def resolve_moe_impl(
             intermediate_size=intermediate_size,
             swiglu_gptoss_style=swiglu_gptoss_style,
             bias=bias,
-            activation_type=activation_type,
+            activation=activation,
             routing=routing,
         )
     if deployment is None:
@@ -369,16 +439,21 @@ def resolve_moe_impl(
             )
             continue
         eligibility = candidate.can_implement(problem, deployment)
-        if eligibility.eligible:
-            eligible.append(candidate)
-            continue
-        rejected.append(
-            MoERejection(
-                _legacy_backend_name(candidate),
-                eligibility.reject_reason,
-                eligibility.detail,
+        if not eligibility.eligible:
+            rejected.append(
+                MoERejection(
+                    _legacy_backend_name(candidate),
+                    eligibility.reject_reason,
+                    eligibility.detail,
+                )
             )
-        )
+            continue
+        # After can_implement, so a backend's own more specific reason wins.
+        activation_rejection = _reject_unsupported_activation(candidate, problem)
+        if activation_rejection is not None:
+            rejected.append(activation_rejection)
+            continue
+        eligible.append(candidate)
 
     # candidates is already priority-ordered.
     winner_cls = eligible[0] if eligible else None
@@ -402,6 +477,13 @@ def resolve_moe_impl(
         env_fingerprint=deployment.env.fingerprint(),
     )
 
+    if report.degraded and not allow_degradation:
+        location = "" if layer_idx is None else f" [layer_idx={layer_idx}]"
+        raise ValueError(
+            f"MoE backend {requested} was requested with degradation disallowed "
+            f"but cannot serve this layer{location}. {report.describe()}"
+        )
+
     if report.degraded and winner_cls is not None:
         cause = report.degraded_from
         location = "" if layer_idx is None else f" [layer_idx={layer_idx}]"
@@ -419,7 +501,17 @@ def resolve_moe_impl(
 def impl_class_for(report: MoEResolutionReport) -> MoEImplClass:
     """The class a report's winner names, or raise with the whole trail."""
     if report.winner is None:
-        raise ValueError(f"no MoE implementation can serve this layer. {report.describe()}")
+        # describe() prints reason codes only. With nothing left to run, the
+        # operator needs the details too -- that is all the error can offer.
+        details = "; ".join(
+            f"{rejection.legacy_backend}: {rejection.detail}"
+            for rejection in report.rejected
+            if rejection.detail
+        )
+        raise ValueError(
+            f"no MoE implementation can serve this layer. {report.describe()}"
+            + (f" Details: {details}" if details else "")
+        )
     for candidate in IMPL_PRIORITY:
         if _legacy_backend_name(candidate) == report.winner:
             return candidate
