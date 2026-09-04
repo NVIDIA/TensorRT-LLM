@@ -121,40 +121,52 @@ def test_grouped_gemm_inputs_helper_fixed_expert_capacity(tile_size: int):
         helper.get_expert_capacity_num_permuted_tokens(0)
 
 
-@pytest.mark.parametrize("tile_size", [128, 256])
-def test_count_native_tile_plan_empty_and_boundary_experts(tile_size: int):
+@pytest.mark.parametrize(
+    ("tile_size", "expected"),
+    [
+        (
+            128,
+            [
+                (1, 1, 257),
+                (2, 255, 514),
+                (3, 384, 771),
+                (4, 512, 1028),
+                (4, 513, 1156),
+                (6, 768, 1542),
+                (6, 896, 1670),
+                (7, 1024, 1799),
+                (7, 1152, 1927),
+                (7, 1153, 2055),
+            ],
+        ),
+        (
+            256,
+            [
+                (1, 1, 513),
+                (2, 511, 1026),
+                (3, 768, 1539),
+                (4, 1024, 2052),
+                (4, 1025, 2308),
+                (6, 1536, 3078),
+                (6, 1792, 3334),
+                (7, 2048, 3591),
+                (7, 2304, 3847),
+                (7, 2305, 4103),
+            ],
+        ),
+    ],
+)
+def test_count_native_tile_plan_empty_and_boundary_experts(
+    tile_size: int,
+    expected: list[tuple[int, int, int]],
+) -> None:
     """Count-native scheduling must preserve expert-major rows at M boundaries."""
     capacity = 2 * tile_size + 1
     counts = [0, 1, tile_size - 1, tile_size, tile_size + 1, 0, 2 * tile_size, capacity]
 
     plan = _expert_count_tile_plan(counts, capacity, tile_size)
 
-    expected = []
-    global_tile_idx = 0
-    for expert_idx, count in enumerate(counts):
-        for row_in_expert in range(0, count, tile_size):
-            rows_in_tile = min(tile_size, count - row_in_expert)
-            expected.append(
-                (
-                    expert_idx,
-                    global_tile_idx * tile_size + rows_in_tile,
-                    expert_idx * capacity + row_in_expert,
-                )
-            )
-            global_tile_idx += 1
-
     assert plan == expected
-    assert all(expert_idx not in (0, 5) for expert_idx, _, _ in plan)
-    assert sum(expert_idx == 3 for expert_idx, _, _ in plan) == 1
-    assert sum(expert_idx == 4 for expert_idx, _, _ in plan) == 2
-    assert sum(expert_idx == 6 for expert_idx, _, _ in plan) == 2
-    assert sum(expert_idx == 7 for expert_idx, _, _ in plan) == 3
-
-    for tile_idx, (expert_idx, mn_limit, expanded_row_start) in enumerate(plan):
-        assert expanded_row_start // capacity == expert_idx
-        row_in_expert = expanded_row_start - expert_idx * capacity
-        expected_rows = min(tile_size, counts[expert_idx] - row_in_expert)
-        assert mn_limit == tile_idx * tile_size + expected_rows
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])

@@ -393,6 +393,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         key = self.unique_id()
         if key not in self.__class__.tuning_config_cache:
             if self.use_direct_expert_metadata:
+                # One tuning profile is shared by the 128- and 256-row
+                # tactics. Use the minimum tile size so its capacity buckets
+                # cover the union needed by both tactics; each kernel still
+                # rounds capacity to its selected tile size.
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
                                                  self.local_expert_offset, 128)

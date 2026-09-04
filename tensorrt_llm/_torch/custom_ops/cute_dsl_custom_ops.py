@@ -2850,8 +2850,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 for metadata in (tile_idx_to_group_idx, tile_idx_to_mn_limit,
                                  permuted_idx_to_expanded_idx,
                                  num_non_exiting_tiles):
-                    assert metadata.dtype == torch.int32
-                    assert metadata.size() == (self.num_local_experts, )
+                    if (metadata.dtype != torch.int32
+                            or metadata.size() != (self.num_local_experts, )):
+                        raise ValueError(
+                            "Expert-count metadata must be int32 with one "
+                            "entry per local expert")
             else:
                 assert tile_idx_to_group_idx.dtype == torch.int32
                 assert tile_idx_to_group_idx.size() == (num_tiles, )
@@ -3742,8 +3745,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 for metadata in (tile_idx_to_group_idx, tile_idx_to_mn_limit,
                                  permuted_idx_to_expanded_idx,
                                  num_non_exiting_tiles):
-                    assert metadata.dtype == torch.int32
-                    assert metadata.size() == (self.num_local_experts, )
+                    if (metadata.dtype != torch.int32
+                            or metadata.size() != (self.num_local_experts, )):
+                        raise ValueError(
+                            "Expert-count metadata must be int32 with one "
+                            "entry per local expert")
             else:
                 assert tile_idx_to_group_idx.dtype == torch.int32
                 assert tile_idx_to_group_idx.size() == (num_tiles, )
