@@ -459,6 +459,102 @@ async def test_context_only_response_finishes_hooks(stream):
     service._gen_client.send_request.assert_not_awaited()
 
 
+# --- sub-agent ctx affinity: which conversation_id the ctx/gen routers see ---
+
+
+def _stub_two_phase_service(service: OpenAIDisaggregatedService) -> None:
+    """Wire a service so one ctx-then-gen disagg request runs through both routers."""
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    service._check_conditional_disagg = AsyncMock(return_value=(None, True))
+    service._check_gen_only_disagg = AsyncMock(return_value=False)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    # finish_reason="length" => a gen phase is still needed, so the gen router runs too.
+    service._ctx_client.send_request = AsyncMock(
+        return_value=_make_completion_response("", finish_reason="length", context_only=True)
+    )
+    service._gen_client.send_request = AsyncMock(
+        return_value=_make_completion_response("done", finish_reason="stop", context_only=False)
+    )
+
+
+def _sent_conversation_id(client) -> str:
+    # The conversation_id carried on the request that reaches the ctx/gen worker
+    # -- the same object the router selects on. Robust across schedule styles
+    # (gen-first delegates gen placement to the client with server=None, so the
+    # gen *router* is not consulted there).
+    request = client.send_request.await_args.args[0]
+    return request.conversation_params.conversation_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_subagent_ctx_affinity_routes_ctx_by_parent_gen_by_own(schedule_style):
+    # Assert the conversation_id the CTX and GEN sides actually receive.
+    # With subagent_affinity_scope="context", the frontend stashes the parent id
+    # in subagent_ctx_affinity_id; the CTX request must carry the parent id while
+    # the GEN request keeps the sub-agent's own id. This must hold in BOTH
+    # schedule styles (the gen-first path applies affinity before ctx-router
+    # selection too).
+    service = _make_service(schedule_style)
+    _stub_two_phase_service(service)
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(
+            conversation_id="own-id", subagent_ctx_affinity_id="parent-id"
+        ),
+    )
+
+    await service._send_disagg_request(request)
+
+    # The CTX router selects on this same (parent-pinned) request object.
+    assert (
+        service._ctx_router.get_next_server.await_args.args[0]
+        is (service._ctx_client.send_request.await_args.args[0])
+    )
+    assert _sent_conversation_id(service._ctx_client) == "parent-id"
+    assert _sent_conversation_id(service._gen_client) == "own-id"
+    # The original request (and thus the gen request) is never mutated.
+    assert request.conversation_params.conversation_id == "own-id"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_subagent_ctx_affinity_siblings_collapse_to_parent_ctx_id(schedule_style):
+    # Routing-side check only: sibling requests of the same parent all pin their
+    # CTX request to the parent conversation_id (co-locating for shared-prefix KV
+    # reuse), while each keeps its own id for gen. The worker-side consequence of
+    # that collapse under the V2 per_conversation policy (ConversationManager
+    # treating siblings as overlapping turns) is covered in
+    # test_kv_cache_manager_v2's ConversationManager tests; see the accepted
+    # tradeoff documented on
+    # OpenAIDisaggregatedService._apply_ctx_subagent_affinity (TRTLLM-16022).
+    siblings = ["own-id-a", "own-id-b"]
+    ctx_ids_seen = []
+    gen_ids_seen = []
+    for own_id in siblings:
+        service = _make_service(schedule_style)
+        _stub_two_phase_service(service)
+        request = CompletionRequest(
+            model="test-model",
+            prompt="hello",
+            conversation_params=ConversationParams(
+                conversation_id=own_id, subagent_ctx_affinity_id="parent-id"
+            ),
+        )
+        await service._send_disagg_request(request)
+        ctx_ids_seen.append(_sent_conversation_id(service._ctx_client))
+        gen_ids_seen.append(_sent_conversation_id(service._gen_client))
+
+    # All siblings collapse onto the same parent id on the ctx side ...
+    assert ctx_ids_seen == ["parent-id", "parent-id"]
+    # ... while each keeps its own id on the gen side (gen stays load-balanced).
+    assert gen_ids_seen == siblings
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
 async def test_send_disagg_request_leaves_streaming_usage_to_gen_server(schedule_style):

@@ -18,6 +18,7 @@ import asyncio
 import signal
 import socket
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
@@ -45,8 +46,9 @@ from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionRequest, CompletionRequest, UCompletionRequest,
-    UCompletionResponse, ensure_request_chat_template_allowed)
+    ChatCompletionRequest, CompletionRequest, ConversationParams,
+    UCompletionRequest, UCompletionResponse,
+    ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -313,42 +315,81 @@ class OpenAIDisaggServer:
             req: UCompletionRequest,
             raw_req: Request,
             subagent_affinity_header: Optional[str] = None,
-            subagent_affinity_scope: str = "context"):
-        """Populate conversation_params.conversation_id from supported headers.
+            subagent_affinity_scope: str = "context") -> None:
+        """Populate conversation_params.conversation_id from body/headers.
 
-        Body ``conversation_params.conversation_id`` is canonical. Headers are
-        used only when the body does not provide an id. When
-        ``subagent_affinity_header`` is set, a sub-agent's parent-session header
-        co-locates it with its parent; the fleets it applies to are set by
-        ``subagent_affinity_scope``:
+        Conversation-id precedence, highest to lowest, for the fleet(s) the
+        sub-agent affinity applies to (CTX for "context" scope; CTX and GEN for
+        "both"):
+
+          1. [future TODO] a sub-agent parent-affinity id supplied in the
+             request BODY -- NOT implemented yet (see TODO below).
+          2. the configured sub-agent parent-session HEADER
+             (``conversation_affinity_header_for_subagents``).
+          3. ``conversation_params.conversation_id`` from the request BODY.
+          4. a conversation-id HEADER (``X-Session-ID``, ...).
+
+        The parent-session header (2) overriding a body conversation_id (3) is
+        the ONE deliberate exception to the usual "body is canonical" rule: it
+        applies only to this single configured header and only for the in-scope
+        fleet(s). Ordinary session headers (4) still lose to the body.
 
         - "context" (default): only the CONTEXT request pins to the parent
-          (shared prefill KV reuse). The GEN request keeps the sub-agent's own
-          id and load-balances across the gen fleet -- avoiding a whole
-          sub-agent tree piling onto one small-batch gen instance (the
-          gen-queue TTFT regression). The parent id is carried in
-          ``conversation_params.subagent_ctx_affinity_id`` and applied to the
-          ctx request only, in the disagg service.
-        - "both": the parent header overrides the conversation id for BOTH the
-          ctx and gen fleets.
+          (shared prefill KV reuse). The parent id is carried in the
+          server-private ``conversation_params.subagent_ctx_affinity_id`` and
+          swapped into the ctx request only, in the disagg service; the GEN
+          request keeps the resolved conversation_id (3/4) and load-balances
+          across the gen fleet -- avoiding a whole sub-agent tree piling onto
+          one small-batch gen instance (the gen-queue TTFT regression).
+        - "both": the parent id replaces the conversation_id outright, so BOTH
+          the ctx and gen fleets pin to the parent.
         """
-        if subagent_affinity_header and subagent_affinity_scope == "context":
-            # Resolve to the DEFAULT (own X-Session-ID) so ctx+gen both start
-            # from the sub-agent's own id, then stash the parent id so only the
-            # ctx request is re-pinned to it downstream.
-            resolve_request_conversation_id(req, raw_req.headers)
-            parent = extract_subagent_parent_id(raw_req.headers,
-                                                subagent_affinity_header)
-            if parent and req.conversation_params is not None:
+        # Precedence steps 3/4: resolve the ordinary conversation_id (body wins
+        # over headers). Steps 1/2 (sub-agent affinity) are layered on below.
+        resolve_request_conversation_id(req, raw_req.headers)
+
+        # ``subagent_ctx_affinity_id`` is a SERVER-PRIVATE field: the serve edge
+        # is its only writer. Clear any client-supplied body value so a request
+        # body can never enable ctx affinity while the feature is unconfigured
+        # (that would bypass the opt-in). It is (re)set below only for "context"
+        # scope, from the trusted parent header.
+        # TODO(TRTLLM-16022) [future precedence step 1]: accept a sub-agent
+        # parent-affinity id supplied in the request BODY, ranked ABOVE the
+        # header value here. Until then the body cannot carry the affinity key.
+        if req.conversation_params is not None:
+            req.conversation_params.subagent_ctx_affinity_id = None
+
+        parent = extract_subagent_parent_id(raw_req.headers,
+                                            subagent_affinity_header)
+        if not subagent_affinity_header or parent is None:
+            # Feature off, or a main-agent request (no parent header): keep the
+            # conversation_id resolved above.
+            return
+
+        if subagent_affinity_scope == "both":
+            # Precedence step 2 over 3/4 for both fleets: the parent header
+            # overrides the conversation_id.
+            if req.conversation_params is None:
+                req.conversation_params = ConversationParams(
+                    conversation_id=parent)
+            else:
+                req.conversation_params.conversation_id = parent
+        else:  # "context"
+            # Stash the parent id for the ctx request only; gen keeps its own id.
+            if req.conversation_params is not None:
                 req.conversation_params.subagent_ctx_affinity_id = parent
-        else:
-            # scope == "both" (or feature off when the header is None): the
-            # parent header overrides the conversation id for both fleets.
-            resolve_request_conversation_id(
-                req,
-                raw_req.headers,
-                subagent_affinity_header=subagent_affinity_header,
-            )
+            else:
+                # Parent-only request (no body id and no session header) -- the
+                # shape a minimal gateway sends. conversation_id is required and
+                # non-empty, so synthesize a unique own id: the ctx request is
+                # re-pinned to the parent downstream, while gen routes by this
+                # fresh id and load-balances (a distinct conversation_id on the
+                # gen conversation router degrades to least-loaded selection --
+                # the same "gen load-balances" behavior as a request that had
+                # its own id). Bounded by the router's session-table LRU.
+                req.conversation_params = ConversationParams(
+                    conversation_id=f"subagent:{uuid.uuid4()}",
+                    subagent_ctx_affinity_id=parent)
 
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.

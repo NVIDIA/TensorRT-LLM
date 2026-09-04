@@ -1,8 +1,11 @@
 import time
 from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 
 import pytest
 import yaml
+
+from tensorrt_llm.llmapi import disagg_utils
 
 # isort: off
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -281,6 +284,62 @@ def test_extract_disagg_cfg_rejects_invalid_subagent_affinity_scope(value):
     cfg["subagent_affinity_scope"] = value
     with pytest.raises(ValueError, match="subagent_affinity_scope must be"):
         extract_disagg_cfg(**cfg)
+
+
+def _extract_disagg_cfg_capturing_warnings(cfg):
+    # The warning goes through tensorrt_llm's logger; patch it so the assertion
+    # does not depend on Python-logging propagation.
+    with mock.patch.object(disagg_utils.logger, "warning") as warn:
+        config = extract_disagg_cfg(**cfg)
+    return config, [call.args[0] for call in warn.call_args_list]
+
+
+def test_subagent_affinity_warns_when_ctx_router_not_conversation():
+    # Default ctx router is round_robin -> instance affinity is inactive.
+    cfg = get_yaml_config()
+    cfg["conversation_affinity_header_for_subagents"] = "X-Dynamo-Parent-Session-ID"
+    cfg["subagent_affinity_scope"] = "context"
+
+    _, warnings = _extract_disagg_cfg_capturing_warnings(cfg)
+
+    assert any("INACTIVE" in msg and "context router is 'round_robin'" in msg
+               for msg in warnings), warnings
+
+
+def test_subagent_affinity_both_scope_warns_for_each_non_conversation_fleet():
+    cfg = get_yaml_config()  # ctx=round_robin, gen=load_balancing
+    cfg["conversation_affinity_header_for_subagents"] = "X-Dynamo-Parent-Session-ID"
+    cfg["subagent_affinity_scope"] = "both"
+
+    _, warnings = _extract_disagg_cfg_capturing_warnings(cfg)
+
+    assert len(warnings) == 1, warnings
+    assert "context router is 'round_robin'" in warnings[0]
+    assert "generation router is 'load_balancing'" in warnings[0]
+
+
+@pytest.mark.parametrize("router_type",
+                         ["conversation", "Conversation", "CONVERSATION"])
+def test_subagent_affinity_no_warning_when_ctx_router_is_conversation(
+        router_type):
+    # create_router() resolves the type case-insensitively, so a capitalized
+    # "Conversation" must not trip a false "affinity inactive" warning.
+    cfg = get_yaml_config()
+    cfg["context_servers"]["router"] = {"type": router_type}
+    cfg["conversation_affinity_header_for_subagents"] = "X-Dynamo-Parent-Session-ID"
+    cfg["subagent_affinity_scope"] = "context"
+
+    _, warnings = _extract_disagg_cfg_capturing_warnings(cfg)
+
+    assert warnings == []
+
+
+def test_subagent_affinity_no_warning_when_feature_off():
+    cfg = get_yaml_config()  # ctx=round_robin, but the feature is not enabled
+
+    _, warnings = _extract_disagg_cfg_capturing_warnings(cfg)
+
+    assert warnings == []
 
 
 def test_extract_ctx_gen_cfgs():
