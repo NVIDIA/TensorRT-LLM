@@ -127,7 +127,7 @@ def assert_acceptance_length(test_key: str, al_value: float) -> None:
 
     Args:
         test_key: Key in acceptance_length.yaml identifying the test variant,
-            e.g. ``"TestLlama3_1_8BInstruct::test_dflash"``.
+            e.g. ``"TestGPTOSS::test_dflash"``.
         al_value: Observed mean acceptance length to check.
 
     Population:

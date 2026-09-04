@@ -677,18 +677,6 @@ def llama_model_root(request):
     if request.param == "TinyLlama-1.1B-Chat-v1.0":
         llama_model_root = os.path.join(models_root, "llama-models-v2",
                                         "TinyLlama-1.1B-Chat-v1.0")
-    elif request.param == "llama-3.1-8b":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-8B")
-    elif request.param == "llama-3.1-8b-instruct-hf-fp8":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Llama-3.1-8B-Instruct-FP8")
-    elif request.param == "llama-3.1-8b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Llama-3.1-8B-Instruct")
-    elif request.param == "llama-3.1-8b-hf-nvfp4":
-        llama_model_root = os.path.join(models_root, "nvfp4-quantized",
-                                        "Meta-Llama-3.1-8B")
     assert os.path.exists(
         llama_model_root
     ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"

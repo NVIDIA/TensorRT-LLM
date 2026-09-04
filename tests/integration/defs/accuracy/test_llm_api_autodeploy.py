@@ -1209,22 +1209,11 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     """
     # Aliases for models that have different names in the registry and the reference accuracy files.
     MODEL_REFERENCE_ALIASES = {
-        "nvidia/Llama-3.1-8B-Instruct-FP8": "meta-llama/Llama-3.1-8B-Instruct",
-        "nvidia/Llama-3.1-8B-Instruct-NVFP4":
-        "meta-llama/Llama-3.1-8B-Instruct",
         "nvidia/DeepSeek-R1-0528-NVFP4-v2": "deepseek-ai/DeepSeek-R1-0528",
     }
 
     # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
     MODEL_REGISTRY_ACCURACY_PARAMS = [
-        pytest.param("meta-llama/Llama-3.1-8B-Instruct", {}, [MMLU, GSM8K],
-                     id="meta-llama_Llama-3.1-8B-Instruct"),
-        pytest.param("nvidia/Llama-3.1-8B-Instruct-FP8", {}, [MMLU, GSM8K],
-                     marks=skip_pre_ada,
-                     id="nvidia_Llama-3.1-8B-Instruct-FP8"),
-        pytest.param("nvidia/Llama-3.1-8B-Instruct-NVFP4", {}, [MMLU, GSM8K],
-                     marks=skip_pre_blackwell,
-                     id="nvidia_Llama-3.1-8B-Instruct-NVFP4"),
         pytest.param("google/gemma-3-1b-it", {}, [MMLU, GSM8K],
                      id="google_gemma-3-1b-it"),
         pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],

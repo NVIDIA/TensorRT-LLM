@@ -1,14 +1,11 @@
-import json
 import math
-import os
 
 import pytest
 import torch
-from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
 
 import tensorrt_llm
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.rocket import (
     RocketKVCacheManager,
@@ -21,84 +18,8 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, RocketSparseAttentionConfig
+from tensorrt_llm.llmapi import KvCacheConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
-
-
-@pytest.mark.skipif(getSMVersion() < 100, reason="RocketKV requires SM100 (Blackwell)")
-@pytest.mark.parametrize("backend", ["pytorch"])
-@pytest.mark.parametrize("model_name", ["llama-3.1-model/Llama-3.1-8B-Instruct"])
-@pytest.mark.parametrize("attention_backend", ["VANILLA", "TRTLLM"])
-def test_model(backend, model_name, attention_backend, monkeypatch):
-    # RocketKV is a single-GPU path. Keep this test independent of MPI
-    # dynamic-process bootstrap so a cluster launch failure cannot mask the
-    # attention result.
-    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
-    model_dir = str(llm_models_root() / model_name)
-    max_batch_size = 16
-    max_output_tokens = 128
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7, enable_block_reuse=False)
-
-    kt_cache_dtype = "float8_e5m2" if attention_backend == "TRTLLM" else "bfloat16"
-
-    sparse_attention_config = RocketSparseAttentionConfig(
-        window_size=32,
-        kernel_size=63,
-        prompt_budget=2048,
-        kt_cache_dtype=kt_cache_dtype,
-    )
-
-    cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1, 2, 4, 8, 16],
-        enable_padding=True,
-    )
-
-    llm = LLM(
-        model=model_dir,
-        backend=backend,
-        kv_cache_config=kv_cache_config,
-        attn_backend=attention_backend,
-        sparse_attention_config=sparse_attention_config,
-        max_batch_size=max_batch_size,
-        max_seq_len=20480,
-        max_num_tokens=81920,
-        cuda_graph_config=None if attention_backend == "VANILLA" else cuda_graph_config,
-    )
-
-    inputs, references = [], []
-    current_file = os.path.abspath(__file__)
-    current_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(current_file))))
-    input_file = f"{current_dir}/multi_gpu/NIAH_simple_data.jsonl"
-    with open(input_file, "r") as f:
-        for line in f:
-            sample = json.loads(line)
-            inputs.append(
-                {
-                    "prompt": sample["input_context"] + sample["input_query"],
-                }
-            )
-            references.append(sample["outputs"][0])
-
-    with llm:
-        outputs = llm.generate(
-            inputs,
-            use_tqdm=True,
-            sampling_params=SamplingParams(
-                add_special_tokens=False, max_tokens=max_output_tokens, temperature=0.8, top_p=0.95
-            ),
-        )
-
-    count = 0
-    for ref, ret in zip(references, outputs):
-        print(f"ret: {ret.outputs[0].text}")
-        print(f"ref: {ref}")
-        if ref not in ret.outputs[0].text:
-            print(f"reference {ref} is not in the output {ret.outputs[0].text}")
-        else:
-            count = count + 1
-    acc = count / len(outputs)
-
-    assert acc >= 0.9, "accuracy test of rocketkv sparse attention failed"
 
 
 def create_rocket_kv_cache_manager(
@@ -772,11 +693,6 @@ def test_rocket_add_dummy_requests_forwards_capture_sampling_params(mocker):
 
 
 if __name__ == "__main__":
-    # RocketKV e2e tests
-    print("=== Testing RocketKV E2E tests ===")
-    test_model("pytorch", "llama-3.1-model/Llama-3.1-8B-Instruct", "VANILLA")
-    test_model("pytorch", "llama-3.1-model/Llama-3.1-8B-Instruct", "TRTLLM")
-
     # Unit tests for sparse_kv_predict
     print("\n=== Testing sparse_kv_predict ===")
     test_sparse_kv_predict(1, 1)  # bs=1, context only

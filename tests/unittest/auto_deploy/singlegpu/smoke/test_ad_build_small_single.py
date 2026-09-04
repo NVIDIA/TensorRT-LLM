@@ -83,32 +83,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     "model_hub_id, llm_extra_args",
     [
         (
-            "meta-llama/Meta-Llama-3.1-8B-Instruct",
-            {
-                "kv_cache_config": {
-                    "free_gpu_memory_fraction": 0.0001,
-                },
-                "transforms": {
-                    "insert_cached_attention": {"backend": "flashinfer"},
-                    # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
-                    # "compile_model": {"backend": "torch-opt"},
-                    "compile_model": {
-                        "backend": "torch-cudagraph",
-                        "cuda_graph_batch_sizes": [1, 2],
-                    },
-                },
-            },
-        ),
-        (
-            "meta-llama/Meta-Llama-3.1-8B-Instruct",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
-                },
-                "mode": "transformers",
-            },
-        ),
-        (
             "Qwen/Qwen3-30B-A3B",
             {
                 "transforms": {

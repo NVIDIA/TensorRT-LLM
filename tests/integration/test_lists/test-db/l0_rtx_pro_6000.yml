@@ -28,9 +28,6 @@ l0_rtx_pro_6000:
   - unittest/_torch/thop/parallel/test_w4a8_linear.py
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B] # 3mins
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_fp8_hf-Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf] # 3mins
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_nvfp4_hf-Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf] # 2mins

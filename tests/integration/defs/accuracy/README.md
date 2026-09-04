@@ -109,19 +109,17 @@ The accuracy references are registered in the YAML files in [references](./refer
 * Model level: Each model is indexed by its unique Hugging Face model ID in each YAML file.
 * Accuracy specification level: Each accuracy specification is some feature combination that has justifiable accuracy difference from the default accuracy.
 
-For example, in [references/mmlu.yaml](./references/mmlu.yaml) the model [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) has accuracy references as following:
+For example, in [references/mmlu.yaml](./references/mmlu.yaml) the model [`mistralai/Ministral-8B-Instruct-2410`](https://huggingface.co/mistralai/Ministral-8B-Instruct-2410) has accuracy references as following:
 
 ```yaml
-meta-llama/Llama-3.1-8B-Instruct:
-  - accuracy: 68.17
-  - quant_algo: FP8
-    accuracy: 67.93
+mistralai/Ministral-8B-Instruct-2410:
+  - accuracy: 66.35
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 67.87
+    accuracy: 65.96
 ```
 
-The first item is the default accuracy specification (i.e., using original Hugging Face model data type and no quantization), and the reference accuracy is 68.17. The second item is an accuracy specification with FP8 GEMM quantization, with a slightly lower reference accuracy 67.93. The third item is a specification with FP8 GEMM and KV cache quantization, with a further slightly lower reference accuracy 67.87.
+The first item is the default accuracy specification (i.e., using original Hugging Face model data type and no quantization), and the reference accuracy is 66.35. The second item is an accuracy specification with FP8 GEMM and KV cache quantization, with a slightly lower reference accuracy 65.96.
 
 Model data type and quantization decide the precision in model computation, so accuracy differences can be *justified* if different data types or quantizations are used. Hence, they are the most typical components in accuracy specifications. Please see other categories of accuracy specifications documented in `AccuracyTask.get_hypothesis_testing_params` in [accuracy_core.py](./accuracy_core.py). Note that we exclude most inference features such as parallelism, because theoretically they should not affect model accuracy. Think from the opposite perspective, if enabling tensor parallelism results in statistically significant accuracy loss, we might need to check whether some accuracy bugs exist.
 
@@ -137,14 +135,14 @@ If all the evaluated accuracies are equal to or higher than the corresponding th
 
 ### Add New Test Cases with Existing Tasks
 
-We suggest supporting the model with LLM API, and then add tests to [test_llm_api.py](./test_llm_api.py) or [test_llm_api_pytorch.py](./test_llm_api_pytorch.py). Typically, a test class is responsible for a model (corresponding to a unique Hugging Face model ID); it contains several test methods for different features (e.g., quantizations, parallelisms). For example, in [test_llm_api_pytorch.py](./test_llm_api_pytorch.py) the model [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) has the test class defined as:
+We suggest supporting the model with LLM API, and then add tests to [test_llm_api.py](./test_llm_api.py) or [test_llm_api_pytorch.py](./test_llm_api_pytorch.py). Typically, a test class is responsible for a model (corresponding to a unique Hugging Face model ID); it contains several test methods for different features (e.g., quantizations, parallelisms). For example, in [test_llm_api_pytorch.py](./test_llm_api_pytorch.py) the model [`mistralai/Ministral-8B-Instruct-2410`](https://huggingface.co/mistralai/Ministral-8B-Instruct-2410) has the test class defined as:
 
 ```python
-class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Ministral-8B-Instruct-2410"
+    MODEL_PATH = f"{llm_models_root()}/Ministral-8B-Instruct-2410"
 
-    def test_bfloat16(self, ...):
+    def test_auto_dtype(self, ...):
         # create an LLM instance with tested features enabled, optionally with pytest parameters
         llm = LLM(self.MODEL_PATH, ...)
         # use a context manager to explicitly deconstruct the LLM instance upon exiting
@@ -166,7 +164,7 @@ The last step is registering the accuracy reference. If the new test case shares
 Otherwise, run the new test case without reference by prepending `TRTLLM_ACCURACY_NO_REFERENCE=1`. For example,
 
 ```bash
-TRTLLM_ACCURACY_NO_REFERENCE=1 pytest -vs "test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile]"
+TRTLLM_ACCURACY_NO_REFERENCE=1 pytest -vs "test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype"
 ```
 
 The results would look like:

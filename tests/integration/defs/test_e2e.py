@@ -24,10 +24,10 @@ from typing import Any, Optional, Tuple
 
 import pytest
 import yaml
-from defs.trt_test_alternative import (check_call, check_call_negative_test,
-                                       check_output, print_info, print_warning)
+from defs.trt_test_alternative import (check_call, check_output, print_info,
+                                       print_warning)
 
-from .common import get_mmlu_accuracy, venv_check_call
+from .common import get_mmlu_accuracy
 from .conftest import (get_device_count, get_sm_version, llm_models_root,
                        skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
                        skip_pre_hopper, tests_path, unittest_path)
@@ -386,178 +386,6 @@ def temp_extra_llm_api_options_file(request):
         yield None
 
 
-@pytest.mark.parametrize(
-    "model_name, llama_model_root, use_extra_config, pytorch_backend_config",
-    [('meta-llama/Llama-3.1-8B', 'llama-3.1-8b', False, False),
-     pytest.param('meta-llama/Llama-3.1-8B',
-                  'llama-3.1-8b-instruct-hf-fp8',
-                  True,
-                  False,
-                  marks=skip_pre_hopper),
-     pytest.param('meta-llama/Llama-3.1-8B',
-                  'llama-3.1-8b-instruct-hf-fp8',
-                  True,
-                  True,
-                  marks=skip_pre_hopper),
-     pytest.param('meta-llama/Llama-3.1-8B',
-                  'llama-3.1-8b-hf-nvfp4',
-                  False,
-                  False,
-                  marks=skip_pre_blackwell)],
-    indirect=['llama_model_root'])
-def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
-                                             llama_model_root, model_name,
-                                             use_extra_config,
-                                             pytorch_backend_config,
-                                             temp_extra_llm_api_options_file):
-    """Sanity check on latency benchmark for LLM API with PyTorch backend
-    """
-    model_path, dataset_path = trtllm_bench_prolog(llm_root, llm_venv,
-                                                   llama_model_root, model_name,
-                                                   False, False)
-
-    benchmark_cmd = \
-        f"trtllm-bench --model {model_name} --model_path {model_path} " \
-        f"throughput " \
-        f"--dataset {dataset_path} --backend pytorch"
-
-    mapping = {
-        "Meta-Llama-3.1-8B": 19.4,
-        "Llama-3.1-8B-Instruct-FP8": 12.0,
-        "Meta-Llama-3.1-8B-NVFP4": 10.2
-    }
-    if use_extra_config:
-        benchmark_cmd += f" --config {temp_extra_llm_api_options_file}"
-
-    model_id = llama_model_root.split(r"/")[-1]
-    if "nvfp4-quantized" in llama_model_root:
-        model_id += "-NVFP4"
-
-    check_call(benchmark_cmd, shell=True)
-
-
-def test_trtllm_bench_mgmn(llm_root, llm_venv):
-    model_name = "meta-llama/Llama-3.1-8B"
-    llama_model_dir = Path(
-        llm_models_root()) / "llama-3.1-model/Llama-3.1-8B-Instruct"
-    _, dataset_path = trtllm_bench_prolog(llm_root,
-                                          llm_venv,
-                                          model_subdir=llama_model_dir,
-                                          model_name=model_name,
-                                          quant=None,
-                                          streaming=False)
-
-    benchmark_cmd = \
-            f"mpirun --allow-run-as-root -n 2 trtllm-llmapi-launch trtllm-bench --model {model_name} " \
-            f"--model_path {llama_model_dir} " \
-            f"throughput " \
-            f"--dataset {str(dataset_path)} --backend pytorch --tp 2"
-
-    check_call(benchmark_cmd, shell=True, env=llm_venv._new_env)
-
-
-@pytest.mark.parametrize(
-    "model_name",
-    [
-        "meta-llama/Llama-3.1-8B",
-    ],
-)
-def test_trtllm_bench_help_sanity(model_name):
-    """Sanity check that the options are defined properly by printing out help
-    """
-    check_call("trtllm-bench --help", shell=True)
-    check_call(f"trtllm-bench --model {model_name} throughput --help",
-               shell=True)
-    check_call(f"trtllm-bench --model {model_name} latency --help", shell=True)
-
-
-@pytest.mark.parametrize("request_rate", [False, True],
-                         ids=["", "enable_request_rate"])
-@pytest.mark.parametrize("concurrency", [False, True],
-                         ids=["", "enable_concurrency"])
-def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
-                                                   request_rate, concurrency):
-    """Sanity check on the trtllm-bench new request rate and concurrency API
-    """
-    model_subdir = "llama-3.1-model/Meta-Llama-3.1-8B"
-    model_name = "meta-llama/Llama-3.1-8B"
-
-    model_path, dataset_path = trtllm_bench_prolog(llm_root,
-                                                   llm_venv,
-                                                   model_subdir,
-                                                   model_name,
-                                                   quant=None,
-                                                   streaming=False)
-
-    benchmark_cmd = \
-        f"trtllm-bench --model {model_name} --model_path {model_path} throughput " \
-        f"--dataset {dataset_path} --backend pytorch"
-
-    if request_rate:
-        benchmark_cmd += " --request_rate 100"
-    if concurrency:
-        benchmark_cmd += " --concurrency 100"
-
-    print(f"cmd: {benchmark_cmd}")
-
-    if request_rate and concurrency:
-        # negative test, request rate and concurrency should not be turned on at the same time
-        check_call_negative_test(benchmark_cmd, shell=True)
-    else:
-        check_call(benchmark_cmd, shell=True)
-
-
-@pytest.mark.parametrize("model_subdir", [
-    "llama-3.1-model/Meta-Llama-3.1-8B",
-],
-                         ids=lambda x: x.strip("-"))
-@pytest.mark.parametrize(
-    "model_name",
-    [
-        "meta-llama/Llama-3.1-8B",
-    ],
-)
-@pytest.mark.parametrize("streaming", [True, False],
-                         ids=["non-streaming", "streaming"])
-@pytest.mark.parametrize("backend", ["pytorch"], ids=["PyTorch"])
-def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
-                                    model_subdir, streaming, backend):
-    """Test the iteration log functionality with necessary options
-    """
-    iteration_log = None
-
-    try:
-        iteration_log = tempfile.mkstemp(dir="/tmp", suffix=".txt")[1]
-
-        model_path, dataset_path = trtllm_bench_prolog(llm_root,
-                                                       llm_venv,
-                                                       model_subdir,
-                                                       model_name,
-                                                       quant=None,
-                                                       streaming=streaming)
-
-        benchmark_cmd = \
-            f"trtllm-bench --model {model_name} --model_path {model_path} " \
-            f"throughput --dataset {dataset_path} --iteration_log {iteration_log}"
-
-        if streaming:
-            benchmark_cmd += " --streaming"
-
-        benchmark_cmd += f" --backend {backend}"
-
-        check_call(benchmark_cmd, shell=True)
-
-        assert os.path.exists(
-            iteration_log
-        ), f"Iteration log file {iteration_log} was not created."
-        if os.path.getsize(iteration_log) == 0:
-            raise AssertionError(
-                f"Iteration log file {iteration_log} is empty.")
-    finally:
-        if iteration_log:
-            shutil.rmtree(iteration_log, ignore_errors=True)
-
-
 def test_trtllm_serve_example(llm_root, llm_venv):
     example_root = Path(os.path.join(llm_root, "examples", "serve"))
     test_root = unittest_path() / "llmapi" / "apps"
@@ -768,10 +596,8 @@ def test_openai_mmencoder_example(llm_root, llm_venv):
          str(test_root / "_test_openai_mmencoder.py")])
 
 
-@pytest.mark.parametrize("model_name", [
-    "meta-llama/Llama-3.1-8B-Instruct",
-    pytest.param("openai/gpt-oss-120b", marks=skip_pre_hopper)
-])
+@pytest.mark.parametrize(
+    "model_name", [pytest.param("openai/gpt-oss-120b", marks=skip_pre_hopper)])
 def test_openai_chat_guided_decoding(llm_root, llm_venv, model_name: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -782,10 +608,8 @@ def test_openai_chat_guided_decoding(llm_root, llm_venv, model_name: str):
 
 
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("model_name", [
-    "llama-3.1-model/Meta-Llama-3.1-8B",
-    pytest.param("gpt_oss/gpt-oss-20b", marks=skip_pre_hopper)
-])
+@pytest.mark.parametrize(
+    "model_name", [pytest.param("gpt_oss/gpt-oss-20b", marks=skip_pre_hopper)])
 def test_trtllm_benchmark_serving(llm_venv, model_name):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -802,39 +626,6 @@ def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
     llm_venv.run_cmd([
         "-m", "pytest",
         str(test_root / "_test_trtllm_serve_multimodal_benchmark.py")
-    ])
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.skip_less_device_memory(40000)
-@pytest.mark.parametrize("service_discovery", ["etcd"])
-def test_openai_disagg_multi_nodes_completion_service_discovery(
-        llm_root, llm_venv, service_discovery):
-    test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m",
-        "pytest",
-        str(test_root /
-            f"_test_disagg_serving_multi_nodes_service_discovery.py::test_completion[{service_discovery}]"
-            ),
-    ])
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.skip_less_device_memory(40000)
-@pytest.mark.parametrize("gen_config",
-                         ["gen_tp2pp1", "gen_tp1pp2", "gen_tp1pp1"])
-@pytest.mark.parametrize("ctx_config",
-                         ["ctx_tp2pp1", "ctx_tp1pp2", "ctx_tp1pp1"])
-def test_openai_disagg_multi_nodes_completion(llm_root, llm_venv, ctx_config,
-                                              gen_config):
-    test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m",
-        "pytest",
-        str(test_root /
-            f"_test_disagg_serving_multi_nodes.py::test_completion[{ctx_config}-{gen_config}]"
-            ),
     ])
 
 
@@ -857,27 +648,9 @@ def parse_output(text):
     return results
 
 
-def test_ptp_quickstart(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-
-    src = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
-    dst = f"{llm_venv.get_working_directory()}/meta-llama/Llama-3.1-8B-Instruct"
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    os.symlink(src, dst, target_is_directory=True)
-
-    venv_check_call(llm_venv, [str(example_root / "quickstart_example.py")])
-
-
 @pytest.mark.parametrize("model_name,model_path", [
-    ("Llama3.1-8B-BF16", "llama-3.1-model/Meta-Llama-3.1-8B"),
     ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
-    pytest.param('Llama3.1-8B-NVFP4',
-                 'nvfp4-quantized/Meta-Llama-3.1-8B',
-                 marks=skip_pre_blackwell),
-    pytest.param('Llama3.1-8B-FP8',
-                 'llama-3.1-model/Llama-3.1-8B-Instruct-FP8',
-                 marks=skip_pre_hopper),
     pytest.param('Qwen3-30B-A3B',
                  'Qwen3/Qwen3-30B-A3B',
                  marks=pytest.mark.skip_less_device_memory(80000)),
@@ -893,10 +666,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
                  marks=skip_pre_blackwell),
     pytest.param(
         'GPT-OSS-120B', 'gpt_oss/gpt-oss-120b', marks=skip_pre_blackwell),
-    ("Llama3.1-8B-bf16-instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
-    pytest.param('Llama3.1-8B-FP4',
-                 'modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4',
-                 marks=skip_pre_blackwell),
     pytest.param(
         'Qwen3-8b-fp8', 'Qwen3/nvidia-Qwen3-8B-FP8', marks=skip_pre_hopper),
     pytest.param('Qwen3-8b-nvfp4',
@@ -930,11 +699,8 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
         ])
     else:
         mapping = {
-            "Llama3.1-8B-BF16": 18.60,
             "Llama3.2-11B-BF16": 18.88,
             "Nemotron4_4B-BF16": 12.50,
-            "Llama3.1-8B-FP8": 13.05,
-            "Llama3.1-8B-NVFP4": 10.2
         }
         cmds = [
             str(example_root / "quickstart_advanced.py"),
@@ -1040,8 +806,6 @@ def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
 
 
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
-    ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
-     "EAGLE3-LLaMA3.1-Instruct-8B"),
     pytest.param('GPT-OSS-120B-Eagle3',
                  'gpt_oss/gpt-oss-120b',
                  'gpt_oss/gpt-oss-120b-Eagle3',
@@ -1062,88 +826,6 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
         f"{llm_models_root()}/{model_path}",
         "--draft_model_dir",
         f"{llm_models_root()}/{eagle_model_path}",
-        "--disable_kv_cache_reuse",
-        "--disable_overlap_scheduler",
-    ])
-
-
-@pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
-    ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
-     "EAGLE3-LLaMA3.1-Instruct-8B"),
-])
-def test_draft_token_tree_quickstart_advanced_eagle3(llm_root, llm_venv,
-                                                     model_name, model_path,
-                                                     eagle_model_path):
-    print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    llm_venv.run_cmd([
-        str(example_root / "quickstart_advanced.py"),
-        "--prompt",
-        "You are a good assistant. Please tell me the capital of France is",
-        "--spec_decode_max_draft_len",
-        "3",
-        "--spec_decode_algo",
-        "eagle3",
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        "--draft_model_dir",
-        f"{llm_models_root()}/{eagle_model_path}",
-        "--disable_kv_cache_reuse",
-        "--disable_overlap_scheduler",
-        "--eagle_choices",
-        "[[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [2, 0], [0, 0, 0], [0, 1, 0], [1, 0, 0]]",
-        "--kv_cache_fraction",
-        "0.4",
-    ])
-
-
-@pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
-    ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
-     "EAGLE3-LLaMA3.1-Instruct-8B"),
-])
-def test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree(
-        llm_root, llm_venv, model_name, model_path, eagle_model_path):
-    print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    llm_venv.run_cmd([
-        str(example_root / "quickstart_advanced.py"),
-        "--prompt",
-        "You are a good assistant. Please tell me the capital of France is",
-        "--spec_decode_max_draft_len",
-        "3",
-        "--spec_decode_algo",
-        "eagle3",
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        "--draft_model_dir",
-        f"{llm_models_root()}/{eagle_model_path}",
-        "--disable_kv_cache_reuse",
-        "--disable_overlap_scheduler",
-        "--eagle_choices",
-        "[[0], [1], [2]]",
-        "--kv_cache_fraction",
-        "0.4",
-    ])
-
-
-@pytest.mark.parametrize("model_name,model_path", [
-    ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
-])
-def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
-                                       model_path):
-    print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    llm_venv.run_cmd([
-        str(example_root / "quickstart_advanced.py"),
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        "--spec_decode_algo",
-        "NGRAM",
-        "--spec_decode_max_draft_len",
-        "4",
-        "--max_matching_ngram_size",
-        "2",
-        "--use_cuda_graph",
         "--disable_kv_cache_reuse",
         "--disable_overlap_scheduler",
     ])
@@ -1413,23 +1095,6 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
             "--cuda_graph_padding_enabled",
         ])
     llm_venv.run_cmd(cmd)
-
-
-@skip_pre_blackwell
-def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    model_path = "Llama-3_1-8B-Instruct_fp8_nvfp4_hf"
-    llm_venv.run_cmd([
-        str(example_root / "quickstart_advanced.py"),
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-    ])
-
-    # NOTE: we deliberately do not check the LLM outputs with keyword matching ratios as in the
-    # other tests, as it can be brittle and cause flakiness in CI.
-    # This test now becomes a smoke / functional test.
-    # Proper accuracy tests should be added to
-    # `tests/integration/defs/accuracy/test_llm_api_pytorch_multimodal.py`.
 
 
 @pytest.mark.parametrize("modality", ["image", "video"])
@@ -1873,58 +1538,3 @@ def test_get_ci_container_port():
     assert container_port_start > 0
     assert container_port_num > 0
     assert container_port_start + container_port_num <= 60000
-
-
-@skip_pre_hopper
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("model_name", ["meta/Meta-Llama-3.1-8B"],
-                         ids=["llama3_1-8b"])
-@pytest.mark.parametrize("model_subdir", ["llama-3.1-model/Meta-Llama-3.1-8B"],
-                         ids=["llama_v3_1"])
-def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir):
-    """Run benchmark in MIG mode, check if throughput increases with concurrency."""
-    results = {}
-    concurrency_list = [1, 32, 64, 128]
-
-    for concurrency in concurrency_list:
-        num_requests = concurrency * 10
-        runner = BenchRunner(llm_root=llm_root,
-                             llm_venv=llm_venv,
-                             model_name=model_name,
-                             model_subdir=model_subdir,
-                             streaming=False,
-                             use_mpirun=False,
-                             tp_size=1,
-                             concurrency=concurrency,
-                             num_requests=num_requests)
-
-        output = runner()
-        results[concurrency] = output
-
-    print(f"\n=== Benchmark Results Comparison ===")
-    print(f"Model: {model_name}")
-    print(
-        f"{'Concurrency':<15} {'Throughput':<15} {'Latency':<15} {'Num Requests':<15}"
-    )
-    print("-" * 60)
-
-    for idx, val in enumerate(concurrency_list):
-        metrics = results.get(val)
-        if not isinstance(metrics, dict):
-            pytest.fail(
-                f"Unexpected benchmark result type for concurrency {val}: {type(metrics)}"
-            )
-        try:
-            throughput = float(metrics.get('throughput', 0))
-            latency = float(metrics.get('latency', 0))
-            num_requests = int(metrics.get('num_requests', 0))
-        except (ValueError, TypeError) as e:
-            pytest.fail(
-                f"Failed to parse benchmark results for concurrency {val}: {e}")
-        assert throughput > 0, f"Throughput is 0 for concurrency {val}"
-        assert latency > 0, f"Latency is 0 for concurrency {val}"
-        print(f"{val:<15} {throughput:<15} {latency:<15} {num_requests:<15}")
-        if idx > 0:
-            prev_throughput = float(results[concurrency_list[idx - 1]].get(
-                'throughput', 0))
-            assert throughput > prev_throughput * 1.3, f"Throughput is not increasing for concurrency {concurrency_list[idx]}"

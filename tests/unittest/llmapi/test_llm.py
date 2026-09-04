@@ -253,7 +253,6 @@ def test_llm_with_kv_cache_retention_config():
         (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
         (llama_model_path, False, 0.95),
         (get_model_path(qwen3_tokenizer_model_name), False, 0.95),
-        (get_model_path('llama-3.1-model/Meta-Llama-3.1-8B'), False, 0.95),
         (get_model_path('DeepSeek-R1/DeepSeek-R1'), False, 0.95)
     ])
 @pytest.mark.part0

@@ -1,6 +1,3 @@
-test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
-test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP4-modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4]
-test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-bf16-instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
 test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-20B-gpt_oss/gpt-oss-20b]
 test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-120B-gpt_oss/gpt-oss-120b]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-8b-fp8-Qwen3/nvidia-Qwen3-8B-FP8]
@@ -15,8 +12,6 @@ test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-9B-v2-nvfp4-NVIDIA-Nemot
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_nvfp4_hf-Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf]
 
-accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
 

@@ -428,15 +428,6 @@ def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 
 _SMALL_MODEL_CONFIGS = {
-    "meta-llama/Meta-Llama-3.1-8B-Instruct": {
-        "model_kwargs": {
-            "num_hidden_layers": 1,
-            "hidden_size": 64,
-            "intermediate_size": 64,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
-        },
-    },
     "Qwen/Qwen3-30B-A3B": {
         "model_kwargs": {
             "num_hidden_layers": 2,
@@ -571,7 +562,7 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
     Get the small model configuration for a given HuggingFace model hub ID.
 
     Args:
-        model_hub_id: The HuggingFace model hub ID (e.g., "meta-llama/Meta-Llama-3.1-8B-Instruct")
+        model_hub_id: The HuggingFace model hub ID (e.g., "Qwen/Qwen3-30B-A3B")
 
     Returns:
         Dictionary containing the model configuration
