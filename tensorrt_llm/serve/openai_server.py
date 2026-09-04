@@ -3161,7 +3161,7 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} generated and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
-            total = get_steady_clock_now_in_seconds() - request_received
+            total = get_global_steady_clock_now_in_seconds() - request_received
             headers = build_visual_gen_timing_headers(
                 build_visual_gen_server_timings(metrics, total=total))
 
@@ -3381,7 +3381,7 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} edited and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
-            total = get_steady_clock_now_in_seconds() - request_received
+            total = get_global_steady_clock_now_in_seconds() - request_received
             headers = build_visual_gen_timing_headers(
                 build_visual_gen_server_timings(metrics, total=total))
 
