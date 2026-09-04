@@ -755,6 +755,100 @@ def test_count_tokens_without_context_workers_is_an_error_not_a_zero():
         asyncio.run(service.anthropic_count_tokens(request))
 
 
+class _FakeSession:
+    """Records the one POST post_json makes and replays a canned response."""
+
+    def __init__(self, status=200, payload=None, text=""):
+        self._status, self._payload, self._text = status, payload or {}, text
+        self.sent = {}
+
+    def post(self, url, data, headers):
+        self.sent = {"url": url, "data": data, "headers": headers}
+        session = self
+
+        class _Response:
+            status = session._status
+            reason = "Bad Request"
+            headers = {}
+            request_info = None
+            history = ()
+
+            async def json(self):
+                return session._payload
+
+            async def text(self):
+                return session._text
+
+        class _Ctx:
+            async def __aenter__(self):
+                return _Response()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+def test_post_json_sends_msgpack_the_worker_can_decode():
+    """Exercises post_json's own serialisation rather than a mock of it.
+
+    Every other test here substitutes post_json, so nothing covers the body it
+    actually builds. The worker only decodes msgpack when X-TRTLLM-Msgpack is
+    set, so a wrong header or encoding is a runtime failure on a disaggregated
+    deployment that no mocked test can see.
+    """
+    import msgspec
+
+    from tensorrt_llm.serve.anthropic_protocol import (
+        AnthropicCountTokensRequest,
+        AnthropicCountTokensResponse,
+    )
+    from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+
+    session = _FakeSession(payload={"input_tokens": 11})
+    client = object.__new__(OpenAIHttpClient)
+    client._session = session
+    request = AnthropicCountTokensRequest(model=MODEL, messages=[{"role": "user", "content": "hi"}])
+
+    response = asyncio.run(
+        client.post_json(
+            "v1/messages/count_tokens", request, AnthropicCountTokensResponse, "ctx0:8000"
+        )
+    )
+
+    assert response.input_tokens == 11
+    # The router hands out bare host:port, which aiohttp will not accept.
+    assert session.sent["url"] == "http://ctx0:8000/v1/messages/count_tokens"
+    assert session.sent["headers"]["X-TRTLLM-Msgpack"] == "1"
+    assert msgspec.msgpack.decode(session.sent["data"])["model"] == MODEL
+
+
+def test_post_json_raises_on_an_error_status():
+    """A 4xx must raise, not be parsed as if it were a response body.
+
+    response_type(**body) on an error payload would either throw a confusing
+    validation error or, worse, construct a defaulted object.
+    """
+    import aiohttp
+
+    from tensorrt_llm.serve.anthropic_protocol import (
+        AnthropicCountTokensRequest,
+        AnthropicCountTokensResponse,
+    )
+    from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+
+    client = object.__new__(OpenAIHttpClient)
+    client._session = _FakeSession(status=400, text='{"message":"messages must not be empty"}')
+    request = AnthropicCountTokensRequest(model=MODEL, messages=[{"role": "user", "content": "hi"}])
+
+    with pytest.raises(aiohttp.ClientResponseError, match="messages must not be empty"):
+        asyncio.run(
+            client.post_json(
+                "v1/messages/count_tokens", request, AnthropicCountTokensResponse, "ctx0:8000"
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "message,expected",
     [

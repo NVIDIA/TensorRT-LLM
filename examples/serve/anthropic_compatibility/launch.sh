@@ -59,6 +59,7 @@ mkdir -p "${FLEET_DIR}"
 
 PIDS=()
 cleanup() {
+    trap - EXIT INT TERM   # a second Ctrl-C must not re-enter this
     # Reverse order: drop the registration first so the gateway stops routing
     # to a server that is already going away, rather than discovering it by
     # timeout after the next heartbeat is missed.
@@ -66,7 +67,20 @@ cleanup() {
     for pid in "${PIDS[@]:-}"; do
         [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null
     done
-    wait 2>/dev/null
+    # Bounded, then forced. A worker that declines to exit would otherwise hold
+    # its GPU memory indefinitely, and an unbounded `wait` here would hang the
+    # Ctrl-C that was meant to release it.
+    for _ in $(seq 1 20); do
+        local alive=0
+        for pid in "${PIDS[@]:-}"; do
+            [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null && alive=1
+        done
+        (( alive )) || break
+        sleep 1
+    done
+    for pid in "${PIDS[@]:-}"; do
+        [[ -n "${pid}" ]] && kill -9 "${pid}" 2>/dev/null
+    done
     echo "[launch] stopped; logs kept in ${RUN_DIR}"
 }
 trap cleanup EXIT INT TERM
