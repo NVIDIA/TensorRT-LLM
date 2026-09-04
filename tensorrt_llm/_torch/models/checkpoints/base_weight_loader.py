@@ -4,7 +4,7 @@
 import threading
 from abc import ABC, abstractmethod
 from bisect import bisect_left
-from typing import Any, Dict, Iterator, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, Tuple, Union
 
 from tensorrt_llm.mapping import Mapping
 
@@ -23,10 +23,66 @@ class ConsumableWeightsDict:
     concurrent iteration while other threads may modify the dictionary.
     """
 
-    def __init__(self, weights: Dict[str, Any]):
+    def __init__(
+        self,
+        weights: Dict[str, Any],
+        *,
+        consumption_observer: Callable[[int, int, int], None] | None = None,
+    ):
         self._weights = weights
         self._lock = threading.Lock()
         self._key_index: list[str] | None = None
+        self._consumption_observer = consumption_observer
+        self._consumption_ledger = (None if consumption_observer is None else {
+            key: (id(weight), self._weight_nbytes(weight))
+            for key, weight in weights.items()
+        })
+
+    def set_consumption_observer(
+            self, observer: Callable[[int, int, int], None] | None) -> None:
+        """Observe explicit consumption progress from ``mark_consumed*``.
+
+        Generic deletion and :meth:`clear` do not imply that the underlying
+        storage is no longer live: another mapping may still alias it.
+        """
+        with self._lock:
+            self._consumption_observer = observer
+            self._consumption_ledger = (None if observer is None else {
+                key: (id(weight), self._weight_nbytes(weight))
+                for key, weight in self._weights.items()
+            })
+
+    @staticmethod
+    def _weight_nbytes(weight: Any) -> int | None:
+        nbytes = getattr(weight, "nbytes", None)
+        return nbytes if isinstance(nbytes, int) and nbytes >= 0 else None
+
+    @staticmethod
+    def _notify_consumed(
+        observer: Callable[[int, int, int], None] | None,
+        consumed_bytes: int,
+        consumed_items: int,
+        sized_items: int,
+    ) -> None:
+        if observer is None or consumed_items == 0:
+            return
+        observer(consumed_bytes, consumed_items, sized_items)
+
+    def _consumption_report_locked(self, keys: list[str]) -> tuple[int, int]:
+        if self._consumption_ledger is None:
+            return 0, 0
+        consumed_bytes = 0
+        sized_items = 0
+        for key in keys:
+            ledger_entry = self._consumption_ledger.pop(key, None)
+            if ledger_entry is None:
+                continue
+            expected_identity, nbytes = ledger_entry
+            if expected_identity == id(
+                    self._weights[key]) and nbytes is not None:
+                consumed_bytes += nbytes
+                sized_items += 1
+        return consumed_bytes, sized_items
 
     def __getitem__(self, key: str) -> Any:
         return self._weights[key]
@@ -35,11 +91,17 @@ class ConsumableWeightsDict:
         with self._lock:
             if key not in self._weights:
                 self._key_index = None
+            if self._consumption_ledger is not None:
+                old_value = self._weights.get(key)
+                if old_value is not value:
+                    self._consumption_ledger[key] = (id(value), None)
             self._weights[key] = value
 
     def __delitem__(self, key: str) -> None:
         with self._lock:
             del self._weights[key]
+            if self._consumption_ledger is not None:
+                self._consumption_ledger.pop(key, None)
 
     def __contains__(self, key: str) -> bool:
         return key in self._weights
@@ -74,6 +136,10 @@ class ConsumableWeightsDict:
         with self._lock:
             if any(key not in self._weights for key in other):
                 self._key_index = None
+            if self._consumption_ledger is not None:
+                for key, value in other.items():
+                    if self._weights.get(key) is not value:
+                        self._consumption_ledger[key] = (id(value), None)
             self._weights.update(other)
 
     def clear(self) -> None:
@@ -81,11 +147,15 @@ class ConsumableWeightsDict:
 
         Use once a downstream dict owns the tensors: a derived dict aliases the
         source tensors it did not rewrite, so consuming it frees nothing while
-        this dict still holds them.
+        this dict still holds them. Clearing this mapping is not consumption:
+        aliases outside it may remain live, so it never grants read-ahead
+        credit.
         """
         with self._lock:
             self._weights.clear()
             self._key_index = []
+            if self._consumption_ledger is not None:
+                self._consumption_ledger.clear()
 
     @classmethod
     def take_ownership(cls, source: Union[Dict[str, Any],
@@ -104,8 +174,29 @@ class ConsumableWeightsDict:
         """
         if not isinstance(source, cls):
             return derived
-        source.clear()
-        return cls(derived)
+        with source._lock:
+            ledger_by_identity: dict[int, list[int | None]] = {}
+            if source._consumption_ledger is not None:
+                for key, weight in source._weights.items():
+                    identity, nbytes = source._consumption_ledger.get(
+                        key, (id(weight), None))
+                    if identity == id(weight):
+                        ledger_by_identity.setdefault(identity,
+                                                      []).append(nbytes)
+            derived_ledger = {}
+            for key, weight in derived.items():
+                entries = ledger_by_identity.get(id(weight))
+                nbytes = entries.pop() if entries else None
+                derived_ledger[key] = (id(weight), nbytes)
+            source._weights.clear()
+            source._key_index = []
+            observer = source._consumption_observer
+            source._consumption_observer = None
+            source._consumption_ledger = None
+        result = cls(derived, consumption_observer=observer)
+        if observer is not None:
+            result._consumption_ledger = derived_ledger
+        return result
 
     def filter_prefix(self, prefix: str) -> Dict[str, Any]:
         """Same result as a ``startswith(prefix)`` scan, without the scan.
@@ -146,13 +237,19 @@ class ConsumableWeightsDict:
         Use instead of :meth:`mark_consumed` when a module consumed specific
         tensors rather than a whole ``name.*`` subtree.
         """
-        deleted = 0
+        removed_keys = []
         with self._lock:
             for key in keys:
                 if key in self._weights:
-                    del self._weights[key]
-                    deleted += 1
-        return deleted
+                    removed_keys.append(key)
+            consumed_bytes, sized_items = self._consumption_report_locked(
+                removed_keys)
+            for key in removed_keys:
+                del self._weights[key]
+            observer = self._consumption_observer
+        self._notify_consumed(observer, consumed_bytes, len(removed_keys),
+                              sized_items)
+        return len(removed_keys)
 
     def mark_consumed(self, prefix: str) -> int:
         """
@@ -168,9 +265,14 @@ class ConsumableWeightsDict:
         """
         with self._lock:
             keys_to_delete = self._keys_with_prefix_locked(prefix + ".")
+            consumed_bytes, sized_items = self._consumption_report_locked(
+                keys_to_delete)
             for key in keys_to_delete:
                 del self._weights[key]
-            return len(keys_to_delete)
+            observer = self._consumption_observer
+        self._notify_consumed(observer, consumed_bytes, len(keys_to_delete),
+                              sized_items)
+        return len(keys_to_delete)
 
 
 class BaseWeightLoader(ABC):

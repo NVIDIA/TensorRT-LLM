@@ -214,10 +214,11 @@
     {
       "allowed_values": [
         "auto",
+        "bounded_rank_striped_read_ahead",
         "native",
         "rank_striped_read_ahead"
       ],
-      "annotation": "Literal['auto', 'native', 'rank_striped_read_ahead']",
+      "annotation": "Literal['auto', 'native', 'rank_striped_read_ahead', 'bounded_rank_striped_read_ahead']",
       "converter": "",
       "kind": "categorical",
       "path": "checkpoint_io_policy"

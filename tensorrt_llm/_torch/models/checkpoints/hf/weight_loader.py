@@ -40,7 +40,8 @@ from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_catalog import \
     build_safetensors_checkpoint_catalog
 from tensorrt_llm._torch.models.checkpoints.hf.rank_striped_read_ahead import (
     RankStripedReadAheadSession, build_local_plan, close_node_communicator,
-    coordinate_error, effective_available_host_memory, memory_admission)
+    coordinate_error, effective_available_host_memory, memory_admission,
+    rolling_issuer_lead_admission)
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
 from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
@@ -54,7 +55,12 @@ _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
 _AUTO_IO_POLICY = "auto"
 _NATIVE_IO_POLICY = "native"
 _RANK_STRIPED_IO_POLICY = "rank_striped_read_ahead"
-_SUPPORTED_IO_POLICIES = (_NATIVE_IO_POLICY, _RANK_STRIPED_IO_POLICY)
+_BOUNDED_RANK_STRIPED_IO_POLICY = "bounded_rank_striped_read_ahead"
+_RANK_STRIPED_IO_POLICIES = (
+    _RANK_STRIPED_IO_POLICY,
+    _BOUNDED_RANK_STRIPED_IO_POLICY,
+)
+_SUPPORTED_IO_POLICIES = (_NATIVE_IO_POLICY, ) + _RANK_STRIPED_IO_POLICIES
 _SUPPORTED_REQUESTED_IO_POLICIES = (_AUTO_IO_POLICY, ) + _SUPPORTED_IO_POLICIES
 # Model families whose checkpoints are too large to materialize in host RAM;
 # their models stream rank-local slices out of the lazy mmapped handles.
@@ -116,6 +122,7 @@ class HfWeightLoader(BaseWeightLoader):
     _requested_checkpoint_io_policy = _NATIVE_IO_POLICY
     _selection_fallback_reason: str | None = None
     _partial_model_loading = False
+    _pending_read_ahead_session: RankStripedReadAheadSession | None = None
     _last_checkpoint_io_status = _CheckpointIOStatus(
         requested=_NATIVE_IO_POLICY,
         selected=_NATIVE_IO_POLICY,
@@ -128,6 +135,7 @@ class HfWeightLoader(BaseWeightLoader):
                  selection_fallback_reason: str | None = None,
                  partial_model_loading: bool = False) -> None:
         self._partial_model_loading = partial_model_loading
+        self._pending_read_ahead_session = None
         self._configure_checkpoint_io_policy(
             checkpoint_io_policy,
             requested_checkpoint_io_policy=requested_checkpoint_io_policy,
@@ -163,6 +171,68 @@ class HfWeightLoader(BaseWeightLoader):
     @property
     def checkpoint_io_policy(self) -> str:
         return self._checkpoint_io_policy
+
+    def activate_weight_session(self,
+                                readiness_error: BaseException | None = None
+                                ) -> None:
+        """Collectively validate readiness, then activate deferred reads."""
+        session = self._pending_read_ahead_session
+        if (self._checkpoint_io_policy != _BOUNDED_RANK_STRIPED_IO_POLICY
+                or session is None):
+            if readiness_error is not None:
+                raise readiness_error
+            return
+
+        coordinated_readiness_error = coordinate_error(
+            session.active_communicator,
+            "bounded rank-striped mapper readiness",
+            readiness_error,
+        )
+        if coordinated_readiness_error is not None:
+            # No reader has started yet. Every participating rank rejects the
+            # activation before any rank can mutate model weights; finish()
+            # will close the prepared file descriptors in the same collective
+            # sequence on all ranks.
+            session.disable()
+            status = self._last_checkpoint_io_status
+            status.activated = False
+            status.fallback_reason = str(coordinated_readiness_error)
+            if readiness_error is not None:
+                raise readiness_error
+            raise coordinated_readiness_error
+
+        activation_error = None
+        try:
+            session.start(defer_reads=True)
+        except Exception as error:
+            activation_error = error
+        coordinated_error = coordinate_error(
+            session.active_communicator,
+            "bounded rank-striped reader activation",
+            activation_error,
+        )
+        if coordinated_error is not None:
+            # Every participating rank reaches this decision before model
+            # mutation. Cancel any readers that started successfully and keep
+            # using the already-mapped native tensors.
+            cleanup_error = session.cancel_reads()
+            coordinated_cleanup_error = coordinate_error(
+                session.active_communicator,
+                "bounded rank-striped activation cleanup",
+                cleanup_error,
+            )
+            session.disable()
+            status = self._last_checkpoint_io_status
+            status.activated = False
+            status.fallback_reason = str(coordinated_error)
+            logger.warning(
+                "Bounded rank-striped activation degraded collectively before "
+                f"model materialization: {coordinated_error}")
+            if coordinated_cleanup_error is not None:
+                raise coordinated_cleanup_error
+            return
+        session.release_reads()
+        self._last_checkpoint_io_status.activated = True
 
     @property
     def last_checkpoint_io_status(self) -> _CheckpointIOStatus:
@@ -515,6 +585,7 @@ class HfWeightLoader(BaseWeightLoader):
             yield weights
             return
 
+        self._pending_read_ahead_session = session
         body_error = None
         try:
             yield weights
@@ -523,38 +594,63 @@ class HfWeightLoader(BaseWeightLoader):
             raise
         finally:
             try:
-                read_error = session.finish(body_error)
-            except Exception as error:
-                status = self._last_checkpoint_io_status
-                status.effective = "none"
-                if body_error is None:
-                    status.fallback_reason = str(error)
+                try:
+                    read_error = session.finish(body_error)
+                except Exception as error:
+                    status = self._last_checkpoint_io_status
+                    status.effective = "none"
+                    if body_error is None:
+                        status.fallback_reason = str(error)
+                        self._log_checkpoint_io_status()
+                        raise
+                    status.fallback_reason = (
+                        "model materialization failed: "
+                        f"{type(body_error).__name__}: {body_error}")
                     self._log_checkpoint_io_status()
-                    raise
-                status.fallback_reason = (
-                    "model materialization failed: "
-                    f"{type(body_error).__name__}: {body_error}")
-                self._log_checkpoint_io_status()
-                # Preserve the specific local error (for example, CUDA OOM) instead
-                # of finish()'s rank-coordinated wrapper.
-                logger.error(
-                    "Rank-striped model materialization failed; preserving "
-                    "the original exception. Coordinated session result: "
-                    f"{type(error).__name__}: {error}")
-            else:
-                status = self._last_checkpoint_io_status
-                if read_error is None:
-                    status.effective = _RANK_STRIPED_IO_POLICY
+                    # Preserve the specific local error (for example, CUDA
+                    # OOM) instead of finish()'s rank-coordinated wrapper.
+                    logger.error(
+                        "Rank-striped model materialization failed; "
+                        "preserving the original exception. Coordinated "
+                        "session result: "
+                        f"{type(error).__name__}: {error}")
                 else:
-                    # Read-ahead is advisory. The native mmap/materialization
-                    # path succeeded, so never retry a partially mutated model.
-                    status.effective = _NATIVE_IO_POLICY
-                    status.fallback_reason = str(read_error)
-                    logger.warning(
-                        "Rank-striped read-ahead degraded after activation; "
-                        "keeping the successfully materialized model: "
-                        f"{read_error}")
-                self._log_checkpoint_io_status()
+                    status = self._last_checkpoint_io_status
+                    progress = session.progress
+                    if progress is not None:
+                        logger.info(
+                            "Bounded rank-striped read-ahead progress: "
+                            f"issued_bytes={progress.issued_bytes}, "
+                            f"consumed_bytes={progress.consumed_bytes}, "
+                            f"max_local_issuer_lead_bytes="
+                            f"{progress.max_issuer_lead_bytes}, "
+                            f"credit_wait_seconds="
+                            f"{progress.credit_wait_seconds:.6f}, "
+                            f"consumption_coverage="
+                            f"{progress.consumption_coverage:.6f}, "
+                            f"submitted_extents={progress.submitted_extents}, "
+                            f"completed_extents={progress.completed_extents}, "
+                            f"partial_extents={progress.partial_extents}, "
+                            f"cancelled_extents={progress.cancelled_extents}, "
+                            f"max_pending_extents="
+                            f"{progress.max_pending_extents}. Linux page-cache "
+                            "residency remains kernel-managed.")
+                    if read_error is None and session.enabled:
+                        status.effective = status.selected
+                    else:
+                        # Read-ahead is advisory. The native mmap/materialization
+                        # path succeeded, so never retry a partially mutated model.
+                        status.effective = _NATIVE_IO_POLICY
+                        if read_error is not None:
+                            status.fallback_reason = str(read_error)
+                            logger.warning(
+                                "Rank-striped read-ahead degraded after "
+                                "activation; keeping the successfully "
+                                f"materialized model: {read_error}")
+                    self._log_checkpoint_io_status()
+            finally:
+                if self._pending_read_ahead_session is session:
+                    self._pending_read_ahead_session = None
 
     @staticmethod
     def _active_communicator():
@@ -629,7 +725,7 @@ class HfWeightLoader(BaseWeightLoader):
         message = ("Checkpoint I/O policy is falling back before model "
                    f"materialization: requested={status.requested}, "
                    f"selected={status.selected}, reason={reason}.")
-        if status.requested == _RANK_STRIPED_IO_POLICY:
+        if status.requested in _RANK_STRIPED_IO_POLICIES:
             logger.warning(message)
         else:
             logger.info(message)
@@ -810,13 +906,23 @@ class HfWeightLoader(BaseWeightLoader):
 
         file_sizes = [(path, stat.st_size) for path, stat in stats]
         checkpoint_bytes = sum(size for _, size in file_sizes)
-        admitted, headroom = memory_admission(checkpoint_bytes,
+        issuer_group_initial_lead_bytes = None
+        if self._checkpoint_io_policy == _BOUNDED_RANK_STRIPED_IO_POLICY:
+            admitted, headroom, issuer_group_initial_lead_bytes = \
+                rolling_issuer_lead_admission(checkpoint_bytes,
                                               available_memory)
-        if eligibility_reason is None and not admitted:
-            eligibility_reason = (
-                f"checkpoint bytes ({checkpoint_bytes}) exceed available "
-                f"host memory ({available_memory}) after startup headroom "
-                f"({headroom})")
+            if eligibility_reason is None and not admitted:
+                eligibility_reason = (
+                    "no host memory remains for bounded rank-striped "
+                    f"read-ahead after startup headroom ({headroom})")
+        else:
+            admitted, headroom = memory_admission(checkpoint_bytes,
+                                                  available_memory)
+            if eligibility_reason is None and not admitted:
+                eligibility_reason = (
+                    f"checkpoint bytes ({checkpoint_bytes}) exceed available "
+                    f"host memory ({available_memory}) after startup headroom "
+                    f"({headroom})")
 
         discovery_signature = tuple(
             (os.path.basename(path), size) for path, size in file_sizes)
@@ -844,14 +950,20 @@ class HfWeightLoader(BaseWeightLoader):
                                             active_communicator,
                                             node_communicator, **kwargs), None
 
-        self._last_checkpoint_io_status.selected = _RANK_STRIPED_IO_POLICY
+        self._last_checkpoint_io_status.selected = self._checkpoint_io_policy
         session = None
         setup_error = None
         try:
-            plan = build_local_plan(file_sizes, local_rank, local_size)
+            plan = build_local_plan(
+                file_sizes,
+                local_rank,
+                local_size,
+                issuer_group_initial_lead_bytes=issuer_group_initial_lead_bytes,
+            )
             session = RankStripedReadAheadSession(active_communicator,
-                                                  node_communicator,
-                                                  plan).start()
+                                                  node_communicator, plan)
+            if self._checkpoint_io_policy != _BOUNDED_RANK_STRIPED_IO_POLICY:
+                session.start()
         except Exception as error:
             setup_error = error
         coordinated_setup_error = coordinate_error(active_communicator,
@@ -867,12 +979,23 @@ class HfWeightLoader(BaseWeightLoader):
         assert session is not None
 
         status = self._last_checkpoint_io_status
-        status.activated = True
-        logger.info("Rank-striped checkpoint read-ahead activated: "
+        status.activated = (self._checkpoint_io_policy
+                            != _BOUNDED_RANK_STRIPED_IO_POLICY)
+        group_budget_log = ("unbounded" if issuer_group_initial_lead_bytes
+                            is None else str(issuer_group_initial_lead_bytes))
+        local_budget_log = ("unbounded" if plan.initial_issuer_lead_bytes
+                            is None else str(plan.initial_issuer_lead_bytes))
+        state = "activated" if status.activated else "prepared"
+        logger.info(f"Rank-striped checkpoint read-ahead {state}: "
+                    f"policy={self._checkpoint_io_policy}, "
                     f"local_rank={local_rank}, local_size={local_size}, "
                     f"workers={plan.workers}, assigned_bytes="
                     f"{plan.assigned_bytes}, checkpoint_bytes="
-                    f"{checkpoint_bytes}.")
+                    f"{checkpoint_bytes}, issuer_group_initial_lead_bytes="
+                    f"{group_budget_log}, local_issuer_initial_lead_bytes="
+                    f"{local_budget_log}. The lead accounting is per issuer; "
+                    "it does not deduplicate replicated source tensors or "
+                    "bound Linux page-cache residency.")
 
         weights = None
         mapping_error = None
@@ -898,6 +1021,8 @@ class HfWeightLoader(BaseWeightLoader):
             self._log_checkpoint_io_status()
             raise coordinated_mapping_error
         assert weights is not None
+        if self._checkpoint_io_policy == _BOUNDED_RANK_STRIPED_IO_POLICY:
+            weights.set_consumption_observer(session.report_consumed)
         return weights, session
 
     def _load_weights_native(self,

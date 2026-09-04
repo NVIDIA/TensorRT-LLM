@@ -4,6 +4,7 @@
 import pickle
 import sys
 import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -50,6 +51,13 @@ def _write_checkpoint(tmp_path: Path) -> tuple[Path, dict[str, torch.Tensor]]:
 def _rank_striped_loader(*, partial_model_loading: bool = False) -> HfWeightLoader:
     return HfWeightLoader(
         checkpoint_io_policy="rank_striped_read_ahead",
+        partial_model_loading=partial_model_loading,
+    )
+
+
+def _bounded_rank_striped_loader(*, partial_model_loading: bool = False) -> HfWeightLoader:
+    return HfWeightLoader(
+        checkpoint_io_policy="bounded_rank_striped_read_ahead",
         partial_model_loading=partial_model_loading,
     )
 
@@ -107,6 +115,178 @@ def test_extent_plan_is_complete_disjoint_and_fair(tmp_path, monkeypatch):
     workers = read_ahead.distribute_worker_budget(65)
     assert sum(workers) == 64
     assert max(workers) - min(workers) == 1
+
+
+def test_rolling_budget_is_fair_and_order_is_pluggable(tmp_path, monkeypatch):
+    monkeypatch.setattr(read_ahead, "_CHUNK_SIZE", 4)
+    monkeypatch.setattr(read_ahead, "_READ_SIZE", 1)
+    monkeypatch.setattr(read_ahead, "_WORKERS_PER_LOAD_GROUP", 3)
+    monkeypatch.setattr(read_ahead, "_WORKERS_PER_RANK", 2)
+    files = [(str(tmp_path / "a"), 10), (str(tmp_path / "b"), 7)]
+    source_order = [
+        read_ahead.ReadAheadExtent(str(tmp_path / "a"), 0, 4),
+        read_ahead.ReadAheadExtent(str(tmp_path / "a"), 4, 4),
+        read_ahead.ReadAheadExtent(str(tmp_path / "a"), 8, 2),
+        read_ahead.ReadAheadExtent(str(tmp_path / "b"), 0, 4),
+        read_ahead.ReadAheadExtent(str(tmp_path / "b"), 4, 3),
+    ]
+    plans = [
+        read_ahead.build_local_plan(
+            files,
+            rank,
+            4,
+            issuer_group_initial_lead_bytes=10,
+            ordered_extents=list(reversed(source_order)),
+        )
+        for rank in range(4)
+    ]
+
+    assert [plan.initial_issuer_lead_bytes for plan in plans] == [4, 3, 3, 0]
+    assert [extent for plan in plans for extent in plan.extents]
+    assert set(extent for plan in plans for extent in plan.extents) == set(source_order)
+    assert plans[0].extents[0] == source_order[-1]
+
+    with pytest.raises(ValueError, match="complete permutation"):
+        read_ahead.build_local_plan(
+            files,
+            0,
+            4,
+            issuer_group_initial_lead_bytes=10,
+            ordered_extents=source_order[:-1],
+        )
+
+    monkeypatch.setattr(read_ahead, "_READ_SIZE", 4)
+    assert read_ahead.distribute_initial_lead_budget(7, 4, 5) == (7, 0, 0, 0)
+    assert read_ahead.distribute_initial_lead_budget(8, 4, 5) == (4, 4, 0, 0)
+
+
+def test_rolling_credit_blocks_until_consumption_and_cancel_wakes_waiter():
+    credits = read_ahead._RollingReadAheadCredits(4, 12)
+    assert credits.acquire(8) == 4
+
+    result = []
+    waiter = threading.Thread(target=lambda: result.append(credits.acquire(8)))
+    waiter.start()
+    time.sleep(0.01)
+    assert waiter.is_alive()
+
+    credits.report_consumed(3, 1, 1)
+    waiter.join(timeout=5)
+    assert result == [3]
+    credits.complete(4, 4)
+    credits.complete(3, 3)
+
+    blocked = threading.Thread(target=lambda: result.append(credits.acquire(8)))
+    blocked.start()
+    time.sleep(0.01)
+    assert blocked.is_alive()
+    credits.cancel()
+    blocked.join(timeout=5)
+    assert result[-1] == 0
+
+
+def test_sum_of_per_issuer_leads_stays_within_distributed_initial_budget():
+    initial_budgets = (5, 3, 2)
+    credits = [
+        read_ahead._RollingReadAheadCredits(budget, assigned_bytes=100)
+        for budget in initial_budgets
+    ]
+
+    # Model replicated source tensors explicitly: every rank reports the same
+    # four source bytes. The phase-one guarantee is still only the sum of
+    # process-local issuer leads; it does not claim four unique source bytes.
+    for issuer, budget in zip(credits, initial_budgets):
+        assert issuer.acquire(budget) == budget
+        issuer.complete(budget, budget)
+        issuer.report_consumed(4, 1, 1)
+        assert issuer.acquire(4) == 4
+        issuer.complete(4, 4)
+
+    progress = [
+        issuer.snapshot(
+            submitted_extents=0,
+            completed_extents=0,
+            partial_extents=0,
+            cancelled_extents=0,
+            max_pending_extents=0,
+        )
+        for issuer in credits
+    ]
+    aggregate_issuer_lead = sum(item.issued_bytes - item.consumed_bytes for item in progress)
+    assert aggregate_issuer_lead <= sum(initial_budgets)
+
+
+def test_bounded_session_limits_pending_extents_and_handles_short_reads(tmp_path, monkeypatch):
+    path = tmp_path / "weights"
+    path.write_bytes(b"0123456789" * 20)
+    monkeypatch.setattr(read_ahead, "_READ_SIZE", 40)
+    extents = tuple(
+        read_ahead.ReadAheadExtent(str(path), offset, 10) for offset in range(0, 200, 10)
+    )
+    plan = read_ahead.ReadAheadPlan(extents, workers=2, initial_issuer_lead_bytes=200)
+    real_pread = read_ahead.os.pread
+
+    def short_pread(file_descriptor, size, offset):
+        return real_pread(file_descriptor, max(1, size // 2), offset)
+
+    monkeypatch.setattr(read_ahead.os, "pread", short_pread)
+    session = read_ahead.RankStripedReadAheadSession(None, None, plan).start()
+    assert session._thread is not None
+    session._thread.join(timeout=5)
+    assert not session._thread.is_alive()
+
+    progress = session.progress
+    assert progress is not None
+    assert progress.issued_bytes == 200
+    assert progress.completed_extents == len(extents)
+    assert progress.partial_extents == 0
+    assert progress.max_pending_extents <= 4
+    assert progress.submitted_extents == len(extents)
+    assert session.cancel_and_close() is None
+
+
+def test_bounded_session_does_not_enqueue_the_full_checkpoint(tmp_path):
+    path = tmp_path / "weights"
+    path.write_bytes(b"x" * 20)
+    extents = tuple(read_ahead.ReadAheadExtent(str(path), offset, 1) for offset in range(20))
+    plan = read_ahead.ReadAheadPlan(extents, workers=2, initial_issuer_lead_bytes=1)
+    session = read_ahead.RankStripedReadAheadSession(None, None, plan).start()
+
+    deadline = time.monotonic() + 5
+    while session._submitted_extents == 0 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    # Four futures may be pending (2 workers * 2); one can finish and be
+    # replaced before the remaining readers exhaust their initial credit.
+    assert 0 < session._submitted_extents <= 5
+    assert session._submitted_extents < len(extents)
+    assert session.cancel_and_close() is None
+    progress = session.progress
+    assert progress is not None
+    assert progress.max_pending_extents <= 4
+    assert progress.completed_extents + progress.partial_extents + progress.cancelled_extents <= (
+        progress.submitted_extents
+    )
+
+
+def test_deferred_session_issues_no_payload_io_before_release(tmp_path, monkeypatch):
+    path = tmp_path / "weights"
+    path.write_bytes(b"x")
+    plan = read_ahead.ReadAheadPlan(
+        (read_ahead.ReadAheadExtent(str(path), 0, 1),),
+        workers=1,
+        initial_issuer_lead_bytes=1,
+    )
+    pread = mock.Mock(return_value=b"x")
+    monkeypatch.setattr(read_ahead.os, "pread", pread)
+    session = read_ahead.RankStripedReadAheadSession(None, None, plan).start(defer_reads=True)
+
+    time.sleep(0.01)
+    pread.assert_not_called()
+    session.release_reads()
+    assert session._thread is not None
+    session._thread.join(timeout=5)
+    pread.assert_called_once()
+    assert session.cancel_and_close() is None
 
 
 @pytest.mark.parametrize(
@@ -273,7 +453,10 @@ def test_collective_native_fallback_failure_escapes_without_cleanup(
     close_node_communicator.assert_not_called()
 
 
-@pytest.mark.parametrize("requested_policy", ["auto", "rank_striped_read_ahead"])
+@pytest.mark.parametrize(
+    "requested_policy",
+    ["auto", "rank_striped_read_ahead", "bounded_rank_striped_read_ahead"],
+)
 @pytest.mark.parametrize("partial,available", [(True, 1 << 40), (False, 0)])
 def test_ineligible_request_uses_exact_native_fallback(
     tmp_path: Path,
@@ -284,7 +467,9 @@ def test_ineligible_request_uses_exact_native_fallback(
 ) -> None:
     checkpoint_dir, _ = _write_checkpoint(tmp_path)
     loader = HfWeightLoader(
-        checkpoint_io_policy="rank_striped_read_ahead",
+        checkpoint_io_policy=(
+            "rank_striped_read_ahead" if requested_policy == "auto" else requested_policy
+        ),
         requested_checkpoint_io_policy=requested_policy,
         partial_model_loading=partial,
     )
@@ -309,7 +494,7 @@ def test_ineligible_request_uses_exact_native_fallback(
     assert status.effective == "native"
     assert status.fallback_reason
     reader_start.assert_not_called()
-    if requested_policy == "rank_striped_read_ahead":
+    if requested_policy != "auto":
         warning.assert_called_once()
         assert "falling back before model materialization" in warning.call_args.args[0]
     else:
@@ -329,6 +514,20 @@ def test_disabled_weight_cache_does_not_force_fallback(tmp_path, monkeypatch):
     loader.load_weights(str(checkpoint_dir), mapping=Mapping())
 
     assert loader.last_checkpoint_io_status.activated
+
+
+def test_bounded_policy_admits_a_checkpoint_larger_than_its_window(tmp_path, monkeypatch):
+    checkpoint_dir, _ = _write_checkpoint(tmp_path)
+    monkeypatch.setattr(read_ahead, "_HOST_MEMORY_HEADROOM_BYTES", 0)
+    monkeypatch.setattr(read_ahead, "_HOST_MEMORY_HEADROOM_FRACTION", 0)
+    monkeypatch.setattr(read_ahead, "_ROLLING_INITIAL_LEAD_BYTES_PER_LOAD_GROUP", 1)
+    monkeypatch.setattr(weight_loader_module, "effective_available_host_memory", lambda: 1)
+    loader = _bounded_rank_striped_loader()
+
+    with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()):
+        loader.activate_weight_session()
+
+    assert loader.last_checkpoint_io_status.effective == ("bounded_rank_striped_read_ahead")
 
 
 def test_reader_start_failure_cleans_up_and_falls_back(tmp_path, monkeypatch):
@@ -365,6 +564,78 @@ def test_reader_start_failure_cleans_up_and_falls_back(tmp_path, monkeypatch):
     assert not status.activated
     assert status.effective == "native"
     assert "start failed" in status.fallback_reason
+
+
+def test_bounded_reader_defers_activation_until_mapper_boundary(tmp_path, monkeypatch):
+    checkpoint_dir, _ = _write_checkpoint(tmp_path)
+    loader = _bounded_rank_striped_loader()
+    started = threading.Event()
+
+    def wait_for_cancel(session, _extent):
+        started.set()
+        assert session._cancel.wait(timeout=5)
+        return 0
+
+    monkeypatch.setattr(read_ahead.RankStripedReadAheadSession, "_read_extent", wait_for_cancel)
+
+    with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()):
+        assert not started.is_set()
+        assert not loader.last_checkpoint_io_status.activated
+        loader.activate_weight_session()
+        assert started.wait(timeout=5)
+        assert loader.last_checkpoint_io_status.activated
+
+    assert loader.last_checkpoint_io_status.effective == ("bounded_rank_striped_read_ahead")
+
+
+def test_bounded_mapper_readiness_failure_is_rank_coherent_before_start():
+    communicator = mock.Mock()
+    communicator.Get_size.return_value = 2
+    communicator.allgather.return_value = [None, "ValueError: peer mapper failed"]
+    local_errors = (None, ValueError("peer mapper failed"))
+    raised_errors = []
+
+    for local_error in local_errors:
+        loader = _bounded_rank_striped_loader()
+        session = mock.Mock()
+        session.active_communicator = communicator
+        loader._pending_read_ahead_session = session
+
+        with pytest.raises((RuntimeError, ValueError)) as raised:
+            loader.activate_weight_session(local_error)
+        raised_errors.append(raised.value)
+        session.start.assert_not_called()
+        session.disable.assert_called_once()
+        assert not loader.last_checkpoint_io_status.activated
+        assert "peer mapper failed" in loader.last_checkpoint_io_status.fallback_reason
+
+    assert isinstance(raised_errors[0], RuntimeError)
+    assert raised_errors[1] is local_errors[1]
+    assert communicator.allgather.call_args_list == [
+        mock.call(None),
+        mock.call("ValueError: peer mapper failed"),
+    ]
+
+
+def test_bounded_activation_failure_degrades_collectively_without_reload(tmp_path, monkeypatch):
+    checkpoint_dir, _ = _write_checkpoint(tmp_path)
+    loader = _bounded_rank_striped_loader()
+    native_load = mock.Mock(side_effect=AssertionError("must not reload"))
+    monkeypatch.setattr(loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(
+        read_ahead.RankStripedReadAheadSession,
+        "start",
+        mock.Mock(side_effect=RuntimeError("activation failed")),
+    )
+
+    with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()):
+        loader.activate_weight_session()
+        assert not loader.last_checkpoint_io_status.activated
+
+    native_load.assert_not_called()
+    status = loader.last_checkpoint_io_status
+    assert status.effective == "native"
+    assert "activation failed" in status.fallback_reason
 
 
 def test_session_overlaps_materialization_and_cancels_tail(tmp_path, monkeypatch):
@@ -478,6 +749,51 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
     success = success_loader.last_checkpoint_io_status.effective
     communicator.Barrier()
 
+    bounded_success_loader = _bounded_rank_striped_loader()
+    with bounded_success_loader.open_weight_session(
+        checkpoint_dir, mapping=mapping
+    ) as bounded_success_weights:
+        bounded_success_loader.activate_weight_session()
+        assert bounded_success_weights
+    bounded_success = bounded_success_loader.last_checkpoint_io_status.effective
+    communicator.Barrier()
+
+    readiness_loader = _bounded_rank_striped_loader()
+    local_readiness_error = (
+        RuntimeError("rank-local readiness failure") if rank == world_size - 1 else None
+    )
+    readiness_error = None
+    try:
+        with readiness_loader.open_weight_session(
+            checkpoint_dir, mapping=mapping
+        ) as readiness_weights:
+            assert readiness_weights
+            readiness_loader.activate_weight_session(local_readiness_error)
+    except BaseException as error:
+        readiness_error = f"{type(error).__name__}: {error}"
+    readiness_status = readiness_loader.last_checkpoint_io_status
+    communicator.Barrier()
+
+    original_start = rank_striped_read_ahead.RankStripedReadAheadSession.start
+    if rank == world_size - 1:
+
+        def fail_reader_start(_session, *, defer_reads=False):
+            del defer_reads
+            raise RuntimeError("rank-local bounded reader-start failure")
+
+        rank_striped_read_ahead.RankStripedReadAheadSession.start = fail_reader_start
+    reader_start_loader = _bounded_rank_striped_loader()
+    try:
+        with reader_start_loader.open_weight_session(
+            checkpoint_dir, mapping=mapping
+        ) as reader_start_weights:
+            assert reader_start_weights
+            reader_start_loader.activate_weight_session()
+        reader_start_status = reader_start_loader.last_checkpoint_io_status
+    finally:
+        rank_striped_read_ahead.RankStripedReadAheadSession.start = original_start
+    communicator.Barrier()
+
     fallback_failure_loader = _rank_striped_loader()
     if rank == world_size - 1:
         original_native_load = fallback_failure_loader._load_weights_native
@@ -557,6 +873,14 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         "rank": rank,
         "success": success,
         "sum": float(success_weights["model.norm.weight"].sum()),
+        "bounded_success": bounded_success,
+        "bounded_sum": float(bounded_success_weights["model.norm.weight"].sum()),
+        "readiness_error": readiness_error,
+        "readiness_effective": readiness_status.effective,
+        "readiness_reason": readiness_status.fallback_reason,
+        "reader_start_effective": reader_start_status.effective,
+        "reader_start_reason": reader_start_status.fallback_reason,
+        "reader_start_sum": float(reader_start_weights["model.norm.weight"].sum()),
         "fallback_failure_error": fallback_failure_error,
         "subgroup_effective": subgroup_effective,
         "subgroup_sum": float(subgroup_weights["model.norm.weight"].sum()),
@@ -585,6 +909,17 @@ def test_real_mpi_success_and_rank_local_failures(tmp_path, mpi_pool_executor):
     assert {result["rank"] for result in results} == {0, 1}
     assert all(result["success"] == "rank_striped_read_ahead" for result in results)
     assert all(result["sum"] == expected_sum for result in results)
+    assert all(result["bounded_success"] == "bounded_rank_striped_read_ahead" for result in results)
+    assert all(result["bounded_sum"] == expected_sum for result in results)
+    assert all("rank-local readiness failure" in result["readiness_error"] for result in results)
+    assert all(result["readiness_effective"] == "none" for result in results)
+    assert all("rank-local readiness failure" in result["readiness_reason"] for result in results)
+    assert all(result["reader_start_effective"] == "native" for result in results)
+    assert all(
+        "rank-local bounded reader-start failure" in result["reader_start_reason"]
+        for result in results
+    )
+    assert all(result["reader_start_sum"] == expected_sum for result in results)
     assert all(
         "rank-local native fallback failure" in result["fallback_failure_error"]
         for result in results

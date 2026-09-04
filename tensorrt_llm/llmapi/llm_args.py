@@ -5804,7 +5804,8 @@ class TorchLlmArgs(BaseLlmArgs):
     )
 
     checkpoint_io_policy: Literal[
-        "auto", "native", "rank_striped_read_ahead"] = Field(
+        "auto", "native", "rank_striped_read_ahead",
+        "bounded_rank_striped_read_ahead"] = Field(
             default="auto",
             description=
             "Controls checkpoint storage I/O independently of checkpoint format. "
@@ -5815,10 +5816,18 @@ class TorchLlmArgs(BaseLlmArgs):
             "SafeTensors extents while native mapping, materialization, and H2D "
             "continue. Incompatible configurations select native I/O before "
             "optimized reader or collective setup. Runtime-ineligible loads fall "
-            "back to native before model mutation.",
+            "back to native before model mutation. "
+            "'bounded_rank_striped_read_ahead' is an explicit experimental "
+            "variant that limits the sum of process-local issuer leads and "
+            "queued work using foreground tensor-consumption progress. "
+            "Replicated ranks can report the same source tensor independently, "
+            "so this is not a unique-source-byte or Linux page-cache-residency "
+            "bound.",
             status="prototype",
             json_schema_extra={
-                "type": "Literal['auto', 'native', 'rank_striped_read_ahead']"
+                "type":
+                "Literal['auto', 'native', 'rank_striped_read_ahead', "
+                "'bounded_rank_striped_read_ahead']"
             },
         )
 
@@ -6476,11 +6485,13 @@ class TorchLlmArgs(BaseLlmArgs):
         # requested policy for telemetry while reporting its native selection.
         # PyTorch requests are resolved at loader construction, where the actual
         # format and registered loader implementations are known.
-        if (self.checkpoint_io_policy == "rank_striped_read_ahead"
-                and self.backend != "pytorch"):
+        if (self.checkpoint_io_policy in (
+                "rank_striped_read_ahead",
+                "bounded_rank_striped_read_ahead",
+        ) and self.backend != "pytorch"):
             logger.warning(
                 "Checkpoint I/O policy resolved before loading: "
-                "requested=rank_striped_read_ahead, selected=native, "
+                f"requested={self.checkpoint_io_policy}, selected=native, "
                 "reason=rank-striped read-ahead requires the PyTorch backend.")
         return self
 

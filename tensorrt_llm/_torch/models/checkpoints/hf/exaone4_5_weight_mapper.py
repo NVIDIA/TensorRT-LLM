@@ -34,5 +34,5 @@ class Exaone4_5HfWeightMapper(HfWeightMapper):
             else:
                 renamed[key] = value
         if is_consumable:
-            return ConsumableWeightsDict(renamed)
+            return ConsumableWeightsDict.take_ownership(weights, renamed)
         return renamed

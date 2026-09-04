@@ -333,11 +333,15 @@ def get_rank_model_storage(model):
 _AUTO_CHECKPOINT_IO_POLICY = "auto"
 _NATIVE_CHECKPOINT_IO_POLICY = "native"
 _RANK_STRIPED_CHECKPOINT_IO_POLICY = "rank_striped_read_ahead"
+_BOUNDED_RANK_STRIPED_CHECKPOINT_IO_POLICY = "bounded_rank_striped_read_ahead"
+_RANK_STRIPED_CHECKPOINT_IO_POLICIES = (
+    _RANK_STRIPED_CHECKPOINT_IO_POLICY,
+    _BOUNDED_RANK_STRIPED_CHECKPOINT_IO_POLICY,
+)
 _SUPPORTED_CHECKPOINT_IO_POLICIES = (
     _AUTO_CHECKPOINT_IO_POLICY,
     _NATIVE_CHECKPOINT_IO_POLICY,
-    _RANK_STRIPED_CHECKPOINT_IO_POLICY,
-)
+) + _RANK_STRIPED_CHECKPOINT_IO_POLICIES
 _SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
 
 
@@ -393,13 +397,15 @@ def _resolve_checkpoint_io_policy(
                    f"requested={requested_policy}, "
                    f"selected={_NATIVE_CHECKPOINT_IO_POLICY}, "
                    f"reason={reason}.")
-        if requested_policy == _RANK_STRIPED_CHECKPOINT_IO_POLICY:
+        if requested_policy in _RANK_STRIPED_CHECKPOINT_IO_POLICIES:
             logger.warning(message)
         else:
             logger.info(message)
         return _NATIVE_CHECKPOINT_IO_POLICY, reason
 
-    return _RANK_STRIPED_CHECKPOINT_IO_POLICY, None
+    if requested_policy == _AUTO_CHECKPOINT_IO_POLICY:
+        return _RANK_STRIPED_CHECKPOINT_IO_POLICY, None
+    return requested_policy, None
 
 
 def _construct_checkpoint_loader(
@@ -489,6 +495,17 @@ def _open_checkpoint_weight_session(
         return _legacy_weight_session(checkpoint_loader, checkpoint_dir,
                                       **kwargs)
     return checkpoint_loader.open_weight_session(checkpoint_dir, **kwargs)
+
+
+def _activate_checkpoint_weight_session(
+        checkpoint_loader: Any,
+        readiness_error: BaseException | None = None) -> None:
+    """Coordinate mapper readiness before activating deferred loader work."""
+    activate = getattr(checkpoint_loader, "activate_weight_session", None)
+    if activate is not None:
+        activate(readiness_error)
+    if readiness_error is not None:
+        raise readiness_error
 
 
 @contextmanager
@@ -1887,15 +1904,26 @@ class ModelLoader:
                 ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
                 ModelLoaderMetricNames.CHECKPOINT_FINALIZATION_SECONDS.value,
                 **load_weights_kwargs) as weights:
-            weights_preloaded = checkpoint_loader.is_weights_preloaded()
-            self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                model, config)
-            _inspect_shadow_weight_load_plan(
-                checkpoint_loader,
-                checkpoint_dir,
-                self.weight_mapper,
-                **load_weights_kwargs,
-            )
+            readiness_error = None
+            weights_preloaded = False
+            weight_mapper = None
+            try:
+                weights_preloaded = checkpoint_loader.is_weights_preloaded()
+                weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                    model, config)
+            except BaseException as error:
+                readiness_error = error
+            if weight_mapper is not None:
+                _inspect_shadow_weight_load_plan(
+                    checkpoint_loader,
+                    checkpoint_dir,
+                    weight_mapper,
+                    **load_weights_kwargs,
+                )
+            _activate_checkpoint_weight_session(checkpoint_loader,
+                                                readiness_error)
+            assert weight_mapper is not None
+            self.weight_mapper = weight_mapper
             if weights:
                 with timing_metric(
                         ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
@@ -1918,22 +1946,30 @@ class ModelLoader:
                 ModelLoaderMetricNames.DRAFT_CHECKPOINT_FINALIZATION_SECONDS.
                 value,
                 mapping=self.mapping) as weights:
-            if model.draft_config is not None:
-                draft_model_arch = model.draft_config.pretrained_config.architectures[
-                    0]
-                draft_weight_mapper = AutoCheckpointMapper.get(
-                    checkpoint_loader.checkpoint_format, draft_model_arch)
-                draft_weight_mapper.init_model_and_config(
-                    model.draft_model, model.draft_config)
-            else:
-                # MTP one-model + separate MTP checkpoint: no draft HF architecture.
-                draft_weight_mapper = self.weight_mapper
-            _inspect_shadow_weight_load_plan(
-                checkpoint_loader,
-                self.spec_config.speculative_model,
-                draft_weight_mapper,
-                mapping=self.mapping,
-            )
+            mapper_error = None
+            draft_weight_mapper = None
+            try:
+                if model.draft_config is not None:
+                    draft_model_arch = model.draft_config.pretrained_config.architectures[
+                        0]
+                    draft_weight_mapper = AutoCheckpointMapper.get(
+                        checkpoint_loader.checkpoint_format, draft_model_arch)
+                    draft_weight_mapper.init_model_and_config(
+                        model.draft_model, model.draft_config)
+                else:
+                    # MTP one-model + separate MTP checkpoint: no draft HF architecture.
+                    draft_weight_mapper = self.weight_mapper
+            except BaseException as error:
+                mapper_error = error
+            if draft_weight_mapper is not None:
+                _inspect_shadow_weight_load_plan(
+                    checkpoint_loader,
+                    self.spec_config.speculative_model,
+                    draft_weight_mapper,
+                    mapping=self.mapping,
+                )
+            _activate_checkpoint_weight_session(checkpoint_loader, mapper_error)
+            assert draft_weight_mapper is not None
             with timing_metric(
                     ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.
                     value, self._metrics):
