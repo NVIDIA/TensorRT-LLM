@@ -310,7 +310,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("hidden_size", &tr::ModelConfig::getHiddenSize)
         .def_prop_ro("size_per_head", &tr::ModelConfig::getSizePerHead)
         .def_prop_ro("data_type", &tr::ModelConfig::getDataType)
-        .def_prop_ro("speculative_decoding_mode", &tr::ModelConfig::getSpeculativeDecodingMode)
         .def_prop_rw("head_size", &tr::ModelConfig::getSizePerHead, &tr::ModelConfig::setSizePerHead)
         .def_prop_rw(
             "num_kv_heads_per_layer", &tr::ModelConfig::getNumKvHeadsPerLayer, &tr::ModelConfig::setNumKvHeadsPerLayer)

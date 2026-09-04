@@ -22,8 +22,8 @@
 #include <functional>
 
 void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager& kvCacheManager,
-    RequestVector& contextRequests, RequestVector const& generationRequests, runtime::ModelConfig const& modelConfig,
-    OptionalRef<BaseKVCacheManager> crossKvCacheManager) const
+    RequestVector& contextRequests, RequestVector const& generationRequests,
+    [[maybe_unused]] runtime::ModelConfig const& modelConfig, OptionalRef<BaseKVCacheManager> crossKvCacheManager) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(allocateKvCache);
@@ -41,14 +41,6 @@ void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager
 
             // Allocate/Reuse KV cache
             kvCacheManager.addSequenceBatch({{{requestId, promptLen, reqBeamWidth}}}, {std::ref(*llmReq)});
-
-            // EagleNet will increment kv cache up to maxPathLen to account for accepted tokens.
-            // Then up to maxDecodingDraftTokens will be used to generate next draft tokens.
-            if (modelConfig.getSpeculativeDecodingMode().isEagle())
-            {
-                draftLength = modelConfig.getSpeculativeDecodingModule().getMaxPathLen()
-                    + modelConfig.getSpeculativeDecodingModule().getMaxDecodingTokens();
-            }
 
             // Allocate more KV cache for speculative decoding
             if (draftLength > 0)
@@ -71,14 +63,6 @@ void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager
     {
         auto const requestId = llmReq->mRequestId;
         auto decodingTokens = llmReq->getNumDraftTokens() + 1;
-
-        // EagleNet will increment kv cache up to maxPathLen to account for accepted tokens.
-        // Then up to maxDecodingDraftTokens will be used to generate next draft tokens.
-        if (modelConfig.getSpeculativeDecodingMode().isEagle())
-        {
-            decodingTokens = modelConfig.getSpeculativeDecodingModule().getMaxPathLen()
-                + modelConfig.getSpeculativeDecodingModule().getMaxDecodingTokens();
-        }
 
         for (SizeType32 di = 0; di < decodingTokens; ++di)
         {

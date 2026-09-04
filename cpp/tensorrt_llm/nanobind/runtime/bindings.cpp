@@ -313,27 +313,5 @@ void initBindingsEarly(nb::module_& m)
         .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false,
             nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("stream", &tr::BufferManager::getStream);
-
-    nb::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
-        .def(nb::init<tr::SpeculativeDecodingMode::UnderlyingType>(), nb::arg("state"))
-        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
-        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
-        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
-        .def_static("Eagle", &tr::SpeculativeDecodingMode::Eagle)
-        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
-        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens)
-        .def_prop_ro("is_none", &tr::SpeculativeDecodingMode::isNone)
-        .def_prop_ro("is_draft_tokens_external", &tr::SpeculativeDecodingMode::isDraftTokensExternal)
-        .def_prop_ro("is_medusa", &tr::SpeculativeDecodingMode::isMedusa)
-        .def_prop_ro("is_eagle", &tr::SpeculativeDecodingMode::isEagle)
-        .def_prop_ro("is_lookahead_decoding", &tr::SpeculativeDecodingMode::isLookaheadDecoding)
-        .def_prop_ro("is_explicit_draft_tokens", &tr::SpeculativeDecodingMode::isExplicitDraftTokens)
-        .def_prop_ro("updates_position_ids", &tr::SpeculativeDecodingMode::updatesPositionIds)
-        .def_prop_ro("requires_attention_mask", &tr::SpeculativeDecodingMode::requiresAttentionMask)
-        .def_prop_ro("predicts_draft_tokens", &tr::SpeculativeDecodingMode::predictsDraftTokens)
-        .def_prop_ro("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind)
-        .def_prop_ro("variable_draft_length", &tr::SpeculativeDecodingMode::variableDraftLength)
-        .def_prop_ro("has_draft_logits", &tr::SpeculativeDecodingMode::hasDraftLogits)
-        .def_prop_ro("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue);
 }
 } // namespace tensorrt_llm::nanobind::runtime
