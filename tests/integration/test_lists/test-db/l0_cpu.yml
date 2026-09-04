@@ -92,6 +92,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_responses_streaming_events.py
   - unittest/llmapi/apps/test_responses_streaming_tool_calls.py
   - unittest/llmapi/apps/test_responses_usage.py
+  - unittest/llmapi/apps/test_serve_port_validation.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
   - unittest/llmapi/test_bench_async.py

@@ -644,16 +644,20 @@ def launch_server(
                 "in-memory store cannot be shared across frontends.")
         os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
+    # port == 0 lets the kernel pick the port; the caller then needs a way
+    # to learn it, either by service discovery or by report_addr. Validate
+    # before getaddrinfo, which rejects negative ports with its own error.
+    if not (port > 0 or (port == 0 and
+                         (disagg_cluster_config is not None or report_addr))):
+        raise ValueError(
+            "Port must be a positive integer, or 0 to let the kernel pick "
+            "one when disagg cluster config or --report_addr is provided")
+
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
         [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
-        # port == 0 lets the kernel pick the port; the caller then needs a way
-        # to learn it, either by service discovery or by report_addr.
-        assert port > 0 or disagg_cluster_config is not None or report_addr, (
-            "Port must be specified unless disagg cluster config or "
-            "--report_addr is provided")
         # Without SO_REUSEADDR a restart is refused for the whole TIME_WAIT
         # window (~60s) by the tombstones of connections this server accepted.
         # The flag has to be set on the socket that owns the port first, since
