@@ -170,6 +170,53 @@ def test_sampling_params_default_truncation_matches_openai() -> None:
     assert params.top_k == 0
 
 
+def test_omitted_max_tokens_is_unbounded_like_openai() -> None:
+    """An omitted stopping.max_tokens means "unbounded", not SamplingParams' 32.
+
+    /v1/completions models an absent max_tokens as None and the engine deduces
+    the budget from max_seq_len. Inheriting the dataclass default instead would
+    silently truncate every OpenEngine request at 32 tokens.
+    """
+    assert sampling_params_from_request(generation_pb2.GenerateRequest()).max_tokens is None
+
+    with_stopping = generation_pb2.GenerateRequest(
+        stopping=generation_pb2.StoppingOptions(min_tokens=1),
+    )
+    assert sampling_params_from_request(with_stopping).max_tokens is None
+
+    explicit = generation_pb2.GenerateRequest(
+        stopping=generation_pb2.StoppingOptions(max_tokens=7),
+    )
+    assert sampling_params_from_request(explicit).max_tokens == 7
+
+
+def test_greedy_decoding_with_multiple_sequences_is_rejected() -> None:
+    """n/best_of go through SamplingParams._validate(), as on /v1/completions.
+
+    _validate runs only from __post_init__, so assigning n after construction
+    would skip the guard that rejects multiple returns under greedy decoding and
+    hand the client duplicate sequences reported as distinct samples.
+    """
+    request = generation_pb2.GenerateRequest(
+        sampling=generation_pb2.SamplingParams(temperature=0.0, num_sequences=3),
+    )
+
+    with pytest.raises(ValueError, match="[Gg]reedy"):
+        sampling_params_from_request(request)
+
+
+def test_multiple_sequences_are_accepted_when_sampling() -> None:
+    """The guard is specific to greedy decoding; n > 1 still works otherwise."""
+    request = generation_pb2.GenerateRequest(
+        sampling=generation_pb2.SamplingParams(temperature=0.8, num_sequences=3),
+    )
+
+    params = sampling_params_from_request(request)
+
+    assert params.n == 3
+    assert params.best_of == 3
+
+
 def test_sampling_params_default_truncation_without_sampling_message() -> None:
     """The truncation defaults are applied even with no sampling message."""
     params = sampling_params_from_request(generation_pb2.GenerateRequest())

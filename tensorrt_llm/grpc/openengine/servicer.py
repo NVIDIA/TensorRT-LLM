@@ -199,6 +199,21 @@ def sampling_params_from_request(
     kwargs.setdefault("temperature", 1.0)
     kwargs.setdefault("top_p", 1.0)
     kwargs.setdefault("top_k", 0)
+    # SamplingParams.max_tokens defaults to 32, but the protocol default for an
+    # omitted stopping.max_tokens is "unbounded", as on /v1/completions (whose
+    # max_tokens is Optional[int] = None). None is the engine's documented unset
+    # sentinel: _deduce_max_tokens derives the budget from max_seq_len.
+    kwargs.setdefault("max_tokens", None)
+
+    # n/best_of must be constructor arguments: SamplingParams._validate() runs
+    # only from __post_init__, so assigning them afterwards skips it. That guard
+    # is what rejects greedy decoding with multiple returns -- without it a
+    # temperature=0 request with num_sequences>1 is accepted here and returns
+    # duplicate sequences as distinct samples, while the same request over
+    # /v1/completions is a 400.
+    if num_sequences > 1:
+        kwargs["n"] = num_sequences
+        kwargs["best_of"] = num_sequences
 
     sampling_params = SamplingParams(**kwargs)
     # Record which sampling fields the client actually supplied (mirrors the HTTP
@@ -206,9 +221,6 @@ def sampling_params_from_request(
     # defaults above would look client-provided and suppress a model's
     # generation_config.json sampling defaults under generation_config="auto".
     sampling_params._set_request_provided_fields(provided_fields)
-    if num_sequences > 1:
-        sampling_params.n = num_sequences
-        sampling_params.best_of = num_sequences
     return sampling_params
 
 
