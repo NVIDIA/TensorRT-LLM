@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import tempfile
 from contextlib import contextmanager
@@ -9,6 +24,8 @@ from typing import Optional, Union
 from zmq import PULL, Context
 
 from tensorrt_llm import logger
+
+ITERATION_WRITER_JOIN_TIMEOUT = 5
 
 
 # The IterationWriter class implements a multi-process logging system that captures and writes
@@ -95,6 +112,8 @@ class IterationWriter:
             yield
         else:
             logger.info(f"Logging iterations to {self.log_path}...")
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_path.open("w").close()
             stop = Event()
             process = Process(name="IterationWriter",
                               target=self.run,
@@ -104,7 +123,19 @@ class IterationWriter:
                 yield
             finally:
                 stop.set()
-                process.join()
+                process.join(timeout=ITERATION_WRITER_JOIN_TIMEOUT)
+                if process.is_alive():
+                    logger.warning(
+                        "Iteration logging process did not stop within %s seconds; "
+                        "terminating it.", ITERATION_WRITER_JOIN_TIMEOUT)
+                    process.terminate()
+                    process.join(timeout=ITERATION_WRITER_JOIN_TIMEOUT)
+                if process.is_alive():
+                    logger.warning(
+                        "Iteration logging process did not terminate within %s seconds; "
+                        "killing it.", ITERATION_WRITER_JOIN_TIMEOUT)
+                    process.kill()
+                    process.join()
 
     def __del__(self) -> None:
         if self._socket_path is not None:
@@ -135,17 +166,17 @@ class IterationWriter:
         socket = None
 
         try:
-            # Create a ZeroMQ context and socket for inter-process communication
-            logger.debug(f"Iteration logging: Binding to {address}...")
-            context = Context(io_threads=1)
-            socket = context.socket(PULL)
-            socket.bind(address)
-
-            # Open the log file for writing and start listening for messages
-            logger.debug(
-                f"Iteration logging: Listening for messages on {address}...")
             with open(log_path, "w") as f:
                 logger.info(f"Iteration logging: Opened log file {log_path}...")
+                # Open the output before binding so a path error cannot leave the
+                # producer connected to a dead consumer.
+                logger.debug(f"Iteration logging: Binding to {address}...")
+                context = Context(io_threads=1)
+                socket = context.socket(PULL)
+                socket.bind(address)
+                logger.debug(
+                    f"Iteration logging: Listening for messages on {address}..."
+                )
                 # Receive the first message from the socket
                 message = socket.recv_json()
                 logger.debug(f"Iteration logging: Received initial message")
