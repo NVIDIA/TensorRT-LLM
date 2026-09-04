@@ -42,6 +42,7 @@ l0_a10:
   - unittest/_torch/models/test_qwen3_next_eager_fusion.py
   - unittest/_torch/weight_sharing
   - unittest/inputs/test_multimodal_input_processor.py
+  - unittest/inputs/test_prefix_token_cache.py
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cache_transceiver_precheck_run.py
   - unittest/others/test_lora_manager.py
