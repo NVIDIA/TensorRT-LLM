@@ -14,11 +14,9 @@
 
 """Paged-KV helpers for the task-scheduled FMHA *context* kernel.
 
-Mirrors the decode-side helpers in
-``../fmha_decode/fmha_decode_resources/helpers_kv_tile_idx.py`` but is stripped
-down to what context needs: context has no multi-CTA-KV split, folds any
-sliding-window prefix into ``kv_tile_start``, and uses one
-``kv_tile_start + loop_offset`` expression for the current K/V tile index.
+Context has no multi-CTA-KV split, folds any sliding-window prefix into
+``kv_tile_start``, and uses one ``kv_tile_start + loop_offset`` expression for
+the current K/V tile index. Page IDs come from fixed row-strided block tables.
 """
 
 import cutlass
@@ -51,21 +49,16 @@ def _runtime_last_valid_page_idx(cfg: FmhaConfig, seq_len_kv: Int32) -> Int32:
 
 
 @cute.jit
-def _load_paged_request_bounds(
-    paged_kv_indptr: cute.Pointer,
+def _load_block_table_row_bounds(
+    block_table_row_stride: Int32,
     cfg: FmhaConfig,
     seq_len_kv: Int32,
     batch_coord: Int32,
 ) -> tuple[Int32, Int32]:
-    """Load one CSR row base and its runtime-valid inclusive page bound."""
-    request_begin = Int32(paged_kv_indptr[batch_coord])
-    request_end = Int32(paged_kv_indptr[batch_coord + Int32(1)])
-    row_page_idx_ub = cute.math.max(request_end - request_begin - Int32(1), Int32(0))
-    page_idx_ub = cute.math.min(
-        row_page_idx_ub,
-        _runtime_last_valid_page_idx(cfg, seq_len_kv),
-    )
-    return request_begin, page_idx_ub
+    """Return one fixed-table row base and runtime-valid inclusive page bound."""
+
+    row_begin = batch_coord * block_table_row_stride
+    return row_begin, _runtime_last_valid_page_idx(cfg, seq_len_kv)
 
 
 @cute.jit

@@ -133,7 +133,7 @@ class _DecodePlanState:
     """One complete static paged-decode plan published atomically.
 
     Request metadata is deliberately absent. Every launch supplies its own
-    sequence lengths, native CSR page table, and (for packed Q) query offsets.
+    sequence lengths, row-strided page table, and (for packed Q) query offsets.
     """
 
     device: torch.device
@@ -271,8 +271,8 @@ def _planned_kv_lengths_mode(
 ) -> Literal["dynamic", "planned_uniform_max"]:
     """Classify host length evidence for fixed-length kernel scheduling.
 
-    When every evidenced request is exactly the compiled maximum, native CSR
-    page addressing still uses runtime indptr/indices while task domains and
+    When every evidenced request is exactly the compiled maximum, native page
+    addressing still uses the runtime block table while task domains and
     masks can use the compile-time length. Validated runs recheck this equality
     proof against their per-run lengths; the evidence itself is not retained.
     """
@@ -986,14 +986,69 @@ def _validate_paged_kv_metadata(
     )
 
 
+def _validate_block_table_metadata(
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> tuple[torch.device, int, int]:
+    """Validate the synchronization-free fixed page-table structure."""
+
+    if not isinstance(block_tables, torch.Tensor):
+        raise TypeError("block_tables must be a torch.Tensor")
+    if block_tables.ndim != 2:
+        raise ValueError("block_tables must have shape [B, C]")
+    if block_tables.dtype != torch.int32:
+        raise TypeError("block_tables must have dtype torch.int32")
+    if block_tables.device.type != "cuda":
+        raise ValueError("block_tables must be a CUDA tensor")
+    if block_tables.data_ptr() % 4 != 0:
+        raise ValueError("block_tables data pointer must be 4-byte aligned")
+
+    if not isinstance(seq_lens, torch.Tensor):
+        raise TypeError("seq_lens must be a torch.Tensor")
+    if seq_lens.ndim != 1:
+        raise ValueError("seq_lens must be one-dimensional")
+    if seq_lens.dtype != torch.int32:
+        raise TypeError("seq_lens must have dtype torch.int32")
+    if seq_lens.device.type != "cuda":
+        raise ValueError("seq_lens must be a CUDA tensor")
+    if not seq_lens.is_contiguous():
+        raise ValueError("seq_lens must be contiguous")
+    if seq_lens.data_ptr() % 4 != 0:
+        raise ValueError("seq_lens data pointer must be 4-byte aligned")
+    if block_tables.device != seq_lens.device:
+        raise ValueError("block_tables and seq_lens must be on the same device")
+
+    batch_size = int(seq_lens.numel())
+    if batch_size <= 0:
+        raise ValueError("seq_lens must contain at least one request")
+    if int(block_tables.shape[0]) != batch_size:
+        raise ValueError(
+            "block_tables must have one row per request: expected "
+            f"{batch_size}, got {block_tables.shape[0]}"
+        )
+    table_capacity = int(block_tables.shape[1])
+    if table_capacity <= 0:
+        raise ValueError("block_tables must contain at least one page column")
+    if table_capacity > _MAX_INT32:
+        raise ValueError("block_tables column count exceeds signed int32")
+    if block_tables.stride(1) != 1:
+        raise ValueError("block_tables must be contiguous within each row")
+    if block_tables.stride(0) < table_capacity:
+        raise ValueError(
+            "block_tables rows must not overlap: row stride must be at least "
+            f"the column count ({table_capacity}), got {block_tables.stride(0)}"
+        )
+    return seq_lens.device, batch_size, table_capacity
+
+
 def _read_paged_kv_plan_values(
     paged_kv_indptr: torch.Tensor,
     paged_kv_indices: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
     *,
     page_size: int,
-) -> tuple[int, ...]:
-    """Validate CSR values at plan time and return per-request K/V lengths."""
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Validate CSR values and return its offsets and per-request K/V lengths."""
 
     batch_size = int(paged_kv_last_page_len.numel())
     values = torch.cat((paged_kv_indptr, paged_kv_last_page_len)).tolist()
@@ -1015,7 +1070,7 @@ def _read_paged_kv_plan_values(
     if any(length < 1 or length > page_size for length in last_page_lens):
         raise ValueError(f"paged_kv_last_page_len values must be in [1, {page_size}]")
 
-    return tuple(
+    seq_lens = tuple(
         (end - start - 1) * page_size + last_page_len
         for start, end, last_page_len in zip(
             indptr[:-1],
@@ -1024,6 +1079,70 @@ def _read_paged_kv_plan_values(
             strict=True,
         )
     )
+    return indptr, seq_lens
+
+
+def _csr_to_block_tables(
+    paged_kv_indices: torch.Tensor,
+    indptr: tuple[int, ...],
+    seq_lens: tuple[int, ...],
+    *,
+    page_size: int,
+) -> torch.Tensor:
+    """Materialize canonical CSR page IDs as a native fixed page table.
+
+    The canonical one-shot API has already synchronized to validate CSR values.
+    Equal-width rows are exposed as a zero-copy view only when their actual CSR
+    extents equal the native table capacity. Otherwise a temporary dense table
+    copies each active prefix from its true CSR row start. Its inactive tail is
+    deliberately invalid; the native kernel must bound every access by
+    ``seq_lens``.
+    """
+
+    if paged_kv_indices.ndim != 1:
+        raise ValueError("CSR page IDs must be one-dimensional")
+    if paged_kv_indices.dtype != torch.int32:
+        raise TypeError("CSR page IDs must have dtype torch.int32")
+    if not paged_kv_indices.is_contiguous():
+        raise ValueError("CSR page IDs must be contiguous")
+    page_counts = tuple((seq_len + page_size - 1) // page_size for seq_len in seq_lens)
+    batch_size = len(page_counts)
+    if len(indptr) != batch_size + 1:
+        raise ValueError("CSR indptr must contain one more offset than rows")
+    if indptr[0] != 0:
+        raise ValueError("CSR indptr must start at zero")
+    if any(end < begin for begin, end in zip(indptr[:-1], indptr[1:], strict=True)):
+        raise ValueError("CSR indptr offsets must be nondecreasing")
+    if indptr[-1] != int(paged_kv_indices.numel()):
+        raise ValueError("the final CSR indptr offset must equal the page-ID count")
+    table_capacity = max(page_counts)
+    csr_page_counts = tuple(
+        end - begin for begin, end in zip(indptr[:-1], indptr[1:], strict=True)
+    )
+    if any(
+        active_page_count > csr_page_count
+        for active_page_count, csr_page_count in zip(
+            page_counts, csr_page_counts, strict=True
+        )
+    ):
+        raise ValueError("CSR rows do not contain every active K/V page")
+    if all(csr_page_count == table_capacity for csr_page_count in csr_page_counts):
+        return paged_kv_indices.view(batch_size, table_capacity)
+
+    block_tables = torch.full(
+        (batch_size, table_capacity),
+        -1,
+        dtype=torch.int32,
+        device=paged_kv_indices.device,
+    )
+    for request_idx, (page_begin, page_count) in enumerate(
+        zip(indptr[:-1], page_counts, strict=True)
+    ):
+        page_end = page_begin + page_count
+        block_tables[request_idx, :page_count].copy_(
+            paged_kv_indices[page_begin:page_end]
+        )
+    return block_tables
 
 
 def _decode_output_shape(
@@ -1358,8 +1477,7 @@ def _get_compiled_decode(
         out: cute.Tensor,
         seq_lens: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
-        paged_kv_indptr: cute.Tensor,
-        paged_kv_indices: cute.Tensor,
+        block_tables: cute.Tensor,
         partial_o: cute.Tensor,
         partial_stats: cute.Tensor,
         split_kv_counter: cute.Tensor,
@@ -1381,7 +1499,7 @@ def _get_compiled_decode(
         static_full_split_prefix: cutlass.Constexpr[bool],
         static_native_uniform_kv: cutlass.Constexpr[bool],
     ) -> None:
-        """Adapt TVM-FFI tensors to the raw native-CSR pointer launcher."""
+        """Adapt TVM-FFI tensors to the row-strided native launcher."""
 
         q_offsets_iter = cu_seqlens_q.iterator
         total_q_tokens = Int32(static_batch_size * static_seq_len_q)
@@ -1408,7 +1526,7 @@ def _get_compiled_decode(
             seq_lens.iterator,
             q_offsets_iter,
             total_q_tokens,
-            paged_kv_indices.iterator,
+            block_tables.iterator,
             partial_o.iterator,
             partial_stats.iterator,
             split_kv_counter.iterator,
@@ -1422,8 +1540,9 @@ def _get_compiled_decode(
             static_max_kv_len,
             False,
             True,
-            paged_kv_indptr.iterator,
-            paged_kv_indices.iterator,
+            block_tables.iterator,
+            Int32(block_tables.shape[1]),
+            Int64(block_tables.stride[0]),
             num_physical_kv_pages,
             k_page_stride,
             v_page_stride,
@@ -1484,7 +1603,8 @@ def _get_compiled_decode(
             )
 
     physical_pages = cute.sym_int()
-    logical_pages = cute.sym_int()
+    block_table_capacity = cute.sym_int()
+    block_table_row_stride = cute.sym_int64(divisibility=1)
     k_outer_stride = cute.sym_int64(divisibility=1)
     v_outer_stride = cute.sym_int64(divisibility=1)
     total_q_tokens = cute.sym_int()
@@ -1541,8 +1661,12 @@ def _get_compiled_decode(
     cu_seqlens_q_fake = fake_compact(
         Int32, (batch_size + 1,) if use_packed_q else (1,), 4
     )
-    indptr_fake = fake_compact(Int32, (batch_size + 1,), 4)
-    indices_fake = fake_compact(Int32, (logical_pages,), 4)
+    block_tables_fake = cute.runtime.make_fake_tensor(
+        Int32,
+        (batch_size, block_table_capacity),
+        stride=(block_table_row_stride, 1),
+        assumed_align=4,
+    )
     partial_o_fake = fake_compact(partial_dtype, partial_o_shape, 16)
     partial_stats_fake = fake_compact(Float32, partial_stats_shape, 16)
     counter_fake = fake_compact(Int32, counter_shape, 4)
@@ -1558,8 +1682,7 @@ def _get_compiled_decode(
             out_fake,
             seq_lens_fake,
             cu_seqlens_q_fake,
-            indptr_fake,
-            indices_fake,
+            block_tables_fake,
             partial_o_fake,
             partial_stats_fake,
             counter_fake,
@@ -1813,9 +1936,7 @@ def _validate_decode_output_aliasing(
     *,
     seq_lens: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-    paged_kv_last_page_len: Optional[torch.Tensor],
+    block_tables: torch.Tensor,
     workspace_buffer: torch.Tensor,
 ) -> None:
     """Keep output disjoint from every FMHA decode input allocation."""
@@ -1827,9 +1948,7 @@ def _validate_decode_output_aliasing(
         ("v_cache", runtime.v_cache),
         ("seq_lens", seq_lens),
         ("qo_indptr", qo_indptr),
-        ("paged_kv_indptr", paged_kv_indptr),
-        ("paged_kv_indices", paged_kv_indices),
-        ("paged_kv_last_page_len", paged_kv_last_page_len),
+        ("block_tables", block_tables),
         ("workspace_buffer", workspace_buffer),
     )
 
@@ -1839,8 +1958,7 @@ def _launch_decode(
     *,
     seq_lens: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+    block_tables: torch.Tensor,
     workspace: _DecodeWorkspaceViews,
     compiled_main: Callable[..., object],
     compiled_reducer: Optional[Callable[..., object]],
@@ -1855,8 +1973,7 @@ def _launch_decode(
         runtime.out,
         seq_lens,
         q_offsets,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
         workspace.partial_o,
         workspace.partial_stats,
         workspace.split_kv_counter,
@@ -1982,52 +2099,41 @@ def _validate_decode_run_metadata_values(
     runtime: _DecodeRuntime,
     *,
     seq_lens: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+    block_tables: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
 ) -> None:
     """Synchronously validate per-run metadata values and constexpr evidence."""
 
-    combined = torch.cat((paged_kv_indptr, seq_lens)).tolist()
-    indptr = tuple(int(value) for value in combined[: state.batch_size + 1])
-    runtime_seq_lens = tuple(int(value) for value in combined[state.batch_size + 1 :])
-    if indptr[0] != 0:
-        raise ValueError("paged_kv_indptr must start at zero")
-    if any(end <= start for start, end in zip(indptr[:-1], indptr[1:], strict=True)):
-        raise ValueError(
-            "paged_kv_indptr must be strictly increasing so every request "
-            "contains at least one page"
-        )
-    if indptr[-1] != int(paged_kv_indices.numel()):
-        raise ValueError(
-            "the final paged_kv_indptr offset must equal "
-            "paged_kv_indices.numel(): "
-            f"expected {paged_kv_indices.numel()}, got {indptr[-1]}"
-        )
-    for request_idx, (begin, end, seq_len) in enumerate(
-        zip(indptr[:-1], indptr[1:], runtime_seq_lens, strict=True)
-    ):
+    runtime_seq_lens = tuple(int(value) for value in seq_lens.tolist())
+    table_capacity = int(block_tables.shape[1])
+    for request_idx, seq_len in enumerate(runtime_seq_lens):
         if seq_len <= 0 or seq_len > state.max_kv_len:
             raise ValueError(
                 f"seq_lens values must be within [1, {state.max_kv_len}]; "
                 f"request {request_idx} has {seq_len}"
             )
         required_pages = (seq_len + state.page_size - 1) // state.page_size
-        if end - begin < required_pages:
+        if table_capacity < required_pages:
             raise ValueError(
-                "paged_kv_indptr row does not contain enough pages for "
+                "block_tables does not have enough columns for "
                 f"seq_lens[{request_idx}]={seq_len}: requires {required_pages}, "
-                f"got {end - begin}"
+                f"got {table_capacity}"
             )
 
-    page_ids = tuple(int(value) for value in paged_kv_indices.tolist())
-    if any(
-        page_id < 0 or page_id >= runtime.num_physical_pages for page_id in page_ids
+    block_table_rows = block_tables.tolist()
+    for request_idx, (row, seq_len) in enumerate(
+        zip(block_table_rows, runtime_seq_lens, strict=True)
     ):
-        raise ValueError(
-            "paged_kv_indices values must index the physical K/V cache in "
-            f"[0, {runtime.num_physical_pages})"
-        )
+        required_pages = (seq_len + state.page_size - 1) // state.page_size
+        if any(
+            int(page_id) < 0 or int(page_id) >= runtime.num_physical_pages
+            for page_id in row[:required_pages]
+        ):
+            raise ValueError(
+                "block_tables values for active pages must index the physical "
+                f"K/V cache in [0, {runtime.num_physical_pages}); request "
+                f"{request_idx} contains an invalid page ID"
+            )
 
     if state.use_packed_q:
         assert qo_indptr is not None
@@ -2087,8 +2193,7 @@ def prims_ts_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: PagedKVCache,
     workspace_buffer: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+    block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
     *,
@@ -2103,7 +2208,7 @@ def prims_ts_batch_decode_with_kv_cache(
     window_left: int = -1,
     kv_layout: Literal["HND"] = "HND",
 ) -> torch.Tensor:
-    """Launch fixed or packed-Q native-CSR FMHA decode with caller scratch.
+    """Launch fixed or packed-Q native page-table decode with caller scratch.
 
     For ``seq_len_q=1``, ``query`` and the returned output both have shape
     ``[B, Hq, D]``. For ``seq_len_q>1``, both use compact token-major
@@ -2120,19 +2225,19 @@ def prims_ts_batch_decode_with_kv_cache(
 
     ``kv_cache`` is either a combined
     ``[pages, 2, Hkv, page_size, D]`` tensor or a ``(K, V)`` tuple of
-    ``[pages, Hkv, page_size, D]`` tensors. The metadata uses FlashInfer's
-    native CSR page-ID ABI; ``seq_lens`` is explicit and ``max_seq_len`` is the
-    exact static maximum used for automatic policy selection and JIT caching.
+    ``[pages, Hkv, page_size, D]`` tensors. ``block_tables`` is an int32 CUDA
+    tensor with shape ``[B, C]``. Entries are contiguous within each row while
+    the outer row stride may be greater than ``C``. ``seq_lens`` is explicit
+    and ``max_seq_len`` is the exact static maximum used for automatic policy
+    selection and JIT caching.
     It must be no larger than ``2,147,483,392`` so the padded 256-token K/V
     tile endpoint remains representable as signed Int32.
-    Each request must own enough CSR entries for its per-run length::
+    The table must contain enough columns for every per-run length::
 
-        (seq_lens[b] + page_size - 1) // page_size <= (
-            paged_kv_indptr[b + 1] - paged_kv_indptr[b]
-        )
+        (seq_lens[b] + page_size - 1) // page_size <= C
 
-    The indptr must start at zero, increase strictly, and end at
-    ``paged_kv_indices.numel()``; every active page ID must index ``kv_cache``.
+    Every active page ID must index ``kv_cache``. Inactive tail entries at and
+    beyond ``ceil(seq_lens[b] / page_size)`` are ignored.
 
     ``workspace_buffer`` must be zero-initialized before its first use and
     re-zeroed whenever an argument contributing to the semantic JIT key changes,
@@ -2140,7 +2245,7 @@ def prims_ts_batch_decode_with_kv_cache(
     to one in-flight launch or captured graph and must not overlap query, K/V
     cache, metadata, or output storage. Runtime sequence lengths must remain
     positive and no larger than ``max_seq_len``; this hot path
-    deliberately does not read device metadata back to the host. Per-run CSR,
+    deliberately does not read device metadata back to the host. Per-run table,
     length, page-ID, and packed-Q values may change between completed launches
     or graph replays only while all of their contracts remain valid. They must
     not be mutated concurrently with a launch or replay that reads them. Warm
@@ -2161,8 +2266,9 @@ def prims_ts_batch_decode_with_kv_cache(
         Combined or separate paged K/V storage.
     workspace_buffer : torch.Tensor
         Zero-initialized caller-owned byte workspace for this semantic key.
-    paged_kv_indptr, paged_kv_indices : torch.Tensor
-        Native CSR row offsets and physical page IDs.
+    block_tables : torch.Tensor
+        CUDA int32 physical page IDs with shape ``[B, C]``, unit inner stride,
+        and non-overlapping row stride at least ``C``.
     seq_lens : torch.Tensor
         Per-run K/V sequence lengths for each request.
     max_seq_len : int
@@ -2202,11 +2308,8 @@ def prims_ts_batch_decode_with_kv_cache(
     )
     assert resolved_seq_len_q is not None
     seq_len_q = resolved_seq_len_q
-    metadata_device, batch_size = _validate_paged_kv_row_metadata(
-        paged_kv_indptr,
-        paged_kv_indices,
-        seq_lens,
-        "seq_lens",
+    metadata_device, batch_size, _ = _validate_block_table_metadata(
+        block_tables, seq_lens
     )
     _validate_q(
         query,
@@ -2304,8 +2407,7 @@ def prims_ts_batch_decode_with_kv_cache(
         ("v_cache", runtime.v_cache),
         ("seq_lens", seq_lens),
         ("qo_indptr", qo_indptr),
-        ("paged_kv_indptr", paged_kv_indptr),
-        ("paged_kv_indices", paged_kv_indices),
+        ("block_tables", block_tables),
         ("out", runtime.out),
     )
     if caller_provided_out:
@@ -2313,9 +2415,7 @@ def prims_ts_batch_decode_with_kv_cache(
             runtime,
             seq_lens=seq_lens,
             qo_indptr=qo_indptr,
-            paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
-            paged_kv_last_page_len=None,
+            block_tables=block_tables,
             workspace_buffer=workspace_buffer,
         )
     compiled_main, compiled_reducer, _, scratch_shapes = _get_compiled_decode(
@@ -2328,8 +2428,7 @@ def prims_ts_batch_decode_with_kv_cache(
         runtime,
         seq_lens=seq_lens,
         qo_indptr=qo_indptr,
-        paged_kv_indptr=paged_kv_indptr,
-        paged_kv_indices=paged_kv_indices,
+        block_tables=block_tables,
         workspace=workspace,
         compiled_main=compiled_main,
         compiled_reducer=compiled_reducer,
@@ -2342,7 +2441,7 @@ class BatchDecodePagedTSWrapper:
     A plan fixes device, batch size, geometry, dtypes, query storage mode, and
     maximum K/V capacity. It owns compiled callables and one mutable scratch
     workspace, but no request tensors. Every run supplies sequence lengths and
-    native CSR page metadata; packed-query plans also consume per-run Q offsets.
+    a row-strided page table; packed-query plans also consume per-run Q offsets.
 
     One wrapper supports one ordered execution lane. Concurrent streams or
     graph replays require separate wrappers and workspace buffers.
@@ -2620,8 +2719,7 @@ class BatchDecodePagedTSWrapper:
         q: torch.Tensor,
         paged_kv_cache: PagedKVCache,
         seq_lens: torch.Tensor,
-        paged_kv_indptr: torch.Tensor,
-        paged_kv_indices: torch.Tensor,
+        block_tables: torch.Tensor,
         *,
         qo_indptr: Optional[torch.Tensor] = None,
         bmm1_scale: Optional[float] = None,
@@ -2652,10 +2750,10 @@ class BatchDecodePagedTSWrapper:
             Runtime combined or separate paged K/V storage matching the plan.
         seq_lens : torch.Tensor
             Per-run contiguous int32 CUDA K/V lengths with shape ``[B]``.
-        paged_kv_indptr : torch.Tensor
-            Per-run contiguous int32 CUDA CSR row offsets with shape ``[B + 1]``.
-        paged_kv_indices : torch.Tensor
-            Per-run contiguous int32 CUDA physical page IDs.
+        block_tables : torch.Tensor
+            Per-run int32 CUDA physical page IDs with shape ``[B, C]``. Entries
+            must be contiguous within each row; the row stride may be any value
+            at least ``C``. Inactive tail entries are ignored.
         qo_indptr : torch.Tensor, optional
             Per-run cumulative query offsets with shape ``[B + 1]``. Required for
             a packed-query plan and rejected for a fixed-query plan.
@@ -2684,11 +2782,13 @@ class BatchDecodePagedTSWrapper:
         runtime_qo_indptr = qo_indptr if state.use_packed_q else None
         caller_provided_out = out is not None
         if validate:
-            metadata_device, metadata_batch_size = _validate_paged_kv_row_metadata(
-                paged_kv_indptr,
-                paged_kv_indices,
+            (
+                metadata_device,
+                metadata_batch_size,
+                _,
+            ) = _validate_block_table_metadata(
+                block_tables,
                 seq_lens,
-                "seq_lens",
             )
             if metadata_device != state.device:
                 raise ValueError(
@@ -2732,8 +2832,7 @@ class BatchDecodePagedTSWrapper:
                 state,
                 runtime,
                 seq_lens=seq_lens,
-                paged_kv_indptr=paged_kv_indptr,
-                paged_kv_indices=paged_kv_indices,
+                block_tables=block_tables,
                 qo_indptr=runtime_qo_indptr,
             )
             _validate_tensor_does_not_overlap_inputs(
@@ -2744,8 +2843,7 @@ class BatchDecodePagedTSWrapper:
                 ("v_cache", runtime.v_cache),
                 ("seq_lens", seq_lens),
                 ("qo_indptr", runtime_qo_indptr),
-                ("paged_kv_indptr", paged_kv_indptr),
-                ("paged_kv_indices", paged_kv_indices),
+                ("block_tables", block_tables),
                 ("out", runtime.out),
             )
             if caller_provided_out:
@@ -2753,9 +2851,7 @@ class BatchDecodePagedTSWrapper:
                     runtime,
                     seq_lens=seq_lens,
                     qo_indptr=runtime_qo_indptr,
-                    paged_kv_indptr=paged_kv_indptr,
-                    paged_kv_indices=paged_kv_indices,
-                    paged_kv_last_page_len=None,
+                    block_tables=block_tables,
                     workspace_buffer=state.workspace_buffer,
                 )
         else:
@@ -2772,8 +2868,7 @@ class BatchDecodePagedTSWrapper:
             runtime,
             seq_lens=seq_lens,
             qo_indptr=runtime_qo_indptr,
-            paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
+            block_tables=block_tables,
             workspace=state.workspace,
             compiled_main=state.compiled_main,
             compiled_reducer=state.compiled_reducer,
@@ -2799,13 +2894,20 @@ def batch_decode_with_paged_kv_cache(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """One-shot fixed or packed-Q native-CSR paged decode.
+    """One-shot fixed or packed-Q paged decode from canonical CSR metadata.
 
     SQ1 preserves the ``[B, Hq, D]`` query/output contract. For fixed
     ``seq_len_q>1``, query and output are both token-major
     ``[B, SQ, Hq, D]``. Providing cumulative ``qo_indptr`` selects packed
     ``[total_q, Hq, D]`` query/output; the wrapper derives ``max_seq_len_q``
     once when it is omitted. No transpose is hidden here.
+
+    This compatibility path validates CSR values on the host and converts the
+    metadata to the native fixed ``[B, C]`` page table before launching. It is
+    therefore not CUDA-graph-capturable. Uniform-width CSR rows use a zero-copy
+    view of ``paged_kv_indices``; ragged rows allocate a temporary dense table.
+    Capture-sensitive callers should plan :class:`BatchDecodePagedTSWrapper`
+    and bind ``block_tables`` plus ``seq_lens`` directly.
 
     Parameters
     ----------
@@ -2861,6 +2963,11 @@ def batch_decode_with_paged_kv_cache(
     if metadata_device != q.device:
         raise ValueError(
             f"paged-KV metadata must be on {q.device}, got {metadata_device}"
+        )
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "batch_decode_with_paged_kv_cache cannot convert CSR metadata during "
+            "CUDA graph capture; use BatchDecodePagedTSWrapper with block_tables"
         )
     if qo_indptr is not None:
         _validate_qo_indptr(
@@ -2937,7 +3044,7 @@ def batch_decode_with_paged_kv_cache(
         output_dtype,
     )
 
-    seq_lens_host = _read_paged_kv_plan_values(
+    indptr_host, seq_lens_host = _read_paged_kv_plan_values(
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
@@ -2962,6 +3069,12 @@ def batch_decode_with_paged_kv_cache(
     max_kv_len = max(seq_lens_host)
     num_pages = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
     seq_lens = ((num_pages - 1) * page_size + paged_kv_last_page_len).contiguous()
+    block_tables = _csr_to_block_tables(
+        paged_kv_indices,
+        indptr_host,
+        seq_lens_host,
+        page_size=page_size,
+    )
 
     wrapper = BatchDecodePagedTSWrapper(kv_layout=kv_layout)
     wrapper.plan(
@@ -2985,8 +3098,7 @@ def batch_decode_with_paged_kv_cache(
         q,
         paged_kv_cache,
         seq_lens,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
         qo_indptr=qo_indptr,
         bmm1_scale=bmm1_scale,
         bmm2_scale=bmm2_scale,
