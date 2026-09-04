@@ -344,13 +344,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, _exc_val, _exc_tb):
-        try:
-            self.shutdown()
-        except RuntimeError as error:
-            if exc_type is None:
-                raise
-            logger.error(f"KvCacheTransceiverV2 shutdown refused during exception unwind: {error}")
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
+        self.shutdown()
 
     def _get_mamba_slot_for_request(self, req: LlmRequest) -> Optional[int]:
         """Get the mamba state slot index for a request, or None."""
@@ -959,6 +954,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # outlive every ownership-enabled NIXL operation.
             self._send_reqs[rid] = req
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            # A remote cancellation can win before the local TxSession is
+            # created. Sender.setup_session() records that terminal state and
+            # reports safe pre-submission failures to every known receiver;
+            # leave retirement to the normal status path without attempting
+            # to publish KV or auxiliary memory afterward.
+            if session.has_failed():
+                return
         try:
             if self.pipeline_transfer_enabled:
                 slice = self._build_prefill_chunk(req)
@@ -1145,6 +1147,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # DP ranks (entries that will never have a TxSession created for them).
         self._transfer_worker.sweep_stale_req_infos()
 
+        if getattr(self, "_fp4_mla_bridge_enabled", False):
+            # CtxTransferStatus has no cancellation channel. In the qualified
+            # no-retry bridge, a globally quiesced cancellation is a terminal
+            # send failure that the executor must consume to release its
+            # matching AsyncTransferManager claim.
+            failed.extend(rid for rid in cancelled if rid not in failed)
         return CtxTransferStatus(completed, failed)
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:

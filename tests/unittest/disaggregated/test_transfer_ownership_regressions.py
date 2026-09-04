@@ -1269,20 +1269,6 @@ def test_shutdown_fails_stop_when_receive_close_refuses_after_preflight() -> Non
 
 
 @pytest.mark.cpu_only
-def test_context_manager_preserves_primary_exception_when_shutdown_refuses() -> None:
-    transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver.shutdown = Mock(side_effect=RuntimeError("resources remain active"))
-
-    with pytest.raises(ValueError, match="primary failure"):
-        with transceiver:
-            raise ValueError("primary failure")
-
-    transceiver.shutdown.assert_called_once_with()
-    with pytest.raises(RuntimeError, match="resources remain active"):
-        transceiver.__exit__(None, None, None)
-
-
-@pytest.mark.cpu_only
 def test_concurrent_shutdown_is_serialized() -> None:
     entered = threading.Event()
     release = threading.Event()
@@ -1326,14 +1312,11 @@ def test_concurrent_shutdown_is_serialized() -> None:
     assert call_count == 1
 
 
-def _make_owned_sender(
-    operation_drain_timeout_s: float | None = None,
-) -> transfer_mod.Sender:
+def _make_owned_sender() -> transfer_mod.Sender:
     sender = object.__new__(transfer_mod.Sender)
     sender._enforce_physical_ownership = True
     sender._sessions_lock, sender._sessions = threading.Lock(), {}
     sender._shutdown = sender._shutdown_requested = False
-    sender._agent_operation_gate = transfer_mod._AgentOperationGate(operation_drain_timeout_s)
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
     sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
     sender._instance_rank = 0
@@ -1391,6 +1374,140 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
         ],
     )
     assert sender._send_task_queues[0].empty()
+
+
+@pytest.mark.cpu_only
+def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    rid = 106
+    sender = _make_owned_sender()
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_requests = {}
+    sender._peer_requests_timestamps = {}
+    sender._pre_cancelled_rids = {rid}
+    params = DisaggregatedParams(
+        disagg_request_id=rid,
+        schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
+    )
+    request = SimpleNamespace(
+        py_request_id=rid,
+        py_disaggregated_params=params,
+        py_kv_send_session_retired=False,
+        state=LlmRequestState.CONTEXT_INIT,
+        set_kv_cache_transfer_start=lambda _timestamp: None,
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._fp4_mla_bridge_enabled = True
+    transceiver._enable_pipelined_transfer = False
+    transceiver._ever_had_send_session = False
+    transceiver._ctx_need_tp_sync = False
+    transceiver._ctx_need_pp_sync = False
+    transceiver._sender_future_timeout_ms = None
+    transceiver.kv_transfer_timeout_ms = None
+    transceiver._dist = SimpleNamespace(tp_allgather=lambda values: [values])
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._validate_bridge_req = Mock(return_value=True)
+    sweep_stale_req_infos = Mock()
+    transceiver._transfer_worker = SimpleNamespace(
+        create_tx_session=lambda _request: transfer_mod.TxSession(rid, params, sender),
+        sweep_stale_req_infos=sweep_stale_req_infos,
+    )
+    transceiver._create_kv_slice = Mock()
+    transceiver._finalize_send = Mock()
+
+    transceiver.respond_and_send_async(request)
+
+    session = transceiver._send_sessions[rid]
+    assert session.status == SessionStatus.CANCELLED
+    assert session.kv_tasks == []
+    assert session.aux_task is None
+    assert transceiver._send_reqs == {rid: request}
+    assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    transceiver._create_kv_slice.assert_not_called()
+    transceiver._finalize_send.assert_not_called()
+
+    transfers = {rid: request}
+    end_transfer = Mock(side_effect=lambda req: transfers.pop(req.py_request_id) is req)
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = transceiver
+    executor.async_transfer_manager = SimpleNamespace(
+        requests_in_transfer=lambda: transfers,
+        end_transfer=end_transfer,
+    )
+    executor.active_requests = [request]
+    executor._disagg_timed_out_ctx_cancelled_ids = set()
+    executor._check_cache_transfer_errors = Mock()
+
+    PyExecutor._check_disagg_ctx_cache_transfer_status(executor)
+
+    assert transfers == {}
+    end_transfer.assert_called_once_with(request)
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert request.py_kv_send_session_retired
+    assert transceiver._send_sessions == {}
+    assert transceiver._send_reqs == {}
+    sweep_stale_req_infos.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("bridge_enabled", "has_inflight", "releases_claim"),
+    [
+        (True, False, True),
+        (True, True, False),
+        (False, False, False),
+    ],
+)
+def test_bridge_rejection_releases_only_without_physical_owner(
+    bridge_enabled: bool,
+    has_inflight: bool,
+    releases_claim: bool,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    rid = 107
+    request = SimpleNamespace(
+        is_context_only_request=True,
+        is_context_finished=True,
+        is_finished_due_to_length=False,
+        is_finished_due_to_cancellation=False,
+        is_child=False,
+        parent_request_id=None,
+        py_request_id=rid,
+        py_kv_transfer_start_time=None,
+        state=LlmRequestState.CONTEXT_INIT,
+    )
+    transceiver = SimpleNamespace(
+        _fp4_mla_bridge_enabled=bridge_enabled,
+        has_retired_send_session=lambda _req: False,
+        respond_and_send_async=lambda req: setattr(
+            req, "state", LlmRequestState.DISAGG_TRANS_ERROR
+        ),
+        has_inflight_transfer=lambda _req: has_inflight,
+        kv_transfer_timeout_ms=1000,
+    )
+    async_transfer_manager = SimpleNamespace(
+        start_transfer=Mock(),
+        end_transfer=Mock(return_value=True),
+    )
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = transceiver
+    executor.kv_cache_manager = Mock(spec=[])
+    executor.async_transfer_manager = async_transfer_manager
+    executor.active_requests = [request]
+    executor.canceled_req_ids = []
+
+    PyExecutor._send_disagg_ctx_kv_async(executor, [request])
+
+    async_transfer_manager.start_transfer.assert_called_once_with(request)
+    if releases_claim:
+        async_transfer_manager.end_transfer.assert_called_once_with(request)
+        assert request.py_kv_transfer_start_time is None
+    else:
+        async_transfer_manager.end_transfer.assert_not_called()
+        assert request.py_kv_transfer_start_time is not None
 
 
 @pytest.mark.cpu_only
@@ -1678,9 +1795,7 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
     assert not task.resources_drained
     expected_status = None if failure_mode == "submit_exception" else status
     evidence = task._physical_ops[peer_rank]
-    assert evidence[:2] == [request, expected_status]
-    assert len(evidence) == 3
-    assert callable(evidence[-1])
+    assert evidence == [request, expected_status]
     assert sender._ownership_poisoned is not None
 
 
@@ -1693,9 +1808,7 @@ def test_receiver_in_doubt_retains_destination_and_closes_admission(
     receiver = _make_owned_receiver()
     params = DisaggregatedParams(
         disagg_request_id=rid,
-        schedule_style=(
-            DisaggScheduleStyle.GENERATION_FIRST if auxiliary else DisaggScheduleStyle.CONTEXT_FIRST
-        ),
+        schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
     )
     session = RxSession(request_id=rid, params=params, receiver=receiver)
     task = session.prepare_receive(KVSlice(is_last_slice=True))
@@ -1704,16 +1817,19 @@ def test_receiver_in_doubt_retains_destination_and_closes_admission(
     assert session.try_begin_transfer(task.slice_id, set(), writer_cohort={0})
 
     if auxiliary:
-        accepted, _ = task.record_writer_result(
+        session.process_kv_agent_result(
             0,
-            False,
-            wait_for_local_completion=False,
+            0,
+            True,
+            AgentResult.FAILED,
         )
-        assert accepted
         assert task.resources_drained
         session.process_aux_agent_result(0, AgentResult.IN_DOUBT)
         assert session._aux_status == transfer_mod.TaskStatus.ERROR
     else:
+        session.process_aux_agent_result(0, AgentResult.FAILED)
+        assert session._aux_physical_owner is not None
+        assert session._aux_physical_owner.resources_drained
         session.process_kv_agent_result(0, 0, True, AgentResult.IN_DOUBT)
         assert task.status == transfer_mod.TaskStatus.ERROR
 
@@ -1782,8 +1898,11 @@ def test_sender_ignores_remote_agent_registration_after_shutdown_request(
 def test_sender_registration_does_not_wait_for_active_transfer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sender = _make_owned_sender(operation_drain_timeout_s=0.01)
+    sender = _make_owned_sender()
     sender._device_id, sender._registrar, sender._agent = 0, Mock(), Mock()
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=1))
+    assert task.begin_physical_operation(7)
+    sender._sessions[1] = SimpleNamespace(kv_tasks=[task])
     peer = SimpleNamespace(
         instance_name="gen",
         instance_rank=2,
@@ -1793,20 +1912,57 @@ def test_sender_registration_does_not_wait_for_active_transfer(
     monkeypatch.setattr(transfer_mod.cudart, "cudaSetDevice", Mock(return_value=0))
     monkeypatch.setattr(transfer_mod, "CUASSERT", Mock())
     monkeypatch.setattr(transfer_mod.RankInfo, "from_bytes", Mock(return_value=peer))
-    release = sender._agent_operation_gate.acquire_transfer()
-
-    sender._register_peer_rank(b"", [b"", b"rank"])
+    thread_results: queue.Queue[Exception | None] = queue.Queue()
+    registration = _start_checked_thread(
+        lambda: sender._register_peer_rank(b"", [b"", b"rank"]),
+        thread_results,
+    )
+    registration.join(timeout=10)
+    assert not registration.is_alive()
+    _raise_thread_errors(thread_results, expected=1)
 
     sender._registrar.register.assert_called_once_with("gen", 2, peer)
     sender._agent.load_remote_agent.assert_called_once_with("gen2", b"descriptor")
     assert sender._loaded_remote_agents == {"gen2"}
-    assert sender._agent_operation_gate._active_transfers == 1
-    release()
+    assert not task.resources_drained
 
 
 @pytest.mark.cpu_only
-def test_sender_retires_only_after_done_and_retains_ambiguous_operation() -> None:
-    sender = _make_owned_sender(operation_drain_timeout_s=0.01)
+@pytest.mark.parametrize(
+    ("ownership_enabled", "legacy_shared", "uses_shared_dealer"),
+    [
+        (False, True, True),
+        (False, False, False),
+        (True, True, False),
+        (True, False, False),
+    ],
+)
+def test_sender_result_dealer_preserves_legacy_early_failure_routing(
+    ownership_enabled: bool,
+    legacy_shared: bool,
+    uses_shared_dealer: bool,
+) -> None:
+    sender = object.__new__(transfer_mod.Sender)
+    sender._enforce_physical_ownership = ownership_enabled
+    shared_dealer = Mock()
+    thread_dealer = Mock()
+    sender._get_or_connect_dealer = Mock(return_value=shared_dealer)
+    sender._get_or_connect_thread_dealer = Mock(return_value=thread_dealer)
+
+    dealer = sender._get_result_dealer("receiver", legacy_shared=legacy_shared)
+
+    assert dealer is (shared_dealer if uses_shared_dealer else thread_dealer)
+    if uses_shared_dealer:
+        sender._get_or_connect_dealer.assert_called_once_with("receiver")
+        sender._get_or_connect_thread_dealer.assert_not_called()
+    else:
+        sender._get_or_connect_dealer.assert_not_called()
+        sender._get_or_connect_thread_dealer.assert_called_once_with("receiver")
+
+
+@pytest.mark.cpu_only
+def test_sender_retires_only_after_done() -> None:
+    sender = _make_owned_sender()
     done_status = SimpleNamespace(wait=lambda: True)
     sender._agent = SimpleNamespace(submit_transfer_requests=lambda _request: done_status)
     done = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=92))
@@ -1819,37 +1975,10 @@ def test_sender_retires_only_after_done_and_retains_ambiguous_operation() -> Non
     done.finish_physical_operation(7)
     assert done.resources_drained
 
-    ambiguous_status = SimpleNamespace(
-        wait=lambda: False,
-        last_status_str=lambda: "still active",
-    )
-    sender._agent = SimpleNamespace(submit_transfer_requests=lambda _request: ambiguous_status)
-    ambiguous = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=93))
-    ambiguous_request = Mock()
-
-    assert ambiguous.begin_physical_operation(7)
-    assert sender._submit_transfer(ambiguous, 7, ambiguous_request) == (
-        False,
-        "still active",
-    )
-    assert sender._ownership_poisoned is not None
-    assert not ambiguous.resources_drained
-    assert ambiguous._physical_ops[7][:2] == [ambiguous_request, ambiguous_status]
-    assert sender._agent_operation_gate._active_transfers == 1
-    with pytest.raises(RuntimeError, match="quarantined"):
-        sender._agent_operation_gate.acquire_transfer()
-    with pytest.raises(RuntimeError, match="refuses teardown"):
-        sender._agent_operation_gate.close()
-    assert sender._agent_operation_gate._active_transfers == 1
-
-    ambiguous.finish_physical_operation(7)
-    sender._agent_operation_gate.close()
-    assert sender._agent_operation_gate._active_transfers == 0
-
 
 @pytest.mark.cpu_only
 def test_poisoned_sender_retires_only_unsubmitted_operation() -> None:
-    sender = _make_owned_sender(operation_drain_timeout_s=0.01)
+    sender = _make_owned_sender()
     sender._agent = Mock()
     task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=95))
     request = Mock()
@@ -1865,26 +1994,6 @@ def test_poisoned_sender_retires_only_unsubmitted_operation() -> None:
     sender._agent.submit_transfer_requests.assert_not_called()
     assert sender._ownership_poisoned is not None
     assert task.resources_drained
-
-
-@pytest.mark.cpu_only
-def test_agent_gate_timeouts_retain_active_transfer() -> None:
-    for timeout_s in (0.0, -1.0):
-        gate = transfer_mod._AgentOperationGate(drain_timeout_s=timeout_s)
-        assert gate._drain_timeout_s == transfer_mod._FALLBACK_TX_OVERALL_TIMEOUT_S
-
-    close_gate = transfer_mod._AgentOperationGate(drain_timeout_s=0.01)
-    release_close = close_gate.acquire_transfer()
-
-    with pytest.raises(RuntimeError, match="refuses teardown"):
-        close_gate.close()
-
-    assert close_gate._active_transfers == 1
-    release_close()
-    with pytest.raises(RuntimeError, match="quarantined"):
-        close_gate.acquire_transfer()
-    close_gate.close()
-    assert close_gate._active_transfers == 0
 
 
 @pytest.mark.cpu_only

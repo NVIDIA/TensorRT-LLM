@@ -7700,6 +7700,18 @@ class PyExecutor:
                     # Send the monolithic slice or final pipelined chunk.
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
+                    # Bridge validation can safely reject before creating a
+                    # transfer session. Release the matching async-manager
+                    # claim immediately; there is no physical accessor whose
+                    # retirement must be polled.
+                    if (getattr(self.kv_cache_transceiver,
+                                "_fp4_mla_bridge_enabled", False)
+                            and req.state == LlmRequestState.DISAGG_TRANS_ERROR
+                            and not self.kv_cache_transceiver.
+                            has_inflight_transfer(req)):
+                        self._end_transfer_and_maybe_terminate(req)
+                        continue
+
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()
                 elif (self.kv_cache_transceiver.pipeline_transfer_enabled
