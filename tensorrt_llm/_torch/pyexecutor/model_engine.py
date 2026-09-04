@@ -1085,10 +1085,10 @@ class PyTorchModelEngine(ModelEngine):
             self.breakable_cuda_graph_runner = BreakableCUDAGraphRunner(
                 decoder_model.model)
 
-        # Pinned staging buffers for async H2D copies on the ragged path;
-        # see _pinned_host for the two-slot WAR-guard rationale.
+        # Pinned staging buffers for async H2D copies on the ragged path.
+        # Two slots allow two same-key copies in one input-preparation pass;
+        # wait_for_input_copy protects their reuse across iterations.
         self._pinned_host_cache = {}
-        self._pinned_host_events = {}
         self._pinned_host_active = {}
 
         # Initialize CUDA Graph LoRA manager if LoRA is enabled
@@ -5598,19 +5598,13 @@ class PyTorchModelEngine(ModelEngine):
         Async H2D sources must outlive the queued copy -- PyTorch does not
         extend the lifetime of an async source, so a temporary tensor can be
         reclaimed while the DMA still reads it. Buffers are keyed by name and
-        grown monotonically.
+        grown monotonically. Two slots support the token and draft gathers
+        issued under the same key in one preparation pass. The executor calls
+        :meth:`wait_for_input_copy` before the next pass mutates host input, so
+        no additional per-slot event or synchronization is needed.
         """
         values = list(values)
-        # WAR guard: a slot must not be rewritten while its previous
-        # non_blocking H2D is still queued. Callers record the active slot's
-        # event via _pinned_host_record after enqueuing; two slots alternate,
-        # so this wait targets the copy from two steps ago and is free in
-        # steady state (a single slot would stall prepare behind the previous
-        # step's stream position).
         slot = 1 - self._pinned_host_active.get(key, 1)
-        evt = self._pinned_host_events.get((key, slot))
-        if evt is not None:
-            evt.synchronize()
         bufs = self._pinned_host_cache.setdefault(key, [None, None])
         buf = bufs[slot]
         if buf is None or buf.numel() < len(values) or buf.dtype != dtype:
@@ -5623,24 +5617,6 @@ class PyTorchModelEngine(ModelEngine):
         if values:
             view.copy_(torch.tensor(values, dtype=dtype))
         return view
-
-    def _pinned_host_record(self, *keys: str) -> None:
-        """Mark the H2D copies from these staging buffers as enqueued.
-
-        Call after the non_blocking copy that reads a `_pinned_host` view.
-        Skipped during graph capture (the staging copies are eager on every
-        step, including graph steps; only the one-time capture pass is not).
-        """
-        if torch.cuda.is_current_stream_capturing():
-            return
-        for key in keys:
-            slot = self._pinned_host_active.get(key)
-            if slot is None:
-                continue
-            evt = self._pinned_host_events.get((key, slot))
-            if evt is None:
-                evt = self._pinned_host_events[(key, slot)] = torch.cuda.Event()
-            evt.record()
 
     def _attach_ragged_verify_layout(self, spec_metadata, attn_metadata,
                                      generation_requests) -> None:
@@ -5679,7 +5655,6 @@ class PyTorchModelEngine(ModelEngine):
         lens_view.copy_(self._pinned_host("ragged_verify_lens", token_lens,
                                           torch.int32),
                         non_blocking=True)
-        self._pinned_host_record("ragged_verify_lens")
         indptr_view = self.ragged_qo_indptr_cuda[:n + 1]
         indptr_view.copy_(build_qo_indptr(lens_view), non_blocking=True)
         spec_metadata.verify_lens = lens_view
@@ -5703,10 +5678,8 @@ class PyTorchModelEngine(ModelEngine):
         rows, cols = ragged_gather_index_lists(slots, counts)
         rows_dev = self._pinned_host("gather_rows", rows,
                                      torch.long).to('cuda', non_blocking=True)
-        self._pinned_host_record("gather_rows")
         cols_dev = self._pinned_host("gather_cols", cols,
                                      torch.long).to('cuda', non_blocking=True)
-        self._pinned_host_record("gather_cols")
         return (rows_dev, cols_dev)
 
     def _update_target_input_tensors(

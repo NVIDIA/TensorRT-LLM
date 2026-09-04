@@ -621,13 +621,12 @@ class CUDAGraphRunner:
             # applicable" so the payload is plain ints on every rank.
             local_bucket = self._ragged_verify_bucket(
                 batch) if can_run_cuda_graph else None
-            all_can_graph_batch = self.config.dist.tp_allgather_int64(
-                [
-                    can_run_cuda_graph,
-                    batch_size,
-                    -1 if local_bucket is None else int(local_bucket),
-                    self._local_draft_len(batch) if can_run_cuda_graph else -1,
-                ]).tolist()
+            all_can_graph_batch = self.config.dist.tp_allgather_int64([
+                can_run_cuda_graph,
+                batch_size,
+                -1 if local_bucket is None else int(local_bucket),
+                self._local_draft_len(batch) if can_run_cuda_graph else -1,
+            ]).tolist()
             is_all_gen_only = all(all_can_graph[0]
                                   for all_can_graph in all_can_graph_batch)
             all_shapes_equal = all(peer[1:] == all_can_graph_batch[0][1:]

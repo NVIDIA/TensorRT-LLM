@@ -32,6 +32,21 @@ def _engine(runner, buckets):
     )
 
 
+def test_pinned_host_ping_pongs_without_private_cuda_events() -> None:
+    engine = SimpleNamespace(
+        _pinned_host_cache={},
+        _pinned_host_active={},
+    )
+
+    first = PyTorchModelEngine._pinned_host(engine, "rows", [1, 2], torch.long)
+    second = PyTorchModelEngine._pinned_host(engine, "rows", [3, 4], torch.long)
+    third = PyTorchModelEngine._pinned_host(engine, "rows", [5, 6], torch.long)
+
+    assert first.data_ptr() == third.data_ptr()
+    assert first.data_ptr() != second.data_ptr()
+    assert third.tolist() == [5, 6]
+
+
 @pytest.mark.parametrize(
     ("verifier_budget", "scheduled_window", "high_rows"),
     [(80, 4, 0), (81, 5, 1), (88, 5, 8)],
