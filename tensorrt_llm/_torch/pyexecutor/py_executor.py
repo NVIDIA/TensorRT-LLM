@@ -1143,8 +1143,8 @@ class PyExecutor:
             return
         timed_out = self._pending_timed_out_requests
         self._pending_timed_out_requests = []
-        any_timed_out = any(
-            self.dist.tp_allgather(bool(timed_out), small_payload=True))
+        any_timed_out = bool(
+            self.dist.tp_allgather_int64([bool(timed_out)]).any())
         if any_timed_out:
             self._handle_errors(error_msg="Request timed out (KV transfer)",
                                 requests=timed_out,
@@ -3500,8 +3500,8 @@ class PyExecutor:
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
         # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
         if self.enable_attention_dp:
-            tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size,
-                                                    small_payload=True)
+            tp_batch_sizes = self.dist.tp_allgather_int64(
+                [scheduled_batch.batch_size])[:, 0].tolist()
             can_queue = 0 not in tp_batch_sizes
             can_queue_this_rank = scheduled_batch.batch_size > 0
         else:
@@ -5715,8 +5715,6 @@ class PyExecutor:
             # can be allowed once its semantics are defined (TRTLLM-14792).
             beam_width_array = sampling_config.beam_width_array
             if beam_width_array:
-                if isinstance(beam_width_array[0], (list, tuple)):
-                    beam_width_array = beam_width_array[0]
                 if any(b < a
                        for a, b in zip(beam_width_array, beam_width_array[1:])):
                     raise ValueError(
@@ -6121,10 +6119,10 @@ class PyExecutor:
              for req in context_requests]) + num_scheduled_generation_requests
         # Note: We use tp_allgather instead of tp_cp_allgather because we want to
         # balance the requests across DP ranks; not CP ranks within those DP ranks.
-        responses_list = self.dist.tp_allgather([
+        responses_list = self.dist.tp_allgather_int64([
             num_scheduled_context_requests, num_scheduled_generation_requests,
             num_scheduled_tokens, num_real_generation_requests
-        ])
+        ]).tolist()
         all_ranks_num_real_generation_requests = [
             response[3] for response in responses_list
         ]

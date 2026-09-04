@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -49,9 +49,10 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
+                           extract_qwen4_exp_ple_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid,
+                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -156,8 +157,12 @@ def get_kv_cache_manager_cls(
                     sparse_attn_config, use_kv_cache_manager_v2=use_v2)
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
+        if sparse_attn_algorithm == "qsa" and not use_v2:
+            raise ValueError(
+                "QSA with hybrid Mamba / linear-attention models requires "
+                "use_kv_cache_manager_v2=True.")
         if (sparse_attn_config is not None
-                and sparse_attn_algorithm != "skip_softmax"):
+                and sparse_attn_algorithm not in ("qsa", "skip_softmax")):
             raise ValueError(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
@@ -291,8 +296,17 @@ def get_kv_cache_manager_cls(
                 "V2 Mamba block reuse is not compatible with "
                 "enable_kv_pool_rebalance because the rebalancer does not "
                 "yet model retained recurrent-state snapshots.")
+        if sparse_attn_algorithm == "qsa":
+            return get_sparse_attn_kv_cache_manager(
+                sparse_attn_config, use_kv_cache_manager_v2=True)
         return MambaHybridCacheManagerV2
     elif sparse_attn_config is not None:
+        if sparse_attn_algorithm == "qsa":
+            # The QSA manager extends the hybrid manager because it must retain
+            # both paged attention data and recurrent GDN state.
+            raise ValueError(
+                "QSA sparse attention currently requires a hybrid Mamba / "
+                "linear-attention model.")
         return get_sparse_attn_kv_cache_manager(sparse_attn_config,
                                                 use_kv_cache_manager_v2=use_v2)
     else:
@@ -522,6 +536,25 @@ def draft_config_defines_attention_layout(
         getattr(draft_pretrained_config, "use_sliding_window", None) is not None
         or getattr(draft_pretrained_config, "sliding_window", None) is not None
         or bool(getattr(draft_pretrained_config, "layer_types", None)))
+
+
+def _expand_attention_window_pattern_to_global_layers(
+    max_attention_window: Optional[Sequence[int]],
+    layer_mask: Sequence[bool],
+) -> Optional[List[int]]:
+    """Expand an enabled-layer pattern into physical global-layer order."""
+    if max_attention_window is None:
+        return None
+
+    pattern = list(max_attention_window)
+    global_windows = [pattern[0]] * len(layer_mask)
+    enabled_layer_offset = 0
+    for layer_idx, enabled in enumerate(layer_mask):
+        if enabled:
+            global_windows[layer_idx] = pattern[enabled_layer_offset %
+                                                len(pattern)]
+            enabled_layer_offset += 1
+    return global_windows
 
 
 def _derive_draft_max_attention_window(
@@ -1563,6 +1596,11 @@ class KvCacheCreator:
             kv_cache_config,
             max_seq_len,
             estimating_kv_cache=estimating_kv_cache)
+        draft_kv_config.max_attention_window = (
+            _expand_attention_window_pattern_to_global_layers(
+                draft_kv_config.max_attention_window,
+                spec_dec_layer_mask,
+            ))
         if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
                 and draft_kv_config.pool_ratio is not None
                 and len(draft_kv_config.pool_ratio) != 1):
@@ -2252,6 +2290,29 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
+def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
+                                    is_draft: bool):
+    """Align target-only PLE state with a target/draft cache layout."""
+    if is_draft:
+        return None
+
+    params = extract_qwen4_exp_ple_cache_params(config)
+    num_target_layers = len(params.ple_layer_mask)
+    if num_target_layers > total_layers:
+        raise ValueError(
+            "PLE layer mask cannot exceed the hybrid cache layout: "
+            f"got {num_target_layers}, expected at most {total_layers}")
+    if num_target_layers == total_layers:
+        return params
+
+    # Unified one-model caches append attention-only MTP layers.
+    return dataclasses.replace(
+        params,
+        ple_layer_mask=params.ple_layer_mask + [False] *
+        (total_layers - num_target_layers),
+    )
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -2654,7 +2715,7 @@ def _create_kv_cache_manager(
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             **mamba_manager_extra_kwargs,
         )
-    elif is_qwen3_hybrid(config):
+    elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -2730,6 +2791,23 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if getattr(sparse_attention_config, "algorithm", None) == "qsa":
+            # Resolve the side-cache shape from the same checkpoint geometry
+            # used to construct the QSA index projection.
+            mamba_manager_extra_kwargs.update(
+                sparse_attention_config=sparse_attention_config,
+                pretrained_config=config,
+            )
+        if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
+                                               MambaHybridCacheManagerV2):
+            ple_cache_params = _get_qwen4_exp_ple_cache_params(
+                config,
+                total_layers=len(mamba_layer_mask),
+                is_draft=is_draft,
+            )
+            if ple_cache_params is not None:
+                mamba_manager_extra_kwargs[
+                    "qwen4_exp_ple_cache_params"] = ple_cache_params
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,

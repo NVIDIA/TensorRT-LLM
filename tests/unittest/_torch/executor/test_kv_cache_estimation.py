@@ -701,6 +701,37 @@ def test_v2_dflash_draft_cost_covers_context_and_generation_slots():
     assert cost == CacheCost(slope=0, intercept=expected_configured_slots * slot_bytes)
 
 
+def test_v2_static_cache_size_preserves_window_pattern_phase_across_pp() -> None:
+    class FakeModelConfig:
+        quant_config = None
+        pretrained_config = SimpleNamespace(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+
+        def get_num_attention_layers(self) -> int:
+            return 5
+
+    mapping = Mock(enable_attention_dp=False, tp_size=1)
+    mapping.pp_layers.return_value = [3]
+
+    cache_cost = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            FakeModelConfig(),
+            mapping,
+            tokens_per_block=64,
+            max_seq_len=256,
+            max_batch_size=1,
+            kv_cache_config=KvCacheConfig(max_attention_window=[128, 256]),
+        )
+    )
+
+    # Global layer 3 selects the full-attention entry, so its 64-byte layer
+    # cost is entirely per-token with no fixed SWA allocation.
+    assert cache_cost == CacheCost(slope=64, intercept=0)
+
+
 def test_creator_uses_v2_affine_cache_cost():
     class FakeV2Manager(KVCacheManagerV2):
         @staticmethod
@@ -724,7 +755,7 @@ def test_v2_quota_from_max_tokens_models_context_swa_scratch():
     manager = object.__new__(KVCacheManagerV2)
     manager._has_cp_helix = False
     manager.num_local_layers = 3
-    manager.pp_layers = [0, 1, 2]
+    manager.pp_layers = [4, 5, 6]
     manager.max_attention_window_vec = [128, 128, None]
     manager.tokens_per_block = 64
     manager.max_batch_size = 4
