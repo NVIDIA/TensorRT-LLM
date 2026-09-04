@@ -25,9 +25,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
-    import sys
-    from pathlib import Path
-
     from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
         Attention2DAttention,
         RingAttention,
@@ -37,9 +34,6 @@ try:
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenJointAttention
     from tensorrt_llm.visual_gen.args import ParallelConfig
-
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -95,6 +89,8 @@ def _run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs) -> No
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
+    from ._visual_gen_dist_utils import spawn_with_retry
+
     spawn_with_retry(
         lambda port: mp.spawn(
             _distributed_worker,
