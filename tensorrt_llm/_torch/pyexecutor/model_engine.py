@@ -2951,10 +2951,6 @@ class PyTorchModelEngine(ModelEngine):
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
 
-                    torch.cuda.synchronize()
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
         # The logits allocations grow with the number of requests and are not
         # part of the captured model body. Warm up the largest request count so
         # those allocations can be reused during stable inference.

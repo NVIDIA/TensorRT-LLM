@@ -1,9 +1,7 @@
-import os
-import sys
 import time
 
 import pytest
-from test_base_worker import create_fake_executor_config
+from test_base_worker import create_fake_llm_args
 
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -12,7 +10,6 @@ from tensorrt_llm.llmapi.utils import logger_debug
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
 from utils.util import similar, skip_single_gpu
 # isort: on
@@ -23,9 +20,8 @@ model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 class TestRpcProxy:
 
     def create_proxy(self, tp_size: int):
-        # Create executor config with the correct tp_size
-        llm_args, executor_config = create_fake_executor_config(model_path,
-                                                                tp_size=tp_size)
+        # Create LLM args with the correct tp_size
+        llm_args = create_fake_llm_args(model_path, tp_size=tp_size)
 
         # Enable KV cache events
         llm_args.kv_cache_config = KvCacheConfig(
@@ -37,7 +33,6 @@ class TestRpcProxy:
         proxy = GenerationExecutorRpcProxy(
             worker_kwargs={
                 "engine": model_path,
-                "executor_config": None,
                 "llm_args": llm_args,
                 "model_world_size": tp_size,
                 "hf_model_dir": model_path,

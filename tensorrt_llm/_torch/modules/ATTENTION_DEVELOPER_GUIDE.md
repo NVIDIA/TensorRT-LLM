@@ -304,9 +304,15 @@ The main differences across backends:
 
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
-`TrtllmAttention` dispatches attention through an ordered list of internal FMHA
-libraries. `TritonCustomMaskFmha` provides Triton context attention for custom
-masks, `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
+Each `TrtllmAttention` owns a per-instance `FmhaManager`. The manager builds
+the ordered list of internal FMHA libraries, performs phase-aware selection,
+and caches request-dependent selections. `update_quant_config()` replaces the
+manager, rebuilding the library list and starting with an empty selection
+cache. `TrtllmAttention` prepares the complete per-forward state, passes itself
+to the manager for selection, and then executes the selected library.
+
+`TritonCustomMaskFmha` provides Triton context attention for custom masks,
+`CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
 `FlashInferSparseMlaFmha` integrates SM120/SM121 sparse MLA kernels for
 DeepSeek-V4 and DSA,
 `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
@@ -320,9 +326,9 @@ use `TLLM_FMHA_LIBS=fallback` or
 to force the fallback
 path. Each FMHA library exposes `is_available()` for module/static environment
 checks and `is_supported()` for per-forward request checks.
-For mixed non-MLA batches, the dispatcher checks each active phase independently
-with `is_supported(..., phase=...)`; a phased library accepts only phases backed
-by its corresponding `run_*()` entry point.
+For mixed non-MLA batches, the manager checks each active phase independently
+with `is_supported(..., phase=...)`; a phased library accepts only phases
+backed by its corresponding `run_*()` entry point.
 
 The `TrtllmAttention` constructor's optional `flashinfer_mla_backend` argument
 explicitly selects the MLA generation kernel inside
@@ -355,6 +361,8 @@ initialization (this covers attention-DP speculative verification).
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
+- `fmha/manager.py` owns per-attention library construction, selection, and
+  selection caching.
 - `fmha/phased.py` defines `PhasedFmha`, shared phase splitting, and the
   context/generation and MHA/MLA entry points.
 - `fmha/combined.py` composes different context and generation implementations
@@ -471,7 +479,8 @@ Working rules:
 | `tensorrt_llm/_torch/modules/mla.py` | MLA module logic, MLA custom ops, and MLA-specific dispatch |
 | `tensorrt_llm/_torch/attention_backend/interface.py` | Backend contract, base metadata, capability hooks |
 | `tensorrt_llm/_torch/attention_backend/utils.py` | Backend and sparse-backend selection |
-| `tensorrt_llm/_torch/attention_backend/trtllm.py` | TRTLLM backend and metadata |
+| `tensorrt_llm/_torch/attention_backend/trtllm.py` | TRTLLM backend execution and metadata |
+| `tensorrt_llm/_torch/attention_backend/fmha/manager.py` | Per-instance FMHA library construction, selection, and caching |
 | `tensorrt_llm/_torch/attention_backend/fmha/` | Internal TRTLLM FMHA libraries |
 | `tensorrt_llm/_torch/attention_backend/vanilla.py` | Torch fallback backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/flashinfer.py` | FlashInfer backend and metadata |
@@ -491,6 +500,8 @@ Key test files:
 
 - `tests/unittest/_torch/attention/test_attention.py`
 - `tests/unittest/_torch/attention/test_attention_mla.py`
+- `tests/unittest/_torch/attention/test_fmha_manager.py`
+- `tests/unittest/_torch/attention/test_combined_fmha.py`
 - `tests/unittest/_torch/attention/test_vanilla_attention.py`
 - `tests/unittest/_torch/attention/test_flashinfer_attention.py`
 - `tests/unittest/_torch/attention/sparse/`

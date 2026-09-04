@@ -29,28 +29,26 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     OutputConfig const& outputConfig, std::optional<SizeType32> const& endId, std::optional<SizeType32> const& padId,
     std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
     std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
-    std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig, std::optional<PromptTuningConfig> pTuningConfig,
-    std::optional<MultimodalInput> multimodalInput, std::optional<Tensor> multimodalEmbedding,
-    std::optional<MropeConfig> mRopeConfig, std::optional<LoraConfig> loraConfig,
-    std::optional<LookaheadDecodingConfig> lookaheadConfig,
+    std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
+    std::optional<Tensor> multimodalEmbedding, std::optional<MropeConfig> mRopeConfig,
+    std::optional<LoraConfig> loraConfig, std::optional<LookaheadDecodingConfig> lookaheadConfig,
     std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig, std::optional<std::string> logitsPostProcessorName,
     std::optional<LogitsPostProcessor> logitslogitsPostProcessor, std::optional<VecTokens> encoderInputTokenIds,
     std::optional<IdType> clientId, bool returnAllGeneratedTokens, float priority, RequestType type,
     std::optional<ContextPhaseParams> contextPhaseParams, std::optional<Tensor> encoderInputFeatures,
     std::optional<SizeType32> encoderOutputLength, std::optional<Tensor> crossAttentionMask,
-    SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig, std::optional<Tensor> skipCrossAttnBlocks,
+    SizeType32 numReturnSequences, std::optional<Tensor> skipCrossAttnBlocks,
     std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
     std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
     std::optional<std::string> cacheSalt)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
         padId, std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
-        std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(multimodalInput),
-        std::move(multimodalEmbedding), std::move(mRopeConfig), std::move(loraConfig), lookaheadConfig,
-        std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName), std::move(logitslogitsPostProcessor),
-        std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, type,
-        std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength, crossAttentionMask,
-        numReturnSequences, eagleConfig, skipCrossAttnBlocks, std::move(guidedDecodingParams), languageAdapterUid,
-        allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
+        std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
+        std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
+        std::move(logitslogitsPostProcessor), std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens,
+        priority, type, std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
+        crossAttentionMask, numReturnSequences, skipCrossAttnBlocks, std::move(guidedDecodingParams),
+        languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
 {
 }
 
@@ -132,11 +130,6 @@ std::optional<std::list<VecTokens>> Request::getStopWords() const
 std::optional<Tensor> Request::getEmbeddingBias() const
 {
     return mImpl->getEmbeddingBias();
-}
-
-std::optional<ExternalDraftTokensConfig> Request::getExternalDraftTokensConfig() const
-{
-    return mImpl->getExternalDraftTokensConfig();
 }
 
 std::optional<PromptTuningConfig> Request::getPromptTuningConfig() const
@@ -234,11 +227,6 @@ std::optional<Tensor> Request::getCrossAttentionMask() const
     return mImpl->getCrossAttentionMask();
 }
 
-std::optional<EagleConfig> Request::getEagleConfig() const
-{
-    return mImpl->getEagleConfig();
-}
-
 std::optional<Tensor> Request::getSkipCrossAttnBlocks() const
 {
     return mImpl->getSkipCrossAttnBlocks();
@@ -307,11 +295,6 @@ void Request::setStopWords(std::list<VecTokens> const& stopWords)
 void Request::setEmbeddingBias(Tensor const& embeddingBias)
 {
     mImpl->setEmbeddingBias(embeddingBias);
-}
-
-void Request::setExternalDraftTokensConfig(ExternalDraftTokensConfig const& specDecodingConfig)
-{
-    mImpl->setExternalDraftTokensConfig(specDecodingConfig);
 }
 
 void Request::setPromptTuningConfig(PromptTuningConfig const& pTuningConfig)
@@ -402,11 +385,6 @@ void Request::setEncoderOutputLength(SizeType32 encoderOutputLength)
 void Request::setCrossAttentionMask(Tensor crossAttentionMask)
 {
     mImpl->setCrossAttentionMask(crossAttentionMask);
-}
-
-void Request::setEagleConfig(std::optional<EagleConfig> const& eagleConfig)
-{
-    mImpl->setEagleConfig(eagleConfig);
 }
 
 void Request::setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks)
