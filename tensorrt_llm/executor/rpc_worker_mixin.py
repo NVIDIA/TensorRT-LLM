@@ -88,8 +88,16 @@ class RpcWorkerMixin:
 
         all_responses = []
         for _ in range(qsize):
-            # The queue contains batches of responses, so extend the list
-            all_responses.extend(self._response_queue.get())
+            # The queue normally contains batches of responses, but the
+            # classic _send_rsp path (exercised when postprocess workers are
+            # enabled) legitimately enqueues bare responses; extend() on a
+            # bare LlmResponse raises "'LlmResponse' object is not iterable".
+            # Tolerate both shapes.
+            item = self._response_queue.get()
+            if isinstance(item, list):
+                all_responses.extend(item)
+            else:
+                all_responses.append(item)
         return all_responses
 
     async def fetch_responses_async(self, timeout: Optional[float] = None) -> list:
