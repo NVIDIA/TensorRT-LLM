@@ -299,6 +299,7 @@ def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
         openai_completion=AsyncMock(),
         openai_chat_completion=AsyncMock(),
         anthropic_count_tokens=AsyncMock(),
+        openai_responses=AsyncMock(),
     )
     disagg._perf_metrics_collector = SimpleNamespace(get_perf_metrics=AsyncMock())
     disagg._disagg_cluster_storage = None
@@ -319,6 +320,14 @@ def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
     for server in (standard, disagg):
         paths = {route.path for route in server.app.routes}
         assert "/v1/messages/count_tokens" in paths
+
+    # The disaggregated server reached parity with the aggregated one on these
+    # two only recently, and both were client-visible outages: Responses-API
+    # clients got a 404 on /v1/responses, and any client doing model discovery
+    # got one on /v1/models and had to be told the model name out of band.
+    disagg_paths = {route.path for route in disagg.app.routes}
+    assert "/v1/responses" in disagg_paths
+    assert "/v1/models" in disagg_paths
 
 
 def _batch_client(runner=None):
