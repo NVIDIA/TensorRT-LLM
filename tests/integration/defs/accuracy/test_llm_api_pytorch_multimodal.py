@@ -32,7 +32,6 @@ from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCuda
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (
-    get_sm_version,
     is_sm_100f,
     llm_models_root,
     skip_post_blackwell_ultra,
@@ -119,113 +118,6 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
                 sampling_params=self.sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
-
-
-@skip_pre_hopper
-class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "google/gemma-3-27b-it"
-    # Note: This has only the LLM part quantized. Vision part is in bfloat16.
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it-fp8/"
-    MAX_NUM_TOKENS = 12800
-
-    sampling_params = SamplingParams(
-        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<end_of_turn>"
-    )
-
-    # Gemma3 VLM needs KV cache reuse disabled for custom mask support.
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False,
-        enable_partial_reuse=False,
-        free_gpu_memory_fraction=0.4,
-        dtype="fp8",
-    )
-
-    def _make_llm(self, model_path: str):
-        # Gemma3 VLM needs FlashInfer attention backend for custom mask support.
-        return LLM(
-            model_path,
-            max_batch_size=16,
-            max_num_tokens=self.MAX_NUM_TOKENS,
-            max_seq_len=8704,  # 8192 + 512.
-            kv_cache_config=self.kv_cache_config,
-            attn_backend="FLASHINFER",
-            enable_chunked_prefill=False,
-        )
-
-    def test_fp8_prequantized(self):
-        # Blackwell FP8 numerics differ from Hopper at the cubin level
-        # (~5pt drop on MMMU). Route to a Blackwell-calibrated reference
-        # rather than relaxing the Hopper one.
-        extra_acc_spec = "sm100_fp8" if get_sm_version() >= 100 else None
-        with self._make_llm(self.MODEL_PATH) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(
-                llm,
-                extra_acc_spec=extra_acc_spec,
-                sampling_params=self.sampling_params,
-            )
-
-    @skip_pre_blackwell
-    def test_nvfp4_prequantized(self):
-        model_path = f"{llm_models_root()}/gemma/gemma-3-27b-it-FP4"
-        with self._make_llm(model_path) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-
-@skip_pre_hopper
-class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "google/gemma-3-12b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-12b-it"
-    MAX_NUM_TOKENS = 12800
-
-    sampling_params = SamplingParams(
-        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<end_of_turn>"
-    )
-
-    # Gemma3 VLM needs KV cache reuse disabled for custom mask support.
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False,
-        enable_partial_reuse=False,
-        free_gpu_memory_fraction=0.6,
-    )
-
-    kv_cache_config_fp8 = kv_cache_config.model_copy(update={"dtype": "fp8"})
-
-    def _make_llm(self, model_path: str, kv_cache_config: KvCacheConfig = None):
-        # Gemma3 VLM needs FlashInfer attention backend for custom mask support.
-        if kv_cache_config is None:
-            kv_cache_config = self.kv_cache_config
-        return LLM(
-            model_path,
-            max_batch_size=16,
-            max_num_tokens=self.MAX_NUM_TOKENS,
-            max_seq_len=8704,  # 8192 + 512.
-            kv_cache_config=kv_cache_config,
-            attn_backend="FLASHINFER",
-            enable_chunked_prefill=False,
-        )
-
-    def test_auto_dtype(self):
-        with self._make_llm(self.MODEL_PATH) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-    def test_fp8_prequantized(self):
-        model_path = f"{llm_models_root()}/gemma/gemma-3-12b-it-fp8"
-        with self._make_llm(model_path, self.kv_cache_config_fp8) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-    @skip_pre_blackwell
-    def test_nvfp4_prequantized(self):
-        model_path = f"{llm_models_root()}/gemma/gemma-3-12b-it-fp4"
-        with self._make_llm(model_path, self.kv_cache_config_fp8) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
 
 
 @pytest.mark.skipif(

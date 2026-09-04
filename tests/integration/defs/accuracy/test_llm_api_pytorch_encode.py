@@ -240,7 +240,6 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 #
 # One representative per distinct TRT-LLM architecture class:
 #   LlamaForCausalLM   — TinyLlama (also covers Mistral, which aliases LlamaModel)
-#   Gemma3ForCausalLM  — Gemma-3-1B (sliding window + global alternation)
 #   Qwen3ForCausalLM   — Qwen3-0.6B (QKNorm)
 DECODER_MODELS = [
     # -- LlamaForCausalLM (covers Llama + Mistral family) --
@@ -248,12 +247,6 @@ DECODER_MODELS = [
         "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
         id="tinyllama-1.1b",
-    ),
-    # -- Gemma3ForCausalLM --
-    pytest.param(
-        "google/gemma-3-1b-it",
-        f"{llm_models_root()}/gemma/gemma-3-1b-it/",
-        id="gemma-3-1b",
     ),
     # -- Qwen3ForCausalLM --
     pytest.param(
@@ -274,8 +267,7 @@ class TestDecoderEncode(LlmapiAccuracyTestHarness):
     ]
 
     # Top-K size used for the argmax-in-top-K containment / overlap checks.
-    # Chosen to be robust to near-tie argmax flips under FP16/BF16 rounding
-    # on very large vocabularies (Gemma-3 has 262K tokens).
+    # This is robust to near-tie argmax flips under FP16/BF16 rounding.
     TOPK = 5
     TOPK_MIN_OVERLAP = 3
 

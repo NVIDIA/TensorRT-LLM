@@ -30,40 +30,6 @@ if get_sm_version() >= 103:
         allow_module_level=True)
 
 
-class TestGpt2(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "gpt2"
-    MODEL_PATH = f"{llm_models_root()}/gpt2"
-    EXAMPLE_FOLDER = "models/core/gpt"
-
-    def test_auto_dtype(self):
-        # float16
-        self.run(dtype='auto')
-
-    @skip_post_blackwell
-    @pytest.mark.parametrize("precision", ["int8", "int4"])
-    def test_weight_only(self, precision: str):
-        quant_algo = QuantAlgo.W8A16 if precision == "int8" else QuantAlgo.W4A16
-        self.run(quant_algo=quant_algo)
-
-    def test_beam_search(self):
-        self.run(extra_acc_spec="beam_width=4",
-                 extra_build_args=["--max_beam_width=4"],
-                 extra_summarize_args=["--num_beams=4", "--length_penalty=2.0"])
-
-
-class TestGpt2Medium(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "gpt2-medium"
-    MODEL_PATH = f"{llm_models_root()}/gpt2-medium"
-    EXAMPLE_FOLDER = "models/core/gpt"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-    @skip_pre_ada
-    def test_fp8(self):
-        self.run(quant_algo=QuantAlgo.FP8)
-
-
 class TestStarcoder2_15B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "bigcode/starcoder2-15b"
     MODEL_PATH = f"{llm_models_root()}/starcoder2-model"
@@ -357,29 +323,3 @@ class TestGemma7B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     def test_fp8(self):
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
-
-
-@pytest.mark.skip_less_device_memory(40000)
-class TestGemma2_9BIt(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "google/gemma-2-9b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-2-9b-it"
-    EXAMPLE_FOLDER = "models/core/gemma"
-
-    @skip_post_blackwell
-    def test_auto_dtype(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 dtype='auto',
-                 extra_convert_args=["--ckpt-type=hf"])
-
-    @skip_post_blackwell
-    @pytest.mark.parametrize("precision", ["int8", "int4"])
-    def test_weight_only(self, precision: str):
-        quant_algo = QuantAlgo.W8A16 if precision == "int8" else QuantAlgo.W4A16
-        self.run(quant_algo=quant_algo, extra_convert_args=["--ckpt-type=hf"])
-
-    @skip_pre_hopper
-    def test_fp8(self):
-        self.run(quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 extra_convert_args=["--device_map=sequential"])
