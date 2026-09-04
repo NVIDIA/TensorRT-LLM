@@ -232,10 +232,15 @@ class AutoPipeline:
             return None
 
         if "transformer" in config and ("vae" in config or "audio_vae" in config):
+            # Imported here because pipeline_ltx23 imports register_pipeline from
+            # this module at import time.
+            from .models.ltx23.pipeline_ltx23 import detect_native_ltx_pipeline
+
+            detected = detect_native_ltx_pipeline(config)
             logger.info(
-                "AutoPipeline: Detected LTX-2 native checkpoint "
+                f"AutoPipeline: Detected {detected} native checkpoint "
                 f"(safetensors metadata) at {checkpoint_dir}"
             )
-            return "LTX2Pipeline"
+            return detected
 
         return None

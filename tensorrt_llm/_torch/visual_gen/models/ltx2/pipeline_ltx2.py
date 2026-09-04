@@ -626,6 +626,8 @@ class LTX2Pipeline(BasePipeline):
     ``transformers`` library.
     """
 
+    _cuda_graph_runner_cls = _LTX2CUDAGraphRunner
+
     def __init__(self, model_config):
         _sa_cfg = model_config.attention.sparse_attention_config
         if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
@@ -833,7 +835,7 @@ class LTX2Pipeline(BasePipeline):
         if not self.pipeline_config.cuda_graph.enable:
             return
 
-        runner = _LTX2CUDAGraphRunner(
+        runner = self._cuda_graph_runner_cls(
             CUDAGraphRunnerConfig(use_cuda_graph=True),
         )
         self.transformer.register_cuda_graph_extra_key_fns(runner)

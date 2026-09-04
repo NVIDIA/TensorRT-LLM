@@ -291,6 +291,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  - unittest/_torch/visual_gen/test_ltx23_transformer.py
+  - unittest/_torch/visual_gen/test_ltx23_pipeline.py
   - unittest/_torch/visual_gen/test_wan21_i2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan21_t2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py
@@ -322,6 +324,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_example[bf16]
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_example[fp8]
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_example
@@ -450,6 +454,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-nvfp4]
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-cuda-graph]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_video_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_audio_against_golden
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_lpips_matches_eager
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend
   - examples/visual_gen/test_visual_gen_wan.py::test_wan21_t2v_lpips_against_golden
