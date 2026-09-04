@@ -23,7 +23,7 @@
 
 void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager& kvCacheManager,
     RequestVector& contextRequests, RequestVector const& generationRequests,
-    [[maybe_unused]] runtime::ModelConfig const& modelConfig, OptionalRef<BaseKVCacheManager> crossKvCacheManager) const
+    OptionalRef<BaseKVCacheManager> crossKvCacheManager) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(allocateKvCache);
