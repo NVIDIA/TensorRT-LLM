@@ -58,6 +58,7 @@ from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
+from ..model_config import ModelConfig
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
                                                 _build_request_multimodal_input)
@@ -116,6 +117,24 @@ def _get_context_prompt_lookahead_token(request: LlmRequest,
 def resolve_mamba_metadata_cls(model: torch.nn.Module) -> Type[Mamba2Metadata]:
     """Resolve the model-specific Mamba metadata class with a default."""
     return getattr(model, 'mamba_metadata_cls', None) or Mamba2Metadata
+
+
+def _get_num_heads_per_kv(model_config: ModelConfig) -> int:
+    """Return the largest GQA ratio required by the model's attention layers."""
+    config = model_config.pretrained_config
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    layer_specs = model_config.kv_cache_layer_specs
+    if layer_specs:
+        num_key_value_heads = [spec.num_kv_heads for spec in layer_specs]
+    else:
+        num_key_value_heads = getattr(config, "num_key_value_heads", None)
+
+    if isinstance(num_key_value_heads, (list, tuple)):
+        num_key_value_heads = min(
+            (kv for kv in num_key_value_heads if kv and kv > 0), default=0)
+    if num_attention_heads and num_key_value_heads:
+        return num_attention_heads // num_key_value_heads
+    return 1
 
 
 def _make_single_token_context_graph_batch(
@@ -3463,22 +3482,8 @@ class PyTorchModelEngine(ModelEngine):
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
         cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
-        num_attention_heads = getattr(self.model.model_config.pretrained_config,
-                                      'num_attention_heads', None)
         config = self.model.model_config.pretrained_config
-
-        num_attention_heads = getattr(config, 'num_attention_heads', None)
-        num_key_value_heads = getattr(config, 'num_key_value_heads', None)
-
-        # Calculate the number of attention heads per KV head (GQA ratio)
-        if isinstance(num_key_value_heads, (list, tuple)):
-            # Filter out invalid KV heads, default to 0 if no valid KV heads are found
-            num_key_value_heads = min(
-                (kv for kv in num_key_value_heads if kv and kv > 0), default=0)
-        if num_attention_heads and num_key_value_heads:
-            num_heads_per_kv = num_attention_heads // num_key_value_heads
-        else:
-            num_heads_per_kv = 1
+        num_heads_per_kv = _get_num_heads_per_kv(self.model.model_config)
 
         metadata_cls = self.attn_backend.Metadata
         sparse_metadata_params = (

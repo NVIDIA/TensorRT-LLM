@@ -407,34 +407,50 @@ def _get_static_cache_size_layer_components(
     kv_cache_config: Optional[KvCacheConfig] = None,
 ) -> tuple[List[int], List[Optional[int]]]:
     config = model_config.pretrained_config
-
-    num_key_value_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-    if isinstance(num_key_value_heads, Iterable):
-        num_key_value_heads = sum(num_key_value_heads) / len(num_key_value_heads)
+    layer_specs = getattr(model_config, "kv_cache_layer_specs", None)
 
     mla = hasattr(config, "kv_lora_rank") and config.kv_lora_rank is not None
     if mla:
-        head_dim = config.kv_lora_rank + config.qk_rope_head_dim
-        kv_factor = 1
+        cache_sizes_per_token = [config.kv_lora_rank + config.qk_rope_head_dim]
+        layer_indices = None
+    elif layer_specs:
+        if num_layers is None:
+            layer_indices = mapping.pp_layers(model_config.get_num_attention_layers())
+        else:
+            layer_indices = list(range(max(num_layers, 1)))
+        if not layer_indices:
+            layer_indices = [0]
+
+        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        cache_sizes_per_token = []
+        for layer_idx in layer_indices:
+            layer_spec = layer_specs[layer_idx % len(layer_specs)]
+            num_kv_heads = layer_spec.num_kv_heads
+            num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
+            cache_sizes_per_token.append(2 * layer_spec.head_dim * num_kv_heads)
     else:
+        num_key_value_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+        if isinstance(num_key_value_heads, Iterable):
+            num_key_value_heads = sum(num_key_value_heads) / len(num_key_value_heads)
         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
         head_dim = getattr(config, "head_dim", None)
         if not isinstance(head_dim, int):
             head_dim = config.hidden_size // config.num_attention_heads
         head_dim = head_dim * num_key_value_heads // tp_size
-        kv_factor = 2
+        cache_sizes_per_token = [2 * head_dim]
+        layer_indices = None
 
-    cache_size_per_token = kv_factor * head_dim
     quant_config = model_config.quant_config
-    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
-        layer_size = cache_size_per_token
-    elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache():
-        layer_size = math.ceil(cache_size_per_token / 2) + math.ceil(cache_size_per_token / 16)
-    else:
+
+    def get_layer_size(cache_size_per_token: int) -> int:
+        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
+            return cache_size_per_token
+        if quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache():
+            return math.ceil(cache_size_per_token / 2) + math.ceil(cache_size_per_token / 16)
         assert quant_config is None or (not quant_config.quant_mode.has_kv_cache_quant()), (
             "Quantized kv cache is not expected"
         )
-        layer_size = cache_size_per_token * 2
+        return cache_size_per_token * 2
 
     if num_layers is None:
         total_attention_layers = model_config.get_num_attention_layers()
@@ -442,8 +458,18 @@ def _get_static_cache_size_layer_components(
     else:
         local_layer_ids = list(range(max(num_layers, 1)))
     num_attention_layers = len(local_layer_ids)
-    layer_sizes = [layer_size] * num_attention_layers
+    if len(cache_sizes_per_token) == 1:
+        layer_sizes = [get_layer_size(cache_sizes_per_token[0])] * num_attention_layers
+    else:
+        layer_sizes = [get_layer_size(size) for size in cache_sizes_per_token]
+        assert len(layer_sizes) == num_attention_layers
     window_pattern = kv_cache_config.max_attention_window if kv_cache_config is not None else None
+    if (
+        window_pattern is None
+        and layer_specs
+        and any(spec.attention_window is not None for spec in layer_specs)
+    ):
+        window_pattern = [spec.attention_window for spec in layer_specs]
 
     # Static estimation accepts an unknown max_seq_len and treats recurrent-state
     # sentinels as full-attention cost. Runtime resolution must preserve those

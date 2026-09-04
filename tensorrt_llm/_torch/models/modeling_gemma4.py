@@ -17,7 +17,18 @@
 import copy
 import dataclasses
 import math
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Literal,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import torch
 import torch.nn.functional as F
@@ -50,7 +61,7 @@ from ..attention_backend.interface import (
 )
 from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..model_config import ModelConfig
+from ..model_config import KVCacheLayerSpec, ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
@@ -86,6 +97,79 @@ if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
     )
 
 from transformers import Gemma4TextConfig  # noqa: E402
+
+
+class _NamedLayerType(Protocol):
+    name: str
+
+
+_LayerType = Union[str, _NamedLayerType]
+
+
+class _Gemma4LayerGeometry(Protocol):
+    head_dim: int
+    num_key_value_heads: int
+
+
+def _is_gemma4_sliding_layer(layer_type: _LayerType) -> bool:
+    """Return whether a Gemma4 layer type denotes sliding attention."""
+    layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
+    return "sliding" in layer_type_name
+
+
+def _get_gemma4_per_layer_config(
+    config: Gemma4TextConfig,
+    layer_idx: int,
+) -> Optional[_Gemma4LayerGeometry]:
+    """Return concrete layer geometry when Transformers provides it."""
+    per_layer_config = getattr(config, "per_layer_config", None)
+    if per_layer_config is None:
+        return None
+    return cast(Sequence[_Gemma4LayerGeometry], per_layer_config)[layer_idx]
+
+
+def _get_gemma4_layer_head_dim(config: Gemma4TextConfig, layer_idx: int) -> int:
+    """Resolve one layer's head dimension across Gemma4 config schemas."""
+    layer_config = _get_gemma4_per_layer_config(config, layer_idx)
+    if layer_config is not None:
+        return layer_config.head_dim
+
+    head_dim = config.head_dim
+    if _is_gemma4_sliding_layer(config.layer_types[layer_idx]):
+        return head_dim
+    global_head_dim = getattr(config, "global_head_dim", None)
+    return global_head_dim if global_head_dim is not None else head_dim
+
+
+def _get_gemma4_layer_num_kv_heads(config: Gemma4TextConfig, layer_idx: int) -> int:
+    """Resolve one layer's KV-head count across Gemma4 config schemas."""
+    layer_config = _get_gemma4_per_layer_config(config, layer_idx)
+    if layer_config is not None:
+        return layer_config.num_key_value_heads
+
+    num_kv_heads = config.num_key_value_heads
+    is_sliding = _is_gemma4_sliding_layer(config.layer_types[layer_idx])
+    if not is_sliding and getattr(config, "attention_k_eq_v", False):
+        return getattr(config, "num_global_key_value_heads", None) or num_kv_heads
+    return num_kv_heads
+
+
+def _get_gemma4_kv_cache_layer_specs(config: Gemma4TextConfig) -> list[KVCacheLayerSpec]:
+    """Translate Gemma4 config schemas into model-agnostic KV geometry."""
+    sliding_window = getattr(config, "sliding_window", None)
+    return [
+        KVCacheLayerSpec(
+            head_dim=_get_gemma4_layer_head_dim(config, layer_idx),
+            num_kv_heads=_get_gemma4_layer_num_kv_heads(config, layer_idx),
+            attention_window=(
+                int(sliding_window)
+                if sliding_window is not None
+                and _is_gemma4_sliding_layer(config.layer_types[layer_idx])
+                else None
+            ),
+        )
+        for layer_idx in range(config.num_hidden_layers)
+    ]
 
 
 def _gemma4_rope_max_positions(model_config: ModelConfig) -> int:
@@ -227,6 +311,25 @@ class Gemma4Attention(QKNormRoPEAttention):
         self.is_sliding = is_sliding
         self.is_kv_shared = is_kv_shared
         config = model_config.pretrained_config
+        geometry_layer_idx = layer_idx
+        if geometry_layer_idx is None:
+            if getattr(config, "per_layer_attributes", None):
+                raise ValueError(
+                    "Gemma4Attention requires layer_idx with a heterogeneous Transformers config."
+                )
+            geometry_layer_idx = next(
+                (
+                    idx
+                    for idx, layer_type in enumerate(config.layer_types)
+                    if (layer_type == "sliding_attention") == is_sliding
+                ),
+                None,
+            )
+            if geometry_layer_idx is None:
+                raise ValueError(
+                    "Gemma4Attention could not infer layer_idx: no layer type "
+                    f"matches is_sliding={is_sliding}."
+                )
 
         # Native TRTLLM's SM100 FP8-KV path consumes BF16 Q/K/V and quantizes
         # while appending to the cache. Keep RoPE at the model layer so the
@@ -239,22 +342,12 @@ class Gemma4Attention(QKNormRoPEAttention):
             and is_sm_100f()
         )
 
-        # Per-layer head_dim and kv heads
-        # Note: num_global_key_value_heads is only used when K=V (alternative
-        # attention). For non-K=V full layers, use regular num_key_value_heads.
+        # Transformers 5.14+ exposes heterogeneous geometry only through
+        # per_layer_config, while older versions keep flat global fields.
+        # Resolve both schemas without enabling ambiguous global access.
         use_k_eq_v = getattr(config, "attention_k_eq_v", False) and not is_sliding
-        if is_sliding:
-            layer_head_dim = config.head_dim
-            layer_num_kv_heads = config.num_key_value_heads
-        else:
-            layer_head_dim = getattr(config, "global_head_dim", config.head_dim)
-            if use_k_eq_v:
-                layer_num_kv_heads = (
-                    getattr(config, "num_global_key_value_heads", None)
-                    or config.num_key_value_heads
-                )
-            else:
-                layer_num_kv_heads = config.num_key_value_heads
+        layer_head_dim = _get_gemma4_layer_head_dim(config, geometry_layer_idx)
+        layer_num_kv_heads = _get_gemma4_layer_num_kv_heads(config, geometry_layer_idx)
 
         # Build RoPE params per layer type
         rope_params = RopeParams()
@@ -297,11 +390,6 @@ class Gemma4Attention(QKNormRoPEAttention):
 
         self.use_k_eq_v = use_k_eq_v
 
-        # Temporarily override config.head_dim so the Attention base class
-        # picks up the correct per-layer head_dim.
-        original_head_dim = config.head_dim
-        config.head_dim = layer_head_dim
-
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -315,15 +403,13 @@ class Gemma4Attention(QKNormRoPEAttention):
             dense_bias=False,
             config=model_config,
             q_scaling=q_scaling,
+            head_dim=layer_head_dim,
             # Full-attention layers use proportional RoPE whose active
             # frequencies are paired across the full head. Apply it at the
             # module layer because fused preprocessing cannot represent that
             # pairing with only the logical rotary dimension.
             rope_fusion=is_sliding and not self._use_trtllm_fused_qkv_prep,
         )
-
-        # Restore original config head_dim
-        config.head_dim = original_head_dim
 
         # Fix proportional RoPE for full-attention layers.
         #
@@ -1073,6 +1159,9 @@ class Gemma4DecoderLayer(DecoderLayer):
 # ---------------------------------------------------------------------------
 class Gemma4TextModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Gemma4TextConfig]):
+        model_config.set_kv_cache_layer_specs(
+            _get_gemma4_kv_cache_layer_specs(model_config.pretrained_config)
+        )
         super().__init__(model_config)
         config = self.model_config
         pretrained = config.pretrained_config
@@ -1300,9 +1389,10 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults.
 
-        The TRTLLM attention backend uses trtllm-gen for the regular attention
-        phases and a Triton context phase for bidirectional multimodal masks.
-        External shared-KV MTP still requires FlashInfer attention metadata.
+        Preserve the existing TRTLLM default on datacenter Blackwell. Other
+        architectures use FlashInfer FA2 because the native MMHA backend does
+        not support Gemma4's 512-wide heads. External shared-KV MTP also
+        requires FlashInfer attention metadata.
         """
         speculative_config = getattr(llm_args, "speculative_config", None)
         spec_dec_mode = getattr(speculative_config, "spec_dec_mode", None)
@@ -1310,7 +1400,9 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             spec_dec_mode is not None and spec_dec_mode.is_mtp_eagle_one_model()
         )
         return {
-            "attn_backend": "FLASHINFER" if uses_external_shared_kv else "TRTLLM",
+            "attn_backend": (
+                "FLASHINFER" if uses_external_shared_kv or not is_sm_100f() else "TRTLLM"
+            ),
         }
 
     @classmethod
