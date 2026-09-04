@@ -140,6 +140,35 @@ def checkout(repo: str | Path, name: str) -> None:
     _git(repo, "checkout", name)
 
 
+def create_worktree(
+    repo: str | Path,
+    path: str | Path,
+    branch: str,
+    base_commit: str,
+) -> None:
+    """Create ``branch`` at ``base_commit`` in a new linked worktree."""
+    worktree = Path(path)
+    if not _CLUSTER_SSH:
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", "-b", branch, str(worktree), base_commit)
+
+
+def remove_worktree(repo: str | Path, path: str | Path) -> None:
+    """Remove a managed linked worktree after its useful state is integrated."""
+    _git(repo, "worktree", "remove", "--force", str(path))
+
+
+def reset_to(repo: str | Path, commit: str) -> None:
+    """Reset a worker branch and its files to the frozen item base."""
+    _git(repo, "reset", "--hard", commit)
+    _git(repo, "clean", "-fd")
+
+
+def fast_forward(repo: str | Path, branch: str) -> None:
+    """Fast-forward the currently checked-out campaign branch."""
+    _git(repo, "merge", "--ff-only", branch)
+
+
 def commit_all(repo: str | Path, message: str) -> str:
     """Stage every change (``add -A``) and commit; return the new HEAD.
 
@@ -156,6 +185,11 @@ def commit_all(repo: str | Path, message: str) -> str:
     _git(repo, "add", "-A")
     _git(repo, "commit", "--no-verify", "-m", message)
     return rev_parse_head(repo)
+
+
+def format_patch(repo: str | Path, base_commit: str, result_commit: str = "HEAD") -> str:
+    """Return one binary-safe textual patch for ``base..result``."""
+    return _git(repo, "diff", "--binary", f"{base_commit}..{result_commit}")
 
 
 def discard_uncommitted(repo: str | Path) -> None:

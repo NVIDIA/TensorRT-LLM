@@ -6,10 +6,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "anyio>=4.0",
+    "fsspec>=2026.7.0",
     "pyyaml>=6.0",
     "rich>=13.0",
     "claude-agent-sdk==0.2.143",
     "openai-codex==0.147.0",
+    "sshfs>=2026.8.0",
 ]
 
 [project.optional-dependencies]
