@@ -231,6 +231,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     msa_kv_indices: Optional[torch.Tensor] = None
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
+    # Layer whose K/V/index-K caches were already written this step by the
+    # fused scatter (msa_write_layer_caches); run_msa_paged_gqa consumes and
+    # clears it so the legacy per-cache writes are skipped exactly once.
+    _msa_prewritten_layer: Optional[int] = None
 
     # _msa_buffers_ready gates the once-only device buffers;
     # _msa_fields_ready marks that the current step's buffers are populated.
@@ -660,6 +664,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         buffers. The transient builder tensors are discarded.
         """
         self._msa_fields_ready = False
+        # Drop any prewritten marker a failed prior step left unconsumed, so
+        # it can never suppress a later step's cache write.
+        self._msa_prewritten_layer = None
         if not self._msa_buffers_ready:
             return
         request_ids = self.request_ids
@@ -732,6 +739,53 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             idx_k.reshape(num_tokens, 1, sparse_index_dim),
             layout="HND",
         )
+
+    def msa_write_layer_caches(
+        self,
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_k: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Write a layer's new-token K, V, and (sparse layers) index-K.
+
+        One fused kernel launch when the source/cache layouts allow it, else
+        the legacy per-cache writes. Runs before the indexer's proxy pass
+        reads the index-K cache; the layer is recorded in
+        _msa_prewritten_layer so run_msa_paged_gqa skips its own K/V write.
+        Requires prepared metadata (msa_out_cache_loc filled), the same
+        contract as the writes it replaces.
+        """
+        from .msa_scatter import fused_write_layer_caches
+
+        buffers = self.kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+        k_view, v_view = buffers[:, 0], buffers[:, 1]
+        idx_cache = self.msa_idx_k_cache(layer_idx) if idx_k is not None else None
+        num_tokens = int(k.shape[0])
+        out_cache_loc = self.msa_out_cache_loc[:num_tokens]
+        if not fused_write_layer_caches(k_view, v_view, idx_cache, out_cache_loc, k, v, idx_k):
+            num_kv_heads = int(k_view.shape[1])
+            head_dim = int(k_view.shape[3])
+            write_kv_slots(
+                k_view,
+                out_cache_loc,
+                k.reshape(num_tokens, num_kv_heads, head_dim),
+                layout="HND",
+            )
+            write_kv_slots(
+                v_view,
+                out_cache_loc,
+                v.reshape(num_tokens, num_kv_heads, head_dim),
+                layout="HND",
+            )
+            if idx_k is not None:
+                write_kv_slots(
+                    idx_cache,
+                    out_cache_loc,
+                    idx_k.reshape(num_tokens, 1, int(idx_cache.shape[-1])),
+                    layout="HND",
+                )
+        self._msa_prewritten_layer = layer_idx
 
     def msa_proxy_max_score_view(
         self, num_index_heads: int, plan_max_k_tiles: int, num_tokens: int
@@ -827,13 +881,16 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         metadata,
         *,
         idx_sm_scale: Optional[float] = None,
+        idx_k_prewritten: bool = False,
     ) -> torch.Tensor:
         """Write the index-K cache and return the selected block indices.
 
         The model layer runs this before forward and threads the result through
         forward_args.sparse_backend_args. Returns [total_q, num_kv_heads, topk].
         Decode uses the prebuilt graph-safe proxy plan; prefill and mixed
-        batches use the prebuilt eager proxy plan.
+        batches use the prebuilt eager proxy plan. `idx_k_prewritten` marks
+        that the fused per-layer cache write (msa_write_layer_caches) already
+        stored this layer's index-K.
         """
         config = self.m3_config
         idx_sm_scale = idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
@@ -866,13 +923,18 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                     "The MiniMax-M3 BF16 indexer requires BF16 index-Q and a live "
                     f"BF16 index-K tensor; got Q={idx_q_view.dtype}, K={live_k_dtype}."
                 )
-            idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
-            metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
+            # The fused per-layer write (msa_write_layer_caches, signalled by
+            # idx_k_prewritten) may already have stored this live bf16 index-K
+            # ahead of the proxy pass; write it here only when it did not.
+            if not idx_k_prewritten:
+                idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
+                metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
         # The FP8 indexer mirrors vLLM's unscaled E4M3 contract: normalized
         # index Q/K are cast directly and the proxy accumulates their QK scores
         # in FP32. Block ordering is invariant to the omitted positive scale.
         # The fused production path arrives here with E4M3 Q and an already
-        # populated cache; the BF16 path writes its live K above.
+        # populated cache; the BF16 path writes its live K above unless the
+        # fused per-layer write already did.
 
         # One selection path. Decode passes the graph-safe proxy plan plus the
         # proxy scratch shaped to the live query count. Prefill and mixed batches
