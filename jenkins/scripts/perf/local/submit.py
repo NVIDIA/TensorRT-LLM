@@ -49,30 +49,6 @@ DISAGG_CONFIG_FOLDER = os.environ.get(
     "DISAGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/disaggregated"
 )
 
-# Optional instrumentation segments that may follow the benchmark mode in a test
-# id. Keep in sync with test_perf_sanity.py:TEST_ID_MODIFIERS -- the grammar is
-# only decidable because no config file stem starts with one of these.
-TIME_BREAKDOWN_MODIFIER = "time_breakdown"
-TEST_ID_MODIFIERS = (TIME_BREAKDOWN_MODIFIER,)
-
-# Benchmark modes test_perf_sanity.py actually mints a time_breakdown test id
-# for. gen_only is deliberately absent: its regression metric is the gen-worker
-# device step time, so the lifecycle spans add nothing there, and the collector
-# generates no such id. Keep in sync with the two *_TIME_BREAKDOWN_CONFIGS loops
-# in test_perf_sanity.py:get_disagg_test_cases.
-TIME_BREAKDOWN_BENCHMARK_MODES = ("e2e", "ctx_only")
-
-
-def format_test_label(benchmark_mode: str, time_breakdown: bool = False) -> str:
-    """Compose the mode segment(s) of a test id.
-
-    Mirrors test_perf_sanity.py:format_test_label so the regenerated id matches
-    the collected one.
-    """
-    if time_breakdown:
-        return f"{benchmark_mode}-{TIME_BREAKDOWN_MODIFIER}"
-    return benchmark_mode
-
 
 def get_llm_src_default():
     """Get default llm_src path by going up 4 directories from this script."""
@@ -114,64 +90,41 @@ def parse_test_string(test_case_name: str):
 
     Test name formats:
     - Disagg e2e: disagg_upload-e2e-{config_base}
-    - Disagg e2e + lifecycle breakdown: disagg_upload-e2e-time_breakdown-{config_base}
     - Disagg gen_only: disagg_upload-gen_only-{config_base}
     - ctx_only: aggr_upload-ctx_only-{config_base} (runs aggr mode but reads disagg config)
-    - ctx_only + lifecycle breakdown: aggr_upload-ctx_only-time_breakdown-{config_base}
     - Regular aggr: aggr_upload-{config}-{server_name}
 
-    The optional modifier segment (TEST_ID_MODIFIERS) sits between the benchmark
-    mode and the config stem and is orthogonal to the mode.
-
     Returns:
-        tuple: (config_base_name, select_pattern, runtime_mode, benchmark_mode,
-                time_breakdown)
+        tuple: (config_base_name, select_pattern, runtime_mode, benchmark_mode)
             - runtime_mode: "aggregated" or "disaggregated"
-            - benchmark_mode: "e2e", "gen_only", "ctx_only", or None (normal aggr)
-            - time_breakdown: True when the "time_breakdown" modifier is present
+            - benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
     """
     labels = test_case_name.split("-")
 
-    # ValueError rather than assert throughout: these are test-id grammar
-    # violations, and `python -O` removes assert statements, which would turn a
-    # malformed id into a silent IndexError or a submission against the wrong
-    # config instead of a clear rejection. Matches the sibling parser in
-    # jenkins/scripts/perf/submit.py, which already raises.
-    if len(labels) <= 1:
-        raise ValueError(f"perf_sanity test must have a config file: {test_case_name}")
-
-    def split_modifiers(rest):
-        """Peel the optional modifier segment off the front of the stem."""
-        time_breakdown = bool(rest) and rest[0] == TIME_BREAKDOWN_MODIFIER
-        if time_breakdown:
-            rest = rest[1:]
-        if not rest:
-            raise ValueError(f"Test name has a modifier but no config: {test_case_name}")
-        return time_breakdown, "-".join(rest)
+    assert len(labels) > 1, "perf_sanity test must have a config file!"
 
     prefix = labels[0]
     is_disagg_prefix = "disagg" in prefix
     is_aggr_prefix = "aggr" in prefix
-    time_breakdown = False
 
     if is_disagg_prefix:
-        # Disagg format: disagg_upload-{e2e|gen_only}[-{modifier}]-{config_base}
-        if len(labels) <= 2:
-            raise ValueError(f"Disagg test must have benchmark_mode and config: {test_case_name}")
+        # Disagg format: disagg_upload-{e2e|gen_only}-{config_base}
+        assert len(labels) > 2, "Disagg test must have benchmark_mode and config!"
         benchmark_mode = labels[1]  # e2e or gen_only
-        if benchmark_mode not in ("e2e", "gen_only"):
-            raise ValueError(f"Invalid benchmark_mode for disagg: {benchmark_mode}")
+        assert benchmark_mode in ("e2e", "gen_only"), (
+            f"Invalid benchmark_mode for disagg: {benchmark_mode}"
+        )
         runtime_mode = "disaggregated"
-        time_breakdown, config_base_name = split_modifiers(labels[2:])
+        config_base_name = "-".join(labels[2:])
         select_pattern = None
     elif is_aggr_prefix:
         # Check if this is ctx_only (aggr_upload-ctx_only-{config_base})
         if len(labels) > 2 and labels[1] == "ctx_only":
-            # ctx_only: aggr_upload-ctx_only[-{modifier}]-{config_base}
+            # ctx_only: aggr_upload-ctx_only-{config_base}
             # Runs in aggregated mode but reads disagg config
             benchmark_mode = "ctx_only"
             runtime_mode = "aggregated"
-            time_breakdown, config_base_name = split_modifiers(labels[2:])
+            config_base_name = "-".join(labels[2:])
             select_pattern = None
         else:
             # Regular aggr: aggr_upload-config_yml or aggr_upload-config_yml-server_config_name
@@ -183,7 +136,7 @@ def parse_test_string(test_case_name: str):
     else:
         raise ValueError(f"Invalid test name prefix: {prefix}")
 
-    return config_base_name, select_pattern, runtime_mode, benchmark_mode, time_breakdown
+    return config_base_name, select_pattern, runtime_mode, benchmark_mode
 
 
 def get_config_yaml_path(llm_src, config_base_name, benchmark_mode):
@@ -588,21 +541,18 @@ def generate_pytest_command(
     runtime_mode,
     benchmark_mode,
     waives_file="",
-    time_breakdown=False,
 ):
     """Generate pytest command and test list."""
     # Generate test list content based on runtime_mode and benchmark_mode
     if runtime_mode == "disaggregated":
-        # disagg_upload-{e2e|gen_only}[-{modifier}]-{config_base}
-        label = format_test_label(benchmark_mode, time_breakdown)
+        # disagg_upload-{e2e|gen_only}-{config_base}
         test_list_content = (
-            f"perf/test_perf_sanity.py::test_e2e[disagg-{label}-{config_file_base_name}]"
+            f"perf/test_perf_sanity.py::test_e2e[disagg-{benchmark_mode}-{config_file_base_name}]"
         )
     elif benchmark_mode == "ctx_only":
-        # aggr_upload-ctx_only[-{modifier}]-{config_base}
-        label = format_test_label("ctx_only", time_breakdown)
+        # aggr_upload-ctx_only-{config_base}
         test_list_content = (
-            f"perf/test_perf_sanity.py::test_e2e[aggr-{label}-{config_file_base_name}]"
+            f"perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-{config_file_base_name}]"
         )
     else:
         # Normal aggr: aggr-{config}-{select_pattern}
@@ -707,13 +657,6 @@ def main():
         help="Benchmark mode for disagg config (when --config-file is provided)",
     )
     parser.add_argument(
-        "--time-breakdown",
-        action="store_true",
-        help="Record the per-request lifecycle breakdown; adds the "
-        f"'{TIME_BREAKDOWN_MODIFIER}' modifier segment to the generated test id "
-        "(when --config-file is provided)",
-    )
-    parser.add_argument(
         "--partition",
         required=True,
         help="SLURM partition; use 'unspecified' to omit #SBATCH --partition "
@@ -802,13 +745,9 @@ def main():
     # --test-list takes precedence over --config-file
     if args.test_list:
         test_case_name = extract_test_case_name(args.test_list)
-        (
-            config_file_base_name,
-            select_pattern,
-            runtime_mode,
-            benchmark_mode,
-            time_breakdown,
-        ) = parse_test_string(test_case_name)
+        config_file_base_name, select_pattern, runtime_mode, benchmark_mode = parse_test_string(
+            test_case_name
+        )
         config_yaml = get_config_yaml_path(llm_src, config_file_base_name, benchmark_mode)
     elif args.config_file:
         config_yaml = os.path.abspath(args.config_file)
@@ -828,24 +767,11 @@ def main():
             else:
                 runtime_mode = "disaggregated"
             select_pattern = None
-            time_breakdown = args.time_breakdown
-            # Refuse here rather than at collection: the id this would compose
-            # (e.g. `disagg-gen_only-time_breakdown-<stem>`) is well-formed and
-            # parses fine, but test_perf_sanity.py never generates it, so pytest
-            # would exit "no tests ran" after the whole job has been queued,
-            # built and allocated.
-            if time_breakdown and benchmark_mode not in TIME_BREAKDOWN_BENCHMARK_MODES:
-                raise ValueError(
-                    f"--time-breakdown is not supported for --benchmark_mode "
-                    f"{benchmark_mode!r}; supported modes are "
-                    f"{', '.join(TIME_BREAKDOWN_BENCHMARK_MODES)}"
-                )
         else:
             # Aggr config
             runtime_mode = "aggregated"
             benchmark_mode = None
             select_pattern = args.test_name
-            time_breakdown = False
             if not select_pattern:
                 raise ValueError("--test-name is required for aggregated config")
     else:
@@ -858,11 +784,9 @@ def main():
     # would carry `_upload` while test_perf_sanity.py creates its working dir
     # under the stripped form — producing two divergent folders.
     if runtime_mode == "disaggregated":
-        label = format_test_label(benchmark_mode, time_breakdown)
-        test_case_name = f"disagg-{label}-{config_file_base_name}"
+        test_case_name = f"disagg-{benchmark_mode}-{config_file_base_name}"
     elif benchmark_mode == "ctx_only":
-        label = format_test_label("ctx_only", time_breakdown)
-        test_case_name = f"aggr-{label}-{config_file_base_name}"
+        test_case_name = f"aggr-ctx_only-{config_file_base_name}"
     else:
         test_case_name = f"aggr-{config_file_base_name}-{select_pattern}"
 
@@ -943,7 +867,6 @@ def main():
         runtime_mode,
         benchmark_mode,
         waives_file=args.waives_file,
-        time_breakdown=time_breakdown,
     )
 
     # Write test list file
