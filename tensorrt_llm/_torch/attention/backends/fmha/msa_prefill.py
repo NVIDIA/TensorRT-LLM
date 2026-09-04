@@ -208,9 +208,11 @@ class MsaPrefillFmha(PhasedFmha):
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
         # A step's context rows are this library's and its generation rows
-        # MsaDecodeFmha's, whatever the step looks like, so the two verdicts
-        # are opposite constants and their partition of the phases is total.
-        return phase is not FmhaPhase.GENERATION
+        # MsaDecodeFmha's, whatever the step looks like, so each library claims
+        # its one phase and their partition of the phases is total. The
+        # phase-less query asks for the whole step, which neither can serve
+        # alone: a mixed step belongs to the two together through CombinedFmha.
+        return phase is FmhaPhase.CONTEXT
 
     def prepare_workspace(
         self,
