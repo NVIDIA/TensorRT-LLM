@@ -178,6 +178,16 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         """Number of transfer requests routed to the bounce fast path so far."""
         return self._cpp_agent.bounce_submit_count
 
+    @property
+    def bounce_reject_count(self) -> int:
+        """Number of transfer requests the bounce admission gate declined (bounce enabled)."""
+        return self._cpp_agent.bounce_reject_count
+
+    @property
+    def bounce_reject_counts(self) -> dict[str, int]:
+        """Per-reason rejection counts, keyed by the C++ BounceRejectReason snake_case name."""
+        return self._cpp_agent.bounce_reject_counts
+
     def get_local_agent_desc(self) -> bytes:
         """Get the local agent descriptor as bytes."""
         agent_desc = self._cpp_agent.get_local_agent_desc()

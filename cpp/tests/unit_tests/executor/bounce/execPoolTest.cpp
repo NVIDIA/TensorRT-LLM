@@ -72,6 +72,23 @@ TEST(ExecPool, AcquireReleaseExhaustion)
     EXPECT_EQ(pool.freeCount(), 3u);
 }
 
+TEST(ExecPool, ZeroCopyArgumentsSkipDeviceScratch)
+{
+    if (!hasCuda())
+        GTEST_SKIP();
+    // Under zero-copy the kernel reads plan arrays through hostPinnedDev, so no device scratch is
+    // allocated — but scratchBytes still sizes the plan capacity. (AcquireReleaseExhaustion covers
+    // the non-zero-copy scratch != nullptr case.)
+    b::ExecPool pool(1, 64, 0, /*useZeroCopyArguments=*/true);
+    auto* c = pool.tryAcquire();
+    ASSERT_NE(c, nullptr);
+    EXPECT_EQ(c->scratch, nullptr);
+    EXPECT_GT(c->scratchBytes, 0u);
+    EXPECT_NE(c->hostPinned, nullptr);
+    EXPECT_NE(c->hostPinnedDev, nullptr);
+    pool.release(c);
+}
+
 TEST(ExecPool, StreamScratchAreUsable)
 {
     if (!hasCuda())

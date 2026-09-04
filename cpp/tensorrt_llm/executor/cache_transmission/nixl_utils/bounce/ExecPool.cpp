@@ -46,8 +46,13 @@ ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int device
         {
             auto& c = mCtxs[i];
             c.id = i;
-            c.scratchBytes = scratchBytes;
-            TLLM_CUDA_CHECK(cudaMalloc(&c.scratch, scratchBytes));
+            c.scratchBytes = scratchBytes; // also bounds the plan size under zero-copy (no scratch)
+            if (!useZeroCopyArguments)
+            {
+                // Device staging for the H2D'd plan arrays; under zero-copy the kernel reads them
+                // from hostPinnedDev and this buffer would never be touched.
+                TLLM_CUDA_CHECK(cudaMalloc(&c.scratch, scratchBytes));
+            }
             // Map the pinned buffer when kernels should read plan arrays in place without an H2D copy.
             TLLM_CUDA_CHECK(cudaHostAlloc(
                 &c.hostPinned, scratchBytes, useZeroCopyArguments ? cudaHostAllocMapped : cudaHostAllocDefault));

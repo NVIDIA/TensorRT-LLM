@@ -129,6 +129,12 @@ public:
     /// lease expired can plausibly still be in flight) + re-schedule. Returns the resulting grants.
     [[nodiscard]] std::vector<Grant> reapQuarantine();
 
+    /// Time-driven re-evaluation of the drain time-box: schedule() only runs on scheduler events, so
+    /// in a quiet system an expired drain would otherwise sit until the next grant/free. Returns
+    /// schedule()'s grants when the drain has outlived mDrainTimeout, else nothing. Called from the
+    /// receiver's periodic checkTimeouts() sweep.
+    [[nodiscard]] std::vector<Grant> pollDrain();
+
     /// True if `flow` currently holds region `offset`. Lets the transport drop a late DATA for a
     /// region this flow no longer owns (cancelled/reclaimed) — scattering a freed/re-granted region
     /// would corrupt another flow's data.
@@ -161,6 +167,13 @@ public:
     {
         std::lock_guard<std::mutex> lk(mMu);
         return mLocalHeld.size();
+    }
+
+    /// Upper bound on how long receiver drain mode may block grants to other flows (see mDrainTimeout).
+    void setDrainTimeout(std::chrono::milliseconds timeout)
+    {
+        std::lock_guard<std::mutex> lk(mMu);
+        mDrainTimeout = timeout;
     }
 
     // ---- inspectors (for tests / metrics) ----
@@ -249,11 +262,26 @@ private:
     // Receiver-only anti-starvation barrier. Every successful remote grant advances mGrantSequence.
     // A flow whose head allocation keeps failing while enough other grants pass it becomes mDrainFlow;
     // schedule() then pauses NEW remote grants until that one head fits. Local acquireLocal() remains
-    // untouched, avoiding a cross-direction circular wait in the shared-arena case.
+    // untouched, avoiding a cross-direction circular wait in the shared-arena case. The drain is
+    // time-boxed by mDrainTimeout (see setDrainTimeout): a silent peer holding regions must not stall
+    // every other peer until its lease + quarantine expire, so an overlong drain is abandoned and the
+    // normal round-robin sweep resumes. The expiry is checked inside schedule() (on scheduler
+    // events) and by pollDrain() (from the periodic timeout sweep, whose granularity is 50 ms..1 s, so
+    // expiry may be observed up to one sweep late) — it therefore also fires when no event arrives.
+    // Abandoning restarts the head's bypass count, so it may re-latch once the threshold is crossed
+    // again: under sustained traffic a permanently blocked head alternates between letting
+    // ~threshold grants through and blocking for up to mDrainTimeout. The time-box bounds each stall;
+    // it does not remove the episode — aggregate throughput over a lease + quarantine window stays
+    // low (~threshold grants per mDrainTimeout) until the silent peer's regions are lease-reclaimed
+    // and reaped, or the blocked head's own sender cancels at requestTimeoutMs (a pending-only head
+    // holds no regions and is never lease-reclaimed itself).
     static constexpr std::uint64_t kMinimumBypassGrants{8};
     static constexpr std::uint64_t kBypassRounds{2};
     std::uint64_t mGrantSequence{0};
     std::optional<std::string> mDrainFlow;
+    std::chrono::steady_clock::time_point mDrainSince{}; // when mDrainFlow was latched
+    std::chrono::milliseconds mDrainTimeout{15000};
+    bool mDrainAbandonWarned{false};                     // first drain abandon is a WARNING, later ones DEBUG
     // Round-robin ring of active flow keys (insertion order). NOTE: "ring" not "order" — distinct
     // from BuddyAllocator's size `order` (mArena), which is the power-of-two block exponent.
     std::vector<std::string> mRing;

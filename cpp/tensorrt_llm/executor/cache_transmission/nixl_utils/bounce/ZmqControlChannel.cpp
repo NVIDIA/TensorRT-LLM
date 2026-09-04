@@ -38,7 +38,7 @@ namespace
 constexpr int kSendHwm = 1 << 16;
 } // namespace
 
-ZmqControlChannel::ZmqControlChannel(std::string selfName, std::string const& bindAddr)
+ZmqControlChannel::ZmqControlChannel(std::string selfName, std::string const& bindAddr, std::size_t maxMsgBytes)
     : mSelfName(std::move(selfName))
     , mCtx(/*io_threads=*/1)
     , mRouter(mCtx, zmq::socket_type::router)
@@ -54,6 +54,10 @@ ZmqControlChannel::ZmqControlChannel(std::string selfName, std::string const& bi
     // messages (a forgotten-then-readded peer's WANTs vanish until request timeout). HANDOVER hands the
     // identity to the new connection instead. (Loopback reconnect makes this race easy to hit.)
     mRouter.set(zmq::sockopt::router_handover, 1);
+    // Defensive range check against a buggy or mis-configured peer (not an adversary model, see the
+    // trust model above): the ROUTER never buffers a frame larger than the owner's cap, which is
+    // sized above the largest legitimate DATA message.
+    mRouter.set(zmq::sockopt::maxmsgsize, static_cast<int64_t>(maxMsgBytes));
     // zmq disables IPv6 on a socket by default, so binding an IPv6 address would fail. Enable it when
     // the bind address is IPv6 (brackets, e.g. "tcp://[::1]:*"). Mirrors ucx_utils. (Default ctor arg
     // is the IPv4 loopback, so tests are unaffected.)

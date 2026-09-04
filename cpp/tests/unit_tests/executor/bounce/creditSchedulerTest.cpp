@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <iterator>
 #include <map>
@@ -660,6 +661,66 @@ TEST(CreditScheduler, StaleFlowsReportsIdleFlowsOnly)
     *now += std::chrono::seconds(31);
     (void) s.reapQuarantine();
     EXPECT_EQ(freeRegions(s), 1u); // recovered (live still holds its in-flight second chunk)
+}
+
+TEST(CreditScheduler, DrainModeIsTimeBoxed)
+{
+    // Drain mode withholds grants from every other flow until the latched head fits. A silent peer
+    // holding a region can make that "never", so the drain is time-boxed: after setDrainTimeout the
+    // scheduler abandons it, resumes round-robin grants, and does not re-latch the same head on the
+    // very next sweep (its bypass count restarts).
+    auto now = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+    auto s = makeTimedSched(/*nRegions=*/8, /*maxInflight=*/2, now);
+    s.setDrainTimeout(std::chrono::milliseconds(100));
+    std::string const silent = std::string("C\x1f") + "1"; // holds one region forever
+    std::string const busy = std::string("B\x1f") + "1";   // keeps completing/re-granting
+    std::string const big = std::string("A\x1f") + "1";    // wants the WHOLE arena: never fits
+    std::string const late = std::string("D\x1f") + "1";   // arrives while the drain is active
+    Mirror m;
+    m.grant(s.onWant(silent, want(1)));
+    m.grant(s.onWant(busy, want(100)));
+    ASSERT_EQ(s.heldCount(busy), 2u);
+    EXPECT_TRUE(s.onWant(big, {8 * kRegion}).empty());
+
+    // Each completion frees one region and re-grants it to `busy`; once enough grants have bypassed
+    // `big`, the drain latches and the re-grant is withheld (empty result while `busy` still wants).
+    auto completeOne = [&]
+    {
+        auto it = std::find_if(m.owner.begin(), m.owner.end(), [&](auto const& kv) { return kv.second == busy; });
+        if (it == m.owner.end())
+        {
+            ADD_FAILURE() << "`busy` holds no region to complete";
+            return std::size_t{0};
+        }
+        auto const off = it->first;
+        m.free(off);
+        auto g = s.onScatterDone(busy, off);
+        m.grant(g);
+        return g.size();
+    };
+    // Bypass threshold is max(kMinimumBypassGrants=8, kBypassRounds*ring=6) = 8 grants, so 20 is safe.
+    bool latched = false;
+    for (int i = 0; i < 20 && !latched; ++i)
+    {
+        latched = completeOne() == 0;
+    }
+    ASSERT_TRUE(latched) << "drain never latched on the blocked head";
+    EXPECT_EQ(s.heldCount(busy), 1u);
+    EXPECT_TRUE(s.onWant(late, want(1)).empty()) << "drain did not withhold grants from other flows";
+    EXPECT_TRUE(s.pollDrain().empty()) << "pollDrain abandoned a drain that has not timed out";
+
+    // Quiet system: no further scheduler event arrives. Past the time-box the periodic pollDrain()
+    // alone must abandon the drain and grant the withheld flows again...
+    *now += std::chrono::milliseconds(101);
+    auto const resumed = s.pollDrain();
+    m.grant(resumed);
+    EXPECT_GE(resumed.size(), 2u) << "drain not abandoned after its timeout";
+    EXPECT_EQ(s.heldCount(late), 1u);
+    EXPECT_EQ(s.heldCount(big), 0u);
+    EXPECT_TRUE(s.pollDrain().empty()); // nothing latched any more
+    // ...and the immediately following sweep must not re-latch `big` (which would withhold again).
+    EXPECT_GE(completeOne(), 1u) << "abandoned drain head was re-latched on the next sweep";
+    checkConservation(s, {silent, busy, big, late}, 8);
 }
 
 TEST(CreditScheduler, SharedArenaLocalAndRemoteShareOneAllocator)

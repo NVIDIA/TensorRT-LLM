@@ -305,7 +305,23 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             nb::call_guard<nb::gil_scoped_release>())
         // Programmatic bounce v2 observability (deployment checks and tests; no log parsing).
         .def_prop_ro("bounce_enabled", &kvc::NixlTransferAgent::isBounceEnabled)
-        .def_prop_ro("bounce_submit_count", &kvc::NixlTransferAgent::getBounceSubmitCount);
+        .def_prop_ro("bounce_submit_count", &kvc::NixlTransferAgent::getBounceSubmitCount)
+        .def_prop_ro("bounce_reject_count", &kvc::NixlTransferAgent::getBounceRejectCount)
+        .def_prop_ro("bounce_reject_counts",
+            [](kvc::NixlTransferAgent const& self)
+            {
+                // Python dicts keep insertion order, so filling by index yields BounceRejectReason
+                // (evaluation) order — more useful than the alphabetical order a std::map would give.
+                nb::dict out;
+                auto const counts = self.getBounceRejectCounts();
+                for (std::size_t i = 0; i < counts.size(); ++i)
+                {
+                    out[nb::str(kvc::NixlTransferAgent::bounceRejectReasonName(
+                        static_cast<kvc::bounce::BounceRejectReason>(i)))]
+                        = nb::int_(counts[i]);
+                }
+                return out;
+            });
 #endif
 
     // NOTE: MooncakeTransferAgent/MooncakeTransferStatus class bindings are intentionally

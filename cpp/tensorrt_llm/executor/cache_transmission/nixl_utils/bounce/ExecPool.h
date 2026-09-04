@@ -47,10 +47,10 @@ struct ExecCtx
     std::uint32_t id{};
     cudaStream_t stream{nullptr};
     cudaEvent_t event{nullptr};   // gather-completion event (cudaEventRecord/Query, no blocking sync)
-    void* scratch{nullptr};       // device plan arrays; unused when zero-copy arguments are enabled
+    void* scratch{nullptr};       // device plan arrays; nullptr (not allocated) under zero-copy arguments
     void* hostPinned{nullptr};    // pinned staging for the plan arrays (H2D source, or read in-kernel)
     void* hostPinnedDev{nullptr}; // device alias of hostPinned when zero-copy arguments are enabled
-    std::size_t scratchBytes{0};
+    std::size_t scratchBytes{0};  // plan-array capacity in bytes (set in both modes; sizes maxPlanEntries)
 };
 
 class ExecPool

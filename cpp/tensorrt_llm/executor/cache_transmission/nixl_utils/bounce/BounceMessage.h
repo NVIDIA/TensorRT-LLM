@@ -39,6 +39,7 @@ enum class BounceMsgType : std::uint16_t
     kGRANT = 2, // receiver -> sender: credits[] for requestId
     kDATA = 3,  // sender -> receiver: region written; scatter entries[] (after getXferStatus SUCCESS)
     kACK = 4,   // receiver -> sender: chunk scattered; region freed
+    kNACK = 5,  // receiver -> sender: chunk/request cannot be completed; sender fails the request
 };
 
 #pragma pack(push, 1)
@@ -121,6 +122,11 @@ inline constexpr std::uint16_t kBounceVersion = 2U;
 [[nodiscard]] std::string encodeData(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint32_t numChunks,
     std::uint64_t regionHandle, std::vector<BounceScatterRun> const& entries);
 [[nodiscard]] std::string encodeAck(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint64_t regionHandle);
+/// NACK: the receiver KNOWS this chunk/request cannot complete (scatter failure, ungrantable chunk
+/// size, plan overflow), so the sender fails it now instead of waiting out requestTimeoutMs.
+/// Header-only like ACK. The sender fails the WHOLE request on any NACK, so chunkIdx/regionHandle are
+/// informational only (0 when the receiver has no chunk context, e.g. a rejected WANT).
+[[nodiscard]] std::string encodeNack(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint64_t regionHandle);
 
 // ---- decode ----
 /// Decode the fixed header. Returns false on short blob, bad magic, or version mismatch.
@@ -160,8 +166,8 @@ enum class BounceControlKind : std::uint8_t
 /// the metadata validates compatibility (BounceTransport::registerPeerHandshake) BEFORE ever
 /// engaging bounce toward us: incompatible (or absent) handshake -> that peer transparently uses
 /// the standard per-desc NIXL path instead of waiting for requestTimeoutMs.
-/// Compatibility is strict equality of wireVersion, controlKind and effective maxChunkSizeBytes.
-/// Worker/stream counts, timeouts, the zero-copy-argument path, allocation granularity and
+/// Compatibility is strict equality of wireVersion, controlKind, effective maxChunkSizeBytes and
+/// requestTimeoutMs. Worker/stream counts, the zero-copy-argument path, allocation granularity and
 /// configured arena size are local settings and are not compared. The usable arena capacity is
 /// carried for diagnostics.
 struct BounceHandshake
@@ -174,6 +180,11 @@ struct BounceHandshake
     // This agent's effective per-chunk cap after the arena-capacity clamp. Peers compare this field
     // exactly, which also keeps their scatter-plan capacities consistent.
     std::uint64_t maxChunkSizeBytes{0};
+    // This agent's request_timeout_ms. Peers compare it exactly: the receiver's region lease (2x its
+    // value) must exceed the sender's timeout. The quarantine (1x) starts at lease expiry OR at a
+    // receiver-side peer teardown (forget()/invalidateRemoteAgent); on the lease path it needs no
+    // extra margin of its own.
+    std::int32_t requestTimeoutMs{0};
     // Control-channel address: a zmq endpoint (kZMQ).
     std::string endpoint;
 };

@@ -172,18 +172,33 @@ TEST(BounceTransport, ReplacementHandshakeClearsStaleCompatibility)
     EXPECT_FALSE(node->tx->registerPeerHandshake("peer", b::encodeHandshake(incompatible)));
     EXPECT_FALSE(node->tx->hasPeerHandshake("peer"));
 
+    // request_timeout_ms is handshake-enforced too (receiver lease/quarantine derive from it).
+    b::BounceHandshake timeoutMismatch;
+    ASSERT_TRUE(b::decodeHandshake(compatible, timeoutMismatch));
+    EXPECT_EQ(timeoutMismatch.requestTimeoutMs, cfg.requestTimeoutMs);
+    timeoutMismatch.requestTimeoutMs += 1;
+    ASSERT_TRUE(node->tx->registerPeerHandshake("peer", compatible));
+    EXPECT_FALSE(node->tx->registerPeerHandshake("peer", b::encodeHandshake(timeoutMismatch)));
+    EXPECT_FALSE(node->tx->hasPeerHandshake("peer"));
+
     ASSERT_TRUE(node->tx->registerPeerHandshake("peer", compatible));
     EXPECT_FALSE(node->tx->registerPeerHandshake("peer", {}));
     EXPECT_FALSE(node->tx->hasPeerHandshake("peer"));
 
+    // Peer input must never throw out of the metadata-exchange path: a decodable handshake with an
+    // empty or un-connectable endpoint just disables bounce for that peer.
     b::BounceHandshake invalidEndpoint;
     ASSERT_TRUE(b::decodeHandshake(compatible, invalidEndpoint));
     invalidEndpoint.endpoint.clear();
-    EXPECT_ANY_THROW(node->tx->registerPeerHandshake("peer", b::encodeHandshake(invalidEndpoint)));
+    bool registered = true;
+    EXPECT_NO_THROW(registered = node->tx->registerPeerHandshake("peer", b::encodeHandshake(invalidEndpoint)));
+    EXPECT_FALSE(registered);
     EXPECT_FALSE(node->tx->hasPeerHandshake("peer"));
 
     invalidEndpoint.endpoint = "not-a-zmq-endpoint";
-    EXPECT_ANY_THROW(node->tx->registerPeerHandshake("peer", b::encodeHandshake(invalidEndpoint)));
+    registered = true;
+    EXPECT_NO_THROW(registered = node->tx->registerPeerHandshake("peer", b::encodeHandshake(invalidEndpoint)));
+    EXPECT_FALSE(registered);
     EXPECT_FALSE(node->tx->hasPeerHandshake("peer"));
     node->tx->shutdown();
 }
