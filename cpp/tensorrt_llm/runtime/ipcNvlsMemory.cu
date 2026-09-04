@@ -24,6 +24,8 @@
 #endif
 #if ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/common/nvmlWrapper.h"
+
+#include <cstdlib>
 #endif
 #include <unistd.h>
 
@@ -145,10 +147,69 @@ private:
     MPI_Comm mGroupComm;
 };
 
+// Returns true when NVML reports the GPU's NVLink fabric registration as
+// completed successfully, i.e. Fabric Manager has configured the NVSwitch
+// fabric this device is attached to. This is the driver's own record of the
+// precondition for NVLS multicast binds. Note the distinction from IMEX:
+// fabric *handles* (cuMemCreate with CU_MEM_HANDLE_TYPE_FABRIC) additionally
+// need the IMEX plane, but single-node NVLS binds work over POSIX-FD handles
+// and only need the switch fabric itself to be configured.
+static bool nvlinkFabricConfigured()
+{
+    // Static for the process; cached because each query is a full
+    // nvmlInit/nvmlShutdown cycle and this runs on every NVLS allocation via
+    // getMemHandleType(). An exception during the first attempt propagates and
+    // the query is retried on the next call.
+    static bool const configured = []() -> bool
+    {
+        int device_id;
+        TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
+
+        auto nvml = tensorrt_llm::common::NVMLWrapper::getInstance();
+        tensorrt_llm::common::NvmlManager nvmlManager;
+
+        nvmlDevice_t nvml_device;
+        NVMLCHECK(nvml->nvmlDeviceGetHandleByIndex(device_id, &nvml_device));
+
+        nvmlGpuFabricState_t fabric_state;
+        nvmlReturn_t fabric_status;
+        if (nvml->hasGpuFabricInfoV())
+        {
+            nvmlGpuFabricInfoV_t fabric_info_v;
+            memset(&fabric_info_v, 0, sizeof(fabric_info_v));
+            fabric_info_v.version = nvmlGpuFabricInfo_v2;
+            NVMLCHECK(nvml->nvmlDeviceGetGpuFabricInfoV(nvml_device, &fabric_info_v));
+            fabric_state = fabric_info_v.state;
+            fabric_status = fabric_info_v.status;
+        }
+        else if (nvml->hasGpuFabricInfo())
+        {
+            nvmlGpuFabricInfo_t fabric_info;
+            NVMLCHECK(nvml->nvmlDeviceGetGpuFabricInfo(nvml_device, &fabric_info));
+            fabric_state = fabric_info.state;
+            fabric_status = fabric_info.status;
+        }
+        else
+        {
+            TLLM_LOG_TRACE("checking fabric state... NVML fabric info APIs not available.");
+            return false;
+        }
+
+        if (fabric_state != NVML_GPU_FABRIC_STATE_COMPLETED || fabric_status != NVML_SUCCESS)
+        {
+            TLLM_LOG_TRACE("checking fabric state... fabric state is NOT COMPLETE: state=%u status=%u.", fabric_state,
+                fabric_status);
+            return false;
+        }
+        return true;
+    }();
+    return configured;
+}
+
 // Returns CU_MEM_HANDLE_TYPE_FABRIC when fabric-handle memory can actually be
 // allocated and exported on the current device (i.e. the fabric/IMEX plane is
-// provisioned), else CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR. Used both to pick
-// the NVLS allocation handle type and by ipcNvlsFabricUsable() to gauge usability.
+// provisioned), else CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR. Used to pick
+// the NVLS allocation handle type.
 static CUmemAllocationHandleType getMemHandleType()
 {
     int device_id;
@@ -163,41 +224,9 @@ static CUmemAllocationHandleType getMemHandleType()
         return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     }
 
-    auto nvml = tensorrt_llm::common::NVMLWrapper::getInstance();
-    tensorrt_llm::common::NvmlManager nvmlManager;
-
-    nvmlDevice_t nvml_device;
-    NVMLCHECK(nvml->nvmlDeviceGetHandleByIndex(device_id, &nvml_device));
-
-    nvmlGpuFabricState_t fabric_state;
-    nvmlReturn_t fabric_status;
-    if (nvml->hasGpuFabricInfoV())
+    // Fabric handles additionally require the switch fabric to be configured.
+    if (!nvlinkFabricConfigured())
     {
-        nvmlGpuFabricInfoV_t fabric_info_v;
-        memset(&fabric_info_v, 0, sizeof(fabric_info_v));
-        fabric_info_v.version = nvmlGpuFabricInfo_v2;
-        NVMLCHECK(nvml->nvmlDeviceGetGpuFabricInfoV(nvml_device, &fabric_info_v));
-        fabric_state = fabric_info_v.state;
-        fabric_status = fabric_info_v.status;
-    }
-    else if (nvml->hasGpuFabricInfo())
-    {
-        nvmlGpuFabricInfo_t fabric_info;
-        NVMLCHECK(nvml->nvmlDeviceGetGpuFabricInfo(nvml_device, &fabric_info));
-        fabric_state = fabric_info.state;
-        fabric_status = fabric_info.status;
-    }
-    else
-    {
-        TLLM_LOG_TRACE("checking fabric support... NVML fabric info APIs not available.");
-        return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-    }
-
-    // Check if the fabric is fully initialized.
-    if (fabric_state != NVML_GPU_FABRIC_STATE_COMPLETED || fabric_status != NVML_SUCCESS)
-    {
-        TLLM_LOG_TRACE("checking fabric support... fabric state is NOT COMPLETE: state=%u status=%u.", fabric_state,
-            fabric_status);
         return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     }
 
@@ -239,7 +268,7 @@ static CUmemAllocationHandleType getMemHandleType()
         return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     }
 
-    TLLM_LOG_TRACE("fabric status: device=%d, state=%u status=%u", device_id, fabric_state, fabric_status);
+    TLLM_LOG_TRACE("fabric handles usable: device=%d", device_id);
 
     CUCHECK(cuMemRelease(imported_handle));
     CUCHECK(cuMemRelease(handle));
@@ -491,58 +520,125 @@ bool ipcNvlsSupported()
 #endif
 }
 
-bool ipcNvlsFabricUsable()
+namespace
+{
+
+enum class NvlsUsability
+{
+    kUsable,
+    kNotSupported,        // static multicast capability missing (nothing to warn about)
+    kFabricNotConfigured, // NVML fabric state not COMPLETED: binds would fail
+    kMultiNodeNeedsImex,  // cross-node FABRIC handles unavailable
+};
+
+// Why NVLS is (not) usable in this session; see ipcNvlsUsable() in the header
+// for the full rationale. Static for the process, so compute once and cache.
+NvlsUsability nvlsUsability()
 {
 #if ENABLE_MULTI_DEVICE
-    // Extends ipcNvlsSupported() with a live fabric probe. The probe is
-    // relatively heavy (it allocates and exports fabric-handle memory), so
-    // compute it once and cache it.
-    static bool const usable = []() -> bool
+    static NvlsUsability const usability = []() -> NvlsUsability
     {
         if (!ipcNvlsSupported())
         {
-            return false;
+            return NvlsUsability::kNotSupported;
         }
 #if !ENABLE_NVSHMEM
-        // The multicast attribute is a false positive when the fabric/IMEX plane
-        // is not provisioned (e.g. nvidia-imex not running): NVLS multicast
-        // cannot actually be bound there. getMemHandleType() does the real test
-        // -- it resolves to FABRIC only if fabric-handle memory can be allocated
-        // and exported. On any probe error, assume usable so an unrelated
-        // failure never disables a healthy NVLS setup.
+        // On any probe error, assume usable so an unrelated failure never
+        // disables a healthy setup.
         try
         {
-            if (getMemHandleType() != CU_MEM_HANDLE_TYPE_FABRIC)
+            // An unconfigured switch fabric makes the multicast attribute a
+            // false positive: the bind then fails and poisons the CUDA context
+            // with a sticky error (the startup hang PR #15302 fixed).
+            if (!nvlinkFabricConfigured())
             {
-                TLLM_LOG_WARNING(
-                    "\n"
-                    "**************************************************************************\n"
-                    "* NVLS (NVLink SHARP) DISABLED for NCCL -- falling back to NVLink P2P     *\n"
-                    "**************************************************************************\n"
-                    "* The GPU advertises multicast support, but the NVLink fabric/IMEX plane *\n"
-                    "* is NOT provisioned on this node, so NVLS multicast memory cannot be    *\n"
-                    "* bound. Collectives will still work over NVLink P2P, but NVLS-           *\n"
-                    "* accelerated NCCL is off and performance may be reduced. (Single-node   *\n"
-                    "* NVLS over POSIX-FD, e.g. MNNVL allreduce, is unaffected.)              *\n"
-                    "*                                                                        *\n"
-                    "* To enable NVLS: start nvidia-imex and expose                           *\n"
-                    "* /dev/nvidia-caps-imex-channels to the container. Set                   *\n"
-                    "* NCCL_NVLS_ENABLE=1 explicitly to override this fallback.               *\n"
-                    "**************************************************************************");
-                return false;
+                return NvlsUsability::kFabricNotConfigured;
+            }
+            // Cross-node NVLS shares multicast memory via FABRIC handles (a
+            // POSIX FD cannot leave the machine), so a multi-node session
+            // additionally needs the IMEX plane. localSession() is materialized
+            // during MPI initialization, so these size reads are local and
+            // non-collective.
+            bool const multiNode = COMM_SESSION.getSize() != LOCAL_COMM_SESSION.getSize();
+            if (multiNode && getMemHandleType() != CU_MEM_HANDLE_TYPE_FABRIC)
+            {
+                return NvlsUsability::kMultiNodeNeedsImex;
             }
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_DEBUG("NVLS fabric probe could not run, assuming usable: %s", e.what());
+            TLLM_LOG_DEBUG("NVLink fabric state probe could not run, assuming usable: %s", e.what());
         }
 #endif // !ENABLE_NVSHMEM
-        return true;
+        return NvlsUsability::kUsable;
     }();
-    return usable;
+    return usability;
 #else
-    return false;
+    return NvlsUsability::kNotSupported;
 #endif
+}
+
+[[maybe_unused]] void warnNvlsDisabledForNccl(char const* reason, char const* remedy)
+{
+    TLLM_LOG_WARNING(
+        "\n"
+        "**************************************************************************\n"
+        "* NVLS (NVLink SHARP) DISABLED for NCCL -- falling back to NVLink P2P    *\n"
+        "**************************************************************************\n"
+        "%s"
+        "* Collectives will still work over NVLink P2P, but NVLS-accelerated      *\n"
+        "* NCCL is off and performance may be reduced. (TRT-LLM's own single-node *\n"
+        "* NVLS over POSIX-FD, e.g. MNNVL allreduce, is unaffected.)              *\n"
+        "*                                                                        *\n"
+        "%s"
+        "* Set NCCL_NVLS_ENABLE=1 explicitly to override this fallback.           *\n"
+        "**************************************************************************",
+        reason, remedy);
+}
+
+} // namespace
+
+bool ipcNvlsUsable()
+{
+    return nvlsUsability() == NvlsUsability::kUsable;
+}
+
+void maybeDisableNcclNvls()
+{
+#if ENABLE_MULTI_DEVICE && !defined(_WIN32)
+    // NCCL aborts during init if it tries NVLS multicast in a session that
+    // cannot bind it, so decide before the first ncclCommInitRank. The decision
+    // is process-wide by necessity: NCCL caches NCCL_NVLS_ENABLE on first read,
+    // so per-communicator toggling would not take effect anyway. An explicit
+    // user setting skips the probe and the warning entirely; setenv's
+    // no-overwrite flag would preserve it regardless.
+    if (getenv("NCCL_NVLS_ENABLE") != nullptr)
+    {
+        return;
+    }
+    switch (nvlsUsability())
+    {
+    case NvlsUsability::kUsable: return;
+    case NvlsUsability::kNotSupported: break;
+    case NvlsUsability::kFabricNotConfigured:
+        warnNvlsDisabledForNccl(
+            "* The GPU advertises multicast support, but the driver does not report   *\n"
+            "* a successfully configured NVLink fabric (NVML fabric state is not      *\n"
+            "* COMPLETED), so NVLS multicast binds cannot be trusted on this node.    *\n",
+            "* To enable NVLS: make sure nvidia-fabricmanager is running and healthy  *\n"
+            "* on the host.                                                            *\n");
+        break;
+    case NvlsUsability::kMultiNodeNeedsImex:
+        warnNvlsDisabledForNccl(
+            "* This is a multi-node session, and cross-node NVLS multicast memory     *\n"
+            "* requires fabric handles, but the fabric/IMEX plane is NOT provisioned  *\n"
+            "* on this node.                                                          *\n",
+            "* To enable NVLS: start nvidia-imex and expose                            *\n"
+            "* /dev/nvidia-caps-imex-channels to the container.                        *\n");
+        break;
+    }
+    setenv("NCCL_NVLS_ENABLE", "0", 0);
+#endif // ENABLE_MULTI_DEVICE && !defined(_WIN32)
 }
 
 IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group)
