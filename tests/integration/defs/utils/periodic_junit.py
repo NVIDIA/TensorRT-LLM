@@ -79,6 +79,9 @@ class PeriodicJUnitXML:
             logger=None,  # Optional logger (info, warning functions)
             save_unfinished_test:
         bool = False,  # Save unfinished test name in output-dir/unfinished_test.txt if True
+            unfinished_test_path:
+        Optional[
+            str] = None,  # Override the unfinished_test.txt location; defaults to xmlpath's directory
             dump_hang_traceback:
         bool = False,  # Dump a thread traceback to output-dir/hang_traceback.txt on a hang if True
             hang_dump_fraction:
@@ -96,6 +99,12 @@ class PeriodicJUnitXML:
             batch_size: Number of tests before triggering a save (default: 10)
             logger: Optional dictionary with 'info' and 'warning' functions for logging
             save_unfinished_test: If True, save unfinished test name in output-dir/unfinished_test.txt
+            unfinished_test_path: If set, save/clear unfinished test names in this file
+                instead of output-dir/unfinished_test.txt. Lets callers that redirect
+                xmlpath elsewhere (e.g. a rerun attempt writing to its own results file)
+                still record a crash into the same unfinished_test.txt the caller checks,
+                instead of a copy under the redirected xmlpath's directory that nothing
+                reads.
             dump_hang_traceback: If True, dump every thread's stack to
                 output-dir/hang_traceback.txt when a test overruns its timeout or the
                 process is signalled, so a hang leaves a diagnosable stack instead of an
@@ -108,6 +117,8 @@ class PeriodicJUnitXML:
         self.batch_size = batch_size
         self.logger = logger or {}
         self.save_unfinished_test = save_unfinished_test
+        self.unfinished_test_path = os.path.abspath(
+            unfinished_test_path) if unfinished_test_path else None
         self.dump_hang_traceback = dump_hang_traceback
         self.hang_dump_fraction = hang_dump_fraction
         # Kept open for the process lifetime so faulthandler can write to it from the
@@ -206,7 +217,8 @@ class PeriodicJUnitXML:
         self.pending_reports.append(report)
 
         output_dir = os.path.dirname(self.xmlpath)
-        unfinished_test_path = os.path.join(output_dir, "unfinished_test.txt")
+        unfinished_test_path = self.unfinished_test_path or os.path.join(
+            output_dir, "unfinished_test.txt")
 
         # save unfinished test nodeid to output-dir/unfinished_test.txt
         if self.save_unfinished_test and report.when == "setup":

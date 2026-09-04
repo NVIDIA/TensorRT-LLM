@@ -1693,6 +1693,9 @@ def getPytestBaseCommandLine(
         "--periodic-junit-xmlpath ${outputPath}/results.xml",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
+        // Reruns redirect --periodic-junit-xmlpath elsewhere but inherit this
+        // flag unchanged, so every attempt shares one unfinished_test.txt.
+        "--periodic-unfinished-test-path=${outputPath}/unfinished_test.txt",
         "--periodic-hang-traceback",
     ]
 
@@ -4576,6 +4579,7 @@ def generateRerunReport(stageName, llmSrc) {
     // Collect all original and rerun result files
     def allInputFiles = []
 
+    // ---- Regular test results ----
     // Add original results
     if (fileExists("${WORKSPACE}/${stageName}/results.xml")) {
         allInputFiles.add("${WORKSPACE}/${stageName}/results.xml")
@@ -4584,7 +4588,18 @@ def generateRerunReport(stageName, llmSrc) {
             rerunResultFiles.add("${WORKSPACE}/${stageName}/results.xml")
         }
     }
+    // Add regular rerun results
+    if (hasRegularReruns) {
+        for (times in [1, 2]) {
+            def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
+            if (fileExists(rerunFile)) {
+                allInputFiles.add(rerunFile)
+                rerunResultFiles.add(rerunFile)
+            }
+        }
+    }
 
+    // ---- Isolated test results ----
     // Add ALL isolated test results to allInputFiles
     def isolatedResults = sh(script: "find ${WORKSPACE}/${stageName} -name 'results_isolated_*.xml' 2>/dev/null || true", returnStdout: true).trim()
     if (isolatedResults) {
@@ -4593,26 +4608,15 @@ def generateRerunReport(stageName, llmSrc) {
                 allInputFiles.add(file.trim())
             }
         }
-        // Add isolated test results that have reruns to rerunResultFiles and add their rerun results to allInputFiles
-        isolatedTestsWithReruns.each { isolatedTest ->
-            if (fileExists(isolatedTest.originalResult)) {
-                rerunResultFiles.add(isolatedTest.originalResult)
-                echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
-            }
-            for (times in [1, 2]) {
-                def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
-                if (fileExists(rerunFile)) {
-                    allInputFiles.add(rerunFile)
-                    rerunResultFiles.add(rerunFile)
-                }
-            }
-        }
     }
-
-    // Add regular rerun results
-    if (hasRegularReruns) {
+    // Add isolated rerun results
+    isolatedTestsWithReruns.each { isolatedTest ->
+        if (fileExists(isolatedTest.originalResult)) {
+            rerunResultFiles.add(isolatedTest.originalResult)
+            echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
+        }
         for (times in [1, 2]) {
-            def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
+            def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
             if (fileExists(rerunFile)) {
                 allInputFiles.add(rerunFile)
                 rerunResultFiles.add(rerunFile)
@@ -5330,12 +5334,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (Exception e) {
                         def isRerunFailed = rerunFailedTests(
                             stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag)
+                        // Unconditional: a test can crash again during the rerun itself
+                        // (isRerunFailed=true), and unfinished_test.txt is the only
+                        // record of that crash. junit()'s "results*.xml" glob picks up
+                        // results-timeout.xml directly, so this is what surfaces it.
+                        def hadUnfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
                         if (isRerunFailed) {
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Regular tests failed after rerun attempt"
                             }
                             rerunFailed = true
-                        } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
+                        } else if (hadUnfinishedTests) {
                             // Rerun passed but the first run had a timeout: mark this
                             // stage FAILURE so "[${stageName}] Run Pytest" turns red,
                             // not just the enclosing parent stage.
