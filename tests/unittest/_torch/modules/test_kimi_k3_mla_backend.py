@@ -130,6 +130,7 @@ def test_kimi_k3_mla_construction_fails_fast_for_fp8_kv_with_attention_dp(
             layer_idx=0,
             max_position_embeddings=256,
             model_config=model_config,
+            aux_stream_dict={},
         )
 
 
