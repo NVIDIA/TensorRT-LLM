@@ -95,6 +95,25 @@ constexpr bool isSMCompatible(int gpuSM, int kernelSM)
     return gpuSM == kernelSM;
 }
 
+inline void checkTrtllmSkipCorrThreshold(fmha::FmhaOptions const& options, float skipCorrThreshold)
+{
+    fmha::checkSkipCorrThreshold(options, skipCorrThreshold);
+    if (skipCorrThreshold <= 0.0F)
+    {
+        return;
+    }
+
+    auto const dtypeBmm2 = fmha::getDtypeBmm2(options);
+    if (dtypeBmm2 == tg::Dtype::Fp16)
+    {
+        TLLM_CHECK_WITH_INFO(skipCorrThreshold <= 15.0F, "skipCorrThreshold must be <= 15 for FP16 BMM2.");
+    }
+    else if (dtypeBmm2 == tg::Dtype::Bfloat16)
+    {
+        TLLM_CHECK_WITH_INFO(skipCorrThreshold <= 32.0F, "skipCorrThreshold must be <= 32 for BF16 BMM2.");
+    }
+}
+
 class TllmGenFmhaKernel
 {
 
@@ -267,6 +286,7 @@ public:
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
+        checkTrtllmSkipCorrThreshold(options, params.mSkipCorrThreshold);
 
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
@@ -362,6 +382,7 @@ private:
 
         checkFmhaOptions(options, optionsFromArgs);
         updateFmhaOptions(options, optionsFromArgs);
+        checkTrtllmSkipCorrThreshold(options, params.mSkipCorrThreshold);
 
         auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
         tg::CudaRunner::Grid grid{numCtasX, numCtasY, numCtasZ};
@@ -479,6 +500,7 @@ public:
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
+        checkTrtllmSkipCorrThreshold(options, params.mSkipCorrThreshold);
 
         // Any caller that selects MultiCtasKvMode must supply the partial-reduction scratch pool
         // and per-CTA counter; fail fast here instead of silently falling back to Disabled.
@@ -577,14 +599,15 @@ public:
                 fmhaData.mOutputBuffers.multiCtasKvCounterPtrD, fmhaData.mOutputBuffers.partialOPtrD,
                 fmhaData.mOutputBuffers.partialStatsPtrD, fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD,
                 fmhaData.mOutputBuffers.softmaxStatsD, fmhaData.mOutputBuffers.oDebugPtrD,
-                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax,
-                fmhaData.mMetaData.skipCorrThreshold, fmhaData.mScales.kvSfScale,
-                fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO, options.mUseBlockSparseAttention,
-                options.mUsesSharedPagedKvIdx);
+                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax, fmhaData.mMetaData.skipCorrThreshold,
+                fmhaData.mScales.kvSfScale, fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO,
+                options.mUseBlockSparseAttention, options.mUsesSharedPagedKvIdx);
 
             launchFmhaKernel(kernelParams, kernelMeta, func, grid, options, params.stream);
             // Run the separate reduction kernel if needed.
-            runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.stream);
+            float const softmaxPScale
+                = fmha::getSoftmaxPScale(fmha::getDtypeBmm2(options), kernelParams.mSkipCorrThreshold);
+            runFmhaReduction(kernelMeta, kernelParams, softmaxPScale, params.mMultiProcessorCount, params.stream);
         }
     }
 
@@ -654,8 +677,8 @@ private:
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
-            kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
-            kernelMeta.mGroupsHeadsQ, kernelMeta.mGroupsTokensHeadsQ, numInstsQ, numInstsKv);
+            kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible, kernelMeta.mGroupsHeadsQ,
+            kernelMeta.mGroupsTokensHeadsQ, numInstsQ, numInstsKv);
     }
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
@@ -684,22 +707,22 @@ private:
             + ", uses2CtaMma=" + std::to_string(uses2CtaMma)
             + ", sparseType=" + std::to_string(static_cast<int>(options.mSparseType))
             + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible)
-            + ", groupsHeadsQ=" + std::to_string(options.mGroupsHeadsQ)
-            + ", groupsTokensHeadsQ=" + std::to_string(options.mGroupsTokensHeadsQ) + ", numInstsQ="
-            + std::to_string(options.mNumInstsQ) + ", numInstsKv=" + std::to_string(options.mNumInstsKv) + ", variant="
+            + ", groupsHeadsQ=" + std::to_string(options.mGroupsHeadsQ) + ", groupsTokensHeadsQ="
+            + std::to_string(options.mGroupsTokensHeadsQ) + ", numInstsQ=" + std::to_string(options.mNumInstsQ)
+            + ", numInstsKv=" + std::to_string(options.mNumInstsKv) + ", variant="
             + (options.mFusesDsv4InvRopeFp8Quant ? (options.mUsesDsv4Ue8m0ScaleO ? "dsv4-ue8m0" : "dsv4-fp32")
                                                  : "plain");
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
-        return std::make_pair(hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
-                                  static_cast<int>(options.mFmhaKernelType), static_cast<int>(options.mTileScheduler),
-                                  static_cast<int>(options.mMultiCtasKvMode), static_cast<int>(options.mHeadDimPerCtaV),
-                                  static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
-                                  static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
-                                  static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
-                                  static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible,
-                                  options.mGroupsHeadsQ, options.mGroupsTokensHeadsQ, options.mNumInstsQ,
-                                  options.mNumInstsKv),
+        return std::make_pair(
+            hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
+                static_cast<int>(options.mFmhaKernelType), static_cast<int>(options.mTileScheduler),
+                static_cast<int>(options.mMultiCtasKvMode), static_cast<int>(options.mHeadDimPerCtaV),
+                static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
+                static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
+                static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
+                static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible, options.mGroupsHeadsQ,
+                options.mGroupsTokensHeadsQ, options.mNumInstsQ, options.mNumInstsKv),
             info);
     }
 
@@ -885,7 +908,7 @@ private:
         fmhaData.mMetaData.sparseMlaTopKLensPtrD = params.ptrSparseMlaTopKLens;
         fmhaData.mMetaData.kvPageIdxD = params.kvPageIdxPtr;
         fmhaData.mMetaData.inflateMax = 0.0F; // Default value for inflate max
-        fmhaData.mMetaData.skipCorrThreshold = 0.0F; // 0 disables threshold-based skip correction
+        fmhaData.mMetaData.skipCorrThreshold = params.mSkipCorrThreshold;
         fmhaData.mMetaData.startTokenIdxSfO = params.mSfStartTokenIdx;
 
         // Fill Scales
@@ -1245,9 +1268,8 @@ private:
             + ", numTokensPerPage=" + std::to_string(selectKernelParams.mNumTokensPerPage)
             + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
             + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
-            + ", sparseAttention=" + std::to_string(static_cast<int>(params.mSparseAttention))
-            + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible)
-            + ", numInstsQ=1, numInstsKv=1"
+            + ", sparseAttention=" + std::to_string(static_cast<int>(params.mSparseAttention)) + ", skipsSoftmax="
+            + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible) + ", numInstsQ=1, numInstsKv=1"
             + ", fusesDsv4InvRopeFp8Quant=" + std::to_string(params.mDsv4EpilogueFusion.enabled);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
