@@ -173,11 +173,12 @@ class HfWeightLoader(BaseWeightLoader):
         return self._checkpoint_io_policy
 
     def activate_weight_session(self,
-                                readiness_error: BaseException | None = None
-                                ) -> None:
+                                readiness_error: BaseException | None = None,
+                                *,
+                                weight_mapper: Any = None) -> None:
         """Collectively validate readiness, then activate deferred reads."""
         session = self._pending_read_ahead_session
-        if (self._checkpoint_io_policy != _BOUNDED_RANK_STRIPED_IO_POLICY
+        if (self._checkpoint_io_policy not in _RANK_STRIPED_IO_POLICIES
                 or session is None):
             if readiness_error is not None:
                 raise readiness_error
@@ -185,7 +186,7 @@ class HfWeightLoader(BaseWeightLoader):
 
         coordinated_readiness_error = coordinate_error(
             session.active_communicator,
-            "bounded rank-striped mapper readiness",
+            "rank-striped mapper readiness",
             readiness_error,
         )
         if coordinated_readiness_error is not None:
@@ -201,6 +202,71 @@ class HfWeightLoader(BaseWeightLoader):
                 raise readiness_error
             raise coordinated_readiness_error
 
+        if self._checkpoint_io_policy == _BOUNDED_RANK_STRIPED_IO_POLICY:
+            local_plan = None
+            plan_error = None
+            try:
+                if weight_mapper is None:
+                    raise ValueError(
+                        "bounded rank-striped activation requires an initialized "
+                        "weight mapper")
+                catalog = session.checkpoint_catalog
+                if catalog is None:
+                    raise ValueError(
+                        "bounded rank-striped activation requires a checkpoint "
+                        "catalog")
+                local_plan = weight_mapper.build_weight_load_plan(catalog)
+                local_plan.validate_against(catalog)
+            except Exception as error:
+                plan_error = error
+            coordinated_plan_error = coordinate_error(
+                session.active_communicator,
+                "bounded rank-striped weight plan build",
+                plan_error,
+            )
+            if coordinated_plan_error is not None:
+                self._degrade_bounded_activation(session, "weight plan build",
+                                                 coordinated_plan_error)
+                return
+            assert local_plan is not None
+
+            compiled_plan = None
+            compiler_error = None
+            try:
+                node_communicator = session.node_communicator
+                node_plans = ([local_plan] if node_communicator is None else
+                              node_communicator.allgather(local_plan))
+                compiled_plan = session.compile_local_plan(node_plans)
+            except Exception as error:
+                compiler_error = error
+            coordinated_compiler_error = coordinate_error(
+                session.active_communicator,
+                "bounded rank-striped weight plan compilation",
+                compiler_error,
+            )
+            if coordinated_compiler_error is not None:
+                self._degrade_bounded_activation(session,
+                                                 "weight plan compilation",
+                                                 coordinated_compiler_error)
+                return
+            assert compiled_plan is not None
+
+            configuration_error = None
+            try:
+                session.configure_plan(compiled_plan)
+            except Exception as error:
+                configuration_error = error
+            coordinated_configuration_error = coordinate_error(
+                session.active_communicator,
+                "bounded rank-striped reader configuration",
+                configuration_error,
+            )
+            if coordinated_configuration_error is not None:
+                self._degrade_bounded_activation(
+                    session, "reader configuration",
+                    coordinated_configuration_error)
+                return
+
         activation_error = None
         try:
             session.start(defer_reads=True)
@@ -208,7 +274,7 @@ class HfWeightLoader(BaseWeightLoader):
             activation_error = error
         coordinated_error = coordinate_error(
             session.active_communicator,
-            "bounded rank-striped reader activation",
+            "rank-striped reader activation",
             activation_error,
         )
         if coordinated_error is not None:
@@ -218,7 +284,7 @@ class HfWeightLoader(BaseWeightLoader):
             cleanup_error = session.cancel_reads()
             coordinated_cleanup_error = coordinate_error(
                 session.active_communicator,
-                "bounded rank-striped activation cleanup",
+                "rank-striped activation cleanup",
                 cleanup_error,
             )
             session.disable()
@@ -226,13 +292,24 @@ class HfWeightLoader(BaseWeightLoader):
             status.activated = False
             status.fallback_reason = str(coordinated_error)
             logger.warning(
-                "Bounded rank-striped activation degraded collectively before "
+                "Rank-striped activation degraded collectively before "
                 f"model materialization: {coordinated_error}")
             if coordinated_cleanup_error is not None:
                 raise coordinated_cleanup_error
             return
         session.release_reads()
         self._last_checkpoint_io_status.activated = True
+
+    def _degrade_bounded_activation(self, session: RankStripedReadAheadSession,
+                                    phase: str, error: BaseException) -> None:
+        """Disable unstarted advisory work after an all-rank decision."""
+        session.disable()
+        status = self._last_checkpoint_io_status
+        status.activated = False
+        status.fallback_reason = str(error)
+        logger.warning(
+            "Bounded rank-striped read-ahead degraded collectively during "
+            f"{phase}; keeping the already-mapped native tensors: {error}")
 
     @property
     def last_checkpoint_io_status(self) -> _CheckpointIOStatus:
@@ -513,6 +590,10 @@ class HfWeightLoader(BaseWeightLoader):
                                       mapping=mapping,
                                       use_consolidated=use_consolidated,
                                       **kwargs) as weights:
+            # Synchronous callers have no later mapper-readiness boundary.
+            # V1 can activate directly; bounded mode collectively records that
+            # no initialized mapper is available and degrades in place.
+            self.activate_weight_session()
             return weights
 
     @contextmanager
@@ -838,6 +919,7 @@ class HfWeightLoader(BaseWeightLoader):
 
         weight_files = []
         stats = []
+        checkpoint_catalog = None
         available_memory = 0
         eligibility_reason = None
         preflight_error = None
@@ -857,6 +939,10 @@ class HfWeightLoader(BaseWeightLoader):
             elif (self._partial_model_loading
                   or int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0")) != 0):
                 eligibility_reason = "partial model loading was requested"
+            if (self._checkpoint_io_policy == _BOUNDED_RANK_STRIPED_IO_POLICY
+                    and eligibility_reason is None):
+                checkpoint_catalog = build_safetensors_checkpoint_catalog(
+                    weight_files)
             available_memory = effective_available_host_memory()
         except Exception as error:
             preflight_error = error
@@ -926,10 +1012,12 @@ class HfWeightLoader(BaseWeightLoader):
 
         discovery_signature = tuple(
             (os.path.basename(path), size) for path, size in file_sizes)
+        catalog_id = (None if checkpoint_catalog is None else
+                      checkpoint_catalog.catalog_id)
         selections = ([
-            (discovery_signature, eligibility_reason)
+            (discovery_signature, catalog_id, eligibility_reason)
         ] if active_communicator is None else active_communicator.allgather(
-            (discovery_signature, eligibility_reason)))
+            (discovery_signature, catalog_id, eligibility_reason)))
         if any(selection[0] != selections[0][0]
                for selection in selections[1:]):
             self._close_unactivated_session(
@@ -938,9 +1026,9 @@ class HfWeightLoader(BaseWeightLoader):
             raise RuntimeError(
                 "SafeTensors checkpoint discovery must match "
                 f"across model-load ranks; received {selections}.")
-        fallback_reasons = [(rank, selection[1])
+        fallback_reasons = [(rank, selection[2])
                             for rank, selection in enumerate(selections)
-                            if selection[1] is not None]
+                            if selection[2] is not None]
         if fallback_reasons:
             rank, reason = fallback_reasons[0]
             self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
@@ -949,6 +1037,14 @@ class HfWeightLoader(BaseWeightLoader):
                                             f"rank {rank}: {reason}",
                                             active_communicator,
                                             node_communicator, **kwargs), None
+        if any(selection[1] != selections[0][1]
+               for selection in selections[1:]):
+            self._close_unactivated_session(
+                None, node_communicator, active_communicator,
+                "rank-striped catalog mismatch cleanup")
+            raise RuntimeError(
+                "SafeTensors checkpoint catalogs must match across "
+                f"model-load ranks; received {selections}.")
 
         self._last_checkpoint_io_status.selected = self._checkpoint_io_policy
         session = None
@@ -960,10 +1056,16 @@ class HfWeightLoader(BaseWeightLoader):
                 local_size,
                 issuer_group_initial_lead_bytes=issuer_group_initial_lead_bytes,
             )
-            session = RankStripedReadAheadSession(active_communicator,
-                                                  node_communicator, plan)
-            if self._checkpoint_io_policy != _BOUNDED_RANK_STRIPED_IO_POLICY:
-                session.start()
+            session = RankStripedReadAheadSession(
+                active_communicator,
+                node_communicator,
+                plan,
+                checkpoint_catalog=checkpoint_catalog,
+                source_files=file_sizes,
+                local_rank=local_rank,
+                local_size=local_size,
+                issuer_group_initial_lead_bytes=issuer_group_initial_lead_bytes,
+            )
         except Exception as error:
             setup_error = error
         coordinated_setup_error = coordinate_error(active_communicator,
@@ -979,14 +1081,12 @@ class HfWeightLoader(BaseWeightLoader):
         assert session is not None
 
         status = self._last_checkpoint_io_status
-        status.activated = (self._checkpoint_io_policy
-                            != _BOUNDED_RANK_STRIPED_IO_POLICY)
+        status.activated = False
         group_budget_log = ("unbounded" if issuer_group_initial_lead_bytes
                             is None else str(issuer_group_initial_lead_bytes))
         local_budget_log = ("unbounded" if plan.initial_issuer_lead_bytes
                             is None else str(plan.initial_issuer_lead_bytes))
-        state = "activated" if status.activated else "prepared"
-        logger.info(f"Rank-striped checkpoint read-ahead {state}: "
+        logger.info(f"Rank-striped checkpoint read-ahead prepared: "
                     f"policy={self._checkpoint_io_policy}, "
                     f"local_rank={local_rank}, local_size={local_size}, "
                     f"workers={plan.workers}, assigned_bytes="

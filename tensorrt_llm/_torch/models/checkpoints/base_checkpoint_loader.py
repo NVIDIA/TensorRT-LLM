@@ -82,10 +82,13 @@ class BaseCheckpointLoader(ABC):
         """Whether the last load wrote weights directly into the model."""
         return False
 
-    def activate_weight_session(self,
-                                readiness_error: BaseException | None = None
-                                ) -> None:
+    def activate_weight_session(
+            self,
+            readiness_error: BaseException | None = None,
+            *,
+            weight_mapper: BaseWeightMapper | None = None) -> None:
         """Activate deferred advisory work before model materialization."""
+        del weight_mapper
         if readiness_error is not None:
             raise readiness_error
 

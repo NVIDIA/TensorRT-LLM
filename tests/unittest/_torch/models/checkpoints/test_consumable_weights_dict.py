@@ -70,6 +70,16 @@ def test_index_stays_correct_across_deletion_and_clear():
     assert weights.mark_consumed("b") == 0
 
 
+def test_mark_consumed_keys_ignores_duplicate_requests():
+    reports = []
+    tensor = torch.zeros(8, dtype=torch.uint8)
+    weights = ConsumableWeightsDict({"a.weight": tensor})
+    weights.set_consumption_observer(lambda *report: reports.append(report))
+
+    assert weights.mark_consumed_keys(["a.weight", "a.weight"]) == 1
+    assert reports == [(tensor.nbytes, 1, 1)]
+
+
 def test_take_ownership_empties_a_consumable_source():
     """The derived mapping aliases the source, so the source must let go.
 

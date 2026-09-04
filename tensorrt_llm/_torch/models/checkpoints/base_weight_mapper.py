@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
+from bisect import bisect_left
 from collections.abc import Callable, Mapping
 
 import torch
@@ -13,7 +14,8 @@ from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
 from tensorrt_llm._torch.models.checkpoints.weight_load_plan import (
     WeightDemand, WeightLoadOrderConfidence, WeightLoadPlan,
     WeightLoadPlanCoverage)
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import (DecoderModelForCausalLM,
+                                                       is_moe_weight_owner)
 
 
 class BaseWeightMapper(ABC):
@@ -86,18 +88,197 @@ class BaseWeightMapper(ABC):
 
     def build_weight_load_plan(self,
                                catalog: CheckpointCatalog) -> WeightLoadPlan:
-        """Build a conservative shadow plan for this rank.
+        """Build a conservative, source-neutral load plan for this rank.
 
-        The generic mapper cannot infer model-specific fusion, transformation,
-        or ordering dependencies. Treat the entire catalog as one indivisible
-        demand so consumers may use the plan for all-source read-ahead, but not
-        destination-aware selective I/O. Specialized mappers may override this
-        method to return an exact plan.
+        This method mirrors the native module walk without invoking any weight
+        transformation or loading callback. It uses module structure, explicit
+        fusion mappings, and preload hints to identify likely consumer groups.
+        The inference is advisory: every source tensor is retained exactly once,
+        unmatched tensors remain in physical catalog order at the tail, and the
+        plan never permits selective I/O. Specialized mappers may override this
+        method when they can provide stronger guarantees.
         """
         if self._model is None:
             raise ValueError(
                 "weight mapper must be initialized before building a load plan")
         mapping = self._model.model_config.mapping
+
+        # Catalog order is the source adapter's physical order. Preserve it
+        # within each inferred group and in the unmatched tail.
+        physical_names = tuple(tensor.name for tensor in catalog.tensors)
+        physical_index = {
+            name: index
+            for index, name in enumerate(physical_names)
+        }
+        sorted_names = tuple(sorted(physical_names))
+
+        named_modules = getattr(self._model, "named_modules", None)
+        if named_modules is None:
+            return self._build_opaque_weight_load_plan(catalog, physical_names)
+
+        modules = tuple(named_modules(remove_duplicate=False))
+        remaining_names = set(physical_names)
+        demands: list[WeightDemand] = []
+
+        def take_prefixes(prefixes: tuple[str, ...]) -> tuple[str, ...]:
+            """Take unassigned tensor names below structural module prefixes."""
+            matched_indexes: set[int] = set()
+            for prefix in prefixes:
+                if not prefix:
+                    continue
+                if prefix in remaining_names:
+                    matched_indexes.add(physical_index[prefix])
+
+                descendant_prefix = f"{prefix}."
+                index = bisect_left(sorted_names, descendant_prefix)
+                while (index < len(sorted_names)
+                       and sorted_names[index].startswith(descendant_prefix)):
+                    name = sorted_names[index]
+                    if name in remaining_names:
+                        matched_indexes.add(physical_index[name])
+                    index += 1
+
+            result = tuple(physical_names[index]
+                           for index in sorted(matched_indexes))
+            remaining_names.difference_update(result)
+            return result
+
+        def take_exact(names: tuple[str, ...]) -> tuple[str, ...]:
+            matched_indexes = {
+                physical_index[name]
+                for name in names
+                if name in remaining_names and name in physical_index
+            }
+            result = tuple(physical_names[index]
+                           for index in sorted(matched_indexes))
+            remaining_names.difference_update(result)
+            return result
+
+        def source_module_path(module_path: str, module: nn.Module) -> str:
+            """Mirror native path normalization without touching payloads."""
+            parts = module_path.split('.') if module_path else []
+            if (parts and parts[-1] == "backend"
+                    and is_moe_weight_owner(module)):
+                return '.'.join(parts[:-1])
+            return module_path
+
+        def infer_source_names(module_path: str,
+                               module: nn.Module) -> tuple[str, ...]:
+            # Match the materializer's early exit: only modules that own at
+            # least one parameter slot can be consumers in the native walk.
+            if not module._parameters or self.should_skip_module(module_path):
+                return ()
+
+            normalized_path = source_module_path(module_path, module)
+            module_parts = normalized_path.split('.') if normalized_path else []
+            module_name = module_parts[-1] if module_parts else ""
+            parent_parts = module_parts[:-1]
+
+            # A fused destination consumes raw tensors from explicitly named
+            # sibling subtrees, for example q_proj/k_proj/v_proj -> qkv_proj.
+            if module_name and self.does_require_special_handling(module_name):
+                prefixes = tuple('.'.join(parent_parts + [source_name])
+                                 for source_name in self.mapping[module_name])
+                return take_prefixes(prefixes)
+
+            # Custom module loaders receive the full structurally matched
+            # subtree. Do not treat the root as a subtree consumer: an empty
+            # prefix contains the whole checkpoint and conveys no useful order.
+            # Other model-specific path rewrites that are not expressed by the
+            # mapper (for example a checkpoint-only namespace prefix)
+            # intentionally miss here and remain in the safe, all-source
+            # unmatched tail.
+            if normalized_path and (self.is_special_instance_module(module)
+                                    or hasattr(module, 'load_weights')):
+                return take_prefixes((normalized_path, ))
+
+            # The native fallback copies only direct parameters. Descendant
+            # parameters belong to their own named-module consumers.
+            parameter_names = tuple(
+                f"{normalized_path}.{name}" if normalized_path else name
+                for name, _ in module.named_parameters(recurse=False))
+            return take_exact(parameter_names)
+
+        preload_suffixes = tuple(
+            getattr(self._model, "preload_weight_modules", None) or ())
+        preload_modules: list[tuple[str, nn.Module]] = []
+        preload_paths: set[str] = set()
+        for suffix in preload_suffixes:
+            for module_path, module in modules:
+                if (source_module_path(module_path, module).endswith(suffix)
+                        and module_path not in preload_paths):
+                    preload_paths.add(module_path)
+                    preload_modules.append((module_path, module))
+
+        previous_preload_group: str | None = None
+        for module_path, module in preload_modules:
+            source_names = infer_source_names(module_path, module)
+            if not source_names:
+                continue
+            group_id = f"preload:{len(demands):06d}:{module_path}"
+            predecessors = ((previous_preload_group, )
+                            if previous_preload_group is not None else ())
+            demands.append(
+                WeightDemand(
+                    group_id=group_id,
+                    source_names=source_names,
+                    destination_ranks=(mapping.rank, ),
+                    priority=len(demands),
+                    predecessors=predecessors,
+                ))
+            previous_preload_group = group_id
+
+        # Native materialization schedules non-preloaded modules concurrently,
+        # so represent them with equal priority and no artificial dependency
+        # chain. Tuple order remains a deterministic tie-breaker.
+        nonpreload_priority = len(demands)
+        for module_path, module in modules:
+            if module_path in preload_paths:
+                continue
+            source_names = infer_source_names(module_path, module)
+            if not source_names:
+                continue
+            demands.append(
+                WeightDemand(
+                    group_id=
+                    f"module:{len(demands):06d}:{module_path or '<root>'}",
+                    source_names=source_names,
+                    destination_ranks=(mapping.rank, ),
+                    priority=nonpreload_priority,
+                ))
+
+        # If structural inspection found nothing useful, expose no ordering
+        # claim. Otherwise retain every unresolved tensor as a physical tail.
+        if not demands:
+            return self._build_opaque_weight_load_plan(catalog, physical_names)
+
+        unmatched_names = tuple(name for name in physical_names
+                                if name in remaining_names)
+        if unmatched_names:
+            demands.append(
+                WeightDemand(
+                    group_id="unmatched_checkpoint_tensors",
+                    source_names=unmatched_names,
+                    destination_ranks=(mapping.rank, ),
+                    priority=nonpreload_priority + 1,
+                ))
+
+        plan = WeightLoadPlan(
+            catalog_id=catalog.catalog_id,
+            rank=mapping.rank,
+            world_size=mapping.world_size,
+            coverage=WeightLoadPlanCoverage.CONSERVATIVE,
+            ordering=WeightLoadOrderConfidence.ADVISORY,
+            demands=tuple(demands),
+        )
+        plan.validate_against(catalog)
+        return plan
+
+    def _build_opaque_weight_load_plan(
+            self, catalog: CheckpointCatalog,
+            physical_names: tuple[str, ...]) -> WeightLoadPlan:
+        """Build an all-source plan when no useful ordering can be inferred."""
+        mapping = self.model.model_config.mapping
         plan = WeightLoadPlan(
             catalog_id=catalog.catalog_id,
             rank=mapping.rank,
@@ -106,7 +287,7 @@ class BaseWeightMapper(ABC):
             ordering=WeightLoadOrderConfidence.OPAQUE,
             demands=(WeightDemand(
                 group_id="all_checkpoint_tensors",
-                source_names=tuple(sorted(catalog.tensor_names)),
+                source_names=physical_names,
                 destination_ranks=(mapping.rank, ),
             ), ),
         )

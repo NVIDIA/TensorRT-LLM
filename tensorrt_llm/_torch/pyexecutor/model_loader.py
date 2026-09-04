@@ -497,13 +497,15 @@ def _open_checkpoint_weight_session(
     return checkpoint_loader.open_weight_session(checkpoint_dir, **kwargs)
 
 
-def _activate_checkpoint_weight_session(
-        checkpoint_loader: Any,
-        readiness_error: BaseException | None = None) -> None:
+def _activate_checkpoint_weight_session(checkpoint_loader: Any,
+                                        readiness_error: BaseException
+                                        | None = None,
+                                        *,
+                                        weight_mapper: Any = None) -> None:
     """Coordinate mapper readiness before activating deferred loader work."""
     activate = getattr(checkpoint_loader, "activate_weight_session", None)
     if activate is not None:
-        activate(readiness_error)
+        activate(readiness_error, weight_mapper=weight_mapper)
     if readiness_error is not None:
         raise readiness_error
 
@@ -1920,8 +1922,11 @@ class ModelLoader:
                     weight_mapper,
                     **load_weights_kwargs,
                 )
-            _activate_checkpoint_weight_session(checkpoint_loader,
-                                                readiness_error)
+            _activate_checkpoint_weight_session(
+                checkpoint_loader,
+                readiness_error,
+                weight_mapper=weight_mapper,
+            )
             assert weight_mapper is not None
             self.weight_mapper = weight_mapper
             if weights:
@@ -1968,7 +1973,11 @@ class ModelLoader:
                     draft_weight_mapper,
                     mapping=self.mapping,
                 )
-            _activate_checkpoint_weight_session(checkpoint_loader, mapper_error)
+            _activate_checkpoint_weight_session(
+                checkpoint_loader,
+                mapper_error,
+                weight_mapper=draft_weight_mapper,
+            )
             assert draft_weight_mapper is not None
             with timing_metric(
                     ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.

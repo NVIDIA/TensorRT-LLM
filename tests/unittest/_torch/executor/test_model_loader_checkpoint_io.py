@@ -287,6 +287,8 @@ class _SessionCheckpointLoader:
         self.events = events
         self.checkpoint_dir = checkpoint_dir
         self.weights = {"model.weight": object()} if weights is None else weights
+        self.initialized_weight_mapper = object()
+        self.activation_mappers: list[object | None] = []
 
     @contextmanager
     def open_weight_session(
@@ -306,9 +308,15 @@ class _SessionCheckpointLoader:
     def get_initialized_weight_mapper(self, model: object, config: object) -> object:
         del model, config
         self.events.append("mapper_init")
-        return object()
+        return self.initialized_weight_mapper
 
-    def activate_weight_session(self, readiness_error: BaseException | None = None) -> None:
+    def activate_weight_session(
+        self,
+        readiness_error: BaseException | None = None,
+        *,
+        weight_mapper: object | None = None,
+    ) -> None:
+        self.activation_mappers.append(weight_mapper)
         self.events.append("session_activate")
         if readiness_error is not None:
             raise readiness_error
@@ -395,6 +403,7 @@ def test_model_loader_session_spans_mapper_and_materialization() -> None:
     assert "checkpoint_preparation_seconds" in loader.metrics
     assert "weight_population_seconds" in loader.metrics
     assert "checkpoint_finalization_seconds" in loader.metrics
+    assert checkpoint_loader.activation_mappers == [checkpoint_loader.initialized_weight_mapper]
 
 
 def test_shadow_plan_disabled_does_not_call_inspection_hooks(
@@ -429,15 +438,13 @@ def test_shadow_plan_is_advisory_and_preserves_materialization_order(
     events = []
     checkpoint_loader = _SessionCheckpointLoader(events)
     checkpoint_loader.build_checkpoint_catalog = MagicMock(
-        side_effect=lambda *_args, **_kwargs: (events.append("catalog") or catalog)
+        side_effect=lambda *_args, **_kwargs: events.append("catalog") or catalog
     )
     weight_mapper = SimpleNamespace(
-        build_weight_load_plan=MagicMock(
-            side_effect=lambda _catalog: (events.append("plan") or plan)
-        )
+        build_weight_load_plan=MagicMock(side_effect=lambda _catalog: events.append("plan") or plan)
     )
     checkpoint_loader.get_initialized_weight_mapper = MagicMock(
-        side_effect=lambda *_args: (events.append("mapper_init") or weight_mapper)
+        side_effect=lambda *_args: events.append("mapper_init") or weight_mapper
     )
     model = MagicMock()
     loader = ModelLoader.__new__(ModelLoader)
@@ -459,6 +466,7 @@ def test_shadow_plan_is_advisory_and_preserves_materialization_order(
         "mapper_init",
         "catalog",
         "plan",
+        "session_activate",
         "materialize",
         "session_exit",
     ]
@@ -555,9 +563,13 @@ def test_preload_readiness_failure_is_coordinated_before_activation_start() -> N
                 raise local_error
             return False
 
-        def activate(readiness_error: BaseException | None = None) -> None:
+        def activate(
+            readiness_error: BaseException | None = None,
+            *,
+            weight_mapper: object | None = None,
+        ) -> None:
             events.append("session_activate")
-            bounded_loader.activate_weight_session(readiness_error)
+            bounded_loader.activate_weight_session(readiness_error, weight_mapper=weight_mapper)
 
         checkpoint_loader.is_weights_preloaded = check_preloaded
         checkpoint_loader.activate_weight_session = activate
@@ -609,7 +621,7 @@ def test_draft_session_spans_mapper_and_materialization(
         demands=(WeightDemand("all", ("draft.weight",), (0,)),),
     )
     checkpoint_loader.build_checkpoint_catalog = MagicMock(
-        side_effect=lambda *_args, **_kwargs: (events.append("catalog") or catalog)
+        side_effect=lambda *_args, **_kwargs: events.append("catalog") or catalog
     )
     model = MagicMock()
     model.draft_config = SimpleNamespace(
@@ -624,9 +636,7 @@ def test_draft_session_spans_mapper_and_materialization(
     )
     draft_mapper = MagicMock()
     draft_mapper.init_model_and_config.side_effect = lambda *_args: events.append("mapper_init")
-    draft_mapper.build_weight_load_plan.side_effect = lambda _catalog: (
-        events.append("plan") or plan
-    )
+    draft_mapper.build_weight_load_plan.side_effect = lambda _catalog: events.append("plan") or plan
     monkeypatch.setattr(
         model_loader_module.AutoCheckpointMapper, "get", MagicMock(return_value=draft_mapper)
     )
@@ -645,6 +655,7 @@ def test_draft_session_spans_mapper_and_materialization(
     assert "draft_checkpoint_preparation_seconds" in loader.metrics
     assert "draft_weight_population_seconds" in loader.metrics
     assert "draft_checkpoint_finalization_seconds" in loader.metrics
+    assert checkpoint_loader.activation_mappers == [draft_mapper]
 
 
 def test_draft_mapper_failure_reaches_activation_before_session_finish(
@@ -698,7 +709,7 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization(
         demands=(WeightDemand("all", ("draft.weight",), (0,)),),
     )
     checkpoint_loader.build_checkpoint_catalog = MagicMock(
-        side_effect=lambda *_args, **_kwargs: (events.append("catalog") or catalog)
+        side_effect=lambda *_args, **_kwargs: events.append("catalog") or catalog
     )
     model = MagicMock()
     model.draft_config = None
@@ -707,9 +718,7 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization(
     loader.spec_config = SimpleNamespace(speculative_model="/draft")
     loader.mapping = object()
     loader.weight_mapper = SimpleNamespace(
-        build_weight_load_plan=MagicMock(
-            side_effect=lambda _catalog: (events.append("plan") or plan)
-        )
+        build_weight_load_plan=MagicMock(side_effect=lambda _catalog: events.append("plan") or plan)
     )
     loader._call_load_weights = MagicMock(
         side_effect=lambda *_args, **_kwargs: events.append("materialize")

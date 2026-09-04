@@ -238,10 +238,12 @@ class ConsumableWeightsDict:
         tensors rather than a whole ``name.*`` subtree.
         """
         removed_keys = []
+        seen_keys = set()
         with self._lock:
             for key in keys:
-                if key in self._weights:
+                if key in self._weights and key not in seen_keys:
                     removed_keys.append(key)
+                    seen_keys.add(key)
             consumed_bytes, sized_items = self._consumption_report_locked(
                 removed_keys)
             for key in removed_keys:

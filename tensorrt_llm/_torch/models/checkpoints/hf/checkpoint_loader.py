@@ -93,15 +93,19 @@ class HfCheckpointLoader(BaseCheckpointLoader):
             use_consolidated=kwargs.get("use_consolidated", False),
         )
 
-    def activate_weight_session(self,
-                                readiness_error: BaseException | None = None
-                                ) -> None:
+    def activate_weight_session(
+            self,
+            readiness_error: BaseException | None = None,
+            *,
+            weight_mapper: BaseWeightMapper | None = None) -> None:
         """Start deferred read-ahead only on the built-in HF path."""
         if (type(self) is HfCheckpointLoader
                 and type(self.weight_loader) is HfWeightLoader):
-            self.weight_loader.activate_weight_session(readiness_error)
+            self.weight_loader.activate_weight_session(
+                readiness_error, weight_mapper=weight_mapper)
             return
-        super().activate_weight_session(readiness_error)
+        super().activate_weight_session(readiness_error,
+                                        weight_mapper=weight_mapper)
 
     @property
     def weight_loader(self) -> BaseWeightLoader:
