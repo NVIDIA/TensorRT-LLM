@@ -4044,7 +4044,7 @@ def runPytestWithLog(stageName, pytestCommand, invIdx, unfinishedFile, timeoutDa
     // created by the test container and can be root-owned. Keep the temporary
     // command file in the Jenkins-writable workspace root.
     def cmdFile = Utils.createTempLocation(pipeline, "./pytest_cmd_${invIdx}.sh")
-    def logFile = "${outDir}/pytest_output_inv${invIdx}.log"
+    def logFile = Utils.createTempLocation(pipeline, "./pytest_output_${invIdx}.log")
     def wrapperScript = "${llmSrc}/jenkins/scripts/run_pytest_with_log.sh"
 
     writeFile file: cmdFile, text: "#!/usr/bin/env bash\nset -ex\ncd '${llmSrc}/tests/integration/defs'\n${pytestCommand.join(' ')}"
@@ -4095,7 +4095,7 @@ def runPytestWithLog(stageName, pytestCommand, invIdx, unfinishedFile, timeoutDa
             }
         }
     } finally {
-        sh "rm -f '${cmdFile}' || true"
+        sh "rm -f '${cmdFile}' '${logFile}' || true"
     }
 }
 
