@@ -12,6 +12,9 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  # Documentation link validation (CPU-only, no GPU needed)
+  - test_doc.py::test_http_url_validity
+  - test_doc.py::test_relative_path_validity
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises
