@@ -3312,12 +3312,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._apply_branch_snapshot_point(request)
 
     def _apply_branch_snapshot_point(self, request: LlmRequest) -> None:
-        # prompt_len is unioned in unconditionally: try_commit_blocks derives
-        # commit_limit from max(snapshot_points), so a lone branch point below
-        # the prompt end would silently stop commits there and lose the
-        # prompt-end snapshot. It also makes the flag usable on its own.
         points = set(request.expect_snapshot_points)
-        points.add(request.prompt_len)
+        # Keep the flag usable without any configured snapshot placement. If a
+        # placement is configured, preserve it: adding prompt_len can replace a
+        # nearby recurrent checkpoint in the same radix-tree block because a
+        # block stores one recurrent page per life cycle.
+        if not points:
+            points.add(request.prompt_len)
         point = self._branch_snapshot_points.get(request.py_request_id)
         if point is not None and point > request.context_current_position:
             points.add(point)

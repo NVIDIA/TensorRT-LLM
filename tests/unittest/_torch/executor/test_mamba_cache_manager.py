@@ -3012,11 +3012,11 @@ def test_branch_snapshot_taken_counts_successful_commit_once():
     assert mgr._branch_snapshots_taken_total == 1
 
 
-def test_branch_snapshot_always_keeps_the_prompt_end_as_the_maximum():
-    """try_commit_blocks caps commits at max(snapshot_points).
+def test_branch_snapshot_adds_prompt_end_without_configured_placement():
+    """Keep branch snapshots usable when no baseline placement is configured.
 
     A branch point below the prompt end must not become the maximum, or the
-    prompt-end snapshot is silently lost against the current baseline.
+    feature would stop committing at the branch point.
     """
     mgr = _branch_snapshot_manager()
     request = _fake_context_request(prompt_len=256)
@@ -3025,6 +3025,25 @@ def test_branch_snapshot_always_keeps_the_prompt_end_as_the_maximum():
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
 
     assert max(request.expect_snapshot_points) == request.prompt_len
+
+
+def test_branch_snapshot_preserves_configured_nonzero_end_offset():
+    """Do not replace a same-block recurrent checkpoint before prompt end."""
+    mgr = _branch_snapshot_manager(
+        tokens_per_block=64,
+        additional_snapshot_offsets_from_end=[2],
+    )
+    request = _fake_context_request(prompt_len=256)
+    kv_cache = _fake_reuse_match(divergence=192)
+
+    mgr.prepare_expect_snapshot_points([request])
+    assert request.expect_snapshot_points == [254]
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    assert request.expect_snapshot_points == [192, 254]
+
+    mgr.prepare_expect_snapshot_points([request])
+    assert request.expect_snapshot_points == [192, 254]
 
 
 def test_branch_snapshot_points_stay_sorted_and_deduplicated():
