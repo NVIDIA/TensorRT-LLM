@@ -21,7 +21,6 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger, set_level
 
 from .._utils import mpi_world_size
-from ..bindings import executor as tllm
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
@@ -536,7 +535,6 @@ class GenerationExecutor(ABC):
     @staticmethod
     def create(
         engine: Path,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         model_world_size: int = 1,
         world_size: int = 0,
@@ -598,7 +596,6 @@ class GenerationExecutor(ABC):
 
         worker_kwargs = {
             "engine": engine,
-            "executor_config": executor_config,
             "batched_logits_processor": batched_logits_processor,
             "hf_model_dir": hf_model_dir,
             "tokenizer": tokenizer,
