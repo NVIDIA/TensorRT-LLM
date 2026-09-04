@@ -145,6 +145,31 @@ def test_exact_allocator_spends_the_modeled_real_row_target() -> None:
     assert sum(value + 1 for value in lens) + pad_tokens == 22
 
 
+def test_device_window_allocator_retains_ranked_host_fallback() -> None:
+    table = ExactSpsCostTable(
+        tables={3: ExactSpsCostRow(token_counts=(0, 14), step_time_ms=(8.0, 7.0))},
+        max_draft_len=5,
+    )
+    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table, device_windows=True)
+    decision = ExactSpsLocalDecision(
+        num_requests=3,
+        # Deliberately favor the last two requests. The host allocation remains
+        # a valid ranked fallback whenever the device prologue cannot run.
+        survival=torch.tensor([[0.1] * 5, [0.2] * 5, [0.9] * 5], dtype=torch.float32),
+        native_expected_yield=9.0,
+        compact_expected_yields=(8.0,),
+    )
+
+    lens, budget, pad_tokens = planner.allocate_exact_sps_candidate(
+        decision, graph_batch_size=3, verifier_budget=14
+    )
+
+    assert lens == [1, 5, 5]
+    assert budget == 8
+    assert pad_tokens == 0
+    assert sum(value + 1 for value in lens) == 14
+
+
 def test_unmeasured_exact_cell_is_rejected() -> None:
     table = ExactSpsCostTable(
         tables={4: ExactSpsCostRow(token_counts=(0, 14), step_time_ms=(8.0, 7.0))},
