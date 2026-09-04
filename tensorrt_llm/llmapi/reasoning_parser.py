@@ -179,7 +179,8 @@ class BaseReasoningParser(ABC):
     def finish(self) -> ReasoningParserResult:
         """Called when the stream ends. Subclasses may override to flush
         buffered state or reclassify accumulated content. The default
-        implementation returns an empty result."""
+        implementation returns an empty result.
+        """
         return ReasoningParserResult()
 
 
@@ -210,8 +211,7 @@ class IdentityReasoningParser(BaseReasoningParser):
 @register_reasoning_parser("minimax_m2", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2_append_think", reasoning_at_start=True)
 class DeepSeekR1Parser(BaseReasoningParser):
-    """
-    Reasoning parser for DeepSeek-R1. Reasoning format: <think>(.*)</think>.
+    """Reasoning parser for DeepSeek-R1. Reasoning format: <think>(.*)</think>.
     Since the latest official tokenizer_config.json initially adds "<think>\\n" at the end of the prompt
     (https://huggingface.co/deepseek-ai/DeepSeek-R1/blob/main/tokenizer_config.json),
     treat all the text before the </think> tag as `reasoning_content` and the text after as `content`.
@@ -387,6 +387,44 @@ class PoolsideV1ReasoningParser(DeepSeekV4ReasoningParser):
                 chat_template_kwargs=chat_template_kwargs)
 
 
+@register_reasoning_parser("xingchen4")
+class XingChen4ReasoningParser(BaseReasoningParser):
+    """Reasoning parser for XingChen4 models."""
+
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+
+    def __init__(
+        self,
+        *,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        kwargs = chat_template_kwargs or {}
+        value = kwargs.get("enable_thinking", kwargs.get("thinking"))
+        thinking_enabled = True if value is None else bool(value)
+
+        if thinking_enabled:
+            self._parser = DeepSeekR1Parser(
+                reasoning_at_start=True,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        else:
+            self._parser = IdentityReasoningParser(
+                chat_template_kwargs=chat_template_kwargs, )
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        if text.startswith(self.reasoning_start):
+            text = text[len(self.reasoning_start):]
+        return self._parser.parse(text)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        return self._parser.parse_delta(delta_text)
+
+    def finish(self) -> ReasoningParserResult:
+        return self._parser.finish()
+
+
 @register_reasoning_parser("minimax_m3")
 class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
     """Reasoning parser for MiniMax-M3.
@@ -442,6 +480,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
+    "xingchen4": "xingchen4",
     "laguna": "poolside_v1",
     "deepseek_v4": "deepseek_v4",
     "nemotron_h": "nemotron-v3",
@@ -580,7 +619,8 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         reasoning_content into content so the response always has content.
 
         Whitespace-only content (e.g. a newline after the closing think tag) is
-        treated as empty so the swap still runs (NVBug 6060281)."""
+        treated as empty so the swap still runs (NVBug 6060281).
+        """
         content = result.content or ""
         if self._force_nonempty_content and not content.strip(
         ) and result.reasoning_content:
@@ -597,7 +637,8 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
 
         `<tool_call>` is a special token that always arrives as a single
         atomic delta, so we only need to check `delta_text` (not the
-        parent's internal buffer)."""
+        parent's internal buffer).
+        """
         if (self.in_reasoning and self._tool_call_start in delta_text
                 and self.reasoning_end not in self._buffer):
             remaining = self._buffer
@@ -633,7 +674,8 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         as reasoning_content since we are still in reasoning mode.
 
         If the closing tag was already found (or reasoning was never
-        entered), flushes any remaining buffer as content."""
+        entered), flushes any remaining buffer as content.
+        """
         if self.in_reasoning and not self._found_closing_tag:
             remaining = self._buffer
             self._buffer = ""

@@ -1260,7 +1260,7 @@ class MTPForCausalLM(nn.Module):
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
                 mtp_layer = Glm4MTP
-            case "deepseek_v3" | "deepseek_v32" | "glm_moe_dsa":
+            case "deepseek_v3" | "deepseek_v32" | "glm_moe_dsa" | "xingchen4":
                 from .modeling_deepseekv3 import DeepseekV3MTP
                 mtp_layer = DeepseekV3MTP
             case "exaone_moe":
@@ -1318,7 +1318,9 @@ class MTPDraftModel(nn.Module):
                                 layer_idx,
                                 aux_stream_dict,
                                 is_separate_draft_engine=True)
-        elif model_type in ["deepseek_v3", "deepseek_v32", "glm_moe_dsa"]:
+        elif model_type in [
+                "deepseek_v3", "deepseek_v32", "glm_moe_dsa", "xingchen4"
+        ]:
             from .modeling_deepseekv3 import DeepseekV3MTP
             mtp_layer = DeepseekV3MTP(model_config,
                                       layer_idx,
