@@ -44,7 +44,7 @@ class _ContiguousKVStorage:
 
 @dataclass(frozen=True)
 class _PagedKVStorage:
-    """Paged K/V storage and request metadata consumed by one run."""
+    """Paged K/V storage and request metadata consumed by one live run."""
 
     paged_kv_cache: PagedKVCache
     paged_kv_indptr: torch.Tensor
@@ -54,7 +54,7 @@ class _PagedKVStorage:
 
 @dataclass(frozen=True)
 class _PagedKVLaunchPayload:
-    """Launch-only paged metadata derived during shared validation."""
+    """Launch-only live paged metadata derived during shared validation."""
 
     paged_kv_indptr: torch.Tensor
     paged_kv_indices: torch.Tensor
@@ -75,7 +75,7 @@ class _BlockSparseRunArgs:
     block_indptr: torch.Tensor
     block_indices: torch.Tensor
     kv_valid_bits: torch.Tensor
-    kv_valid_bits_is_active: bool
+    kv_valid_bits_is_live: bool
     sm_scale: float
     paged_kv: _PagedKVLaunchPayload | None
 
@@ -167,7 +167,7 @@ def validate_paged_kv_metadata(
     device: torch.device,
     batch_size: int,
 ) -> None:
-    """Validate the shared structural ABI for per-run paged request metadata."""
+    """Validate the shared structural ABI for live paged request metadata."""
 
     for tensor, name, shape in (
         (paged_kv_indptr, "paged_kv_indptr", (batch_size + 1,)),
@@ -225,7 +225,7 @@ def validate_block_sparse_run(
     Q/O use compact ``[B, Sq, Hq, D]`` on the planned device and dtype.
     Contiguous K/V use compact ``[B, Skv, Hkv, D]`` directly. Paged K/V are
     normalized once into zero-copy HND cache views plus launch metadata. An
-    explicit output is returned by identity and may not overlap any launch
+    explicit output is returned by identity and may not overlap any live launch
     input. ``sm_scale=None`` is materialized as ``1 / sqrt(D)``.
     """
 
@@ -378,7 +378,7 @@ def validate_block_sparse_run(
         block_indptr=block_indptr,
         block_indices=block_indices,
         kv_valid_bits=effective_kv_valid_bits,
-        kv_valid_bits_is_active=state.use_kv_valid_bits,
+        kv_valid_bits_is_live=state.use_kv_valid_bits,
         sm_scale=effective_scale,
         paged_kv=paged_kv,
     )
@@ -396,7 +396,7 @@ def record_block_sparse_run_args(
     run_args.out.record_stream(stream)
     run_args.block_indptr.record_stream(stream)
     run_args.block_indices.record_stream(stream)
-    if run_args.kv_valid_bits_is_active:
+    if run_args.kv_valid_bits_is_live:
         run_args.kv_valid_bits.record_stream(stream)
     if run_args.paged_kv is not None:
         run_args.paged_kv.paged_kv_indptr.record_stream(stream)

@@ -61,7 +61,7 @@ from .fmha_resources import (
 
 @dataclass(kw_only=True)
 class PackedContextWorkQueue(WorkQueue):
-    """Persistent queue that skips Q tiles outside a runtime packed request."""
+    """Persistent queue that skips Q tiles outside a live packed request."""
 
     cfg: cutlass.Constexpr[FmhaConfig] = field(init=False, default=None)
     cum_seqlen_q: Any = field(init=False, default=None)
@@ -72,7 +72,7 @@ class PackedContextWorkQueue(WorkQueue):
         cum_seqlen_q: cute.Tensor,
         **kwargs: Any,
     ) -> None:
-        """Attach the per-run packed-Q metadata used by the skip predicate."""
+        """Attach the live packed-Q metadata used by the skip predicate."""
         super().__init__(**kwargs)
         self.cfg = cfg
         self.cum_seqlen_q = cum_seqlen_q
@@ -123,7 +123,7 @@ def _schedule_with_work_queue(
 def _packed_context_skip_predicate(
     work_queue: WorkQueue | None,
 ) -> Callable[..., object] | None:
-    """Select the runtime-Q skip predicate before schedule capture creates proxies."""
+    """Select the live-Q skip predicate before schedule capture creates proxies."""
     if isinstance(work_queue, PackedContextWorkQueue):
         return PackedContextWorkQueue.skip_work_tile_if
     return None

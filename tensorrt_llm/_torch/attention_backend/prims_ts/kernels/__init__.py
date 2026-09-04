@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlashInfer-owned source package for the TS attention kernels.
+"""FlashInfer-owned source package for the experimental TS attention kernels.
 
 The compiler-facing modules are intentionally not imported here so ordinary
 FlashInfer imports do not require the CuTe DSL toolchain.

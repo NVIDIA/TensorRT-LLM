@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prepare per-run canonical BSR rows for the PrimTS FMHA route consumer.
+"""Prepare live canonical BSR rows for the PrimTS FMHA route consumer.
 
 The kernel converts caller-owned semantic KV blocks into fixed-stride route
 metadata on every run. Route origins are logical KV-token coordinates;
 the paged specialization also resolves each origin to a physical page ID for
 the attention load path. One warp handles one BSR row and iterates only that
-row's active routes, while four warps share a CTA.
+row's live routes, while four warps share a CTA.
 
 ``row_route_offsets`` is a separate plan-owned immutable Int32 tensor.
 ``route_workspace`` contains only mutable row counts and route metadata
-described by ``_BlockSparseRouteLayout``. Payload outside each active row
+described by ``_BlockSparseRouteLayout``. Payload outside each live row
 count is intentionally stale. ``max_blocks_per_row`` is the plan-declared
 semantic BSR-block limit, which remains distinct from packed-route capacity.
 """
@@ -135,7 +135,7 @@ def _retained_atom_count(
         remaining_tokens = cutlass.Int32(seq_len_kv) - last_block_origin
         runtime_assert(
             remaining_tokens > cutlass.Int32(0),
-            "block_indices row exceeds the active KV block range",
+            "block_indices row exceeds the live KV block range",
         )
         retained_last_atoms = (remaining_tokens - cutlass.Int32(1)) // cutlass.Int32(
             atom_size
@@ -310,7 +310,7 @@ def _publish_prepared_route_count(
     seq_len_kv: cutlass.Int32,
     cfg: cutlass.Constexpr[_PreparedRouteConfig],
 ) -> tuple[cutlass.Int32, cutlass.Int32]:
-    """Assert semantic capacity, publish the header, and return its active span."""
+    """Assert semantic capacity, publish the header, and return its live span."""
 
     row_route_begin = cutlass.Int32(0)
     required_route_count = cutlass.Int32(0)
@@ -614,7 +614,7 @@ class _PrepareBlockSparseRoutes:
         )
 
         request_begin = cutlass.Int32(0)
-        runtime_seq_len_kv = cutlass.Int32(self.cfg.seq_len_kv)
+        live_seq_len_kv = cutlass.Int32(self.cfg.seq_len_kv)
         if cutlass.const_expr(self.route_layout.is_paged):
             raw_seq_len_kv = cutlass.Int32(self.cfg.seq_len_kv)
             if lane_idx == cutlass.Int32(0) and row_is_valid:
@@ -622,14 +622,14 @@ class _PrepareBlockSparseRoutes:
                 runtime_assert(
                     raw_seq_len_kv >= cutlass.Int32(self.minimum_seq_len_kv)
                     and raw_seq_len_kv <= cutlass.Int32(self.cfg.seq_len_kv),
-                    "seq_lens_kv is outside the planned length range",
+                    "seq_lens_kv is outside the planned live-length range",
                 )
             raw_seq_len_kv = _warp_broadcast_i32(raw_seq_len_kv, 0)
-            runtime_seq_len_kv = raw_seq_len_kv
+            live_seq_len_kv = raw_seq_len_kv
 
             if lane_idx == cutlass.Int32(0) and row_is_valid:
                 required_pages = _positive_i32_ceil_div(
-                    runtime_seq_len_kv,
+                    live_seq_len_kv,
                     self.page_size,
                 )
                 request_begin = cutlass.Int32(paged_kv_indptr[batch_idx])
@@ -647,7 +647,7 @@ class _PrepareBlockSparseRoutes:
                         cutlass.Int32(cute.size(paged_kv_indices)),
                         required_pages,
                     ),
-                    "paged_kv_indptr row lacks the required active page capacity",
+                    "paged_kv_indptr row lacks the required live page capacity",
                 )
             request_begin = _warp_broadcast_i32(request_begin, 0)
 
@@ -661,7 +661,7 @@ class _PrepareBlockSparseRoutes:
             lane_idx,
             row_is_valid,
             max_blocks_per_row,
-            runtime_seq_len_kv,
+            live_seq_len_kv,
             self.cfg,
         )
 
@@ -688,7 +688,7 @@ class _PrepareBlockSparseRoutes:
                     self.cfg.kv_block_size,
                     self.cfg.atom_size,
                     self.cfg.logical_origins_per_route,
-                    runtime_seq_len_kv,
+                    live_seq_len_kv,
                 )
             if cutlass.const_expr(self.route_layout.is_paged):
                 physical_page_id = _resolve_paged_route_atom_page_id(
@@ -703,7 +703,7 @@ class _PrepareBlockSparseRoutes:
             if logical_origin_is_valid:
                 atom_is_full = cutlass.Boolean(
                     logical_origin
-                    <= runtime_seq_len_kv - cutlass.Int32(self.cfg.atom_size)
+                    <= live_seq_len_kv - cutlass.Int32(self.cfg.atom_size)
                 )
             if lane_idx < cutlass.Int32(self.cfg.logical_origins_per_route):
                 route_workspace[route_metadata_word_index + lane_idx] = logical_origin
@@ -727,7 +727,7 @@ class _PrepareBlockSparseRoutes:
                 logical_origin_is_valid,
                 atom_is_full,
                 route_metadata_word_index,
-                runtime_seq_len_kv,
+                live_seq_len_kv,
                 self.cfg,
             )
             route_idx = route_idx + cutlass.Int32(1)

@@ -290,7 +290,7 @@ def _init_causal_domain_state(
     # Index of the sequence coordinate in tile_coord.
     task._seq_idx = seq_idx
     # Mixed packed causal launches derive a request-local safe K-loop extent
-    # from per-run metadata. Fixed and uniform-packed launches leave these fields
+    # from live metadata. Fixed and uniform-packed launches leave these fields
     # unset and retain the static plan-time domain calculation above.
     task._batch_idx = batch_idx
     task._cum_seqlen_q = cum_seqlen_q
@@ -723,7 +723,7 @@ def build_context_task_manager(
         Number of KV tiles in the loop domain.
     q_offset : int or Int32
         Default right shift of Q rows for causal S_q < S_kv masking. Mixed
-        packed launches derive the request-local shift from per-run metadata.
+        packed launches derive the request-local shift from live metadata.
     domain_n_kwargs : dict
         Domain policy for tasks that process the full KV loop.
     domain_n_minus_1_kwargs : dict

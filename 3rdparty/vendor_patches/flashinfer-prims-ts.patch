@@ -1,5 +1,5 @@
 diff --git a/block_sparse.py b/block_sparse.py
-index a69006bcf8d6dd38e380e19fb8c3a22ace3a0545..3e1996e3fa4a834245b5207b8507d02a2bc36201 100644
+index 77a9fc4542ab5fb82aa0df6f7c73e56b7d5fbe89..af132c6a69ce0e4a35903b8e4428f481e949f6b8 100644
 --- a/block_sparse.py
 +++ b/block_sparse.py
 @@ -1,3 +1,4 @@
@@ -7,8 +7,57 @@ index a69006bcf8d6dd38e380e19fb8c3a22ace3a0545..3e1996e3fa4a834245b5207b8507d02a
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -35,12 +36,6 @@ from typing import Literal
+ import torch
+ 
+ from flashinfer.api_logging import flashinfer_api
+-from flashinfer.trace.templates.attention import (
+-    prims_ts_block_sparse_trace,
+-    prims_ts_block_sparse_wrapper_trace_dispatch,
+-    prims_ts_paged_block_sparse_trace_dispatch,
+-    prims_ts_paged_block_sparse_wrapper_trace_dispatch,
+-)
+ 
+ from ._block_sparse.config import _validate_block_sparse_static_profile
+ from ._block_sparse.inspection import (
+@@ -220,7 +215,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+         # previously published revision intact and runnable.
+         self._plan_state = candidate
+ 
+-    @flashinfer_api(trace=prims_ts_block_sparse_wrapper_trace_dispatch)
++    @flashinfer_api
+     def run(
+         self,
+         q: torch.Tensor,
+@@ -302,7 +297,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+         return self._launch_validated_run(state, run_args, run_stream)
+ 
+ 
+-@flashinfer_api(trace=prims_ts_block_sparse_trace)
++@flashinfer_api
+ def block_sparse_attention(
+     q: torch.Tensor,
+     k: torch.Tensor,
+@@ -512,7 +507,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+             )
+         self._plan_state = candidate
+ 
+-    @flashinfer_api(trace=prims_ts_paged_block_sparse_wrapper_trace_dispatch)
++    @flashinfer_api
+     def run(
+         self,
+         q: torch.Tensor,
+@@ -618,7 +613,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+         return self._launch_validated_run(state, run_args, run_stream)
+ 
+ 
+-@flashinfer_api(trace=prims_ts_paged_block_sparse_trace_dispatch)
++@flashinfer_api
+ def block_sparse_attention_with_paged_kv_cache(
+     q: torch.Tensor,
+     paged_kv_cache: PagedKVCache,
 diff --git a/decode.py b/decode.py
-index d08f4c9a014cef00e56d47e030807094c383962c..2334723b4d84e0d0d3ed7bb572bc839fd38fec22 100644
+index 11d2d9892d14b48c88ffa7a06b1c952587fb995d..bf567e3e8a0255acece3875189c36d0e0f8cd67e 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -16,8 +65,35 @@ index d08f4c9a014cef00e56d47e030807094c383962c..2334723b4d84e0d0d3ed7bb572bc839f
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -27,8 +28,6 @@ import torch
+ from flashinfer.api_logging import flashinfer_api
+ from flashinfer.trace.templates.attention import (
+     attention_ts_decode_trace_dispatch,
+-    prims_ts_decode_trace_dispatch,
+-    prims_ts_decode_wrapper_trace_dispatch,
+ )
+ 
+ from ._tensor_aliasing import (
+@@ -2179,7 +2178,7 @@ def _validate_decode_run_metadata_values(
+         )
+ 
+ 
+-@flashinfer_api(trace=prims_ts_decode_trace_dispatch)
++@flashinfer_api
+ def prims_ts_batch_decode_with_kv_cache(
+     query: torch.Tensor,
+     kv_cache: PagedKVCache,
+@@ -2704,7 +2703,7 @@ class BatchDecodePagedTSWrapper:
+         # previous complete plan revision usable.
+         self._plan_state = candidate
+ 
+-    @flashinfer_api(trace=prims_ts_decode_wrapper_trace_dispatch)
++    @flashinfer_api
+     def run(
+         self,
+         q: torch.Tensor,
 diff --git a/mla_decode.py b/mla_decode.py
-index 827f9413a7f2a1f2072b639fef428fb7b17de60b..dfd77328409d6f4ce9287cfb2203884901a476b6 100644
+index a6a91f762a57a6077bbaa6d43dbd228bb44a1fd7..9b41173bc4db8d6c737c5042d305cddaaf7793bc 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -25,3 +101,20 @@ index 827f9413a7f2a1f2072b639fef428fb7b17de60b..dfd77328409d6f4ce9287cfb22038849
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -25,7 +26,6 @@ from flashinfer.api_logging import flashinfer_api
+ from flashinfer.trace.templates.attention import (
+     prims_ts_decode_mla_one_shot_trace_dispatch,
+     prims_ts_decode_mla_trace_dispatch,
+-    prims_ts_decode_mla_wrapper_trace_dispatch,
+ )
+ 
+ from ._tensor_aliasing import (
+@@ -1906,7 +1906,7 @@ class BatchMLADecodePagedTSWrapper:
+             split_kv=int(dict(policy)["split_kv"]),
+         )
+ 
+-    @flashinfer_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
++    @flashinfer_api
+     def run(
+         self,
+         query: torch.Tensor,
