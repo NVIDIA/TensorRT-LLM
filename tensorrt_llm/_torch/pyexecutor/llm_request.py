@@ -812,6 +812,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_num_connector_matched_tokens = 0
 
+        # KV connector query state, used by KVCacheManagerV2 (V1 answers the
+        # query under the block manager's tree mutex and needs no state).
+        # UNASKED (`py_connector_prefix_end is None`) -> ASKED -> DELIVERED.
+        # `py_connector_prefix_end` is the absolute prompt position one past
+        # the last token the connector offered to serve, deliberately not the
+        # returned delta: the request may be deferred and re-derive a larger
+        # locally-matched prefix, against which a delta would overshoot.
+        self.py_connector_prefix_start: Optional[int] = None
+        self.py_connector_prefix_end: Optional[int] = None
+        self.py_connector_load_async = False
+        self.py_connector_delivered = False
+
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
             max_new_tokens=self.py_max_new_tokens,
@@ -849,7 +861,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self._cached_tokens = value
             self._cached_tokens_set = True
 
+    @property
     def is_generation_only_request(self):
+        # Must stay a property: the C++ base exposes this as a read-only
+        # property (nanobind/batch_manager/bindings.cpp), and a plain method
+        # here shadows it with something always-truthy for any caller that
+        # reads it as an attribute.
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
 
     def create_response(self,

@@ -125,7 +125,7 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
         exclude_last_generation_logits=False,
     )
 
-    assert llm_request.is_generation_only_request()
+    assert llm_request.is_generation_only_request
     assert llm_request.has_draft_tokens()
     assert llm_request.num_draft_tokens == len(draft_tokens)
     assert llm_request.draft_tokens == draft_tokens
