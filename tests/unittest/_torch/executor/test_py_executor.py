@@ -3329,3 +3329,40 @@ class TestAdpBalanceExcludesPadDummies:
         gathered = executor.dist.tp_allgather.call_args[0][0]
         assert gathered[1] == 2, "scheduled count keeps counting the dummy"
         assert gathered[3] == 1, "real count must exclude the dummy"
+
+
+def _make_pp_relay_executor(*, pp_size: int, is_last_pp_rank: bool) -> PyExecutor:
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.dist = Mock(pp_size=pp_size, is_last_pp_rank=is_last_pp_rank)
+    executor.num_micro_batches = pp_size
+    executor.send_handles = [object() for _ in range(pp_size)]
+    executor.wait_on_pp_send_handles = Mock()
+    return executor
+
+
+@pytest.mark.parametrize("pp_size", [3, 4, 5])
+def test_last_pp_rank_drains_only_the_relay_send_whose_recv_is_due(pp_size):
+    """The first rank relays slot ``(m + 1 - pp_size) % n`` in iteration ``m``;
+    the last rank must wait on exactly that slot before its forward. Waiting on
+    the others blocks it on recvs the peer posts only after its next
+    top-of-loop collectives, which need this rank (pp>=4 disagg deadlock)."""
+    executor = _make_pp_relay_executor(pp_size=pp_size, is_last_pp_rank=True)
+
+    for microbatch_id in range(pp_size):
+        executor.wait_on_pp_send_handles.reset_mock()
+
+        executor._drain_relay_sends_before_forward(microbatch_id)
+
+        first_rank_relay_slot = (microbatch_id + 1 - pp_size) % pp_size
+        executor.wait_on_pp_send_handles.assert_called_once_with(
+            executor.send_handles, first_rank_relay_slot
+        )
+
+
+def test_non_last_pp_rank_drains_every_relay_send():
+    executor = _make_pp_relay_executor(pp_size=4, is_last_pp_rank=False)
+
+    executor._drain_relay_sends_before_forward(2)
+
+    waited = sorted(call.args[1] for call in executor.wait_on_pp_send_handles.call_args_list)
+    assert waited == [0, 1, 2, 3]
