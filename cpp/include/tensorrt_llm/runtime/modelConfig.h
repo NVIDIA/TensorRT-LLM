@@ -547,16 +547,6 @@ public:
         mModelVariant = modelVariant;
     }
 
-    [[nodiscard]] SizeType32 getMaxDecodingDraftTokens() const
-    {
-        return getSpeculativeDecodingMode().isNone() ? 0 : getSpeculativeDecodingModule().getMaxDecodingDraftTokens();
-    }
-
-    [[nodiscard]] SizeType32 constexpr getMaxDecodingTokens() const noexcept
-    {
-        return getSpeculativeDecodingMode().isNone() ? 1 : getSpeculativeDecodingModule().getMaxDecodingTokens();
-    }
-
     void constexpr setContextFMHA(bool contextFMHA) noexcept
     {
         mContextFMHA = contextFMHA;

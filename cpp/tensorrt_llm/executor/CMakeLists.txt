@@ -47,7 +47,6 @@ set(SRCS
     dynamicBatchConfig.cpp
     schedulerConfig.cpp
     serialization.cpp
-    speculativeDecodingConfig.cpp
     tensor.cpp
     types.cpp
     requestUtils.cpp
