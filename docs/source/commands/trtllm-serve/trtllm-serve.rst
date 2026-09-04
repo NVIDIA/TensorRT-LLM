@@ -352,4 +352,4 @@ This syntax section lists all command line arguments for ``trtllm-serve``'s subc
    :nested: full
 
 Besides the above examples, `trtllm-serve` is also used as an entrypoint for performance benchmarking.
-Please refer to `Performance Benchmarking with `trtllm-serve` <https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/commands/trtllm-serve/trtllm-serve-bench.md>` for more details.
+Please refer to :doc:`run-benchmark-with-trtllm-serve` for more details.
