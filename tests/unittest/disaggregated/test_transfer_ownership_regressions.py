@@ -361,7 +361,7 @@ def test_pre_cancelled_rx_session_never_publishes_destination(
     receiver._pre_cancelled_rids = {rid}
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
-    receiver._shutdown = True
+    receiver._shutdown = False
     receiver.dispatch_task = Mock()
     receiver.send_cancel_to_senders = Mock()
 
@@ -390,7 +390,7 @@ def test_remote_cancel_resolves_strong_owned_session() -> None:
     receiver._pre_cancelled_rids = set()
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
-    receiver._shutdown = True
+    receiver._shutdown = False
     receiver.send_cancel_to_senders = Mock()
     session = _make_rx_session(receiver, rid)
 
@@ -562,7 +562,7 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     receiver._pre_cancelled_rids = set()
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
-    receiver._shutdown = True
+    receiver._shutdown = False
     receiver_req = SimpleNamespace(
         unique_rid=rid,
         slice_id=0,
@@ -646,7 +646,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     receiver._pre_cancelled_rids = set()
     receiver._bounce = bounce
     receiver._enforce_physical_ownership = True
-    receiver._shutdown = True
+    receiver._shutdown = False
     receiver._dealers = {}
     receiver_req = SimpleNamespace(
         unique_rid=rid,
@@ -815,7 +815,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     receiver._pre_cancelled_rids = set()
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
-    receiver._shutdown = True
+    receiver._shutdown = False
     receiver._dealers = {}
     receiver._build_recv_req_info = Mock(
         return_value=SimpleNamespace(
@@ -1368,6 +1368,7 @@ def test_aux_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> N
     rid = 98
     peer_rank = 2
     sender = _make_owned_sender()
+    sender._instance_rank = 5
     sender._device_id = 0
     sender._agent = Mock()
     sender._registrar = SimpleNamespace(
