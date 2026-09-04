@@ -724,8 +724,8 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         uint32_t numWorker = config.backendParams.find("num_workers") != config.backendParams.end()
             ? std::stoi(config.backendParams.at("num_workers"))
             : 1;
-        nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
-            numWorker, 0, 10000, config.enableTelemetry};
+        nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_RW, numWorker,
+            0, 10000, config.enableTelemetry};
         mAddress = getAvailableIP() + ":" + std::to_string(port);
         mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
@@ -735,8 +735,8 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
             ? std::stoi(config.backendParams.at("num_workers"))
             : 1;
         mAddress.clear();
-        nixlAgentConfig nixlConfig{config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
-            numWorker, 0, 10000, config.enableTelemetry};
+        nixlAgentConfig nixlConfig{config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_RW, numWorker,
+            0, 10000, config.enableTelemetry};
         mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
 
