@@ -3019,6 +3019,44 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
 // ============================== Lora Add Bias =================================
 constexpr static int LORA_KERNELS_THREADS_PER_BLOCK = 256;
 
+#if defined(ENABLE_FP8)
+template <class T>
+__global__ void convertMoeLoraInputToFp8Kernel(__nv_fp8_e4m3* output, T const* input, int64_t numElements)
+{
+    int64_t const index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < numElements)
+    {
+        output[index] = __nv_fp8_e4m3(static_cast<float>(input[index]));
+    }
+}
+
+template <class T>
+__global__ void convertMoeLoraOutputFromFp8Kernel(T* output, __nv_fp8_e4m3 const* input, int64_t numElements)
+{
+    int64_t const index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < numElements)
+    {
+        output[index] = static_cast<T>(static_cast<float>(input[index]));
+    }
+}
+
+template <class T>
+void convertMoeLoraInputToFp8(__nv_fp8_e4m3* output, T const* input, int64_t numElements, cudaStream_t stream)
+{
+    constexpr int kThreads = 256;
+    int const blocks = static_cast<int>((numElements + kThreads - 1) / kThreads);
+    convertMoeLoraInputToFp8Kernel<<<blocks, kThreads, 0, stream>>>(output, input, numElements);
+}
+
+template <class T>
+void convertMoeLoraOutputFromFp8(T* output, __nv_fp8_e4m3 const* input, int64_t numElements, cudaStream_t stream)
+{
+    constexpr int kThreads = 256;
+    int const blocks = static_cast<int>((numElements + kThreads - 1) / kThreads);
+    convertMoeLoraOutputFromFp8Kernel<<<blocks, kThreads, 0, stream>>>(output, input, numElements);
+}
+#endif
+
 template <class ScaleBiasType, class LoraType, bool IsGated>
 __global__ void loraAddBiasKernel(ScaleBiasType* output, LoraType const* lora_result, ScaleBiasType const* bias,
     int64_t const* num_valid_tokens_ptr, int* permuted_token_selected_experts, int64_t inter_size)
@@ -3294,13 +3332,16 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node, use_mxfp8_weight_scaling_);
 
     // lora related
-    size_t const lora_input_size
-        = (use_lora && use_fp8) ? std::max(permuted_elems, interbuf_elems) * sizeof(ScaleBiasType) : 0;
+    size_t const lora_input_size = use_lora ? std::max(permuted_elems, interbuf_elems) * sizeof(ScaleBiasType) : 0;
     size_t const lora_fc1_result_size = use_lora
         ? (is_gated_activation ? 2 * interbuf_elems * sizeof(ScaleBiasType) : interbuf_elems * sizeof(ScaleBiasType))
         : 0;
     size_t const lora_add_bias_size = use_lora ? lora_fc1_result_size : 0;
     size_t const lora_fc2_result_size = use_lora ? permuted_elems * sizeof(ScaleBiasType) : 0;
+    size_t const lora_fp8_input_size = use_lora ? std::max(permuted_elems, interbuf_elems) * sizeof(uint8_t) : 0;
+    size_t const lora_fp8_result_size = use_lora
+        ? std::max(is_gated_activation ? 2 * interbuf_elems : interbuf_elems, permuted_elems) * sizeof(uint8_t)
+        : 0;
 
     // We do some overlapping of the large workspace buffers. Although we could overlap some of the other buffers, they
     // are small enough (i.e no factor of hidden size) they will only be a couple MiB at most, so we don't bother
@@ -3402,6 +3443,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     ADD(lora_fc1_result);
     ADD(lora_add_bias);
     ADD(lora_fc2_result);
+    ADD(lora_fp8_input);
+    ADD(lora_fp8_result);
     ADD(deepseek_fc_workspace);
     ADD(smoothed_act);
 
@@ -3525,6 +3568,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     lora_fc1_result_ = {};
     lora_add_bias_ = {};
     lora_fc2_result_ = {};
+    lora_fp8_input_ = {};
+    lora_fp8_result_ = {};
 
     if (use_lora)
     {
@@ -3532,10 +3577,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         lora_fc1_result_ = getWsPtr(ScaleBiasType{}, "lora_fc1_result");
         lora_add_bias_ = getWsPtr(ScaleBiasType{}, "lora_add_bias");
         lora_fc2_result_ = getWsPtr(ScaleBiasType{}, "lora_fc2_result");
+        lora_fp8_input_ = getWsPtr(uint8_t{}, "lora_fp8_input");
+        lora_fp8_result_ = getWsPtr(uint8_t{}, "lora_fp8_result");
         TLLM_CHECK_WITH_INFO(!use_fp8 || lora_input_ != nullptr, "LoRA input must not be nullptr if FP8 is enabled");
         TLLM_CHECK(lora_fc1_result_ != nullptr);
         TLLM_CHECK(lora_add_bias_ != nullptr);
         TLLM_CHECK(lora_fc2_result_ != nullptr);
+        TLLM_CHECK(lora_fp8_input_ != nullptr);
+        TLLM_CHECK(lora_fp8_result_ != nullptr);
     }
 
     if (use_deepseek_fp8_block_scale)
@@ -4248,7 +4297,6 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     }
     else if constexpr (!act_fp4)
     {
-        TLLM_CHECK(!lora_input_);
         input = reinterpret_cast<ScaleBiasType*>(permuted_data_);
     }
 
@@ -4258,27 +4306,57 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     if (lora_params.grouped_gemm.enabled)
     {
         auto const& grouped_gemm = lora_params.grouped_gemm;
-        tensorrt_llm::DataType const data_type = moeLoraDataType<ScaleBiasType>();
+        tensorrt_llm::DataType const data_type = grouped_gemm.data_type;
+        tensorrt_llm::DataType const compute_data_type = moeLoraDataType<ScaleBiasType>();
 
-        // The grouped-GEMM GEMM skips rank-0 rows, but the bias/reorder paths
-        // read lora_fc1_result_ for every valid row. Zero the buffer first so
-        // skipped rows are a deterministic no-op. It is contiguous and holds
-        // both the gated and fc1 halves when gated, so one memset covers both.
-        size_t const fc1_result_bytes = static_cast<size_t>(expanded_num_rows) * static_cast<size_t>(inter_size)
-            * (is_gated_activation ? 2u : 1u) * sizeof(ScaleBiasType);
-        TLLM_CUDA_CHECK(cudaMemsetAsync(lora_fc1_result_, 0, fc1_result_bytes, stream));
+        int64_t const fc1_result_elements = expanded_num_rows * inter_size * (is_gated_activation ? 2 : 1);
+        void const* grouped_input = input;
+        void* grouped_fc1_output = lora_fc1_result;
+        void* grouped_gated_output = lora_gated_out;
+
+        if (data_type == tensorrt_llm::DataType::kFP8)
+        {
+#if defined(ENABLE_FP8)
+            auto* fp8_input = static_cast<__nv_fp8_e4m3*>(lora_fp8_input_);
+            convertMoeLoraInputToFp8(fp8_input, input, expanded_num_rows * hidden_size, stream);
+            grouped_input = fp8_input;
+
+            auto* fp8_output = static_cast<__nv_fp8_e4m3*>(lora_fp8_result_);
+            auto* fp8_fc1_output = fp8_output + (is_gated_activation ? expanded_num_rows * inter_size : 0);
+            grouped_fc1_output = fp8_fc1_output;
+            grouped_gated_output = fp8_output;
+            TLLM_CUDA_CHECK(cudaMemsetAsync(
+                fp8_output, 0, static_cast<size_t>(fc1_result_elements) * sizeof(__nv_fp8_e4m3), stream));
+#else
+            TLLM_THROW("FP8 MoE LoRA requires an ENABLE_FP8 build.");
+#endif
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(data_type == compute_data_type,
+                "MoE LoRA cache dtype must match the FP16/BF16 activation compute dtype unless the cache is FP8.");
+            TLLM_CUDA_CHECK(cudaMemsetAsync(
+                lora_fc1_result_, 0, static_cast<size_t>(fc1_result_elements) * sizeof(ScaleBiasType), stream));
+        }
 
         runMoeLoraGroupedGemmModule(grouped_gemm.fc1, expanded_num_rows, /*in_hidden_size=*/hidden_size,
-            grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices,
-            /*input_base=*/static_cast<void const*>(input),
-            /*output_base=*/static_cast<void*>(lora_fc1_result), grouped_gemm.run, data_type, stream);
+            grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices, grouped_input,
+            grouped_fc1_output, grouped_gemm.run, data_type, stream);
 
         if (is_gated_activation)
         {
             runMoeLoraGroupedGemmModule(grouped_gemm.gated, expanded_num_rows, /*in_hidden_size=*/hidden_size,
-                grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices,
-                /*input_base=*/static_cast<void const*>(input),
-                /*output_base=*/static_cast<void*>(lora_gated_out), grouped_gemm.run, data_type, stream);
+                grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices, grouped_input,
+                grouped_gated_output, grouped_gemm.run, data_type, stream);
+        }
+
+        if (data_type == tensorrt_llm::DataType::kFP8)
+        {
+#if defined(ENABLE_FP8)
+            convertMoeLoraOutputFromFp8(
+                lora_fc1_result_, static_cast<__nv_fp8_e4m3 const*>(lora_fp8_result_), fc1_result_elements, stream);
+            sync_check_cuda_error(stream);
+#endif
         }
     }
     else
@@ -4342,7 +4420,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     }
     else if constexpr (!act_fp4)
     {
-        TLLM_CHECK(!lora_input_);
         input = reinterpret_cast<ScaleBiasType*>(fc1_result_);
     }
 
@@ -4353,18 +4430,47 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     if (lora_params.grouped_gemm.enabled)
     {
         auto const& grouped_gemm = lora_params.grouped_gemm;
-        tensorrt_llm::DataType const data_type = moeLoraDataType<ScaleBiasType>();
+        tensorrt_llm::DataType const data_type = grouped_gemm.data_type;
+        tensorrt_llm::DataType const compute_data_type = moeLoraDataType<ScaleBiasType>();
 
-        // As in loraFC1, zero the output so rank-0 rows the GEMM skips do not
-        // feed stale data into the downstream add.
-        size_t const fc2_result_bytes
-            = static_cast<size_t>(num_tokens) * static_cast<size_t>(hidden_size) * sizeof(ScaleBiasType);
-        TLLM_CUDA_CHECK(cudaMemsetAsync(lora_fc2_result_, 0, fc2_result_bytes, stream));
+        int64_t const fc2_result_elements = num_tokens * hidden_size;
+        void const* grouped_input = input;
+        void* grouped_output = lora_fc2_result_;
+
+        if (data_type == tensorrt_llm::DataType::kFP8)
+        {
+#if defined(ENABLE_FP8)
+            auto* fp8_input = static_cast<__nv_fp8_e4m3*>(lora_fp8_input_);
+            convertMoeLoraInputToFp8(fp8_input, input, num_tokens * inter_size, stream);
+            grouped_input = fp8_input;
+
+            auto* fp8_output = static_cast<__nv_fp8_e4m3*>(lora_fp8_result_);
+            grouped_output = fp8_output;
+            TLLM_CUDA_CHECK(cudaMemsetAsync(
+                fp8_output, 0, static_cast<size_t>(fc2_result_elements) * sizeof(__nv_fp8_e4m3), stream));
+#else
+            TLLM_THROW("FP8 MoE LoRA requires an ENABLE_FP8 build.");
+#endif
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(data_type == compute_data_type,
+                "MoE LoRA cache dtype must match the FP16/BF16 activation compute dtype unless the cache is FP8.");
+            TLLM_CUDA_CHECK(cudaMemsetAsync(
+                lora_fc2_result_, 0, static_cast<size_t>(fc2_result_elements) * sizeof(ScaleBiasType), stream));
+        }
 
         runMoeLoraGroupedGemmModule(grouped_gemm.fc2, num_tokens, /*in_hidden_size=*/inter_size,
-            grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices,
-            /*input_base=*/static_cast<void const*>(input),
-            /*output_base=*/static_cast<void*>(lora_fc2_result_), grouped_gemm.run, data_type, stream);
+            grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices, grouped_input,
+            grouped_output, grouped_gemm.run, data_type, stream);
+
+        if (data_type == tensorrt_llm::DataType::kFP8)
+        {
+#if defined(ENABLE_FP8)
+            convertMoeLoraOutputFromFp8(
+                lora_fc2_result_, static_cast<__nv_fp8_e4m3 const*>(lora_fp8_result_), fc2_result_elements, stream);
+#endif
+        }
         sync_check_cuda_error(stream);
         return;
     }

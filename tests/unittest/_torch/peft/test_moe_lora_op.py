@@ -1239,6 +1239,70 @@ def test_moe_all_three_lora_with_gated_aliased_to_fc1_eager_matches_pytorch_refe
         MoERunner.runner_dict.clear()
 
 
+# -- Native FP8 routed-expert LoRA adapter weights -------------------------
+
+
+def _adapter_to_fp8(adapter):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    return {
+        name: tensor.clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn).contiguous()
+        for name, tensor in adapter.items()
+    }
+
+
+@requires_cuda_and_op
+@pytest.mark.parametrize("schema", ["per_request", "slot_indexed"])
+def test_moe_fp8_adapter_weights_change_output(schema):
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 16
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    out_baseline = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype)[0]
+
+    fc1_adapter = _adapter_to_fp8(
+        _make_per_expert_lora_scaled(
+            num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=510
+        )
+    )
+    gated_adapter = _adapter_to_fp8(
+        _make_per_expert_lora_scaled(
+            num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=511
+        )
+    )
+    fc2_adapter = _adapter_to_fp8(
+        _make_per_expert_lora_scaled(
+            num_experts, rank, inter_size, hidden_size, dtype=dtype, device=device, seed=512
+        )
+    )
+
+    builder = _build_lora_request_buffers if schema == "per_request" else _build_lora_slot_buffers
+    lora_kwargs = builder(
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
+        gated_a=gated_adapter["A"],
+        gated_b=gated_adapter["B"],
+    )
+    lora_kwargs["lora_dtype"] = torch.float8_e4m3fn
+
+    out_lora = _call_fused_moe(
+        x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=lora_kwargs
+    )[0]
+
+    assert out_lora.dtype == dtype
+    assert torch.isfinite(out_lora).all()
+    diff = (out_lora.float() - out_baseline.float()).abs().mean().item()
+    assert diff > 1e-3, f"Native FP8 MoE LoRA ({schema}) had no observable effect: {diff}"
+
+
 # -- Per-tensor FP8 (qdq) base weights + routed-expert LoRA -----------------
 #
 # The CUTLASS MoE LoRA kernel dequantizes per-tensor FP8 activations to the

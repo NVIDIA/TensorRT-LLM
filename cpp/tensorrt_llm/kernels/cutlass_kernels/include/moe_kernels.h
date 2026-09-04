@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1011,6 +1011,8 @@ private:
     ScaleBiasType* lora_fc1_result_{};
     ScaleBiasType* lora_add_bias_{};
     ScaleBiasType* lora_fc2_result_{};
+    void* lora_fp8_input_{};
+    void* lora_fp8_result_{};
     void* smoothed_act_{};
 
     TmaWarpSpecializedGroupedGemmInput tma_ws_grouped_gemm1_input_;

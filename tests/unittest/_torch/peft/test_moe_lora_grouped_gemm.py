@@ -105,6 +105,17 @@ def _make_adapter_set(num_experts, rank, hidden_size, inter_size, dtype, device,
     return {"fc1": fc1, "gated": gated, "fc2": fc2}
 
 
+def _adapter_set_to_fp8(adapters):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    return {
+        module: {
+            name: tensor.clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn).contiguous()
+            for name, tensor in weights.items()
+        }
+        for module, weights in adapters.items()
+    }
+
+
 def _per_request_kwargs(num_tokens, adapters, rank):
     """Single-request per-request schema covering all tokens with one adapter."""
     fc1, gated, fc2 = adapters["fc1"], adapters["gated"], adapters["fc2"]
@@ -275,6 +286,135 @@ def test_cuda_graph_replay_matches_eager():
     # Replay reproduces the captured computation bit-for-bit.
     torch.testing.assert_close(out_replay, out_eager, rtol=0, atol=0)
     torch.testing.assert_close(out_replay, out_ref, rtol=_RTOL, atol=_ATOL)
+
+
+@pytest.mark.parametrize("distinct_layers", [False, True])
+@requires_cuda_and_op
+def test_cuda_graph_replay_multiple_calls_shared_runner(distinct_layers):
+    """A model graph may invoke one cached MoE runner from many expert layers."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 4, 128, 256
+    num_experts, top_k, rank = 4, 2, 8
+    num_layers = 4
+
+    layer_inputs = []
+    for layer_idx in range(num_layers):
+        if not distinct_layers and layer_inputs:
+            layer_inputs.append(layer_inputs[0])
+            continue
+        input_seed = 1000 + layer_idx if distinct_layers else 1000
+        adapter_seed = 1100 + 10 * layer_idx if distinct_layers else 1100
+        x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+            num_tokens,
+            hidden_size,
+            inter_size,
+            num_experts,
+            top_k,
+            dtype,
+            device,
+            seed=input_seed,
+        )
+        adapters = _make_adapter_set(
+            num_experts,
+            rank,
+            hidden_size,
+            inter_size,
+            dtype,
+            device,
+            base_seed=adapter_seed,
+        )
+        slot_kwargs = _slot_kwargs(torch.zeros(num_tokens, dtype=torch.int32), [adapters], rank)
+        # Retain the adapter tensors alongside their raw-pointer tables.
+        layer_inputs.append((x, w3_w1, w2, topk_ids, topk_scores, slot_kwargs, adapters))
+
+    def call_layers():
+        return [
+            _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, dict(slot_kwargs))
+            for x, w3_w1, w2, topk_ids, topk_scores, slot_kwargs, _adapters in layer_inputs
+        ]
+
+    eager_outputs = [output.clone() for output in call_layers()]
+    for _ in range(2):
+        call_layers()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_outputs = call_layers()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for replay_output, eager_output in zip(captured_outputs, eager_outputs):
+        torch.testing.assert_close(replay_output, eager_output, rtol=0, atol=0)
+
+
+@requires_cuda_and_op
+def test_cuda_graph_activates_empty_slot_on_replay():
+    """Engine warmup captures empty LoRA slots before adapters enter the PEFT cache."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k, rank = 4, 2, 8
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    adapters = _make_adapter_set(
+        num_experts, rank, hidden_size, inter_size, dtype, device, base_seed=425
+    )
+    active_kwargs = _slot_kwargs(torch.zeros(num_tokens, dtype=torch.int32), [adapters], rank)
+    active_tables = {
+        key: value.clone()
+        for key, value in active_kwargs.items()
+        if isinstance(value, torch.Tensor) and ("ranks" in key or "weight_ptrs" in key)
+    }
+    replay_kwargs = active_kwargs
+    for key, value in replay_kwargs.items():
+        if isinstance(value, torch.Tensor) and ("ranks" in key or "weight_ptrs" in key):
+            value.zero_()
+
+    def call():
+        return _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, replay_kwargs)
+
+    graph, captured = _warmup_and_capture(call)
+    for key, value in active_tables.items():
+        replay_kwargs[key].copy_(value)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    out_ref = _reference(x, w3_w1, w2, topk_ids, topk_scores, adapters)
+    torch.testing.assert_close(captured, out_ref, rtol=_RTOL, atol=_ATOL)
+
+
+@requires_cuda_and_op
+def test_fp8_adapter_cuda_graph_replay_matches_eager():
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k, rank = 4, 2, 16
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    adapters = _adapter_set_to_fp8(
+        _make_adapter_set(num_experts, rank, hidden_size, inter_size, dtype, device, base_seed=450)
+    )
+    slot_kwargs = _slot_kwargs(torch.zeros(num_tokens, dtype=torch.int32), [adapters], rank)
+    slot_kwargs["lora_dtype"] = torch.float8_e4m3fn
+
+    def call():
+        return _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, dict(slot_kwargs))
+
+    baseline = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, {})
+    out_eager = call().clone()
+    graph, captured = _warmup_and_capture(call)
+    graph.replay()
+    torch.cuda.synchronize()
+    out_replay = captured.clone()
+
+    assert torch.isfinite(out_replay).all()
+    assert (out_replay.float() - baseline.float()).abs().mean().item() > 1e-3
+    torch.testing.assert_close(out_replay, out_eager, rtol=0, atol=0)
 
 
 @requires_cuda_and_op

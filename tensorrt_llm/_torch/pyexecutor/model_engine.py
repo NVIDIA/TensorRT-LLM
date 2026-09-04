@@ -1108,7 +1108,8 @@ class PyTorchModelEngine(ModelEngine):
                 lora_model_config=self.lora_model_config,
                 overlap_lora_and_base=lora_config.overlap_lora_and_base,
                 device='cuda',
-                max_tokens_per_seq=max_tokens_per_seq)
+                max_tokens_per_seq=max_tokens_per_seq,
+                max_num_tokens=self.max_num_tokens)
 
             logger.info(
                 f"Initialized CUDA Graph LoRA manager, "
