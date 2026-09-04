@@ -37,7 +37,7 @@ def get_visual_gen_attention_backend(
     Get diffusion attention backend class by name.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL", "TE")
 
     Returns:
         Diffusion attention backend class
@@ -51,10 +51,12 @@ def get_visual_gen_attention_backend(
                  Requires flash-attn package with cute interface
         - "CUTEDSL": CuTe DSL kernels. create_attention selects dense/SkipSoftmax FMHA or VSA
                       from AttentionConfig.sparse_attention_config.
+        - "TE": TransformerEngine FP8 attention; requires transformer_engine package
     """
     # Lazy imports to avoid circular dependency
     from .cute_dsl import CuTeDSLAttention
     from .flash_attn4 import FlashAttn4Attention
+    from .te import TEAttention
     from .trtllm import TrtllmAttention
     from .vanilla import VanillaAttention
 
@@ -68,6 +70,8 @@ def get_visual_gen_attention_backend(
         return FlashAttn4Attention
     elif backend_name == "CUTEDSL":
         return CuTeDSLAttention
+    elif backend_name == "TE":
+        return TEAttention
     else:
         # Default to VANILLA for maximum compatibility
         return VanillaAttention
