@@ -5459,3 +5459,223 @@ class TestForcedToolArgumentsEnd:
             "location": "Hello",
             "unit": "fahrenheit",
         }
+
+
+# ============================================================================
+# Tool parser: marker match with zero extracted calls warning — TRTLLM-17917
+# ============================================================================
+
+
+class TestToolParserEmptyExtractionWarning:
+    """Test diagnostic warnings when a tool parser matches markers but extracts no calls."""
+
+    def test_apply_tool_parser_warns_on_empty_extraction(
+        self,
+        sample_tools: list[ChatCompletionToolsParam],
+    ) -> None:
+        """Warn when marker is matched but extraction produces 0 calls."""
+        from unittest.mock import patch
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+        from tensorrt_llm.serve.postprocess_handlers import (
+            ChatPostprocArgs, apply_tool_parser)
+
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=sample_tools,
+        )
+        args = ChatPostprocArgs.from_request(req)
+        args.tool_parser = "qwen3"
+
+        # Malformed tool call that matches marker but cannot be extracted
+        text = "<tool_call>\n{invalid json\n</tool_call>"
+
+        with patch("tensorrt_llm.serve.postprocess_handlers.logger.warning") as mock_warn:
+            _normal_text, calls = apply_tool_parser(
+                args, output_index=0, text=text, streaming=False)
+
+            assert calls == []
+            matching_warnings = [
+                call.args[0] for call in mock_warn.call_args_list
+                if "Configured tool parser 'qwen3' matched tool-call marker" in str(call.args[0])
+            ]
+            assert len(matching_warnings) == 1
+            assert "Plausible causes: parser/template mismatch" in matching_warnings[0]
+
+    def test_apply_tool_parser_no_warning_when_no_marker(
+        self,
+        sample_tools: list[ChatCompletionToolsParam],
+    ) -> None:
+        """Do not warn when output contains no tool-call markers."""
+        from unittest.mock import patch
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+        from tensorrt_llm.serve.postprocess_handlers import (
+            ChatPostprocArgs, apply_tool_parser)
+
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=sample_tools,
+        )
+        args = ChatPostprocArgs.from_request(req)
+        args.tool_parser = "qwen3"
+
+        text = "Just a regular assistant response without any tool calls."
+
+        with patch("tensorrt_llm.serve.postprocess_handlers.logger.warning") as mock_warn:
+            _normal_text, calls = apply_tool_parser(
+                args, output_index=0, text=text, streaming=False)
+
+            assert calls == []
+            mock_warn.assert_not_called()
+
+    def test_apply_tool_parser_no_warning_when_calls_extracted(
+        self,
+        sample_tools: list[ChatCompletionToolsParam],
+    ) -> None:
+        """Do not warn when tool calls are successfully extracted."""
+        from unittest.mock import patch
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+        from tensorrt_llm.serve.postprocess_handlers import (
+            ChatPostprocArgs, apply_tool_parser)
+
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=sample_tools,
+        )
+        args = ChatPostprocArgs.from_request(req)
+        args.tool_parser = "qwen3"
+
+        text = '<tool_call>\n{"name": "get_weather", "arguments": {"location": "NYC"}}\n</tool_call>'
+
+        with patch("tensorrt_llm.serve.postprocess_handlers.logger.warning") as mock_warn:
+            _normal_text, calls = apply_tool_parser(
+                args, output_index=0, text=text, streaming=False)
+
+            assert len(calls) == 1
+            mock_warn.assert_not_called()
+
+    def test_apply_tool_parser_no_warning_when_streaming(
+        self,
+        sample_tools: list[ChatCompletionToolsParam],
+    ) -> None:
+        """Do not warn during incremental streaming chunks."""
+        from unittest.mock import patch
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+        from tensorrt_llm.serve.postprocess_handlers import (
+            ChatPostprocArgs, apply_tool_parser)
+
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=sample_tools,
+            stream=True,
+        )
+        args = ChatPostprocArgs.from_request(req)
+        args.tool_parser = "qwen3"
+
+        # Incomplete chunk during streaming
+        text = "<tool_call>\n"
+
+        with patch("tensorrt_llm.serve.postprocess_handlers.logger.warning") as mock_warn:
+            _normal_text, _calls = apply_tool_parser(
+                args, output_index=0, text=text, streaming=True)
+
+            mock_warn.assert_not_called()
+
+    def test_responses_apply_tool_parser_warns_on_empty_extraction(
+        self,
+        sample_tools: list[ChatCompletionToolsParam],
+    ) -> None:
+        """Warn in Responses API when marker matches but extraction produces 0 calls."""
+        from unittest.mock import patch
+        from tensorrt_llm.serve.responses_utils import _apply_tool_parser
+
+        text = "<tool_call>\n{invalid json\n</tool_call>"
+
+        with patch("tensorrt_llm.serve.responses_utils.logger.warning") as mock_warn:
+            _normal_text, calls = _apply_tool_parser(
+                tool_parser_id="qwen3",
+                tools=sample_tools,
+                output_index=0,
+                text=text,
+                streaming=False,
+            )
+
+            assert calls == []
+            matching_warnings = [
+                call.args[0] for call in mock_warn.call_args_list
+                if "Configured tool parser 'qwen3' matched tool-call marker" in str(call.args[0])
+            ]
+            assert len(matching_warnings) == 1
+            assert "Plausible causes: parser/template mismatch" in matching_warnings[0]
+
+    def test_responses_apply_tool_parser_no_warning_when_no_marker(
+        self,
+        sample_tools: list[ChatCompletionToolsParam],
+    ) -> None:
+        """Do not warn in Responses API when output contains no tool-call markers."""
+        from unittest.mock import patch
+        from tensorrt_llm.serve.responses_utils import _apply_tool_parser
+
+        text = "Just a regular assistant response without any tool calls."
+
+        with patch("tensorrt_llm.serve.responses_utils.logger.warning") as mock_warn:
+            _normal_text, calls = _apply_tool_parser(
+                tool_parser_id="qwen3",
+                tools=sample_tools,
+                output_index=0,
+                text=text,
+                streaming=False,
+            )
+
+            assert calls == []
+            mock_warn.assert_not_called()
+
+    def test_responses_apply_tool_parser_no_warning_when_calls_extracted(
+        self,
+        sample_tools: list[ChatCompletionToolsParam],
+    ) -> None:
+        """Do not warn in Responses API when tool calls are successfully extracted."""
+        from unittest.mock import patch
+        from tensorrt_llm.serve.responses_utils import _apply_tool_parser
+
+        text = '<tool_call>\n{"name": "get_weather", "arguments": {"location": "NYC"}}\n</tool_call>'
+
+        with patch("tensorrt_llm.serve.responses_utils.logger.warning") as mock_warn:
+            _normal_text, calls = _apply_tool_parser(
+                tool_parser_id="qwen3",
+                tools=sample_tools,
+                output_index=0,
+                text=text,
+                streaming=False,
+            )
+
+            assert len(calls) == 1
+            mock_warn.assert_not_called()
+
+    def test_responses_apply_tool_parser_suppresses_warning_when_disabled(
+        self,
+        sample_tools: list[ChatCompletionToolsParam],
+    ) -> None:
+        """Suppress diagnostic warning during intermediate streaming reparses."""
+        from unittest.mock import patch
+        from tensorrt_llm.serve.responses_utils import _apply_tool_parser
+
+        # Incomplete tool call chunk during streaming reparse
+        text = "<tool_call>\n{partial"
+
+        with patch("tensorrt_llm.serve.responses_utils.logger.warning") as mock_warn:
+            _normal_text, calls = _apply_tool_parser(
+                tool_parser_id="qwen3",
+                tools=sample_tools,
+                output_index=0,
+                text=text,
+                streaming=False,
+                warn_on_empty_extraction=False,
+            )
+
+            assert calls == []
+            mock_warn.assert_not_called()
+

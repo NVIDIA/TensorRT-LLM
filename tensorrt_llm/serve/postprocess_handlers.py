@@ -223,6 +223,19 @@ def apply_tool_parser(args: ChatPostprocArgs,
                       text: str,
                       streaming: bool,
                       finished: bool = False) -> Tuple[str, List[ToolCallItem]]:
+    """Apply the configured tool parser to extract tool calls from generated text.
+
+    Args:
+        args: Chat completion post-processing arguments containing tool definitions
+            and configuration.
+        output_index: Output index of the sequence being processed.
+        text: Text to parse (full text if non-streaming, incremental chunk if streaming).
+        streaming: Whether this is an incremental streaming step.
+        finished: Whether generation has finished for this sequence.
+
+    Returns:
+        Tuple of cleaned text and list of extracted ToolCallItem objects.
+    """
     tool_parser = None
     tools = args.tools
     if args.tool_parser is not None and tools is not None:
@@ -235,6 +248,13 @@ def apply_tool_parser(args: ChatPostprocArgs,
     if tool_parser is not None and tools is not None:
         if not streaming:
             result = tool_parser.detect_and_parse(text, tools)
+            if not result.calls and tool_parser.has_tool_call(text):
+                logger.warning(
+                    f"Configured tool parser '{args.tool_parser}' matched "
+                    "tool-call marker in output but extracted no calls. "
+                    "Plausible causes: parser/template mismatch, malformed or "
+                    "truncated output, an empty tool block, or arguments the "
+                    "parser rejected.")
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
             if finished:
