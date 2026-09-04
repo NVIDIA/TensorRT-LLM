@@ -976,3 +976,72 @@ def test_stalled_stream_cleanup_does_not_untrack_a_resubmission(
     assert asyncio.run(scenario()) == 1
     # The replacement's handle was aborted, not the stalled one's.
     assert llm.handles[1].aborted
+
+
+def test_terminal_error_yield_is_watched_for_a_stalled_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consumer that abandons the stream on a terminal error yield is detected.
+
+    The watchdog only measures while a response is pending, so a yield that does
+    not arm it leaves the generator suspended with the request id still
+    registered and the timer rescheduling forever: GetLoad over-reports and the
+    id is permanently unusable. Regression test for the defensive
+    "stream ended before all outputs finished" yield, which never sets a
+    finish_reason and so is reached whenever the engine closes early.
+    """
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="A",
+        logprobs=[],
+        prompt_logprobs=[],
+        finish_reason=None,  # engine closes without finishing -> defensive path
+        stop_reason=None,
+    )
+    result = SimpleNamespace(prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None)
+    servicer = OpenEngineInferenceServicer(_FakeLlm([result]), model="test-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="request-stalled-terminal",
+        model="test-model",
+        prompt="hello",
+    )
+    monkeypatch.setattr(openengine_servicer, "_RESPONSE_STALL_TIMEOUT_SECONDS", 0.0)
+
+    async def abandon_on_terminal_error() -> int:
+        responses = servicer.Generate(request, _FakeContext())
+        assert (await responses.__anext__()).HasField("token")
+        terminal = await responses.__anext__()
+        assert terminal.error.message == "generation stream ended before all outputs finished"
+        # The consumer stops here: the generator stays suspended in `yield`, so
+        # its `finally` never runs and only the watchdog can release the id.
+        for _ in range(4):
+            await asyncio.sleep(0)
+        return servicer.active_request_count()
+
+    assert asyncio.run(abandon_on_terminal_error()) == 0
+
+
+def test_generation_only_requires_a_kv_session() -> None:
+    """extra.request_type alone cannot address a context handoff.
+
+    Without a kv.session every id and address field is None, so the engine waits
+    out its receive timeout on the executor loop against a session no context
+    worker is keyed under -- stalling every later request on that engine. This
+    is the case _validate_kv_session guards, reached through the path that does
+    not call it.
+    """
+    request = generation_pb2.GenerateRequest(request_id="r", model="m", prompt="hi")
+    request.extra.update({"request_type": "generation_only"})
+
+    with pytest.raises(ValueError, match="kv.session"):
+        openengine_servicer._disaggregated_params_from_request(request)
+
+
+def test_context_only_via_extra_is_still_accepted() -> None:
+    """The phases that need no handoff keep working through extra."""
+    for request_type in ("context_only", "context_and_generation"):
+        request = generation_pb2.GenerateRequest(request_id="r", model="m", prompt="hi")
+        request.extra.update({"request_type": request_type})
+        params = openengine_servicer._disaggregated_params_from_request(request)
+        assert params.request_type == request_type

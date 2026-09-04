@@ -29,6 +29,14 @@ _RESPONSE_STALL_TIMEOUT_SECONDS = 30.0
 # that carries a `kv.session` handle is always treated as generation_only.
 _REQUEST_TYPE_KEY = "request_type"
 _DISAGG_REQUEST_TYPES = {"context_only", "generation_only", "context_and_generation"}
+# generation_only is deliberately not in the set above: the phase needs the
+# context handoff (an address plus an id), which only a kv.session can carry.
+# Naming it through `extra` alone yields params whose every id and address field
+# is None, and the engine then waits out its receive timeout on the executor
+# loop against a session no context worker is keyed under -- the engine-wide
+# stall _validate_kv_session exists to prevent, reached through the path that
+# does not call it.
+_EXTRA_REQUEST_TYPES = _DISAGG_REQUEST_TYPES - {"generation_only"}
 
 # Floor for logprob values so a -inf (masked token) is JSON/proto-safe, matching
 # the HTTP /v1/completions clamp in create_logprobs.
@@ -640,9 +648,14 @@ def _disaggregated_params_from_request(
     request_type = extra.get(_REQUEST_TYPE_KEY)
     if request_type is None:
         return None
-    if request_type not in _DISAGG_REQUEST_TYPES:
+    if request_type == "generation_only":
         raise ValueError(
-            f"extra.{_REQUEST_TYPE_KEY} must be one of {sorted(_DISAGG_REQUEST_TYPES)}"
+            "a generation_only request must carry its context handoff in "
+            "kv.session; extra.request_type alone cannot address one"
+        )
+    if request_type not in _EXTRA_REQUEST_TYPES:
+        raise ValueError(
+            f"extra.{_REQUEST_TYPE_KEY} must be one of {sorted(_EXTRA_REQUEST_TYPES)}"
         )
     return DisaggregatedParams(request_type=request_type)
 
@@ -1075,6 +1088,12 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 )
 
         def mark_pending() -> None:
+            # Must precede *every* yield, terminal ones included. The watchdog
+            # only measures while pending_since is set; a yield that skips this
+            # leaves it None, so a consumer that stops reading there is never
+            # detected, the generator stays suspended in yield forever, and its
+            # finally -- the only other place that untracks the id and cancels
+            # the timer -- never runs.
             nonlocal pending_since
             pending_since = loop.time()
 
@@ -1116,6 +1135,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                     mark_delivered()
                     if consumer_stalled:
                         engine_terminal = True
+                        mark_pending()
                         yield _engine_error_response(
                             request_id,
                             "response consumer stalled",
@@ -1143,6 +1163,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             # internal engine abort). Surface it as an error rather than silently
             # returning a truncated result to the client.
             engine_terminal = True
+            mark_pending()
             yield _engine_error_response(
                 request_id,
                 "generation stream ended before all outputs finished",
@@ -1157,6 +1178,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             logger.error(f"OpenEngine request {request_id} failed after acceptance: {error}")
             abort_request("response processing failed")
             engine_terminal = True
+            mark_pending()
             yield _engine_error_response(request_id, str(error), result_handle)
         finally:
             cancel_watchdog()
