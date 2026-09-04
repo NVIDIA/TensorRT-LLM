@@ -259,15 +259,25 @@ bool KvCache::resume(std::optional<CUstream> stream)
     TLLM_CHECK_DEBUG_WITH_INFO(mCudaStream.has_value(), "cuda_stream is never set");
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
-    // Check utilization against threshold.
-    auto const utilizations = mManager->storage().getUtilization(kHotLevel);
-    float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
-    if (utilization > mManager->config().maxUtilForResume)
+    auto& storageMgr = mManager->storage();
+
+    // Check utilization against the threshold, per pool group.
+    //
+    // Only pool groups that must reserve growth headroom are subject to maxUtilForResume; a group whose life
+    // cycles all have a constant per-sequence state size may use all of its slots. Taking a single maximum
+    // across pool groups and comparing it against one scalar cannot express that: a fixed-size SSM pool sits at
+    // ~100% utilization whenever it is full, which would veto every resume regardless of attention pressure.
+    auto const utilizations = storageMgr.getUtilization(kHotLevel);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < utilizations.size(); ++pgIdx)
     {
-        return false;
+        float const utilizationLimit
+            = storageMgr.poolGroupNeedsHeadroomForGrowth(pgIdx) ? mManager->config().maxUtilForResume : 1.0F;
+        if (utilizations[pgIdx] > utilizationLimit)
+        {
+            return false;
+        }
     }
 
-    auto& storageMgr = mManager->storage();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     LifeCycleId numLc = storageMgr.numLifeCycles();
 
