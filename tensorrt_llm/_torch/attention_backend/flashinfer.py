@@ -1834,15 +1834,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     if self.num_generations < batch_size:
                         kv_lens_buf[self.num_generations:batch_size].zero_()
 
-        # Refresh captured FA2 schedules only after all page metadata updates.
-        # Defer ordinary multi-wrapper plans to forward_impl; single-wrapper
-        # models still plan eagerly because forward_impl cannot plan during
-        # graph capture.
+        # Eager multi-wrapper execution can replan lazily in forward_impl.
+        # CUDA graph replay cannot re-enter forward_impl, so prepare every
+        # persistent wrapper before capture or replay.
         active_wrappers = [
             pp for pp in self._plan_params_to_wrappers
             if pp.attention_mask_data is None
         ]
-        defer_plan = len(active_wrappers) > 1
+        defer_plan = not self.is_cuda_graph and len(active_wrappers) > 1
         if not (self._is_separate_kv_draft_view and self.is_cuda_graph):
             self._refresh_fa2_cuda_graph_plans()
             self._clean_cached_plans(defer_plan=defer_plan)
