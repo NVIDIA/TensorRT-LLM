@@ -692,16 +692,17 @@ def create_py_executor(
                                            False)
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
-        nvfp4_dsa_cache_reuse = (kv_cache_quant_algo == QuantAlgo.NVFP4
-                                 and getattr(sparse_attention_config,
-                                             "algorithm", None) == "dsa")
+        nvfp4_sparse_cache_reuse = (
+            kv_cache_quant_algo == QuantAlgo.NVFP4
+            and getattr(sparse_attention_config, "algorithm", None)
+            in ("dsa", "deepseek_v4"))
         if kv_cache_config.enable_block_reuse and not (
                 kv_cache_quant_algo is None or kv_cache_quant_algo
                 == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8
-                or nvfp4_dsa_cache_reuse):
+                or nvfp4_sparse_cache_reuse):
             logger.warning(
                 f"KV cache reuse for MLA can only be enabled without KV cache quantization, with FP8 quantization, "
-                f"or with NVFP4 quantization on the DSA sparse path, "
+                f"or with NVFP4 quantization on the DSA or DeepSeek-V4 sparse paths, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
