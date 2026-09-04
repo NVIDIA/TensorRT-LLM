@@ -386,24 +386,9 @@ def test_forward_restores_spec_dec_state_on_failure() -> None:
     attn_metadata = AttentionMetadata(max_num_requests=2, max_num_tokens=16)
     attn_metadata.seq_lens = torch.ones(2, dtype=torch.int32)
     worker = _FailingSpecWorker()
-
-    class _StateHandler:
-        def __init__(self) -> None:
-            self.abort_calls = 0
-
-        def commit_speculative_states(self, *args, **kwargs) -> None:
-            del args, kwargs
-
-        def abort_speculative_states(self) -> None:
-            self.abort_calls += 1
-
-    handler = _StateHandler()
-    worker.register_auxiliary_state_handler(handler)
-    worker.register_auxiliary_state_handler(handler)
     for _ in range(2):
         # The second iteration would trip the pairing assert inside
         # prepare_for_spec_dec if the first failure had leaked saved state.
         with pytest.raises(RuntimeError, match="simulated draft failure"):
             worker(attn_metadata=attn_metadata, spec_metadata=None)
         assert not attn_metadata.has_spec_dec_saved_state
-    assert handler.abort_calls == 2

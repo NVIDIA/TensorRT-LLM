@@ -1318,16 +1318,6 @@ class Qwen4ExpPLE(nn.Module):
         self._pending_conv_states = None
         self._pending_ngram_contexts = None
 
-    def abort_speculative_states(self) -> None:
-        """Restore recurrent state captured before target verification."""
-        for entry in (self._pending_conv_states, self._pending_ngram_contexts):
-            if entry is None:
-                continue
-            state_pool, slots, original, _ = entry
-            state_pool[slots] = original.to(dtype=state_pool.dtype)
-        self._pending_conv_states = None
-        self._pending_ngram_contexts = None
-
     def forward(
         self,
         hidden_states: torch.Tensor,

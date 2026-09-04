@@ -1429,10 +1429,10 @@ class SpecMetadata:
 
 
 class AuxiliarySpeculativeStateHandler(Protocol):
-    """Model-side state written by verification and resolved transactionally.
+    """Model-side state that verification writes once per draft token.
 
-    A successful verify step keeps only the accepted candidate prefix; an
-    interrupted step restores the state that existed before verification.
+    Only some draft tokens are accepted. The commit keeps the state written
+    for the accepted ones and undoes the rest.
     """
 
     def commit_speculative_states(
@@ -1441,9 +1441,6 @@ class AuxiliarySpeculativeStateHandler(Protocol):
         state_indices: torch.Tensor,
         num_contexts: int,
     ) -> None:
-        ...
-
-    def abort_speculative_states(self) -> None:
         ...
 
 
@@ -1499,11 +1496,6 @@ class SpecWorkerBase(nn.Module, ABC):
             handler.commit_speculative_states(num_accepted_tokens,
                                               state_indices, num_contexts)
 
-    def abort_auxiliary_speculative_states(self) -> None:
-        """Roll back registered model-side state after an interrupted verify step."""
-        for handler in self._auxiliary_state_handlers:
-            handler.abort_speculative_states()
-
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if "forward" in cls.__dict__:
@@ -1532,9 +1524,6 @@ class SpecWorkerBase(nn.Module, ABC):
                     spec_metadata = a
         try:
             return self._forward_impl(*args, **kwargs)
-        except Exception:
-            self.abort_auxiliary_speculative_states()
-            raise
         finally:
             self._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
 

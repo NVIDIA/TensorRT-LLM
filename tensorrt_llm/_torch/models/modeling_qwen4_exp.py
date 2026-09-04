@@ -1151,11 +1151,8 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
             attention = getattr(layer, "self_attn", None)
             indexer = getattr(attention, "indexer", None)
             if indexer is not None:
-                if not all(
-                    hasattr(indexer, method)
-                    for method in ("commit_speculative_states", "abort_speculative_states")
-                ):
-                    raise TypeError("QSA indexers must implement speculative commit and abort")
+                if not hasattr(indexer, "commit_speculative_states"):
+                    raise TypeError("QSA indexers must implement speculative commit")
                 spec_worker.register_auxiliary_state_handler(indexer)
 
     @classmethod

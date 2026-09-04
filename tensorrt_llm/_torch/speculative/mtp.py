@@ -419,8 +419,16 @@ class MTPWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
 
+        # Keep the state written for accepted draft tokens, undo the rest.
+        # Must run before the draft pass below, which reads that state back.
         self._commit_target_mamba_states(attn_metadata, num_accepted_tokens,
                                          batch_size)
+        if self._auxiliary_state_handlers:
+            self.commit_auxiliary_speculative_states(
+                num_accepted_tokens,
+                attn_metadata.mamba_metadata.state_indices[:batch_size],
+                attn_metadata.num_contexts,
+            )
 
         # Update MTP past hidden states
         self.update_mtp_hidden_states(input_ids=input_ids,
@@ -510,16 +518,6 @@ class MTPWorker(SpecWorkerBase):
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens, next_draft_tokens,
             spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
-
-        # Keep QSA/PLE verification snapshots live until every fallible draft
-        # operation has succeeded. SpecWorkerBase can then restore them if a
-        # draft kernel, sampler, or allocation fails after target acceptance.
-        if self._auxiliary_state_handlers:
-            self.commit_auxiliary_speculative_states(
-                num_accepted_tokens,
-                attn_metadata.mamba_metadata.state_indices[:batch_size],
-                attn_metadata.num_contexts,
-            )
 
         return {
             'logits': raw_logits,

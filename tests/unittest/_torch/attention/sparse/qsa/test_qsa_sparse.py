@@ -1261,33 +1261,6 @@ def test_qsa_speculative_commit_restores_rejected_side_cache_entries() -> None:
     assert indexer._pending_speculative_cache is None
 
 
-def test_qsa_speculative_abort_restores_all_side_cache_entries() -> None:
-    indexer = object.__new__(QSAIndexer)
-    torch.nn.Module.__init__(indexer)
-    index_cache = torch.arange(24, dtype=torch.float32).reshape(3, 2, 1, 4)
-    position_cache = torch.arange(18, dtype=torch.int32).reshape(3, 2, 3)
-    pages = torch.tensor([0, 0, 1, 1], dtype=torch.long)
-    within = torch.tensor([0, 1, 0, 1], dtype=torch.long)
-    expected_index = index_cache.clone()
-    expected_position = position_cache.clone()
-    indexer._pending_speculative_cache = {
-        "pages": pages,
-        "within": within,
-        "index_values": index_cache[pages, within].clone(),
-        "index_cache": index_cache,
-        "position_values": position_cache[pages, within].clone(),
-        "position_cache": position_cache,
-    }
-    index_cache[pages, within] = -1
-    position_cache[pages, within] = -1
-
-    indexer.abort_speculative_states()
-
-    torch.testing.assert_close(index_cache, expected_index)
-    torch.testing.assert_close(position_cache, expected_position)
-    assert indexer._pending_speculative_cache is None
-
-
 @pytest.mark.parametrize(
     ("sequence_lengths", "num_contexts", "expected"),
     [

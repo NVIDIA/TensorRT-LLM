@@ -641,37 +641,6 @@ def test_ple_speculative_commit_selects_accepted_prefix_state() -> None:
     assert module._pending_ngram_contexts is None
 
 
-def test_ple_speculative_abort_restores_original_state() -> None:
-    module = object.__new__(Qwen4ExpPLE)
-    torch.nn.Module.__init__(module)
-    conv_pool = torch.arange(3, dtype=torch.float32).reshape(3, 1)
-    context_pool = torch.arange(3, dtype=torch.long).reshape(3, 1)
-    slots = torch.tensor([1, 2])
-    expected_conv = conv_pool.clone()
-    expected_context = context_pool.clone()
-    module._pending_conv_states = (
-        conv_pool,
-        slots,
-        conv_pool[slots].clone(),
-        torch.empty(2, 0, 1),
-    )
-    module._pending_ngram_contexts = (
-        context_pool,
-        slots,
-        context_pool[slots].clone(),
-        torch.empty(2, 0, 1, dtype=torch.long),
-    )
-    conv_pool[slots] = -1
-    context_pool[slots] = -1
-
-    module.abort_speculative_states()
-
-    torch.testing.assert_close(conv_pool, expected_conv)
-    torch.testing.assert_close(context_pool, expected_context)
-    assert module._pending_conv_states is None
-    assert module._pending_ngram_contexts is None
-
-
 def test_ple_mixed_batch_bounds_short_conv_workspace(monkeypatch) -> None:
     """IFB must not pad decode rows to the longest context chunk."""
     channels = 8

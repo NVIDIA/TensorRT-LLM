@@ -575,23 +575,3 @@ class QSAIndexer(nn.Module):
             position_cache[pages, within] = torch.where(
                 restore[:, None], position_values, current_positions
             )
-
-    def abort_speculative_states(self) -> None:
-        """Restore all QSA side-cache entries written by target verification."""
-        pending = self._pending_speculative_cache
-        self._pending_speculative_cache = None
-        if pending is None:
-            return
-
-        pages = pending["pages"]
-        within = pending["within"]
-        pending["index_cache"][pages, within] = pending["index_values"]
-        position_values = pending.get("position_values")
-        if position_values is not None:
-            pending["position_cache"][pages, within] = position_values
-
-
-__all__ = [
-    "QSAIndexer",
-    "average_pool_qsa_keys",
-]
