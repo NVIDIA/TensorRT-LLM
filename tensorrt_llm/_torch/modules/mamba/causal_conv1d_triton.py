@@ -18,6 +18,7 @@
 # and https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/mamba/causal_conv1d_triton.py
 # -*- coding: utf-8 -*-
 
+import os
 from typing import List, Optional, Union
 
 import torch
@@ -963,6 +964,71 @@ def _causal_conv1d_update_kernel(
             )
 
 
+_PACKED_CONV_ENABLED = os.environ.get("TRTLLM_GDN_CONV_PACKED", "0") == "1"
+_PACKED_CONV_REQUIRE_EVEN = os.environ.get("TRTLLM_GDN_CONV_PACKED_EVEN_ONLY", "1") == "1"
+
+
+def _packed_conv_applicable(
+    x,
+    conv_state,
+    weight,
+    bias,
+    activation,
+    batch,
+    dim,
+    seqlen,
+    state_len,
+    width,
+    cache_seqlens,
+    conv_state_indices,
+    num_accepted_tokens,
+    intermediate_conv_window,
+    intermediate_state_indices,
+    retrieve_next_token,
+):
+    """Host-side contract check for the packed conv path. No device sync."""
+    # Shape/dtype contract the kernel bakes in (strides 12288 / 36864 hardcoded).
+    if (dim, seqlen, state_len, width) != (4096, 3, 3, 4):
+        return False
+    if x.dtype != torch.bfloat16 or conv_state.dtype != torch.bfloat16:
+        return False
+    # Defense in depth: an earlier revision of this kernel used a batch//2 grid
+    # that silently dropped the last sequence at odd batch >= 128. Every
+    # CUDA-graph-captured decode batch is even (or 1), so refusing odd large
+    # batches costs nothing on the hot path.
+    if _PACKED_CONV_REQUIRE_EVEN and batch >= 128 and batch % 2 != 0:
+        return False
+    if activation not in ("silu", "swish"):
+        return False
+    # Continuous batching with the MTP intermediate-window capture, no spec
+    # rollback offset, no circular buffer, no eagle tree.
+    if conv_state_indices is None or intermediate_conv_window is None:
+        return False
+    if intermediate_state_indices is None or bias is None:
+        return False
+    if (
+        cache_seqlens is not None
+        or num_accepted_tokens is not None
+        or retrieve_next_token is not None
+    ):
+        return False
+    # Exact strides the kernel addresses against.
+    if x.stride() != (seqlen * dim, 1, dim):
+        return False
+    if conv_state.stride() != (dim * state_len, state_len, 1):
+        return False
+    if intermediate_conv_window.stride() != (
+        seqlen * dim * state_len,
+        dim * state_len,
+        state_len,
+        1,
+    ):
+        return False
+    if weight.stride() != (width, 1):
+        return False
+    return True
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1055,6 +1121,50 @@ def causal_conv1d_update(
 
     # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
     out = torch.empty_like(x)
+
+    # ---- Packed fast path ----
+    # Same arithmetic; packed bf16x2 loads/stores coalesce the stride-3
+    # state_len-innermost traffic the kernel below issues one element at a
+    # time. Guarded to the exact contract it was written and validated for;
+    # anything else falls through to the kernel below.
+    if _PACKED_CONV_ENABLED and _packed_conv_applicable(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation,
+        batch,
+        dim,
+        seqlen,
+        state_len,
+        width,
+        cache_seqlens,
+        conv_state_indices,
+        num_accepted_tokens,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        retrieve_next_token,
+    ):
+        from .gdn_conv_packed import run as _packed_conv_run
+
+        # The kernel writes a contiguous (batch, seqlen, dim) buffer, which is
+        # byte-identical to the (batch, dim, seqlen)/(seqlen*dim, 1, dim) tensor
+        # every caller expects -- so the transpose below is a free view, and the
+        # kernel gets a fully coalesced 4096-wide bf16 store per (seq, step).
+        out_packed = torch.empty((batch, seqlen, dim), device=x.device, dtype=x.dtype)
+        _packed_conv_run(
+            x,
+            conv_state,
+            weight,
+            bias,
+            conv_state_indices,
+            intermediate_conv_window,
+            intermediate_state_indices,
+            out_packed,
+        )
+        out = out_packed.transpose(1, 2)
+        return out.squeeze(-1) if unsqueeze else out
+
     stride_w_dim, stride_w_width = weight.stride()
 
     stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
