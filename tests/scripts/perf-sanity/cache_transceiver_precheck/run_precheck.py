@@ -1764,7 +1764,16 @@ def parse_args(argv=None):
     ap.add_argument("--server-idx", type=int, required=True)
     ap.add_argument("--config", required=True, help="disagg perf-sanity yaml path")
     ap.add_argument("--work-dir", required=True, help="shared dir for rendezvous/status")
-    ap.add_argument("--benchmark-mode", default="e2e", choices=["e2e", "gen_only"])
+    # Only the benchmark mode is forwarded, never a test id's instrumentation
+    # modifier (e.g. `time_breakdown`): those change what the harness records,
+    # not the KV transfer being prechecked. submit.py pastes this value into
+    # shell text verbatim, so a mode missing from `choices` would kill the
+    # precheck srun before the workload started.
+    ap.add_argument(
+        "--benchmark-mode",
+        default="e2e",
+        choices=["e2e", "gen_only"],
+    )
     ap.add_argument("--llm-src", default="", help="repo root (model path dict lookup)")
     ap.add_argument("--dry-run", action="store_true", help="print the resolved plan and exit")
     return ap.parse_args(argv)
