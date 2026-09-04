@@ -155,6 +155,8 @@ The checkpoint config may contain multiple `config_groups` for different sparse 
 - `target_sparsity` — optional checkpoint-provided target values. It can be configured separately for prefill and decode; otherwise both phases use the same config.
 - `ignore` — optional fnmatch layer patterns where the calibrated Skip Softmax Attention config should not apply.
 
+TRT-LLM imports NumExpr only when it needs to consume a checkpoint formula. During package bootstrap, TRT-LLM defaults `NUMEXPR_NUM_THREADS` to `1` without overriding an explicit environment setting. This evaluates the scalar formulas without creating a NumExpr worker pool while allowing applications with substantial NumExpr work to opt into parallel evaluation. This setting controls only NumExpr and does not replace workload-specific OpenMP tuning. Applications that import NumExpr before TRT-LLM must configure it before process startup.
+
 ### User Configuration
 
 User configuration is supplied through Python or YAML and controls how the checkpoint metadata is consumed:
