@@ -23,14 +23,14 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, PeftCacheManager, ResourceManager, ResourceManagerType,
-    _merge_kv_cache_pool_pointers,
+    _get_minimum_blocks_per_window, _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.bindings.internal.batch_manager import \
-    PeftTaskNotCachedException
+from tensorrt_llm.bindings.internal.batch_manager import (
+    LinearCacheType, PeftTaskNotCachedException)
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
@@ -72,6 +72,80 @@ def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
             KV_CACHE_HASH_ALGO_AUTO)
 
     warning.assert_not_called()
+
+
+def test_minimum_blocks_per_window_aligns_attention_pool_capacity() -> None:
+    recurrent_window = LinearCacheType.RECURRENT_STATES.value
+    local_blocks = {
+        64: (8, 4),
+        128: (7, 3),
+        recurrent_window: (20, 0),
+    }
+    rank_blocks = [
+        local_blocks,
+        {
+            64: (5, 2),
+            128: (6, 1),
+        },
+        {
+            64: (6, 3),
+            128: (9, 2),
+            recurrent_window: (18, 0),
+        },
+    ]
+
+    assert _get_minimum_blocks_per_window(
+        local_blocks,
+        rank_blocks,
+        [{64, 128}, {64, 128}, {64, 128}],
+    ) == {
+        64: (5, 2),
+        128: (6, 1),
+        recurrent_window: (18, 0),
+    }
+
+
+def test_minimum_blocks_per_window_rejects_asymmetric_hosted_windows() -> None:
+    recurrent_window = LinearCacheType.RECURRENT_STATES.value
+    # Linear-attention sizing emits a positive placeholder key even when the
+    # rank only hosts recurrent-state layers. The hosted-window set, not the
+    # sizing keys, must expose the PP asymmetry.
+    with pytest.raises(RuntimeError, match="Asymmetrical pipeline parallelism"):
+        _get_minimum_blocks_per_window(
+            {
+                128: (8, 4),
+                recurrent_window: (20, 0),
+            },
+            [
+                {
+                    128: (8, 4),
+                    recurrent_window: (20, 0),
+                },
+                {
+                    128: (5, 2)
+                },
+            ],
+            [set(), {128}],
+        )
+
+
+def test_v1_window_resolution_and_grouping_use_local_layer_order() -> None:
+    manager = object.__new__(KVCacheManager)
+    manager.pp_layers = [3, 5]
+    manager.num_local_layers = 2
+    config = KvCacheConfig(max_attention_window=[64, 128, 512])
+
+    manager.max_attention_window_vec = manager._resolve_max_attention_window_vec(
+        config,
+        max_seq_len=256,
+    )
+
+    assert manager.max_attention_window_vec == [64, 256]
+    assert config.max_attention_window == [64, 128, 512]
+    assert manager._get_window_size_to_layers() == {
+        64: [0],
+        256: [1],
+    }
 
 
 class TestMergeKVCachePoolPointers(unittest.TestCase):

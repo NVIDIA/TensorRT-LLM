@@ -426,20 +426,37 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             "update_kv_cache_draft_token_location_2d requires uniform num_kv_heads across all layers, "
             f"but got {cache_mgr.num_kv_heads_per_layer}"
         )
+        assert len(set(cache_mgr.max_attention_window_vec)) == 1, (
+            "update_kv_cache_draft_token_location_2d requires uniform "
+            "attention windows across all local layers, but got "
+            f"{cache_mgr.max_attention_window_vec}"
+        )
+        max_attention_window = cache_mgr.max_attention_window_vec[0]
+        if max_attention_window is None:
+            max_attention_window = cache_mgr.max_seq_len
+        local_pool_ids = {
+            int(cache_mgr.kv_cache_pool_mapping[layer_idx][0])
+            for layer_idx in range(cache_mgr.num_local_layers)
+        }
+        assert len(local_pool_ids) == 1, (
+            "update_kv_cache_draft_token_location_2d requires all local "
+            f"layers in one KV pool, got pools {sorted(local_pool_ids)}"
+        )
+        pool_idx = local_pool_ids.pop()
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d(
             self._accepted_draft_indices_tensor[:batch_size],
             self._num_accepted_tokens_buf[:batch_size],
             attn_metadata.kv_lens_cuda[:batch_size],
             True,
-            cache_mgr.num_layers,
+            cache_mgr.num_local_layers,
             # Use TP-sharded num_kv_heads (per-rank) instead of the unsharded
             # total so the C++ kernel computes correct strides and grid dims.
             cache_mgr.num_kv_heads_per_layer[0],
             self._kv_head_dim_bytes,
             cache_mgr.max_total_draft_tokens,
-            cache_mgr.max_attention_window_vec[0],
-            cache_mgr.kv_cache_pool_pointers,
-            attn_metadata.kv_cache_block_offsets,
+            max_attention_window,
+            cache_mgr.kv_cache_pool_pointers[pool_idx],
+            attn_metadata.kv_cache_block_offsets[pool_idx],
             cache_mgr.max_blocks_per_seq,
             cache_mgr.tokens_per_block,
             None,

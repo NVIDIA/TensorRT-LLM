@@ -3643,6 +3643,12 @@ def test_cpp_hybrid_merges_compact_scale_rows_with_unmanaged_layers():
     )
 
     assert mgr.pp_layers == [0, 2, 3]
+    recurrent_window = LinearCacheType.RECURRENT_STATES.value
+    assert mgr.max_attention_window_vec == [
+        recurrent_window,
+        recurrent_window,
+        mgr.max_seq_len,
+    ]
     assert mgr.kv_cache_pool_mapping[:, 0].tolist() == [0, 0, 1]
     compact_scale_pointers = mgr.impl.get_block_scale_pool_pointers()
     assert compact_scale_pointers.shape == (1, 2)
