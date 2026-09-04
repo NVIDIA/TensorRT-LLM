@@ -1605,6 +1605,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             swa_size_per_request * max_batch_size,
         )
 
+    @torch.inference_mode()
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
         some_checks_unavailable = False
         has_invalid_values = torch.tensor(
@@ -1615,22 +1616,28 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # Handle each attention buffer from start to end to traverse the whole
         # KV cache. Multiple attention buffers can now share one cache layer.
         for (layer, attn), layer_id in self._layer_attn_to_layer_id.items():
-            data_role = attn.role
-            buffer_key = (layer_id, data_role)
-            if buffer_key in buffers_handled:
-                continue
-            buffer = self.get_buffers(layer, attn)
-            # process in chunks of 256 pages to avoid OoM
-            for i in range(0, buffer.shape[0], 256):
-                buffer_slice = buffer[i : i + 256]
-                try:
-                    has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
-                    has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
-                except NotImplementedError:
-                    some_checks_unavailable = True
-            if fill_with_zero:
-                buffer.zero_()
-            buffers_handled.add(buffer_key)
+            buffers = [((layer_id, attn.role), self.get_buffers(layer, attn))]
+            if self._use_nvfp4_compress and attn == DeepseekV4AttentionType.COMPRESS:
+                buffers.append(
+                    (
+                        (layer_id, COMPRESS_BLOCK_SCALE_ROLE),
+                        self.get_compress_scale_buffers(layer),
+                    )
+                )
+            for buffer_key, buffer in buffers:
+                if buffer_key in buffers_handled:
+                    continue
+                # process in chunks of 256 pages to avoid OoM
+                for i in range(0, buffer.shape[0], 256):
+                    buffer_slice = buffer[i : i + 256]
+                    try:
+                        has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
+                        has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
+                    except NotImplementedError:
+                        some_checks_unavailable = True
+                if fill_with_zero:
+                    buffer.zero_()
+                buffers_handled.add(buffer_key)
         torch.cuda.synchronize()
 
         if some_checks_unavailable:
