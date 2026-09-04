@@ -126,6 +126,23 @@ class DatasetConfig(BaseModel):
         return req[self.output_key]
 
 
+def _create_dataset_load_error(e: ValueError) -> ValueError:
+    """Create a more informative ValueError from a dataset loading error.
+
+    Args:
+        e: The original ValueError from datasets.load_dataset().
+
+    Returns:
+        A new ValueError with additional context.
+    """
+    error_msg = str(e)
+    if "Config" in error_msg:
+        error_msg += "\n Please add the config name to the dataset config yaml."
+    elif "split" in error_msg:
+        error_msg += "\n Please specify supported split in the dataset config yaml."
+    return ValueError(error_msg)
+
+
 def load_dataset_from_hf(dataset_config: DatasetConfig):
     """Load dataset from HuggingFace.
 
@@ -148,11 +165,7 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
             )
         )
     except ValueError as e:
-        if "Config" in e:
-            e += "\n Please add the config name to the dataset config yaml."
-        elif "split" in e:
-            e += "\n Please specify supported split in the dataset config yaml."
-        raise ValueError(e)
+        raise _create_dataset_load_error(e) from e
 
     return dataset
 
