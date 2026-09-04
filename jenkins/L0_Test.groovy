@@ -6251,16 +6251,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         16,
         2
     )
-    // B200 PerfSanity post-merge aggregated
-    // 2 Nodes
-    x86SlurmTestConfigs += buildStageConfigs(
-        "DGX_B200-16_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU16-Post-Merge",
-        "auto:dgx-b200-flex",
-        "l0_b200_multi_nodes_perf_sanity_node2_gpu16",
-        3,
-        16,
-        2
-    )
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
 

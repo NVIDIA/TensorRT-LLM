@@ -280,13 +280,13 @@ index 7867f60..38a4aa2 100644
 -template <LowPrecisionType kPrecision, int kHidden, int kNumMaxTopk>
 +template <LowPrecisionType kPrecision, int kHidden, int kNumMaxTopk, bool kStageRecvMetadata>
  __global__ __launch_bounds__(1024, 1) void
-@@ -660,3 +727,29 @@ low_precision_combine(void* combined_x,
+@@ -660,3 +727,34 @@ low_precision_combine(void* combined_x,
                  auto rdma_send_x_global_scale_vec = reinterpret_cast<float*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot + kHiddenCommBytes + kScalesBytes);
 -                global_scale_val = __ldg(global_scale_per_token + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank + token_idx);
 +                if (global_scale_per_token != nullptr) {
 +                    global_scale_val = __ldg(global_scale_per_token + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank + token_idx);
 +                } else {
-+                    // Reproduce calculate_nvfp4_global_scale for finite BF16
++                    // Reproduce calculate_nvfp4_global_scale for nonzero finite BF16
 +                    // inputs. Its getMaxAbs helper performs a block reduction,
 +                    // and its division is compiled as a rounded reciprocal
 +                    // followed by a rounded multiply. This warp performs the
@@ -302,16 +302,21 @@ index 7867f60..38a4aa2 100644
 +                                per_token_max_abs_val, fabsf(static_cast<float>(bf16_values[j])));
 +                        }
 +                    }
++                    // The responsible-expert predicate and token loop bounds
++                    // are warp-uniform, so all active lanes participate.
++                    const auto sync_mask = __activemask();
 +                    per_token_max_abs_val = fmaxf(
 +                        per_token_max_abs_val,
-+                        __shfl_xor_sync(0xffffffff, per_token_max_abs_val, 16));
++                        __shfl_xor_sync(sync_mask, per_token_max_abs_val, 16));
 +                    per_token_max_abs_val = half_warp_reduce_max(per_token_max_abs_val);
 +                    constexpr float kNvfp4GlobalScaleNumerator = 448.f * 6.f;
-+                    global_scale_val = __fmul_rn(
++                    // Any finite scale represents an all-zero token exactly;
++                    // avoid 0 * inf in the block-scale quantizer.
++                    global_scale_val = per_token_max_abs_val == 0.f ? 1.f : __fmul_rn(
 +                        kNvfp4GlobalScaleNumerator, __frcp_rn(per_token_max_abs_val));
 +                }
                  rdma_send_x_global_scale_vec[0] = global_scale_val;
-@@ -718,2 +811,62 @@ low_precision_combine(void* combined_x,
+@@ -718,2 +816,62 @@ low_precision_combine(void* combined_x,
      cg::this_grid().sync();
 +    if constexpr (kStageRecvMetadata) {
 +        __shared__ int staged_topk_idx[kNumMaxTopk];
@@ -374,16 +379,16 @@ index 7867f60..38a4aa2 100644
 +        }
 +    } else {
      for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
-@@ -756,2 +909,3 @@ low_precision_combine(void* combined_x,
+@@ -756,2 +914,3 @@ low_precision_combine(void* combined_x,
      }
 +    }
  }
-@@ -767,3 +921,3 @@ void low_precision_combine(int precision,void* combined_x,
+@@ -767,3 +926,3 @@ void low_precision_combine(int precision,void* combined_x,
              int num_experts, int rank, int num_ranks,
 -            void* workspace, int num_device_sms,
 +            void* workspace, int num_device_sms, bool stage_recv_metadata,
              cudaStream_t stream, int phases) {
-@@ -784,6 +938,9 @@ void low_precision_combine(int precision,void* combined_x,
+@@ -784,6 +943,9 @@ void low_precision_combine(int precision,void* combined_x,
  #define COMBINE_LAUNCH_CASE(hidden) { \
 -auto combine_func = low_precision_combine<LowPrecisionType::FP8, hidden, kNumMaxTopk>; \
 +auto combine_func = stage_recv_metadata ? \
@@ -396,7 +401,7 @@ index 7867f60..38a4aa2 100644
 +            low_precision_combine<LowPrecisionType::NVFP4, hidden, kNumMaxTopk, true> : \
 +            low_precision_combine<LowPrecisionType::NVFP4, hidden, kNumMaxTopk, false>; \
  } else { \
-@@ -810,2 +967,2 @@ LAUNCH_KERNEL(&cfg, combine_func, \
+@@ -810,2 +972,2 @@ LAUNCH_KERNEL(&cfg, combine_func, \
  }
 -}
 \ No newline at end of file

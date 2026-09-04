@@ -156,24 +156,125 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
         _select_explicit_fallback_tactic([])
 
 
-@pytest.mark.parametrize(("value", "expected"), [(None, False), ("0", False), ("1", True)])
-def test_deep_ep_binary_env(monkeypatch, value, expected):
+@pytest.mark.parametrize(
+    ("value", "default", "expected"),
+    [
+        (None, False, False),
+        (None, True, True),
+        ("", True, False),
+        ("0", True, False),
+        ("1", False, True),
+    ],
+)
+def test_deep_ep_binary_env(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    default: bool,
+    expected: bool,
+) -> None:
     name = "TRTLLM_TEST_DEEP_EP_BINARY_ENV"
     if value is None:
         monkeypatch.delenv(name, raising=False)
     else:
         monkeypatch.setenv(name, value)
-    assert _read_binary_env(name) is expected
+    assert _read_binary_env(name, default=default) is expected
 
 
-def test_deep_ep_binary_env_rejects_invalid_value(monkeypatch):
+def test_deep_ep_binary_env_rejects_invalid_value(monkeypatch: pytest.MonkeyPatch) -> None:
     name = "TRTLLM_TEST_DEEP_EP_BINARY_ENV"
     monkeypatch.setenv(name, "true")
     with pytest.raises(ValueError, match=rf"{name} must be 0 or 1"):
         _read_binary_env(name)
 
 
-def test_deep_ep_nvfp4_fused_output_scale_skips_standalone_scale_op(monkeypatch):
+@pytest.mark.parametrize(("value", "expected"), [(None, True), ("0", False)])
+def test_deep_ep_nvfp4_optimization_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+) -> None:
+    env_names = (
+        "TRTLLM_DEEP_EP_NVFP4_FUSED_OUTPUT_SCALE",
+        "TRTLLM_DEEP_EP_NVFP4_FUSED_BF16_DISPATCH",
+        "TRTLLM_DEEP_EP_LP_COMBINE_RECV_METADATA_STAGING",
+    )
+    for name in env_names:
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.delenv("TRTLLM_MOE_POST_QUANT_ALLTOALLV", raising=False)
+    monkeypatch.setenv("NVSHMEM_QP_DEPTH", "128")
+    deep_ep_buffer = SimpleNamespace(reserve=MagicMock())
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency."
+        "buffer_pool.get_low_latency_buffer",
+        MagicMock(return_value=deep_ep_buffer),
+    )
+    quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=lambda: True,
+            has_fp8_qdq=lambda: False,
+        ),
+        quant_mode=SimpleNamespace(is_int4_weight_only_per_group=lambda: False),
+    )
+
+    comm = DeepEPLowLatency(
+        mapping=SimpleNamespace(moe_ep_size=1, moe_ep_rank=0),
+        num_slots=1,
+        hidden_size=4096,
+        weight_dtype=torch.bfloat16,
+        quant_config=quant_config,
+        max_num_tokens=8,
+        use_low_precision_combine=True,
+        moe_max_num_tokens=8,
+    )
+
+    assert comm._fuse_nvfp4_output_scale is expected
+    assert comm._fuse_nvfp4_bf16_dispatch is expected
+    assert comm._stage_low_precision_combine_metadata is expected
+    deep_ep_buffer.reserve.assert_called_once_with(8, 4096, 1)
+
+
+def test_deep_ep_nvfp4_fused_output_scale_ignores_unsupported_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_DEEP_EP_NVFP4_FUSED_OUTPUT_SCALE", "1")
+    monkeypatch.delenv("TRTLLM_DEEP_EP_NVFP4_FUSED_BF16_DISPATCH", raising=False)
+    monkeypatch.delenv("TRTLLM_DEEP_EP_LP_COMBINE_RECV_METADATA_STAGING", raising=False)
+    monkeypatch.setenv("NVSHMEM_QP_DEPTH", "128")
+    monkeypatch.setattr(DeepEPLowLatency, "is_platform_supported", staticmethod(lambda: True))
+    deep_ep_buffer = SimpleNamespace(reserve=MagicMock())
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency."
+        "buffer_pool.get_low_latency_buffer",
+        MagicMock(return_value=deep_ep_buffer),
+    )
+    quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=lambda: False,
+            has_fp8_qdq=lambda: False,
+        ),
+        quant_mode=SimpleNamespace(is_int4_weight_only_per_group=lambda: False),
+    )
+
+    comm = DeepEPLowLatency(
+        mapping=SimpleNamespace(moe_ep_size=1, moe_ep_rank=0),
+        num_slots=1,
+        hidden_size=4096,
+        weight_dtype=torch.bfloat16,
+        quant_config=quant_config,
+        max_num_tokens=8,
+        moe_max_num_tokens=8,
+    )
+
+    assert comm._fuse_nvfp4_output_scale is False
+    deep_ep_buffer.reserve.assert_called_once_with(8, 4096, 1)
+
+
+def test_deep_ep_nvfp4_fused_output_scale_skips_standalone_scale_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calculate_global_scale = MagicMock(
         side_effect=AssertionError("standalone NVFP4 output-scale op must not run")
     )
@@ -260,7 +361,9 @@ def _run_deep_ep_dispatch_scheduler(
     )
 
 
-def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(monkeypatch):
+def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         "tensorrt_llm._torch.moe.fused_moe.moe_scheduler.get_calibrator",
         lambda: SimpleNamespace(maybe_collect_or_replay_slots=lambda _num_slots, slots: slots),
@@ -271,8 +374,16 @@ def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(monkeyp
     input_scale = torch.tensor(0.75, dtype=torch.float32)
 
     comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
-    comm.supports_post_quant_dispatch = MagicMock(return_value=True)
-    comm.should_fuse_bf16_nvfp4_dispatch = MagicMock(return_value=True)
+    comm._fuse_nvfp4_bf16_dispatch = True
+    comm.enable_postquant_alltoall = True
+    comm.hidden_size = x.shape[-1]
+    comm.SUPPORTED_HIDDEN_SIZES_EXTENSION = frozenset({x.shape[-1]})
+    comm.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=lambda: True,
+            has_fp8_qdq=lambda: False,
+        )
+    )
     comm.dispatch = MagicMock(return_value=(x, None, selected_slots, final_scales))
     comm.combine = MagicMock(side_effect=lambda output, **_kwargs: output)
 
@@ -324,7 +435,7 @@ def test_cutedsl_deep_ep_nvfp4_dispatch_capability_fails_closed(
 
 
 def test_unvalidated_backend_cannot_bypass_quantize_input_for_deep_ep_dispatch(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         "tensorrt_llm._torch.moe.fused_moe.moe_scheduler.get_calibrator",
@@ -361,7 +472,7 @@ def test_unvalidated_backend_cannot_bypass_quantize_input_for_deep_ep_dispatch(
     assert "nvfp4_input_scale" not in dispatch_kwargs
 
 
-def test_deep_ep_bf16_nvfp4_fusion_gate_falls_back_for_unsupported_input():
+def test_deep_ep_bf16_nvfp4_fusion_gate_falls_back_for_unsupported_input() -> None:
     comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
     comm._fuse_nvfp4_bf16_dispatch = True
     comm.enable_postquant_alltoall = True

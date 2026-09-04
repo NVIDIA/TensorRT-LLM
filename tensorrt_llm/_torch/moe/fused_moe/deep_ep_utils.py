@@ -9,6 +9,8 @@ import torch
 from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.mapping import Mapping
 
+_LowLatencyHandle = Tuple[torch.Tensor, torch.Tensor, int, int, int]
+
 try:
     from tensorrt_llm.deep_ep import Buffer
     deep_ep_installed = True
@@ -182,12 +184,26 @@ class VariableLengthLowLatencyBuffer:
 
         return recv_hidden_states, recv_scales, recv_expert_count, handle
 
-    def low_latency_dispatch_bf16_to_fp4(self, hidden_states: torch.Tensor,
-                                         global_scale: torch.Tensor,
-                                         topk_idx: torch.Tensor,
-                                         num_max_dispatch_tokens_per_rank: int,
-                                         num_experts: int):
-        """Pack BF16 to NVFP4 in the DeepEP dispatch send phase."""
+    def low_latency_dispatch_bf16_to_fp4(
+        self, hidden_states: torch.Tensor, global_scale: torch.Tensor,
+        topk_idx: torch.Tensor, num_max_dispatch_tokens_per_rank: int,
+        num_experts: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, _LowLatencyHandle]:
+        """Pack BF16 inputs to NVFP4 in the DeepEP dispatch send phase.
+
+        Args:
+            hidden_states: Contiguous BF16 input with shape
+                ``[num_tokens, hidden_size]``.
+            global_scale: One-element FP32 NVFP4 input scale.
+            topk_idx: Expert indices with shape ``[num_tokens, top_k]``.
+            num_max_dispatch_tokens_per_rank: Reserved token capacity per rank.
+            num_experts: Global expert count used to reserve this buffer.
+
+        Returns:
+            The received packed values, received block scales, per-expert
+            receive counts, and an opaque handle that must be passed unchanged
+            to the matching combine operation.
+        """
         if num_experts != self.num_experts:
             raise ValueError(
                 f"num_experts must match the reserved buffer ({self.num_experts}), got {num_experts}"
@@ -202,17 +218,31 @@ class VariableLengthLowLatencyBuffer:
 
         return recv_hidden_states, recv_scales, recv_expert_count, handle
 
-    def low_latency_combine_low_precision(self,
-                                          precision: str,
-                                          hidden_states: torch.Tensor,
-                                          global_scales: Optional[torch.Tensor],
-                                          topk_idx: torch.Tensor,
-                                          topk_weights: torch.Tensor,
-                                          handle: Tuple,
-                                          stage_recv_metadata: bool = False):
-        """
-            Arguments:
-                precision: the precision of the low-precision kernel, "fp8" for FP8, "nvfp4" for NVFP4.
+    def low_latency_combine_low_precision(
+            self,
+            precision: str,
+            hidden_states: torch.Tensor,
+            global_scales: Optional[torch.Tensor],
+            topk_idx: torch.Tensor,
+            topk_weights: torch.Tensor,
+            handle: _LowLatencyHandle,
+            stage_recv_metadata: bool = False) -> torch.Tensor:
+        """Combine low-precision expert outputs through DeepEP.
+
+        Args:
+            precision: ``"fp8"`` or ``"nvfp4"``.
+            hidden_states: Expert outputs with shape
+                ``[num_local_experts, token_capacity, hidden_size]``.
+            global_scales: Optional per-token NVFP4 global scales. ``None``
+                selects in-kernel dynamic scaling for NVFP4.
+            topk_idx: Expert indices with shape ``[num_tokens, top_k]``.
+            topk_weights: Routing weights with shape ``[num_tokens, top_k]``.
+            handle: Opaque handle returned by the matching dispatch operation.
+            stage_recv_metadata: Whether to stage stable receive metadata in
+                CTA shared memory.
+
+        Returns:
+            Combined BF16 output with shape ``[num_tokens, hidden_size]``.
         """
         combined_hidden_states, event, hook = \
             self.buffer.low_latency_combine_low_precision(

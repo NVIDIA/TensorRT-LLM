@@ -28,6 +28,7 @@ import torch
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -38,9 +39,13 @@ _NVFP4_FUSED_BF16_DISPATCH_ENV = "TRTLLM_DEEP_EP_NVFP4_FUSED_BF16_DISPATCH"
 _LOW_PRECISION_COMBINE_STAGE_METADATA_ENV = "TRTLLM_DEEP_EP_LP_COMBINE_RECV_METADATA_STAGING"
 
 
-def _read_binary_env(name: str) -> bool:
+def _read_binary_env(name: str, *, default: bool = False) -> bool:
+    """Read a binary environment flag, using the default only when unset."""
     value = os.environ.get(name)
-    if value not in (None, "0", "1"):
+    if value is None:
+        return default
+    value = value.strip()
+    if value not in ("", "0", "1"):
         raise ValueError(f"{name} must be 0 or 1, got {value!r}")
     return value == "1"
 
@@ -100,21 +105,31 @@ class DeepEPLowLatency(Communication):
         self.use_low_precision_combine = (
             use_low_precision_combine and self.supports_low_precision_combine()
         )
-        self._fuse_nvfp4_output_scale = _read_binary_env(_NVFP4_FUSED_OUTPUT_SCALE_ENV)
-        self._fuse_nvfp4_bf16_dispatch = _read_binary_env(_NVFP4_FUSED_BF16_DISPATCH_ENV)
+        # Enable the applicable fast paths by default while preserving each
+        # environment flag as an explicit rollback to the original path.
+        self.enable_postquant_alltoall = (
+            os.environ.get("TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1") == "1"
+        )
+        self._fuse_nvfp4_output_scale = _read_binary_env(
+            _NVFP4_FUSED_OUTPUT_SCALE_ENV,
+            default=self.use_low_precision_combine and self._has_nvfp4(),
+        )
+        self._fuse_nvfp4_bf16_dispatch = _read_binary_env(
+            _NVFP4_FUSED_BF16_DISPATCH_ENV,
+            default=self._has_nvfp4() and self.supports_post_quant_dispatch(),
+        )
         self._stage_low_precision_combine_metadata = _read_binary_env(
-            _LOW_PRECISION_COMBINE_STAGE_METADATA_ENV
+            _LOW_PRECISION_COMBINE_STAGE_METADATA_ENV,
+            default=self.use_low_precision_combine,
         )
         if self._fuse_nvfp4_output_scale and (
             not self.use_low_precision_combine or not self._has_nvfp4()
         ):
-            raise ValueError(
-                f"{_NVFP4_FUSED_OUTPUT_SCALE_ENV} requires low-precision NVFP4 combine"
+            logger.warning_once(
+                f"Ignoring {_NVFP4_FUSED_OUTPUT_SCALE_ENV} for a layer without "
+                "low-precision NVFP4 combine"
             )
-        # Read from environment variable, same as wideEP
-        self.enable_postquant_alltoall = (
-            os.environ.get("TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1") == "1"
-        )
+            self._fuse_nvfp4_output_scale = False
 
         # Calculate deep_ep_max_num_tokens
         assert moe_max_num_tokens is not None
