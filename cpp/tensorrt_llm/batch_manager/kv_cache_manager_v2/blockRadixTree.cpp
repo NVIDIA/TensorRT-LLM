@@ -195,9 +195,9 @@ BlockKey Hasher::digest() const
 std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
     int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset)
 {
-    TLLM_CHECK_DEBUG(numTokens > 0);
-    TLLM_CHECK_DEBUG(tokenOffset >= 0);
-    TLLM_CHECK_DEBUG(multiModalDataDigest.size() == kDIGEST_LEN);
+    TLLM_CHECK(numTokens > 0);
+    TLLM_CHECK(tokenOffset >= 0);
+    TLLM_CHECK(multiModalDataDigest.size() == kDIGEST_LEN);
     std::vector<TokenIdExt> result;
     result.reserve(static_cast<size_t>(numTokens));
     for (int i = 0; i < numTokens; ++i)

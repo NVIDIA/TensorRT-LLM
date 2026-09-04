@@ -433,7 +433,7 @@ void DiskSlotPool::resize(SlotCount newNumSlots)
 
 Address DiskSlotPool::slotAddress(SlotId slot) const
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slot < numSlots(), "DiskSlotPool::slotAddress: slot index out of bounds");
+    TLLM_CHECK_WITH_INFO(slot < numSlots(), "DiskSlotPool::slotAddress: slot index out of bounds");
     size_t const byteOffset = toSizeT(slot) * mSlotSize;
     TLLM_CHECK_DEBUG_WITH_INFO(byteOffset <= static_cast<size_t>(std::numeric_limits<ssize_t>::max()),
         "DiskSlotPool::slotAddress: byte offset out of range");

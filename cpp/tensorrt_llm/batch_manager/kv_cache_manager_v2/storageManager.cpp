@@ -1487,10 +1487,9 @@ void StorageManager::shrinkPoolGroup(
     // A16: persistent_pages preconditions.
     TLLM_CHECK_DEBUG_WITH_INFO(
         persistentPages.size() <= slotCountToSizeT(newNumSlots), "Not enough slots to hold all persistent pages");
-    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(persistentPages.begin(), persistentPages.end(),
-                                   [this, level, pgIdx](auto const& p) {
-                                       return p->cacheLevel == level && getPoolGroupIndex(level, p->lifeCycle) == pgIdx;
-                                   }),
+    TLLM_CHECK_WITH_INFO(std::all_of(persistentPages.begin(), persistentPages.end(),
+                             [this, level, pgIdx](auto const& p)
+                             { return p->cacheLevel == level && getPoolGroupIndex(level, p->lifeCycle) == pgIdx; }),
         "Persistent page cache level or pool group mismatch");
 
     // Fast path: when no slot id has ever been issued in the to-be-removed

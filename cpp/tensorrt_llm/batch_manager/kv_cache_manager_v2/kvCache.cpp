@@ -1065,7 +1065,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
     // Scratch reuse: enforce constraint.
     bool enableScratch = mEnableSwaScratchReuse;
-    if (TLLM_UNLIKELY(gDebug) && enableScratch && newCap != mCapacity)
+    if (enableScratch && newCap != mCapacity)
     {
         int const maxRewindLen = _swaScratchMaxRewindLen();
         int const minHistoryLength = std::max(0, mCapacity - maxRewindLen);
@@ -1485,14 +1485,14 @@ TypedVec<LifeCycleId, KvCache::TakenPage> KvCache::_takeUncommittedPage(
         if (auto* lock = std::get_if<SharedPageLock>(&bp))
         {
             auto up = dynamicPointerCast<UncommittedPage>(lock->page());
-            TLLM_CHECK_DEBUG_WITH_INFO(up, "page must be UncommittedPage");
+            TLLM_CHECK_WITH_INFO(up, "page must be UncommittedPage");
             result[lc] = {up, true};
         }
         else if (auto* holder = std::get_if<SharedPtr<PageHolder>>(&bp))
         {
             TLLM_CHECK_DEBUG(*holder);
             auto up = dynamicPointerCast<UncommittedPage>((*holder)->page);
-            TLLM_CHECK_DEBUG_WITH_INFO(up, "page must be UncommittedPage");
+            TLLM_CHECK_WITH_INFO(up, "page must be UncommittedPage");
             result[lc] = {up, false};
         }
         bp = std::monostate{};
@@ -2052,7 +2052,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
         {
             auto& blk = *matched.at(ordinal);
             auto* page = blk.storage.at(lcId);
-            TLLM_CHECK_DEBUG_WITH_INFO(page, "Expected page in non-stale block");
+            TLLM_CHECK_WITH_INFO(page, "Expected page in non-stale block");
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
             bpSlot = page->hold();
             if (shouldRecordStats && isAttention)
@@ -2086,7 +2086,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
     {
         auto& snapshotBlock = *matched.back();
         auto* snapshotPage = snapshotBlock.storage[*ssmLcId];
-        TLLM_CHECK_DEBUG_WITH_INFO(snapshotPage, "Last matched block must have SSM snapshot after truncation");
+        TLLM_CHECK_WITH_INFO(snapshotPage, "Last matched block must have SSM snapshot after truncation");
         mSsmBlocks[kDefaultBeamIndex][*ssmLcId] = snapshotPage->hold();
     }
     // Record one SSM snapshot lookup for this reuse-match onboarding (a miss when
@@ -2455,9 +2455,10 @@ int KvCache::getSsmBlockBaseIndex(LayerGroupId lgId, BeamIndex beamIdx) const
     auto const& bp = mSsmBlocks.at(beamIdx).at(lgId);
     if (blockPageIsNull(bp))
         return kBadPageIndex.value();
-    TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
+    TLLM_CHECK_WITH_INFO(
+        std::holds_alternative<SharedPageLock>(bp), "SSM block must be locked before its index is read");
     auto const& pg = blockPageGetPage(bp);
-    TLLM_CHECK_DEBUG_WITH_INFO(pg, "SSM block must have a valid page");
+    TLLM_CHECK_WITH_INFO(pg, "SSM block must have a valid page");
     return slotIdToPageIndexValue(pg->slotId()); // asserts valid slot
 }
 
