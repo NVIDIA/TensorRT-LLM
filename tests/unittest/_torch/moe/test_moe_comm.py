@@ -815,7 +815,12 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
             return f"NVLinkOneSided MAX_TOP_K={NVLinkOneSided.MAX_TOP_K}, got top_k={config.top_k}"
 
     if comm_type == COMM_NCCL_EP:
-        if config.quant_mode != "none":
+        if config.quant_mode == "nvfp4" and config.hidden_size % 256 != 0:
+            return "NcclEP nvfp4 requires hidden_size divisible by 256"
+        if config.quant_mode in ("fp8", "nvfp4"):
+            if not nccl_ep_supports_version("0.2"):
+                return f"NcclEP {config.quant_mode} requires libnccl_ep >= 0.2"
+        elif config.quant_mode != "none":
             return f"NcclEP does not support quant_mode={config.quant_mode}"
         if config.top_k > NCCL_EP_MAX_TOP_K:
             return f"NcclEP MAX_TOP_K={NCCL_EP_MAX_TOP_K}, got top_k={config.top_k}"
@@ -2950,6 +2955,46 @@ class TestMoEComm:
     def test_moe_comm(self, mpi_pool_executor, group: CommTestGroup):
         """Verify full dispatch -> compute -> combine pipeline."""
         _run_full_test_group(mpi_pool_executor, group)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "mpi_pool_executor,group",
+        [
+            pytest.param(
+                2,
+                CommTestGroup(
+                    configs=[
+                        CommTestConfig(
+                            comm_type=COMM_NCCL_EP,
+                            ep_size=2,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=2,
+                            hidden_size=DEFAULT_HIDDEN_SIZE,
+                            all_num_tokens=[16, 16],
+                        )
+                    ]
+                ),
+                id="NcclEP_capability_e2e",
+            ),
+        ],
+        indirect=["mpi_pool_executor"],
+    )
+    def test_nccl_ep_capability_e2e(self, mpi_pool_executor, group: CommTestGroup):
+        """Exercise the public NCCL-EP v0.2 capability path end-to-end."""
+        if not nccl_ep_supports_version("0.2"):
+            pytest.skip("NCCL-EP capability API requires libnccl_ep >= 0.2")
+
+        from nccl.ep import ExpertIdKind, LayoutInfo
+
+        layout_info = LayoutInfo(recv_topk_idx_kind=ExpertIdKind.GLOBAL)
+        assert int(layout_info._lowpp.recv_topk_idx_kind) == int(ExpertIdKind.GLOBAL)
+        _run_full_test_group(mpi_pool_executor, group)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+    def test_nccl_ep_cuda_graph_replay_uses_updated_routing(self, mpi_pool_executor) -> None:
+        """Verify LL CUDA graph replay reads routing written after capture."""
+        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
