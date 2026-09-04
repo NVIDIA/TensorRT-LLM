@@ -716,8 +716,9 @@ private:
             // __file__ of the imported module cannot disagree with what is imported, so it is
             // tried first and the pip path below is left exactly as it was as the fallback.
             {
-                char const* modCmd = "python3 -c \"import tensorrt_llm, os; "
-                                     "print(os.path.dirname(tensorrt_llm.__file__))\" 2>/dev/null";
+                char const* modCmd
+                    = "python3 -c \"import tensorrt_llm, os; "
+                      "print(os.path.dirname(tensorrt_llm.__file__))\" 2>/dev/null";
 #ifdef _MSC_VER
                 FILE* modPipe = _popen(modCmd, "r");
 #else
@@ -744,8 +745,7 @@ private:
                     }
                     if (!modDir.empty())
                     {
-                        auto fromModule = std::filesystem::path(modDir) / "include"
-                            / "trtllm_gen_kernels" / "fmha";
+                        auto fromModule = std::filesystem::path(modDir) / "include" / "trtllm_gen_kernels" / "fmha";
                         if (std::filesystem::exists(fromModule))
                         {
                             execPathStr = (fromModule / "numb").string();
