@@ -19,16 +19,6 @@ llm_perf_core:
 
 # 1: All GPUs common tests(L40S, H100, GB200, B200, B300, GB300, RTX-6000-Server test cases)
 - condition:
-    wildcards:
-      gpu:
-      - '*l40s*'
-      - '*h100*'
-      - '*gb200*'
-      - '*b200*'
-      - '*gb110*'
-      - '*b300*'
-      - '*gb300*'
-      - '*6000*'
     terms:
       supports_fp8: true
     ranges:
@@ -50,10 +40,6 @@ llm_perf_core:
 
 # 2: L40S, H100
 - condition:
-    wildcards:
-      gpu:
-      - '*l40s*'
-      - '*h100*'
     ranges:
       system_gpu_count:
         gte: 2
@@ -68,9 +54,6 @@ llm_perf_core:
 
 # 3: H100 test cases
 - condition:
-    wildcards:
-      gpu:
-      - '*h100*'
     ranges:
       system_gpu_count:
         gte: 8
@@ -97,15 +80,6 @@ llm_perf_core:
 
 # 4: H100, GB200, B200, B300, GB300, RTX6000-Server test cases
 - condition:
-    wildcards:
-      gpu:
-      - '*h100*'
-      - '*gb200*'
-      - '*b200*'
-      - '*gb110*'
-      - '*b300*'
-      - '*gb300*'
-      - '*6000*'
     ranges:
       system_gpu_count:
         gte: 2
@@ -301,13 +275,6 @@ llm_perf_core:
 
 # 9: H100, B200, B300, RTX6000-Server test cases
 - condition:
-    wildcards:
-      gpu:
-      - '*h100*'
-      - '*b200*'
-      - '*gb110*'
-      - '*b300*'
-      - '*6000*'
     ranges:
       system_gpu_count:
         gte: 8
@@ -329,12 +296,6 @@ llm_perf_core:
 
 # 10: B200, B300, RTX6000-Server test cases
 - condition:
-    wildcards:
-      gpu:
-      - '*b200*'
-      - '*gb110*'
-      - '*b300*'
-      - '*6000*'
     ranges:
       system_gpu_count:
         gte: 8
