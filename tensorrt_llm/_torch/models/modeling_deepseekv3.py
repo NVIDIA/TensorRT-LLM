@@ -87,6 +87,14 @@ if IS_FLASHINFER_AVAILABLE:
 else:
     flashinfer_norm = None
 
+_WIDEEP_FLASHINFER_ADD_ADD_RMSNORM_ENV = (
+    "TRTLLM_ENABLE_WIDEEP_FLASHINFER_ADD_ADD_RMSNORM")
+
+
+def _is_wideep_flashinfer_add_add_rmsnorm_enabled() -> bool:
+    """Enable the WideEP fusion by default while preserving a zero rollback."""
+    return os.environ.get(_WIDEEP_FLASHINFER_ADD_ADD_RMSNORM_ENV, "1") == "1"
+
 
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
@@ -1331,8 +1339,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.enable_fusion = os.environ.get(
             "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
-        self.enable_wideep_flashinfer_add_add_rmsnorm = os.environ.get(
-            "TRTLLM_ENABLE_WIDEEP_FLASHINFER_ADD_ADD_RMSNORM", "0") == "1"
+        self.enable_wideep_flashinfer_add_add_rmsnorm = (
+            _is_wideep_flashinfer_add_add_rmsnorm_enabled())
 
         # FIXME: incompatible with mixed quantization mode
         quant_config = self._get_decoder_layer_quant_config(

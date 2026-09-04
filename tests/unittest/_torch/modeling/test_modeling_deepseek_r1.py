@@ -67,6 +67,24 @@ def _can_use(
     )
 
 
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [(None, True), ("1", True), ("0", False)],
+)
+def test_wideep_flashinfer_add_add_rmsnorm_default_and_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str | None,
+    expected: bool,
+) -> None:
+    env_name = deepseek_r1_modeling._WIDEEP_FLASHINFER_ADD_ADD_RMSNORM_ENV
+    if env_value is None:
+        monkeypatch.delenv(env_name, raising=False)
+    else:
+        monkeypatch.setenv(env_name, env_value)
+
+    assert deepseek_r1_modeling._is_wideep_flashinfer_add_add_rmsnorm_enabled() is expected
+
+
 def test_wideep_flashinfer_add_add_rmsnorm_accepts_exact_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
