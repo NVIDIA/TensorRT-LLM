@@ -74,7 +74,7 @@ ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
 
 MODEL_EXPRESS_VERSION = "0.4.1"
-MODEL_EXPRESS_NIXL_VERSION = "1.3.1"
+MODEL_EXPRESS_NIXL_VERSION = "1.4.0"
 MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:${MODEL_EXPRESS_VERSION}"
 MODEL_EXPRESS_REDIS_IMAGE = "urm.nvidia.com/docker/redis:7-alpine"
 
@@ -214,6 +214,12 @@ SLURM_NON_TERMINAL_STATES = [
     "REQUEUED", "RESIZING", "SUSPENDED", "SIGNALING", "STOPPED",
 ]
 
+// How often the background shell watcher snapshots the in-progress
+// ${stageName}/ directory (containing the PeriodicJUnitXML reporter's
+// results.xml) up to Artifactory. 10 minutes balances Artifactory traffic
+// against staleness for multi-hour test stages.
+PROGRESS_UPLOAD_INTERVAL_SEC = 600
+
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
 // were originally inline here, but the Jenkins script-security sandbox
@@ -298,6 +304,8 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
             numRetries: 1,
         )?.trim()
         pipeline.echo(tailOut ?: "")
+    } catch (InterruptedException e) {
+        throw e
     } catch (Exception tailEx) {
         pipeline.echo("Ignorable warning: could not tail ${remotePath} on ${remote.host}: ${tailEx.message}")
     }
@@ -390,57 +398,40 @@ def readSlurmSubmitOutput(def pipeline, Map remote, String jobWorkspace, String 
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
-def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="", boolean suppressTestReporting=false) {
-    CloudManager.withSlurmSshCredentialRemotes(pipeline, clusterName, cluster) { remotes ->
-        // Pin one reachable frontend for the whole collect: every download targets
-        // the same node workspace (/home/svc_tensorrt/bloom/scripts/${nodeName}),
-        // so the find + scps must all hit the login node that holds those files.
-        // No whole-closure failover here -- uploadArtifacts/junit must not re-run.
-        def remote = CloudManager.selectReachableSlurmRemote(pipeline, remotes)
-        def hasTimeoutTest = false
-        def downloadResultSucceed = false
-        def downloadPerfResultSucceed = false
+def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, String postTag="", boolean suppressTestReporting=false) {
+    pipeline.stage('Submit Test Result') {
+        sh "ls -al ${stageName}/ || true"
 
-        pipeline.stage('Submit Test Result') {
-            sh "mkdir -p ${stageName}"
-            // Download timeout test results
-            def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
-            def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, timeoutTestFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
-            if (downloadTimeoutTestSucceed) {
-                if (stageIsInterrupted) {
-                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
-                } else {
-                    sh "ls -al ${stageName}/"
-                    // Generate timeout test result xml if there are terminated unexpectedly tests
-                    hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
-                }
-            }
-            // Download normal test results
-            def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
-            downloadResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, resultsFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+        if (suppressTestReporting) {
+            // This attempt is superseded by a planned retry. Rename its XMLs so
+            // Collect Test Result does not ingest them after extracting the tar.
+            // The progress snapshot still contains the old names, so it must not
+            // be promoted and the modified directory must be uploaded instead.
+            sh """
+                cd ${stageName} && for f in results*.xml; do
+                    [ -e "\$f" ] && mv "\$f" "superseded-\$f"
+                done || true
+            """
+        }
 
-            // Download perf test results
-            def perfResultsBasePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
-            def folderListOutput = Utils.exec(
-                pipeline,
-                script: Utils.sshUserCmd(
-                    remote,
-                    "\"find '${perfResultsBasePath}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -printf '%f\\n' || true\""
-                ),
-                returnStdout: true,
-                numRetries: 3
-            )?.trim() ?: ""
-            def perfFolders = folderListOutput.split(/\s+/).collect { it.trim().replaceAll(/\/$/, '') }.findAll { it }
-            echo "Perf Result Folders: ${perfFolders}"
-            if (perfFolders) {
-                def scpSources = perfFolders.size() == 1
-                    ? "${perfResultsBasePath}/${perfFolders[0]}"
-                    : "{${perfFolders.collect { "${perfResultsBasePath}/${it}" }.join(',')}}"
-                downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
-            }
+        // Always re-tar the local stage directory and upload it directly, rather
+        // than trusting the last progress snapshot uploaded by
+        // progress_upload_snapshot.sh to still match it (the superseded-file
+        // rename above, or other post-snapshot writes, can leave it stale). Use
+        // --transform so tar contents carry the postTag filename without
+        // touching on-disk results*.xml files.
+        ensureStageResultNotUploaded("${stageName}${postTag}")
+        def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+        trtllm_utils.uploadArtifacts(
+            "results-${stageName}${postTag}.tar.gz",
+            "${UPLOAD_PATH}/test-results/"
+        )
+        deleteProgressArtifact(stageName, postTag)
 
-            // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
-            if (isCbtsStage(stageName)) {
+        // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
+        if (isCbtsStage(stageName)) {
+            CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
                 def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
                 def cbtsLocalDir = "${stageName}/cbts"
                 def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
@@ -475,48 +466,33 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                     echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
                 }
             }
-
-            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
-            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
-                // On retry attempts, rename freshly-downloaded result XMLs so that
-                // (a) the tar for this attempt is distinguishable from prior attempts
-                //     already uploaded to Artifactory, and
-                // (b) the junit() glob below picks up this attempt's results as a
-                //     separate set, keeping earlier attempts' test data visible in
-                //     the Jenkins build report rather than overwriting it.
-                if (postTag) {
-                    sh """
-                        cd ${stageName}
-                        for f in results*.xml; do
-                            [ -f "\$f" ] || continue
-                            case "\$f" in *${postTag}.xml) continue ;; esac
-                            name=\"\${f%.xml}\"
-                            mv \"\$f\" \"\${name}${postTag}.xml\" || true
-                        done
-                    """
-                }
-                sh "ls -al ${stageName}/"
-                echo "Upload test results."
-                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
-                ensureStageResultNotUploaded("${stageName}${postTag}")
-                trtllm_utils.uploadArtifacts(
-                    "results-${stageName}${postTag}.tar.gz",
-                    "${UPLOAD_PATH}/test-results/"
-                )
-            } else {
-                println("No results xml to submit")
-            }
         }
+    }
 
-        if ((hasTimeoutTest || downloadResultSucceed) && !suppressTestReporting) {
-            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
-        } else if (suppressTestReporting) {
-            echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing junit() because a retry is still planned"
-        }
+    // For a reportable attempt, rename local results*.xml with postTag so
+    // junit() reports each attempt separately. Superseded attempts were already
+    // renamed above and therefore do not match this loop.
+    if (postTag) {
+        sh """
+            cd ${stageName}
+            for f in results*.xml; do
+                [ -f "\$f" ] || continue
+                case "\$f" in *${postTag}.xml) continue ;; esac
+                mv "\$f" "\${f%.xml}${postTag}.xml" || true
+            done
+        """
+    }
+
+    // junit() uses local XML files already downloaded by the final progress snapshot.
+    def hasLocalResults = sh(script: "ls ${stageName}/results*.xml 2>/dev/null | wc -l", returnStdout: true).trim().toInteger() > 0
+    if (hasLocalResults && !suppressTestReporting) {
+        junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
+    } else if (suppressTestReporting) {
+        echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing junit() because a retry is still planned"
     }
 }
 
-def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
+def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag="") {
     // Run the isolated tests one by one to avoid any potential conflicts
     def isolateTestList = preprocessedLists.isolate
     def isolateTestLines = readFile(file: isolateTestList).readLines()
@@ -548,7 +524,8 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}")
+            def isRerunFailed = rerunFailedTests(
+                stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag)
             if (isRerunFailed) {
                 catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                     error "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
@@ -1296,18 +1273,21 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 if (waitRc == 3) {
                     checkSlurmJobActive()
                 }
+                if (waitRc != 0) {
+                    error "SLURM job ${slurmJobID} did not reach RUNNING during the queue wait. Terminating the job."
+                }
 
                 // Phase 2: job is RUNNING; wait for the Jenkins agent to come online. isNodeOnline()
                 // and Thread.sleep() emit no flow-nodes, so poll every 30s without bloating Blue
                 // Ocean, and probe job status every ~3 min (every 6th iter) to fail fast if the
-                // job dies during bring-up. 120 * 30s = 1h.
+                // job dies during bring-up. 60 * 30s = 30 min.
                 if (waitRc == 0) {
                     // Job is RUNNING: stamp the walltime-budget origin for the
                     // timeout duration fallback (within Phase 1's ~3min poll
                     // granularity of the true RUNNING transition).
                     jobRunningStartMs = System.currentTimeMillis()
                     def onlineCounter = 0
-                    while (!CloudManager.isNodeOnline(nodeName) && onlineCounter < 120) {
+                    while (!CloudManager.isNodeOnline(nodeName) && onlineCounter < 60) {
                         Thread.sleep(30L * 1000L)
                         if (onlineCounter % 6 == 0) {
                             checkSlurmJobActive()
@@ -1389,7 +1369,21 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         }
                     }
                 } else {
-                    error "The Slurm node does not come online in the waiting period. Terminating the job."
+                    def setupLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
+                    try {
+                        CloudManager.withSlurmFrontendFailover(pipeline, remotes) { logRemote ->
+                            echoRemoteLogTail(pipeline, logRemote, setupLogPath)
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception logEx) {
+                        echo "Ignorable warning: could not retrieve ${setupLogPath}: ${logEx.message}"
+                    }
+                    throw new InfraFailure(
+                        "SLURM agent ${nodeName} for job ${slurmJobID} did not come online within 30 minutes " +
+                        "after the job started. Check SLURM logs at ${setupLogPath} on ${cluster.host}.",
+                        null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-agent-online-timeout>"
+                    )
                 }
             }
         }
@@ -1726,6 +1720,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
     def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
     def aggMultiNodeMode = !disaggMultiNodeMode && nodeCount > 1 && stageName.contains("PerfSanity")
+    def singleNvlinkDomainMode = stageName.contains("SingleNvlinkDomain")
     def infraDryRun = isInfraDryRun()
     if (infraDryRun) {
         testList = INFRA_DRY_RUN_TEST_CONTEXT
@@ -1747,6 +1742,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         withCredentials([
             string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
+            string(credentialsId: 'github_read_public_only_token', variable: 'GITHUB_CLONE_TOKEN'),
         ]) {
             CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
@@ -1971,7 +1967,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                 }
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
+                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode || singleNvlinkDomainMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
                 }
@@ -2092,6 +2088,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     srunArgs.add("--container-env=S3_SECRET_KEY")
                 }
+                srunArgs.add("--container-env=GITHUB_CLONE_TOKEN")
                 envVarsToExport.each { varName, varValue ->
                     srunArgs.add("--container-env=${varName}")
                 }
@@ -2140,7 +2137,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    # Keep xtrace off around the token exports so they are not echoed into the Slurm job log.
+                    set +x
                     export HF_TOKEN=$HF_TOKEN
+                    export GITHUB_CLONE_TOKEN=$GITHUB_CLONE_TOKEN
+                    set -x
                     if [ -f "${s3SecretKeyPathNode}" ]; then
                         set +x
                         export S3_SECRET_KEY="\$(cat "${s3SecretKeyPathNode}")"
@@ -2172,7 +2173,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     pipeline.writeFile(file: scriptLaunchSrunArgsPathLocal, text: srunArgs.join(" "))
 
                     sh """
-                        pip3 install pyyaml && \\
+                        pip3 install 'pyyaml>=6.0.1,<6.0.3' && \\
                         python3 ${scriptSubmitLocalPath} \\
                         --llm-src ${llmSrcLocal} \\
                         --test-list ${testListPathLocal} \\
@@ -2486,14 +2487,108 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // -- it fails the closure over to another frontend and the submit guard
                 // reuses the still-active job -- so the monitor needs no same-frontend
                 // retries of its own.
-                Utils.exec(
-                    pipeline,
-                    timeout: false,
-                    script: Utils.sshUserCmd(
-                        remote,
-                        scriptTrackPathNode
-                    )
-                )
+                // Track the Slurm job alongside a controller-side watcher
+                // that SSH-stats the remote results.xml and SCPs / uploads
+                // a progress tar whenever the file's mtime advances. Both
+                // run inside a single `sh` step (track in foreground, watcher
+                // as a background subshell) so Blue Ocean renders the stage
+                // as a single box instead of a nested parallel split.
+                def pytestDoneFile = "${WORKSPACE}/.pytest-done-${stageName}"
+                def progressTar = "results-${stageName}${postTag}-progress.tar.gz"
+                def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${progressTar}"
+                def remoteWorkspaceTrk = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
+                def trackCmd = Utils.sshUserCmd(remote, scriptTrackPathNode)
+                // Stat on the compute node via srun --overlap to bypass the login
+                // node's NFS attribute cache.  The login node's NFS client can cache
+                // a stale directory view for up to acdirmax seconds after the compute
+                // node creates results.xml; running stat directly on the node that
+                // wrote the file avoids this cross-client visibility window entirely.
+                // After the mtime check confirms a change, sshRefreshCacheCmd primes
+                // the login node's NFS cache before the SCP step reads the file.
+                // Some clusters' srun cli_filter plugin rejects any job step that
+                // doesn't carry -A <account> (e.g. "You must specify an account"),
+                // so this overlap step needs the same account the sbatch submission
+                // used, pulled out of partition.additionalArgs.
+                def slurmAccountMatch = (partition.additionalArgs =~ /(?:^|\s)-A\s+(\S+)/)
+                def srunAccountArg = slurmAccountMatch.find() ? "-A ${slurmAccountMatch.group(1)} " : ""
+                def sshStatCmd = Utils.sshUserCmd(remote, "\"srun --overlap ${srunAccountArg}--quiet --jobid='${slurmJobId}' --ntasks=1 stat -c %Y '${remoteWorkspaceTrk}/results.xml' || echo 0\"")
+                def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
+                def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
+                def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
+                def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
+                def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
+                sh "rm -f ${pytestDoneFile}"
+                withCredentials([usernamePassword(
+                        credentialsId: 'urm-artifactory-creds',
+                        usernameVariable: 'ART_USER',
+                        passwordVariable: 'ART_PASS')]) {
+                    sh """#!/bin/bash
+                        set +e
+                        export STAGE_NAME='${stageName}'
+                        export PROGRESS_TAR='${progressTar}'
+                        export PROGRESS_URL='${progressUrl}'
+                        export TIMEOUT_XML_SCRIPT='${llmSrcLocal}/jenkins/scripts/generate_timeout_xml.py'
+                        export POST_TAG='${postTag}'
+                        # ---- background watcher: SSH-stat remote XML, SCP, tar, upload ----
+                        PROGRESS_DONE_FILE='${pytestDoneFile}' \\
+                        PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
+                        LABEL_PREFIX='sbatch checkpoint' \\
+                        SLURM_SSH_STAT_CMD='${sshStatCmd}' \\
+                        SLURM_SSH_REFRESH_CACHE_CMD='${sshRefreshCacheCmd}' \\
+                        SLURM_SCP_XML_CMD='${scpXmlCmd}' \\
+                        SLURM_SCP_UNFINISHED_CMD='${scpUnfinishedCmd}' \\
+                        SLURM_SSH_LIST_PERF_CMD='${sshListPerfCmd}' \\
+                        SLURM_SCP_PERF_TEMPLATE='${scpPerfTemplate}' \\
+                        bash '${llmSrcLocal}/jenkins/scripts/progress_upload_watcher.sh' &
+                        WATCHER_PID=\$!
+
+                        # ---- foreground track: retry up to 3 times on failure ----
+                        attempt=0
+                        rc=1
+                        while [ \$attempt -lt 3 ]; do
+                            ${trackCmd}
+                            rc=\$?
+                            [ \$rc -eq 0 ] && break
+                            attempt=\$((attempt+1))
+                            [ \$attempt -lt 3 ] && echo "Track failed (rc=\$rc), retry \$attempt/3" && sleep 30
+                        done
+
+                        touch '${pytestDoneFile}'
+                        wait \$WATCHER_PID 2>/dev/null || true
+
+                        # ---- immediate final snapshot ----
+                        mkdir -p '${WORKSPACE}/${stageName}'
+                        ${sshRefreshCacheCmd}
+                        for _attempt in 1 2 3; do
+                            ${scpXmlCmd} && break
+                            [ \$_attempt -lt 3 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp xml failed, retry \$_attempt/3" && sleep 10
+                        done || true
+                        _unfinished_ok=0
+                        for _attempt in 1 2 3; do
+                            ${scpUnfinishedCmd} && { _unfinished_ok=1; break; }
+                            echo "[PROGRESS-UPLOAD] ${stageName}: scp unfinished failed (attempt \$_attempt/3)"
+                            [ \$_attempt -lt 3 ] && sleep 10
+                        done
+                        [ "\$_unfinished_ok" -eq 0 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp unfinished not available, skipping"
+                        SCP_PERF_TMPL='${scpPerfTemplate}'
+                        while IFS= read -r perf_folder; do
+                            [ -z "\$perf_folder" ] && continue
+                            _perf_ok=0
+                            for _attempt in 1 2 3; do
+                                eval "\${SCP_PERF_TMPL//PERF_FOLDER_PLACEHOLDER/\$perf_folder}" && { _perf_ok=1; break; }
+                                echo "[PROGRESS-UPLOAD] ${stageName}: scp perf \$perf_folder failed (attempt \$_attempt/3)"
+                                [ \$_attempt -lt 3 ] && sleep 10
+                            done
+                            [ "\$_perf_ok" -eq 0 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp perf \$perf_folder failed after 3 attempts"
+                        done < <(eval '${sshListPerfCmd}' 2>/dev/null || true)
+                        if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
+                            LABEL='sbatch final snapshot' FINAL_SNAPSHOT=1 \\
+                            bash '${llmSrcLocal}/jenkins/scripts/progress_upload_snapshot.sh' || true
+                        fi
+
+                        exit \$rc
+                    """
+                }
 
                 // Verdict: "<STATE>|<EXIT_CODE>"; success is COMPLETED + exit 0.
                 // STATE may contain spaces.
@@ -2567,7 +2662,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             // failure classifies as UserFailure -> not suppressed -> reported.
             boolean suppressTestReporting = (caughtStageError != null && retryContext != null) &&
                 retryContextAllowsRetry(null, retryContext, caughtStageError, false)
-            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag, suppressTestReporting)
+            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, postTag, suppressTestReporting)
+            deleteProgressArtifact(stageName, postTag)
         } finally {
             stage("Clean Up Slurm Resource") {
                 // Workaround to handle the interruption during clean up SLURM resources
@@ -2829,6 +2925,12 @@ def stageMatchesAnyPattern(String key, List patterns) {
     return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
 }
 
+// Return the OpenSearch regexp for sibling shards and their CBTS variants.
+String getTestReuseStagePattern(String stageName) {
+    def stageNamePrefix = stageName.replaceFirst(/-\d+(-cbts)?$/, "")
+    return "${stageNamePrefix}-[0-9]+(-cbts)?"
+}
+
 // Test filter flags
 // Multi-GPU stages matching any entry here run inside the single-GPU job
 // instead of waiting for the separate multi-GPU dispatch (which requires
@@ -2879,7 +2981,8 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-// Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
+// Suffix for CBTS-narrowed stages so they cannot be reused as whole non-CBTS stages.
+// Their individual passed testcases may still be reused through an OpenSearch query.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
 def CBTS_STAGE_SUFFIX = "-cbts"
@@ -3326,8 +3429,10 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                     sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
                 }
             }
-            sh "STAGE_NAME=${stageName}"
-            sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
+            // Redact credential-looking values (e.g. OPEN_SEARCH_DB_CREDENTIALS) before
+            // writing: this file gets tar'd and uploaded to Artifactory, and Jenkins
+            // credential masking only applies to console log output, not to files.
+            sh "STAGE_NAME=${stageName} && env | sort | sed -E 's/^([A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|CREDENTIAL|API_KEY|_PSW)[A-Za-z0-9_]*)=.*/\\1=***REDACTED***/' > ${stageName}/debug_env.txt"
             if (isCbtsStage(stageName)) {
                 freezeCbtsCoverage(stageName)
             }
@@ -3345,11 +3450,19 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                     done || true
                 """
             }
-            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
+
+            // Always re-tar and re-upload the current state of ${stageName}/,
+            // rather than trusting the last progress snapshot to still match it:
+            // debug_env.txt, CBTS coverage freeze, a rerun merge rewriting
+            // results.xml, or the superseded-file rename above can all leave the
+            // last uploaded snapshot stale.
+            def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
             trtllm_utils.uploadArtifacts(
                 "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
             )
+            deleteProgressArtifact(stageName, postTag)
             if (!suppressTestReporting) {
                 junit(testResults: "${stageName}/results*.xml")
             }
@@ -4249,7 +4362,7 @@ def getSSHConnectionPorts(portConfigFile, stageName)
 }
 
 // Return true means the test rerun also fails. Return false otherwise.
-def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular") {
+def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
         echo "There is no ${resultFileName} file, skip the rerun step"
         return true
@@ -4311,11 +4424,44 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             "--periodic-junit-xmlpath ${xmlFile}",
             "--reruns ${times - 1}"
         ]
+        def rerunProgressTar = "results-${stageName}${postTag}-progress.tar.gz"
+        def rerunProgressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${rerunProgressTar}"
+        def rerunDoneFile = "${WORKSPACE}/.rerun${times}-done-${stageName}"
+        sh "rm -f ${rerunDoneFile}"
         try {
-            sh """
-                cd ${llmSrc}/tests/integration/defs && \
-                ${newTestCmdLine.join(" ")}
-            """
+            withCredentials([usernamePassword(
+                    credentialsId: 'urm-artifactory-creds',
+                    usernameVariable: 'ART_USER',
+                    passwordVariable: 'ART_PASS')]) {
+                sh """
+                    set +e
+                    export STAGE_NAME='${stageName}'
+                    export PROGRESS_TAR='${rerunProgressTar}'
+                    export PROGRESS_URL='${rerunProgressUrl}'
+                    export POST_TAG='${postTag}'
+                    # ---- background watcher for rerun${times} ----
+                    PROGRESS_DONE_FILE='${rerunDoneFile}' \\
+                    PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
+                    LABEL_PREFIX='rerun${times} checkpoint' \\
+                    XML_PATH='${xmlFile}' \\
+                    bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
+                    WATCHER_PID=\$!
+
+                    # ---- foreground rerun ----
+                    cd ${llmSrc}/tests/integration/defs && \\
+                    ${newTestCmdLine.join(" ")}
+                    rc=\$?
+
+                    touch '${rerunDoneFile}'
+                    wait \$WATCHER_PID 2>/dev/null || true
+
+                    # ---- immediate final snapshot of rerun${times} ----
+                    LABEL='rerun${times} final snapshot' FINAL_SNAPSHOT=1 \\
+                    bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
+
+                    exit \$rc
+                """
+            }
         } catch(InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -4519,12 +4665,14 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
         sh "mkdir -p ${workDir}"
 
         // 1. OpenSearch lookup -- tests that PASSED in a previous pipeline run
-        //    for this commit + stage.
+        //    for this commit + sibling stage shards. CBTS and non-CBTS results
+        //    are merged only at testcase granularity.
         def passedTestListFile = "${workDir}/passed_test_list.txt"
+        def stageNamePattern = getTestReuseStagePattern(stageName)
         sh """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
-            --stage-name ${stageName} \
+            --stage-name-pattern '${stageNamePattern}' \
             --output-file ${passedTestListFile}
         """
         if (fileExists(passedTestListFile)) {
@@ -4611,6 +4759,44 @@ REUSED_TESTS_EOF
         throw e
     } catch (Exception e) {
         echo "Failed to add passed test list from previous pipeline run to the waives.txt. Error: ${e.message}"
+    }
+}
+
+// Removes the in-progress checkpoint tarball uploaded by the inline
+// shell watcher in runLLMTestlistOnPlatformImpl / runLLMTestlistWithSbatch.
+// Called after final-result handling in both execution paths, including when
+// test execution failed. Progress checkpoints are not intentionally retained
+// based on the test outcome; interruption or upload failure may skip cleanup.
+//
+// Build-scoped: ${UPLOAD_PATH} is per-build, so unswept progress tars are
+// garbage-collected with the rest of the build's artifacts anyway.
+def deleteProgressArtifact(stageName, postTag="") {
+    // UPLOAD_PATH points to the virtual repo `sw-tensorrt-generic`, which
+    // accepts GET/PUT but returns 404 on DELETE. Rewrite to the backing
+    // local repo so the delete actually lands.
+    def deletePath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+    def targetUrl = "https://urm.nvidia.com/artifactory/${deletePath}/test-results/results-${stageName}${postTag}-progress.tar.gz"
+    try {
+        withCredentials([usernamePassword(
+                credentialsId: 'urm-artifactory-creds',
+                usernameVariable: 'ART_USER',
+                passwordVariable: 'ART_PASS')]) {
+            def httpStatus = sh(
+                script: "curl -sSo /dev/null -w '%{http_code}' --retry 2 -X DELETE -u \"\$ART_USER:\$ART_PASS\" '${targetUrl}'",
+                returnStdout: true
+            ).trim()
+            if (httpStatus == '204' || httpStatus == '200') {
+                echo "[PROGRESS-UPLOAD] ${stageName}: deleted progress tar ${targetUrl}"
+            } else if (httpStatus == '404') {
+                echo "[PROGRESS-UPLOAD] ${stageName}: progress tar not found, skipping delete"
+            } else {
+                echo "[PROGRESS-UPLOAD] ${stageName}: delete returned HTTP ${httpStatus} (non-fatal)"
+            }
+        }
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "[PROGRESS-UPLOAD] ${stageName}: progress tar delete failed (non-fatal): ${e.message}"
     }
 }
 
@@ -4774,7 +4960,24 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             // index) must instead install its file behind a dedicated stage
             // guard and skip this one (see the Ray install below for the
             // stage-scoped pattern).
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
+            //
+            // OpenEngine takes that second branch: its bindings resolve only
+            // from a custom index (--extra-index-url https://buf.build/gen/python),
+            // so it owns the CPU-Generic stages -- the only stages whose test
+            // list carries unittest/grpc/openengine/ -- and SMG steps aside
+            // there. No test in l0_cpu.yml imports tensorrt_llm.grpc.smg, so
+            // the swap costs no coverage. The guard is on the stage name and
+            // never on the CBTS scope: `scopes` is the union of every fired
+            // rule's scope, so a mixed selection (openengine source + any other
+            // narrowing change) would push these pins into every shard it runs.
+            // Matched as a substring, like the Ray guard below: a stage name that
+            // picks up a prefix or suffix must keep matching, because a missed
+            // match here is a silent `importorskip` skip rather than a failure.
+            if (stageName.contains("CPU-Generic")) {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
+            } else {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
+            }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
@@ -4996,13 +5199,58 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             ]) {
                 sh "env | sort"
                 try {
+                    // Sentinel that the watcher polls to know pytest has exited
+                    // (success or failure). Lives outside ${stageName}/ so the
+                    // `rm -rf ${stageName}/` at pytest startup doesn't wipe it.
+                    def pytestDoneFile = "${WORKSPACE}/.pytest-done-${stageName}"
+                    def progressTar = "results-${stageName}${postTag}-progress.tar.gz"
+                    def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${progressTar}"
+                    sh "rm -f ${pytestDoneFile}"
                     try {
                         if (preprocessedLists.regularCount > 0) {
-                            sh """
-                                rm -rf ${stageName}/ && \
-                                cd ${llmSrc}/tests/integration/defs && \
-                                ${pytestCommand.join(" ")}
-                            """
+                            // Run pytest in the foreground while a shell subshell
+                            // watcher periodically tars + uploads results.xml. The
+                            // watcher is a background subshell of the same `sh`
+                            // step (not a Groovy parallel branch) so Blue Ocean
+                            // renders the stage as a single box rather than a
+                            // nested parallel split.
+                            withCredentials([usernamePassword(
+                                    credentialsId: 'urm-artifactory-creds',
+                                    usernameVariable: 'ART_USER',
+                                    passwordVariable: 'ART_PASS')]) {
+                                sh """
+                                    set +e
+                                    export STAGE_NAME='${stageName}'
+                                    export PROGRESS_TAR='${progressTar}'
+                                    export PROGRESS_URL='${progressUrl}'
+                                    export TIMEOUT_XML_SCRIPT='${llmSrc}/jenkins/scripts/generate_timeout_xml.py'
+                                    export POST_TAG='${postTag}'
+                                    # ---- background watcher ----
+                                    PROGRESS_DONE_FILE='${pytestDoneFile}' \\
+                                    PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
+                                    LABEL_PREFIX='checkpoint' \\
+                                    XML_PATH='${WORKSPACE}/${stageName}/results.xml' \\
+                                    bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
+                                    WATCHER_PID=\$!
+
+                                    # ---- foreground pytest ----
+                                    rm -rf '${stageName}/'
+                                    cd '${llmSrc}/tests/integration/defs'
+                                    ${pytestCommand.join(" ")}
+                                    rc=\$?
+
+                                    touch '${pytestDoneFile}'
+                                    wait \$WATCHER_PID 2>/dev/null || true
+
+                                    # ---- immediate final snapshot of run 1 ----
+                                    if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
+                                        LABEL='run1 final snapshot' FINAL_SNAPSHOT=1 \\
+                                        bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
+                                    fi
+
+                                    exit \$rc
+                                """
+                            }
                         } else {
                             echo "No regular tests to run for stage ${stageName}"
                             noRegularTests = true
@@ -5015,11 +5263,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 echo '</testsuite>' >> ${stageName}/results.xml
                                 echo '</testsuites>' >> ${stageName}/results.xml
                             """
+                            sh "touch ${pytestDoneFile}"
                         }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml", "regular")
+                        def isRerunFailed = rerunFailedTests(
+                            stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag)
                         if (isRerunFailed) {
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Regular tests failed after rerun attempt"
@@ -5039,7 +5289,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     if (preprocessedLists.isolateCount > 0) {
                         stage ("[${stageName}] Run Pytest (Isolated)") {
                             echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                            rerunFailed = runIsolatedTests(preprocessedLists, pytestCommand, llmSrc, stageName) || rerunFailed
+                            rerunFailed = runIsolatedTests(
+                                preprocessedLists, pytestCommand, llmSrc, stageName, postTag) || rerunFailed
                         }
                     } else {
                         echo "No isolated tests to run for stage ${stageName}"
@@ -5477,6 +5728,7 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
                 // Minus 10 minutes to avoid the Slurm job being stopped earlier.
                 timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                     docker.image(image).inside(dockerArgs) {
+                        trtllm_utils.setupGithubFetchAuth()
                         runner()
                     }
                 }
@@ -5495,6 +5747,7 @@ def runInEnrootOnNode(label, partitionTimeout)
 {
     return {
         runner -> node(label) {
+            trtllm_utils.setupGithubFetchAuth()
             // We submit the Slurm job with the Slurm partition's time spec.
             // Minus 10 minutes to avoid the Slurm job being stopped earlier.
             timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
@@ -5799,8 +6052,10 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
                         (slurmScoped && FailureClassifier.isDeferrableInfra(e, InfraFailure.SLURM))) {
                     def scopeTag = slurmScoped ? "SLURM/K8s" : "K8s"
                     deferred.add([stage: stageName])
-                    echo "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
-                         "siblings continue instead of fail-fast. ${e.toString()}"
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        error "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
+                              "siblings continue instead of fail-fast. ${e.toString()}"
+                    }
                     return
                 }
                 throw e
@@ -5811,8 +6066,8 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
     parallel wrapped
     if (deferred) {
         echo "[INFRA-DEFER] ${deferred.size()} stage(s) infra-incomplete " +
-             "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
-             "(coverage incomplete, no genuine test failure)."
+             "(${deferred.collect { it.stage }.join(', ')}); result already marked UNSTABLE " +
+             "per branch above (coverage incomplete, no genuine test failure)."
         // Distinguish a per-branch infra blip from a cluster-wide outage: when EVERY
         // branch in the group infra-aborted, the shared infra (a SLURM frontend / a
         // whole cluster) is the likely culprit. Flag it loudly so a re-run isn't
@@ -5826,7 +6081,6 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
             echo "[INFRA-DEFER] ALL ${jobs.size()} branch(es) infra-aborted; " +
                  "suspected cluster-wide / shared-frontend outage rather than isolated blips."
         }
-        currentBuild.result = 'UNSTABLE'
     }
 }
 
@@ -5934,6 +6188,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_H100-4_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_B200-CPP-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 9, 1, 1, true],
         "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 9, 1, 1, true],
         "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 9, 1, 1, true],
@@ -5968,8 +6223,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
-        // Single-GPU Gemma4 PerfSanity regression gate and baseline
-        "DGX_B200-PyTorch-PerfSanity-1": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
+        // Single-GPU Gemma4 PerfSanity post-merge baseline
+        "DGX_B200-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
         // PerfSanity post-merge tests
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 2, 4, 8, 1, true],
@@ -6068,13 +6323,19 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
-        // Each testcase uses 8 GPUs and 2 nodes.
+        // Each GB200 testcase below uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
         "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 2, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 2, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex", "l0_gb200_multi_nodes", 3, 3, 8, 2],
+        // GB300 accuracy post-merge aggregated (4 GPUs per node). One test list per topology,
+        // spelled out here rather than via buildStageConfigs: test_to_stage_mapping.py resolves
+        // stage <-> test by list name with a line-based parser, so a shared list or a helper's
+        // output breaks the mapping. For SingleNvlinkDomain see singleNvlinkDomainMode.
+        "GB300-8_GPUs-2_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node2_gpu8", 1, 1, 8, 2],
+        "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 1, 1, 16, 4],
     ]
     // PerfSanity post-merge aggregated
     // 2 Nodes
@@ -6290,6 +6551,19 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
     // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
     // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
+    // GB300 DeepSeek-V4-Pro-DSpark, AgentX agentic trace replay.
+    // These lanes replay a ~1M-token multi-turn conversation trace for a fixed
+    // wall-clock duration instead of a fixed prompt count, so they are pinned to
+    // aws-cmh where the DSpark checkpoint and the trace corpus are staged.
+    // 6 Nodes: ctx2 (2 nodes, 8 GPUs each) + gen1 (2 nodes, 8 GPUs) = 24 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX2-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
+        "gb300-flex-aws-cmh",
+        "l0_gb300_multi_nodes_perf_sanity_ctx2_node2_gpu8_gen1_node2_gpu8",
+        1,
+        24,
+        6
+    )
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -6543,7 +6817,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install 'requests>=2.32.4,<3'")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
                         if (values[5] != DLFW_IMAGE) {
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"

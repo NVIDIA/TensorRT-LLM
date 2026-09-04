@@ -29,14 +29,14 @@ from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
-from ..modules.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
-                                 CutlassFusedMoE, FusedMoEQuantScalesFP8,
-                                 Llama4RenormalizeMoeRoutingMethod,
-                                 MoEWeightLoadingMode)
 from ..modules.gated_mlp import GatedMLP, swiglu
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
+                             CutlassFusedMoE, FusedMoEQuantScalesFP8,
+                             Llama4RenormalizeMoeRoutingMethod,
+                             MoEWeightLoadingMode)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_llama import Llama4Attention, Llama4DecoderLayer, Llama4MoE

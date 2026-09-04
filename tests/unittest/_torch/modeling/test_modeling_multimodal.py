@@ -211,7 +211,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                     module.post_load_weights()
 
         # PyTorchModelEngine builds the vision encoders' AttentionMetadata after
-        # load via `_set_up_multimodal_encoder_attn_metadata`. These standalone
+        # load via `setup_mm_encoder_attn_metadata`. These standalone
         # model tests don't go through the engine, so mirror that walk here --
         # otherwise the encoder forward raises on an uninitialized attn_metadata.
         for module in model.modules():
@@ -300,7 +300,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
 
-        # VL configs (e.g. Qwen2_5_VLConfig) in transformers 5.x no longer
+        # VL configs (e.g. Qwen3VLConfig) in transformers 5.x no longer
         # proxy text_config attributes to the outer config level.
         text_config = getattr(config, "text_config", config)
         kv_cache_manager = KVCacheManager(
@@ -491,10 +491,10 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             raise ValueError(f"Invalid modality: {modality}")
         # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
         # validates per-modality kwargs against a TypedDict, and some
-        # Qwen2/3-VL checkpoints leak processor *output* keys (e.g.
+        # Qwen3-VL checkpoints leak processor *output* keys (e.g.
         # ``video_grid_thw``) into ``output_kwargs[<modality>]`` via the
         # tokenizer's ``init_kwargs`` / ``model_input_names``, tripping
-        # validation. The Qwen VL input processor's ``__init__`` installs a
+        # validation. The Qwen3-VL input processor's ``__init__`` installs a
         # process-wide filter that drops those keys before the validator sees
         # them.
         processor_inputs = hf_processor(
@@ -592,9 +592,9 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
     def _dummy_request_kwargs(self, scenario: MultimodalScenario) -> Dict:
         """Optional override hook for extra kwargs to `add_dummy_requests`.
 
-        Subclasses for mRoPE-using models (Qwen2.5-VL, Qwen3-VL, Qwen3.5-VL,
-        …) should return `{"use_mrope": True}` here so the cache manager
-        allocates the mRoPE position-id buffer at dummy-request time.
+        Subclasses for mRoPE-using models (Qwen3-VL, Qwen3.5-VL, …) should
+        return `{"use_mrope": True}` here so the cache manager allocates the
+        mRoPE position-id buffer at dummy-request time.
         Defaults to an empty dict, preserving existing behavior for tests
         that don't care.
         """

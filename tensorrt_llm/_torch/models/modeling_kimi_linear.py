@@ -110,16 +110,16 @@ from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams
 from ..model_config import ModelConfig
-from ..modules.fused_moe import ConfigurableMoE, create_moe
-from ..modules.fused_moe.interface import _compute_ep_partition
-from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
+from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import Linear as TrtllmLinear
+from ..modules.linear import TensorParallelMode, load_weight_shard
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
-from ..utils import ActivationType, ActType_TrtllmGen
+from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, create_moe
+from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -438,6 +438,74 @@ def _gate_up_ckpt_keys(fused_key: str) -> Tuple[str, str]:
         fused_key.replace(_GATE_UP_FUSED_SUFFIX, ".gate_proj.weight"),
         fused_key.replace(_GATE_UP_FUSED_SUFFIX, ".up_proj.weight"),
     )
+
+
+def _shard_head_major_param(
+    name: str,
+    src: torch.Tensor,
+    param: torch.nn.Parameter,
+    *,
+    kda_tp_size: int,
+    kda_tp_rank: int,
+    model_tp_rank: int,
+) -> torch.Tensor:
+    """TP-shard a KDA ``linear_attn`` or shared-expert / dense-MLP
+    ``down_proj`` checkpoint tensor down to this rank's local slice.
+
+    Returns ``src`` unchanged when it already matches ``param`` (replicated or
+    single-rank tensors) and for every other name — the caller then routes
+    MLA head-shards and the shape-match copy. The actual slicing is delegated
+    to :func:`load_weight_shard` so the framework owns the ceil-divide
+    semantics.
+
+    - ``.linear_attn.`` names are KDA head-major tensors (``linear_attn``
+      exists only on KDA layers): ``o_proj`` shards its input columns (ROW),
+      every other projection its output rows (COLUMN), by ``kda_tp_size``.
+    - a shared-expert / dense-MLP ``down_proj`` is ROW-sharded on its input
+      columns; the fused ``gate_up_proj`` is row-concatenated and returns
+      before this helper, so ``down_proj`` is the only half that reaches here.
+      The TP factor comes from the checkpoint-vs-param shapes; a subgroup
+      smaller than model TP repeats, so the shard index is ``model_tp_rank``
+      modulo the parameter's shard count.
+    """
+    if src.shape == param.shape:
+        return src
+    if ".linear_attn." in name:
+        mode = (
+            TensorParallelMode.ROW if name.endswith(".o_proj.weight") else TensorParallelMode.COLUMN
+        )
+        return load_weight_shard(src, kda_tp_size, kda_tp_rank, mode, device=param.device)
+    if name.endswith(".down_proj.weight") and (".shared_experts." in name or ".mlp." in name):
+        assert src.shape[1] % param.shape[1] == 0, (
+            f"{name}: checkpoint input dim {src.shape[1]} is not "
+            f"divisible by param input dim {param.shape[1]}"
+        )
+        tp = src.shape[1] // param.shape[1]
+        return load_weight_shard(
+            src, tp, model_tp_rank % tp, TensorParallelMode.ROW, device=param.device
+        )
+    return src
+
+
+def _helix_cp_v_b_shard(
+    v_weight: torch.Tensor,
+    *,
+    num_heads_tp_cp: int,
+    cp_rank: int,
+) -> torch.Tensor:
+    """Select this CP rank's ``v_b_proj`` head chunk from a tp-local KV-B split.
+
+    Under Helix context-parallel (cp_size > 1) ``v_b_proj`` holds only this
+    rank's 1/cp post-all-to-all head chunk, while ``kv_b_proj`` and
+    ``k_b_proj_trans`` keep every tp-local head. When cp_size == 1
+    (``num_heads_tp_cp`` equals the full tp-local head count) the tensor is
+    returned unchanged. ``v_weight`` is ``[num_heads_tp, v_head_dim,
+    kv_lora_rank]``; only its leading head axis is sliced.
+    """
+    if num_heads_tp_cp != v_weight.shape[0]:
+        lo = cp_rank * num_heads_tp_cp
+        v_weight = v_weight[lo : lo + num_heads_tp_cp]
+    return v_weight
 
 
 # ---------------------------------------------------------------------------
@@ -1051,6 +1119,16 @@ class KimiK3MoERuntime(nn.Module):
             layer_idx=layer_idx,
             # Let CommunicationFactory select the best available strategy.
             communication_method=None,
+            activation=SiTuActivation(
+                gate_softcap=situ_beta,
+                linear_softcap=situ_linear_beta,
+            ),
+            # A MegaMoE request that silently degraded to CUTLASS would be
+            # benchmarked as if it were MegaMoE, and the decline is easy to
+            # trigger (EP-only, own token / top-k limits). Fail in the resolver
+            # instead, which reports the rejection trail.
+            allow_backend_degradation=routed_moe_model_config.moe_backend
+            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"),
         )
         # trtllm-gen ships SiTu cubins for exactly one dtype combination
         # (``Bmm_MxE4m3_MxE2m1MxE4m3`` = MXFP8 act x MXFP4 weight) and has no
@@ -1072,82 +1150,11 @@ class KimiK3MoERuntime(nn.Module):
                 "CUTLASS or MEGAMOE_CUTEDSL."
             )
 
-        if routed_moe_model_config.moe_backend == "CUTLASS":
-            # Size the per-expert SiTU constants with the same ceil/floor
-            # partition the MoE backend uses for ``expert_size_per_partition``.
-            # A plain ``num_experts // ep_size`` is one element short on the
-            # first ``num_experts % ep_size`` ranks, which trips the
-            # ``swiglu_alpha must have num_experts_on_rank elements`` check in
-            # moeOp.cpp. K3's 384 experts divide evenly at EP8/EP16, so the
-            # mismatch is latent there but real for any uneven split.
-            local_num_experts, _, _ = _compute_ep_partition(
-                self.num_experts,
-                routed_moe_model_config.mapping.moe_ep_size,
-                routed_moe_model_config.mapping.moe_ep_rank,
-            )
-            device = torch.device("cuda", torch.cuda.current_device())
-            self.routed_situ_alpha = torch.full(
-                (local_num_experts,), float(situ_beta), dtype=torch.float32, device=device
-            )
-            self.routed_situ_beta = torch.full(
-                (local_num_experts,),
-                situ_linear_beta,
-                dtype=torch.float32,
-                device=device,
-            )
-            routed_moe_kwargs.update(
-                activation_type=ActivationType.SiTu,
-                swiglu_alpha=self.routed_situ_alpha,
-                swiglu_beta=self.routed_situ_beta,
-            )
-        elif routed_moe_model_config.moe_backend == "TRTLLM":
-            routed_moe_kwargs.update(
-                trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-                # Cubin alpha is the gate-side SiTU beta; cubin beta is the
-                # linear-side SiTU beta.
-                trtllm_gen_activation_alpha=situ_beta,
-                trtllm_gen_activation_beta=situ_linear_beta,
-            )
-        elif routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            routed_moe_kwargs.update(
-                activation="situ",
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
-        # MEGAMOE_CUTEDSL has no branch on purpose. ``MegaMoECuteDsl`` resolves
-        # SiTU from the pretrained config in ``_resolve_activation_config``
-        # (``activation=None`` -> "situ" when ``activation_situ_beta`` is
-        # present), and ``create_moe`` currently rejects the explicit
-        # ``activation``/``situ_beta``/``situ_linear_beta`` trio for anything
-        # other than ``MegaMoEDeepGemm``, so passing them here would raise.
-        # Unifying that plumbing is tracked in TRTLLM-15649.
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
                 "Kimi K3 requires ConfigurableMoE; ENABLE_CONFIGURABLE_MOE must not be disabled."
             )
-        if routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            from ..modules.fused_moe.mega_moe import MegaMoEDeepGemm
-
-            if not isinstance(self.routed_experts.backend, MegaMoEDeepGemm):
-                raise RuntimeError(
-                    "Kimi K3 explicitly requested MEGAMOE_DEEPGEMM, but the "
-                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
-                )
-        if routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL":
-            from ..modules.fused_moe.mega_moe import MegaMoECuteDsl
-
-            # Same guard as MEGAMOE_DEEPGEMM above, and for the same reason:
-            # create_moe silently falls back when a backend declines the
-            # config, and for MegaMoE the decline is easy to trigger (it is
-            # EP-only and has its own token/top-k limits), so an explicit
-            # request that quietly became CUTLASS would be measured as if it
-            # were MegaMoE.
-            if not isinstance(self.routed_experts.backend, MegaMoECuteDsl):
-                raise RuntimeError(
-                    "Kimi K3 explicitly requested MEGAMOE_CUTEDSL, but the "
-                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
-                )
         if self.routed_experts.layer_load_balancer is not None:
             raise NotImplementedError(
                 "Kimi K3 packed-checkpoint streaming does not yet support "
@@ -1479,7 +1486,8 @@ class KimiMLARuntime(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
-        out = self.mixer(hidden_states, attn_metadata)
+        # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
+        out = self.mixer(None, hidden_states, attn_metadata)
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
@@ -1613,12 +1621,20 @@ class KimiLinearDecoderLayer(nn.Module):
         block_residual: torch.Tensor,
         num_snapshots: int,
         attn_metadata: AttentionMetadata,
+        capture: Optional[Tuple[Any, int]] = None,
     ) -> Tuple[torch.Tensor, int]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
         ``block_residual`` is a preallocated snapshot bank in kernel-native
         ``[K_max, M, H]`` layout. Returns the running prefix sum and the
         number of valid bank rows.
+
+        ``capture`` is ``(spec_metadata, layer_id)`` and taps the DSpark aux
+        stream for the layer BEFORE this one: the aggregated stream for layer j
+        is by definition what its next consumer sees, so the mixture computed
+        below already is it. Reading it here beats recomputing it, and is only
+        possible because K3 asserts pp_size == 1 -- layer j+1 is always local.
+        PP support would need a recompute at the rank boundary.
         """
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
@@ -1630,6 +1646,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
             )
+        if capture is not None:
+            capture[0].maybe_capture_hidden_states(capture[1], hidden_states, None)
 
         if self.layer_idx % self.attn_res_block_size == 0:
             block_residual[num_snapshots].copy_(prefix_sum)
@@ -1744,19 +1762,52 @@ class KimiLinearModel(DecoderModel):
             hidden_states.shape[1],
         )
         num_snapshots = 0
-        for layer in self.layers:
+        capture_set = (
+            getattr(spec_metadata, "_capture_layer_set", None)
+            if spec_metadata is not None
+            else None
+        )
+        for i, layer in enumerate(self.layers):
+            # DFlash/DSpark hidden-state capture. The drafter is distilled on
+            # the aggregated stream value -- the pre-norm softmax mixture its
+            # next consumer sees -- not on the raw prefix sum a layer returns,
+            # which is SGLang's fallback for models without the
+            # attention-residual scheme. Capturing the prefix sum costs 4.5pt
+            # of draft acceptance on K3 + RadixArk DSpark (AR 66.9% -> 71.4%).
+            # The tap fires inside layer i+1, which computes that tensor
+            # anyway; see its forward docstring. Ground truth: SGLang
+            # kimi_k3.py:2697 _dspark_capture_stream, attn_residual.py:313
+            # aggregate_stream_torch.
+            capture = None
+            if (
+                spec_metadata is not None
+                and i > 0
+                and (capture_set is None or self.layers[i - 1].layer_idx in capture_set)
+            ):
+                capture = (spec_metadata, self.layers[i - 1].layer_idx)
             hidden_states, num_snapshots = layer(
-                hidden_states, block_residual, num_snapshots, attn_metadata
+                hidden_states, block_residual, num_snapshots, attn_metadata, capture=capture
             )
-            if spec_metadata is not None:
-                # DFlash hidden-state capture. K3's attn-residual scheme
-                # already folds the residual into the running prefix sum
-                # returned by each layer, so unlike Qwen3/Llama we pass the
-                # full hidden state with residual=None. Whether the drafter
-                # is trained against this prefix sum or some other tap point
-                # must be confirmed against the K3 drafter training recipe
-                # before real weights are used.
-                spec_metadata.maybe_capture_hidden_states(layer.layer_idx, hidden_states, None)
+
+        # The last layer has no successor, so this one recompute is
+        # unavoidable -- output-side score weights, matching SGLang's
+        # layer_idx + 1 >= end_layer branch. Unreachable for K3's capture set
+        # against 93 layers; kept so a set that does include the final layer
+        # gets the right tensor rather than the raw prefix sum.
+        if spec_metadata is not None and len(self.layers) > 0:
+            last = self.layers[-1]
+            if capture_set is None or last.layer_idx in capture_set:
+                tail = (
+                    _apply_attn_res(
+                        hidden_states,
+                        block_residual[:num_snapshots],
+                        self.output_attn_res_proj,
+                        self.output_attn_res_norm,
+                    )
+                    if num_snapshots > 0
+                    else hidden_states
+                )
+                spec_metadata.maybe_capture_hidden_states(last.layer_idx, tail, None)
 
         hidden_states = _apply_attn_res(
             hidden_states,
@@ -1874,6 +1925,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     (``modeling_kimi_k3_vl``). The composite ``KimiK3ForConditionalGeneration``
     architecture is registered by that wrapper, not here."""
 
+    mamba_metadata_cls = KimiK3MambaMetadata
+
     def __init__(self, model_config: ModelConfig):
         cfg = _get_text_config(model_config.pretrained_config)
         assert model_config.mapping.pp_size == 1, "Kimi K3 does not support pipeline parallelism"
@@ -1889,16 +1942,20 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         #   separate dense checkpoint (K2.7-Code-DFlash schema) consumed by
         #   the generic DFlashForCausalLM wrapper, and the target only has
         #   to expose per-layer hidden states via maybe_capture_hidden_states
-        #   (see KimiLinearModel.forward). No trained K3 drafter exists yet;
-        #   this path is exercised with synthetic weights
-        #   (examples/kimi_k3/make_synthetic_dflash_drafter.py).
+        #   (see KimiLinearModel.forward).
+        # - DSpark: the same external-drafter flow with the Markov and
+        #   confidence heads enabled (RadixArk/Kimi-K3-DSpark and friends).
+        #   The target side is identical -- the capture in
+        #   KimiLinearModel.forward is unconditional -- so this gate is the
+        #   only place the mode has to be admitted.
         # Modes needing draft heads (MTP/Eagle) are blocked until a
         # draft-head checkpoint exists.
         assert (
             spec_config is None
             or spec_config.spec_dec_mode.is_sa()
             or spec_config.spec_dec_mode.is_dflash()
-        ), "Kimi K3 supports speculative decoding only with SA or DFlash"
+            or spec_config.spec_dec_mode.is_dspark()
+        ), "Kimi K3 supports speculative decoding only with SA, DFlash or DSpark"
         super().__init__(
             KimiLinearModel(model_config),
             model_config,
@@ -2201,29 +2258,37 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 kda_tp_rank = layer.linear_attn._kda_tp_rank
                 break
 
-        def load_param(name: str, param: torch.nn.Parameter):
+        COL = TensorParallelMode.COLUMN  # gate/up column shard (output rows)
+
+        def load_param(name: str, param: torch.nn.Parameter) -> None:
             if device.type == "cuda":
                 torch.cuda.set_device(device)
             if name.endswith(_GATE_UP_FUSED_SUFFIX):
                 # Row-concat the checkpoint's separate gate_proj / up_proj
                 # tensors into the fused [gate | up] parameter.
                 gate_key, up_key = _gate_up_ckpt_keys(name_map[name])
-                # This branch materializes its own sources, so it needs the
-                # same FP8 handling as the single-tensor path below.
-                gate = _dequantize_fp8_block_scaled(
+                inter = param.shape[0] // 2
+                # Materialize + FP8-block-dequant each half (this branch reads
+                # its own sources, so it needs the same FP8 handling as the
+                # single-tensor path below), then column(TP)-shard and
+                # row-concat. TP factor from the checkpoint-vs-param shapes; a
+                # subgroup smaller than model TP repeats, so the shard index is
+                # model tp_rank modulo the half's shard count.
+                gate_full = _dequantize_fp8_block_scaled(
                     gate_key, _materialize(weights[gate_key]), weights
                 )
-                up = _dequantize_fp8_block_scaled(up_key, _materialize(weights[up_key]), weights)
-                inter = param.shape[0] // 2
-                if gate.shape[0] != inter and gate.shape[0] % inter == 0:
-                    # TP-sharded fused MLP (shared experts on the direct
-                    # MoE path, dense MLP with attention-DP off): take this
-                    # subgroup rank's matching row block from each half so
-                    # the SiTU gate/up pairs stay aligned.
-                    shard_count = gate.shape[0] // inter
-                    lo = (model_tp_rank % shard_count) * inter
-                    gate = gate[lo : lo + inter]
-                    up = up[lo : lo + inter]
+                tp = gate_full.shape[0] // inter
+                # load_weight_shard returns the whole tensor when tp <= 1, so
+                # the rank needs no tp > 1 guard.
+                rk = model_tp_rank % tp
+                gate = load_weight_shard(gate_full, tp, rk, COL, device=param.device)
+                up = load_weight_shard(
+                    _dequantize_fp8_block_scaled(up_key, _materialize(weights[up_key]), weights),
+                    tp,
+                    rk,
+                    COL,
+                    device=param.device,
+                )
                 if gate.shape != (inter, param.shape[1]) or up.shape != gate.shape:
                     raise ValueError(
                         f"{name}: checkpoint gate/up shapes "
@@ -2261,12 +2326,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     ).to(param.dtype)
                 )
                 mla_mixer.k_b_proj_trans.data.copy_(k_weight.transpose(1, 2))
-                # Helix: v_b_proj holds this rank's 1/cp post-all-to-all
-                # head chunk; kv_b/k_b_proj_trans keep every tp-local head.
-                h_cp = mla_mixer.num_heads_tp_cp
-                if h_cp != h:
-                    lo = mla_mixer.mapping.cp_rank * h_cp
-                    v_weight = v_weight[lo : lo + h_cp]
+                v_weight = _helix_cp_v_b_shard(
+                    v_weight,
+                    num_heads_tp_cp=mla_mixer.num_heads_tp_cp,
+                    cp_rank=mla_mixer.mapping.cp_rank,
+                )
                 mla_mixer.v_b_proj.data.copy_(v_weight)
                 return
             if name.endswith(".A_log") and src.numel() != param.numel():
@@ -2286,9 +2350,24 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                             f"{param.numel()} entries, got nonzero tail"
                         )
                     src = src[: param.numel()]
+            # KDA ``linear_attn`` (head-major) and shared-expert / dense-MLP
+            # ``down_proj`` shards are shape-derived; replicated tensors and
+            # every other name pass through unchanged. MLA head-shards and the
+            # shape-match copy are handled by the block below.
+            src = _shard_head_major_param(
+                name,
+                src,
+                param,
+                kda_tp_size=kda_tp_size,
+                kda_tp_rank=kda_tp_rank,
+                model_tp_rank=model_tp_rank,
+            )
+
             if src.shape != param.shape:
-                # Delegate MLA q_b/g/o slicing to the same Linear modules that
-                # own their COLUMN/ROW sharding policy. KV-B is handled above.
+                # MLA q_b/g/o head-shard: delegate to the same Linear modules
+                # that own their COLUMN/ROW sharding policy (#17684 removed the
+                # 96->128 head padding). KV-B is handled above; KDA and
+                # shared-expert/MLP shards were resolved in the pre-block above.
                 mla_sharded_linear = mla_head_shard_linears.get(id(param))
                 if mla_sharded_linear is not None:
                     shard = mla_sharded_linear.load_shard(src, device=param.device)
@@ -2299,61 +2378,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         )
                     param.data.copy_(shard.to(param.dtype))
                     return
-                # KDA head-shard (attention-DP off): every mismatching KDA
-                # tensor is head-major with the checkpoint exactly
-                # kda_tp_size times larger on one axis — q/k/v/g/f_b
-                # projections, b_proj, dt_bias, and the depthwise conv
-                # weights on dim 0 (rows), o_proj on dim 1 (columns).
-                # MLA head-sharded projections were handled by parameter
-                # identity above, so shape ratios identify the KDA slices.
-                if kda_tp_size > 1 and ".linear_attn." in name:
-                    if (
-                        src.shape[0] == param.shape[0] * kda_tp_size
-                        and src.shape[1:] == param.shape[1:]
-                    ):
-                        s = param.shape[0]
-                        lo = kda_tp_rank * s
-                        param.data.copy_(src[lo : lo + s].to(param.dtype))
-                        return
-                    if (
-                        src.dim() == 2
-                        and src.shape[0] == param.shape[0]
-                        and src.shape[1] == param.shape[1] * kda_tp_size
-                    ):
-                        s = param.shape[1]
-                        lo = kda_tp_rank * s
-                        param.data.copy_(src[:, lo : lo + s].to(param.dtype))
-                        return
-                # Shared-expert TP (direct MoE path): the module holds a
-                # 1/tp shard of the FFN dim — column shard for gate/up
-                # (output rows), row shard for down (input columns).
-                if ".shared_experts." in name or ".mlp." in name:
-                    # Shared experts (direct MoE path) and the dense L0
-                    # MLP (attention-DP off): the fused gate_up_proj is
-                    # sliced in its dedicated branch above; here the
-                    # unfused halves (if ever configured) and down_proj.
-                    if (
-                        name.endswith((".gate_proj.weight", ".up_proj.weight"))
-                        and src.shape[0] % param.shape[0] == 0
-                        and src.shape[1:] == param.shape[1:]
-                    ):
-                        shard_count = src.shape[0] // param.shape[0]
-                        lo = (model_tp_rank % shard_count) * param.shape[0]
-                        param.data.copy_(src[lo : lo + param.shape[0]].to(param.dtype))
-                        return
-                    if (
-                        name.endswith(".down_proj.weight")
-                        and src.shape[1] % param.shape[1] == 0
-                        and src.shape[0] == param.shape[0]
-                    ):
-                        shard_count = src.shape[1] // param.shape[1]
-                        lo = (model_tp_rank % shard_count) * param.shape[1]
-                        param.data.copy_(src[:, lo : lo + param.shape[1]].to(param.dtype))
-                        return
                 raise ValueError(
-                    f"{name}: checkpoint shape "
-                    f"{tuple(src.shape)} != param shape "
-                    f"{tuple(param.shape)}"
+                    f"{name}: shard/pad result {tuple(src.shape)} != param "
+                    f"shape {tuple(param.shape)}"
                 )
             param.data.copy_(src.to(param.dtype))
             # Keep the checkpoint's FP8 pair for the weight-read conversion,

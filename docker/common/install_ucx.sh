@@ -1,8 +1,11 @@
 #!/bin/bash
 set -ex
 
-UCX_VERSION="v1.21.x"
-UCX_COMMIT="167a4c6a311d9a42e30a37dcc01b8a3e73ea2826"
+# Authenticate the github.com clone below; no-op when no token is available.
+source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
+
+UCX_VERSION="v1.22.x"
+UCX_COMMIT="8a6b06fb880accbb933a79cda893883872c68d9d"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
 UCX_REPO="https://github.com/openucx/ucx.git"
@@ -10,12 +13,20 @@ UCX_REPO="https://github.com/openucx/ucx.git"
 mkdir -p /third-party-source
 
 rm -rf ${UCX_INSTALL_PATH}
-git clone -b ${UCX_VERSION} ${UCX_REPO}
-cd ucx
-git checkout ${UCX_COMMIT}
-cd ..
+
+# Fetch just the pinned commit rather than cloning the whole history
+rm -rf ucx
+git init -q ucx
+git -C ucx remote add origin ${UCX_REPO}
+git -C ucx fetch -q --depth 1 origin ${UCX_COMMIT}
+git -C ucx checkout -q FETCH_HEAD
+
 tar -czf /third-party-source/ucx-${UCX_VERSION}.tar.gz ucx
 cd ucx
+# Pull external/gpunetio shallow, for the same reason: autogen.sh below does a
+# full-history `git submodule update --init` on it. With the submodule already
+# at the recorded commit that call does nothing.
+git submodule update --init --depth 1
 ./autogen.sh
 ./contrib/configure-release       \
   --prefix=${UCX_INSTALL_PATH}    \

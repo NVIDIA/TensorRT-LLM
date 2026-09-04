@@ -242,6 +242,9 @@ class ModelConfig(Generic[TConfig]):
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
+    # Effective threshold requested for trtllm-gen MLA skip-correction. Zero
+    # disables the optimization; hardware support is resolved by the backend.
+    skip_correction_threshold: float = 0.0
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
@@ -282,8 +285,8 @@ class ModelConfig(Generic[TConfig]):
     # If true, the multimodal encoder of a multimodal checkpoint is NOT
     # instantiated/loaded and the model serves text-only requests. This is
     # opt-in per model: each model implementation must honor this flag when
-    # building its encoder (currently the Qwen3-VL / Qwen3.5-VL models); a
-    # model that does not check it simply ignores the flag (no-op).
+    # building its encoder (currently Mistral3 and the Qwen3-VL / Qwen3.5-VL
+    # models); a model that does not check it simply ignores the flag (no-op).
     disable_mm_encoder: bool = False
 
     # Video pruning rate for VLM models (None = EVS disabled)

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Tuple, Union
@@ -76,8 +91,10 @@ class ChatPostprocArgs(PostprocArgs):
     model: str
     num_choices: int = 1
     tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[Union[Literal["none"],
-                                ChatCompletionNamedToolChoiceParam]] = "none"
+    # None means "not specified": only an explicit client "none" (always set
+    # by from_request) suppresses parsed tool calls in apply_tool_parser.
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
+                                ChatCompletionNamedToolChoiceParam]] = None
     return_logprobs: bool = False
     top_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
@@ -89,6 +106,19 @@ class ChatPostprocArgs(PostprocArgs):
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
     has_tool_call: dict[int, bool] = field(default_factory=dict)
     tool_call_id_type: str = "random"
+    # Per-output flag tracking whether the streaming forced-call path has
+    # already emitted the opening delta (with id and function name). The id is
+    # generated once on the first non-empty delta; subsequent deltas omit it
+    # and only stream argument fragments.
+    forced_tool_name_sent: dict[int, bool] = field(default_factory=dict)
+    # Streaming forced-call bookkeeping, per output index: the raw text seen so
+    # far, how much of it has already been streamed as ``arguments``, and
+    # whether the arguments value has finished. Together these let the stream
+    # stop at the end of the JSON value instead of forwarding whatever the
+    # model generates afterwards.
+    forced_tool_args_buffer: dict[int, str] = field(default_factory=dict)
+    forced_tool_args_sent_len: dict[int, int] = field(default_factory=dict)
+    forced_tool_args_done: dict[int, bool] = field(default_factory=dict)
     chat_template_kwargs: Optional[dict[str, Any]] = None
     ctx_usage: Optional[UsageInfo] = None
     # Cache per-request stream metadata so every chunk reuses the same response
@@ -212,6 +242,11 @@ def apply_tool_parser(args: ChatPostprocArgs,
                 result = StreamingParseResult(
                     normal_text=result.normal_text + finish_result.normal_text,
                     calls=result.calls + finish_result.calls)
+        if args.tool_choice == "none":
+            # tool_choice="none": still run the parser (including the finish
+            # flush above) so tool-call markup is stripped from content, but
+            # never surface tool calls.
+            return result.normal_text, []
         normal_text, calls = result.normal_text, result.calls
         if result.calls:
             args.has_tool_call[output_index] = True
@@ -262,6 +297,32 @@ def _forced_call_name(calls: List[ToolCallItem], forced_name: str) -> str:
     return forced_name
 
 
+_JSON_DECODER = json.JSONDecoder()
+
+
+def forced_tool_arguments_end(text: str) -> Optional[int]:
+    """Return the index just past the first complete JSON value in ``text``.
+
+    The forced-tool-call path prefix-injects ``{"name": X, "arguments":`` into
+    the prompt, so generation starts inside a tool-call object. A model that
+    keeps going after the arguments closes the *outer* object too and then
+    emits the parser's end tag and ordinary assistant text -- all of which
+    would otherwise be reported as ``function.arguments``.
+
+    Returns ``None`` while ``text`` is not yet a complete JSON value, so a
+    streaming caller can keep buffering.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return None
+    leading_ws = len(text) - len(stripped)
+    try:
+        _, end = _JSON_DECODER.raw_decode(text, leading_ws)
+    except ValueError:
+        return None
+    return end
+
+
 @nvtx_range_debug("chat_stream_post_processor")
 def chat_stream_post_processor(rsp: GenerationResultBase,
                                args: ChatPostprocArgs) -> List[str]:
@@ -293,7 +354,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
     res: List[str] = []
     finish_reason_sent = [False] * args.num_choices
+    # num_prompt_tokens stays None until a prompt length is recorded, and only
+    # the usage branches below consume it, so offset it only once it exists.
     prompt_tokens = args.num_prompt_tokens
+    if prompt_tokens is not None:
+        prompt_tokens -= args.num_prompt_tokens_offset
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     stream_response_id, stream_created = _ensure_stream_metadata(
         args, rsp, "chatcmpl")
@@ -303,6 +368,17 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
     else:
         include_usage = False
         include_continuous_usage = False
+    if include_usage and prompt_tokens is None:
+        # The usage chunks below feed prompt_tokens into UsageInfo (int fields)
+        # and into the total_tokens arithmetic. The server records the prompt
+        # length before the first chunk is post-processed (the executor does so
+        # on the postproc-worker path), so a missing count here means the
+        # caller wired PostprocArgs without one; fail with a clear message
+        # instead of a TypeError from the usage math.
+        raise ValueError(
+            "Streaming usage was requested, but PostprocArgs.num_prompt_tokens "
+            "is not set; record the prompt token count before "
+            "chat_stream_post_processor reports usage.")
     if args.first_iteration:
         for i in range(args.num_choices):
             res.append(
@@ -331,17 +407,59 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
         forced_tool = _forced_tool_choice(args)
         if forced_tool and not _forced_choice_uses_tool_parser(args):
-            # Forced calls constrained to bare JSON arguments: raw deltas are
-            # the arguments stream. The response carries a tool call, so the
-            # final chunk must report finish_reason="tool_calls".
-            args.has_tool_call[i] = True
-            delta_message = DeltaMessage(tool_calls=[
-                DeltaToolCall(
-                    function=DeltaFunctionCall(name=forced_tool.function.name,
-                                               arguments=delta_text),
-                    index=i,
-                ),
-            ], )
+            # Forced call constrained by JSON-schema guided decoding: the
+            # deltas stream the arguments value. Buffer them so the stream can
+            # stop at the end of that value -- generation starts inside the
+            # tool call, so a model that overruns goes on to close the
+            # enclosing object, emit the parser's end tag and then plain
+            # prose, none of which belongs in ``arguments``.
+            forced_name = forced_tool.function.name
+            delta_arguments = ""
+            if delta_text and not args.forced_tool_args_done.get(i, False):
+                buffered = args.forced_tool_args_buffer.get(i, "") + delta_text
+                args.forced_tool_args_buffer[i] = buffered
+                arguments_end = forced_tool_arguments_end(buffered)
+                if arguments_end is None:
+                    limit = len(buffered)
+                else:
+                    limit = arguments_end
+                    args.forced_tool_args_done[i] = True
+                already_sent = args.forced_tool_args_sent_len.get(i, 0)
+                delta_arguments = buffered[already_sent:limit]
+                args.forced_tool_args_sent_len[i] = max(already_sent, limit)
+
+            tool_calls = []
+            if delta_arguments:
+                if not args.forced_tool_name_sent.get(i, False):
+                    args.forced_tool_name_sent[i] = True
+                    tool_calls.append(
+                        DeltaToolCall(
+                            id=make_tool_call_id(id_type=args.tool_call_id_type,
+                                                 func_name=forced_name,
+                                                 idx=0),
+                            index=0,
+                            type="function",
+                            function=DeltaFunctionCall(
+                                name=forced_name,
+                                arguments=delta_arguments,
+                            ),
+                        ))
+                else:
+                    tool_calls.append(
+                        DeltaToolCall(
+                            index=0,
+                            function=DeltaFunctionCall(
+                                arguments=delta_arguments, ),
+                        ))
+            # finish_reason may only flip once a call has actually been
+            # streamed. A run that ends before any arguments arrived (token
+            # budget, abort) would otherwise report "tool_calls" with no call.
+            if args.forced_tool_name_sent.get(i, False):
+                args.has_tool_call[i] = True
+            if not tool_calls and not output.finish_reason and not has_token_delta:
+                continue
+            delta_message = DeltaMessage(
+                tool_calls=tool_calls if tool_calls else None)
         else:
             delta_text, calls = apply_tool_parser(args,
                                                   i,
@@ -379,8 +497,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                             arguments=call_item.parameters,
                         ),
                     ))
-            # Keep token-bearing chunks visible even when detokenization has no
-            # text to flush yet.
+            # Keep token-bearing chunks visible even when detokenization has
+            # no text to flush yet. Only this branch builds ``delta_message``
+            # here; the forced branch above builds its own and must not have
+            # it rebuilt with ``content``, since a forced call produces no
+            # assistant text.
             if (tool_calls or delta_text or reasoning_delta_text
                     or output.finish_reason or has_token_delta):
                 delta_message = DeltaMessage(
@@ -458,17 +579,45 @@ def chat_response_post_processor(
 
         forced_tool = _forced_tool_choice(args)
         if forced_tool and not _forced_choice_uses_tool_parser(args):
-            # Forced calls constrained to bare JSON arguments: the whole text
-            # is the arguments payload. The response carries a tool call, so
-            # finish_reason must be "tool_calls".
-            args.has_tool_call[output.index] = True
-            message = ChatMessage(
-                role=role,
-                content="",
-                tool_calls=[
-                    ToolCall(function=FunctionCall(
-                        name=forced_tool.function.name, arguments=text))
-                ])
+            # Forced call constrained by JSON-schema guided decoding: the text
+            # is the arguments value. Keep only that value -- guided decoding
+            # should already stop generation there, but a model that overruns
+            # would otherwise have the enclosing brace, the parser's end tag
+            # and its trailing prose reported as ``arguments``, which then
+            # fails to parse as JSON for the caller.
+            if text is None:
+                text = ""
+            arguments_end = forced_tool_arguments_end(text)
+            if arguments_end is None:
+                # No complete JSON value: the generation was truncated (token
+                # budget, abort) or empty. Reporting the partial text as
+                # ``arguments`` would hand the caller something json.loads()
+                # rejects, and claiming finish_reason="tool_calls" would assert
+                # a call that was never completed. Return the text as content
+                # instead, mirroring the no-markup fallback on the extraction
+                # path below and the streaming path, which only flips
+                # finish_reason once a call has actually been streamed.
+                logger.warning(
+                    f"Forced tool_choice '{forced_tool.function.name}' but the "
+                    "model did not produce a complete JSON arguments value; "
+                    "returning the text as content.")
+                message = ChatMessage(role=role,
+                                      content=text,
+                                      reasoning_content=reasoning_text)
+            else:
+                args.has_tool_call[output.index] = True
+                message = ChatMessage(
+                    role=role,
+                    content="",
+                    tool_calls=[
+                        ToolCall(id=make_tool_call_id(
+                            id_type=args.tool_call_id_type,
+                            func_name=forced_tool.function.name,
+                            idx=0),
+                                 function=FunctionCall(
+                                     name=forced_tool.function.name,
+                                     arguments=text[:arguments_end]))
+                    ])
         elif forced_tool:
             # The parser extracts the forced call from the model's native
             # markup; any free-text preamble becomes content per OpenAI
@@ -499,14 +648,15 @@ def chat_response_post_processor(
                                       content=text,
                                       reasoning_content=reasoning_text)
         else:
-            if text is None:
-                text = ""
             text, calls = apply_tool_parser(args, output.index, text, False)
             tool_calls = [
                 ToolCall(function=FunctionCall(name=call.name or "",
                                                arguments=call.parameters))
                 for call in calls
             ]
+            # Only the non-forced path builds ``message`` here; each forced
+            # branch above builds its own. Keeping this outside the ``else``
+            # would clobber those and read ``tool_calls`` unbound.
             message = ChatMessage(role=role,
                                   content=text,
                                   reasoning_content=reasoning_text,
@@ -550,7 +700,7 @@ def chat_response_post_processor(
             full_message = args.last_message_content + choice.message.content
             choice.message.content = full_message
 
-    num_prompt_tokens = args.num_prompt_tokens
+    num_prompt_tokens = args.num_prompt_tokens - args.num_prompt_tokens_offset
     num_generated_tokens = sum(len(output.token_ids) for output in rsp.outputs)
     usage = UsageInfo(
         prompt_tokens=num_prompt_tokens,
@@ -755,7 +905,7 @@ def completion_response_post_processor(
 class ChatCompletionPostprocArgs(PostprocArgs):
     model: str
     tools: Optional[List[ChatCompletionToolsParam]]
-    tool_choice: Optional[Union[Literal["none", "auto"],
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]]
     request_id: Optional[int] = None
     stream_options: Optional[StreamOptions] = None
@@ -852,6 +1002,7 @@ def responses_api_post_processor(
         use_harmony=args.use_harmony,
         reasoning_parser=args.reasoning_parser,
         tool_parser=args.tool_parser,
+        num_prompt_tokens=args.num_prompt_tokens,
     )
 
 
@@ -864,5 +1015,6 @@ def responses_api_streaming_post_processor(
     outputs = args.streaming_processor.process_single_output(rsp)
     if rsp._done:
         outputs.append(
-            args.streaming_processor.get_final_response_non_store(rsp))
+            args.streaming_processor.get_final_response_non_store(
+                rsp, args.num_prompt_tokens))
     return outputs

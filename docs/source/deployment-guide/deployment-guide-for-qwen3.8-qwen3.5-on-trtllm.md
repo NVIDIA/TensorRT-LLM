@@ -5,9 +5,10 @@
 This guide describes how to serve the Qwen3.8 MoE and Qwen3.5 MoE hybrid models with the TensorRT LLM PyTorch backend. It covers the following checkpoints:
 
 * **Qwen3.8-2.4T-A95B MoE FP8** — 2.4 trillion total parameters and 95 billion active parameters per token.
+* **Qwen3.8-27B dense NVFP4** — 27 billion parameters with mixed NVFP4 and FP8 quantization.
 * **Qwen3.5-397B-A17B MoE NVFP4** — 397 billion total parameters and 17 billion active parameters per token.
 
-The models share the `qwen3_5_moe_text` decoder architecture and use the same TensorRT LLM implementation, registered as `Qwen3_5MoeForCausalLM`. Both interleave three gated-delta-network (GDN) linear-attention layers with one grouped-query-attention (GQA) layer, and both use 512 routed experts with top-10 routing.
+The models share the `qwen3_5_moe_text` decoder architecture and use the same TensorRT LLM implementation, registered as `Qwen3_5MoeForCausalLM`. Both interleave three gated-delta-network (GDN) linear-attention layers with one grouped-query-attention (GQA) layer, and both use 512 routed experts with top-10 routing. The dense Qwen3.8-27B checkpoint uses the `Qwen3_5ForConditionalGeneration` multimodal wrapper and the `Qwen3_5ForCausalLM` text decoder.
 
 Sharing an implementation does not make their deployment configurations interchangeable. Qwen3.8 MoE is substantially larger, uses an FP8 checkpoint, and is text-only. The NVIDIA Qwen3.5 MoE NVFP4 checkpoint uses a multimodal wrapper around the shared text decoder. Parallelism, quantization backends, cache sizing, and expert placement must be selected for the exact checkpoint.
 
@@ -68,6 +69,8 @@ MTP3 performance results use a controlled accepted-draft count of 2.3.
 
 * [Qwen/Qwen3.8-2.4T-A95B-FP8](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8) (FP8; the checkpoint the Qwen3.8 profiles in this guide target)
 * [Qwen/Qwen3.8-2.4T-A95B](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) (base, BF16)
+* [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)
+* [Inferact/Qwen3.8-27B-NVFP4](https://huggingface.co/Inferact/Qwen3.8-27B-NVFP4)
 * [nvidia/Qwen3.5-397B-A17B-NVFP4](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4)
 * [Qwen/Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) (base, BF16)
 

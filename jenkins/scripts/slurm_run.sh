@@ -66,7 +66,8 @@ source "$llmSrcNode/jenkins/scripts/slurm_env_setup.sh"
 slurm_setup_runtime_env
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
-env | sort
+# Redact secret values here so they do not leak into the job log
+env | sort | sed -E 's/^([^=]*(TOKEN|SECRET|PASSWORD|CREDENTIALS)[^=]*)=.*/\1=<redacted>/'
 
 echo "Full Command: $pytestCommand"
 
@@ -150,8 +151,10 @@ perf_report_exit_code=0
 eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
-python3 "$llmSrcNode/tests/test_common/s3_output.py" \
-    --drain-spool "$jobWorkspace" || true
+if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
+    python3 "$llmSrcNode/tests/test_common/s3_output.py" \
+        --drain-spool "$jobWorkspace" || true
+fi
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved

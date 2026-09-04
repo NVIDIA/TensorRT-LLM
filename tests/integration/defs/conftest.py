@@ -674,23 +674,9 @@ def llama_v2_tokenizer_model_root():
 def llama_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "llama-30b":
-        llama_model_root = os.path.join(models_root, "llama-models",
-                                        "llama-30b-hf")
-    elif request.param == "TinyLlama-1.1B-Chat-v1.0":
+    if request.param == "TinyLlama-1.1B-Chat-v1.0":
         llama_model_root = os.path.join(models_root, "llama-models-v2",
                                         "TinyLlama-1.1B-Chat-v1.0")
-    elif request.param == "llama-v3-8b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v3", "8B")
-    elif request.param == "llama-v3-8b-instruct-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "llama-v3-8b-instruct-hf")
-    elif request.param == "Llama-3-8B-Instruct-Gradient-1048k":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "Llama-3-8B-Instruct-Gradient-1048k")
-    elif request.param == "Llama-3-70B-Instruct-Gradient-1048k":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "Llama-3-70B-Instruct-Gradient-1048k")
     elif request.param == "llama-3.1-8b":
         llama_model_root = os.path.join(models_root, "llama-3.1-model",
                                         "Meta-Llama-3.1-8B")
@@ -703,21 +689,6 @@ def llama_model_root(request):
     elif request.param == "llama-3.1-8b-hf-nvfp4":
         llama_model_root = os.path.join(models_root, "nvfp4-quantized",
                                         "Meta-Llama-3.1-8B")
-    elif request.param == "llama-3.2-1b":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-1B")
-    elif request.param == "llama-3.2-1b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-1B-Instruct")
-    elif request.param == "llama-3.2-3b":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-3B")
-    elif request.param == "llama-3.2-3b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-3B-Instruct")
-    elif request.param == "llama-3.3-70b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.3-models",
-                                        "Llama-3.3-70B-Instruct")
     assert os.path.exists(
         llama_model_root
     ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
@@ -910,21 +881,6 @@ def mamba_model_root(request):
 
 
 @pytest.fixture(scope="function")
-def nemotron_nas_model_root(request):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert hasattr(request, "param"), "Param is missing!"
-
-    nemotron_nas_model_root = os.path.join(models_root, "nemotron-nas",
-                                           request.param)
-
-    assert exists(
-        nemotron_nas_model_root), f"{nemotron_nas_model_root} doesn't exist!"
-
-    return nemotron_nas_model_root
-
-
-@pytest.fixture(scope="function")
 def llm_lora_model_root(request):
     "get lora model path"
     models_root = llm_models_root()
@@ -938,23 +894,7 @@ def llm_lora_model_root(request):
         model_list = [request.param]
 
     for item in model_list:
-        if item == "Japanese-Alpaca-LoRA-7b-v0":
-            model_root_list.append(
-                os.path.join(models_root, "llama-models",
-                             "Japanese-Alpaca-LoRA-7b-v0"))
-        elif item == "luotuo-lora-7b-0.1":
-            model_root_list.append(
-                os.path.join(models_root, "llama-models", "luotuo-lora-7b-0.1"))
-        elif item == "Ko-QWEN-7B-Chat-LoRA":
-            model_root_list.append(
-                os.path.join(models_root, "Ko-QWEN-7B-Chat-LoRA"))
-        elif item == "Qwen1.5-7B-Chat-750Mb-lora":
-            model_root_list.append(
-                os.path.join(models_root, "Qwen1.5-7B-Chat-750Mb-lora"))
-        elif item == "Upcycled-Qwen1.5-MoE2.7B-LoRA":
-            model_root_list.append(
-                os.path.join(models_root, "Upcycled-Qwen1.5-MoE2.7B-LoRA"))
-        elif item == "peft-lora-starcoder2-15b-unity-copilot":
+        if item == "peft-lora-starcoder2-15b-unity-copilot":
             model_root_list.append(
                 os.path.join(
                     models_root,
@@ -962,43 +902,10 @@ def llm_lora_model_root(request):
                     "starcoder",
                     "peft-lora-starcoder2-15b-unity-copilot",
                 ))
-        elif item == "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32":
-            model_root_list.append(
-                os.path.join(
-                    models_root, "nemotron-nas",
-                    "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32"))
         elif item == "gpt-oss-20b-lora-adapter_NIM_r8":
             model_root_list.append(
                 os.path.join(models_root, "gpt_oss",
                              "gpt-oss-20b-lora-adapter_NIM_r8"))
-
-    return ",".join(model_root_list)
-
-
-@pytest.fixture(scope="function")
-def llm_dora_model_root(request):
-    "get dora model path"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert hasattr(request, "param"), "Param is missing!"
-    model_list = []
-    model_root_list = []
-    if isinstance(request.param, tuple):
-        model_list = list(request.param)
-    else:
-        model_list = [request.param]
-
-    for item in model_list:
-        if item == "commonsense-llama-v3-8b-dora-r32":
-            model_root_list.append(
-                os.path.join(
-                    models_root,
-                    "llama-models-v3",
-                    "DoRA-weights",
-                    "llama_dora_commonsense_checkpoints",
-                    "LLama3-8B",
-                    "dora_r32",
-                ))
 
     return ",".join(model_root_list)
 
@@ -1012,37 +919,6 @@ def llm_long_alpaca_model_root(llm_venv):
     long_alpaca_model_root = os.path.join(workspace, "LongAlpaca-7B")
 
     return long_alpaca_model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("gpt-neox-20b", True)
-def llm_gptneox_model_root(llm_venv):
-    "return gptneox model root"
-
-    workspace = llm_venv.get_working_directory()
-    gptneox_model_root = os.path.join(workspace, "gpt-neox-20b")
-
-    return gptneox_model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("falcon-180b", True)
-def llm_falcon_180b_model_root():
-    "prepare falcon 180b model & return falcon model root"
-    raise RuntimeError("falcon 180b must be cached")
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("falcon-11B", True)
-def llm_falcon_11b_model_root(llm_venv):
-    "prepare falcon-11B model & return falcon model root"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "falcon-11B")
-
-    call(f"git clone https://huggingface.co/tiiuae/falcon-11B {model_root}",
-         shell=True)
-
-    return model_root
 
 
 @pytest.fixture(scope="module")
@@ -1111,86 +987,6 @@ def llm_internlm_20b_model_root(llm_venv):
     )
 
     return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("Qwen-7B-Chat", True)
-def llm_qwen_7b_model_root(llm_venv):
-    "prepare qwen-7b model & return model path"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "Qwen-7B-Chat")
-
-    return model_root
-
-
-@pytest.fixture(scope="function")
-def llm_qwen_model_root(request, llm_venv):
-    "prepare qwen model & return model path"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    qwen_model_root = os.path.join(models_root, "Qwen-7B-Chat")
-
-    if hasattr(request, "param"):
-        if request.param == "qwen_7b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-7B-Chat")
-        elif request.param == "qwen_14b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-14B-Chat")
-        elif request.param == "qwen_72b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-72B-Chat")
-        elif request.param == "qwen_7b_chat_int4":
-            qwen_model_root = os.path.join(models_root, "Qwen-7B-Chat-Int4")
-        elif request.param == "qwen-vl-chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-VL-Chat")
-        elif request.param == "qwen1.5_7b_chat_awq":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-7B-Chat-AWQ")
-        elif request.param == "qwen1.5_0.5b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-0.5B-Chat")
-        elif request.param == "qwen1.5_7b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-7B-Chat")
-        elif request.param == "qwen1.5_14b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-14B-Chat")
-        elif request.param == "qwen1.5_moe_a2.7b_chat":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen1.5-MoE-A2.7B-Chat")
-        elif request.param == "qwen1.5_72b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-72B-Chat")
-        elif request.param == "qwen1.5_moe_a2.7b_chat":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen1.5-MoE-A2.7B-Chat")
-        elif request.param == "qwen1.5_14b_chat_int4":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen1.5-14B-Chat-GPTQ-Int4")
-        elif request.param == "qwen2_0.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-0.5B-Instruct")
-        elif request.param == "qwen2_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-7B-Instruct")
-        elif request.param == "qwen2_7b_awq":
-            qwen_model_root = os.path.join(models_root, "Qwen2-7B-Instruct-AWQ")
-        elif request.param == "qwen2_57b_a14b":
-            qwen_model_root = os.path.join(models_root, "Qwen2-57B-A14B")
-        elif request.param == "qwen2_72b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-72B-Instruct")
-        elif request.param == "qwen2_vl_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-VL-7B-Instruct")
-        elif request.param == "qwen2_audio_7b_instruct":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen2-Audio-7B-Instruct")
-        elif request.param == "qwen2.5_0.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-0.5B-Instruct")
-        elif request.param == "qwen2.5_1.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-1.5B-Instruct")
-        elif request.param == "qwen2.5_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-7B-Instruct")
-        elif request.param == "qwen2.5_14b_instruct_int4":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen2.5-14B-Instruct-GPTQ-Int4")
-        elif request.param == "qwen2.5_72b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-72B-Instruct")
-
-    assert exists(qwen_model_root), f"{qwen_model_root} does not exist!"
-
-    return qwen_model_root
 
 
 @pytest.fixture(scope="function")
