@@ -136,17 +136,20 @@ def _server_timing_ms(headers, name: str) -> float:
 
 
 def _set_deterministic_server_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make the adjusted clock read 10 at arrival and 15 thereafter."""
-    is_arrival = True
+    """Hold the clock at 10 until mock generation starts, then advance to 15."""
+    current_time = 10.0
+    original_generate_async = MockVisualGen.generate_async
 
     def now(_self: AdjustedSteadyClock) -> float:
-        nonlocal is_arrival
-        if is_arrival:
-            is_arrival = False
-            return 10.0
-        return 15.0
+        return current_time
+
+    def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
+        nonlocal current_time
+        current_time = 15.0
+        return original_generate_async(self, inputs=inputs, params=params)
 
     monkeypatch.setattr(AdjustedSteadyClock, "now", now)
+    monkeypatch.setattr(MockVisualGen, "generate_async", generate_async)
 
 
 def _drive_job_to_completion(client, video_id, timeout: float = 5.0):
@@ -686,6 +689,8 @@ class TestImageGeneration:
     def test_image_generation_total_anchored_to_server_arrival(self, image_client, monkeypatch):
         """``total`` uses the shared adjusted clock from arrival to completion."""
         _set_deterministic_server_clock(monkeypatch)
+        # An unrelated read must not advance the clock before request arrival.
+        assert AdjustedSteadyClock().now() == 10.0
 
         resp = image_client.post(
             "/v1/images/generations",
