@@ -112,10 +112,18 @@ def WS_TIE_OF(nrep):
     return nrep * NBINS + 32 * NFINE + 32 * 8
 
 
-def WS_ROWW_OF(nrep):
+def WS_CAND_OF(nrep):
     return nrep * NBINS + 32 * NFINE + 32 * 8 + TIECAP
 
 
+def WS_ROWW_OF(nrep):
+    return WS_CAND_OF(nrep) + 2 * CAPL
+
+
+CAPL = 4096  # K-th-bin candidates a row lists for the last arriver (bigger bins: old path)
+
+
+C_CAND = 6
 C_ARR1, C_WIN, C_ABV, C_TIE, C_ARR2, C_DONE = (
     0,
     1,
@@ -1126,40 +1134,115 @@ def _dsv4_kernel(
             kw = I32(sWK[j])
             uw = kw ^ (0x8000 + ((((kw >> 15) & 1) ^ 1) * 0x7FFF))
             gV[j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
+    use_list = I32(0)
     if cutlass.const_expr(GM == 1):
-        # fine merge through GMEM; the winner range is reserved with one atomic per CTA and
-        # written out while the second spin barrier completes
-        if tidx < NFINE:
-            v = sFine[tidx]
-            if v != 0:
-                _red_add_gpu(wrow_i + cutlass.Int64((WS_FINE_OF(NREP) + 32 * tidx) * 4), v)
-        cute.arch.fence_acq_rel_gpu()
-        cute.arch.barrier()
-        if tidx == 0:
-            _red_add_gpu(wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_ARR2) * 4), I32(1))
-            sCtl[16] = _atom_add_gpu(
-                wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_WIN) * 4), sCtl[8]
-            )
-        cute.arch.barrier()
-        gb = sCtl[16]
-        nwin = sCtl[8]
-        for j in cutlass.range(tidx, nwin, NTHREADS, unroll=1):
-            gI[gb + j] = sHist[j]
-            kw = I32(sWK[j])
-            uw = kw ^ (0x8000 + ((((kw >> 15) & 1) ^ 1) * 0x7FFF))
-            gV[gb + j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
-        if tidx == 0:
-            ctr2 = wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_ARR2) * 4)
-            v2 = _ld_acquire_gpu(ctr2)
-            while v2 < I32(CS):
-                v2 = _ld_acquire_gpu(ctr2)
+        if sTot[b1] <= CAPL:
+            use_list = I32(1)
+        gb = I32(0)
+        nwin = I32(0)
+        cb = I32(0)
+        ncl = I32(0)
+        nsl = I32(0)
+        nitl = I32(0)
+        lanel = I32(0)
+        lml = I32(0)
+        if use_list == 1:
+            # one atomic reserves the winner range, one the candidate range; no rendezvous
+            if tidx == 0:
+                sCtl[16] = _atom_add_gpu(
+                    wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_WIN) * 4), sCtl[8]
+                )
+                sCtl[18] = _atom_add_gpu(
+                    wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_CAND) * 4), sCtl[11]
+                )
+            cute.arch.barrier()
+            gb = sCtl[16]
+            nwin = sCtl[8]
+            for j in cutlass.range(tidx, nwin, NTHREADS, unroll=1):
+                gI[gb + j] = sHist[j]
+                kw = I32(sWK[j])
+                uw = kw ^ (0x8000 + ((((kw >> 15) & 1) ^ 1) * 0x7FFF))
+                gV[gb + j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
+            cb = sCtl[18]
+            ncl = sCtl[11]
+            nsl = ncl
+            if ncl > CAP:
+                nsl = ndn * TOK + nsurv
+            nitl = (nsl + NTHREADS - 1) // NTHREADS
+            lanel = tidx % 32
+            lml = (I32(1) << lanel) - I32(1)
+            for it in cutlass.range(nitl, unroll=1):
+                ci = it * NTHREADS + tidx
+                live = ci < nsl
+                es = I32(0)
+                if live:
+                    es = ci
+                    if ncl <= CAP:
+                        es = sCand[ci]
+                pl = es
+                kk = I32(0)
+                if live:
+                    if cutlass.const_expr(NLOC > NDENSE):
+                        if es < NDENSE * TOK:
+                            kk = I32(sKey[es])
+                        else:
+                            kk = I32(sSKey[es - NDENSE * TOK])
+                            pl = sSPos[es - NDENSE * TOK]
+                    else:
+                        kk = I32(sKey[es])
+                t = (crk + (pl >> 7) * CS) * TOK + (pl & (TOK - 1))
+                take = live and (t < L) and ((kk >> 5) == b1)
+                if ncl <= CAP:
+                    take = live
+                idx = cb + ci
+                ml = I32(0)
+                bl = I32(0)
+                if ncl > CAP:
+                    ml = cute.arch.vote_ballot_sync(take)
+                    if lanel == 0:
+                        if ml != 0:
+                            bl = cute.arch.atomic_add(
+                                sCtl.iterator + 19, cute.arch.popc(ml), scope="cta"
+                            )
+                    bl = cute.arch.shuffle_sync(bl, 0)
+                    idx = cb + bl + cute.arch.popc(ml & lml)
+                if take:
+                    gRow[WS_CAND_OF(NREP) + 2 * idx] = t
+                    gRow[WS_CAND_OF(NREP) + 2 * idx + 1] = kk
+        else:
+            # fine merge through GMEM; the winner range is reserved with one atomic per CTA and
+            # written out while the second spin barrier completes
+            if tidx < NFINE:
+                v = sFine[tidx]
+                if v != 0:
+                    _red_add_gpu(wrow_i + cutlass.Int64((WS_FINE_OF(NREP) + 32 * tidx) * 4), v)
             cute.arch.fence_acq_rel_gpu()
-        cute.arch.barrier()
-        if tidx < NFINE:
-            sFTot[tidx] = _ld_relaxed_gpu(
-                wrow_i + cutlass.Int64((WS_FINE_OF(NREP) + 32 * tidx) * 4)
-            )
-        cute.arch.barrier()
+            cute.arch.barrier()
+            if tidx == 0:
+                _red_add_gpu(wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_ARR2) * 4), I32(1))
+                sCtl[16] = _atom_add_gpu(
+                    wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_WIN) * 4), sCtl[8]
+                )
+            cute.arch.barrier()
+            gb = sCtl[16]
+            nwin = sCtl[8]
+            for j in cutlass.range(tidx, nwin, NTHREADS, unroll=1):
+                gI[gb + j] = sHist[j]
+                kw = I32(sWK[j])
+                uw = kw ^ (0x8000 + ((((kw >> 15) & 1) ^ 1) * 0x7FFF))
+                gV[gb + j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
+            if tidx == 0:
+                ctr2 = wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_ARR2) * 4)
+                v2 = _ld_acquire_gpu(ctr2)
+                while v2 < I32(CS):
+                    v2 = _ld_acquire_gpu(ctr2)
+                cute.arch.fence_acq_rel_gpu()
+            cute.arch.barrier()
+            if tidx < NFINE:
+                sFTot[tidx] = _ld_relaxed_gpu(
+                    wrow_i + cutlass.Int64((WS_FINE_OF(NREP) + 32 * tidx) * 4)
+                )
+            cute.arch.barrier()
     # No rendezvous before the fine push: peer sFTot buffers were zeroed before
     # the scan-end arrive and nobody reads them until the wait below.
     if cutlass.const_expr(CS > 1 and GM == 0):
@@ -1200,59 +1283,60 @@ def _dsv4_kernel(
     if ncand > CAP:
         nscan = ndn * TOK + nsurv
     if cutlass.const_expr(GM == 1):
-        nitb = (nscan + NTHREADS - 1) // NTHREADS
-        lanew = tidx % 32
-        lmw = (I32(1) << lanew) - I32(1)
-        for it in cutlass.range(nitb, unroll=1):
-            ci = it * NTHREADS + tidx
-            live = ci < nscan
-            es = I32(0)
-            if live:
-                es = ci
-                if ncand <= CAP:
-                    es = sCand[ci]
-            pl = es
-            kk = I32(0)
-            if live:
-                if cutlass.const_expr(NLOC > NDENSE):
-                    if es < NDENSE * TOK:
-                        kk = I32(sKey[es])
+        if use_list == 0:
+            nitb = (nscan + NTHREADS - 1) // NTHREADS
+            lanew = tidx % 32
+            lmw = (I32(1) << lanew) - I32(1)
+            for it in cutlass.range(nitb, unroll=1):
+                ci = it * NTHREADS + tidx
+                live = ci < nscan
+                es = I32(0)
+                if live:
+                    es = ci
+                    if ncand <= CAP:
+                        es = sCand[ci]
+                pl = es
+                kk = I32(0)
+                if live:
+                    if cutlass.const_expr(NLOC > NDENSE):
+                        if es < NDENSE * TOK:
+                            kk = I32(sKey[es])
+                        else:
+                            kk = I32(sSKey[es - NDENSE * TOK])
+                            pl = sSPos[es - NDENSE * TOK]
                     else:
-                        kk = I32(sSKey[es - NDENSE * TOK])
-                        pl = sSPos[es - NDENSE * TOK]
-                else:
-                    kk = I32(sKey[es])
-            t = (crk + (pl >> 7) * CS) * TOK + (pl & (TOK - 1))
-            take = live and (t < L) and ((kk >> 5) == b1)
-            if ncand <= CAP:
-                take = live
-            k2 = kk & (NFINE - 1)
-            ab = take and (k2 > b2)
-            tie = take and (k2 == b2)
-            ma = cute.arch.vote_ballot_sync(ab)
-            mt = cute.arch.vote_ballot_sync(tie)
-            basea = I32(0)
-            baset = I32(0)
-            if lanew == 0:
-                if ma != 0:
-                    basea = _atom_add_gpu(cnt9_i, cute.arch.popc(ma))
-                if mt != 0:
-                    baset = _atom_add_gpu(cnt10_i, cute.arch.popc(mt))
-            basea = cute.arch.shuffle_sync(basea, 0)
-            baset = cute.arch.shuffle_sync(baset, 0)
-            ub = kk ^ (0x8000 + ((((kk >> 15) & 1) ^ 1) * 0x7FFF))
-            if ab:
-                p = basea + cute.arch.popc(ma & lmw)
-                gI[cabove + p] = t
-                gV[cabove + p] = U16(ub & 0xFFFF).bitcast(F16).to(F32)
-            if tie:
-                p = baset + cute.arch.popc(mt & lmw)
-                if p < r2:
-                    gI[base2 + p] = t
-                    gV[base2 + p] = U16(ub & 0xFFFF).bitcast(F16).to(F32)
-                if cutlass.const_expr(REFINE == 1):
-                    if p < TIECAP:
-                        gRow[WS_TIE_OF(NREP) + p] = t
+                        kk = I32(sKey[es])
+                t = (crk + (pl >> 7) * CS) * TOK + (pl & (TOK - 1))
+                take = live and (t < L) and ((kk >> 5) == b1)
+                if ncand <= CAP:
+                    take = live
+                k2 = kk & (NFINE - 1)
+                ab = take and (k2 > b2)
+                tie = take and (k2 == b2)
+                ma = cute.arch.vote_ballot_sync(ab)
+                mt = cute.arch.vote_ballot_sync(tie)
+                basea = I32(0)
+                baset = I32(0)
+                if lanew == 0:
+                    if ma != 0:
+                        basea = _atom_add_gpu(cnt9_i, cute.arch.popc(ma))
+                    if mt != 0:
+                        baset = _atom_add_gpu(cnt10_i, cute.arch.popc(mt))
+                basea = cute.arch.shuffle_sync(basea, 0)
+                baset = cute.arch.shuffle_sync(baset, 0)
+                ub = kk ^ (0x8000 + ((((kk >> 15) & 1) ^ 1) * 0x7FFF))
+                if ab:
+                    p = basea + cute.arch.popc(ma & lmw)
+                    gI[cabove + p] = t
+                    gV[cabove + p] = U16(ub & 0xFFFF).bitcast(F16).to(F32)
+                if tie:
+                    p = baset + cute.arch.popc(mt & lmw)
+                    if p < r2:
+                        gI[base2 + p] = t
+                        gV[base2 + p] = U16(ub & 0xFFFF).bitcast(F16).to(F32)
+                    if cutlass.const_expr(REFINE == 1):
+                        if p < TIECAP:
+                            gRow[WS_TIE_OF(NREP) + p] = t
     else:
         for ci in cutlass.range(tidx, nscan, NTHREADS, unroll=2):
             es = ci
@@ -1318,15 +1402,57 @@ def _dsv4_kernel(
         cute.arch.barrier()
         last = sCtl[17] == I32(CS - 1)
         ntg = I32(0)
+        nall = I32(0)
         if last:
-            ntg = _ld_relaxed_gpu(cnt10_i)
-            if ntg > TIECAP:
-                ntg = I32(TIECAP)
-            if tidx == 0:
-                sCtl[10] = _ld_relaxed_gpu(cnt10_i)
-            if cutlass.const_expr(REFINE == 1):
-                for i in cutlass.range(tidx, ntg, NTHREADS, unroll=1):
-                    sTie[i] = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_TIE_OF(NREP) + i) * 4))
+            if use_list == 1:
+                # the whole K-th bin of the row: fine histogram, descent, write-out, tie list
+                nall = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_CAND) * 4))
+                if tidx < 32:
+                    sFine[tidx] = I32(0)
+                if tidx == 0:
+                    sCtl[19] = I32(0)
+                    sCtl[20] = I32(0)
+                cute.arch.barrier()
+                for i in cutlass.range(tidx, nall, NTHREADS, unroll=2):
+                    kc = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_CAND_OF(NREP) + 2 * i + 1) * 4))
+                    cute.arch.atomic_add(sFine.iterator + (kc & (NFINE - 1)), I32(1), scope="cta")
+                cute.arch.barrier()
+                _pick32(sFine, sCtl, tidx, warp_idx, r1, 2)
+                cute.arch.barrier()
+                b2 = sCtl[2]
+                c2above = sCtl[3]
+                r2 = r1 - c2above
+                base2 = cabove + c2above
+                for i in cutlass.range(tidx, nall, NTHREADS, unroll=2):
+                    tc = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_CAND_OF(NREP) + 2 * i) * 4))
+                    kc = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_CAND_OF(NREP) + 2 * i + 1) * 4))
+                    k2 = kc & (NFINE - 1)
+                    uc = kc ^ (0x8000 + ((((kc >> 15) & 1) ^ 1) * 0x7FFF))
+                    p = I32(0)
+                    if k2 > b2:
+                        p = cute.arch.atomic_add(sCtl.iterator + 19, I32(1), scope="cta")
+                        gI[cabove + p] = tc
+                        gV[cabove + p] = U16(uc & 0xFFFF).bitcast(F16).to(F32)
+                    elif k2 == b2:
+                        p = cute.arch.atomic_add(sCtl.iterator + 20, I32(1), scope="cta")
+                        if p < r2:
+                            gI[base2 + p] = tc
+                            gV[base2 + p] = U16(uc & 0xFFFF).bitcast(F16).to(F32)
+                        if cutlass.const_expr(REFINE == 1):
+                            if p < TIECAP:
+                                sTie[p] = tc
+                cute.arch.barrier()
+                if tidx == 0:
+                    sCtl[10] = sCtl[20]
+            else:
+                ntg = _ld_relaxed_gpu(cnt10_i)
+                if ntg > TIECAP:
+                    ntg = I32(TIECAP)
+                if tidx == 0:
+                    sCtl[10] = _ld_relaxed_gpu(cnt10_i)
+                if cutlass.const_expr(REFINE == 1):
+                    for i in cutlass.range(tidx, ntg, NTHREADS, unroll=1):
+                        sTie[i] = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_TIE_OF(NREP) + i) * 4))
         cute.arch.barrier()
         if last:
             for i in cutlass.range(tidx, WS_TIE_OF(NREP) + ntg, NTHREADS, unroll=1):
