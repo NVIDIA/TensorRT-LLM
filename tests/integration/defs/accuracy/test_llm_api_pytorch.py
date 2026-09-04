@@ -50,7 +50,8 @@ from ..conftest import (check_device_contain, get_device_count,
                         skip_pre_blackwell, skip_pre_hopper, skip_ray, skip_x86)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2, assert_acceptance_length)
+                            LongBenchV1, LongBenchV2, assert_acceptance_length,
+                            compute_acceptance_length)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -102,23 +103,6 @@ def _latest_kv_cache_stats(llm):
     ]
     assert entries, "No kvCacheStats reported; is enable_iter_perf_stats set?"
     return entries[-1]
-
-
-def _compute_acceptance_length(llm) -> float:
-    """Mean acceptance length over speculative iterations.
-
-    Requires enable_iter_perf_stats=True. Used by the AL-regression tests.
-    """
-    stats = llm.get_stats(timeout=2)
-    spec_iters = [
-        stat['specDecodingStats'] for stat in stats
-        if stat.get('specDecodingStats')
-        and stat['specDecodingStats']['numDraftTokens'] > 0
-    ]
-    assert spec_iters, "No iterations with speculative decoding stats"
-    accepted = sum(s['numAcceptedTokens'] for s in spec_iters)
-    reqs = sum(s['numRequestsWithDraftTokens'] for s in spec_iters)
-    return (accepted + reqs) / reqs
 
 
 def _assert_non_greedy_cuda_graph_matches_eager(build_llm_kwargs,
@@ -499,7 +483,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_eagle acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
@@ -623,7 +607,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_pard acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestLlama3_1_8BInstruct::test_pard",
                                      acceptance_length)
@@ -757,7 +741,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_dflash acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestLlama3_1_8BInstruct::test_dflash",
@@ -824,7 +808,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_ngram acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestLlama3_1_8BInstruct::test_ngram",
@@ -859,7 +843,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_suffix_automaton enable_global_pool={enable_global_pool} "
                 f"acceptance_length = {acceptance_length:.3f}")
@@ -965,7 +949,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_draft_target_dynamic_draft_len "
                   f"acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
@@ -1612,7 +1596,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             if mtp_nextn > 0:
-                acceptance_length = _compute_acceptance_length(llm)
+                acceptance_length = compute_acceptance_length(llm)
                 print(f"[AL] test_bfloat16 mtp_nextn={mtp_nextn} "
                       f"acceptance_length = {acceptance_length:.3f}")
                 assert_acceptance_length(
@@ -4253,7 +4237,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_gsm8k_dep8_megamoe_deepgemm "
                   f"acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
@@ -4669,7 +4653,7 @@ class TestQwen3_4B(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_eagle3 acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_4B::test_eagle3",
@@ -4904,7 +4888,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                               apply_chat_template=True,
                               chat_template_kwargs={"enable_thinking": False},
                           ))
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_dspark[{attention_backend}] acceptance_length "
                   f"= {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_8B::test_dspark",
@@ -5897,7 +5881,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_dflash acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestGPTOSS::test_dflash",
@@ -6873,7 +6857,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_dflash acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_5_4B::test_dflash",
@@ -8097,7 +8081,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
             if use_mtp:
-                acceptance_length = _compute_acceptance_length(llm)
+                acceptance_length = compute_acceptance_length(llm)
                 print("[AL] test_nvfp4_4gpus_block_reuse "
                       f"acceptance_length = {acceptance_length:.3f}")
                 assert_acceptance_length(

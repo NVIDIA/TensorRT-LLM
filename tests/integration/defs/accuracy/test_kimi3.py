@@ -16,7 +16,6 @@
 import re
 
 import pytest
-import torch
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.configs import KimiK3Config, KimiLinearConfig
@@ -30,47 +29,16 @@ from tensorrt_llm.llmapi import (
     SamplingParams,
     SchedulingParams,
 )
-from tensorrt_llm.sampling_params import GuidedDecodingParams, LogitsProcessor
+from tensorrt_llm.sampling_params import GuidedDecodingParams
 
 from ..conftest import llm_models_root, skip_pre_blackwell
-from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness, assert_acceptance_length
-
-
-class _ForceTokenLogitsProcessor(LogitsProcessor):
-    def __init__(self, forced_token_id: int) -> None:
-        self._forced_token_id = forced_token_id
-
-    def __call__(
-        self,
-        req_id: int,
-        logits: torch.Tensor,
-        token_ids: list[list[int]],
-        stream_ptr: int | None,
-        client_id: int | None,
-    ) -> None:
-        del req_id, token_ids, client_id
-        if stream_ptr is None:
-            self._force_token(logits)
-            return
-        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
-            self._force_token(logits)
-
-    def _force_token(self, logits: torch.Tensor) -> None:
-        logits.fill_(float("-inf"))
-        logits[..., self._forced_token_id] = 0
-
-
-def _compute_acceptance_length(llm: LLM) -> float:
-    stats = llm.get_stats(timeout=2)
-    spec_iterations = [
-        stat["specDecodingStats"]
-        for stat in stats
-        if stat.get("specDecodingStats") and stat["specDecodingStats"]["numDraftTokens"] > 0
-    ]
-    assert spec_iterations, "No iterations with speculative decoding stats"
-    accepted = sum(stat["numAcceptedTokens"] for stat in spec_iterations)
-    requests = sum(stat["numRequestsWithDraftTokens"] for stat in spec_iterations)
-    return (accepted + requests) / requests
+from .accuracy_core import (
+    GSM8K,
+    ForceTokenLogitsProcessor,
+    LlmapiAccuracyTestHarness,
+    assert_acceptance_length,
+    compute_acceptance_length,
+)
 
 
 @pytest.mark.timeout(10800)
@@ -166,7 +134,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             if mode == "sa":
-                acceptance_length = _compute_acceptance_length(llm)
+                acceptance_length = compute_acceptance_length(llm)
                 print(
                     "[AL] TestKimiK3::test_w4a16_mxfp4[sa] "
                     f"acceptance_length = {acceptance_length:.3f}"
@@ -296,7 +264,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 max_tokens=output_length,
                 temperature=0,
                 end_id=-1,
-                logits_processor=_ForceTokenLogitsProcessor(forced_token_id),
+                logits_processor=ForceTokenLogitsProcessor(forced_token_id),
             ),
             use_tqdm=False,
         )
