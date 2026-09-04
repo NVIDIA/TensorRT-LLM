@@ -74,16 +74,13 @@ from ..modules.mla import MLA
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import (
-    CutlassFusedMoE,
+    DEFAULT_MOE_ACTIVATION,
     DeepSeekV4MoeRoutingMethod,
     MoEWeightLoadingMode,
-    TritonFusedMoE,
-    TRTLLMGenFusedMoE,
+    SwigluActivation,
     create_moe,
     is_moe_weight_owner,
-    resolve_moe_cls,
 )
-from ..moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata, get_num_extra_kv_tokens
 from ..utils import (
@@ -1545,61 +1542,15 @@ class DeepseekV4MoE(nn.Module):
         if override_quant_config is not None and experts_quant_config is model_config.quant_config:
             experts_quant_config = override_quant_config
 
+        # One uniform clamp for the whole layer; the selected backend's
+        # ``activation_support`` decides whether its kernels take that as a
+        # per-expert ``float32`` buffer or a baked scalar.
         swiglu_limit = getattr(config, "swiglu_limit", None)
-        moe_swiglu_limit = None
-        if swiglu_limit is not None:
-            # `create_moe` only accepts swiglu_limit for these MoE classes;
-            # ask the resolver rather than the backend string so that a
-            # degradation (e.g. TRTLLM/CUTEDSL/DENSEGEMM dropping back to
-            # CutlassFusedMoE on unsupported quant) is accounted for here too.
-            moe_cls = resolve_moe_cls(
-                model_config,
-                override_quant_config=experts_quant_config,
-                dtype=dtype,
-                # Same routing object as create_moe below.
-                routing=self.gate.routing_method,
-                # create_moe below passes no bias and no swiglu alpha/beta, so
-                # it resolves with the plain SwiGLU package. Say so here too:
-                # leaving this unknown lets gates abstain that create_moe
-                # rejects, and the two calls would pick different backends.
-                swiglu_gptoss_style=False,
-                layer_idx=layer_idx,
-            )
-            supports_swiglu_limit = moe_cls in (
-                CutlassFusedMoE,
-                TritonFusedMoE,
-                TRTLLMGenFusedMoE,
-                DeepGemmFusedMoE,
-            )
-            # NVFP4 routed-expert path: the TRTLLM-Gen fp4-block-scale fused-MoE
-            # cubin produces near-zero accuracy without bias even when
-            # swiglu_limit is supplied; drop the limit there until the cubin
-            # gains a no-bias clamp variant. MXFP4 variants are unaffected.
-            kernel_requires_bias_for_swiglu_limit = (
-                moe_cls is TRTLLMGenFusedMoE and experts_quant_config.quant_mode.has_nvfp4()
-            )
-            # DeepSeek-V4 supplies a uniform scalar limit. The TRTLLM-Gen FP8
-            # path consumes it directly and rejects the redundant tensor.
-            requires_scalar_only_swiglu_limit = (
-                moe_cls is TRTLLMGenFusedMoE
-                and experts_quant_config.quant_mode.has_fp8_block_scales()
-            )
-            if (
-                supports_swiglu_limit
-                and not kernel_requires_bias_for_swiglu_limit
-                and not requires_scalar_only_swiglu_limit
-            ):
-                moe_load_balancer_config = getattr(model_config, "moe_load_balancer", None)
-                num_slots = (
-                    moe_load_balancer_config.num_slots
-                    if moe_load_balancer_config and moe_load_balancer_config.num_slots
-                    else num_experts
-                )
-                local_num_slots = num_slots // model_config.mapping.moe_ep_size
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                moe_swiglu_limit = torch.full(
-                    (local_num_slots,), float(swiglu_limit), dtype=torch.float32, device=device
-                )
+        moe_activation = (
+            SwigluActivation(clamp=float(swiglu_limit))
+            if swiglu_limit is not None
+            else DEFAULT_MOE_ACTIVATION
+        )
 
         self.experts = create_moe(
             num_experts=num_experts,
@@ -1619,8 +1570,7 @@ class DeepseekV4MoE(nn.Module):
                 if experts_quant_config.layer_quant_mode.is_int4_weight_only_per_group()
                 else MoEWeightLoadingMode.VANILLA
             ),
-            swiglu_limit=moe_swiglu_limit,
-            swiglu_limit_scalar=(float(swiglu_limit) if swiglu_limit is not None else None),
+            activation=moe_activation,
         )
 
         self.mapping = model_config.mapping

@@ -1,10 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import contextlib
 import datetime
 import json
 import os
 import random
-import sys
 import time
 from typing import List, Optional, Union
 
@@ -25,13 +39,12 @@ from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
                                            load_hf_tokenizer)
 from tensorrt_llm.sampling_params import LogitsProcessor, SamplingParams
-from tensorrt_llm.serve.openai_protocol import CompletionRequest
+from tensorrt_llm.serve.openai_protocol import CompletionRequest, StreamOptions
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      chat_stream_post_processor)
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, altered_env
@@ -39,8 +52,6 @@ from utils.util import force_ampere, similar, altered_env
 # isort: on
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
-# There are other tests based on llama-7B model, such as the end-to-end tests in test_e2e.py, and parallel tests in
-# test_llm_multi_gpu.py.
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -1231,6 +1242,41 @@ def test_chat_stream_post_processor_reuses_stream_metadata() -> None:
     assert len({payload["created"] for payload in payloads}) == 1
     assert payloads[0]["choices"][0]["delta"]["role"] == "assistant"
     assert payloads[-1]["choices"][0]["delta"]["content"] == "y"
+
+
+def test_chat_stream_post_processor_usage_applies_prompt_token_offset() -> None:
+    result = GenerationResultBase(123, SamplingParams())
+    output = result._outputs[0]
+    output.text = "x"
+    output.token_ids = [1]
+    output.finish_reason = "stop"
+    result._done = True
+
+    args = ChatPostprocArgs(role="assistant",
+                            model="test-model",
+                            num_prompt_tokens=5,
+                            num_prompt_tokens_offset=3,
+                            stream_options=StreamOptions(include_usage=True))
+    payloads = _stream_payloads_from_chunks(
+        chat_stream_post_processor(result, args))
+
+    final_chunk = payloads[-1]
+    assert final_chunk["choices"] == []
+    assert final_chunk["usage"]["prompt_tokens"] == 2
+    assert final_chunk["usage"]["completion_tokens"] == 1
+    assert final_chunk["usage"]["total_tokens"] == 3
+
+
+def test_chat_stream_post_processor_usage_requires_prompt_token_count() -> None:
+    # Usage arithmetic needs a concrete count: a missing one must surface as a
+    # clear error, never as None leaking into UsageInfo or a TypeError.
+    result = GenerationResultBase(123, SamplingParams())
+    args = ChatPostprocArgs(role="assistant",
+                            model="test-model",
+                            stream_options=StreamOptions(include_usage=True))
+
+    with pytest.raises(ValueError, match="num_prompt_tokens"):
+        chat_stream_post_processor(result, args)
 
 
 class _FakeCompletionGeneratorArgs:

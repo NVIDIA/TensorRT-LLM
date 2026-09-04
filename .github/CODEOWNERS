@@ -70,6 +70,7 @@
 /docker @NVIDIA/trt-llm-infra-devs
 /enroot @NVIDIA/trt-llm-infra-devs
 /jenkins @NVIDIA/trt-llm-infra-devs
+/jenkins/config/maintenance_stages.txt @chzblych @yiqingy0 @tburt-nv @hanjingtian
 /jenkins/scripts/cbts @NVIDIA/trt-llm-devs
 /ruff-legacy-baseline.json @NVIDIA/trt-llm-infra-devs
 /ruff-legacy.toml @NVIDIA/trt-llm-infra-devs
@@ -104,12 +105,10 @@
 /cpp/include/tensorrt_llm/batch_manager @NVIDIA/trt-llm-runtime-devs
 /cpp/include/tensorrt_llm/common @NVIDIA/trt-llm-runtime-devs
 /cpp/include/tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
-/cpp/include/tensorrt_llm/layers @NVIDIA/trt-llm-runtime-devs
 /cpp/include/tensorrt_llm/runtime @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/batch_manager @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/common @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
-/cpp/tensorrt_llm/layers @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/nanobind @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/runtime @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/testing @NVIDIA/trt-llm-runtime-devs
@@ -462,6 +461,7 @@
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/py_executor.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/model_engine.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/_torch/pyexecutor/engine/ @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 
 # ===== COMPATIBILITY FORWARDING MODULES =====
 # Definition-free re-export modules left at a retired import path so external

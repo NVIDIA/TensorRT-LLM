@@ -41,6 +41,23 @@ class MoEStaticCapability:
     supports_moe_lora: bool = False
     # Legacy gate: CuteDslFusedMoE isinstance check in ConfigurableMoE DWDP.
     supports_dwdp: bool = False
+    # Legacy gate: ``assert moe_cls in supported_load_balancer_backends`` in
+    # ``create_moe_backend``. Not the same question as the instance-level
+    # ``_supports_load_balancer()``, which TRTLLMGenFusedMoE overrides to mean
+    # "separated routing is used".
+    supports_eplb: bool = False
+    # Legacy gate: the ``assert moe_cls in [...]`` bias allow-list in
+    # ``create_moe_backend``. Per-expert FC bias from the checkpoint, added
+    # before the activation functor runs -- not an activation constant.
+    supports_expert_bias: bool = False
+    # Legacy gate: the three ``assert not apply_router_weight_on_input`` checks
+    # keyed on ``moe_cls`` in ``create_moe_backend``. The fold itself belongs to
+    # MoEScheduler (``x = x * token_final_scales``), so what a backend declares
+    # here is whether it handles what the fold leaves behind: ``None`` scales,
+    # or all-ones under a DeepEP / NCCL comm strategy. Backends that reject the
+    # flag in their own constructor keep doing so; that check guards direct
+    # construction, which never reaches the factory.
+    supports_apply_router_weight_on_input: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +111,11 @@ class MoEProblem:
     bias: Optional[bool] = None
     #: ``ActivationType`` member name; omitted values canonicalize to SwiGLU.
     activation: str = "Swiglu"
+    #: Which of the ``alpha`` / ``beta`` / ``clamp`` ABI registers the caller's
+    #: activation fills; the kind alone does not say, since clamped and
+    #: unclamped SwiGLU share one ``ActivationType``. Empty if the call site
+    #: supplied no activation carrier.
+    activation_constants: frozenset[str] = frozenset()
     #: ``RoutingMethodType`` member name; None means the call site did not say.
     routing: Optional[str] = None
 
@@ -294,6 +316,46 @@ class MoEEligibility:
         return cls(eligible=False, reject_reason=reason, detail=detail)
 
 
+def nvfp4_fc1_row_alignment_rejection(
+    p: "MoEProblem", d: "MoEDeployment"
+) -> Optional[MoEEligibility]:
+    """NVFP4 block scales swizzle in 128x4 tiles, so a gated FC1 buffer rounded
+    up to that tile splits gate/up at the wrong row. Returns the rejection when
+    this shard would be rounded up, else None (unknown shapes abstain).
+    """
+    from tensorrt_llm._torch.utils import is_gated_activation
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    if p.quant_algo != QuantAlgo.NVFP4 or p.intermediate_size is None:
+        return None
+    # Non-gated FC1 is one block with no gate/up split, so the rows the loader
+    # adds stay a zero tail that the kernel never reads as an operand.
+    if not is_gated_activation(p.activation_type):
+        return None
+    tp_size = max(d.tp_size, 1)
+    if p.intermediate_size % tp_size != 0:
+        # Uneven shards are a different concern; do not answer for them.
+        return None
+    fc1_rows_full = p.intermediate_size * 2
+    fc1_rows = fc1_rows_full // tp_size
+    if fc1_rows % 128 == 0:
+        return None
+    if fc1_rows_full % 128 == 0:
+        hint = (
+            f"moe_tp_size must divide {fc1_rows_full // 128}; raise "
+            f"moe_expert_parallel_size to shrink moe_tp_size, which "
+            f"non-ULYSSES CP multiplies by cp_size"
+        )
+    else:
+        hint = "no moe_tp_size satisfies this for this intermediate_size"
+    return MoEEligibility.no(
+        MoERejectReason.SHAPE_UNALIGNED,
+        f"NVFP4 MoE requires gated FC1 rows "
+        f"(2 * intermediate_size_per_partition) to be a multiple of 128, but "
+        f"moe_tp_size={tp_size} gives {fc1_rows}. {hint}.",
+    )
+
+
 @dataclass(frozen=True)
 class MoERejection:
     """One candidate that did not win, and why."""
@@ -367,6 +429,7 @@ class MoEResolutionReport:
                 "swiglu_gptoss_style": self.problem.swiglu_gptoss_style,
                 "bias": self.problem.bias,
                 "activation": self.problem.activation,
+                "activation_constants": sorted(self.problem.activation_constants),
                 "routing": self.problem.routing,
             },
             "deployment": {

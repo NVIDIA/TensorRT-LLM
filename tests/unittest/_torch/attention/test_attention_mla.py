@@ -18,7 +18,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState,
                                                         SamplingConfig)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
+from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -517,6 +518,61 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                           v2_kv_cache)
 
 
+@pytest.mark.parametrize(
+    "kv_cache_dtype,skip_correction_threshold",
+    [(torch.bfloat16, 32.0), (torch.float8_e4m3fn, 8.0)],
+    ids=["bf16_kv_cache", "fp8_kv_cache"],
+)
+def test_attention_mla_skip_correction(kv_cache_dtype: torch.dtype,
+                                       skip_correction_threshold: float):
+    """Test MLA skip-correction with production shapes and both KV dtypes."""
+    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
+        pytest.skip("MLA skip-correction is supported only on SM100 and SM103")
+
+    scenario = Scenario(kv_cache_dtype=kv_cache_dtype,
+                        num_layers=1,
+                        kv_cache_tokens_per_block=32)
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings":
+            scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+    _run_test_for_backend(
+        "TRTLLM",
+        scenario.num_heads,
+        scenario.num_kv_heads,
+        scenario.num_layers,
+        scenario.q_lora_rank,
+        scenario.kv_lora_rank,
+        scenario.qk_nope_head_dim,
+        scenario.qk_rope_head_dim,
+        scenario.v_head_dim,
+        rope_config,
+        scenario.kv_cache_tokens_per_block,
+        torch.device("cuda"),
+        scenario.dtype,
+        scenario.kv_cache_dtype,
+        [127, 255],
+        1,
+        2,
+        True,
+        skip_correction_threshold=skip_correction_threshold,
+    )
+
+
 # FlashInfer MLA test: BF16 only, fewer combos since it's slower
 flashinfer_scenarios = [
     Scenario(kv_cache_dtype=torch.bfloat16,
@@ -747,13 +803,25 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
             f"256, got {pinned_tactic[2]}")
 
 
-def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
-                          q_lora_rank, kv_lora_rank, qk_nope_head_dim,
-                          qk_rope_head_dim, v_head_dim, rope_config,
-                          kv_cache_tokens_per_block, device, dtype,
-                          kv_cache_dtype, context_sequence_lengths,
-                          generation_seq_len_q, num_generation_steps,
-                          v2_kv_cache):
+def _run_test_for_backend(backend_name,
+                          num_heads,
+                          num_kv_heads,
+                          num_layers,
+                          q_lora_rank,
+                          kv_lora_rank,
+                          qk_nope_head_dim,
+                          qk_rope_head_dim,
+                          v_head_dim,
+                          rope_config,
+                          kv_cache_tokens_per_block,
+                          device,
+                          dtype,
+                          kv_cache_dtype,
+                          context_sequence_lengths,
+                          generation_seq_len_q,
+                          num_generation_steps,
+                          v2_kv_cache,
+                          skip_correction_threshold: float = 0.0):
     AttentionCls = get_attention_backend(backend_name)
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
@@ -916,6 +984,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
             q_scaling=q_scaling,
             pos_embd_params=pos_embd_params,
             mla_params=mla_params,
+            skip_correction_threshold=skip_correction_threshold,
         ) for layer_idx in range(num_layers)
     ]
     gen_layers = [
@@ -928,6 +997,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
             q_scaling=q_scaling,
             pos_embd_params=pos_embd_params,
             mla_params=mla_params,
+            skip_correction_threshold=skip_correction_threshold,
         ) for layer_idx in range(num_layers)
     ]
 

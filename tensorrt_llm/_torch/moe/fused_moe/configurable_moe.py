@@ -44,15 +44,11 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, _reject
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
-from tensorrt_llm._torch.utils import (
-    ActType_TrtllmGen,
-    AuxStreamType,
-    EventType,
-    Fp4QuantizedTensor,
-)
+from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from .activation import install_activation_params
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
@@ -162,12 +158,6 @@ class ConfigurableMoE(MoE):
         layer_idx: Optional[int] = None,
         override_quant_config: Optional["QuantConfig"] = None,
         moe_cls: Optional[Type] = None,
-        activation: Optional[str] = None,
-        situ_beta: Optional[float] = None,
-        situ_linear_beta: Optional[float] = None,
-        trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
-        trtllm_gen_activation_alpha: Optional[float] = None,
-        trtllm_gen_activation_beta: Optional[float] = None,
         communication_method: Optional[str] = None,
         **kwargs,
     ):
@@ -201,12 +191,6 @@ class ConfigurableMoE(MoE):
             routing_method=routing_method,
             override_quant_config=override_quant_config,
             moe_cls=moe_cls,
-            activation=activation,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-            trtllm_gen_activation_type=trtllm_gen_activation_type,
-            trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
-            trtllm_gen_activation_beta=trtllm_gen_activation_beta,
             **kwargs,
         )
 
@@ -291,12 +275,6 @@ class ConfigurableMoE(MoE):
         routing_method: BaseMoeRoutingMethod,
         override_quant_config: Optional["QuantConfig"],
         moe_cls: Optional[Type] = None,
-        activation: Optional[str] = None,
-        situ_beta: Optional[float] = None,
-        situ_linear_beta: Optional[float] = None,
-        trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
-        trtllm_gen_activation_alpha: Optional[float] = None,
-        trtllm_gen_activation_beta: Optional[float] = None,
         **kwargs,
     ) -> None:
         """Build the MoE backend, mirror EPLB attrs, then create weights.
@@ -330,12 +308,10 @@ class ConfigurableMoE(MoE):
                 intermediate_size=self.intermediate_size,
                 swiglu_gptoss_style=infer_swiglu_gptoss_style(
                     bias=kwargs.get("bias", False),
-                    swiglu_alpha=kwargs.get("swiglu_alpha"),
-                    swiglu_beta=kwargs.get("swiglu_beta"),
                     activation_type=self.activation_type,
                 ),
                 bias=kwargs.get("bias", False),
-                activation_type=self.activation_type,
+                activation=self.activation,
                 routing=self.routing_method,
                 layer_idx=self.layer_idx,
             )
@@ -360,18 +336,8 @@ class ConfigurableMoE(MoE):
                 bias=kwargs.get("bias", False),
                 apply_router_weight_on_input=self.apply_router_weight_on_input,
                 layer_idx=None,
-                swiglu_alpha=kwargs.get("swiglu_alpha"),
-                swiglu_beta=kwargs.get("swiglu_beta"),
-                swiglu_limit=kwargs.get("swiglu_limit"),
-                swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
-                activation_type=self.activation_type,
-                activation=activation,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-                trtllm_gen_activation_type=trtllm_gen_activation_type,
-                trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
-                trtllm_gen_activation_beta=trtllm_gen_activation_beta,
+                activation=self.activation,
             )
 
         # Backend acceptance is validated at the end of ``__init__`` instead
@@ -389,6 +355,9 @@ class ConfigurableMoE(MoE):
         if self.backend is not None:
             for attr in _BACKEND_SYNC_ATTRS:
                 setattr(self.backend, attr, getattr(self, attr))
+            # ``expert_size_per_partition`` may have just changed (EPLB slots),
+            # and it sizes every per-expert activation constant.
+            install_activation_params(self.backend)
 
         # Sync done -- now the backend has enough info to allocate weight
         # tensors with the right shard / slot count.
@@ -755,6 +724,16 @@ class ConfigurableMoE(MoE):
             if self._override_quant_config is not None
             else self.quant_config
         )
+        # The quant config just changed and a backend may resolve its activation
+        # ABI from it: TRTLLMGenFusedMoE narrows the clamp to a uniform scalar on
+        # the FP8 block-scale path, whose kernel takes one ``double`` by value.
+        # The install in __init__ ran against the pre-layerwise config, so a layer
+        # that layerwise quantization moved onto that path would otherwise keep a
+        # tensor clamp the kernel ignores. Guarded because a re-install
+        # re-materializes from ``activation``, undoing the in-place division
+        # NVFP4TRTLLMGenFusedMoEBaseMethod applies to beta and clamp.
+        if not self.backend._weights_created:
+            install_activation_params(self.backend)
         return self.backend.create_weights()
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):

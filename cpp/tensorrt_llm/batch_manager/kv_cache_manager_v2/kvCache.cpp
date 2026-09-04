@@ -64,7 +64,9 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     , mHistoryLength(0)
     , mExpectedPromptLength(
           expectedPromptLength.has_value() ? std::optional<int>{std::max(*expectedPromptLength, 0)} : std::nullopt)
-    , mNumTokensBeforeHybridPruning(reuseMatch.has_value() ? reuseMatch->numTokensBeforeHybridPruning : 0)
+    , mNumReusableTokensBeforeHybridPruning(
+          reuseMatch.has_value() ? reuseMatch->numReusableTokensBeforeHybridPruning : 0)
+    , mNumReusableTokensBeforePruning(reuseMatch.has_value() ? reuseMatch->numReusableTokensBeforePruning : 0)
     , mEnableRequestStats(enableRequestStats)
     , mNumCommittedBlocks(0)
     , mTokensPerBlock(manager.tokensPerBlock())
@@ -467,8 +469,17 @@ bool KvCache::resume(std::optional<CUstream> stream)
             mBlocks[lastOrdinal].treeBlock = nullptr;
     }
 
+    // A freshly-created cache starts SUSPENDED and is activated by this same
+    // resume() call, so gate the counter on mNeverResumed: only a cache that was
+    // previously ACTIVE and got suspended counts as a preemption recovery.
+    // Without this, the counter would track request admissions, not preemption.
+    bool const firstActivation = mNeverResumed;
     mNeverResumed = false;
     mStatus = Status::ACTIVE;
+    if (!firstActivation && _shouldRecordStats())
+    {
+        mManager->recordRequestResumed();
+    }
     return true;
 }
 
@@ -543,6 +554,10 @@ void KvCache::suspend()
         _freeScratchSlots();
     }
     mStatus = Status::SUSPENDED;
+    if (_shouldRecordStats())
+    {
+        mManager->recordRequestSuspended();
+    }
 }
 
 void KvCache::close()
