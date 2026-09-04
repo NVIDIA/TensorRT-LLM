@@ -5109,6 +5109,7 @@ class TestDSparkConfidenceScheduling:
             enable_lora=False,
             lora_config=None,
             sparse_attention_config=None,
+            pipeline_parallel_size=1,
         )
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -5131,6 +5132,9 @@ class TestDSparkConfidenceScheduling:
             ({
                 "enable_lora": True
             }, "does not yet support LoRA"),
+            ({
+                "pipeline_parallel_size": 2
+            }, "does not yet support pipeline parallelism"),
             (
                 {
                     "sparse_attention_config":
