@@ -4963,8 +4963,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             //
             // OpenEngine takes that second branch: its bindings resolve only
             // from a custom index (--extra-index-url https://buf.build/gen/python),
-            // so it owns the CPU-Generic and L40S-PyTorch stages -- the only
-            // stages whose test list carries unittest/grpc/openengine/ -- and SMG
+            // so it owns the CPU-Generic and L40S stages -- the only stages
+            // whose test list carries unittest/grpc/openengine/ -- and SMG
             // steps aside there. Neither l0_cpu.yml nor l0_l40s.yml imports
             // tensorrt_llm.grpc.smg (the SMG tests live only in l0_a10.yml), so
             // the swap costs no coverage. L40S is in the set because
@@ -4977,7 +4977,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             // Matched as a substring, like the Ray guard below: a stage name that
             // picks up a prefix or suffix must keep matching, because a missed
             // match here is a silent `importorskip` skip rather than a failure.
-            if (stageName.contains("CPU-Generic") || stageName.contains("L40S-PyTorch")) {
+            // It must stay "L40S" and not "L40S-PyTorch": every stage running
+            // the l0_l40s list needs the bindings, and L40S-FMHA-Post-Merge-1
+            // runs it too -- pinned to the narrower prefix, that stage installed
+            // the SMG requirements instead and collected the conformance module
+            // as a silent skip.
+            if (stageName.contains("CPU-Generic") || stageName.contains("L40S")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
             } else {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")

@@ -29,7 +29,28 @@ The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyT
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
 
-Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: OpenEngine KV sessions and prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority or data-parallel-rank metadata. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `Health` and `Abort`; its LoRA lifecycle and KV-event RPCs return `UNIMPLEMENTED`.
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority or data-parallel-rank metadata. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `Health` and `Abort`; its LoRA lifecycle and KV-event RPCs return `UNIMPLEMENTED`.
+
+### Disaggregated serving
+
+A context worker returns its handoff as a `PrefillReady` event carrying a
+`KvSessionRef`; a generation worker resumes it by echoing that `KvSessionRef`
+back in `GenerateRequest.kv.session`. A request carrying a session is always
+treated as `generation_only`.
+
+The context phase has no native field in the protocol, so it is selected with
+`extra["request_type"] = "context_only"` (`"context_and_generation"` is also
+accepted, and is the default when the key is absent). `extra` is outside the
+portable contract, so a client that omits it simply gets aggregated serving.
+`"generation_only"` cannot be named this way: the phase needs the context
+worker's address and request id, which only a `KvSessionRef` carries.
+
+`Control.Abort` cannot yet release a prefill by `kv_session`
+(`KvSessionRef.session_id` is the engine's context request id, not a `Generate`
+`request_id`), so `GetServerInfo` reports
+`kv_connector.supports_abort_cleanup = false`. A generation leg that never
+arrives leaves its KV blocks held on the context worker until that process
+exits.
 
 OpenEngine and SMG are independent protocol integrations. This integration does not make a replacement or convergence decision between them.
 
