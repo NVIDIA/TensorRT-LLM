@@ -5429,7 +5429,7 @@ def checkPipInstall(pipeline, wheel_path, version_override)
     withEnv(["TRTLLM_VERSION_LOCAL=${versionLocal}"]) {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: """
             cd ${LLM_ROOT}/tests/unittest && \
-            python3 test_pip_install.py --wheel_path ${wheelArtifactLinks} --version_local "\${TRTLLM_VERSION_LOCAL}"
+            python3 check_pip_install.py --wheel_path ${wheelArtifactLinks} --version_local "\${TRTLLM_VERSION_LOCAL}"
             """)
     }
 }

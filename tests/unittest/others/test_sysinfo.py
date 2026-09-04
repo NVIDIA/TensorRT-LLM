@@ -13,16 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pathlib
 import sys
 import types
 
 import pytest
 
-_SYSINFO_DIR = pathlib.Path(__file__).resolve().parents[2] / "integration" / "defs" / "sysinfo"
-sys.path.insert(0, str(_SYSINFO_DIR))
-
-import get_sysinfo  # noqa: E402
+__extra_import_path__ = ["~/tests/integration/defs/sysinfo"]
+import get_sysinfo
 
 
 def _disable_distro(monkeypatch: pytest.MonkeyPatch) -> None:

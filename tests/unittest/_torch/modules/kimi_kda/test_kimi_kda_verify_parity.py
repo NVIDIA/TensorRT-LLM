@@ -23,11 +23,10 @@ import torch
 
 pytest.importorskip("fla")
 
+from kimi_kda_test_utils import get_production_decode_kernel_path
+
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
-from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (
-    get_production_decode_kernel_path,
-)
 
 
 class _Cfg:
