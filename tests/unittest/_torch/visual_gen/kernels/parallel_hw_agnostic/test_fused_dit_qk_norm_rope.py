@@ -678,6 +678,64 @@ def test_full_dim_norm_packed_rotate_half_broadcast(label, B, T, num_heads, head
     torch.testing.assert_close(qkv, ref, rtol=2e-2, atol=5e-3)
 
 
+@pytest.mark.parametrize("interleave", [True, False], ids=["interleaved", "rotate_half"])
+@pytest.mark.parametrize(
+    "num_heads,head_dim",
+    [(24, 64), (24, 128), (40, 128)],
+    ids=["head64", "head128", "wan_a14b"],
+)
+def test_full_dim_shared_fp32_cos_matches_expanded(interleave, num_heads, head_dim):
+    """Shared cos/sin must be bitwise-equivalent to the per-head layout."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size, tokens_per_batch = 2, 32
+    num_tokens = batch_size * tokens_per_batch
+    hidden = num_heads * head_dim
+    qkv_shared = torch.randn(num_tokens, 3 * hidden, dtype=torch.bfloat16, device=device) * 0.5
+    qkv_expanded = qkv_shared.clone()
+    v_original = qkv_shared[:, 2 * hidden :].clone()
+    q_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 5.0
+    k_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 5.0
+    cos_shared, sin_shared = _generate_cos_sin(tokens_per_batch, head_dim, device)
+    cos_expanded = (
+        cos_shared.unsqueeze(1)
+        .expand(-1, num_heads, -1)
+        .reshape(tokens_per_batch, hidden)
+        .contiguous()
+    )
+    sin_expanded = (
+        sin_shared.unsqueeze(1)
+        .expand(-1, num_heads, -1)
+        .reshape(tokens_per_batch, hidden)
+        .contiguous()
+    )
+
+    for qkv, cos, sin in (
+        (qkv_shared, cos_shared, sin_shared),
+        (qkv_expanded, cos_expanded, sin_expanded),
+    ):
+        _call_fused_kernel(
+            qkv,
+            num_heads,
+            num_heads,
+            num_heads,
+            head_dim,
+            1e-6,
+            q_weight,
+            k_weight,
+            None,
+            None,
+            cos,
+            sin,
+            -1,
+            interleave=interleave,
+            tokens_per_batch=tokens_per_batch,
+        )
+
+    torch.testing.assert_close(qkv_shared, qkv_expanded, rtol=0, atol=0)
+    torch.testing.assert_close(qkv_shared[:, 2 * hidden :], v_original, rtol=0, atol=0)
+
+
 def test_full_dim_norm_packed_v_unchanged():
     """Full-dim path leaves V slice untouched (sanity)."""
     device = "cuda"
