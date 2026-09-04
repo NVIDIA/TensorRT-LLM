@@ -23,17 +23,19 @@ MSA_REQUIRED_HEAD_DIM = 128
 
 
 def _install_msa_cutlass_compatibility() -> None:
-    """Provide the CUTLASS 4.5 names still referenced by the packaged MSA sources."""
+    """Provide legacy CuTe aliases still referenced by the packaged MSA sources."""
     try:
         import cutlass.cute as cute
     except ImportError:
         return
 
-    # MSA has not yet migrated these two aliases to their CUTLASS DSL 4.6
+    # MSA has not yet migrated these legacy aliases to their CUTLASS DSL 4.6+
     # names. Keep this shim local to the MSA import path and remove it once the
-    # packaged sources use cute.ThrMma and cute.make_rmem_tensor directly.
+    # packaged sources use the current CuTe names directly.
     if not hasattr(cute.core, "ThrMma"):
         setattr(cute.core, "ThrMma", cute.ThrMma)
+    if not hasattr(cute.core, "ThrCopy"):
+        setattr(cute.core, "ThrCopy", cute.ThrCopy)
     if not hasattr(cute, "make_fragment"):
         setattr(cute, "make_fragment", cute.make_rmem_tensor)
 
