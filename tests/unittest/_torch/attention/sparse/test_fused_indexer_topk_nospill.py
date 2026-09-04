@@ -272,6 +272,91 @@ def test_fused_indexer_topk_nospill_cuda_graph(batch, k_top):
 
 
 @skip_not_sm100
+@pytest.mark.parametrize("batch", [1, 4, 16])
+@pytest.mark.parametrize("n_comp", [16384, 65536])
+@pytest.mark.parametrize("k_top", [1024])
+def test_fused_indexer_topk_nospill_split(batch, n_comp, k_top, monkeypatch):
+    # cluster-free row split forced on short rows: S = SMs / batch co-resident CTAs per
+    # row merge through the GMEM workspace (ragged tile counts, non-power-of-two S)
+    monkeypatch.setenv("TRTLLM_FUSED_TOPK_GMEM_SPLIT", "1")
+    device = torch.device("cuda")
+    inp = _build_inputs(batch, n_comp, k_top, "signed", seed=31, device=device)
+    indices = torch.full((batch, k_top), -3, dtype=torch.int32, device=device)
+    values = torch.full((batch, k_top), float("nan"), dtype=torch.float32, device=device)
+    fused_indexer_topk_nospill.run(
+        inp["q_fp4"],
+        inp["sf_q"],
+        inp["kv_cache"],
+        inp["weights"],
+        inp["context_lens"],
+        inp["block_table"],
+        None,
+        indices,
+        values,
+    )
+    torch.cuda.synchronize()
+    ref_vals = _reference(inp, k_top)
+    for i in range(batch):
+        row = indices[i]
+        assert int(row.min()) >= 0
+        assert int(row.max()) < int(inp["context_lens"][i])
+        assert row.unique().numel() == k_top, "duplicate indices"
+        got, _ = torch.sort(values[i], descending=True)
+        want, _ = torch.sort(ref_vals[i], descending=True)
+        dv = (got - want).abs()
+        assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
+            f"row {i}: max value err {float(dv.max()):.4f}"
+        )
+    _check_fp32_boundary(inp, indices, k_top)
+
+
+@skip_not_sm100
+def test_fused_indexer_topk_nospill_split_cuda_graph(monkeypatch):
+    # the split's workspace must be clean at every replay: the last CTA of a row re-zeroes
+    # it inside the launch, so three replays after capture must reproduce eager
+    monkeypatch.setenv("TRTLLM_FUSED_TOPK_GMEM_SPLIT", "1")
+    device = torch.device("cuda")
+    batch, n_comp, k_top = 4, 65536, 1024
+    inp = _build_inputs(batch, n_comp, k_top, "signed", seed=93, device=device)
+    indices = torch.full((batch, k_top), -3, dtype=torch.int32, device=device)
+    values = torch.full((batch, k_top), float("nan"), dtype=torch.float32, device=device)
+
+    def call():
+        fused_indexer_topk_nospill.run(
+            inp["q_fp4"],
+            inp["sf_q"],
+            inp["kv_cache"],
+            inp["weights"],
+            inp["context_lens"],
+            inp["block_table"],
+            None,
+            indices,
+            values,
+        )
+
+    call()
+    torch.cuda.synchronize()
+    eager_vals = values.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for _ in range(3):
+        indices.fill_(-3)
+        values.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        for i in range(batch):
+            row = indices[i]
+            assert int(row.min()) >= 0
+            assert row.unique().numel() == k_top, "duplicate indices after replay"
+            got, _ = torch.sort(values[i], descending=True)
+            want, _ = torch.sort(eager_vals[i], descending=True)
+            assert bool(((got - want).abs() <= 1e-2 + 1e-3 * want.abs()).all()), (
+                f"row {i}: replay value set diverged"
+            )
+
+
+@skip_not_sm100
 @pytest.mark.parametrize("batch", [1, 3, 16, 64])
 @pytest.mark.parametrize("n_comp", [65536, 131072, 262144])
 @pytest.mark.parametrize("k_top", [512, 1024])
