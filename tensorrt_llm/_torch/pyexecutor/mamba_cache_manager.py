@@ -2332,12 +2332,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             )
             kv_cache_config.enable_partial_reuse = False
 
-        kv_cache_config.max_attention_window = []
-        for i in range(len(layer_mask)):
-            if layer_mask[i]:
-                kv_cache_config.max_attention_window.append(
-                    LinearCacheType.RECURRENT_STATES.
-                    value if mamba_layer_mask[i] else max_seq_len)
+        # Keep the vector in physical global-layer order. Disabled entries are
+        # placeholders that are never projected into this manager.
+        kv_cache_config.max_attention_window = [
+            LinearCacheType.RECURRENT_STATES.value
+            if mamba_layer_mask[layer_idx] else max_seq_len
+            for layer_idx in range(len(layer_mask))
+        ]
 
         recurrent_states_window = LinearCacheType.RECURRENT_STATES.value
         local_windows = {
