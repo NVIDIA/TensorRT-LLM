@@ -70,9 +70,9 @@ class DSparkSpecMetadata(SpecMetadata):
     model's ``main_proj`` + ``main_norm`` (inside ``DSv4DSparkDraftModel.forward``)
     as the captured-context attention input (``main_x``).
 
-    The per-layer captured width is the model hidden size after the mHC mean,
-    so the buffer is
-    ``[max_num_tokens, hidden_size * num_capture_layers]``.
+    Mirrors :class:`DFlashSpecMetadata`; the only DSpark-specific detail is that
+    the per-layer captured width is the model hidden size (post hc-mean), so the
+    buffer is ``[max_num_tokens, hidden_size * num_capture_layers]``.
     """
 
     batch_indices_cuda: Optional[torch.Tensor] = None
@@ -94,9 +94,11 @@ class DSparkSpecMetadata(SpecMetadata):
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
 
+        # Set up hidden state capture buffer
         if self.layers_to_capture is not None and len(self.layers_to_capture) > 0:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
             self.num_capture_layers = len(self.layers_to_capture)
+            # O(1) lookups for is_layer_capture() and maybe_capture_hidden_states()
             self._capture_layer_set = frozenset(self.layers_to_capture)
             self._layer_to_idx = {lid: i for i, lid in enumerate(self.layers_to_capture)}
             self.captured_hidden_states = torch.empty(
@@ -121,9 +123,10 @@ class DSparkSpecMetadata(SpecMetadata):
         )
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
 
-        # Maintain the request->slot map on the host (outside any captured
-        # region) and mirror it into ``_batch_to_slot`` so the captured gen
-        # forward indexes the rolling windows by tensor.
+        # CUDA-graph-safe path: maintain the request->slot mapping on the host
+        # (outside the captured region) and mirror it into ``_batch_to_slot`` so the
+        # captured gen forward can index the rolling windows by tensor. Mirrors
+        # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
         worker = getattr(self, "_dspark_worker", None)
         if worker is not None and worker._win_inited:
             current = set(self.request_ids)
@@ -135,11 +138,16 @@ class DSparkSpecMetadata(SpecMetadata):
                     worker._position_initialized[slot] = False
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
-            # Assign a slot to every real gen request that never ran a
-            # context/seed forward on this worker (disaggregated serving
-            # prefills on the context server), so concurrent gen requests do
-            # not share the scratch row. Context requests are seeded by
-            # ``_seed_context_windows``; dummies stay on the scratch row.
+            # Assign a persistent rolling-window slot to every real generation
+            # request that never ran a context/seed forward on this worker. In
+            # disaggregated serving the prompt is prefilled (and the window
+            # seeded) on the *context* server, so ``_seed_context_windows`` never
+            # runs on the generation server and ``_req_to_slot`` stays empty;
+            # without this, all concurrent gen requests fall through to the shared
+            # scratch row below and corrupt each other's draft window at batch
+            # size > 1 (GitHub #16767). Context-prefix entries are left to
+            # ``_seed_context_windows``; the ADP-idle (id 0) and CUDA-graph
+            # padding dummies are kept on the scratch row.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
             for rid in self.request_ids[num_contexts:]:
                 if (
@@ -148,9 +156,10 @@ class DSparkSpecMetadata(SpecMetadata):
                     and rid not in worker._req_to_slot
                 ):
                     worker._assign_slot(rid, reset=False)
-            # Unknown request IDs (warmup / CUDA-graph padding, ADP idle, disagg
-            # seeds without a real id) map to the throwaway scratch row so they
-            # cannot overwrite a live request's rolling window.
+            # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
+            # requests, or disagg seed forwards without a real id) map to the
+            # dedicated throwaway scratch row so they cannot overwrite a live
+            # request's rolling window (they previously aliased to slot 0).
             scratch = worker._scratch_slot
             mapping = torch.tensor(
                 [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
@@ -166,11 +175,14 @@ class DSparkSpecMetadata(SpecMetadata):
     def maybe_capture_hidden_states(
         self, layer_id: int, hidden_states: torch.Tensor, residual: Optional[torch.Tensor] = None
     ) -> None:
-        """Capture a target layer's hidden states into the buffer.
+        """Capture hidden states from a target model layer into the buffer.
 
-        An mHC-flattened ``[num_tokens, hc_mult * hidden]`` input is reduced by
-        mean over the hc streams; a ``[num_tokens, hidden]`` input is stored
-        as-is.
+        DeepSeek-V4 keeps the multi-head (mHC) residual stream flattened as
+        ``[num_tokens, hc_mult * hidden]``; DSpark captures the *mean over the hc
+        streams* (reference ``h.mean(dim=2)`` with ``h`` shaped
+        ``[*, hc_mult, hidden]``). We reduce here so the V4 decoder layer's
+        existing capture call is unchanged. A ``[num_tokens, hidden]`` input
+        (already reduced / non-mHC) is stored as-is.
         """
         if self.captured_hidden_states is None:
             return
@@ -178,6 +190,7 @@ class DSparkSpecMetadata(SpecMetadata):
         if i is not None:
             num_tokens = hidden_states.shape[0]
             to_save = hidden_states + residual if residual is not None else hidden_states
+            # mHC residual -> mean over the hc_mult streams.
             if to_save.shape[-1] != self.hidden_size:
                 hc_mult = to_save.shape[-1] // self.hidden_size
                 to_save = to_save.reshape(num_tokens, hc_mult, self.hidden_size).mean(dim=1)
@@ -250,14 +263,17 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._position_initialized: Optional[torch.Tensor] = None  # [max_batch] bool
         self._win = 0
 
-        # Slot management: ``_req_to_slot`` + ``_free_slots`` (host) are the
-        # source of truth; ``_batch_to_slot`` is the CUDA mirror
-        # (request-order -> slot) the captured gen forward indexes through.
+        # Slot management. ``_req_to_slot`` (python dict) + ``_free_slots`` are the
+        # source of truth, updated in prepare()/forward(); ``_batch_to_slot`` is the
+        # CUDA mirror (request-order -> slot) read by the CUDA-graph-safe batched
+        # gen path (set on the host in prepare(), so the captured forward indexes
+        # the rolling windows through a tensor instead of a python dict lookup).
         self._req_to_slot = {}  # request_id -> slot index
         self._free_slots = deque()  # available slot indices
         self._batch_to_slot: Optional[torch.Tensor] = None  # [max_batch] long, cuda
-        # Throwaway window row for padded / unknown request IDs (set to
-        # ``max_batch`` in ``_lazy_init``); never handed out via ``_free_slots``.
+        # Index of the throwaway "scratch" window row that absorbs padded /
+        # unknown request IDs (set in ``_lazy_init`` to ``max_batch``); it is
+        # never handed out through ``_free_slots``.
         self._scratch_slot = 0
 
         # ``return_confidence`` is read once here (never per step) so the
@@ -275,10 +291,12 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # iteration's draft length; built in ``_lazy_init``.
         self.verify_planner = None
 
-        # DSpark is a one-engine drafter: the worker forward runs inside the
-        # target's CUDA graph, so the gen draft path
-        # (``_draft_gen_block_batched``) must stay host-sync-free and
-        # capture-safe whenever ``cuda_graph_config`` is set.
+        # The generation draft path is the batched, host-sync-free
+        # ``_draft_gen_block_batched`` + ``DSv4DSparkDraftModel.forward_batched`` +
+        # ``dspark_attention_forward_batched``: it is correct in eager mode AND safe
+        # to capture into the target's CUDA graph (DSpark is a one-engine drafter —
+        # its worker forward runs inside that graph, so the draft path MUST be
+        # capture-safe whenever ``cuda_graph_config`` is set).
 
         logger.info(
             f"DSv4DSparkWorker initialized with "
@@ -610,10 +628,16 @@ class DSv4DSparkWorker(SpecWorkerBase):
     ) -> torch.Tensor:
         """CUDA-graph-safe batched gen draft (all gen requests in one forward).
 
-        Must stay free of host syncs and data-dependent shapes. Returns block
-        logits ``[num_gens, K, vocab]`` for ``sample_draft_tokens``, or
-        ``None`` when there is nothing to draft. The full block is always
-        proposed.
+        Free of host syncs and data-dependent shapes: per-request quantities
+        (``nacc``, the bonus, ``main_hidden``, ``start_pos``, the multi-accept
+        back-fill) are gathered as tensors, slots come from the host-built
+        ``_batch_to_slot`` mirror, and the backbone runs once via
+        ``DSv4DSparkDraftModel.forward_batched``. Returns the per-position corrected
+        block logits ``[num_gens, K, vocab]`` (or ``None`` when there is nothing to
+        draft); the worker feeds them to ``SpecWorkerBase.sample_draft_tokens``.
+        Confidence truncation stays disabled — the full block is proposed. When
+        enabled, fixed-shape confidence scores are stored separately for
+        verification scheduling; they never truncate the proposal.
         """
         num_gens = batch_size - num_contexts
         # K is the draft block width (fixed by the checkpoint); Kp1 is the
@@ -654,7 +678,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             base = gen_start + arange_g * target_width  # [G]
         main_hidden = captured[(base + gidx).clamp(min=0, max=captured.shape[0] - 1)]
 
-        # Fixed-size [G, K] masked back-fill of the intermediate accepted tokens
+        # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
         # (everything but the bonus) into the rolling window — same frames as the
         # eager path (old+1 .. old+nacc-1), with j >= nacc-1 masked out.
         # A disaggregated generation worker never sees prompt prefill, so a new
@@ -760,19 +784,25 @@ class DSv4DSparkWorker(SpecWorkerBase):
         spec_metadata._dspark_worker = self
         self._execute_guided_decoder_if_present(logits)
 
-        # Acceptance: strict target-verify, or rejection sampling for a
-        # non-greedy batch with valid draft_probs.
+        # Target-verify acceptance via the unified SpecWorkerBase entry: it
+        # reshapes the stored draft tokens (default (num_gens, runtime_draft_len)
+        # hook), then routes to strict or rejection sampling. Greedy parity with
+        # the previous hand-rolled path is preserved (rejection only engages for a
+        # non-greedy batch with valid draft_probs).
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata
         )
 
         total_target_tokens = input_ids.shape[0]
 
-        # CUDA-graph warmup guard: warmup forwards (is_cuda_graph set, stream
-        # NOT yet capturing) run synthetic gen batches; snapshot/restore the
-        # persistent window state so they are side-effect-free. During the
-        # capture pass the stream IS capturing, so skip the save/restore and
-        # let the ops be recorded; prefill resets wipe capture-time mutation.
+        # CUDA-graph warmup guard: the warmup forwards (is_cuda_graph set, stream
+        # NOT yet capturing) run synthetic gen batches that would otherwise advance
+        # the persistent rolling-window state. Snapshot and restore it so warmup is
+        # side-effect-free. (During the capture pass itself the stream IS capturing,
+        # so we skip the save/restore and let the ops be recorded. Capture-time
+        # mutation stays on dummy/scratch state: a locally-prefilled request
+        # resets its slot at position zero, while a disaggregated generation-only
+        # request receives a freshly zeroed slot.)
         is_warmup = (
             getattr(spec_metadata, "is_cuda_graph", False)
             and not torch.cuda.is_current_stream_capturing()
@@ -788,8 +818,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 None if self._confidence_logits is None else self._confidence_logits.clone()
             )
 
-        # Seed prefill requests' rolling windows from their prompt's captured
-        # context (affects acceptance rate only).
+        # Assign / reset window slots for context (prefill) requests and seed each
+        # request's rolling KV window from its prompt's captured context, so the
+        # first generation step drafts against real context instead of an all-zero
+        # window (acceptance-rate only; verified decoding keeps output correct).
         if num_contexts > 0:
             self._seed_context_windows(
                 draft_model,
@@ -799,18 +831,24 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 total_target_tokens,
             )
 
-        # FUSED_COMM MoE backends sync EP ranks with a phase-flip barrier:
-        # every rank must invoke the draft MoE the same number of times with
-        # the same globally-gathered per-rank token list (num_gens * block
-        # each) or the barrier desyncs. ``all_rank_num_gens`` is gathered at
-        # metadata-prep time, outside any capture region; None for non-ADP /
-        # single-rank runs (local fallback in ``_forward_stage``).
+        # FUSED_COMM MoE backends (DeepGEMM MegaMoE) synchronize EP ranks with an
+        # in-kernel phase-flip NVLink barrier that flips on every kernel call, so
+        # every rank must invoke the draft MoE the same number of times and with
+        # the same globally-gathered per-rank token list, or the barrier desyncs
+        # (hang / "unspecified launch failure"). The draft runs over generation
+        # requests only, each expanded to ``block`` positions, so the per-rank
+        # draft-MoE token count is ``num_gens * block``. ``all_rank_num_gens`` is
+        # gathered at metadata-prep time (model_engine, outside any CUDA-graph
+        # capture region); it is None for non-ADP / single-rank runs, where the
+        # local ``[num_tokens]`` fallback in ``_forward_stage`` is correct.
         block = int(draft_model.block_size)
         all_rank_num_gens = getattr(spec_metadata, "all_rank_num_gens", None)
-        # A rank with zero local gen requests must still cross the draft MoE's
-        # barrier, but the router / shared-expert GEMMs reject 0-row input, so
-        # it runs a 1-row dummy -- encoded as ``1`` in the shared per-rank list
-        # so every rank agrees on the chunk count.
+        # A rank with zero local gen requests still has to cross the draft MoE's
+        # cross-rank barrier, but DeepseekV4MoE's router / shared-expert dense
+        # GEMMs reject a 0-row input (cuBLAS CUBLAS_STATUS_INVALID_VALUE), so such
+        # a rank runs a single 1-row dummy through the MoE (like ADP padding).
+        # Encode that as ``1`` in the globally-shared per-rank token list so every
+        # rank agrees on the FUSED_COMM chunk count and per-rank slice.
         all_rank_draft_tokens = (
             [max(1, int(g) * block) for g in all_rank_num_gens]
             if all_rank_num_gens is not None
@@ -821,6 +859,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
         )
 
         if num_gens > 0:
+            # The batched gen-block draft returns the per-position corrected block
+            # logits [num_gens, K, vocab] and is CUDA-graph-safe.
             gen_logits = self._draft_gen_block_batched(
                 draft_model,
                 spec_metadata,
@@ -859,8 +899,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 gen_draft_tokens = torch.zeros((num_gens, K), dtype=torch.int32, device="cuda")
                 gen_vocab = None
         else:
-            # No local gens: if any peer EP rank has some, still cross the
-            # draft MoE barrier so the FUSED_COMM phase-flip stays lockstep.
+            # No local generation requests: if any peer EP rank has some, we must
+            # still cross the draft MoE's cross-rank barrier the same number of
+            # times (zero-token) so a FUSED_COMM phase-flip barrier stays lockstep.
             if global_has_gen:
                 draft_model.run_moe_lockstep_noop(all_rank_draft_tokens, accepted_tokens.device)
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
