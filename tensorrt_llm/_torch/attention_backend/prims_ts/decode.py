@@ -26,18 +26,8 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
 import torch
 
 from flashinfer.api_logging import flashinfer_api
-
-from ._trace import _get_attention_trace_template
-
-
-attention_ts_decode_trace_dispatch = _get_attention_trace_template(
-    "attention_ts_decode_trace_dispatch"
-)
-prims_ts_decode_trace_dispatch = _get_attention_trace_template(
-    "prims_ts_decode_trace_dispatch"
-)
-prims_ts_decode_wrapper_trace_dispatch = _get_attention_trace_template(
-    "prims_ts_decode_wrapper_trace_dispatch"
+from flashinfer.trace.templates.attention import (
+    attention_ts_decode_trace_dispatch,
 )
 
 from ._tensor_aliasing import (
@@ -1939,7 +1929,7 @@ def _validate_decode_output_aliasing(
     block_tables: torch.Tensor,
     workspace_buffer: torch.Tensor,
 ) -> None:
-    """Keep output disjoint from every FMHA decode input allocation."""
+    """Keep output disjoint from every live FMHA decode allocation."""
 
     _validate_out_does_not_overlap_inputs(
         runtime.out,
@@ -2188,7 +2178,7 @@ def _validate_decode_run_metadata_values(
         )
 
 
-@flashinfer_api(trace=prims_ts_decode_trace_dispatch)
+@flashinfer_api
 def prims_ts_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: PagedKVCache,
@@ -2221,7 +2211,7 @@ def prims_ts_batch_decode_with_kv_cache(
     must ensure that packed offsets start at zero, are strictly increasing, end
     at ``query.shape[0]``, and have every delta at most ``max_seq_len_q``. For
     causal masking, every fixed or packed per-request Q length must also be no
-    greater than the corresponding per-run ``seq_lens`` value.
+    greater than the corresponding live ``seq_lens`` value.
 
     ``kv_cache`` is either a combined
     ``[pages, 2, Hkv, page_size, D]`` tensor or a ``(K, V)`` tuple of
@@ -2270,7 +2260,7 @@ def prims_ts_batch_decode_with_kv_cache(
         CUDA int32 physical page IDs with shape ``[B, C]``, unit inner stride,
         and non-overlapping row stride at least ``C``.
     seq_lens : torch.Tensor
-        Per-run K/V sequence lengths for each request.
+        Live K/V sequence lengths for each request.
     max_seq_len : int
         Static maximum K/V length used for policy selection and JIT caching.
     seq_len_q : int
@@ -2713,7 +2703,7 @@ class BatchDecodePagedTSWrapper:
         # previous complete plan revision usable.
         self._plan_state = candidate
 
-    @flashinfer_api(trace=prims_ts_decode_wrapper_trace_dispatch)
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,

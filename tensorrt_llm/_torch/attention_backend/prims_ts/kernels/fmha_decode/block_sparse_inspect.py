@@ -20,7 +20,7 @@ same semantic ``max_blocks_per_row`` bound that reusable plans receive from
 their caller. Token-mask contents belong to the run-time prepare kernel and
 are not read here.
 
-Paged inspection first validates per-run sequence lengths and page rows, then
+Paged inspection first validates live sequence lengths and page rows, then
 four warps validate four BSR Q-block rows per CTA. Both publish one validation
 status plus the maximum row width in one Int64 summary; no route payload is
 constructed.
@@ -100,7 +100,7 @@ def _inspect_bsr_row(
     bsr_row_is_valid: cutlass.Boolean,
     num_kv_blocks: cutlass.Int32,
 ) -> tuple[cutlass.Int32, cutlass.Int32]:
-    """Validate one BSR row against a static or per-run Int32 upper bound."""
+    """Validate one BSR row against a static or live Int32 upper bound."""
 
     bsr_row_begin = cutlass.Int32(0)
     bsr_row_end = cutlass.Int32(0)
@@ -138,7 +138,7 @@ def _inspect_bsr_row(
 
 
 @cute.jit
-def _inspect_runtime_paged_bsr_row(
+def _inspect_live_paged_bsr_row(
     block_indptr: cute.Tensor,
     block_indices: cute.Tensor,
     seq_lens_kv: cute.Tensor,
@@ -149,17 +149,17 @@ def _inspect_runtime_paged_bsr_row(
     bsr_row_is_valid: cutlass.Boolean,
     kv_block_size: cutlass.Constexpr[int],
 ) -> tuple[cutlass.Int32, cutlass.Int32]:
-    """Inspect one BSR row against the current request sequence length."""
+    """Inspect one live BSR row against the current request sequence length."""
 
     error_code = cutlass.Int32(_BSR_ERROR_NONE)
     selected_kv_block_count = cutlass.Int32(0)
-    num_active_kv_blocks = cutlass.Int32(0)
+    num_live_kv_blocks = cutlass.Int32(0)
     if lane_idx == cutlass.Int32(0) and bsr_row_is_valid:
-        runtime_seq_len_kv = cutlass.Int32(seq_lens_kv[batch_idx])
-        num_active_kv_blocks = (runtime_seq_len_kv - cutlass.Int32(1)) // cutlass.Int32(
+        live_seq_len_kv = cutlass.Int32(seq_lens_kv[batch_idx])
+        num_live_kv_blocks = (live_seq_len_kv - cutlass.Int32(1)) // cutlass.Int32(
             kv_block_size
         ) + cutlass.Int32(1)
-    num_active_kv_blocks = _warp_broadcast_i32(num_active_kv_blocks, 0)
+    num_live_kv_blocks = _warp_broadcast_i32(num_live_kv_blocks, 0)
     error_code, selected_kv_block_count = _inspect_bsr_row(
         block_indptr,
         block_indices,
@@ -168,13 +168,13 @@ def _inspect_runtime_paged_bsr_row(
         q_block_row_idx,
         lane_idx,
         bsr_row_is_valid,
-        num_active_kv_blocks,
+        num_live_kv_blocks,
     )
     return error_code, selected_kv_block_count
 
 
 class _InspectBlockSparseBsr:
-    """Validate canonical BSR against static or per-run request metadata."""
+    """Validate canonical BSR against static or live request metadata."""
 
     def __init__(
         self,
@@ -255,7 +255,7 @@ class _InspectBlockSparseBsr:
                 cutlass.Int32(self.num_kv_blocks),
             )
         else:
-            error_code, selected_kv_block_count = _inspect_runtime_paged_bsr_row(
+            error_code, selected_kv_block_count = _inspect_live_paged_bsr_row(
                 block_indptr,
                 block_indices,
                 seq_lens_kv,
@@ -296,7 +296,7 @@ class _InspectBlockSparseBsr:
 
 
 class _InspectPagedKvMetadata:
-    """Validate per-run lengths and page rows with one warp per request."""
+    """Validate live lengths and page rows with one warp per request."""
 
     def __init__(
         self,
@@ -417,7 +417,7 @@ class _InspectPagedKvMetadata:
 
 
 class _InspectPagedBlockSparseMetadata:
-    """Launch request and BSR inspection into one summary."""
+    """Launch request inspection before live-BSR inspection into one summary."""
 
     def __init__(
         self,
@@ -529,7 +529,7 @@ def compile_paged_block_sparse_metadata_inspection(
     kv_block_size: int,
     page_size: int,
 ) -> Callable[..., None]:
-    """Compile one paged metadata entry that launches request then BSR checks."""
+    """Compile one paged metadata entry that launches request then live-BSR."""
 
     num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
     logical_page_capacity = cute.sym_int()

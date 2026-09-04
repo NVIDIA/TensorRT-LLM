@@ -514,7 +514,7 @@ class FmhaDecodeConfig:
     use_kv_valid_bits: bool = False
     # Let independent warps issue the two fine-route K/V instruction streams.
     # The wrapper resolves this from immutable route capacity; the kernel does
-    # not inspect per-run BSR morphology to select its task topology.
+    # not inspect live BSR morphology to select its task topology.
     use_parallel_sparse_kv_loads: bool = False
     # Number of K/V instances that the loop processes per step. Two instances
     # (K0/V0 and K1/V1) let two parallel SoftmaxTask groups consume alternating

@@ -988,7 +988,7 @@ class GmemQKVResource(MemoryResource):
             seq_coord_q = cuseqlen_q + seq_coord_q
             # Each packed request uses its own bottom-right window origin. For
             # mixed causal plans the task manager also derives the request's
-            # K-loop extent from these runtime Q/K lengths.
+            # K-loop extent from these live Q/K lengths.
             window_q_offset = seqlen_k - seqlen_q
             if cutlass.const_expr(
                 self.cfg.use_paged_kv and not self.cfg.stages_page_offsets_in_smem

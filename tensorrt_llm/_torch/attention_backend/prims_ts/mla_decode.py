@@ -23,18 +23,9 @@ from typing import Any, Literal, Optional, cast
 import torch
 
 from flashinfer.api_logging import flashinfer_api
-
-from ._trace import _get_attention_trace_template
-
-
-prims_ts_decode_mla_one_shot_trace_dispatch = _get_attention_trace_template(
-    "prims_ts_decode_mla_one_shot_trace_dispatch"
-)
-prims_ts_decode_mla_trace_dispatch = _get_attention_trace_template(
-    "prims_ts_decode_mla_trace_dispatch"
-)
-prims_ts_decode_mla_wrapper_trace_dispatch = _get_attention_trace_template(
-    "prims_ts_decode_mla_wrapper_trace_dispatch"
+from flashinfer.trace.templates.attention import (
+    prims_ts_decode_mla_one_shot_trace_dispatch,
+    prims_ts_decode_mla_trace_dispatch,
 )
 
 from ._tensor_aliasing import (
@@ -1495,7 +1486,7 @@ def _validate_mla_output_aliasing(
     qo_indptr: Optional[torch.Tensor],
     workspace_buffer: torch.Tensor,
 ) -> None:
-    """Keep output disjoint from every MLA decode input allocation."""
+    """Keep output disjoint from every live MLA decode allocation."""
 
     _validate_out_does_not_overlap_inputs(
         runtime.out,
@@ -1600,7 +1591,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
     packed launches, callers must ensure that offsets start at zero, are
     strictly increasing, end at ``query.shape[0]``, and have every delta no
     larger than ``max_seq_len_q``. For causal masking, every fixed or packed
-    per-request Q length must also be no greater than the corresponding per-run
+    per-request Q length must also be no greater than the corresponding live
     ``seq_lens`` value. Warm the semantic key before CUDA graph
     capture and provide ``out`` to avoid an output allocation. Captured graphs
     must retain stable ``qo_indptr`` storage; its values may change only while
@@ -1621,7 +1612,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
         Dense physical-page table for each request. Rows must be inner
         contiguous and non-overlapping, but may have padding between them.
     seq_lens : torch.Tensor
-        Per-run K/V sequence lengths.
+        Live K/V sequence lengths.
     max_seq_len : int
         Static maximum K/V length used for policy selection and JIT caching.
     qo_indptr : torch.Tensor, optional
@@ -1915,7 +1906,7 @@ class BatchMLADecodePagedTSWrapper:
             split_kv=int(dict(policy)["split_kv"]),
         )
 
-    @flashinfer_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
+    @flashinfer_api
     def run(
         self,
         query: torch.Tensor,
@@ -2059,7 +2050,7 @@ def batch_decode_mla_with_paged_kv_cache(
         Dense physical-page table for each request. Rows must be inner
         contiguous and non-overlapping, but may have padding between them.
     seq_lens : torch.Tensor
-        Per-run K/V sequence lengths.
+        Live K/V sequence lengths.
     qo_indptr : torch.Tensor, optional
         Cumulative query offsets selecting packed-query mode.
     max_seq_len_q : int, optional
