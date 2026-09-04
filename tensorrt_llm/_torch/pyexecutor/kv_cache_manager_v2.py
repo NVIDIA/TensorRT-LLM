@@ -92,7 +92,7 @@ from .kv_cache_stats import (
     KVCacheV2SsmLifeCycleIterationStats,
     KVCacheV2SsmSnapshotIterationStats,
 )
-from .llm_request import LlmRequest, LlmRequestState, SamplingConfig, get_draft_token_length
+from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
@@ -2148,7 +2148,8 @@ class KVCacheManagerV2(BaseResourceManager):
         ``_extra_buffers_per_layer``. Model-specific managers may declare
         logical layouts without requiring the shared extractor to inspect
         private attributes or role names. MiniMax M3, for example, maps
-        ordinary K/V to ``NHD`` and keeps index-key ``REPLICATED``.
+        ordinary K/V to ``HND`` for its MSA backend and ``NHD`` for its
+        Triton backend, while keeping index-key ``REPLICATED``.
 
         This declaration does not influence storage pooling: V2 storage
         coalesces buffers purely by ``(life_cycle, buffer size)``, so roles
@@ -3563,7 +3564,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 request_id=req_id,
                 max_new_tokens=1,
                 input_tokens=input_tokens,
-                sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+                sampling_config=sampling_params._get_sampling_config(),
                 is_streaming=False,
                 encoder_input_tokens=encoder_input_tokens,
                 encoder_output_len=encoder_output_len,

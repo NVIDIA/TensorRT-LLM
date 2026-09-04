@@ -133,7 +133,7 @@ def _compute_slot_mappings(
     tokens_per_block: int,
     quant_block_size: int,
     data_bytes_per_token: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Compute flat byte indices for FP8/FP4 data and scales from global token positions.
 
     Shared by Indexer.prepare() (CPU) and on_update_kv_lens() (GPU) to avoid
@@ -1609,9 +1609,11 @@ class Indexer(nn.Module):
 
         # Dense skip outputs remain valid priors if a later step enters GVR.
         if has_prefill:
+            # Device lengths: gathering the CUDA selections with the host
+            # seq_lens would force a synchronous H2D copy every layer.
             self.top_k.update_gvr_prior_from_prefill(
                 topk_indices_buffer[:num_ctx_tokens],
-                metadata.seq_lens[:num_contexts],
+                metadata.seq_lens_cuda[:num_contexts],
                 gvr_prior_indices,
                 request_offset=num_generations,
             )

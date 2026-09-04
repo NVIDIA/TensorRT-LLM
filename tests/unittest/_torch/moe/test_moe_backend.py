@@ -57,6 +57,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     materialize_activation_params,
 )
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
@@ -66,7 +67,9 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEEnvironment,
     MoEProblem,
+    MoERejection,
     MoERejectReason,
+    MoEResolutionReport,
     MoERunContext,
     MoEStaticCapability,
 )
@@ -2232,3 +2235,84 @@ def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
             )
 
             ref_fused_moe.check_accuracy(output, ref_output)
+
+
+def _nvfp4_problem(intermediate_size: Optional[int], activation: str) -> MoEProblem:
+    return MoEProblem(
+        quant=QuantAlgo.NVFP4.value,
+        dtype_act=torch.bfloat16,
+        hidden_size=7168,
+        intermediate_size=intermediate_size,
+        num_experts=256,
+        top_k=8,
+        activation=activation,
+    )
+
+
+def _deployment_at_moe_tp(moe_tp_size: int) -> MoEDeployment:
+    return MoEDeployment(
+        ep_size=1,
+        tp_size=moe_tp_size,
+        parallel_size=moe_tp_size,
+        use_dp=False,
+        num_slots=256,
+        env=MoEEnvironment(sm=100),
+    )
+
+
+@pytest.mark.parametrize(
+    "backend_cls", [CutlassFusedMoE, CuteDslFusedMoE], ids=["cutlass", "cutedsl"]
+)
+@pytest.mark.parametrize(
+    "intermediate_size,activation,moe_tp_size,rejected",
+    [
+        # DeepSeek-R1-0528 NVFP4. moe_tp_size=64 is what tp_size=8 + cp_size=8
+        # HELIX resolves to, and it shards FC1 to 64 rows: CuteDSL dies in
+        # unswizzle_sf, Cutlass returns an all-zero output. NVBUG 5859751.
+        (2048, "Swiglu", 32, False),
+        (2048, "Swiglu", 64, True),
+        # Unknown is not false: an absent shape must abstain, not reject.
+        (None, "Swiglu", 64, False),
+        # Nemotron-3 Nano NVFP4: 128-unaligned, but non-gated FC1 has no
+        # gate/up split so the padding is a zero tail and it loads fine.
+        (1856, "Relu2", 1, False),
+    ],
+    ids=["gated_aligned", "gated_unaligned", "unknown_shape", "non_gated"],
+)
+def test_nvfp4_fc1_row_alignment_gate(
+    backend_cls, intermediate_size, activation, moe_tp_size, rejected
+):
+    """A gated NVFP4 FC1 buffer rounded up to the 128-row block-scale tile
+    splits gate/up on padding, so those layers must be turned down here.
+    """
+    verdict = backend_cls.can_implement(
+        _nvfp4_problem(intermediate_size, activation), _deployment_at_moe_tp(moe_tp_size)
+    )
+    if rejected:
+        assert not verdict.eligible
+        assert verdict.reject_reason is MoERejectReason.SHAPE_UNALIGNED
+        assert "moe_expert_parallel_size" in verdict.detail
+    else:
+        # Other gates may still turn the layer down; this one must not.
+        assert verdict.reject_reason is not MoERejectReason.SHAPE_UNALIGNED
+
+
+def test_unresolvable_layer_error_carries_rejection_details():
+    """describe() prints reason codes only, so impl_class_for has to add the
+    details -- without them a shape rejection reaches the operator as a bare
+    ``shape_unaligned`` with no shapes and no way forward.
+    """
+    report = MoEResolutionReport(
+        problem=_nvfp4_problem(2048, "Swiglu"),
+        deployment=_deployment_at_moe_tp(64),
+        winner=None,
+        selected_by="failed",
+        rejected=(
+            MoERejection(
+                "CUTLASS", MoERejectReason.SHAPE_UNALIGNED, "raise moe_expert_parallel_size"
+            ),
+        ),
+        requested="CUTLASS",
+    )
+    with pytest.raises(ValueError, match="raise moe_expert_parallel_size"):
+        impl_class_for(report)

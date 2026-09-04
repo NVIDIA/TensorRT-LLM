@@ -69,6 +69,7 @@ def _stub_sender():
 def _stub_receiver():
     """Create a stub receiver with no-op methods needed by RxSession."""
     receiver = MagicMock()
+    receiver._enforce_physical_ownership = False
     receiver.setup_session = MagicMock()
     receiver.dispatch_task = MagicMock()
     return receiver
@@ -903,10 +904,10 @@ def test_failed_pipelined_send_retires_without_mutating_request_state():
         py_kv_send_session_retired=False,
     )
     session = MagicMock()
+    session._enforce_physical_ownership = False
+    transceiver = object.__new__(KvCacheTransceiverV2)
 
-    KvCacheTransceiverV2._close_failed_sessions(
-        MagicMock(), {42: session}, {42: request}, [42], mark_retired=True
-    )
+    transceiver._close_failed_sessions({42: session}, {42: request}, [42], mark_retired=True)
 
     assert request.state == LlmRequestState.CONTEXT_INIT
     assert request.py_kv_send_session_retired

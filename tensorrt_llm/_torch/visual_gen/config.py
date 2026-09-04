@@ -281,6 +281,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             algo_map = {
                 "FP8": QuantAlgo.FP8,
                 "FP8_BLOCK_SCALES": QuantAlgo.FP8_BLOCK_SCALES,
+                "FP8_PER_CHANNEL_PER_TOKEN": QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
                 "NVFP4": QuantAlgo.NVFP4,
                 "W4A16_AWQ": QuantAlgo.W4A16_AWQ,
                 "W4A8_AWQ": QuantAlgo.W4A8_AWQ,
@@ -304,6 +305,11 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 group_size = weights_config.get("group_size")
             break
 
+        # FP8_PER_CHANNEL_PER_TOKEN quantizes activations per-token at runtime;
+        # static activation quantization is not currently supported.
+        if quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
+            dynamic_activation_quant = True
+
         # Set defaults based on quant_algo if group_size not specified
         if group_size is None:
             if quant_algo in (QuantAlgo.NVFP4,):
@@ -319,6 +325,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             # NVFP4 requires dynamic activation quantization when using dynamic mode
             # since input_scale is not calibrated
             if quant_algo == QuantAlgo.NVFP4 and dynamic_weight_quant:
+                dynamic_activation_quant = True
+            if quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
                 dynamic_activation_quant = True
 
         quant_config = QuantConfig(
@@ -626,6 +634,11 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
 
             NVFP4LinearMethod.use_tunable_quantize = True
+
+        if quant_config.quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
+            from tensorrt_llm._torch.modules.linear import FP8RowwiseLinearMethod
+
+            FP8RowwiseLinearMethod.use_tunable_quantize = True
 
         attention_metadata_state = (
             create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None

@@ -16,6 +16,7 @@ from test_modeling_nemotron_h import extract_decode_logprobs
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.models import modeling_nemotron_nano as nemotron_nano
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NanoV2VLInputProcessor,
@@ -23,8 +24,10 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NanoV2VLVisionEncoder,
     NemotronH_Nano_VL_V2,
     _get_vision_encoder_cuda_graph_config,
+    _normalize_vision_weights,
 )
 from tensorrt_llm._torch.models.modeling_parakeet import ProjectedParakeet
+from tensorrt_llm._torch.models.modeling_radio import split_fused_qkv
 from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm.inputs import (
     AudioData,
@@ -215,6 +218,81 @@ def test_nemotron_nano_rejects_evs_attached_video_embeddings():
             input_ids=torch.tensor([[20]], dtype=torch.long),
             multimodal_params=[param],
         )
+
+
+def _spec_forward_stub():
+    """Minimal stand-in for the VL model: only what `forward` touches."""
+    llm = MagicMock()
+    llm.forward.return_value = torch.zeros(1, 4)
+    return SimpleNamespace(
+        llm=llm,
+        mm_token_ids=torch.tensor([0], dtype=torch.int32),
+        video_pruning_rate=0.0,
+    )
+
+
+def test_nemotron_nano_forward_threads_spec_decoding_args():
+    """MTP drafting needs spec_metadata and resource_manager to reach the inner LM."""
+    model = _spec_forward_stub()
+    attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+    input_ids = torch.tensor([5, 6, 7], dtype=torch.long)
+    spec_metadata = object()
+    resource_manager = object()
+
+    NemotronH_Nano_VL_V2.forward(
+        model,
+        attn_metadata,
+        input_ids=input_ids,
+        spec_metadata=spec_metadata,
+        resource_manager=resource_manager,
+    )
+
+    kwargs = model.llm.forward.call_args.kwargs
+    assert kwargs["spec_metadata"] is spec_metadata
+    assert kwargs["resource_manager"] is resource_manager
+    # Text-only request: fusion is a no-op, so both id arguments agree.
+    assert torch.equal(kwargs["input_ids"], input_ids)
+    assert torch.equal(kwargs["orig_input_ids"], input_ids)
+
+
+def test_nemotron_nano_forward_keeps_prompt_ids_when_embeds_are_fused(monkeypatch):
+    """Fusion nulls input_ids, so orig_input_ids is the drafter's only token source."""
+    monkeypatch.setattr(
+        nemotron_nano,
+        "fuse_input_embeds",
+        lambda *args, **kwargs: (None, torch.zeros(3, 4)),
+    )
+    model = _spec_forward_stub()
+    attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+    input_ids = torch.tensor([5, 6, 7], dtype=torch.long)
+
+    NemotronH_Nano_VL_V2.forward(
+        model,
+        attn_metadata,
+        input_ids=input_ids,
+        spec_metadata=object(),
+    )
+
+    kwargs = model.llm.forward.call_args.kwargs
+    assert kwargs["input_ids"] is None
+    assert torch.equal(kwargs["orig_input_ids"], input_ids)
+
+
+def test_nemotron_nano_forward_passes_through_spec_worker_dict():
+    """One-model MTP returns a dict, not logits; forward must hand it back as-is."""
+    model = _spec_forward_stub()
+    spec_output = {"logits": torch.zeros(1, 4), "next_draft_tokens": torch.zeros(1, 3)}
+    model.llm.forward.return_value = spec_output
+    attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+
+    out = NemotronH_Nano_VL_V2.forward(
+        model,
+        attn_metadata,
+        input_ids=torch.tensor([5, 6, 7], dtype=torch.long),
+        spec_metadata=object(),
+    )
+
+    assert out is spec_output
 
 
 def test_get_vision_encoder_cuda_graph_config():
@@ -999,3 +1077,179 @@ class TestChunkedPrefillCaching:
             "`vision_encoder` was called again on the second chunk. Caching is broken."
         )
         assert torch.equal(result2[0], result[0])
+
+
+@pytest.mark.cpu_only
+class TestModelOptVisionWeightNormalization:
+    """`_normalize_vision_weights` maps ModelOpt vision keys onto the release layout."""
+
+    HIDDEN = 4
+    BLOCKS = "vision_model.radio_model.model.blocks."
+    LAYER = "vision_model.encoder.layer.0."
+
+    def _part(self, offset: int, suffix: str) -> torch.Tensor:
+        """A tensor whose every element identifies which q/k/v part it came from."""
+        shape = (self.HIDDEN, self.HIDDEN) if suffix == "weight" else (self.HIDDEN,)
+        n = int(np.prod(shape))
+        return (torch.arange(n, dtype=torch.float32) + offset * 1000).reshape(shape)
+
+    def _qkv_parts(self, suffixes=("weight", "bias")) -> dict:
+        return {
+            part: {suffix: self._part(offset, suffix) for suffix in suffixes}
+            for part, offset in (("query", 1), ("key", 2), ("value", 3))
+        }
+
+    def _modelopt_checkpoint(self, parts: dict) -> dict:
+        h = self.HIDDEN
+        weights = {
+            # Not a vision weight: must be left behind for the LLM loader.
+            "model.embed_tokens.weight": torch.zeros(2, h),
+            # Derived by this port rather than loaded, so dropped, not rejected.
+            "vision_model.summary_idxs": torch.arange(2),
+            "vision_projector.vision_final_layernorm.weight": torch.zeros(h),
+            "vision_projector.mlp1.norm.weight": torch.zeros(h),
+            "vision_projector.mlp1.linear1.weight": torch.zeros(h, h),
+            "vision_projector.mlp1.linear2.weight": torch.zeros(h, h),
+            "vision_model.embeddings.patch_projection.weight": torch.zeros(h, h),
+            "vision_model.embeddings.position_embedding": torch.zeros(1, h),
+            "vision_model.embeddings.cls_register_token": torch.zeros(1, 1, h),
+            self.LAYER + "attention.output.dense.weight": torch.zeros(h, h),
+            self.LAYER + "mlp.fc1.weight": torch.zeros(h, h),
+            self.LAYER + "norm1.weight": torch.zeros(h),
+            self.LAYER + "layer_scale1.lambda1": torch.ones(h),
+            self.LAYER + "layer_scale2.lambda1": torch.ones(h),
+        }
+        for part, tensors in parts.items():
+            for suffix, tensor in tensors.items():
+                weights[f"{self.LAYER}attention.attention.{part}.{suffix}"] = tensor
+        return weights
+
+    def test_fused_qkv_survives_the_split_radio_performs(self):
+        """Fuse, then split with the real RADIO splitter: does q come back as q?
+
+        The expected value is the caller's own tensor, so this fails only if the
+        two halves of the contract move apart -- which nothing else would catch,
+        since q/k/v share a shape and load_state_dict stays happy either way.
+        """
+        parts = self._qkv_parts()
+        remapped = _normalize_vision_weights(self._modelopt_checkpoint(parts))
+
+        for suffix in ("weight", "bias"):
+            fused_key = f"{self.BLOCKS}0.attn.qkv.{suffix}"
+            split = split_fused_qkv(fused_key, remapped[fused_key])
+            for part, proj in (("query", "q_proj"), ("key", "k_proj"), ("value", "v_proj")):
+                assert torch.equal(
+                    split[fused_key.replace("attn.qkv.", f"attn.{proj}.")],
+                    parts[part][suffix],
+                ), f"{part} did not land in {proj}"
+
+    def test_modelopt_keys_all_land_in_the_release_namespace(self):
+        """Nothing is invented and nothing is left over -- the whole key set, spelled out."""
+        remapped = _normalize_vision_weights(self._modelopt_checkpoint(self._qkv_parts()))
+        assert set(remapped) == {
+            "mlp1.0.weight",
+            "mlp1.1.weight",
+            "mlp1.3.weight",
+            "vision_model.radio_model.model.patch_generator.embedder.weight",
+            "vision_model.radio_model.model.patch_generator.pos_embed",
+            "vision_model.radio_model.model.patch_generator.cls_token.token",
+            self.BLOCKS + "0.attn.proj.weight",
+            self.BLOCKS + "0.attn.qkv.weight",
+            self.BLOCKS + "0.attn.qkv.bias",
+            self.BLOCKS + "0.mlp.fc1.weight",
+            self.BLOCKS + "0.norm1.weight",
+        }
+
+    def test_release_layout_is_left_alone(self):
+        """A release checkpoint keeps its own spelling, and re-running changes nothing."""
+        release = {
+            "model.embed_tokens.weight": torch.zeros(2, self.HIDDEN),
+            "mlp1.0.weight": torch.zeros(self.HIDDEN),
+            self.BLOCKS + "0.attn.qkv.weight": torch.zeros(3 * self.HIDDEN, self.HIDDEN),
+        }
+        once = _normalize_vision_weights(release)
+        assert set(once) == {"mlp1.0.weight", self.BLOCKS + "0.attn.qkv.weight"}
+        assert set(_normalize_vision_weights(once)) == set(once)
+
+    @pytest.mark.parametrize(
+        "bad_key",
+        [
+            "vision_model.encoder.layer.0.attention.attention.rotary_emb.inv_freq",
+            "vision_model.some_new_submodule.weight",
+        ],
+    )
+    def test_unrecognized_vision_key_is_rejected(self, bad_key):
+        """A key nobody mapped must stop the load, not be dropped on the floor."""
+        weights = self._modelopt_checkpoint(self._qkv_parts())
+        weights[bad_key] = torch.zeros(self.HIDDEN)
+        with pytest.raises(ValueError, match="Unrecognized vision"):
+            _normalize_vision_weights(weights)
+
+    def test_unfusable_qkv_suffix_is_rejected(self):
+        """A quantized vision export would attach scales, which are not rows to concatenate.
+
+        The unrecognized-key guards do not reach here: anything under
+        ``attention.attention.{query,key,value}`` is claimed by the fusion
+        branch before those guards run.
+        """
+        parts = self._qkv_parts(suffixes=("weight", "bias", "weight_scale"))
+        with pytest.raises(ValueError, match="weight_scale"):
+            _normalize_vision_weights(self._modelopt_checkpoint(parts))
+
+    def test_mismatched_qkv_suffixes_are_rejected(self):
+        """Q with a bias and K without means one of them was misread."""
+        weights = self._modelopt_checkpoint(self._qkv_parts())
+        del weights[self.LAYER + "attention.attention.key.bias"]
+        with pytest.raises(ValueError, match="key carries"):
+            _normalize_vision_weights(weights)
+
+    def test_missing_qkv_part_is_rejected(self):
+        """Fusing two of three projections would produce a wrongly shaped tensor."""
+        weights = self._modelopt_checkpoint(self._qkv_parts())
+        for suffix in ("weight", "bias"):
+            del weights[f"{self.LAYER}attention.attention.key.{suffix}"]
+        with pytest.raises(ValueError, match=r"missing \['key'\]"):
+            _normalize_vision_weights(weights)
+
+    def test_non_identity_layer_scale_is_rejected(self):
+        """The RADIO port has no LayerScale, so dropping a real one would be silent."""
+        weights = self._modelopt_checkpoint(self._qkv_parts())
+        weights[self.LAYER + "layer_scale1.lambda1"] = torch.full((self.HIDDEN,), 0.1)
+        with pytest.raises(ValueError, match="not all-ones"):
+            _normalize_vision_weights(weights)
+
+
+@pytest.mark.cpu_only
+def test_nemotron_nano_frees_the_modelopt_projector_shard():
+    """The ModelOpt projector tensors stop being referenced once the encoder has loaded.
+
+    `mark_consumed` is what lets the loader release mmap pages module by module;
+    a prefix that is never marked keeps its shard resident for the rest of load.
+    """
+    fake_encoder = MagicMock()
+    fake_encoder.eval.return_value = fake_encoder
+    fake_encoder.to.return_value = fake_encoder
+
+    model = SimpleNamespace(
+        _mm_model_config=_make_minimal_nano_model_config(),
+        vision_encoder=fake_encoder,
+        sound_encoder=None,
+        llm=MagicMock(),
+        model_config=SimpleNamespace(),
+    )
+    weights = ConsumableWeightsDict(
+        {
+            "vision_projector.mlp1.linear1.weight": torch.empty(0),
+            "vision_model.radio_model.weight": torch.empty(0),
+            "language_model.weight": torch.empty(0),
+        }
+    )
+
+    with (
+        mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "0"}),
+        mock.patch.object(nemotron_nano, "NemotronHHfWeightMapper", MagicMock()),
+    ):
+        NemotronH_Nano_VL_V2.load_weights(model, weights)
+
+    assert "vision_projector.mlp1.linear1.weight" not in weights
+    assert "vision_model.radio_model.weight" not in weights

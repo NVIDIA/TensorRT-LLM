@@ -517,6 +517,7 @@ public:
     bool mUseSparseAttention = false;
     bool mUseTllmGenSparseAttentionPaged = false;
     bool mUseTllmGenSparseAttention = false;
+    bool mUseNvfp4MlaKvCache = false;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams;
     int mCpSize = 1;
     int mCpRank = 0;
@@ -585,12 +586,13 @@ public:
             mIsSpecDecodingEnabled, mUseSpecDecoding, mIsSpecDecTree, mSpecDecodingIsGenerationLengthVariable,
             mSpecDecodingMaxGenerationLength, mSpecDecodingTargetMaxGenLen, mForcePrepareSpecDecTreeMask, mIsMLAEnabled,
             mIsGenerationMLA, mUseGenFlashMLA, mUseSparseAttention, mUseTllmGenSparseAttentionPaged,
-            mUseTllmGenSparseAttention, mMLAParams.data(), mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads,
-            mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast,
-            mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
-            mFusesDsv4InvRopeFp8Quant, mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1),
-            mSkipSoftmaxThresholdScaleFactorPrefill, mSkipSoftmaxThresholdScaleFactorDecode, mSkipCorrectionThreshold,
-            mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
+            mUseTllmGenSparseAttention, mUseNvfp4MlaKvCache, mMLAParams.data(), mCpSize, mCpRank, mCpGroup,
+            mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank,
+            mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache,
+            mSkipAttn, mFuseFp4Quant, mFusesDsv4InvRopeFp8Quant, mNbMultiBlockSemaphores,
+            mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
+            mSkipSoftmaxThresholdScaleFactorDecode, mSkipCorrectionThreshold, mSageAttnNumEltsPerBlkQ,
+            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
     };
 
 private:
