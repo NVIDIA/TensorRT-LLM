@@ -26,7 +26,7 @@ def _runner(*, secondary=True):
 def _engine(runner, buckets):
     return SimpleNamespace(
         cuda_graph_runner=runner,
-        spec_config=SimpleNamespace(verify_len_tiers=[1, 3, 5], max_draft_len=5),
+        spec_config=SimpleNamespace(max_draft_len=5),
         _dspark_last_padded_bs=None,
         ragged_verify_token_buckets=lambda _rows: list(buckets),
     )
