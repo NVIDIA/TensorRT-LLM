@@ -686,6 +686,12 @@ class CUDAGraphRunner:
 
         input_ids = current_inputs["input_ids"]
         seqlen = input_ids.shape[0]
+        expected_num_tokens = self._get_num_tokens_for_key(key)
+        if seqlen != expected_num_tokens:
+            raise ValueError(
+                f"replay() got {seqlen} tokens for key {key}, but the graph "
+                f"was captured for {expected_num_tokens} tokens. A shorter "
+                "input_ids leaves the tail of the static input buffer stale.")
         static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
@@ -693,12 +699,31 @@ class CUDAGraphRunner:
             static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
             mrope_delta_read_seq_slots = current_inputs.get(
                 'mrope_delta_read_seq_slots')
+            num_slots = key.batch_size * self.max_beam_width
             if mrope_delta_read_seq_slots is not None:
+                if mrope_delta_read_seq_slots.shape[0] != num_slots:
+                    raise ValueError(
+                        f"replay() got {mrope_delta_read_seq_slots.shape[0]} "
+                        f"mrope_delta_read_seq_slots for key {key}, but the graph "
+                        f"was captured for {num_slots} "
+                        "mrope_delta_read_seq_slots.")
                 static_tensors[
                     'mrope_delta_read_seq_slots'][:mrope_delta_read_seq_slots.
                                                   shape[0]].copy_(
                                                       mrope_delta_read_seq_slots,
                                                       non_blocking=True)
+            else:
+                # Omission means every slot reads the dummy seq slot's
+                # permanently-zero delta (model_engine.py's mrope_dummy_seq_slot
+                # fast path). Fill explicitly instead of leaving stale values.
+                logger.warning_once(
+                    "replay() got no mrope_delta_read_seq_slots for a "
+                    "use_mrope graph; filling the static buffer with the "
+                    "dummy seq slot instead of copying real values.",
+                    key=f"cuda_graph_mrope_delta_read_seq_slots_omitted_{key}")
+                mrope_dummy_seq_slot = self.config.max_num_tokens * self.config.mapping.pp_size
+                static_tensors['mrope_delta_read_seq_slots'][:num_slots].fill_(
+                    mrope_dummy_seq_slot)
         else:
             static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
