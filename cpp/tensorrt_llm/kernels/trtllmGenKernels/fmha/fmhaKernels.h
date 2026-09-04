@@ -204,7 +204,7 @@ public:
                 KernelInfo funcInfo;
                 funcInfo.mMetaInfoIndex = i;
                 TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 13030
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 13040
                 if (kernelMeta.mSharedMemBytes + 1024 > 228 * 1024)
                 {
                     TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,

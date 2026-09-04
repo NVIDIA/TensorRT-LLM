@@ -1391,8 +1391,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             && !sparse_attn_kv_lens.has_value() && aux_kv_cache_pool_ptr.has_value();
         op->mFP8ContextMLA
             = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::getSMVersion() == 100
-                || tensorrt_llm::common::getSMVersion() == 103 || tensorrt_llm::common::getSMVersion() == 107
-                || tensorrt_llm::common::getSMVersion() == 120)
+                  || tensorrt_llm::common::getSMVersion() == 103 || tensorrt_llm::common::getSMVersion() == 107
+                  || tensorrt_llm::common::getSMVersion() == 120)
             && (op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache);
         op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
         op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache;
