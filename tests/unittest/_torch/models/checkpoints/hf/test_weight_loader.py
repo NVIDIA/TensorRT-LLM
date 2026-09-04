@@ -127,6 +127,23 @@ def test_load_weights_ignores_consolidated_ckpt_when_sharded_ckpt_exists(
     assert set(loaded_weight_files) == expected_safetensor_filenames
 
 
+def test_bin_loader_propagates_fallback_error():
+    loader = HfWeightLoader()
+    with (
+        mock.patch(
+            "tensorrt_llm._torch.models.checkpoints.hf.weight_loader.torch.load",
+            side_effect=[OSError("mmap failed"), MyError("fallback failed")],
+        ) as torch_load,
+        pytest.raises(MyError, match="fallback failed"),
+    ):
+        loader._load_bin_or_path_file("model.bin")
+
+    assert torch_load.call_args_list == [
+        mock.call("model.bin", weights_only=True, map_location="cpu", mmap=True),
+        mock.call("model.bin", weights_only=True, map_location="cpu", mmap=False),
+    ]
+
+
 def test_weight_cache_reuses_raw_weights_with_fresh_consumable_wrapper(tmp_path, monkeypatch):
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
 
