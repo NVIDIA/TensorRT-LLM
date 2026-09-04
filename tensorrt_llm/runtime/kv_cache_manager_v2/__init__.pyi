@@ -57,7 +57,6 @@ class PlannedDropHandle:
 class ReuseScope(NamedTuple):
     lora_id: int | None = None
     salt: int | None = None
-    def to_bytes(self) -> bytes: ...
 
 LayerId = NewType("LayerId", int)
 CudaStream = NewType("CudaStream", int)

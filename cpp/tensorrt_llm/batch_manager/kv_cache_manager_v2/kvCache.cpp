@@ -1560,7 +1560,6 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         // New block: take uncommitted pages, convert to committed.
         // Mirrors Python's _take_uncommitted_page + convert path.
         auto taken = _takeUncommittedPage(sb, kDefaultBeamIndex, ssmLcId);
-        sb.treeBlock = newBlock;
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             auto& [up, locked] = taken[lc];
@@ -1573,6 +1572,7 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
             else
                 sb.pages[kDefaultBeamIndex][lc] = committed->hold();
         }
+        sb.treeBlock = newBlock;
         TLLM_CHECK_DEBUG(_getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
         ++mNumCommittedBlocks;
         if (newBlock->eventSink)

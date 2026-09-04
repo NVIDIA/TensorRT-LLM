@@ -1746,7 +1746,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 return nb::ndarray<nb::numpy, int const, nb::ndim<1>>(
                     span.ptr, {static_cast<size_t>(span.len)}, nb::handle());
             },
-            nb::arg("layer_group_id"), nb::arg("beam_idx") = 0)
+            nb::arg("layer_group_id"), nb::arg("beam_id") = 0)
         .def(
             "get_ssm_block_base_index",
             [](kv::KvCache const& self, int layerGroupId, int beamId)
@@ -1811,7 +1811,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCache const& self, int layerGroupId, int beamIdx, bool validOnly) {
                 return self.getAggregatedPageIndices(kv::LayerGroupId{layerGroupId}, kv::BeamIndex{beamIdx}, validOnly);
             },
-            nb::arg("layer_group_id"), nb::arg("beam_idx") = 0, nb::arg("valid_only") = false,
+            nb::arg("layer_group_id"), nb::arg("beam_id") = 0, nb::arg("valid_only") = false,
             // Takes the shared API lock, so it can block on a writer.
             nb::call_guard<nb::gil_scoped_release>())
         .def(
