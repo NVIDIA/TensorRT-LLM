@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._ipc_utils import IpcMemory
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
@@ -58,7 +59,18 @@ def set_allreduce_autotuner_tuning_mode(is_tuning_mode: bool) -> None:
     _ALLREDUCE_AUTOTUNER_TUNING_MODE = is_tuning_mode
 
 
-def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
+def get_allreduce_workspace(mapping: Mapping) -> Tuple[torch.LongTensor, bool]:
+    """Returns the all-reduce workspace and whether CUDA IPC failed while building it.
+
+    cudaDeviceCanAccessPeer can report P2P support on systems where CUDA IPC handles
+    still cannot be imported. The workspace pointers are null in that case and only
+    NCCL can run, which the second element of the returned tuple signals.
+
+    It stays False when the workspace holds no IPC buffers by design, i.e. when P2P
+    was never available in the first place (inter-node TP for instance). Those
+    configurations behave as they always did and must keep their strategy, MNNVL in
+    particular.
+    """
     if not hasattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}'):
         setattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}', {})
 
@@ -70,8 +82,26 @@ def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
             CustomAllReduceHelper.max_workspace_size_auto(
                 mapping.tp_size, support_deterministic=False),
         )
-        allreduce_workspaces[mapping] = (ipc_buffers, workspace)
-    return allreduce_workspaces[mapping][1]
+        ipc_failed = any(buffer.ipc_failed for buffer in ipc_buffers
+                         if isinstance(buffer, IpcMemory))
+        allreduce_workspaces[mapping] = (ipc_buffers, workspace, ipc_failed)
+    _, workspace, ipc_failed = allreduce_workspaces[mapping]
+    return workspace, ipc_failed
+
+
+def _require_ipc_workspace(mapping: Mapping, op_name: str) -> torch.LongTensor:
+    """Workspace for fused ops that reinterpret it as `void**` and have no NCCL path.
+
+    AllReduce degrades to NCCL when CUDA IPC turns out to be unusable, but these
+    kernels cannot: they would dereference the null peer pointers. Fail here with an
+    actionable message rather than in the kernel with an illegal memory access.
+    """
+    workspace, ipc_failed = get_allreduce_workspace(mapping)
+    if ipc_failed:
+        raise RuntimeError(
+            f"{op_name} requires CUDA IPC, which is unavailable on this system, "
+            "and it has no NCCL fallback.")
+    return workspace
 
 
 def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
@@ -783,12 +813,23 @@ class AllReduce(nn.Module):
             # Note: SYMM_MEM now also needs workspace for fallback scenarios (fused ops, etc.)
             # Only UB doesn't need workspace
             if self.strategy != AllReduceStrategy.UB:
-                if self.strategy == AllReduceStrategy.LOWPRECISION:
-                    allocate_low_presicion_allreduce_workspace(self.mapping)
                 if self.strategy not in (AllReduceStrategy.UB,
                                          AllReduceStrategy.NCCL,
                                          AllReduceStrategy.NCCL_SYMMETRIC):
-                    self.workspace = get_allreduce_workspace(self.mapping)
+                    self.workspace, ipc_failed = get_allreduce_workspace(
+                        self.mapping)
+                    # Every custom all-reduce kernel reads the peers' IPC buffers. When
+                    # P2P was reported but the IPC handles could not be exchanged those
+                    # pointers are null, so NCCL is the only strategy left. The user
+                    # already got a warning from open_ipc_memory at that point.
+                    if ipc_failed:
+                        logger.debug(
+                            "CUDA IPC is unavailable, falling back from "
+                            f"{self.strategy.name} to NCCL allreduce.")
+                        self.strategy = AllReduceStrategy.NCCL
+                        self.workspace = None
+                if self.strategy == AllReduceStrategy.LOWPRECISION:
+                    allocate_low_presicion_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL if using AUTO or MNNVL strategy
             if self.strategy in (AllReduceStrategy.AUTO,
@@ -1004,7 +1045,7 @@ class MoEAllReduce(nn.Module):
         """
         super().__init__()
         self.mapping = mapping
-        self.workspace = get_allreduce_workspace(self.mapping)
+        self.workspace = _require_ipc_workspace(self.mapping, "MoEAllReduce")
         # Pls keep this value in sync with the kOneShotMaxToken in moeAllReduceFusionKernels.h
         self.max_token = 128
 
@@ -1267,7 +1308,8 @@ class MiniMaxAllReduceRMS(nn.Module):
     def __init__(self, mapping: Mapping):
         super().__init__()
         self.mapping = mapping
-        self.workspace = get_allreduce_workspace(self.mapping)
+        self.workspace = _require_ipc_workspace(self.mapping,
+                                                "MiniMaxAllReduceRMS")
 
     def forward(self, input: torch.Tensor, rms_weights: torch.Tensor,
                 eps: float):
