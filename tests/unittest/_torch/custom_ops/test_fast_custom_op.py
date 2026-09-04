@@ -26,6 +26,10 @@ import torch
 from tensorrt_llm._torch.custom_ops import fast_custom_op as fco_module
 from tensorrt_llm._torch.custom_ops.fast_custom_op import fast_custom_op
 
+# Registered in l0_cpu.yml, which CI runs with `-m cpu_only`; without this the
+# whole file is deselected and pytest exits 5.
+pytestmark = pytest.mark.cpu_only
+
 _COUNTER = itertools.count()
 
 
