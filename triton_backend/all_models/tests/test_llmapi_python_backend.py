@@ -25,6 +25,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import asyncio
+import json
 import sys
 import types
 from dataclasses import dataclass
@@ -45,6 +46,7 @@ from helpers import (convert_request_input_to_dict,
                      get_streaming_from_request)
 # Use PYTHONPATH=../llmapi/tensorrt_llm/1/
 from model import *
+from model import MultimodalContext, TritonPythonModel  # explicit: avoids F405
 
 
 @dataclass
