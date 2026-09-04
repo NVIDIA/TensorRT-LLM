@@ -1067,8 +1067,7 @@ class KimiK3MoERuntime(nn.Module):
         model_config: ModelConfig,
         cfg,
         layer_idx: int,
-        aux_stream: Optional[torch.cuda.Stream] = None,
-        moe_aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -1119,7 +1118,7 @@ class KimiK3MoERuntime(nn.Module):
             model_config=routed_moe_model_config,
             override_quant_config=routed_quant_config,
             layer_idx=layer_idx,
-            aux_stream_dict=moe_aux_stream_dict,
+            aux_stream_dict=aux_stream_dict,
             # Let CommunicationFactory select the best available strategy.
             communication_method=None,
             activation=SiTuActivation(
@@ -1210,9 +1209,9 @@ class KimiK3MoERuntime(nn.Module):
         )
         # Side stream (+ fork/join events) for overlapping shared-expert
         # compute with the routed chain. Only engaged when multi-stream is
-        # active (CUDA graphs on) and aux_stream is set; otherwise both run in
-        # order on the default stream.
-        self.aux_stream = aux_stream
+        # active (CUDA graphs on); otherwise both run in order on the default
+        # stream.
+        self.shared_expert_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
         self.routed_expert_down_proj = nn.Linear(
@@ -1409,7 +1408,7 @@ class KimiK3MoERuntime(nn.Module):
             lambda: self.shared_experts(identity),
             self.moe_main_event,
             self.moe_shared_event,
-            self.aux_stream,
+            self.shared_expert_stream,
             disable_on_compile=True,
         )
         if self._use_combined_all_reduce:
@@ -1439,6 +1438,7 @@ class KimiMLARuntime(nn.Module):
         cfg: "PretrainedConfig",
         layer_idx: int,
         model_config: ModelConfig,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
     ) -> None:
         super().__init__()
@@ -1483,6 +1483,7 @@ class KimiMLARuntime(nn.Module):
             use_output_gate=cfg.mla_use_output_gate,
             max_position_embeddings=max_positions,
             model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
             mapping_with_cp=mapping_with_cp,
         )
 
@@ -1509,8 +1510,7 @@ class KimiLinearDecoderLayer(nn.Module):
         model_config: ModelConfig,
         cfg,
         layer_idx: int,
-        aux_stream: Optional[torch.cuda.Stream] = None,
-        moe_aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -1528,7 +1528,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 layer_idx,
                 mapping=model_config.mapping,
                 allreduce_strategy=model_config.allreduce_strategy,
-                aux_stream=aux_stream,
+                aux_stream=aux_stream_dict[AuxStreamType.Attention],
                 model_config=model_config,
             )
         else:
@@ -1550,6 +1550,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 cfg,
                 layer_idx,
                 model_config=mla_model_config,
+                aux_stream_dict=aux_stream_dict,
                 # CP original stashed by _setup_helix_mappings; None outside helix.
                 mapping_with_cp=getattr(model_config, "_helix_mapping_with_cp", None),
             )
@@ -1560,9 +1561,7 @@ class KimiLinearDecoderLayer(nn.Module):
             and layer_idx % getattr(cfg, "moe_layer_freq", 1) == 0
         )
         if self.is_moe:
-            self.block_sparse_moe = KimiK3MoERuntime(
-                model_config, cfg, layer_idx, aux_stream, moe_aux_stream_dict
-            )
+            self.block_sparse_moe = KimiK3MoERuntime(model_config, cfg, layer_idx, aux_stream_dict)
         else:
             situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
             situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
@@ -1715,23 +1714,21 @@ class KimiLinearModel(DecoderModel):
         self._text_cfg = cfg
         dtype = torch.bfloat16
 
-        # Side streams shared across all layers. Keep MoE chunking separate
-        # from KDA/shared-expert overlap so both levels can run concurrently.
-        self.aux_stream = torch.cuda.Stream()
-        self.moe_aux_stream_dict = {
-            AuxStreamType.MoeChunkingOverlap: torch.cuda.Stream(),
+        # Attention and MoE phases are sequential, so their branch-overlap
+        # roles share one stream; MoE-internal overlap roles remain separate.
+        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
+        self.aux_stream_dict = {
+            AuxStreamType.Attention: aux_stream_list[0],
+            AuxStreamType.MoeShared: aux_stream_list[0],
+            AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
+            AuxStreamType.MoeBalancer: aux_stream_list[2],
+            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
         self.layers = nn.ModuleList(
             [
-                KimiLinearDecoderLayer(
-                    model_config,
-                    cfg,
-                    layer_idx,
-                    self.aux_stream,
-                    self.moe_aux_stream_dict,
-                )
+                KimiLinearDecoderLayer(model_config, cfg, layer_idx, self.aux_stream_dict)
                 for layer_idx in range(cfg.num_hidden_layers)
             ]
         )
