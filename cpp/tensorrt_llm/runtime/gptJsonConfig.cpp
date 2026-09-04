@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,11 +21,9 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmDataType.h"
-#include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
 #include "tensorrt_llm/runtime/jsonSerialization.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/runtimeDefaults.h"
-#include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -163,21 +161,6 @@ ModelConfig createModelConfig(Json const& json, bool engineVersionNone, SizeType
 
     auto const arch = engineVersionNone ? std::string("none") : config.at(archField).template get<std::string>();
     auto numLayers = config.at(numLayersField).template get<SizeType32>();
-
-    if (!engineVersionNone)
-    {
-        auto const speculativeDecodingModeOpt = parseJsonFieldOptional<SpeculativeDecodingMode::UnderlyingType>(
-            json.at("build_config"), "speculative_decoding_mode");
-
-        if (speculativeDecodingModeOpt.has_value()
-            && SpeculativeDecodingMode(speculativeDecodingModeOpt.value()).isEagle())
-        {
-            auto const& eagleConfig = json.at("pretrained_config").at("eagle_net_config");
-            auto const numEagleNetLayers = eagleConfig.at("num_hidden_layers").template get<SizeType32>();
-
-            numLayers += numEagleNetLayers;
-        }
-    }
 
     auto const numHeads
         = config.at(numHeadsField).template get<SizeType32>() / (tensorParallelism * contextParallelism);
@@ -325,8 +308,6 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
         = parseJsonFieldOr<SizeType32>(builderConfig, "max_prompt_embedding_table_size", 0);
     auto const computeContextLogits = parseJsonFieldOr(builderConfig, "gather_context_logits", false);
     auto const computeGenerationLogits = parseJsonFieldOr(builderConfig, "gather_generation_logits", false);
-    auto const speculativeDecodingModeOpt
-        = parseJsonFieldOptional<SpeculativeDecodingMode::UnderlyingType>(builderConfig, "speculative_decoding_mode");
     auto const kvCacheTypeStr = parseJsonFieldOr<std::string>(builderConfig, "kv_cache_type", "continuous");
     auto const kvCacheType = ModelConfig::KVCacheTypeFromString(kvCacheTypeStr);
     auto const useMrope = parseJsonFieldOr(builderConfig, "use_mrope", false);
@@ -347,9 +328,6 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
     modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);
     modelConfig.computeContextLogits(computeContextLogits);
     modelConfig.computeGenerationLogits(computeGenerationLogits);
-    modelConfig.setSpeculativeDecodingMode(speculativeDecodingModeOpt.has_value()
-            ? SpeculativeDecodingMode(speculativeDecodingModeOpt.value())
-            : SpeculativeDecodingMode::None());
     modelConfig.setKVCacheType(kvCacheType);
     modelConfig.setUseMrope(useMrope);
 }
@@ -561,75 +539,6 @@ GptJsonConfig parseJson(InputType&& input)
             {
                 modelConfig.setModelVariant(ModelConfig::ModelVariant::kGlm);
                 // kGlm is only for GLM-10B
-            }
-        }
-    }
-
-    // Speculative decoding module
-    if (!engineVersionNone)
-    {
-        if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
-        {
-            auto const& pretrainedConfig = json.at("pretrained_config");
-
-            // TODO: adjust param names
-            auto const maxNumPaths = parseJsonFieldOr(pretrainedConfig, "redrafter_num_beams", 0);
-            auto const maxDraftPathLen = parseJsonFieldOr(pretrainedConfig, "redrafter_draft_len_per_beam", 0);
-            auto const maxDraftLen = maxNumPaths * maxDraftPathLen;
-
-            auto explicitDraftTokensModule
-                = std::make_shared<ExplicitDraftTokensModule>(maxDraftPathLen, maxDraftLen, maxNumPaths);
-            modelConfig.setSpeculativeDecodingModule(explicitDraftTokensModule);
-            modelConfig.setUseShapeInference(false);
-        }
-        else if (modelConfig.getSpeculativeDecodingMode().isMedusa())
-        {
-            auto const& pretrainedConfig = json.at("pretrained_config");
-            auto const maxDraftLen = parseJsonFieldOr(pretrainedConfig, "max_draft_len", 0);
-            auto const medusaHeads = parseJsonFieldOptional<SizeType32>(pretrainedConfig, "num_medusa_heads");
-            TLLM_CHECK_WITH_INFO(medusaHeads.has_value() && maxDraftLen > 0,
-                "Both num_medusa_heads and max_draft_len have to be provided for Medusa model");
-
-            auto speculativeDecodingModule
-                = std::make_shared<SpeculativeDecodingModule>(medusaHeads.value(), maxDraftLen, maxDraftLen);
-            modelConfig.setSpeculativeDecodingModule(speculativeDecodingModule);
-        }
-        else
-        {
-            auto const maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
-            if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
-            {
-                TLLM_CHECK_WITH_INFO(
-                    maxDraftLen > 0, "max_draft_len has to be larger than 0 for Lookahead decoding model");
-                auto lookaheadDecodingModule
-                    = std::make_shared<SpeculativeDecodingModule>(maxDraftLen, maxDraftLen, maxDraftLen);
-                modelConfig.setSpeculativeDecodingModule(lookaheadDecodingModule);
-            }
-            else if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
-            {
-                TLLM_CHECK_WITH_INFO(
-                    maxDraftLen > 0, "max_draft_len has to be larger than 0 for decoding with external draft tokens");
-                auto speculativeDecodingModule
-                    = std::make_shared<SpeculativeDecodingModule>(maxDraftLen, maxDraftLen, 1);
-                modelConfig.setSpeculativeDecodingModule(speculativeDecodingModule);
-            }
-            else if (modelConfig.getSpeculativeDecodingMode().isEagle())
-            {
-                auto const& pretrainedConfig = json.at("pretrained_config");
-
-                auto const numEagleLayers = parseJsonFieldOr(pretrainedConfig, "num_eagle_layers", 0);
-                auto const maxNonLeafNodesPerLayer
-                    = pretrainedConfig.at("max_non_leaves_per_layer").template get<SizeType32>();
-
-                TLLM_CHECK_WITH_INFO(maxDraftLen > 0, "max_draft_len has to be larger than 0 for eagle decoding");
-                TLLM_CHECK_WITH_INFO(numEagleLayers > 0, "num_eagle_layers has to be larger than 0 for eagle decoding");
-                TLLM_CHECK_WITH_INFO(
-                    maxNonLeafNodesPerLayer > 0, "max_non_leaves_per_layer has to be larger than 0 for eagle decoding");
-                // Number of paths is maxDecodingTokens = maxDecodingDraftTokens + 1 to account for very flat
-                // trees with depth 1.
-                auto eagleModule
-                    = std::make_shared<SpeculativeDecodingModule>(numEagleLayers, maxDraftLen, maxDraftLen + 1);
-                modelConfig.setSpeculativeDecodingModule(eagleModule);
             }
         }
     }

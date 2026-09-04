@@ -639,15 +639,6 @@ class CUDAGraphRunner:
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
-        def _setup_spec_decoding_and_forward(key: KeyType, forward_fn: Callable,
-                                             capture_inputs: Dict[str, Any]):
-            is_first_draft = key.is_first_draft
-            needs_kv_cache_recompute = True if enable_spec_decode and self.config.spec_config.spec_dec_mode.needs_kv_cache_recompute(
-            ) else False
-            if is_first_draft and self.config.is_draft_model and needs_kv_cache_recompute:
-                capture_inputs['attn_metadata'].use_spec_decoding = True
-            return forward_fn(capture_inputs)
-
         output = None
         with with_multi_stream(True), piecewise_cuda_graph(False):
             # We have to do a warmup run to initialize PyTorch's internal
@@ -656,8 +647,7 @@ class CUDAGraphRunner:
             # This also lets us initialize states in the attn_metadata and
             # resize the shared attention workspace before any graph is captured.
             for _ in range(self.WARMUP_STEPS):
-                output = _setup_spec_decoding_and_forward(
-                    key, forward_fn, capture_inputs)
+                output = forward_fn(capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
                 _restore_spec_decode_capture_state(attn_metadata,
@@ -671,8 +661,7 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
-                output = _setup_spec_decoding_and_forward(
-                    key, forward_fn, capture_inputs)
+                output = forward_fn(capture_inputs)
             if postprocess_fn is not None:
                 postprocess_fn(capture_inputs)
             _restore_spec_decode_capture_state(attn_metadata,

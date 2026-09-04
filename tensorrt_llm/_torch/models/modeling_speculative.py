@@ -1506,12 +1506,6 @@ def _build_mtp_one_model_draft(model_config, draft_config, lm_head, model):
                           lm_head, model)
 
 
-@register_draft_model(SpeculativeDecodingMode.MTP_EAGLE)
-def _build_mtp_eagle_draft(model_config, draft_config, lm_head, model):
-    """Build the two-model MTP-Eagle drafter."""
-    return MTPDraftModelForCausalLM(model_config)
-
-
 @register_draft_model(SpeculativeDecodingMode.PARD)
 def _build_pard_draft(model_config, draft_config, lm_head, model):
     """Build the PARD drafter."""

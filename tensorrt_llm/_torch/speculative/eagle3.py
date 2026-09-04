@@ -1479,5 +1479,3 @@ class MTPEagleWorker(Eagle3OneModelWorker):
             mapping=mapping,
             model_config=model_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
-        # Preserved for callers/tests that still expect this attribute.
-        self.is_thop = False

@@ -2278,16 +2278,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         description=
         "Static tree structure for draft token generation. Each sublist represents a path in the tree. Mutually exclusive with use_dynamic_tree."
     )
-    greedy_sampling: Optional[bool] = Field(
-        default=True,
-        description=
-        "Whether to use greedy sampling (Top-1 with token equality acceptance) or typical acceptance with multinomial sampling."
-    )
-    posterior_threshold: Optional[float] = Field(
-        default=None,
-        description=
-        "Minimum token probability threshold for typical acceptance. Corresponds to epsilon in https://arxiv.org/pdf/2401.10774."
-    )
     use_dynamic_tree: Optional[bool] = Field(
         default=False,
         description=
@@ -2310,9 +2300,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_one_model: Optional[bool] = Field(
         default=True,
         description=
-        "Always uses the one-model implementation (draft as submodule). "
-        "Setting False is ignored and falls back to True; the two-model path "
-        "is deprecated and will be removed in a future release.")
+        "Retained for backward compatibility; the one-model implementation "
+        "(draft as submodule) is the only supported path. Setting False is "
+        "rejected: the two-model path has been removed.")
     eagle3_layers_to_capture: Optional[Set[int]] = Field(
         default=None,
         description=
@@ -2343,12 +2333,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
         if not self.eagle3_one_model:
-            logger.warning(
-                "Eagle3 2-model (eagle3_one_model=False) is deprecated and "
-                "ignored; falling back to eagle3_one_model=True. "
-                "2-model will be removed in a future release.")
-            self.eagle3_one_model = True
-
+            raise ValueError(
+                "eagle3_one_model=False is no longer supported: the two-model "
+                "Eagle3 path has been removed. Omit the field or set it to "
+                "True.")
         self.num_eagle_layers = self.max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
@@ -2449,9 +2437,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self.eagle3_one_model:
-            return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
-        return TorchSpeculativeDecodingMode.EAGLE3
+        return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
 
     @functools.cached_property
     def num_capture_layers(self) -> int:
@@ -2706,7 +2692,6 @@ class SADecodingConfig(DecodingBaseConfig):
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Draft_Target"] = Field(default="Draft_Target")
-    _draft_target_one_model: bool = PrivateAttr(True)
 
     @model_validator(mode="after")
     def validate_draft_target_config(self):
@@ -2725,9 +2710,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self._draft_target_one_model:
-            return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
-        return TorchSpeculativeDecodingMode.DRAFT_TARGET
+        return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -2755,10 +2738,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
     mtp_eagle_one_model: bool = Field(
         default=True,
         description=
-        "When using EAGLE-style MTP, always uses the one-model implementation "
-        "(drafter as submodule). Setting False is ignored and falls back to "
-        "True; the two-model path is deprecated and will be removed in a "
-        "future release.")
+        "Retained for backward compatibility; when using EAGLE-style MTP the "
+        "one-model implementation (drafter as submodule) is the only supported "
+        "path. Setting False is rejected: the two-model path has been "
+        "removed.")
 
     use_dynamic_tree: bool = Field(
         default=False,
@@ -2826,6 +2809,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
             if self.max_draft_len <= 0:
                 raise ValueError("max_draft_len must be > 0 for MTP")
 
+        if not self.mtp_eagle_one_model:
+            raise ValueError(
+                "mtp_eagle_one_model=False is no longer supported: the "
+                "two-model MTP path has been removed. Omit the field or set "
+                "it to True.")
+
         # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
         # dynamic_tree_max_topK alone does not turn it on.
         if not self.use_dynamic_tree and self.dynamic_tree_max_topK is not None:
@@ -2860,16 +2849,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = self.max_draft_len  # linear chain
         return self
 
-    @model_validator(mode="after")
-    def log_two_model_deprecation_warning(self):
-        if not self.mtp_eagle_one_model:
-            logger.warning(
-                "2-model style MTP (mtp_eagle_one_model=False) is deprecated "
-                "and ignored; falling back to mtp_eagle_one_model=True. "
-                "2-model will be removed in a future release.")
-            self.mtp_eagle_one_model = True
-        return self
-
     def supports_backend(self, backend: str) -> bool:
         return backend in ("pytorch", "_autodeploy")
 
@@ -2883,7 +2862,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         # both gated on self.is_mtp_eagle), so no capture buffer is needed
         # and we should skip allocation to avoid disabling post-MLP/MoE
         # fusion via the layer-capture hook.
-        return 1 if self.spec_dec_mode.is_mtp_eagle() else 0
+        return 0
 
     @property
     def spec_dec_mode(self):
@@ -2893,10 +2872,8 @@ class MTPDecodingConfig(DecodingBaseConfig):
         # num_nextn_predict_layers is set from the model's pretrained config by
         # update_spec_config_from_model_config. Treat None (before model load) as 1.
         n = self.num_nextn_predict_layers if self.num_nextn_predict_layers is not None else 1
-        if n == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
+        if n == 1 and not self.use_mtp_vanilla:
             return TorchSpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
-        elif n == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
-            return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
 
 
