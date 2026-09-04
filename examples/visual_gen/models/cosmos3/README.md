@@ -77,19 +77,19 @@ tuned on; they give noticeably cleaner output than a one-line summary.
 # T2V: text-to-video
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/t2v.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # I2V/TI2V: image-conditioned video (vision_path is read from the prompt file;
 # local path, file://, http(s):// URL, or data: URI are all accepted)
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/i2v.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # I2V with an explicit conditioning image (overrides the prompt file)
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/i2v.json \
     --image_path https://example.com/frame.jpg \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # V2V: video-conditioned video (continues the first frames of --video_path).
 # Best results when the prompt describes the input video — e.g. continue a
@@ -99,17 +99,17 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
 python cosmos3.py --model /path/to/Cosmos3-Nano \
     --prompt_file prompts/v2v.json \
     --video_path /path/to/Cosmos3-Nano/assets/example_i2v_output.mp4 \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # T2AV: text-to-video with synchronized audio
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/t2av.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # T2I: text-to-image
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/t2i.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \
     --output_path output.png
 
 # T2I, distilled 4-step checkpoint (use the T2I config so warmup runs the
@@ -134,7 +134,7 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt "The same scene rendered as a photorealistic video, sharp detail." \
     --video_path /path/to/reference.mp4 \
     --extra_params '{"edge": true}' \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # Transfer with a fully synthetic control (no assets): generate an edge-map
 # video of a bouncing ball, then let the prompt paint it photoreal.
@@ -146,7 +146,7 @@ python generate_bouncing_ball_control.py --out_dir ./ball_control
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt "A photorealistic beach ball with colorful panels bouncing between the walls of an enclosed room, studio lighting." \
     --extra_params '{"edge": "./ball_control/control.mp4"}' \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # Multi-hint transfer: edge pins the layout, blur pins the palette/lighting.
 # Hints must describe the same underlying video as each other and the prompt.
@@ -154,7 +154,7 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt "The same scene, ultra sharp, professional photography." \
     --video_path /path/to/reference.mp4 \
     --extra_params '{"edge": true, "blur": true}' \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # Cosmos3-Edge image-to-video (480p-native defaults: 832x480 x 121 frames).
 # Reproduces the model-card sample: the checkpoint ships a structured prompt and
@@ -169,12 +169,12 @@ python cosmos3.py --model nvidia/Cosmos3-Edge \
 # Inline prompt (--prompt or a JSON file path)
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt "A cute puppy playing with a ball in a park" \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # Action — policy (first frame + instruction -> predicted action + rollout video)
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/action_policy.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \
     --action_mode policy \
     --domain_name bridge_orig_lerobot \
     --raw_action_dim 10 \
@@ -186,7 +186,7 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
 # width (9 for av) and a mismatch is rejected.
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/action_forward_dynamics.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \
     --action_mode forward_dynamics \
     --domain_name av \
     --action_json action_trajectory.json \
@@ -196,7 +196,7 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/action_inverse_dynamics.json \
     --video_path /path/to/observation_clip.mp4 \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \
     --action_mode inverse_dynamics \
     --domain_name bridge_orig_lerobot \
     --raw_action_dim 10 \
