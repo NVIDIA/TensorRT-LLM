@@ -1082,6 +1082,63 @@ def test_decode_fmha_runs_the_phase_its_span_describes():
     assert dispatched == [(2, 2)]
 
 
+@pytest.mark.parametrize(
+    "num_contexts, num_generations, expected",
+    [
+        (1, 0, "MsaPrefillFmha"),
+        (0, 1, "MsaDecodeFmha"),
+        (1, 1, "CombinedFmha"),
+    ],
+)
+def test_the_pair_takes_one_phase_each_and_a_mixed_step_together(
+    num_contexts, num_generations, expected
+):
+    """Neither library may claim a whole step, only its own phase.
+
+    FmhaManager asks each library about the whole step before asking about a
+    phase, and a library that answered yes to the first would then be handed
+    the phase it refuses. Claiming one phase each is what leaves a mixed step
+    to CombinedFmha, which is the only way its generation rows reach the
+    decode kernels.
+    """
+    from tensorrt_llm._torch.attention_backend.fmha.manager import FmhaManager
+    from tensorrt_llm._torch.attention_backend.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
+    )
+
+    attention, libraries = _phase_libraries()
+    # CombinedFmha's PhasedFmha.__init__ reads the layer's head geometry.
+    attention.is_mla_enable = False
+    attention.kv_lora_rank = None
+    attention.v_head_dim = None
+    attention.head_dim = 128
+    manager = FmhaManager.__new__(FmhaManager)
+    manager.fmha_libs = libraries
+
+    q = torch.empty((num_contexts + num_generations, 4))
+    metadata = SimpleNamespace(
+        num_contexts=num_contexts,
+        num_generations=num_generations,
+        num_ctx_tokens=num_contexts,
+        use_spec_decoding=False,
+    )
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.mixed)
+
+    # The whole-step query, which the manager asks first.
+    assert not any(
+        library.is_supported(q, None, None, metadata, forward_args) for library in libraries
+    )
+
+    selected = manager._select_uncached(attention, q, None, None, metadata, forward_args)
+
+    assert type(selected).__name__ == expected
+    if expected == "CombinedFmha":
+        decode, prefill = libraries
+        assert selected._get_context_impl() is prefill
+        assert selected._get_generation_impl() is decode
+
+
 def _mixed_batch_sparse_gqa_case(*, page_size, head_dim, num_kv_heads, group, topk, seed):
     """A one-context-plus-three-decode batch for run_msa_prefill_gqa.
 
