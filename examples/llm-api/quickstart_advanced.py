@@ -212,7 +212,6 @@ def add_llm_args(parser):
     parser.add_argument('--use_one_model',
                         default=True,
                         action=argparse.BooleanOptionalAction)
-    parser.add_argument('--eagle_choices', type=str, default=None)
     parser.add_argument('--use_dynamic_tree',
                         default=False,
                         action='store_true')
@@ -320,7 +319,6 @@ def setup_llm(args, **kwargs):
             max_draft_len=args.spec_decode_max_draft_len,
             speculative_model=args.draft_model_dir,
             eagle3_one_model=args.use_one_model,
-            eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
             eagle3_model_arch=args.eagle3_model_arch,

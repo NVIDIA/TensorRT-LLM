@@ -11,8 +11,7 @@ from tensorrt_llm.logger import logger
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
-from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
-                                           ResourceManagerType)
+from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.sampler import Sampler, SampleState, SampleStateTensors
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
@@ -364,19 +363,6 @@ class ModelDrafter(Drafter):
             if request.context_remaining_length == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
-    def update_cur_draft_layer_idx(
-            self,
-            cur_draft_layer_idx: int,
-            resource_manager: Optional[ResourceManager] = None):
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER)
-        if spec_resource_manager is None:
-            return None
-
-        spec_tree_manager = spec_resource_manager.spec_tree_manager
-        if spec_tree_manager is not None:
-            spec_tree_manager.cur_draft_layer_idx = cur_draft_layer_idx
-
     def update_requests(
             self,
             sample_state: SampleState,
@@ -623,12 +609,8 @@ class ModelDrafter(Drafter):
         draft_batch: ScheduledRequests,
         resource_manager: ResourceManager,
         previous_draft_state: Optional[SampleState],
-        cur_draft_layer_idx: int,
         num_accepted_tokens_device: Optional[torch.Tensor] = None
     ) -> Tuple[Any, Optional[SampleState]]:
-        self.update_cur_draft_layer_idx(
-            cur_draft_layer_idx, resource_manager
-        )  # Update the current draft layer index in the resource manager.
         """Forward pass through the draft model."""
         outputs = self.forward_draft_model(
             draft_batch,
@@ -727,7 +709,7 @@ class ModelDrafter(Drafter):
                 break
 
             _, sample_state = self._execute_draft_iteration(
-                draft_batch, resource_manager, previous_draft_state, i + 1)
+                draft_batch, resource_manager, previous_draft_state)
 
             # Update target inputs if provided (for overlap mode)
             if target_inputs is not None and num_draft_reqs is not None:
@@ -787,9 +769,6 @@ class ModelDrafter(Drafter):
             scheduled_batch, target_inputs, num_accepted_tokens_device)
 
         # Initial forward pass
-        self.update_cur_draft_layer_idx(
-            0, resource_manager
-        )  # Update the current draft layer index in the resource manager.
         outputs = self.forward_draft_model(
             draft_batch,
             resource_manager,
@@ -865,9 +844,6 @@ class ModelDrafter(Drafter):
             if draft_batch is None:
                 return
 
-            self.update_cur_draft_layer_idx(
-                0, resource_manager
-            )  # Update the current draft layer index in the resource manager.
             # Initial forward pass.
             outputs = self.forward_draft_model(draft_batch,
                                                resource_manager,

@@ -56,7 +56,7 @@ Dynamic tree mode enables tree-structured draft generation for EAGLE 3, where th
 
 To enable dynamic tree mode, set `use_dynamic_tree=True` on the `Eagle3DecodingConfig` and provide the following parameters:
 
-* `use_dynamic_tree` (`bool`): Enables dynamic tree draft generation. Mutually exclusive with `eagle_choices` (static tree).
+* `use_dynamic_tree` (`bool`): Enables dynamic tree draft generation.
 * `dynamic_tree_max_topK` (`int`): Maximum number of tokens to expand per node at each draft layer.
 * `max_total_draft_tokens` (`int`, optional): Total draft token budget for the tree. Must satisfy `max_draft_len <= max_total_draft_tokens <= dynamic_tree_max_topK * max_draft_len`. Defaults to `dynamic_tree_max_topK * max_draft_len` if not set.
 

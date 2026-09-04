@@ -1108,10 +1108,8 @@ class MTPEagleDynamicTreeResourceManager(BaseResourceManager):
         self.max_num_requests = max_num_requests
         self.spec_tree_manager = SpecTreeManager(
             max_num_requests=max_num_requests,
-            use_dynamic_tree=True,
             max_draft_len=config.max_draft_len,
             max_total_draft_tokens=config.tokens_per_gen_step - 1,
-            eagle_choices=None,
             dynamic_tree_max_topK=config.dynamic_tree_max_topK,
         )
         # MTP hidden-state slot pools (needed by MTPEagleWorker drafter inputs).

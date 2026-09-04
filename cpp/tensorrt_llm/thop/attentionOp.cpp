@@ -1336,7 +1336,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mIsSpecDecodingEnabled = is_spec_decoding_enabled;
     op->mUseSpecDecoding = use_spec_decoding;
     op->mIsSpecDecTree = is_spec_dec_tree;
-    // Include static tree length in the AttentionOp cache key.
+    // Include the tree length in the AttentionOp cache key.
     if (spec_decoding_target_max_draft_tokens.has_value() && op->mSpecDecodingTargetMaxGenLen == 0)
     {
         op->mSpecDecodingTargetMaxGenLen = static_cast<int32_t>(spec_decoding_target_max_draft_tokens.value()) + 1;

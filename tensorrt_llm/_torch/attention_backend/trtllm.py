@@ -1217,7 +1217,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Args:
             batch_size: int, the number of requests in the batch.
             is_spec_decoding_enabled: bool, whether the attention need to be spec_decoding mode, which is determined by attention_need_spec_dec_mode() function.
-            is_spec_dec_tree: bool, whether the spec-dec mode is a tree, i.e., static tree or dynamic tree. For linear-tree, it is always False.
+            is_spec_dec_tree: bool, whether the spec-dec mode is a tree, i.e., dynamic tree. For linear-tree, it is always False.
             is_spec_dec_dynamic_tree: bool, whether using dynamic tree.
             max_draft_len: int, the number of the draft layers.
             max_total_draft_tokens: int, the number of all nodes in the tree (except the root).
@@ -1243,7 +1243,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # on the C++ ``layer_idx == 0`` fallback to rebuild the target mask:
         # the dynamic draft loop clears that mask before the next target step.
         self.force_prepare_spec_dec_tree_mask = is_spec_dec_dynamic_tree
-        # Forward static tree length to FMHA kernel selection.
+        # Forward the tree length to FMHA kernel selection.
         self.max_total_draft_tokens = max_total_draft_tokens
 
         # Parameters can be fixed and not changed during runtime if the
@@ -1255,28 +1255,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # These buffers are accessed more like removing input padding,
             # rather than using max_total_draft_tokens + 1 as the offset between different requests.
             if is_spec_dec_tree and self.spec_decoding_position_offsets is None:
-                if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
-                    # Dynamic tree: use _internal_buf_dim which may be larger
-                    # than max_total_draft_tokens+1 to accommodate K*max_draft_len
-                    buf_dim = spec_tree_manager._internal_buf_dim
-                    # Dynamic tree: 1D layout for flexible view() in drafting loop
-                    self.spec_decoding_position_offsets = torch.empty(
-                        (self.max_num_requests * buf_dim, ),
-                        dtype=torch.int,
-                        device='cuda',
-                    )
-                else:
-                    # Static tree: keep 2D layout
-                    self.spec_decoding_position_offsets = torch.empty(
-                        [self.max_num_requests, max_total_draft_tokens + 1],
-                        dtype=torch.int,
-                        device='cuda',
-                    )
+                # Dynamic tree: use _internal_buf_dim which may be larger
+                # than max_total_draft_tokens+1 to accommodate K*max_draft_len.
+                # 1D layout for flexible view() in the drafting loop.
+                buf_dim = spec_tree_manager._internal_buf_dim
+                self.spec_decoding_position_offsets = torch.empty(
+                    (self.max_num_requests * buf_dim, ),
+                    dtype=torch.int,
+                    device='cuda',
+                )
             if is_spec_dec_tree and self.spec_decoding_packed_mask is None:
-                if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
-                    buf_dim = spec_tree_manager._internal_buf_dim
-                else:
-                    buf_dim = max_total_draft_tokens + 1
+                buf_dim = spec_tree_manager._internal_buf_dim
                 # Zero-init: dynamic-tree dst has inner dim
                 # ceil(buf_dim/32) but only ceil((max_total_draft_tokens+1)/32)
                 # is written each step. Unwritten cols would otherwise feed the
@@ -1348,26 +1337,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
                 cpp_query_len = n_dt
 
-            # Case 2: static tree (target model only)
-            elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
-                assert (spec_metadata.spec_dec_mode.is_eagle3()
-                        or spec_metadata.spec_dec_mode.is_eagle3_one_model()
-                        ), "Tree decoding is only supported for Eagle3 now"
-                assert not getattr(spec_metadata, 'is_draft_model', False), (
-                    "Static tree spec-dec params are only prepared for the target model"
-                )
-
-                # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
-                self.spec_decoding_position_offsets[:batch_size, :].copy_(
-                    spec_tree_manager.spec_dec_position_offsets[0, :],
-                    non_blocking=True)
-                self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
-                    spec_tree_manager.spec_dec_packed_mask[0, :, :],
-                    non_blocking=True)
-                self.spec_decoding_generation_lengths[:batch_size].fill_(
-                    spec_tree_manager.max_total_draft_tokens + 1)
-
-            # Case 3: linear tree
+            # Case 2: linear tree
             else:
                 # Currently dynamic draft length is only supported for linear tree
                 # Dynamic draft length needs position offsets and packed mask to be shaped for each runtime draft length.
