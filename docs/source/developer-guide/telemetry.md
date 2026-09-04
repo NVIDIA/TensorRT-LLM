@@ -276,7 +276,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.enable_global_pool` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.end_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.global_pool_size` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
-| `speculative_config.greedy_sampling` | `Optional[bool]` | `value` |  |  |
 | `speculative_config.is_keep_all` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.is_public_pool` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.is_use_oldest` | `<class 'bool'>` | `value` |  |  |
@@ -294,7 +293,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.mtp_eagle_one_model` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.num_eagle_layers` | `Optional[int]` | `value` |  |  |
 | `speculative_config.num_nextn_predict_layers` | `Optional[int]` | `value` |  |  |
-| `speculative_config.posterior_threshold` | `Optional[float]` | `value` |  |  |
 | `speculative_config.relaxed_delta` | `<class 'float'>` | `value` |  |  |
 | `speculative_config.relaxed_topk` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.sa_config.enable_global_pool` | `<class 'bool'>` | `value` |  |  |
