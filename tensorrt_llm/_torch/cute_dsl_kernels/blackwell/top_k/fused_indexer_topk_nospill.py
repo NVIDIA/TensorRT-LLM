@@ -93,7 +93,9 @@ RBT_MAX = (
 NDENSE_MAX = 256  # tiles whose keys are stored densely; later tiles are safe-line filtered
 CHUNK = 24  # filtered tiles between two consumer rendezvous (multiple of NACC)
 LP = 96  # safe-line refresh period in tiles after the dense prefix (multiple of NACC)
-TIECAP = 256
+TIECAP = (
+    2048  # tie-class members the fp32 refinement can rescore (dead 8 KB buffers hold the lists)
+)
 # GMEM workspace per row (int32 words) for the cluster-free row split: NREP coarse
 # histogram replicas, 32 fine bins and 8 counters on private 128 B lines, tie list
 
@@ -1187,9 +1189,10 @@ def _dsv4_kernel(
     if cutlass.const_expr(CS > 1 and GM == 0):
         cnt9 = cute.arch.map_dsmem_ptr(sCtl.iterator + 9, 0)
         cnt10 = cute.arch.map_dsmem_ptr(sCtl.iterator + 10, 0)
+    sTie = sHist
     tie_base = I32(0)
     if cutlass.const_expr(CS > 1 and GM == 0):
-        tie_base = I32(cute.arch.map_dsmem_ptr(sPart.iterator, 0).toint())
+        tie_base = I32(cute.arch.map_dsmem_ptr(sHist.iterator, 0).toint())
     cnt9_i = wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_ABV) * 4)
     cnt10_i = wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_TIE) * 4)
     ncand = sCtl[11]
@@ -1300,7 +1303,7 @@ def _dsv4_kernel(
                             elif cutlass.const_expr(CS > 1):
                                 _st_dsmem_u32(tie_base + p * 4, t)
                             else:
-                                sPart[p] = t
+                                sTie[p] = t
     last = crk == 0
     if cutlass.const_expr(GM == 1):
         # the last CTA to finish the boundary pass owns the tail: it takes the tie list and
@@ -1314,17 +1317,19 @@ def _dsv4_kernel(
             cute.arch.fence_acq_rel_gpu()
         cute.arch.barrier()
         last = sCtl[17] == I32(CS - 1)
+        ntg = I32(0)
         if last:
+            ntg = _ld_relaxed_gpu(cnt10_i)
+            if ntg > TIECAP:
+                ntg = I32(TIECAP)
             if tidx == 0:
                 sCtl[10] = _ld_relaxed_gpu(cnt10_i)
             if cutlass.const_expr(REFINE == 1):
-                if tidx < TIECAP:
-                    sPart[tidx] = _ld_relaxed_gpu(
-                        wrow_i + cutlass.Int64((WS_TIE_OF(NREP) + tidx) * 4)
-                    )
+                for i in cutlass.range(tidx, ntg, NTHREADS, unroll=1):
+                    sTie[i] = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_TIE_OF(NREP) + i) * 4))
         cute.arch.barrier()
         if last:
-            for i in cutlass.range(tidx, WS_ROWW_OF(NREP), NTHREADS, unroll=1):
+            for i in cutlass.range(tidx, WS_TIE_OF(NREP) + ntg, NTHREADS, unroll=1):
                 gRow[i] = I32(0)
     elif cutlass.const_expr(CS > 1):
         cute.arch.cluster_arrive()
@@ -1337,7 +1342,8 @@ def _dsv4_kernel(
     # fp16 value can differ from an fp32 top-K. The recorded tie members are
     # rescored through the scan's own TMA -> MMA -> epilogue path: a virtual
     # tile stages the 32-token pages of four members, so the fp32 score is the
-    # one that produced the key. ntie <= r2 or ntie > TIECAP keeps the fill.
+    # one that produced the key. ntie <= r2 (all selected anyway) or a class beyond
+    # TIECAP members keeps the fp16 fill.
     if cutlass.const_expr(REFINE == 1):
         ntie = sCtl[10]
         nvt = I32(0)
@@ -1345,7 +1351,7 @@ def _dsv4_kernel(
             if (ntie > r2) and (ntie <= TIECAP):
                 nvt = (ntie + 3) // 4
         sTS = cute.make_tensor(cute.recast_ptr(sCand.iterator, dtype=F32), cute.make_layout(CAP))
-        sPG = cute.make_tensor(sCand.iterator + TIECAP, cute.make_layout(TIECAP))
+        sPG = cute.make_tensor(sTot.iterator, cute.make_layout(TIECAP))
         if warp_idx >= 12 and warp_idx < M_WARP:
             lt = tidx - C_THREADS
             pgt = lt // PPP
@@ -1356,7 +1362,7 @@ def _dsv4_kernel(
                 tm = ti
                 if tm >= ntie:
                     tm = ntie - 1
-                sPG[ti] = gBT[sPart[tm] >> 5]
+                sPG[ti] = gBT[sTie[tm] >> 5]
             cute.arch.barrier(barrier_id=2, number_of_threads=P_THREADS)
             for v in cutlass.range(nvt, unroll=1):
                 j = ntl + v
@@ -1494,7 +1500,7 @@ def _dsv4_kernel(
                 sc = q2[0] + q2[1]
                 ti = (j - ntl) * 4 + lane // 32
                 if ti < ntie:
-                    if (lane % 32) == (sPart[ti] & 31):
+                    if (lane % 32) == (sTie[ti] & 31):
                         sTS[ti] = sc
         cute.arch.barrier()
         if warp_idx == 0:
@@ -1519,7 +1525,7 @@ def _dsv4_kernel(
                     if (sj > si) or ((sj == si) and (tj < ti)):
                         rk = rk + 1
                 if rk < r2:
-                    gI[base2 + rk] = sPart[ti]
+                    gI[base2 + rk] = sTie[ti]
                     gV[base2 + rk] = tv
 
 
@@ -1834,7 +1840,9 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
     # fp32-exact boundary: the K-th fp16 tie class is rescored through the MMA
     # path (on by default); TRTLLM_FUSED_TOPK_FP32_EXACT=0 keeps the fp16 fill
     REFINE = 0 if os.environ.get("TRTLLM_FUSED_TOPK_FP32_EXACT", "1") == "0" else 1
-    assert KTOP <= NBINS and TIECAP <= NBINS // 8, "winner staging reuses the histogram buffers"
+    assert KTOP <= NBINS and TIECAP <= NBINS and TIECAP <= CAP, (
+        "tie lists reuse the histogram and candidate buffers"
+    )
     key = (B, NCOMP, KTOP, MAXB, NPAGES, STAGES, CS, NLOC, NDENSE, SCAP, REFINE, RBT, GM, NREP)
     kv_ptr = make_ptr(U8, kv_cache.data_ptr(), GMEM, assumed_align=16)
     q_ptr = make_ptr(U8, q_fp4.data_ptr(), GMEM, assumed_align=16)

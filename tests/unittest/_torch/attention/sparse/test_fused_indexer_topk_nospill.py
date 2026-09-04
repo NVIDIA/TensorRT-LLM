@@ -485,7 +485,7 @@ def test_fused_indexer_topk_nospill_fp32_boundary(batch, n_comp, k_top, monkeypa
     _check_fp32_boundary(inp, indices, k_top)
 
 
-def _check_fp32_boundary(inp, indices, k_top, tie_cap=256):
+def _check_fp32_boundary(inp, indices, k_top, tie_cap=2048):
     scores = _reference_indices(inp, k_top)
     for i in range(indices.shape[0]):
         s = scores[i]
