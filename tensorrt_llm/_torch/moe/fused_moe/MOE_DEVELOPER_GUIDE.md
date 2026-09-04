@@ -363,6 +363,8 @@ exposes the Rubin helpers) and carries three constraints the other SMs do not:
   once from the loaded weights, so they cannot follow expert migration
   (`EPLB_UNSUPPORTED`) or parameter rebinding. DWDP is not an error: with
   `uses_locality_domain` true, `_should_enable_dwdp` simply returns False.
+  Both locality-domain kernels also fuse SwiGLU, so `plan_moe` declines any other
+  activation: an NVFP4 Relu2 layer runs unpartitioned rather than being rejected.
 
 Cutlass covers `W4A16 NVFP4` on a wider SM range than plain `NVFP4` because the
 two run different kernels: `W4A16NVFP4CutlassFusedMoEMethod` dequantizes the FP4
