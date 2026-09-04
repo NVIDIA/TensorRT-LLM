@@ -494,6 +494,10 @@ class TritonPythonModel:
 
         # Unique request id used to identify each triton request
         triton_req_id = str(randint(0, sys.maxsize))
+        # Absence from `req_id_to_request_data` only means "cancelled" once the
+        # request has been added to it. Before that it just means preprocessing
+        # has not finished, and an error still has to be reported to the client.
+        request_registered = False
 
         try:
             from tensorrt_llm import SamplingParams
@@ -523,6 +527,7 @@ class TritonPythonModel:
                     # TODO: [JIRA-4496] Add all batched request ids to the set
                     self.triton_user_id_to_req_ids[triton_user_id].add(
                         triton_req_id)
+                request_registered = True
 
             async for request_output in response_iterator:
                 # Send each response if streaming.
@@ -575,7 +580,7 @@ class TritonPythonModel:
             # already sent a COMPLETE_FINAL on this response_sender; they
             # remove the entry from req_id_to_request_data as the signal.
             with self.lock:
-                was_cancelled = (triton_req_id
+                was_cancelled = (request_registered and triton_req_id
                                  not in self.req_id_to_request_data)
             if not was_cancelled:
                 error = pb_utils.TritonError(f"Error generating request: {e}")

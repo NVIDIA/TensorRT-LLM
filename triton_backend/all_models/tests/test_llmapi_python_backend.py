@@ -27,6 +27,7 @@
 import asyncio
 import json
 import sys
+import threading
 import types
 from dataclasses import dataclass
 from typing import Dict, List, Union
@@ -561,3 +562,91 @@ def test_build_multimodal_prompt_falls_back_on_older_trtllm():
     }
     assert "mm_item_order" not in prompt
     assert captured == {"placeholder_argcount": 3, "used_sync_template": True}
+
+
+def _bare_model_for_execute():
+    """A model with only the state `_execute_single_request` touches."""
+    model = TritonPythonModel.__new__(TritonPythonModel)
+    model.logger = MagicMock()
+    model.lock = threading.Lock()
+    model.req_id_to_request_data = {}
+    model.triton_user_id_to_req_ids = {}
+    model._ongoing_request_count = 0
+    model.decoupled = False
+    model.output_dtype = np.object_
+    return model
+
+
+class _RecordingSender:
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, response, flags=None):
+        self.sent.append((response, flags))
+
+
+def test_execute_single_request_reports_preprocessing_failure():
+    # A bad image URL fails inside _convert_request, before the request is
+    # registered in req_id_to_request_data. The error must still reach the
+    # client with COMPLETE_FINAL, otherwise it waits forever.
+    model = _bare_model_for_execute()
+    sender = _RecordingSender()
+    request = make_mock_triton_request({"text_input": ["describe this"]})
+    request.get_response_sender = lambda: sender
+    request.request_id = lambda: "triton-user-1"
+
+    async def failing_convert(_request):
+        raise RuntimeError(
+            "Cannot connect to host example.invalid:443 [Name or service not known]"
+        )
+
+    model._convert_request = failing_convert
+
+    with patch.dict(sys.modules, {"tensorrt_llm": MagicMock()}):
+        with pytest.raises(RuntimeError):
+            asyncio.run(model._execute_single_request(request))
+
+    pb_utils = sys.modules["triton_python_backend_utils"]
+    assert len(sender.sent) == 1, "client must receive exactly one response"
+    response, flags = sender.sent[0]
+    assert flags == pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL
+    assert response.has_error()
+    assert "example.invalid" in response.error.message
+
+
+def test_execute_single_request_skips_response_when_cancelled():
+    # Once the request IS registered, an empty map means the cancellation loop
+    # already sent COMPLETE_FINAL and removed the entry, so the error handler
+    # must stay silent rather than send a second final response.
+    model = _bare_model_for_execute()
+    sender = _RecordingSender()
+    request = make_mock_triton_request({"text_input": ["describe this"]})
+    request.get_response_sender = lambda: sender
+    request.request_id = lambda: "triton-user-2"
+
+    async def convert(_request):
+        return ("a prompt", {}, False, {}, None)
+
+    class CancellingIterator:
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            # Stand in for cancellation_loop: it sends COMPLETE_FINAL and drops
+            # the entry while generation is in flight.
+            with model.lock:
+                model.req_id_to_request_data.clear()
+            raise RuntimeError("request aborted")
+
+    engine = MagicMock()
+    engine.generate_async.return_value = CancellingIterator()
+    model._convert_request = convert
+    model._llm_engine = engine
+
+    with patch.dict(sys.modules, {"tensorrt_llm": MagicMock()}):
+        with pytest.raises(RuntimeError):
+            asyncio.run(model._execute_single_request(request))
+
+    assert sender.sent == [], "must not double-send after cancellation"
