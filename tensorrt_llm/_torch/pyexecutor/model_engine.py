@@ -711,6 +711,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self._torch_compile_enabled = torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
+        self._torch_compile_recompile_limit = None
 
         prefill_cuda_graph_num_tokens = self.llm_args.prefill_capture_num_tokens
         if prefill_cuda_graph_num_tokens is None:
@@ -753,6 +754,14 @@ class PyTorchModelEngine(ModelEngine):
                     capture_num_tokens=self._prefill_cuda_graph_num_tokens,
                     max_num_streams=torch_compile_max_num_streams,
                     mapping=self.mapping)
+                # Size Dynamo's guard cache for the expected PCG variants.
+                self._torch_compile_recompile_limit = max(
+                    16,
+                    len(self._prefill_cuda_graph_num_tokens),
+                    torch._dynamo.config.recompile_limit,
+                )
+                torch._dynamo.config.recompile_limit = (
+                    self._torch_compile_recompile_limit)
                 apply_llm_torch_compile = getattr(self.model,
                                                   "apply_llm_torch_compile",
                                                   None)
@@ -772,7 +781,6 @@ class PyTorchModelEngine(ModelEngine):
                         self.model,
                         backend=self._torch_compile_backend,
                         fullgraph=torch_compile_fullgraph)
-                torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
         except Exception as e:

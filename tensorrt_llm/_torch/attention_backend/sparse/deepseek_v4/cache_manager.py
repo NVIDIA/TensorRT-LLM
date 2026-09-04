@@ -20,7 +20,11 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import GPU_LEVEL, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    GPU_LEVEL,
+    KVCacheManagerV2,
+    _BasePageTableMaterializer,
+)
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -534,6 +538,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             pin_memory=prefer_pinned(),
             device="cpu",
         )
+        self._page_table_materializer = _BasePageTableMaterializer(
+            self.host_kv_cache_block_offsets,
+            self._stream,
+            allocate_device_source=False,
+        )
         staging_capacity = self.max_batch_size * self.max_beam_width
         self._host_compress_block_tables_staging = {
             compress_ratio: torch.full(
@@ -631,6 +640,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self.host_kv_cache_block_offsets,
             device=device,
         )
+        if self._page_table_materializer.uses_device_staging:
+            # Device staging uploads only the active rows, but the DSV4 op uses
+            # a capacity-sized identity index. Mark the inactive tail invalid so
+            # it is defined even though no attention consumer reads its output.
+            self._device_kv_cache_block_offsets_input.fill_(BAD_PAGE_INDEX)
         self._precomputed_sliding_block_tables = torch.empty(
             (
                 self.num_local_layers,
@@ -641,11 +655,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             dtype=torch.int32,
             device=device,
         )
-        self._device_copy_idx_staging = torch.zeros(
-            self.host_kv_cache_block_offsets.size(1),
-            dtype=torch.int32,
-            device=device,
-        )
+        if self._page_table_materializer.uses_device_staging:
+            self._device_copy_idx_staging = torch.arange(
+                self.host_kv_cache_block_offsets.size(1),
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            self._device_copy_idx_staging = torch.zeros(
+                self.host_kv_cache_block_offsets.size(1),
+                dtype=torch.int32,
+                device=device,
+            )
         self._device_num_contexts = torch.empty((), dtype=torch.int32, device=device)
         self._device_layer_offsets = self._layer_offsets.to(device=device)
         self._device_layer_attn_pool_ids = self._layer_attn_pool_ids.to(
@@ -1280,11 +1301,19 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 for pool_id in range(self.num_pools)
             ]
 
-        device_copy_idx = self._copy_idx_to_device(copy_idx)
-        self._device_kv_cache_block_offsets_input.copy_(
-            self.host_kv_cache_block_offsets,
-            non_blocking=True,
-        )
+        # Preserve the established non-CC full-table upload and GPU gather.
+        if self._page_table_materializer.uses_device_staging:
+            self._page_table_materializer.copy_rows_to_device(
+                self._device_kv_cache_block_offsets_input,
+                copy_idx,
+            )
+            device_copy_idx = self._device_copy_idx_staging
+        else:
+            device_copy_idx = self._copy_idx_to_device(copy_idx)
+            self._device_kv_cache_block_offsets_input.copy_(
+                self.host_kv_cache_block_offsets,
+                non_blocking=True,
+            )
 
         if scratch_descs_by_pool is not None:
             scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(

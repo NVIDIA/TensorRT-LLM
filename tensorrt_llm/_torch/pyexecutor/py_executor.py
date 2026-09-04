@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
 from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional,
@@ -1190,7 +1190,15 @@ class PyExecutor:
             # saving incomplete results that would be overwritten anyway
             enable_profiler = bool(os.environ.get(
                 "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
-            with host_profiler_context(enable=enable_profiler), \
+            # Dynamo overrides are ContextVars. Apply the model-derived limit
+            # in the executor context as well as the model-initialization
+            # context so serving inherits the same compile policy.
+            recompile_limit = self.model_engine._torch_compile_recompile_limit
+            dynamo_context = (torch._dynamo.config.patch(
+                recompile_limit=recompile_limit)
+                              if recompile_limit is not None else nullcontext())
+            with dynamo_context, \
+                 host_profiler_context(enable=enable_profiler), \
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
                 self.event_loop()
         except Exception as e:
