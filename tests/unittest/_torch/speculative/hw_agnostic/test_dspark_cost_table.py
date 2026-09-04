@@ -733,7 +733,7 @@ def test_exact_table_accepts_four_compact_cells_for_six_graph_sizes():
     graphs = (16, 32, 64, 128, 192, 256)
     table = ExactSpsCostTable(
         tables={
-            graph: SpsCostTable(
+            graph: ExactSpsCostRow(
                 token_counts=(0, int(2.5 * graph), 3 * graph, 4 * graph, 5 * graph),
                 step_time_ms=(10.0, 6.0, 7.0, 8.0, 9.0),
             )

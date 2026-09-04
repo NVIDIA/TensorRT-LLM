@@ -3566,10 +3566,6 @@ class PyExecutor:
             planner.install_runtime_cost_table(runtime_cost_table)
 
         gen_requests = scheduled_batch.generation_requests
-        confidence_rows = [
-            worker.confidence_row_for(request.py_request_id)
-            for request in gen_requests
-        ]
         is_distributed = self.dist is not None and self.dist.tp_size > 1
         compute_windows = bool(
             getattr(self.model_engine, "_dspark_trims_submitted_tokens", False))
@@ -3578,24 +3574,25 @@ class PyExecutor:
         device_budget = None
         exact_local = None
         exact_table = planner.exact_cost_table
-        exact_cells = (tuple(
-            getattr(self.model_engine, "_dspark_exact_candidate_cells",
-                    ())) if exact_table is not None else ())
-        if exact_table is not None and not exact_cells:
+        if exact_table is None:
+            raise RuntimeError(
+                "DSpark confidence scheduling has no authenticated exact SPS table"
+            )
+        exact_cells = tuple(
+            getattr(self.model_engine, "_dspark_exact_candidate_cells", ()))
+        if not exact_cells:
             exact_cells = exact_table.candidate_cells()
         exact_requests: Optional[List[LlmRequest]] = gen_requests
         exact_zero_real_adp_dummy = False
-        if exact_table is not None:
-            exact_requests, exact_zero_real_adp_dummy = (
-                _classify_dspark_exact_generation_rows(gen_requests))
+        exact_requests, exact_zero_real_adp_dummy = (
+            _classify_dspark_exact_generation_rows(gen_requests))
 
         # A stale capacity must never re-rank a later batch.
         self.model_engine._dspark_device_budget = None
         if compute_windows:
-            if scheduled_batch.context_requests and (exact_table is not None or
-                                                     planner.skip_mixed_trim):
+            if scheduled_batch.context_requests:
                 pass
-            elif exact_table is not None:
+            else:
                 if exact_requests is not None:
                     exact_rows = [
                         worker.confidence_row_for(request.py_request_id)
@@ -3603,17 +3600,6 @@ class PyExecutor:
                     ]
                     exact_local = planner.prepare_exact_sps_decision(
                         num_gen_requests=len(exact_requests), rows=exact_rows)
-            elif planner.device_windows:
-                decision = planner.decide_verify_budget(
-                    num_gen_requests=len(gen_requests), rows=confidence_rows)
-                if decision is not None:
-                    device_budget, ragged_lens = decision
-            else:
-                ragged_lens = planner.decide_verify_lens(
-                    num_gen_requests=len(gen_requests),
-                    rows=confidence_rows,
-                    reduce_across_ranks=False,
-                )
 
         local_rows = (exact_local.num_requests if exact_local is not None else
                       len(ragged_lens) if ragged_lens is not None else 0)
@@ -3629,20 +3615,19 @@ class PyExecutor:
 
         exact_yield_scale = 1_000_000
         exact_identity_words = (0, ) * 8
-        if exact_table is not None:
-            exact_identity_words = tuple(
-                getattr(
-                    self.model_engine,
-                    "_dspark_exact_identity_words",
-                    exact_table.collective_identity_words,
-                ))
+        exact_identity_words = tuple(
+            getattr(
+                self.model_engine,
+                "_dspark_exact_identity_words",
+                exact_table.collective_identity_words,
+            ))
         native_yield_wire, compact_yields_wire = _encode_dspark_exact_expected_yields(
             exact_local=exact_local,
             num_cells=len(exact_cells),
             yield_scale=exact_yield_scale,
         )
         local_payload.extend([
-            1 if exact_table is not None else 0,
+            1,
             1 if exact_local is not None else 0,
             len(exact_cells),
             *exact_identity_words,
@@ -3653,9 +3638,9 @@ class PyExecutor:
         runner = self.model_engine.cuda_graph_runner
         local_payload.extend([
             int(scheduled_batch.batch_size),
-            1 if planner.max_tier in getattr(runner, "padding_dummy_requests",
-                                             {}) else 0,
-            1 if planner.max_tier in getattr(
+            1 if planner.max_verify_len in getattr(
+                runner, "padding_dummy_requests", {}) else 0,
+            1 if planner.max_verify_len in getattr(
                 runner, "secondary_padding_dummy_requests", {}) else 0,
         ])
         payloads = self.dist.tp_allgather(
@@ -3703,7 +3688,7 @@ class PyExecutor:
             int(payload[batch_size_index]) for payload in payloads)
         widest_batch_size = max(peer_batch_sizes, default=0)
         common_padded_batch_size = runner._round_up_batch_size_with_draft_len(
-            widest_batch_size, planner.max_tier)
+            widest_batch_size, planner.max_verify_len)
         padding_needed = any(
             int(payload[batch_size_index]) != common_padded_batch_size
             for payload in payloads)
@@ -3715,9 +3700,7 @@ class PyExecutor:
             common_padded_batch_size > 0 and padding_supported and all(
                 int(payload[batch_size_index]) == common_padded_batch_size
                 or int(payload[padding_dummy_index]) for payload in payloads))
-        exact_policy_agreed = bool(
-            exact_table is not None
-            and all(int(payload[5]) for payload in payloads))
+        exact_policy_agreed = bool(all(int(payload[5]) for payload in payloads))
         agreement = ADPShapeAgreement(
             iteration=int(self.iter_counter),
             batch_identity=id(scheduled_batch),
@@ -3726,7 +3709,7 @@ class PyExecutor:
             all_can_graph=all_can_graph,
             widest_batch_size=widest_batch_size,
             graph_batch_size=common_padded_batch_size,
-            draft_len=int(planner.max_tier),
+            draft_len=int(planner.max_verify_len),
             padding_ready=padding_ready,
         )
         runner.adp_shape_agreement = agreement
@@ -3736,7 +3719,7 @@ class PyExecutor:
             runner.ragged_zero_real_high_rows = 0
             for request in gen_requests:
                 request.py_verify_len = None
-            return int(planner.max_tier)
+            return int(planner.max_verify_len)
 
         exact_shape = None
         if exact_local is not None:
@@ -3818,7 +3801,7 @@ class PyExecutor:
                                 graph_batch_size=common_graph_batch_size,
                                 verifier_budget=selected_verifier_budget,
                                 min_verify_len=planner.cfg.min_verify_len,
-                                max_verify_len=planner.max_tier,
+                                max_verify_len=planner.max_verify_len,
                             )
                             if peer_geometry is None:
                                 raise RuntimeError(
@@ -3835,6 +3818,9 @@ class PyExecutor:
         bucket = None
         ragged_active = False
         if ragged_lens is not None:
+            if exact_shape is None:
+                raise RuntimeError(
+                    "DSpark exact allocation produced no measured graph shape")
             if all_can_graph:
                 bucket = self.model_engine.fit_ragged_verify_lens(
                     gen_requests,
@@ -3880,7 +3866,7 @@ class PyExecutor:
         if buffer is not None:
             worker.bump_draft_seq()
             planner.stage_confidence(buffer)
-        return int(planner.max_tier)
+        return int(planner.max_verify_len)
 
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
