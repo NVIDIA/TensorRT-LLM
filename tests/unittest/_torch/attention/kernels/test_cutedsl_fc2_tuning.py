@@ -59,6 +59,13 @@ def _make_runner(
             [
                 ((128, 128), (1, 1), False),
                 ((128, 128), (1, 2), False),
+            ],
+        ),
+        (
+            "0",
+            [
+                ((128, 128), (1, 1), False),
+                ((128, 128), (1, 2), False),
                 ((128, 256), (1, 1), False),
             ],
         ),
@@ -88,13 +95,14 @@ def test_fc2_n_tile_size_override(
     tactics = runner.get_valid_tactics(inputs, OptimizationProfile())
 
     assert tactics == expected_tactics
-    assert runner._get_default_tactic()[0][1] == (int(env_value) if env_value is not None else 128)
-    if env_value is None:
+    expected_override = 128 if env_value is None else (None if env_value == "0" else int(env_value))
+    assert runner._get_default_tactic()[0][1] == (expected_override or 128)
+    if expected_override is None:
         assert "fc2_n_tile_size_override" not in runner.unique_id()
     else:
         assert runner.unique_id()[-2:] == (
             "fc2_n_tile_size_override",
-            int(env_value),
+            expected_override,
         )
 
 
@@ -113,5 +121,5 @@ def test_fc2_n_tile_size_override_rejects_invalid_values(
 ) -> None:
     monkeypatch.setenv(_CUTEDSL_FC2_N_TILE_SIZE_ENV, env_value)
 
-    with pytest.raises(ValueError, match=f"{_CUTEDSL_FC2_N_TILE_SIZE_ENV} must be unset"):
+    with pytest.raises(ValueError, match=f"{_CUTEDSL_FC2_N_TILE_SIZE_ENV} must be 0"):
         _make_runner(monkeypatch)
