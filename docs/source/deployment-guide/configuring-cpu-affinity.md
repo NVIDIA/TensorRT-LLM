@@ -30,12 +30,7 @@ environment variable as follows:
 
 The affinity is applied to every thread of the worker process, including
 threads created before the configuration point (for example by MPI or
-communication libraries). Optionally, `TLLM_EXECUTOR_LOOP_PIN=1` pins the
-executor's event-loop thread to a small dedicated slice of the device's
-NUMA-aware CPU list so that it does not compete with the other worker threads:
-`TLLM_EXECUTOR_LOOP_PIN_NCORES` (default 2) CPUs starting at
-`TLLM_EXECUTOR_LOOP_PIN_OFFSET` (default 16), with devices that share the same
-CPU list taking consecutive slices.
+communication libraries).
 
 ## Other environmental considerations
 

@@ -45,7 +45,6 @@ from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType, PeftCacheConfig,
                                           WaitingQueuePolicy)
-from tensorrt_llm.llmapi.utils import get_executor_loop_cpus
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
@@ -1183,22 +1182,10 @@ class PyExecutor:
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
-    def _pin_event_loop_thread(self):
-        try:
-            cpus = get_executor_loop_cpus(self.device_id)
-            if not cpus:
-                return
-            os.sched_setaffinity(0, cpus)
-            logger.info(f"Executor event loop thread pinned to CPUs {cpus} "
-                        f"(device {self.device_id}).")
-        except Exception as e:
-            logger.warning(f"Executor event loop thread pinning failed: {e}")
-
     def _event_loop_wrapper(self):
         crashed = False
         self._event_loop_completed = False
         try:
-            self._pin_event_loop_thread()
             # Skip line profiler during warmup/memory estimation phase to avoid
             # saving incomplete results that would be overwritten anyway
             enable_profiler = bool(os.environ.get(

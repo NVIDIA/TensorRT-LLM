@@ -707,25 +707,6 @@ def configure_cpu_affinity(device_id: int) -> None:
             f"({nthreads} threads).")
 
 
-def get_executor_loop_cpus(device_id: int) -> List[int]:
-    """CPUs for the executor event-loop thread, or [] when pinning is off.
-
-    Enabled by TLLM_EXECUTOR_LOOP_PIN=1. The thread gets
-    TLLM_EXECUTOR_LOOP_PIN_NCORES (default 2) CPUs starting at
-    TLLM_EXECUTOR_LOOP_PIN_OFFSET (default 16) within the device's NUMA-aware
-    CPU list; devices sharing that list take consecutive slices.
-    """
-    if os.environ.get("TLLM_EXECUTOR_LOOP_PIN") != "1":
-        return []
-    offset = int(os.environ.get("TLLM_EXECUTOR_LOOP_PIN_OFFSET", "16"))
-    ncores = int(os.environ.get("TLLM_EXECUTOR_LOOP_PIN_NCORES", "2"))
-    cpus = get_numa_aware_cpu_affinity(device_id)
-    slot = sum(1 for d in range(device_id)
-               if get_numa_aware_cpu_affinity(d) == cpus)
-    start = offset + ncores * slot
-    return cpus[start:start + ncores]
-
-
 def generate_api_docs_as_docstring(model: Type[BaseModel],
                                    include_annotations=False,
                                    indent="") -> str:
