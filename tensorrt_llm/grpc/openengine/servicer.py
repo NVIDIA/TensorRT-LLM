@@ -24,6 +24,19 @@ from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 _RESPONSE_STALL_TIMEOUT_SECONDS = 30.0
 
+# Ceiling on prompt_length * prompt_candidates. Building a PromptOutput is one
+# synchronous, non-preemptible slice of work sized by both, and both are
+# client-controlled: a 128k prompt at top_n=100 is minutes of detokenization and
+# protobuf construction on the shared event loop, stalling every other in-flight
+# stream, before producing a message too large to send. Rejecting up front costs
+# nothing; the limit is generous enough that no realistic request reaches it.
+_MAX_PROMPT_LOGPROB_ENTRIES = 1_000_000
+
+# Cap on the number of stop conditions. Each one costs a KMP automaton per
+# output index and a scan of every generated token, so an unbounded list lets a
+# single request tax the event loop for the whole stream.
+_MAX_STOP_CONDITIONS = 64
+
 # OpenEngine has no native request-type field, so the phase of a disaggregated
 # request is carried in the request's `extra` Struct under this key. A request
 # that carries a `kv.session` handle is always treated as generation_only.
@@ -168,6 +181,11 @@ def sampling_params_from_request(
         if stopping.HasField("min_tokens"):
             kwargs["min_tokens"] = stopping.min_tokens
 
+        if len(stopping.conditions) > _MAX_STOP_CONDITIONS:
+            raise ValueError(
+                f"at most {_MAX_STOP_CONDITIONS} stopping conditions are supported, "
+                f"got {len(stopping.conditions)}"
+            )
         stop_texts = []
         stop_token_ids = []
         for condition in stopping.conditions:
@@ -282,8 +300,13 @@ def _token_infos(
     # candidate strings exist for logprob display (mirroring the HTTP path, which
     # only surfaces token strings inside logprobs), so the common token-ids/text
     # streaming path skips per-token detokenization entirely.
-    need_strings = bool(logprobs)
-    token_strings = _token_strings(tokenizer, token_ids) if need_strings else [""] * len(token_ids)
+    if not logprobs:
+        # The common streaming path: no logprobs means no token or candidate
+        # strings, so skip detokenization and the candidate bookkeeping rather
+        # than building empty scaffolding for every token of every request.
+        return [generation_pb2.TokenInfo(token_id=token_id) for token_id in token_ids]
+
+    token_strings = _token_strings(tokenizer, token_ids)
     candidate_items: list[list[tuple[int, Any]]] = []
     candidate_ids: dict[int, None] = {}
     for index in range(len(token_ids)):
@@ -316,15 +339,17 @@ def _token_infos(
                 kwargs["logprob"] = _clamp_logprob(sampled.logprob)
                 if sampled.rank is not None:
                     kwargs["rank"] = sampled.rank
-            kwargs["candidates"] = [
-                generation_pb2.LogProb(
+            candidates = []
+            for candidate_id, candidate in candidate_items[index]:
+                logprob = generation_pb2.LogProb(
                     token_id=candidate_id,
                     logprob=_clamp_logprob(candidate.logprob),
                     token=candidate_strings[candidate_id],
-                    **({"rank": candidate.rank} if candidate.rank is not None else {}),
                 )
-                for candidate_id, candidate in candidate_items[index]
-            ]
+                if candidate.rank is not None:
+                    logprob.rank = candidate.rank
+                candidates.append(logprob)
+            kwargs["candidates"] = candidates
         token_infos.append(generation_pb2.TokenInfo(**kwargs))
     return token_infos
 
@@ -407,19 +432,35 @@ def _prompt_output(
 _TERMINAL_FINISH_REASONS = frozenset({"stop", "length", "cancelled", "timeout"})
 
 
-def _aligned_logprobs(output: Any) -> Sequence[Any]:
-    """Logprobs index-aligned with ``output.token_ids``.
+def _logprob_shortfall(output: Any) -> int:
+    """How many leading tokens carry no logprob.
 
     On a generation_only request the engine tolerates being one logprob short --
     the context worker did not transfer the first token's -- and only logs a
     warning. Slicing positionally against that would attribute every logprob,
-    rank and candidate set to the wrong token, so pad the missing head instead.
+    rank and candidate set to the wrong token.
     """
     logprobs = output.logprobs or []
-    shortfall = len(output.token_ids or []) - len(logprobs)
-    if shortfall > 0 and logprobs:
-        return [None] * shortfall + list(logprobs)
-    return logprobs
+    if not logprobs:
+        return 0
+    return max(0, len(output.token_ids or []) - len(logprobs))
+
+
+def _delta_logprobs(output: Any, sent_token_count: int, shortfall: int) -> Sequence[Any]:
+    """Logprobs for ``token_ids[sent_token_count:]``, head-padded if short.
+
+    Indexes into the engine's cumulative list rather than rebuilding a padded
+    copy of it. ``output.logprobs`` grows for the whole stream, so materializing
+    ``[None] * shortfall + list(logprobs)`` on every streaming step made a
+    logprobs-enabled generation_only request O(n^2) in output length -- and the
+    shortfall branch is not an edge case there, it holds for the entire stream.
+    """
+    logprobs = output.logprobs or []
+    if not shortfall:
+        return logprobs[sent_token_count:]
+    if sent_token_count >= shortfall:
+        return logprobs[sent_token_count - shortfall :]
+    return [None] * (shortfall - sent_token_count) + list(logprobs)
 
 
 def _finish_event(output: Any, end_id: int | None) -> generation_pb2.GenerationFinished:
@@ -744,6 +785,10 @@ class _OpenEngineFormatState(PostprocArgs):
     sent_text_lengths: dict = field(default_factory=dict)
     observed_text_lengths: dict = field(default_factory=dict)
     stop_prefix_trackers: dict = field(default_factory=dict)
+    # Per output index, how many leading tokens carry no logprob. Fixed for the
+    # stream once the engine has produced any, so it is resolved once instead of
+    # being re-derived from the growing cumulative list on every step.
+    logprob_shortfalls: dict = field(default_factory=dict)
     finished_indices: set = field(default_factory=set)
     prompt_sent: bool = False
     prefill_ready_sent: set = field(default_factory=set)
@@ -771,6 +816,23 @@ def _format_result(
         return responses
 
     if sampling_params.prompt_logprobs is not None and not args.prompt_sent and result.outputs:
+        # Sized by prompt_length * candidates, both client-controlled, and built
+        # in one non-preemptible slice: refuse rather than stall every other
+        # in-flight stream for the seconds-to-minutes this would take.
+        entries = len(result.prompt_token_ids or ()) * max(sampling_params.prompt_logprobs, 1)
+        if entries > _MAX_PROMPT_LOGPROB_ENTRIES:
+            args.prompt_sent = True
+            responses.append(
+                _engine_error_response(
+                    request_id,
+                    f"prompt logprobs would produce {entries} entries, above the "
+                    f"{_MAX_PROMPT_LOGPROB_ENTRIES} supported; lower "
+                    "response.prompt_candidates or shorten the prompt",
+                    result,
+                    code=error_pb2.ERROR_CODE_INVALID_ARGUMENT,
+                )
+            )
+            return responses
         responses.append(
             generation_pb2.GenerateResponse(
                 request_id=request_id,
@@ -807,8 +869,12 @@ def _format_result(
         args.observed_text_lengths[output.index] = len(all_text)
 
         if delta_token_ids or delta_text:
-            logprobs = _aligned_logprobs(output)
-            delta_logprobs = logprobs[sent_token_count:]
+            logprob_shortfall = args.logprob_shortfalls.get(output.index)
+            if logprob_shortfall is None:
+                logprob_shortfall = _logprob_shortfall(output)
+                if output.logprobs:
+                    args.logprob_shortfalls[output.index] = logprob_shortfall
+            delta_logprobs = _delta_logprobs(output, sent_token_count, logprob_shortfall)
             token_infos = _token_infos(
                 tokenizer, delta_token_ids, delta_logprobs, sampling_params.logprobs or 0
             )

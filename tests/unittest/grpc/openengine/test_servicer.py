@@ -24,6 +24,7 @@ from tensorrt_llm.grpc.openengine.servicer import (  # noqa: E402
     OpenEngineInferenceServicer,
     sampling_params_from_request,
 )
+from tensorrt_llm.sampling_params import SamplingParams  # noqa: E402
 
 # Runs on the CPU stage: the engine is stubbed, so nothing here needs a GPU.
 pytestmark = pytest.mark.cpu_only
@@ -1052,3 +1053,52 @@ def test_context_only_via_extra_is_still_accepted() -> None:
         request.extra.update({"request_type": request_type})
         params = openengine_servicer._disaggregated_params_from_request(request)
         assert params.request_type == request_type
+
+
+def test_no_logprobs_token_infos_skip_detokenization() -> None:
+    """The common streaming path builds no token or candidate strings."""
+
+    class _ExplodingTokenizer:
+        def decode(self, *a: Any, **k: Any) -> str:
+            raise AssertionError("detokenization is not needed without logprobs")
+
+    infos = openengine_servicer._token_infos(_ExplodingTokenizer(), [10, 11])
+
+    assert [info.token_id for info in infos] == [10, 11]
+    assert all(info.token == "" and not info.candidates for info in infos)
+
+
+def test_oversized_prompt_logprobs_are_refused_not_built() -> None:
+    """A prompt_length * candidates blow-up is rejected, not computed.
+
+    PromptOutput is built in one non-preemptible slice on the shared event loop,
+    so an unbounded one stalls every other in-flight stream before producing a
+    message too large to send.
+    """
+    limit = openengine_servicer._MAX_PROMPT_LOGPROB_ENTRIES
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[],
+        text="",
+        logprobs=[],
+        prompt_logprobs=[],
+        finish_reason=None,
+        stop_reason=None,
+    )
+    result = SimpleNamespace(
+        prompt_token_ids=list(range(limit)),
+        outputs=[output],
+        cached_tokens=0,
+        error=None,
+    )
+    state = openengine_servicer._OpenEngineFormatState(
+        request_id="r",
+        sampling_params=SamplingParams(prompt_logprobs=2),
+        tokenizer=_FakeTokenizer(),
+    )
+
+    responses = openengine_servicer._format_result(result, state)
+
+    assert len(responses) == 1
+    assert responses[0].error.code == openengine_servicer.error_pb2.ERROR_CODE_INVALID_ARGUMENT
+    assert "prompt logprobs" in responses[0].error.message
