@@ -235,22 +235,6 @@ def run_msa_paged_gqa(
         )
         return
 
-    if getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_idx):
-        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode import (
-            minimax_m3_trtllm_gen_dense_attention,
-        )
-
-        minimax_m3_trtllm_gen_dense_attention(
-            q_view,
-            kv_cache_manager,
-            layer_idx,
-            metadata,
-            sm_scale=sm_scale,
-            output=out_view,
-            kv_scale_quant_orig=kv_scale_quant_orig,
-        )
-        return
-
     k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
 
     # Leading query tokens fmha_sm100 must still run: the whole batch until a

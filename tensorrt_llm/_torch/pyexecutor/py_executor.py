@@ -5734,11 +5734,6 @@ class PyExecutor:
                 and self.max_num_tokens is not None):
             token_nums = [self.max_num_tokens]
 
-        # A separate draft KV cache manager must also see the dummy, or
-        # its prepare_resources hits an unknown request id.
-        draft_kv_cache_manager = self.resource_manager.get_resource_manager(
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-
         if (not self._enable_dsv4_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
             try:
@@ -5748,12 +5743,11 @@ class PyExecutor:
                     is_gen=self._adp_dummy_is_gen,
                     prepare_resource=True,
                     max_num_draft_tokens=self.max_total_draft_tokens,
-                    draft_kv_cache_manager=draft_kv_cache_manager,
                 )
             except OutOfPagesError:
                 dummy_requests = None
             if not dummy_requests:
-                # Both KV cache managers report allocation failure by returning
+                # The cache manager reports allocation failure by returning
                 # None, expecting the caller to retry on a later iteration. An
                 # empty batch is safe here because _can_queue() allgathers batch
                 # sizes, so every rank skips the forward pass together.
@@ -5786,7 +5780,6 @@ class PyExecutor:
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
-                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         except OutOfPagesError:
             dummy_requests = None

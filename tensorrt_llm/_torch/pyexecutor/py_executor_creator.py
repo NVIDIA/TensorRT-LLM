@@ -511,13 +511,12 @@ def create_py_executor(
         if hasattr(spec_config, '_max_batch_size'):
             spec_config._max_batch_size = max_batch_size
 
-        # WAR for https://nvbugs/5807902
-        # Disable separate draft KV cache in disaggregated mode
-        # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
-        # (The shared-manager fallback is exactly what MiniMax-M3 wants here
-        # — its drafter shares the target manager and rides prefix reuse and
-        # KV transfer natively — so M3's earlier #17341 exemption is retired.)
-        if cache_transceiver_config is not None:
+        # WAR for https://nvbugs/5807902: disable the separate draft KV cache
+        # in disaggregated mode. MiniMax-M3 also uses the unified target cache
+        # in every supported one-model configuration; its native P128 view maps
+        # the dense draft K/V pages inside M3's non-uniform mega-slot.
+        if (cache_transceiver_config is not None
+                or is_minimax_m3(m3_sparse_config)):
             spec_config._allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla

@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from unittest import mock
 
 import pytest
@@ -7875,10 +7876,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         (attention-DP generation), False the TEP production-candidate shape.
         Values that are workload-tuned (1M-context sizes) or GPU-generation-
         tuned (memory fractions) are CI-adjusted and called out inline.
-        Accuracy is asserted through the router; the drafter's KV rides the
-        shared logical blocks, so a corrupted or dropped drafter cache
-        collapses accuracy. Acceptance stats stay with the aggregated arm,
-        which exercises the same view code.
+        Accuracy is asserted through the router. A chat-GSM8K acceptance probe
+        additionally guards the drafter KV that rides the shared logical
+        blocks, since accuracy alone is insensitive to rejected draft tokens.
         """
         if not (overlap_scheduler and cuda_graph and use_msa):
             pytest.skip("the disagg arm pins the production serving shape "
@@ -7887,7 +7887,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         speculative_config = {
             "decoding_type": "Eagle3",
             "max_draft_len": max_draft_len,
-            "speculative_model": f"{llm_models_root()}/MiniMax-M3-EAGLE3",
+            "speculative_model": f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
             "eagle3_one_model": True,
         }
         common_config = {
@@ -7975,6 +7975,13 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "num_postprocess_workers": 4,
             "stream_interval": 100,
             "enable_iter_perf_stats": True,
+            # Preserve the complete acceptance-probe window. The default
+            # engine and OpenAI-server buffers retain only their latest 1000
+            # iterations, which samples whichever requests finish last. Full
+            # 200-prompt runs produced at most 2966 records, so 5000 keeps the
+            # complete window without making either buffer unbounded.
+            "max_stats_len": 5000,
+            "iter_stats_max_iterations": 5000,
             "cuda_graph_config": {
                 "enable_padding": True,
                 "batch_sizes": [1, 2, 4, 8, 16],
@@ -8024,14 +8031,16 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                     if inferencemax else GSM8K(model_name))
             task.evaluate(llm)
 
-            # Chat-format acceptance probe — the same workload and
-            # thresholds as the aggregated arm's (200 GSM8K questions,
-            # chat template, greedy, 512 tokens; drafter card reference
-            # rate 0.839 / length 3.518). The disagg fixture has no
-            # get_stats, so the probe window comes from the generation
-            # worker's /metrics buffer (enable_iter_perf_stats), drained
-            # right before the probe; the dataset loads from the models
-            # root so the probe works offline like the eval does.
+            # Chat-format acceptance probe — 200 GSM8K questions, chat
+            # template, greedy, 512 tokens (drafter-card reference rate 0.839 /
+            # length 3.518). Four native-P128 unified-cache validation runs
+            # measured 0.803-0.823 / 3.410-3.468. The floors retain run-to-run
+            # headroom while rejecting the earlier corrupted-draft-KV result
+            # (0.779-0.780 / 3.338-3.339).
+            # The disagg fixture has no get_stats, so read the generation
+            # worker's bounded iteration-stat window after draining the
+            # preceding eval. The dataset loads from the models root so the
+            # probe works offline like the eval does.
             import requests
             info = requests.get(f"{llm.router_url}/cluster_info",
                                 timeout=30).json()
@@ -8050,15 +8059,22 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                                                   add_generation_prompt=True)
                 for q in questions
             ]
-            requests.get(f"http://{gen_url}/metrics", timeout=30)  # drain
+            metrics_url = f"http://{gen_url}/metrics"
+            # A completed request wakes a background stats collector whose
+            # queue-drain timeout is 0.5 s. Let it finish before clearing or
+            # reading the HTTP snapshot buffer.
+            time.sleep(1)
+            requests.get(metrics_url, timeout=120).raise_for_status()
             probe_params = SamplingParams(max_tokens=512, temperature=0)
             for future in [
                     llm.generate_async(prompt, probe_params)
                     for prompt in chat_prompts
             ]:
                 future.result()
-            records = requests.get(f"http://{gen_url}/metrics",
-                                   timeout=30).json()
+            time.sleep(1)
+            response = requests.get(metrics_url, timeout=120)
+            response.raise_for_status()
+            records = response.json()
             drafted = accepted = steps = 0
             for record in records:
                 stats = record.get("specDecodingStats") or {}
@@ -8071,13 +8087,13 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             print(f"MiniMax-M3 Eagle3 disagg chat-GSM8K acceptance: rate="
                   f"{chat_rate:.3f}, mean acceptance length="
                   f"{chat_length:.3f} ({steps} spec iterations)")
-            assert chat_rate > 0.78, \
+            assert chat_rate > 0.80, \
                 f"Eagle3 chat-GSM8K acceptance rate too low: " \
-                f"{chat_rate:.3f} (threshold 0.78, reference 0.839 from " \
+                f"{chat_rate:.3f} (threshold 0.80, reference 0.839 from " \
                 f"the drafter card)"
-            assert chat_length > 3.3, \
+            assert chat_length > 3.4, \
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
-                f"{chat_length:.3f} (threshold 3.3, reference 3.518 from " \
+                f"{chat_length:.3f} (threshold 3.4, reference 3.518 from " \
                 f"the drafter card)"
 
     @pytest.mark.skip_less_device(6)
@@ -8137,7 +8153,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             return
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
-            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
+            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
         )
         # The runtime forces tokens_per_block per implementation (128 MSA / 32
         # reference).
@@ -8200,9 +8216,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 task = GSM8K(model_name)
                 task.evaluate(llm)
 
-            # Chat-format acceptance — the drafter's training distribution
-            # (Inferact/MiniMax-M3-EAGLE3 card: 0.839 / 3.518). Reuses the
-            # live engine and the cached dataset; ~20 s under CUDA graphs.
+            # Chat-format acceptance — the drafter's training distribution.
+            # Reuses the live engine and the cached dataset; ~20 s under
+            # CUDA graphs.
             questions = [
                 r["question"]
                 for r in load_dataset("gsm8k", "main", split="test")
@@ -8223,20 +8239,26 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert steps > 0, "no speculative iterations recorded"
             chat_rate = accepted / drafted
             chat_length = 1 + accepted / steps
-            # Published reference (Inferact/MiniMax-M3-EAGLE3 drafter card):
-            # rate 0.839, length 3.518. Our testing thresholds: rate > 0.78,
-            # length > 3.3.
+            # The GQA drafter card publishes no GSM8K figure, so the
+            # reference stays the MHA card's (rate 0.839, length 3.518):
+            # the GQA head is retrained on the same data with only the
+            # attention changed (64 -> 4 KV heads), the cards agree on the
+            # benchmark they share (MT-Bench 2.698 vs 2.668), and this arm
+            # measures the GQA head at 0.838 / 3.515 — indistinguishable
+            # from the MHA reference. Floors: rate > 0.80, length > 3.4
+            # (see the disaggregated arm for how they are calibrated).
             ref_rate, ref_length = 0.839, 3.518
-            ref_source = "the Inferact/MiniMax-M3-EAGLE3 drafter model card"
+            ref_source = ("the Inferact/MiniMax-M3-EAGLE3 (MHA) drafter "
+                          "card, which the GQA head matches on GSM8K")
             print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
                   f"{chat_rate:.3f}, mean acceptance length="
                   f"{chat_length:.3f} ({steps} spec iterations)")
-            assert chat_rate > 0.78, \
+            assert chat_rate > 0.80, \
                 f"Eagle3 chat-GSM8K acceptance rate too low: {chat_rate:.3f} " \
-                f"(threshold 0.78, reference {ref_rate} from {ref_source})"
-            assert chat_length > 3.3, \
+                f"(threshold 0.80, reference {ref_rate} from {ref_source})"
+            assert chat_length > 3.4, \
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
-                f"{chat_length:.3f} (threshold 3.3, reference {ref_length} " \
+                f"{chat_length:.3f} (threshold 3.4, reference {ref_length} " \
                 f"from {ref_source})"
             print(f"Eagle3 acceptance references: rate {ref_rate}, length "
                   f"{ref_length} — from {ref_source}.")
@@ -8244,7 +8266,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
     def test_nvfp4_kv_eagle3_smoke(self):
-        """Generate through MSA with a true NVFP4 KV cache and linear Eagle3."""
+        """Generate through MSA with a true NVFP4 KV cache and GQA Eagle3."""
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import \
             msa_package_available
 
@@ -8254,7 +8276,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         spec_config = Eagle3DecodingConfig(
             max_draft_len=3,
-            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
+            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
         )
         kv_cache_config = KvCacheConfig(
             dtype="nvfp4",

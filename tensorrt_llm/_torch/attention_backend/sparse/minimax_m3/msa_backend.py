@@ -53,7 +53,7 @@ from .msa_utils import (
 )
 from .trtllm_gen_dense_decode import (
     dense_decode_unsupported_reason,
-    uniform_dense_subpage_geometry,
+    uniform_dense_subpages_per_slot,
     write_subpage_block_table,
 )
 
@@ -312,7 +312,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # factor, or 0 where the pool has no single one; see msa_subpage_rows.
     msa_subpage_block_table: Optional[torch.Tensor] = None
     _msa_subpages_per_slot: int = 0
-    _msa_pages_per_dense_role: int = 1
     # Per-request kv_lens as staged by prepare(), before the overlap scheduler
     # corrects them. on_update_kv_lens clamps against this; see there.
     msa_kv_lens_staged: Optional[torch.Tensor] = None
@@ -598,16 +597,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         )
         # Resolved once here rather than per step: the factor is fixed by the
         # pool's layout for the life of the manager.
-        self._msa_subpages_per_slot, self._msa_pages_per_dense_role = (
-            uniform_dense_subpage_geometry(kv_cache_manager)
-        )
+        self._msa_subpages_per_slot = uniform_dense_subpages_per_slot(kv_cache_manager)
         if self._msa_subpages_per_slot > 0:
             self.msa_subpage_block_table = self.get_empty(
                 buffers,
                 (
                     max_num_sequences,
                     2,
-                    max_blocks_per_seq * self._msa_pages_per_dense_role,
+                    max_blocks_per_seq,
                 ),
                 cache_name="msa_subpage_block_table",
                 dtype=torch.int32,
@@ -1459,7 +1456,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 self.msa_block_table[:batch_size],
                 self._msa_subpages_per_slot,
                 self.msa_subpage_block_table[:batch_size],
-                self._msa_pages_per_dense_role,
             )
 
         # Staging for on_update_kv_lens.
@@ -1530,11 +1526,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         Requires prepared metadata (msa_out_cache_loc filled), the same
         contract as the writes it replaces.
         """
-        from .msa_scatter import (
-            fused_write_layer_caches,
-            fused_write_layer_caches_nvfp4,
-            fused_write_subpaged_layer_caches,
-        )
+        from .msa_scatter import fused_write_layer_caches, fused_write_layer_caches_nvfp4
 
         idx_cache = self.msa_idx_k_cache(layer_idx) if idx_k is not None else None
         num_tokens = int(k.shape[0])
@@ -1542,9 +1534,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         is_nvfp4_layer = getattr(self.kv_cache_manager, "is_nvfp4_layer", lambda _layer_idx: False)(
             layer_idx
         )
-        is_fp8_subpaged_layer = getattr(
-            self.kv_cache_manager, "is_fp8_subpaged_layer", lambda _layer_idx: False
-        )(layer_idx)
         if is_nvfp4_layer:
             if kv_scale_orig_quant is None:
                 raise RuntimeError(
@@ -1571,13 +1560,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 raise RuntimeError(
                     "MiniMax-M3 NVFP4 cache writer requires CUDA HND P128/P32 cache views, "
                     "contiguous logical K/V rows, and FP32 K/V quantization scales"
-                )
-        elif is_fp8_subpaged_layer:
-            k_view, v_view = self.kv_cache_manager.get_fp8_dense_buffers(layer_idx)
-            if not fused_write_subpaged_layer_caches(k_view, v_view, out_cache_loc, k, v):
-                raise RuntimeError(
-                    "MiniMax-M3 hybrid FP8 dense/Eagle cache writer requires CUDA "
-                    "HND P32 sub-page views and contiguous logical K/V rows"
                 )
         else:
             buffers = self.kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")

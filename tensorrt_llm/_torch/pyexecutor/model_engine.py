@@ -975,13 +975,8 @@ class PyTorchModelEngine(ModelEngine):
     def use_beam_search(self):
         return self.max_beam_width > 1
 
-    def _get_draft_kv_cache_manager(
-        self, resource_manager: ResourceManager
-    ) -> Optional[Union[KVCacheManager, KVCacheManagerV2]]:
-        """
-        Returns the draft KV cache manager only in one-model speculative decoding
-        mode where the target model manages a separate draft KV cache.
-        """
+    def _get_draft_kv_cache_manager(self, resource_manager: ResourceManager):
+        """Return the one-model draft manager or shared-layout adapter."""
         return get_draft_kv_cache_manager(self.spec_config, resource_manager)
 
     @contextmanager

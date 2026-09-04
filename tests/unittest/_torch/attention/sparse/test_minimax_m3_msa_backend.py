@@ -9,7 +9,6 @@ Numerical parity against the Triton reference is covered by the SM100
 integration accuracy test.
 """
 
-from inspect import signature
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +20,6 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import write
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_scatter import (
     fused_write_layer_caches,
     fused_write_layer_caches_nvfp4,
-    fused_write_subpaged_layer_caches,
 )
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
     msa_ported_decode_active,
@@ -1279,63 +1277,6 @@ def test_nvfp4_sparse_dispatch_uses_only_the_msa_csr_path(monkeypatch):
     ) == first_ptrs
 
 
-def test_fp8_subpaged_dispatch_forwards_dequant_scale(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The shared Eagle cache path must preserve its FP8 dequant scale."""
-    import tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa as msa_gqa
-    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils as msa_utils
-    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode as dense_decode
-
-    monkeypatch.setattr(
-        msa_utils, "msa_decode_span_bounds", lambda metadata, num_tokens: (0, 0, 0, 0, 0)
-    )
-    parameter = signature(dense_decode.minimax_m3_trtllm_gen_dense_attention).parameters[
-        "kv_scale_quant_orig"
-    ]
-    assert parameter.default is None
-    captured: dict[str, object] = {}
-
-    def fake_dense_attention(*_args: object, **kwargs: object) -> None:
-        captured.update(kwargs)
-
-    monkeypatch.setattr(
-        dense_decode,
-        "minimax_m3_trtllm_gen_dense_attention",
-        fake_dense_attention,
-    )
-
-    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
-    attention.layer_idx = 3
-    attention.head_dim = 128
-    attention.num_heads = 8
-    attention.q_scaling = 1.0
-    metadata = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            is_nvfp4_layer=lambda layer_idx: False,
-            is_fp8_subpaged_layer=lambda layer_idx: layer_idx == 3,
-        ),
-        _msa_prewritten_layer=3,
-    )
-    q = torch.zeros(2, attention.num_heads * attention.head_dim)
-    output = torch.empty_like(q)
-    dequant_scale = torch.ones(3, dtype=torch.float32)
-
-    msa_gqa.run_msa_paged_gqa(
-        attention,
-        q,
-        None,
-        None,
-        metadata,
-        output,
-        kv_block_indexes=None,
-        plan=None,
-        kv_scale_quant_orig=dequant_scale,
-    )
-
-    assert captured["kv_scale_quant_orig"] is dequant_scale
-
-
 @pytest.mark.parametrize("q_heads,kv_heads", [(64, 4), (16, 1)])
 def test_nvfp4_standard_stage_uses_preplanned_msa_and_stable_scratch(
     monkeypatch, q_heads, kv_heads
@@ -1660,37 +1601,6 @@ def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
 
     torch.testing.assert_close(pool.to(torch.float32), ref_pool.to(torch.float32))
     torch.testing.assert_close(idx_pool, ref_idx_pool)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_subpage_scatter_places_tokens_inside_p32_pages():
-    torch.manual_seed(17)
-    num_slots, pages_per_role, num_heads = 3, 4, 2
-    physical_page, head_dim = 32, 128
-    k_cache = torch.zeros(
-        (num_slots, pages_per_role, num_heads, physical_page, head_dim),
-        dtype=torch.float8_e4m3fn,
-        device="cuda",
-    )
-    v_cache = torch.zeros_like(k_cache)
-    slots = torch.tensor([0, 31, 32, 127, 128, 255, -1], dtype=torch.int32, device="cuda")
-    qkv = torch.randn(
-        slots.numel(), 2 * num_heads * head_dim + 13, dtype=torch.bfloat16, device="cuda"
-    )
-    k = qkv[:, : num_heads * head_dim]
-    v = qkv[:, num_heads * head_dim : 2 * num_heads * head_dim]
-
-    assert fused_write_subpaged_layer_caches(k_cache, v_cache, slots, k, v)
-    expected_k = k.reshape(slots.numel(), num_heads, head_dim).to(torch.float8_e4m3fn)
-    expected_v = v.reshape(slots.numel(), num_heads, head_dim).to(torch.float8_e4m3fn)
-    for row, slot in enumerate(slots[:-1].tolist()):
-        page, logical_within = divmod(slot, 128)
-        subpage, within = divmod(logical_within, physical_page)
-        assert torch.equal(k_cache[page, subpage, :, within], expected_k[row])
-        assert torch.equal(v_cache[page, subpage, :, within], expected_v[row])
-    # The invalid row is masked and therefore cannot touch any cache location.
-    assert torch.count_nonzero(k_cache[2]).item() == 0
-    assert torch.count_nonzero(v_cache[2]).item() == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

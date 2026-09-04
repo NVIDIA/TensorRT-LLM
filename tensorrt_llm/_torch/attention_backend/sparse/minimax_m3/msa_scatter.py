@@ -72,61 +72,6 @@ def _fused_paged_scatter_kernel(
 
 
 @triton.jit
-def _fused_subpaged_scatter_kernel(
-    k_src,
-    v_src,
-    k_cache,
-    v_cache,
-    out_cache_loc,
-    k_src_row_stride,
-    v_src_row_stride,
-    kc_stride_page,
-    kc_stride_subpage,
-    kc_stride_head,
-    kc_stride_tok,
-    vc_stride_page,
-    vc_stride_subpage,
-    vc_stride_head,
-    vc_stride_tok,
-    logical_tokens_per_block,
-    physical_tokens_per_block,
-    H: tl.constexpr,
-    D: tl.constexpr,
-):
-    """Scatter FP8 K/V into P32 pages inside one logical P128 slot."""
-    t = tl.program_id(0).to(tl.int64)
-    slot = tl.load(out_cache_loc + t).to(tl.int64)
-    valid = slot >= 0
-    page = slot // logical_tokens_per_block
-    logical_within = slot % logical_tokens_per_block
-    subpage = logical_within // physical_tokens_per_block
-    within = logical_within % physical_tokens_per_block
-    d = tl.arange(0, D)
-    for h in tl.static_range(H):
-        src = t * k_src_row_stride + h * D + d
-        k_vals = tl.load(k_src + src)
-        v_vals = tl.load(v_src + t * v_src_row_stride + h * D + d)
-        k_dst = (
-            k_cache
-            + page * kc_stride_page
-            + subpage * kc_stride_subpage
-            + h * kc_stride_head
-            + within * kc_stride_tok
-            + d
-        )
-        v_dst = (
-            v_cache
-            + page * vc_stride_page
-            + subpage * vc_stride_subpage
-            + h * vc_stride_head
-            + within * vc_stride_tok
-            + d
-        )
-        tl.store(k_dst, k_vals.to(k_cache.dtype.element_ty), mask=valid)
-        tl.store(v_dst, v_vals.to(v_cache.dtype.element_ty), mask=valid)
-
-
-@triton.jit
 def _fused_nvfp4_paged_scatter_kernel(
     k_data_src,
     v_data_src,
@@ -320,62 +265,6 @@ def fused_write_layer_caches(
     return True
 
 
-def fused_write_subpaged_layer_caches(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-) -> bool:
-    """Write ordinary K/V into physical sub-pages of a logical cache block.
-
-    Hybrid M3 stores dense and shared-Eagle K/V as FP8 P32 pages while its
-    allocator and request lifecycle remain P128.  ``k_cache``/``v_cache`` are
-    ``[logical_slots, pages_per_role, heads, P32, D]`` zero-copy views.
-    """
-    if not (k.is_cuda and k_cache.is_cuda):
-        return False
-    if k_cache.dim() != 5 or v_cache.shape != k_cache.shape:
-        return False
-    if k_cache.stride(-1) != 1 or v_cache.stride(-1) != 1:
-        return False
-    _num_slots, pages_per_role, num_heads, physical_page, head_dim = k_cache.shape
-    if pages_per_role <= 0 or physical_page <= 0 or (head_dim & (head_dim - 1)) != 0:
-        return False
-    inner = num_heads * head_dim
-    k_stride = _row_stride_if_fusable(k, inner)
-    v_stride = _row_stride_if_fusable(v, inner)
-    if k_stride is None or v_stride is None:
-        return False
-    num_tokens = int(out_cache_loc.shape[0])
-    if num_tokens == 0:
-        return True
-
-    _fused_subpaged_scatter_kernel[(num_tokens,)](
-        k,
-        v,
-        k_cache,
-        v_cache,
-        out_cache_loc,
-        k_stride,
-        v_stride,
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        k_cache.stride(3),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        v_cache.stride(2),
-        v_cache.stride(3),
-        pages_per_role * physical_page,
-        physical_page,
-        H=num_heads,
-        D=head_dim,
-        num_warps=2,
-    )
-    return True
-
-
 def fused_write_layer_caches_nvfp4(
     k_data_cache: torch.Tensor,
     v_data_cache: torch.Tensor,
@@ -527,5 +416,4 @@ def fused_write_layer_caches_nvfp4(
 __all__ = [
     "fused_write_layer_caches",
     "fused_write_layer_caches_nvfp4",
-    "fused_write_subpaged_layer_caches",
 ]

@@ -203,11 +203,6 @@ def msa_paged_kv(kv_cache_manager, layer_idx: int) -> Tuple[torch.Tensor, torch.
     runtime and needs only each page's [page_size, head_dim] block to be
     contiguous, which this view satisfies, so no copy is required.
     """
-    if getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_idx):
-        raise RuntimeError(
-            "hybrid FP8 dense/Eagle cache is physically P32; use the direct "
-            "TRTLLM-Gen dense adapter instead of msa_paged_kv"
-        )
     buffers = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
     return buffers[:, 0], buffers[:, 1]
 
@@ -225,16 +220,6 @@ def write_msa_main_kv(
     resident before the sparse GQA runs. The write uses the head-major HND view
     so `msa_paged_kv` can return a zero-copy view.
     """
-    if getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_idx):
-        from .msa_scatter import fused_write_subpaged_layer_caches
-
-        k_view, v_view = kv_cache_manager.get_fp8_dense_buffers(layer_idx)
-        if not fused_write_subpaged_layer_caches(k_view, v_view, out_cache_loc, k, v):
-            raise RuntimeError(
-                "MiniMax-M3 hybrid FP8 dense/Eagle cache write requires CUDA "
-                "P32 sub-page views and contiguous K/V rows"
-            )
-        return
     buffers = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
     k_view, v_view = buffers[:, 0], buffers[:, 1]
     num_kv_heads = int(k_view.shape[1])
