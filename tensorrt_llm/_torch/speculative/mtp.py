@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -7,6 +10,7 @@ from tensorrt_llm._utils import prefer_pinned
 
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.llm_request import LlmRequest
+from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
@@ -254,6 +258,7 @@ class MTPWorker(SpecWorkerBase):
         self.mapping = mapping if mapping is not None else getattr(
             model_config, "mapping", None)
         self.is_thop = False
+        self._is_mamba_hybrid_cache = None
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if spec_config.sa_config is not None:
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
@@ -261,6 +266,30 @@ class MTPWorker(SpecWorkerBase):
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
+
+    def _commit_target_mamba_states(
+        self,
+        attn_metadata: AttentionMetadata,
+        num_accepted_tokens: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        """Promote the target state at each generation request's accepted depth.
+
+        Target verification writes intermediate GDN/Mamba states for every
+        candidate position. The next draft pass must start from the accepted
+        candidate, rather than the last (possibly rejected) position.
+        """
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        if self._is_mamba_hybrid_cache is None:
+            self._is_mamba_hybrid_cache = isinstance(
+                attn_metadata.kv_cache_manager, MambaHybridCacheManager)
+        if num_gens > 0 and self._is_mamba_hybrid_cache:
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices,
+            )
 
     def _forward_impl(
         self,
@@ -389,6 +418,17 @@ class MTPWorker(SpecWorkerBase):
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
+
+        # Keep the state written for accepted draft tokens, undo the rest.
+        # Must run before the draft pass below, which reads that state back.
+        self._commit_target_mamba_states(attn_metadata, num_accepted_tokens,
+                                         batch_size)
+        if self._auxiliary_state_handlers:
+            self.commit_auxiliary_speculative_states(
+                num_accepted_tokens,
+                attn_metadata.mamba_metadata.state_indices[:batch_size],
+                attn_metadata.num_contexts,
+            )
 
         # Update MTP past hidden states
         self.update_mtp_hidden_states(input_ids=input_ids,
