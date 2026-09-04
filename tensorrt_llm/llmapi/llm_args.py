@@ -59,10 +59,8 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  ContextChunkingPolicy as _ContextChunkingPolicy,
                                  DecodingConfig,
                                  DynamicBatchConfig as _DynamicBatchConfig,
-                                 ExecutorConfig as _ExecutorConfig,
                                  ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig,
                                  KvCacheConfig as _KvCacheConfig,
-                                 LookaheadDecodingConfig as _LookaheadDecodingConfig,
                                  PeftCacheConfig as _PeftCacheConfig,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
 from ..bindings.internal.algorithms import AgentTreeConfig as _AgentTreeConfig  # isort: skip
@@ -2169,29 +2167,6 @@ class LayerwiseBenchmarksConfig(StrictBaseModel):
         return self
 
 
-class MedusaDecodingConfig(DecodingBaseConfig):
-    decoding_type: Literal["Medusa"] = Field(default="Medusa")
-    medusa_choices: Optional[List[List[int]]] = Field(
-        default=None,
-        description=
-        "Tree structure for Medusa draft token generation. Each sublist represents a path in the tree where elements are token indices at each level. "
-        "For example, [[0], [0, 0], [1], [0, 1]] defines multiple branches.")
-    num_medusa_heads: Optional[int] = Field(
-        default=None,
-        description=
-        "Number of Medusa prediction heads to use. Each head predicts a draft token at a different position in parallel. "
-        "If not specified, defaults to the 'medusa_num_heads' value from the Medusa model's config.json."
-    )
-
-    @model_validator(mode="after")
-    def set_max_total_draft_tokens(self):
-        self.max_total_draft_tokens = self.max_draft_len  # Current Medusa only supports linear tree
-        return self
-
-    def supports_backend(self, backend: str) -> bool:
-        return backend not in ("pytorch", "_autodeploy")
-
-
 class EagleDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Eagle"] = Field(default="Eagle")
     eagle_choices: Optional[List[List[int]]] = Field(
@@ -3712,49 +3687,11 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
             lora_prefetch_dir=self.lora_prefetch_dir)
 
 
-@PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
-class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
-    """Configuration for lookahead speculative decoding."""
-
-    decoding_type: Literal["Lookahead"] = Field(default="Lookahead")
-    max_window_size: PositiveInt = Field(
-        default=_LookaheadDecodingConfig.get_default_lookahead_decoding_window(
-        ),
-        description="Number of NGrams in lookahead branch per step.")
-    max_ngram_size: PositiveInt = Field(
-        default=_LookaheadDecodingConfig.get_default_lookahead_decoding_ngram(),
-        description="Number of tokens per NGram.")
-    max_verification_set_size: PositiveInt = Field(
-        default=_LookaheadDecodingConfig.
-        get_default_lookahead_decoding_verification_set(),
-        description="Number of NGrams in verification branch per step.")
-
-    @model_validator(mode="after")
-    def set_max_total_draft_tokens(self):
-        self.max_total_draft_tokens = self.max_draft_len  # Current Lookahead only supports linear tree
-        return self
-
-    def calculate_speculative_resource(self):
-        return _LookaheadDecodingConfig.calculate_speculative_resource_tuple(
-            self.max_window_size, self.max_ngram_size,
-            self.max_verification_set_size)
-
-    def _to_pybind(self):
-        return _LookaheadDecodingConfig(self.max_window_size,
-                                        self.max_ngram_size,
-                                        self.max_verification_set_size)
-
-    def supports_backend(self, backend: str) -> bool:
-        return backend not in ("pytorch", "_autodeploy")
-
-
 SpeculativeConfig: TypeAlias = Annotated[
     Union[
         DraftTargetDecodingConfig,
         Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
         EagleDecodingConfig,
-        LookaheadDecodingConfig,
-        MedusaDecodingConfig,
         MTPDecodingConfig,
         NGramDecodingConfig,
         SADecodingConfig,
@@ -6666,15 +6603,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 "sampler_force_async_worker=True; the speculative path "
                 "bypasses the sampler's async D2H worker.")
         return self
-
-    def get_executor_config(
-        self,
-        _hf_model_dir: Optional[Path] = None,
-        tokenizer: Optional[TokenizerBase] = None,
-    ) -> _ExecutorConfig:
-        executor_config = super().get_executor_config(_hf_model_dir, tokenizer)
-        executor_config.mm_encoder_only = self.mm_encoder_only
-        return executor_config
 
 
 def update_llm_args_with_extra_dict(
