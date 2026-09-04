@@ -13,16 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import bisect
 import contextlib
 import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field, fields, is_dataclass
-from enum import Enum
-from typing import (TYPE_CHECKING, Dict, Iterator, List, NamedTuple, Optional,
-                    Set, Tuple)
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
 
 import torch
 
