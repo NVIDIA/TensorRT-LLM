@@ -5,15 +5,13 @@
 import hashlib
 import json
 
-import numpy as np
 import pytest
 import torch
 
 from tensorrt_llm._torch.speculative.dspark_planner import (
+    ExactSpsCostRow,
     ExactSpsCostTable,
     ExactSpsDrainGuard,
-    SpsCostTable,
-    compute_verify_token_budget,
     load_runtime_sps_cost_table,
     select_exact_sps_candidate,
     validate_sps_cost_table_payload,
@@ -53,152 +51,6 @@ def test_survival_is_cumulative_product():
     conf = torch.tensor([[0.9, 0.8, 0.5, 1.0, 1.0, 1.0, 1.0]])
     surv = compute_survival(conf)
     assert torch.allclose(surv[0, :3], torch.tensor([0.9, 0.72, 0.36]), atol=1e-6)
-
-
-# --------------------------------------------------------------------------
-# budget argmax
-# --------------------------------------------------------------------------
-
-
-def _brute_force_budget(survival, num_gen, table, min_len=1, max_len=None):
-    """Independent O(N) reimplementation used as the oracle for the argmax:
-    expected emitted tokens per millisecond over submitted-token cost."""
-    bs, blk = survival.shape
-    cap = min(max_len or blk, blk)
-    cand = np.sort(survival[:, min_len:cap].reshape(-1))[::-1]
-    base = num_gen + float(survival[:, :min_len].sum())
-    floor_tokens = bs * (min_len + 1)
-    best_n, best = 0, -np.inf
-    for n in range(cand.size + 1):
-        theta = (base + float(cand[:n].sum())) / table.step_time(floor_tokens + n, num_gen)
-        if theta > best:
-            best, best_n = theta, n
-    return best_n
-
-
-def test_budget_matches_brute_force_on_staircase():
-    """Theta is not unimodal on a staircase; a greedy first-descent scan is wrong."""
-    rng = np.random.default_rng(7)
-    # A cost curve with genuine shelves and risers.
-    table = SpsCostTable(
-        token_counts=(0, 64, 128, 192, 256, 320),
-        step_time_ms=(4.0, 4.05, 6.5, 6.55, 9.0, 9.05),
-    )
-    for trial in range(25):
-        bs = int(rng.integers(1, 40))
-        conf = rng.uniform(0.55, 0.99, size=(bs, BLOCK))
-        surv = np.cumprod(conf, axis=1)
-        got = compute_verify_token_budget(survival=surv, num_gen_requests=bs, cost_table=table)
-        want = _brute_force_budget(surv, bs, table)
-        assert got == want, f"trial {trial}: bs={bs} got={got} want={want}"
-
-
-def test_flat_cost_table_degenerates_to_verify_all():
-    """A flat cost model makes every token free -> spend the whole budget."""
-    table = SpsCostTable.flat(2.0)
-    assert table.is_flat
-    surv = np.cumprod(np.full((6, BLOCK), 0.9), axis=1)
-    budget = compute_verify_token_budget(survival=surv, num_gen_requests=6, cost_table=table)
-    assert budget == 6 * (BLOCK - 1)
-    # An empty batch has no candidates to buy, whatever the table says.
-    assert (
-        compute_verify_token_budget(
-            survival=np.zeros((0, BLOCK)), num_gen_requests=0, cost_table=table
-        )
-        == 0
-    )
-
-
-def test_cost_table_interpolates_between_breakpoints():
-    """The consumer contract is clamped linear interpolation, not a floor;
-    a shelf is only flat if the table measured it as two equal breakpoints."""
-    table = SpsCostTable(token_counts=(0, 100), step_time_ms=(1.0, 5.0))
-    assert table.step_time(99) > table.step_time(1)
-    assert table.step_time(50) == pytest.approx(3.0)
-    # A measured shelf stays flat under interpolation.
-    shelf = SpsCostTable(token_counts=(0, 99, 100), step_time_ms=(1.0, 1.0, 5.0))
-    assert shelf.step_time(1) == shelf.step_time(99)
-    # Above the last breakpoint we clamp rather than extrapolate.
-    assert table.step_time(10_000) == table.step_time(100)
-
-
-def test_cost_table_rejects_malformed_input():
-    with pytest.raises(ValueError, match="strictly increasing"):
-        SpsCostTable(token_counts=(0, 0), step_time_ms=(1.0, 2.0))
-    with pytest.raises(ValueError, match="same length"):
-        SpsCostTable(token_counts=(0, 1), step_time_ms=(1.0,))
-    with pytest.raises(ValueError, match="positive"):
-        SpsCostTable(token_counts=(0,), step_time_ms=(0.0,))
-    with pytest.raises(ValueError, match="minimum_predicted_gain"):
-        SpsCostTable(token_counts=(0,), step_time_ms=(1.0,), minimum_predicted_gain=-0.01)
-
-
-def test_minimum_gain_guard_falls_back_to_full_budget():
-    """A noise-sized compact advantage must preserve ordinary full K."""
-    bs, block = 4, 5
-    survival = np.ones((bs, block), dtype=np.float64)
-    table = SpsCostTable(
-        token_counts=(2 * bs, bs * (block + 1)),
-        step_time_ms=(3.3, 10.0),
-        minimum_predicted_gain=0.02,
-    )
-
-    assert compute_verify_token_budget(
-        survival=survival,
-        num_gen_requests=bs,
-        cost_table=table,
-        min_verify_len=1,
-        max_verify_len=block,
-        allowed_lens=[1, block],
-    ) == bs * (block - 1)
-    assert compute_verify_token_budget(
-        survival=survival,
-        num_gen_requests=bs,
-        cost_table=table,
-        min_verify_len=1,
-        max_verify_len=block,
-    ) == bs * (block - 1)
-
-
-def test_minimum_gain_threshold_edge_keeps_compact_candidate():
-    survival = np.ones((1, 2), dtype=np.float64)
-    at_threshold = SpsCostTable(
-        token_counts=(2, 3),
-        step_time_ms=(1.6, 3.0),
-        minimum_predicted_gain=0.25,
-    )
-    above_threshold = SpsCostTable(
-        token_counts=(2, 3),
-        step_time_ms=(1.6, 3.0),
-        minimum_predicted_gain=0.250001,
-    )
-
-    assert (
-        compute_verify_token_budget(
-            survival=survival,
-            num_gen_requests=1,
-            cost_table=at_threshold,
-            allowed_lens=[1, 2],
-        )
-        == 0
-    )
-    assert (
-        compute_verify_token_budget(
-            survival=survival,
-            num_gen_requests=1,
-            cost_table=at_threshold,
-        )
-        == 0
-    )
-    assert (
-        compute_verify_token_budget(
-            survival=survival,
-            num_gen_requests=1,
-            cost_table=above_threshold,
-            allowed_lens=[1, 2],
-        )
-        == 1
-    )
 
 
 def _multi_g_sps_payload():
@@ -280,25 +132,25 @@ def test_exact_cost_table_never_interpolates(tmp_path):
 
 
 def test_exact_cost_table_rejects_fractional_programmatic_cells():
-    table = SpsCostTable(token_counts=(0, 704), step_time_ms=(8.0, 7.0))
+    table = ExactSpsCostRow(token_counts=(0, 704), step_time_ms=(8.0, 7.0))
     with pytest.raises(TypeError, match="graph batch size"):
         ExactSpsCostTable(tables={128.5: table}, max_draft_len=5)
     with pytest.raises(TypeError, match="measured verifier budget"):
         ExactSpsCostTable(
-            tables={128: SpsCostTable(token_counts=(0, 704.5), step_time_ms=(8.0, 7.0))},
+            tables={128: ExactSpsCostRow(token_counts=(0, 704.5), step_time_ms=(8.0, 7.0))},
             max_draft_len=5,
         )
     with pytest.raises(ValueError, match="V=0 native static K5"):
         ExactSpsCostTable(
-            tables={128: SpsCostTable(token_counts=(704,), step_time_ms=(7.0,))},
+            tables={128: ExactSpsCostRow(token_counts=(704,), step_time_ms=(7.0,))},
             max_draft_len=5,
         )
 
 
 def test_exact_cost_table_identity_covers_grid_costs_and_policy():
     tables = {
-        64: SpsCostTable(token_counts=(0, 352), step_time_ms=(5.0, 4.5)),
-        128: SpsCostTable(token_counts=(0, 704), step_time_ms=(8.0, 7.0)),
+        64: ExactSpsCostRow(token_counts=(0, 352), step_time_ms=(5.0, 4.5)),
+        128: ExactSpsCostRow(token_counts=(0, 704), step_time_ms=(8.0, 7.0)),
     }
     first = ExactSpsCostTable(tables=tables, max_draft_len=5, minimum_predicted_gain=0.02)
     reordered = ExactSpsCostTable(
@@ -309,7 +161,7 @@ def test_exact_cost_table_identity_covers_grid_costs_and_policy():
     changed_cost = ExactSpsCostTable(
         tables={
             **tables,
-            128: SpsCostTable(token_counts=(0, 704), step_time_ms=(8.0, 7.1)),
+            128: ExactSpsCostRow(token_counts=(0, 704), step_time_ms=(8.0, 7.1)),
         },
         max_draft_len=5,
         minimum_predicted_gain=0.02,
@@ -341,7 +193,7 @@ def test_iteration_drain_guard_rejects_invalid_or_unmeasured_metadata():
 
     with pytest.raises(ValueError, match="measured native tail table for G=16"):
         ExactSpsCostTable(
-            tables={128: SpsCostTable(token_counts=(0,), step_time_ms=(8.0,))},
+            tables={128: ExactSpsCostRow(token_counts=(0,), step_time_ms=(8.0,))},
             max_draft_len=5,
             iteration_drain_guard=_drain_guard(tail_graph_batch_size=16),
         )
@@ -351,15 +203,14 @@ def test_iteration_drain_guard_rejects_invalid_or_unmeasured_metadata():
 def test_exact_cost_table_direct_construction_bounds_positive_cells(invalid_budget):
     with pytest.raises(ValueError, match=r"G <= V <= G\*\(K\+1\)"):
         ExactSpsCostTable(
-            tables={128: SpsCostTable(token_counts=(0, invalid_budget), step_time_ms=(8.0, 7.0))},
+            tables={
+                128: ExactSpsCostRow(token_counts=(0, invalid_budget), step_time_ms=(8.0, 7.0))
+            },
             max_draft_len=5,
         )
 
 
-def test_runtime_loader_keeps_legacy_cost_table_interpolation(tmp_path):
-    direct = SpsCostTable(token_counts=(0, 100), step_time_ms=(1.0, 5.0))
-    assert direct.minimum_predicted_gain == 0.0
-
+def test_runtime_loader_rejects_legacy_cost_curve(tmp_path):
     path = tmp_path / "legacy.json"
     path.write_text(
         json.dumps(
@@ -371,23 +222,12 @@ def test_runtime_loader_keeps_legacy_cost_table_interpolation(tmp_path):
         )
     )
 
-    table, _ = load_runtime_sps_cost_table(path, graph_batch_sizes=[64, 128], max_draft_len=5)
-
-    assert isinstance(table, SpsCostTable)
-    assert table.step_time(50) == pytest.approx(3.0)
-    assert table.minimum_predicted_gain == pytest.approx(0.01)
-
-    path.write_text(
-        json.dumps(
-            {
-                "token_counts": [0, 100],
-                "step_time_ms": [1.0, 5.0],
-                "minimum_predicted_gain": 0.03,
-            }
+    with pytest.raises(ValueError, match="schema_version=2"):
+        load_runtime_sps_cost_table(
+            path,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
         )
-    )
-    table, _ = load_runtime_sps_cost_table(path, graph_batch_sizes=[64, 128], max_draft_len=5)
-    assert table.minimum_predicted_gain == pytest.approx(0.03)
 
 
 def test_exact_cost_table_loader_requires_schema_v2(tmp_path):
@@ -425,7 +265,7 @@ def test_runtime_exact_loader_requires_independent_fingerprint_file(tmp_path):
 
 
 @pytest.mark.parametrize("marker", ["engine_fingerprint", "measurements"])
-def test_v2_markers_cannot_downgrade_to_legacy(tmp_path, marker):
+def test_partial_v2_payload_cannot_bypass_schema_validation(tmp_path, marker):
     exact_payload = _multi_g_sps_payload()
     mixed_payload = {
         "token_counts": [0, 100],
@@ -686,7 +526,7 @@ def test_schema_v2_rejects_fractional_graph_key(tmp_path):
 
 def test_exact_selector_keeps_native_on_tie_or_below_threshold():
     table = ExactSpsCostTable(
-        tables={128: SpsCostTable(token_counts=(0, 704), step_time_ms=(10.0, 8.0))},
+        tables={128: ExactSpsCostRow(token_counts=(0, 704), step_time_ms=(10.0, 8.0))},
         max_draft_len=5,
         minimum_predicted_gain=0.02,
         iteration_drain_guard=_drain_guard(),
@@ -734,7 +574,7 @@ def test_exact_selector_keeps_native_on_tie_or_below_threshold():
 
 def test_exact_selector_fails_closed_without_iteration_drain_metadata():
     table = ExactSpsCostTable(
-        tables={128: SpsCostTable(token_counts=(0, 512), step_time_ms=(100.0, 80.0))},
+        tables={128: ExactSpsCostRow(token_counts=(0, 512), step_time_ms=(100.0, 80.0))},
         max_draft_len=5,
         minimum_predicted_gain=0.0,
     )
@@ -756,8 +596,8 @@ def test_exact_selector_fails_closed_without_iteration_drain_metadata():
 def test_exact_selector_applies_strict_iteration_drain_group_value():
     table = ExactSpsCostTable(
         tables={
-            16: SpsCostTable(token_counts=(0,), step_time_ms=(40.0,)),
-            128: SpsCostTable(token_counts=(0, 512), step_time_ms=(100.0, 80.0)),
+            16: ExactSpsCostRow(token_counts=(0,), step_time_ms=(40.0,)),
+            128: ExactSpsCostRow(token_counts=(0, 512), step_time_ms=(100.0, 80.0)),
         },
         max_draft_len=5,
         minimum_predicted_gain=0.0,
@@ -798,7 +638,7 @@ def test_exact_selector_applies_strict_iteration_drain_group_value():
 def test_exact_selector_reranks_every_g_by_guarded_group_value(graph_batch_size):
     table = ExactSpsCostTable(
         tables={
-            graph_batch_size: SpsCostTable(
+            graph_batch_size: ExactSpsCostRow(
                 token_counts=(
                     0,
                     3 * graph_batch_size,
@@ -844,10 +684,10 @@ def test_exact_selector_fails_closed_without_measured_compact_cell():
     graph_batch_size = 32
     table = ExactSpsCostTable(
         tables={
-            16: SpsCostTable(token_counts=(0,), step_time_ms=(40.0,)),
-            32: SpsCostTable(token_counts=(0,), step_time_ms=(55.0,)),
-            64: SpsCostTable(token_counts=(0,), step_time_ms=(70.0,)),
-            128: SpsCostTable(token_counts=(0, 512), step_time_ms=(100.0, 80.0)),
+            16: ExactSpsCostRow(token_counts=(0,), step_time_ms=(40.0,)),
+            32: ExactSpsCostRow(token_counts=(0,), step_time_ms=(55.0,)),
+            64: ExactSpsCostRow(token_counts=(0,), step_time_ms=(70.0,)),
+            128: ExactSpsCostRow(token_counts=(0, 512), step_time_ms=(100.0, 80.0)),
         },
         max_draft_len=5,
         minimum_predicted_gain=0.0,
@@ -868,7 +708,7 @@ def test_exact_selector_fails_closed_without_measured_compact_cell():
 
 def test_exact_production_candidates_exclude_full_ragged_control():
     table = ExactSpsCostTable(
-        tables={128: SpsCostTable(token_counts=(0, 704, 768), step_time_ms=(8.0, 7.0, 8.1))},
+        tables={128: ExactSpsCostRow(token_counts=(0, 704, 768), step_time_ms=(8.0, 7.0, 8.1))},
         max_draft_len=5,
     )
     assert table.candidate_budgets(128) == (704, 768)
@@ -880,7 +720,7 @@ def test_exact_table_limits_compact_graph_cells_per_g():
     with pytest.raises(ValueError, match="compact V cells per G"):
         ExactSpsCostTable(
             tables={
-                128: SpsCostTable(
+                128: ExactSpsCostRow(
                     token_counts=(0, 128, 256, 384, 512, 640),
                     step_time_ms=(8.0, 7.9, 7.8, 7.7, 7.6, 7.5),
                 )

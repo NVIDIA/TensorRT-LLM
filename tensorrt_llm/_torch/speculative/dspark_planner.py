@@ -12,23 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DSpark verification-budget planner: how many tokens are worth verifying.
-
-The scheduler maximizes *system* goodput::
-
-    tau(n)   = num_gen_requests + sum of the n largest prefix-survival values
-    Theta(n) = tau(n) / step_cost_ms(num_gen_requests + n)
-    budget   = argmax_n Theta(n)
-
-Invariants: take the GLOBAL argmax (marginal cost is a staircase, so ``Theta``
-is not unimodal and a first-descent stop parks on the first shelf); cost is
-per step, indexed by the TOTAL verified token count including the bonus
-position (a request verifying ``L`` drafts submits ``L + 1`` tokens); and
-``Theta`` is a ratio, so the non-trimmable ``bias + alpha(bs)`` terms do not
-cancel -- they must be supplied, not guessed (see :class:`SpsCostTable`). The
-planner runs on the host because its output selects a CUDA graph, a host
-decision.
-"""
+"""Authenticated DSpark verification costs and exact ``(G, V)`` selection."""
 
 import hashlib
 import json
@@ -44,61 +28,20 @@ _MAX_EXACT_COMPACT_CELLS_TOTAL = 32
 
 __all__ = [
     "ExactSpsDrainGuard",
+    "ExactSpsCostRow",
     "ExactSpsCostTable",
-    "SpsCostTable",
     "load_runtime_sps_cost_table",
     "select_exact_sps_candidate",
     "validate_sps_cost_table_payload",
-    "compute_verify_token_budget",
-    "total_verify_tokens",
 ]
 
 
-def total_verify_tokens(num_requests: int, verify_len: int) -> int:
-    """Tokens the target scores for ``num_requests`` each verifying ``verify_len`` drafts.
-
-    One bonus/anchor token per request plus its drafted positions. This is the
-    unit :class:`SpsCostTable` is indexed by; the single place it is computed so
-    the planner and the tier derivation cannot drift apart.
-    """
-    return int(num_requests) * (int(verify_len) + 1)
-
-
 @dataclass(frozen=True)
-class SpsCostTable:
-    """Measured decode step time as a function of total verified tokens.
-
-    Attributes:
-        token_counts: strictly increasing total-token breakpoints, in
-            :func:`total_verify_tokens` units (bonus tokens included).
-        step_time_ms: measured ``theta(M)`` at each breakpoint.
-        fixed_overhead_ms: the ``bias`` term -- per-step cost that trimming
-            cannot touch -- if not already inside ``step_time_ms``.
-            Understating the non-trimmable terms makes the planner over-trim:
-            ``tau / T`` is a ratio, so they do not cancel.
-        batch_sizes / batch_overhead_ms: optional ``alpha(bs)`` breakpoints --
-            the batch-size-dependent, non-trimmable part of the step.
-        minimum_predicted_gain: a compact candidate must beat full K by at
-            least this relative goodput margin. Runtime profiler artifacts
-            default it to one percent so calibration and timing noise resolve
-            to the native full-K path instead of an unproven trim.
-
-    Lookup is a clamped linear interpolation between breakpoints; a flat shelf
-    must be MEASURED as two breakpoints with equal values (a floor lookup makes
-    tokens look free right before a riser and the argmax over-spends). Queries
-    outside the measured range clamp to the end values; callers must bound the
-    budget so the high clamp does not happen silently.
-    """
+class ExactSpsCostRow:
+    """Direct whole-step measurements for one rank-local graph size ``G``."""
 
     token_counts: Sequence[int]
     step_time_ms: Sequence[float]
-    fixed_overhead_ms: float = 0.0
-    batch_sizes: Sequence[int] = field(default_factory=tuple)
-    batch_overhead_ms: Sequence[float] = field(default_factory=tuple)
-    # Direct constructors (primarily unit tests and offline analysis) retain
-    # the mathematical argmax by default. Runtime-loaded profiler artifacts
-    # supply a conservative non-zero guard; see ``DSparkWorker``.
-    minimum_predicted_gain: float = 0.0
 
     def __post_init__(self) -> None:
         if len(self.token_counts) != len(self.step_time_ms):
@@ -107,63 +50,19 @@ class SpsCostTable:
                 f"({len(self.step_time_ms)}) must have the same length"
             )
         if not self.token_counts:
-            raise ValueError("SpsCostTable requires at least one measured point")
-        if any(b <= a for a, b in zip(self.token_counts, self.token_counts[1:])):
+            raise ValueError("ExactSpsCostRow requires at least one measured point")
+        token_counts = tuple(
+            _require_exact_int(value, field="measured verifier budget", minimum=0)
+            for value in self.token_counts
+        )
+        step_time_ms = tuple(
+            _require_positive_finite_number(value, field="SPS step time")
+            for value in self.step_time_ms
+        )
+        if any(b <= a for a, b in zip(token_counts, token_counts[1:])):
             raise ValueError("token_counts must be strictly increasing")
-        if any(not math.isfinite(t) or t <= 0.0 for t in self.step_time_ms):
-            raise ValueError("step_time_ms entries must be positive and finite")
-        if not math.isfinite(self.fixed_overhead_ms) or self.fixed_overhead_ms < 0.0:
-            raise ValueError("fixed_overhead_ms must be >= 0 and finite")
-        if len(self.batch_sizes) != len(self.batch_overhead_ms):
-            raise ValueError(
-                f"batch_sizes ({len(self.batch_sizes)}) and batch_overhead_ms "
-                f"({len(self.batch_overhead_ms)}) must have the same length"
-            )
-        if any(b <= a for a, b in zip(self.batch_sizes, self.batch_sizes[1:])):
-            raise ValueError("batch_sizes must be strictly increasing")
-        if any(not math.isfinite(t) or t < 0.0 for t in self.batch_overhead_ms):
-            raise ValueError("batch_overhead_ms entries must be >= 0 and finite")
-        if not math.isfinite(self.minimum_predicted_gain) or self.minimum_predicted_gain < 0.0:
-            raise ValueError("minimum_predicted_gain must be >= 0 and finite")
-
-    def batch_overhead(self, num_requests: int) -> float:
-        """``alpha(num_requests)`` -- 0.0 when the table has no batch axis."""
-        if not self.batch_sizes:
-            return 0.0
-        return float(
-            np.interp(
-                float(num_requests),
-                np.asarray(self.batch_sizes, dtype=np.float64),
-                np.asarray(self.batch_overhead_ms, dtype=np.float64),
-            )
-        )
-
-    def step_time(self, num_tokens: int, num_requests: int = 0) -> float:
-        """``bias + alpha(num_requests) + theta(num_tokens)``, in ms."""
-        return float(self.step_times(np.asarray([int(num_tokens)]), num_requests)[0])
-
-    def step_times(self, num_tokens: np.ndarray, num_requests: int = 0) -> np.ndarray:
-        """Vectorized :meth:`step_time` over a token-count array."""
-        theta = np.interp(
-            np.asarray(num_tokens, dtype=np.float64),
-            np.asarray(self.token_counts, dtype=np.float64),
-            np.asarray(self.step_time_ms, dtype=np.float64),
-        )
-        return theta + self.fixed_overhead_ms + self.batch_overhead(num_requests)
-
-    @classmethod
-    def flat(cls, step_time_ms: float = 1.0) -> "SpsCostTable":
-        """Explicit "not profiled" marker: every extra token looks free, so
-        the planner degenerates to verify-all. Callers should warn rather than
-        silently ship this."""
-        return cls(token_counts=(0,), step_time_ms=(float(step_time_ms),))
-
-    @property
-    def is_flat(self) -> bool:
-        """Whether the trimmable term ``theta(M)`` is constant. ``bias`` and
-        ``alpha(bs)`` are identical for every candidate length, so variation
-        there cannot distinguish lengths."""
-        return len(set(self.step_time_ms)) <= 1
+        object.__setattr__(self, "token_counts", token_counts)
+        object.__setattr__(self, "step_time_ms", step_time_ms)
 
 
 @dataclass(frozen=True)
@@ -237,12 +136,11 @@ class ExactSpsCostTable:
     the mandatory fallback comparator and is never a ragged capture bucket.
     Every positive cell must fit the physical verifier window
     ``G <= V <= G * (max_draft_len + 1)``.
-    Unlike :class:`SpsCostTable`, no interpolation is permitted on either
-    axis: an unmeasured graph shape is a configuration error rather than an
-    estimate.
+    No interpolation is permitted on either axis: an unmeasured graph shape
+    is a configuration error rather than an estimate.
     """
 
-    tables: dict[int, SpsCostTable]
+    tables: dict[int, ExactSpsCostRow]
     max_draft_len: int
     minimum_predicted_gain: float = 0.01
     iteration_drain_guard: Optional[ExactSpsDrainGuard] = None
@@ -250,7 +148,7 @@ class ExactSpsCostTable:
 
     def __post_init__(self) -> None:
         max_draft_len = _require_exact_int(self.max_draft_len, field="max_draft_len", minimum=1)
-        normalized: dict[int, SpsCostTable] = {}
+        normalized: dict[int, ExactSpsCostRow] = {}
         for graph_batch_size, table in self.tables.items():
             canonical_graph_batch_size = _require_exact_int(
                 graph_batch_size, field="graph batch size", minimum=1
@@ -260,8 +158,8 @@ class ExactSpsCostTable:
             normalized[canonical_graph_batch_size] = table
         if not normalized:
             raise ValueError("ExactSpsCostTable requires at least one graph batch size")
-        if any(not isinstance(table, SpsCostTable) for table in normalized.values()):
-            raise TypeError("ExactSpsCostTable values must be SpsCostTable instances")
+        if any(not isinstance(table, ExactSpsCostRow) for table in normalized.values()):
+            raise TypeError("ExactSpsCostTable values must be ExactSpsCostRow instances")
         for graph_batch_size, table in normalized.items():
             budgets = tuple(
                 _require_exact_int(value, field="measured verifier budget", minimum=0)
@@ -359,7 +257,7 @@ class ExactSpsCostTable:
             for offset in range(0, len(self.identity_sha256), 8)
         )
 
-    def for_graph_batch_size(self, num_requests: int) -> SpsCostTable:
+    def for_graph_batch_size(self, num_requests: int) -> ExactSpsCostRow:
         """Return the directly measured V cells for one exact G."""
         graph_batch_size = _require_exact_int(num_requests, field="graph batch size", minimum=1)
         try:
@@ -427,11 +325,6 @@ class ExactSpsCostTable:
             if verifier_budget < full_budget
         )
 
-    @property
-    def is_flat(self) -> bool:
-        """Whether every measured G curve has constant step time."""
-        return all(table.is_flat for table in self.tables.values())
-
 
 def _read_sps_cost_payload(path: str | Path) -> dict[str, object]:
     with Path(path).open(encoding="utf-8") as file:
@@ -441,40 +334,18 @@ def _read_sps_cost_payload(path: str | Path) -> dict[str, object]:
     return payload
 
 
-def _is_exact_sps_payload(payload: dict[str, object]) -> bool:
-    return bool(_V2_MARKER_FIELDS.intersection(payload))
-
-
-def _build_legacy_sps_cost_table(
-    payload: dict[str, object],
-) -> SpsCostTable:
-    return SpsCostTable(
-        token_counts=tuple(int(value) for value in payload["token_counts"]),
-        step_time_ms=tuple(float(value) for value in payload["step_time_ms"]),
-        fixed_overhead_ms=float(payload.get("fixed_overhead_ms", 0.0)),
-        batch_sizes=tuple(int(value) for value in payload.get("batch_sizes", ())),
-        batch_overhead_ms=tuple(float(value) for value in payload.get("batch_overhead_ms", ())),
-        minimum_predicted_gain=float(payload.get("minimum_predicted_gain", 0.01)),
-    )
-
-
 def load_runtime_sps_cost_table(
     path: str | Path,
     *,
     graph_batch_sizes: Sequence[int],
     max_draft_len: int,
     live_engine_fingerprint_path: str | Path | None = None,
-) -> tuple[SpsCostTable | ExactSpsCostTable, dict[str, object]]:
-    """Load a legacy curve or an authenticated exact ``T(G,V)`` table.
-
-    Exact schema-v2 tables need an independently generated live-runtime
-    fingerprint. Keeping that seal in a separate file prevents the cost
-    artifact from authenticating itself while still allowing legacy profiler
-    curves to load unchanged.
-    """
+) -> tuple[ExactSpsCostTable, dict[str, object]]:
+    """Load an authenticated schema-v2 exact ``T(G,V)`` table."""
     payload = _read_sps_cost_payload(path)
-    if not _is_exact_sps_payload(payload):
-        return _build_legacy_sps_cost_table(payload), payload
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version != 2:
+        raise ValueError("Exact SPS cost artifacts require schema_version=2")
     if live_engine_fingerprint_path is None:
         raise ValueError(
             "Schema-v2 exact SPS artifacts require an independently generated "
@@ -497,11 +368,11 @@ def _build_exact_sps_cost_table(
 ) -> ExactSpsCostTable:
     exact_tables = payload["cost_tables"]
     assert isinstance(exact_tables, dict)
-    parsed_tables: dict[int, SpsCostTable] = {}
+    parsed_tables: dict[int, ExactSpsCostRow] = {}
     for graph_batch_size, exact_payload in exact_tables.items():
         canonical_graph_batch_size = _parse_graph_batch_size_key(graph_batch_size)
         assert isinstance(exact_payload, dict)
-        parsed_tables[canonical_graph_batch_size] = SpsCostTable(
+        parsed_tables[canonical_graph_batch_size] = ExactSpsCostRow(
             token_counts=tuple(
                 _require_json_int(value, field="rank-local verifier budget", minimum=0)
                 for value in exact_payload["token_counts"]
@@ -562,13 +433,6 @@ _V2_TOP_LEVEL_FIELDS = {
     "schema_version",
 }
 _V2_OPTIONAL_TOP_LEVEL_FIELDS = {"iteration_drain_guard"}
-_V2_MARKER_FIELDS = {
-    "cost_tables",
-    "engine_fingerprint",
-    "engine_fingerprint_sha256",
-    "measurements",
-    "schema_version",
-}
 _V2_TABLE_FIELDS = {"step_time_ms", "token_counts"}
 _V2_DRAIN_GUARD_FIELDS = {
     "loss_multiplier",
@@ -804,8 +668,7 @@ def validate_sps_cost_table_payload(
     Schema-v2 candidate budgets come directly from each per-G table. ``V=0``
     is required for every G and denotes the measured native static K5 path;
     positive V cells are arbitrary ragged candidates and need not be uniform
-    length multiples. Legacy artifacts continue to use the existing
-    verify-length configuration and interpolating loader.
+    length multiples. Other schemas are rejected.
 
     Args:
         payload: Parsed schema-v2 SPS artifact.
@@ -1120,85 +983,3 @@ def select_exact_sps_candidate(
             ),
         )
     )
-
-
-def compute_verify_token_budget(
-    *,
-    survival: np.ndarray,
-    num_gen_requests: int,
-    cost_table: SpsCostTable,
-    min_verify_len: int = 1,
-    max_verify_len: Optional[int] = None,
-    allowed_lens: Optional[Sequence[int]] = None,
-) -> int:
-    """Return the batch-wide verify-token budget (tokens *above* the floor).
-
-    Args:
-        survival: ``[bs, K]`` prefix-survival probabilities. Only the columns at
-            or beyond ``min_verify_len`` are schedulable; earlier positions are
-            already granted to every request.
-        num_gen_requests: generating requests this step. Each contributes one
-            guaranteed output token, which is the constant term of ``tau``.
-        cost_table: measured step cost; see :class:`SpsCostTable`.
-        min_verify_len / max_verify_len: per-request bounds, mirroring
-            :class:`~.dspark_schedule.DSparkScheduleConfig`.
-        allowed_lens: restrict the answer to budgets a captured tier can
-            realise (``n in {bs*(t - min_verify_len)}``). Pass it whenever the
-            result will be executed: any non-tier total is rounded UP to a
-            captured bucket, pushing a budget chosen inside a cost shelf back
-            over the riser it was avoiding.
-
-    Returns:
-        ``n`` maximizing ``tau(n) / step_cost(floor_tokens + n)``, in ``[0, N]``
-        where ``N`` is the number of schedulable candidates -- restricted to the
-        tier-aligned indices when ``allowed_lens`` is given.
-    """
-    if survival.ndim != 2:
-        raise ValueError(f"survival must be [bs, K], got shape {survival.shape}")
-    bs, block_size = survival.shape
-    cap = min(int(max_verify_len or block_size), block_size)
-    schedulable = max(cap - int(min_verify_len), 0)
-    if bs == 0 or num_gen_requests <= 0 or schedulable <= 0:
-        return 0
-
-    surv = np.asarray(survival, dtype=np.float64)
-    candidates = np.sort(surv[:, min_verify_len : min_verify_len + schedulable].reshape(-1))[::-1]
-    if candidates.size == 0:
-        return 0
-
-    # tau(n): one bonus token per request, plus the floor positions' survival
-    # (unbought but part of the yield -- omitting the constant moves the argmax
-    # of a ratio), plus the n admitted candidates best-first.
-    base = float(num_gen_requests) + float(surv[:, :min_verify_len].sum())
-    tau = base + np.concatenate(([0.0], np.cumsum(candidates)))
-    # Includes the bonus position: dropping it under-reports the batch by a
-    # whole ``bs``.
-    floor_tokens = total_verify_tokens(bs, min_verify_len)
-    tokens = floor_tokens + np.arange(tau.size)
-    theta = tau / cost_table.step_times(tokens, num_gen_requests)
-    if allowed_lens is None:
-        best = int(np.argmax(theta))
-        full = int(theta.size - 1)
-        if best != full and theta[best] < theta[full] * (1.0 + cost_table.minimum_predicted_gain):
-            return full
-        return best
-    # Tier-aligned: the same theta curve, evaluated only at totals the executor
-    # can land on -- n = bs*(t - min_verify_len) gives tokens = bs*(t+1)
-    # = total_verify_tokens(bs, t).
-    idx = sorted(
-        {
-            int(bs) * (int(t) - int(min_verify_len))
-            for t in allowed_lens
-            if int(min_verify_len) <= int(t) <= cap
-        }
-    )
-    idx = [n for n in idx if 0 <= n < theta.size]
-    if not idx:
-        return 0
-    best = int(max(idx, key=lambda n: (theta[n], n)))
-    full = int(bs) * (cap - int(min_verify_len))
-    if full in idx and (
-        best != full and theta[best] < theta[full] * (1.0 + cost_table.minimum_predicted_gain)
-    ):
-        return full
-    return best
