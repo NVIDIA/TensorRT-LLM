@@ -30,6 +30,7 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_minicpmv4_6.py
   - unittest/_torch/modeling/test_multimodal_encoder_mixin.py
   - unittest/_torch/sampler/test_token_ban.py
+  - unittest/_torch/sampler/test_in_graph_sampling.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
   - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py

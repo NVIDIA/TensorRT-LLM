@@ -26,6 +26,7 @@ Every op is ``@_compiler_disable``d to keep one clean Dynamo graph break per op
 instead of a per-call break from tracing flashinfer's lazy JIT bootstrap.
 """
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, Union, cast
 
 import torch
@@ -374,6 +375,40 @@ def sample_from_logits_op(
     if top_p is not None:
         return top_p_sampling_from_probs_op(probs, top_p, seed=seed, offset=offset)
     return sampling_from_probs_op(probs, seed=seed, offset=offset)
+
+
+def warmup_sample_from_logits_op(
+    vocab_size: int, device: torch.device, dtype: torch.dtype, batch_sizes: Iterable[int]
+) -> None:
+    """Compile ``sample_from_logits_op`` before any CUDA graph capture.
+
+    The op is ``torch.compile``d with static shape guards, so it recompiles per
+    row count. The fast sampling tier calls it inside ``torch.cuda.graph()``
+    capture, where compiling would allocate and synchronize, so warm every batch
+    size the graphs are captured for -- warming only one would leave the rest to
+    compile inside the capture region.
+
+    Best-effort, like ``warmup_sampling_module``: a failure here only means the
+    compile happens later, at the real call site.
+    """
+    if not IS_FLASHINFER_AVAILABLE:
+        return
+    try:
+        for rows in sorted(set(batch_sizes)):
+            logits = torch.zeros((rows, vocab_size), device=device, dtype=dtype)
+            temperatures = torch.ones(rows, device=device, dtype=torch.float32)
+            # Non-neutral filters, so the compiled graph covers the branches a
+            # real fast-tier batch takes.
+            top_ks = torch.full((rows,), 50, device=device, dtype=torch.int32)
+            top_ps = torch.full((rows,), 0.9, device=device, dtype=torch.float32)
+            seeds = torch.zeros(rows, device=device, dtype=torch.int64)
+            offsets = torch.zeros(rows, device=device, dtype=torch.int64)
+            sample_from_logits_op(logits, temperatures, top_ks, top_ps, seed=seeds, offset=offsets)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "sample_from_logits_op prewarm failed; it will be compiled "
+            f"lazily on first use. {type(e).__name__}: {e}"
+        )
 
 
 @_compiler_disable
