@@ -17,7 +17,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -29,11 +28,8 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
 
 from .common import get_mmlu_accuracy, venv_check_call
 from .conftest import (get_device_count, get_sm_version, llm_models_root,
-                       skip_no_sm120, skip_post_blackwell, skip_pre_ada,
-                       skip_pre_blackwell, skip_pre_hopper, tests_path,
-                       unittest_path)
-
-sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
+                       skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
+                       skip_pre_hopper, unittest_path)
 
 _MEM_FRACTION_50 = 0.5
 _MEM_FRACTION_80 = 0.8
@@ -243,24 +239,6 @@ class BenchRunner:
                     )
 
         return result
-
-
-@pytest.mark.parametrize("model_name", ["meta-llama/Meta-Llama-3-8B-Instruct"],
-                         ids=["llama3-8b"])
-@pytest.mark.parametrize("model_subdir",
-                         ["llama-models-v3/llama-v3-8b-instruct-hf"],
-                         ids=["llama-v3"])
-@pytest.mark.parametrize("use_pytorch_backend", [True], ids=["pytorch_backend"])
-def test_trtllm_bench_llmapi_launch(llm_root, llm_venv, model_name,
-                                    model_subdir, use_pytorch_backend):
-    runner = BenchRunner(llm_root=llm_root,
-                         llm_venv=llm_venv,
-                         model_name=model_name,
-                         model_subdir=model_subdir,
-                         streaming=False,
-                         use_mpirun=True,
-                         tp_size=2)
-    runner()
 
 
 @pytest.mark.parametrize(
@@ -904,12 +882,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Llama3.1-8B-FP8',
                  'llama-3.1-model/Llama-3.1-8B-Instruct-FP8',
                  marks=skip_pre_hopper),
-    pytest.param('Nemotron-Super-49B-v1-NVFP4',
-                 'nvfp4-quantized/Llama-3_3-Nemotron-Super-49B-v1_nvfp4_hf',
-                 marks=skip_pre_hopper),
-    pytest.param('Nemotron-Super-49B-v1-FP8',
-                 'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8',
-                 marks=skip_pre_hopper),
     pytest.param('Qwen3-30B-A3B',
                  'Qwen3/Qwen3-30B-A3B',
                  marks=pytest.mark.skip_less_device_memory(80000)),
@@ -921,16 +893,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
         'Qwen3-30B-A3B_nvfp4_hf',
         'Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf',
         marks=(skip_pre_blackwell, pytest.mark.skip_less_device_memory(20000))),
-    pytest.param(
-        'Llama3.3-70B-FP8',
-        'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8',
-        marks=(skip_pre_blackwell, pytest.mark.skip_less_device_memory(96000))),
-    pytest.param('Llama3.3-70B-FP4',
-                 'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4',
-                 marks=skip_pre_blackwell),
-    pytest.param('Nemotron-Super-49B-v1-BF16',
-                 'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1',
-                 marks=skip_pre_blackwell),
     pytest.param('GPT-OSS-20B', 'gpt_oss/gpt-oss-20b',
                  marks=skip_pre_blackwell),
     pytest.param(
@@ -955,12 +917,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
                  'Qwen3/nvidia-Qwen3-32B-NVFP4',
                  marks=skip_pre_blackwell),
     ("Qwen3-32B-bf16", "Qwen3/Qwen3-32B"),
-    pytest.param('Nemotron-Super-49B-v1.5-FP8',
-                 'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1_5-FP8',
-                 marks=skip_pre_hopper),
-    pytest.param('Llama-4-Scout-17B-16E-FP4',
-                 'llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4',
-                 marks=skip_pre_blackwell),
     pytest.param('Nemotron-Nano-9B-v2-nvfp4',
                  'NVIDIA-Nemotron-Nano-9B-v2-NVFP4',
                  marks=skip_pre_blackwell),
@@ -991,10 +947,6 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
         ]
         if "Qwen3" in model_name:
             cmds.append("--kv_cache_fraction=0.6")
-        if "Llama3.3-70B" in model_name:
-            cmds.append("--max_num_tokens=1024")
-        if "Llama-4" in model_name:
-            cmds.append("--max_seq_len=8192")
         llm_venv.run_cmd(cmds)
 
 
@@ -1414,10 +1366,6 @@ def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path,gpu_count", [
-    pytest.param('Nemotron-Ultra-253B',
-                 'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
-                 8,
-                 marks=(skip_pre_hopper, pytest.mark.timeout(12600))),
     pytest.param('DeepSeek-V3-671B-FP8',
                  'DeepSeek-V3-0324',
                  8,
@@ -1430,13 +1378,7 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
     if gpu_count > get_device_count():
         pytest.skip(f"Not enough GPUs for {model_name}")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    mapping = {
-        "Llama3.1-70B-BF16": 24.6,
-        "Llama3.1-70B-FP8": 58.5,
-        "Llama3.1-405B-FP8": 63.2,
-        "Nemotron-Ultra-253B": 72.3,
-        "DeepSeek-V3-671B-FP8": 83.8
-    }
+    mapping = {"DeepSeek-V3-671B-FP8": 83.8}
     llm_venv.run_cmd([
         str(example_root / "quickstart_advanced.py"),
         "--enable_chunked_prefill",
@@ -1448,51 +1390,12 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
     ])
 
 
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("cuda_graph", [False, True])
-@pytest.mark.parametrize("tp_size, pp_size", [
-    pytest.param(2, 2, marks=pytest.mark.skip_less_device(4)),
-    pytest.param(2, 4, marks=pytest.mark.skip_less_mpi_world_size(8)),
-])
-@pytest.mark.parametrize("model_name,model_path", [
-    pytest.param('Llama3.3-70B-FP8',
-                 'llama-3.3-models/Llama-3.3-70B-Instruct-FP8',
-                 marks=skip_pre_hopper),
-])
-def test_ptp_quickstart_advanced_pp_enabled(llm_root, llm_venv, model_name,
-                                            model_path, cuda_graph, tp_size,
-                                            pp_size):
-    print(f"Testing {model_name} on 8 GPUs.")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    cmd = [
-        str(example_root / "quickstart_advanced.py"),
-        "--enable_chunked_prefill",
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        f"--tp_size={tp_size}",
-        f"--pp_size={pp_size}",
-        "--moe_ep_size=1",
-        "--kv_cache_fraction=0.6",
-    ]
-    if cuda_graph:
-        cmd.extend([
-            "--use_cuda_graph",
-            "--cuda_graph_padding_enabled",
-        ])
-    llm_venv.run_cmd(cmd)
-
-
 @skip_pre_hopper
 @pytest.mark.skip_less_mpi_world_size(8)
 @pytest.mark.parametrize("cuda_graph", [False, True])
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama-4-Maverick-17B-128E-Instruct-FP8",
      "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8"),
-    ("Llama-4-Scout-17B-16E-Instruct-FP8",
-     "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8"),
-    pytest.param('Llama-4-Scout-17B-16E-Instruct-FP4',
-                 'llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4',
-                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
         llm_root, llm_venv, model_name, model_path, cuda_graph):
@@ -1514,30 +1417,6 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
             "--cuda_graph_padding_enabled",
         ])
     llm_venv.run_cmd(cmd)
-
-
-# This test is specifically to be run on 2 GPUs on Blackwell RTX 6000 Pro (SM120) architecture
-# TODO: remove once we have a node with 8 GPUs and reuse test_ptp_quickstart_advanced_8gpus
-@skip_no_sm120
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("model_name,model_path", [
-    ('Nemotron-Super-49B-v1-BF16',
-     'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1'),
-])
-def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
-                                             model_path):
-    print(f"Testing {model_name} on 2 GPUs (SM120+).")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    llm_venv.run_cmd([
-        str(example_root / "quickstart_advanced.py"),
-        "--enable_chunked_prefill",
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        "--tp_size=2",
-        "--max_num_tokens=256",
-        f"--kv_cache_fraction={_MEM_FRACTION_50}",
-    ])
 
 
 @skip_pre_blackwell
@@ -1856,14 +1735,8 @@ def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
 @pytest.mark.parametrize("tp_size,pp_size", [(2, 1), (1, 2)],
                          ids=["tp2", "pp2"])
 @pytest.mark.parametrize("model_path", [
-    pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
-                 marks=skip_pre_hopper),
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
                  marks=skip_pre_blackwell),
-    pytest.param('llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8',
-                 marks=skip_pre_hopper),
-    pytest.param('llama4-models/Llama-4-Scout-17B-16E-Instruct',
-                 marks=skip_pre_hopper),
 ])
 def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
                                            tp_size, pp_size):
@@ -1905,8 +1778,6 @@ def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
 @pytest.mark.skip_less_device_memory(80000)
 @skip_pre_hopper
 @pytest.mark.parametrize("model_dir,draft_model_dir", [
-    ("modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
-     "EAGLE3-LLaMA3.3-Instruct-70B"),
     ("Qwen3/Qwen3-30B-A3B", "Qwen3/Qwen3-30B-eagle3"),
     pytest.param("Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
                  "Qwen3/qwen3-235B-eagle3",

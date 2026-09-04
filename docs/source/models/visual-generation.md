@@ -117,7 +117,50 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 
 The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queued` → `generating` (model inference) → `postprocessing` (encode the media and/or write the output file) → `completed`. The `generating` → `postprocessing` transition marks the end of inference; the video is downloadable via `/content` once `completed`.
 
-`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject such requests with HTTP 400. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
+`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject such requests with HTTP 400; the same switch also rejects a reference sent with `format="path"`, since both ask the server to trust a local filesystem path. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
+
+### Reference Inputs
+
+Conditioning references are supplied through the typed fields `image_reference`, `video_reference`, and `audio_reference`. Each field takes a single reference or a list. A reference is `MediaRef(content=..., format=...)`, and `format` is required.
+
+| `format` | Content | Notes |
+|---|---|---|
+| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. |
+| `url` | An `http(s)` URL | Fetched on the coordinator through the SSRF-guarded loader. |
+| `base64` | Base64 text | A `data:` URI is also accepted. |
+| `bytes` | Raw `bytes` | Python API only. |
+
+Every pipeline declares the reference slots and roles it accepts through `ref_slot_specs`, and a request is validated against that declaration before generation begins. References are resolved to raw bytes on the coordinator, so a worker never needs a filesystem shared with the client.
+
+Most models take a single reference whose role is unambiguous:
+
+```python
+from tensorrt_llm import VisualGen
+from tensorrt_llm.visual_gen import MediaRef
+
+vg = VisualGen(model="Wan-AI/Wan2.2-TI2V-5B-Diffusers")
+params = vg.default_params
+params.image_reference = MediaRef(content="start.png", format="path")
+output = vg.generate(inputs="the scene comes alive with gentle motion", params=params)
+```
+
+Models that accept the same modality in more than one role need `role`. Wan 2.1 I2V takes a first frame and an optional last frame:
+
+```python
+from tensorrt_llm import VisualGen
+from tensorrt_llm.visual_gen import MediaRef
+
+vg = VisualGen(model="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers")
+params = vg.default_params
+params.image_reference = [
+    MediaRef(content="start.png", format="path", role="first_frame"),
+    MediaRef(content="end.png", format="path", role="last_frame"),
+]
+```
+
+FLUX.2 and Qwen-Image-Edit accept a list of reference images on `image_reference`.
+
+The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for request examples.
 
 ## Optimizations
 

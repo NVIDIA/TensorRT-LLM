@@ -11,6 +11,7 @@ import torch
 pytest.importorskip("fla")
 
 from fla.modules import ShortConvolution  # noqa: E402
+from kimi_kda_test_utils import KimiKDAReference, get_production_prefill_kernel_path
 
 from tensorrt_llm._torch.modules.kimi_kda import (
     KimiKDALinearAttention,  # noqa: E402
@@ -21,10 +22,6 @@ from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (  # noqa: E402
     fused_kda_post_conv,
 )
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn  # noqa: E402
-from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (  # noqa: E402
-    KimiKDAReference,
-    get_production_prefill_kernel_path,
-)
 
 NUM_HEADS = 96
 HEAD_DIM = 128

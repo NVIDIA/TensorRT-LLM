@@ -414,31 +414,20 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             """
         }
 
-        // Promote progress tar to final path, or fall back to direct upload.
-        // progress_upload_snapshot.sh writes the sentinel on each successful PUT.
+        // Always re-tar the local stage directory and upload it directly, rather
+        // than trusting the last progress snapshot uploaded by
+        // progress_upload_snapshot.sh to still match it (the superseded-file
+        // rename above, or other post-snapshot writes, can leave it stale). Use
+        // --transform so tar contents carry the postTag filename without
+        // touching on-disk results*.xml files.
         ensureStageResultNotUploaded("${stageName}${postTag}")
-        if (suppressTestReporting || !promoteProgressTar(stageName, postTag)) {
-            if (suppressTestReporting) {
-                echo "[PROGRESS-UPLOAD] ${stageName}: results*.xml changed on disk, re-uploading instead of promoting progress tar"
-            } else {
-                // Progress upload never succeeded (Artifactory unreachable, watcher not started, etc.).
-                echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
-            }
-            // Fall back to the original approach: tar the local stage directory
-            // and upload it directly. Use --transform so tar contents carry the
-            // postTag filename without touching on-disk results*.xml files.
-            def xmlCount = sh(script: "ls ${stageName}/results*.xml 2>/dev/null | wc -l", returnStdout: true).trim().toInteger()
-            if (suppressTestReporting || xmlCount > 0) {
-                def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
-                trtllm_utils.uploadArtifacts(
-                    "results-${stageName}${postTag}.tar.gz",
-                    "${UPLOAD_PATH}/test-results/"
-                )
-            } else {
-                println("No results xml to submit")
-            }
-        }
+        def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+        trtllm_utils.uploadArtifacts(
+            "results-${stageName}${postTag}.tar.gz",
+            "${UPLOAD_PATH}/test-results/"
+        )
+        deleteProgressArtifact(stageName, postTag)
 
         // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
         if (isCbtsStage(stageName)) {
@@ -1753,6 +1742,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         withCredentials([
             string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
+            string(credentialsId: 'github_read_public_only_token', variable: 'GITHUB_CLONE_TOKEN'),
         ]) {
             CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
@@ -2098,6 +2088,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     srunArgs.add("--container-env=S3_SECRET_KEY")
                 }
+                srunArgs.add("--container-env=GITHUB_CLONE_TOKEN")
                 envVarsToExport.each { varName, varValue ->
                     srunArgs.add("--container-env=${varName}")
                 }
@@ -2146,7 +2137,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    # Keep xtrace off around the token exports so they are not echoed into the Slurm job log.
+                    set +x
                     export HF_TOKEN=$HF_TOKEN
+                    export GITHUB_CLONE_TOKEN=$GITHUB_CLONE_TOKEN
+                    set -x
                     if [ -f "${s3SecretKeyPathNode}" ]; then
                         set +x
                         export S3_SECRET_KEY="\$(cat "${s3SecretKeyPathNode}")"
@@ -2930,6 +2925,12 @@ def stageMatchesAnyPattern(String key, List patterns) {
     return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
 }
 
+// Return the OpenSearch regexp for sibling shards and their CBTS variants.
+String getTestReuseStagePattern(String stageName) {
+    def stageNamePrefix = stageName.replaceFirst(/-\d+(-cbts)?$/, "")
+    return "${stageNamePrefix}-[0-9]+(-cbts)?"
+}
+
 // Test filter flags
 // Multi-GPU stages matching any entry here run inside the single-GPU job
 // instead of waiting for the separate multi-GPU dispatch (which requires
@@ -2980,7 +2981,8 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-// Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
+// Suffix for CBTS-narrowed stages so they cannot be reused as whole non-CBTS stages.
+// Their individual passed testcases may still be reused through an OpenSearch query.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
 def CBTS_STAGE_SUFFIX = "-cbts"
@@ -3427,16 +3429,14 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                     sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
                 }
             }
-            sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
+            // Redact credential-looking values (e.g. OPEN_SEARCH_DB_CREDENTIALS) before
+            // writing: this file gets tar'd and uploaded to Artifactory, and Jenkins
+            // credential masking only applies to console log output, not to files.
+            sh "STAGE_NAME=${stageName} && env | sort | sed -E 's/^([A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|CREDENTIAL|API_KEY|_PSW)[A-Za-z0-9_]*)=.*/\\1=***REDACTED***/' > ${stageName}/debug_env.txt"
             if (isCbtsStage(stageName)) {
                 freezeCbtsCoverage(stageName)
             }
             echo "Upload test results."
-            // promoteProgressTar is a server-side move of the already-uploaded
-            // progress snapshot. It is only valid when on-disk results*.xml are
-            // unchanged from that snapshot. After a rename (or any other local
-            // XML mutation) the snapshot is stale and must be re-tarred.
-            boolean xmlsMutated = false
             if (suppressTestReporting) {
                 // This attempt is superseded by a planned retry. Keep the tar for
                 // forensics, but move its result XMLs aside so the top-level Collect
@@ -3449,22 +3449,19 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                         [ -e "\$f" ] && mv "\$f" "superseded-\$f"
                     done || true
                 """
-                xmlsMutated = true
             }
 
-            if (xmlsMutated || !promoteProgressTar(stageName, postTag)) {
-                if (xmlsMutated) {
-                    echo "[PROGRESS-UPLOAD] ${stageName}: results*.xml changed on disk, re-uploading instead of promoting progress tar"
-                } else {
-                    echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
-                }
-                def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
-                trtllm_utils.uploadArtifacts(
-                    "results-${stageName}${postTag}.tar.gz",
-                    "${UPLOAD_PATH}/test-results/"
-                )
-            }
+            // Always re-tar and re-upload the current state of ${stageName}/,
+            // rather than trusting the last progress snapshot to still match it:
+            // debug_env.txt, CBTS coverage freeze, a rerun merge rewriting
+            // results.xml, or the superseded-file rename above can all leave the
+            // last uploaded snapshot stale.
+            def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+            trtllm_utils.uploadArtifacts(
+                "results-${stageName}${postTag}.tar.gz",
+                "${UPLOAD_PATH}/test-results/"
+            )
             deleteProgressArtifact(stageName, postTag)
             if (!suppressTestReporting) {
                 junit(testResults: "${stageName}/results*.xml")
@@ -4668,12 +4665,14 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
         sh "mkdir -p ${workDir}"
 
         // 1. OpenSearch lookup -- tests that PASSED in a previous pipeline run
-        //    for this commit + stage.
+        //    for this commit + sibling stage shards. CBTS and non-CBTS results
+        //    are merged only at testcase granularity.
         def passedTestListFile = "${workDir}/passed_test_list.txt"
+        def stageNamePattern = getTestReuseStagePattern(stageName)
         sh """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
-            --stage-name ${stageName} \
+            --stage-name-pattern '${stageNamePattern}' \
             --output-file ${passedTestListFile}
         """
         if (fileExists(passedTestListFile)) {
@@ -4761,39 +4760,6 @@ REUSED_TESTS_EOF
     } catch (Exception e) {
         echo "Failed to add passed test list from previous pipeline run to the waives.txt. Error: ${e.message}"
     }
-}
-
-// Promotes the progress tar to the final results path via an Artifactory
-// server-side move (no data re-transfer). Returns true when a progress
-// snapshot existed and was promoted; false when no snapshot was uploaded or
-// the server-side move failed.
-// Virtual repo sw-tensorrt-generic does not support move; rewrite to the
-// backing local repo as we do for DELETE in deleteProgressArtifact().
-def promoteProgressTar(stageName, postTag="") {
-    def progressOkFile = "${WORKSPACE}/results-${stageName}${postTag}-progress.tar.gz.upload_ok"
-    if (!fileExists(progressOkFile)) {
-        return false
-    }
-    def localUploadPath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
-    def srcArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}-progress.tar.gz"
-    def dstArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}.tar.gz"
-    def rc
-    withCredentials([usernamePassword(
-            credentialsId: 'urm-artifactory-creds',
-            usernameVariable: 'ART_USER',
-            passwordVariable: 'ART_PASS')]) {
-        rc = sh(
-            script: """curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" -X POST \
-                'https://urm.nvidia.com/artifactory/api/move/${srcArtPath}?to=/${dstArtPath}'""",
-            returnStatus: true
-        )
-        if (rc == 0) {
-            echo "[PROGRESS-UPLOAD] ${stageName}: progress tar moved to test-results/ as results-${stageName}${postTag}.tar.gz"
-        } else {
-            echo "[PROGRESS-UPLOAD] ${stageName}: move failed (rc=${rc}); results may already be at destination or progress tar was deleted"
-        }
-    }
-    return rc == 0
 }
 
 // Removes the in-progress checkpoint tarball uploaded by the inline
@@ -4994,7 +4960,24 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             // index) must instead install its file behind a dedicated stage
             // guard and skip this one (see the Ray install below for the
             // stage-scoped pattern).
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
+            //
+            // OpenEngine takes that second branch: its bindings resolve only
+            // from a custom index (--extra-index-url https://buf.build/gen/python),
+            // so it owns the CPU-Generic stages -- the only stages whose test
+            // list carries unittest/grpc/openengine/ -- and SMG steps aside
+            // there. No test in l0_cpu.yml imports tensorrt_llm.grpc.smg, so
+            // the swap costs no coverage. The guard is on the stage name and
+            // never on the CBTS scope: `scopes` is the union of every fired
+            // rule's scope, so a mixed selection (openengine source + any other
+            // narrowing change) would push these pins into every shard it runs.
+            // Matched as a substring, like the Ray guard below: a stage name that
+            // picks up a prefix or suffix must keep matching, because a missed
+            // match here is a silent `importorskip` skip rather than a failure.
+            if (stageName.contains("CPU-Generic")) {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
+            } else {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
+            }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
@@ -5446,7 +5429,7 @@ def checkPipInstall(pipeline, wheel_path, version_override)
     withEnv(["TRTLLM_VERSION_LOCAL=${versionLocal}"]) {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: """
             cd ${LLM_ROOT}/tests/unittest && \
-            python3 test_pip_install.py --wheel_path ${wheelArtifactLinks} --version_local "\${TRTLLM_VERSION_LOCAL}"
+            python3 check_pip_install.py --wheel_path ${wheelArtifactLinks} --version_local "\${TRTLLM_VERSION_LOCAL}"
             """)
     }
 }
@@ -5745,6 +5728,7 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
                 // Minus 10 minutes to avoid the Slurm job being stopped earlier.
                 timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                     docker.image(image).inside(dockerArgs) {
+                        trtllm_utils.setupGithubFetchAuth()
                         runner()
                     }
                 }
@@ -5763,6 +5747,7 @@ def runInEnrootOnNode(label, partitionTimeout)
 {
     return {
         runner -> node(label) {
+            trtllm_utils.setupGithubFetchAuth()
             // We submit the Slurm job with the Slurm partition's time spec.
             // Minus 10 minutes to avoid the Slurm job being stopped earlier.
             timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
@@ -6067,8 +6052,10 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
                         (slurmScoped && FailureClassifier.isDeferrableInfra(e, InfraFailure.SLURM))) {
                     def scopeTag = slurmScoped ? "SLURM/K8s" : "K8s"
                     deferred.add([stage: stageName])
-                    echo "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
-                         "siblings continue instead of fail-fast. ${e.toString()}"
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        error "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
+                              "siblings continue instead of fail-fast. ${e.toString()}"
+                    }
                     return
                 }
                 throw e
@@ -6079,8 +6066,8 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
     parallel wrapped
     if (deferred) {
         echo "[INFRA-DEFER] ${deferred.size()} stage(s) infra-incomplete " +
-             "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
-             "(coverage incomplete, no genuine test failure)."
+             "(${deferred.collect { it.stage }.join(', ')}); result already marked UNSTABLE " +
+             "per branch above (coverage incomplete, no genuine test failure)."
         // Distinguish a per-branch infra blip from a cluster-wide outage: when EVERY
         // branch in the group infra-aborted, the shared infra (a SLURM frontend / a
         // whole cluster) is the likely culprit. Flag it loudly so a re-run isn't
@@ -6094,7 +6081,6 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
             echo "[INFRA-DEFER] ALL ${jobs.size()} branch(es) infra-aborted; " +
                  "suspected cluster-wide / shared-frontend outage rather than isolated blips."
         }
-        currentBuild.result = 'UNSTABLE'
     }
 }
 
@@ -6202,6 +6188,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_H100-4_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_B200-CPP-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 9, 1, 1, true],
         "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 9, 1, 1, true],
         "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 9, 1, 1, true],

@@ -76,6 +76,26 @@ def forward_context_sparse_attn(
     position_ids: Optional[torch.Tensor] = None,
     indexer_intermediates: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
+    if getattr(self.mqa, "has_fp4_kv_cache", False):
+        if latent_cache is None:
+            raise ValueError("NVFP4 DSA context requires latent_cache")
+        # Append every uncached context token before sparse prediction. The
+        # predictor then dequantizes the union of selected TopK rows into a
+        # compact FP8 pool, while the attention op skips its normal KV append.
+        self.mqa.mla_rope_append_paged_kv_assign_q(
+            q, latent_cache, attn_metadata, is_generation=False
+        )
+        return self.forward_absorption_context(
+            q,
+            compressed_kv,
+            k_pe,
+            attn_metadata,
+            output,
+            position_ids=position_ids,
+            latent_cache=None,
+            q_rope_applied=True,
+            sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=indexer_intermediates),
+        )
     if should_use_short_mha(self, attn_metadata, position_ids):
         return self.forward_context(
             q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache

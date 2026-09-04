@@ -79,6 +79,7 @@ class _FakeExecutor(PyExecutor):
         self.kv_connector_manager = None
         self.disable_overlap_scheduler = True
         self.previous_batch = None
+        self.canceled_req_ids = []
 
     def _check_disagg_ctx_cache_transfer_status(self, _):
         return None
@@ -94,6 +95,7 @@ class TestSendKvAsyncReleasesIndexSlot:
         transfer_manager = AsyncTransferManager(resource_manager)
         transceiver = MagicMock()
         transceiver.kv_transfer_timeout_ms = None
+        transceiver.has_retired_send_session.return_value = False
         return _FakeExecutor(kv_cache_manager, transfer_manager, transceiver), transfer_manager
 
     def test_send_kv_async_calls_release_index_slot(self):

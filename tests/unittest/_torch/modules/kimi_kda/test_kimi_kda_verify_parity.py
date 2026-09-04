@@ -23,11 +23,10 @@ import torch
 
 pytest.importorskip("fla")
 
+from kimi_kda_test_utils import get_production_decode_kernel_path
+
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
-from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (
-    get_production_decode_kernel_path,
-)
 
 
 class _Cfg:
@@ -196,13 +195,15 @@ def test_kda_prefill_matches_reference():
 
 
 @torch.no_grad()
-def test_kda_qkvg_multistream_decode_matches_separate_projections():
+@pytest.mark.parametrize("num_heads", [6, 8])
+def test_kda_decode_matches_reference(num_heads):
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
 
     torch.manual_seed(0)
     device = "cuda"
     cfg = _K3Cfg()
+    cfg.linear_attn_config = {**cfg.linear_attn_config, "num_heads": num_heads}
     lin = cfg.linear_attn_config
     h = lin["num_heads"]
     head_dim = lin["head_dim"]
@@ -243,8 +244,12 @@ def test_kda_qkvg_multistream_decode_matches_separate_projections():
         actual = runtime(hidden_states, _decode_metadata(actual_cache, slot_indices))
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(actual_cache.temporal, expected_cache.temporal, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_cache.temporal, expected_cache.temporal, rtol=2e-4, atol=2e-4)
+    untouched = torch.ones(slots, dtype=torch.bool, device=device)
+    untouched[slot_indices] = False
+    assert torch.equal(actual_cache.conv[untouched], expected_cache.conv[untouched])
+    assert torch.equal(actual_cache.temporal[untouched], expected_cache.temporal[untouched])
 
 
 @pytest.mark.parametrize("batch", [1, 3])

@@ -4,14 +4,13 @@ import pathlib as _pl
 import shutil
 import sys as _sys
 
+# Declared above the cpp_common import: this covers every file in this
+# directory, but only for imports that run after it, and cpp_common reaches
+# build_wheel while this conftest is still executing.
+__extra_import_path__ = ["~/scripts"]
+
 import defs.cpp.cpp_common as _cpp
 import pytest
-
-build_script_dir = _pl.Path(
-    __file__).parent.resolve().parent.parent.parent.parent / "scripts"
-assert build_script_dir.is_dir()
-_sys.path.append(str(build_script_dir))
-
 from build_wheel import main as build_trt_llm
 from defs.conftest import llm_models_root
 
@@ -170,6 +169,47 @@ def build_google_tests(request, build_type):
         nixl_root="/opt/nvidia/nvda_nixl",
         skip_building_wheel=True,
         extra_make_targets=["google-tests"],
+    )
+
+
+@pytest.fixture(scope="session")
+def build_kv_cache_compression_tests(request, build_type):
+    """Build only the standalone NVFP4 cold-page kernel gtest.
+
+    The binary uses NO_TLLM_LINKAGE, so this skips the full-library
+    build that build_google_tests pays for.
+    """
+    cuda_arch = f"{request.param}-real"
+
+    _logger.info(f"Using CUDA arch: {cuda_arch}")
+
+    build_trt_llm(
+        build_type=build_type,
+        cuda_architectures=cuda_arch,
+        job_count=12,
+        use_ccache=True,
+        generator="Ninja",
+        nixl_root="/opt/nvidia/nvda_nixl",
+        skip_building_wheel=True,
+        configure_only=True,
+    )
+
+    build_dir = _cpp.find_build_dir(build_type)
+    _cpp.run_command(
+        [
+            "cmake",
+            "--build",
+            str(build_dir),
+            "--config",
+            build_type,
+            "--parallel",
+            "12",
+            "--target",
+            "nvfp4ColdPageKernelsTest",
+        ],
+        cwd=build_dir,
+        env=_os.environ,
+        timeout=1800,
     )
 
 
