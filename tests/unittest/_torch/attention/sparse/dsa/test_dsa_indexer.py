@@ -337,6 +337,7 @@ def test_shared_topk_lifecycle(monkeypatch):
     metadata.max_num_sequences = 2
     metadata.max_num_tokens = 4
     metadata.num_sparse_topk = 3
+    metadata._top_k_rows_per_sequence = 1
     metadata.num_sms = 1
     metadata.cuda_graph_buffers = None
     metadata.kv_cache_manager = SimpleNamespace(max_blocks_per_seq=2)
@@ -514,6 +515,62 @@ def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, exp
     assert indexer._indexer_bf16 is (flag_value == "1")
     assert indexer.wk.dtype == expected_dtype
     assert indexer.weights_proj.dtype == expected_dtype
+
+
+@pytest.mark.parametrize(
+    "is_tree,is_dynamic,max_draft_len,max_total_draft_tokens,spec_tree_manager,rows_per_sequence",
+    [
+        (False, False, 7, 7, None, 8),
+        (True, False, 3, 7, None, 8),
+        (
+            True,
+            True,
+            6,
+            31,
+            SimpleNamespace(_internal_buf_dim=60, dynamic_tree_max_topK=10),
+            60,
+        ),
+    ],
+)
+def test_metadata_spec_update_resizes_top_k_workspace(
+    is_tree,
+    is_dynamic,
+    max_draft_len,
+    max_total_draft_tokens,
+    spec_tree_manager,
+    rows_per_sequence,
+):
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.max_num_sequences = 2
+    metadata.max_draft_tokens = 0
+    metadata._top_k_rows_per_sequence = 1
+    metadata.num_sparse_topk = 2
+    metadata.is_cuda_graph = True
+    metadata.enable_gvr_topk = True
+    metadata.use_cute_dsl_topk = False
+    metadata.nvfp4_mla_fp8_scratch = None
+    metadata.kv_lens_cuda_2d = torch.empty(2, 1)
+    metadata.kv_lens_expanded_host = torch.empty(2)
+    metadata._create_kv_lens_2d_buffer = Mock()
+    metadata.create_expanded_buffers = Mock()
+    metadata._create_top_k_workspace = Mock()
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata."
+        "TrtllmAttentionMetadata.update_spec_dec_param"
+    ):
+        metadata.update_spec_dec_param(
+            batch_size=2,
+            is_spec_decoding_enabled=True,
+            is_spec_dec_tree=is_tree,
+            is_spec_dec_dynamic_tree=is_dynamic,
+            max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_total_draft_tokens,
+            spec_tree_manager=spec_tree_manager,
+        )
+
+    assert metadata._top_k_rows_per_sequence == rows_per_sequence
+    metadata._create_top_k_workspace.assert_called_once_with(True)
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
