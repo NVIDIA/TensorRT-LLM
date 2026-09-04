@@ -12,16 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host-side coordinator turning DSpark confidence into a per-iteration draft length.
-
-Contracts: the decision is made on the host (CUDA-graph selection is a host
-value); the verified token total must round up to a captured verify bucket, or
-the step silently runs eager; and every rank must shape the batch identically
--- the caller reduces the ragged decision across ranks before any rank acts on
-it, while :meth:`decide_verify_lens` itself is rank-local by default.
-Confidence is read from a lagged, non-blocking snapshot; a snapshot that is
-not ready degrades to verifying everything, never to a stale guess.
-"""
+"""Host-side coordinator for exact DSpark ``(G, V)`` policy decisions."""
 
 from dataclasses import dataclass, replace
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -30,7 +21,7 @@ import numpy as np
 import torch
 
 from ..._utils import prefer_pinned
-from .dspark_planner import ExactSpsCostTable, SpsCostTable, compute_verify_token_budget
+from .dspark_planner import ExactSpsCostTable
 from .dspark_schedule import DSparkScheduleConfig, compute_survival, schedule_verify_lens_topk
 
 
@@ -98,40 +89,29 @@ __all__ = ["DSparkVerifyPlanner"]
 
 
 class DSparkVerifyPlanner:
-    """Stages confidence off the device and turns it into a draft length.
+    """Stages confidence and prepares exact ``(G,V)`` policy inputs.
 
     Args:
         cfg: verify-length bounds.
-        cost_table: measured step cost. A flat table means "not profiled"; the
-            planner then refuses to trim (see :meth:`decide_verify_lens`).
-        tiers: draft lengths that have a captured CUDA graph. The drafted block
-            is always ``max_tier``; these also bound the budget search.
+        cost_table: authenticated exact ``T(G,V)`` table installed by
+            ``ModelEngine`` before the first decision.
         apply_calibration: maps raw confidence logits to probabilities. Normally
             ``confidence_head.apply_sts``; defaults to a plain sigmoid.
-        all_rank_max: cross-rank reduction, returning the max of ``value`` over
-            ranks. ``None`` for single-rank runs.
         device_windows: use the lag-2 snapshot for capacity while a device
             prologue ranks the current requests.
-        skip_mixed_trim: fail closed on mixed context/generation steps whose
-            cost is not represented by a pure-decode table.
     """
 
     def __init__(
         self,
         *,
         cfg: DSparkScheduleConfig,
-        cost_table: Optional[SpsCostTable | ExactSpsCostTable] = None,
-        tiers: Optional[Sequence[int]] = None,
+        cost_table: Optional[ExactSpsCostTable] = None,
         apply_calibration: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        all_rank_max: Optional[Callable[[int], int]] = None,
         device_windows: bool = False,
-        skip_mixed_trim: bool = False,
     ):
         self.cfg = cfg
         self.cost_table = cost_table
-        self.tiers: List[int] = sorted({int(t) for t in (tiers or [cfg.resolved_max_verify_len])})
         self.apply_calibration = apply_calibration or torch.sigmoid
-        self.all_rank_max = all_rank_max
 
         self._host_buffer: Optional[torch.Tensor] = None
         self._copy_event: Optional[torch.cuda.Event] = None
@@ -144,30 +124,26 @@ class DSparkVerifyPlanner:
         # Two pinned buffers alternate; the pair we are NOT writing this step
         # is the older, guaranteed-landed one.
         self.device_windows = bool(device_windows)
-        self.skip_mixed_trim = bool(skip_mixed_trim)
         self._prev_buffer: Optional[torch.Tensor] = None
         self._prev_event: Optional[torch.cuda.Event] = None
         self._prev_valid = False
         # Count every path that declines to trim; degradation here is silent.
         self.stats = {
-            "decisions": 0,
             "fallback_no_snapshot": 0,
-            "fallback_flat_cost": 0,
             "fallback_no_confidence": 0,
             "fallback_short_snapshot": 0,
-            "fallback_no_gen_requests": 0,
-            "fallback_full_k": 0,
         }
 
-    def install_runtime_cost_table(self, cost_table: SpsCostTable | ExactSpsCostTable) -> None:
+    def install_runtime_cost_table(self, cost_table: ExactSpsCostTable) -> None:
         """Install ModelEngine's already validated runtime cost object."""
-        if isinstance(cost_table, ExactSpsCostTable):
-            if cost_table.max_draft_len != self.cfg.resolved_max_verify_len:
-                raise ValueError(
-                    "Exact SPS max_draft_len does not match planner: "
-                    f"table={cost_table.max_draft_len}, "
-                    f"planner={self.cfg.resolved_max_verify_len}"
-                )
+        if not isinstance(cost_table, ExactSpsCostTable):
+            raise TypeError("DSpark confidence scheduling requires an exact SPS cost table")
+        if cost_table.max_draft_len != self.cfg.resolved_max_verify_len:
+            raise ValueError(
+                "Exact SPS max_draft_len does not match planner: "
+                f"table={cost_table.max_draft_len}, "
+                f"planner={self.cfg.resolved_max_verify_len}"
+            )
         if self.cost_table is not None and self.cost_table != cost_table:
             raise RuntimeError(
                 "DSpark planner already holds a different SPS cost object; "
@@ -178,7 +154,7 @@ class DSparkVerifyPlanner:
 
     @property
     def exact_cost_table(self) -> Optional[ExactSpsCostTable]:
-        return self.cost_table if isinstance(self.cost_table, ExactSpsCostTable) else None
+        return self.cost_table
 
     def prepare_exact_sps_decision(
         self,
@@ -328,18 +304,17 @@ class DSparkVerifyPlanner:
         return [int(value) for value in lens], int(budget), int(pad_tokens)
 
     @property
-    def max_tier(self) -> int:
-        return self.tiers[-1] if self.tiers else self.cfg.resolved_max_verify_len
+    def max_verify_len(self) -> int:
+        return self.cfg.resolved_max_verify_len
 
     def stage_confidence(self, confidence_logits: torch.Tensor) -> None:
         """Start a non-blocking device->host copy of the confidence buffer.
 
         ``confidence_logits`` is the worker's whole slot-indexed buffer, staged
-        in full so :meth:`decide_verify_lens` can look up any live request by
+        in full so exact-policy preparation can look up any live request by
         slot across the one-iteration lag. Never synchronizes: the copy is
-        issued on the current stream and an event is recorded;
-        :meth:`decide_verify_lens` polls the event and skips a snapshot that
-        has not landed.
+        issued on the current stream and an event is recorded; policy
+        preparation polls the event and skips a snapshot that has not landed.
         """
         if confidence_logits is None or confidence_logits.shape[0] == 0:
             return
@@ -421,165 +396,3 @@ class DSparkVerifyPlanner:
             self.stats["fallback_no_confidence"] += 1
             return None
         return selected
-
-    def decide_verify_budget(
-        self,
-        *,
-        num_gen_requests: int,
-        rows: Optional[Sequence[int]] = None,
-    ) -> Optional[Tuple[int, List[int]]]:
-        """Capacity only, for device-window mode: ``(budget, shape_lens)``.
-
-        The budget (verify tokens above the per-request floor) comes from the
-        cost-table argmax over the OLDER staged snapshot -- lag-2 by the
-        block-relative count, the paper's prescription: capacity tolerates
-        staleness, ranking does not. ``shape_lens`` is a canonical uniform
-        spread of the budget used ONLY for the cross-rank shape agreement and
-        bucket fit (both read totals, never the split); the true per-request
-        windows are chosen on device from the verified block's own confidence.
-        Fail-closed like :meth:`decide_verify_lens`: None means verify the
-        full block.
-        """
-        self.stats["decisions"] += 1
-        if num_gen_requests <= 0:
-            self.stats["fallback_no_gen_requests"] += 1
-            return None
-        n = int(num_gen_requests)
-        trimmable = self.cfg.resolved_max_verify_len - self.cfg.min_verify_len
-        if self.cost_table is None or self.cost_table.is_flat:
-            self.stats["fallback_flat_cost"] += 1
-            return None
-        snapshot = self._ready_older_snapshot()
-        if snapshot is None:
-            self.stats["fallback_no_snapshot"] += 1
-            return None
-        selected = self._gather_rows(num_gen_requests=n, rows=rows, snapshot=snapshot)
-        if selected is None:
-            return None
-        survival = compute_survival(self.apply_calibration(selected))
-        budget = compute_verify_token_budget(
-            survival=survival.numpy().astype(np.float64),
-            num_gen_requests=n,
-            cost_table=self.cost_table,
-            min_verify_len=self.cfg.min_verify_len,
-            max_verify_len=self.cfg.resolved_max_verify_len,
-            allowed_lens=self.tiers,
-        )
-        full_budget = n * trimmable
-        if int(budget) >= full_budget:
-            # The full tier is not a ragged schedule. Returning None preserves
-            # the ordinary static-K executor path and its lower overhead.
-            self.stats["fallback_full_k"] += 1
-            return None
-        floor_tokens = n * (self.cfg.min_verify_len + 1)
-        predicted = float(
-            self.cost_table.step_times(np.asarray([floor_tokens + int(budget)]), n)[0]
-        )
-        self.last_predicted_step_ms = predicted
-        self.stats["predicted_ms_sum"] = self.stats.get("predicted_ms_sum", 0.0) + predicted
-        self.stats["predicted_steps"] = self.stats.get("predicted_steps", 0) + 1
-        budget = max(0, min(int(budget), n * trimmable))
-        base, extra = divmod(budget, n)
-        shape_lens = [
-            min(
-                self.cfg.min_verify_len + base + (1 if i < extra else 0),
-                self.cfg.resolved_max_verify_len,
-            )
-            for i in range(n)
-        ]
-        return budget, shape_lens
-
-    def decide_verify_lens(
-        self,
-        *,
-        num_gen_requests: int,
-        rows: Optional[Sequence[int]] = None,
-        all_rank_max: Optional[Callable[[int], int]] = None,
-        reduce_across_ranks: bool = True,
-        budget_override: Optional[int] = None,
-    ) -> Optional[List[int]]:
-        """Per-request verify lengths for a ragged step, or None to stay uniform.
-
-        The cost-model argmax sets the budget; the global survival top-k splits
-        it across requests. Fail-closed: any untrustworthy input (no snapshot,
-        flat cost table, empty batch) returns None and the step verifies
-        everything. The batch-wide maximum is reduced across ranks (it sizes
-        the drafted-token buffer and per-request padding); individual lengths
-        stay local. Returns exactly ``num_gen_requests`` entries or None,
-        never a partial list.
-        """
-        # Counted before any decline so the fallback counters have a denominator.
-        self.stats["decisions"] += 1
-
-        if num_gen_requests <= 0:
-            self.stats["fallback_no_gen_requests"] += 1
-            return None
-
-        if budget_override is not None:
-            # Device-window mode chooses capacity from a lag-2 snapshot, then
-            # spends that budget against the current snapshot here.
-            selected = self._gather_rows(num_gen_requests=num_gen_requests, rows=rows)
-            if selected is None:
-                return None
-            survival = compute_survival(self.apply_calibration(selected))
-            lens = schedule_verify_lens_topk(
-                survival=survival, budget=int(budget_override), cfg=self.cfg
-            ).tolist()
-        else:
-            if self.cost_table is None or self.cost_table.is_flat:
-                self.stats["fallback_flat_cost"] += 1
-                return None
-            selected = self._gather_rows(num_gen_requests=num_gen_requests, rows=rows)
-            if selected is None:
-                return None
-
-            probs = self.apply_calibration(selected)
-            survival = compute_survival(probs)
-            # Scored as the top-k redistribution that actually runs, on the
-            # same tier-aligned cost grid as the uniform argmax.
-            budget = compute_verify_token_budget(
-                survival=survival.numpy().astype(np.float64),
-                num_gen_requests=int(num_gen_requests),
-                cost_table=self.cost_table,
-                min_verify_len=self.cfg.min_verify_len,
-                max_verify_len=self.cfg.resolved_max_verify_len,
-                # Required: any non-tier total is rounded up to a captured
-                # bucket, pushing a budget chosen below a cost riser back over it.
-                allowed_lens=self.tiers,
-            )
-            full_budget = int(num_gen_requests) * (
-                self.cfg.resolved_max_verify_len - self.cfg.min_verify_len
-            )
-            if int(budget) >= full_budget:
-                # Full K uses the native uniform path and its lower overhead.
-                self.stats["fallback_full_k"] += 1
-                return None
-            # Predicted step cost, recorded so runs can be reconciled against
-            # measured hostStepTimeMS; a systematic gap flags a wrong or
-            # mismatched cost table.
-            floor_tokens = int(num_gen_requests) * (self.cfg.min_verify_len + 1)
-            predicted = float(
-                self.cost_table.step_times(
-                    np.asarray([floor_tokens + int(budget)]), int(num_gen_requests)
-                )[0]
-            )
-            self.last_predicted_step_ms = predicted
-            self.stats["predicted_ms_sum"] = self.stats.get("predicted_ms_sum", 0.0) + predicted
-            self.stats["predicted_steps"] = self.stats.get("predicted_steps", 0) + 1
-            lens = schedule_verify_lens_topk(
-                survival=survival, budget=budget, cfg=self.cfg
-            ).tolist()
-
-        # The early returns above are rank-local (some timing-dependent), so no
-        # collective may run before this point; reduce once, unconditionally,
-        # at a point every rank reaches. reduce_across_ranks=False means the
-        # caller does that agreement itself.
-        if reduce_across_ranks:
-            all_rank_max = all_rank_max or self.all_rank_max
-            if all_rank_max is not None:
-                agreed_max = int(all_rank_max(int(max(lens))))
-                lens = [min(int(v), agreed_max) for v in lens]
-        assert len(lens) == num_gen_requests, (
-            f"internal: produced {len(lens)} verify lengths for {num_gen_requests} requests"
-        )
-        return [int(v) for v in lens]

@@ -2,11 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Hardware-independent tests for the DSpark confidence policy coordinator."""
 
-import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.speculative.dspark_planner import ExactSpsCostTable, SpsCostTable
+from tensorrt_llm._torch.speculative.dspark_planner import ExactSpsCostRow, ExactSpsCostTable
 from tensorrt_llm._torch.speculative.dspark_schedule import DSparkScheduleConfig
 from tensorrt_llm._torch.speculative.dspark_verify import (
     DSparkVerifyPlanner,
@@ -19,20 +18,6 @@ def _config() -> DSparkScheduleConfig:
     return DSparkScheduleConfig(block_size=5, min_verify_len=1)
 
 
-def _legacy_table() -> SpsCostTable:
-    return SpsCostTable(
-        token_counts=(0, 8, 24, 48),
-        step_time_ms=(2.0, 2.1, 4.0, 9.0),
-    )
-
-
-def _planner(**kwargs) -> DSparkVerifyPlanner:
-    kwargs.setdefault("cfg", _config())
-    kwargs.setdefault("cost_table", _legacy_table())
-    kwargs.setdefault("tiers", [1, 3, 5])
-    return DSparkVerifyPlanner(**kwargs)
-
-
 def _publish_snapshot(planner: DSparkVerifyPlanner, logits: torch.Tensor) -> None:
     planner._host_buffer = logits
     planner._copy_event = None
@@ -40,9 +25,9 @@ def _publish_snapshot(planner: DSparkVerifyPlanner, logits: torch.Tensor) -> Non
 
 
 def test_runtime_cost_table_is_authoritative() -> None:
-    planner = DSparkVerifyPlanner(cfg=_config(), tiers=[1, 3, 5])
+    planner = DSparkVerifyPlanner(cfg=_config())
     authoritative = ExactSpsCostTable(
-        tables={4: SpsCostTable(token_counts=(0, 14), step_time_ms=(8.0, 7.0))},
+        tables={4: ExactSpsCostRow(token_counts=(0, 14), step_time_ms=(8.0, 7.0))},
         max_draft_len=5,
     )
 
@@ -51,7 +36,7 @@ def test_runtime_cost_table_is_authoritative() -> None:
     assert planner.cost_table is authoritative
 
     different = ExactSpsCostTable(
-        tables={4: SpsCostTable(token_counts=(0, 14), step_time_ms=(8.0, 7.1))},
+        tables={4: ExactSpsCostRow(token_counts=(0, 14), step_time_ms=(8.0, 7.1))},
         max_draft_len=5,
     )
     with pytest.raises(RuntimeError, match="different SPS cost object"):
@@ -59,9 +44,9 @@ def test_runtime_cost_table_is_authoritative() -> None:
 
 
 def test_runtime_cost_table_must_match_the_draft_block() -> None:
-    planner = DSparkVerifyPlanner(cfg=_config(), tiers=[1, 3, 5])
+    planner = DSparkVerifyPlanner(cfg=_config())
     incompatible = ExactSpsCostTable(
-        tables={4: SpsCostTable(token_counts=(0, 12), step_time_ms=(8.0, 7.0))},
+        tables={4: ExactSpsCostRow(token_counts=(0, 12), step_time_ms=(8.0, 7.0))},
         max_draft_len=4,
     )
 
@@ -100,14 +85,14 @@ def test_exact_cell_geometry_matches_the_executed_layout(
 def test_idle_attention_dp_rank_advertises_only_feasible_cells() -> None:
     table = ExactSpsCostTable(
         tables={
-            4: SpsCostTable(
+            4: ExactSpsCostRow(
                 token_counts=(0, 12, 14, 24),
                 step_time_ms=(8.0, 6.0, 6.5, 8.1),
             )
         },
         max_draft_len=5,
     )
-    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table, tiers=[1, 3, 5])
+    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table)
 
     decision = planner.prepare_exact_sps_decision(num_gen_requests=0, rows=[])
 
@@ -123,10 +108,10 @@ def test_idle_attention_dp_rank_advertises_only_feasible_cells() -> None:
 
 def test_exact_policy_reads_confidence_by_request_row() -> None:
     table = ExactSpsCostTable(
-        tables={4: SpsCostTable(token_counts=(0, 14), step_time_ms=(8.0, 7.0))},
+        tables={4: ExactSpsCostRow(token_counts=(0, 14), step_time_ms=(8.0, 7.0))},
         max_draft_len=5,
     )
-    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table, tiers=[1, 3, 5])
+    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table)
     logits = torch.full((5, 5), -8.0)
     logits[3] = 8.0
     _publish_snapshot(planner, logits)
@@ -139,10 +124,10 @@ def test_exact_policy_reads_confidence_by_request_row() -> None:
 
 def test_exact_allocator_spends_the_modeled_real_row_target() -> None:
     table = ExactSpsCostTable(
-        tables={4: SpsCostTable(token_counts=(0, 22), step_time_ms=(8.0, 7.0))},
+        tables={4: ExactSpsCostRow(token_counts=(0, 22), step_time_ms=(8.0, 7.0))},
         max_draft_len=5,
     )
-    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table, tiers=[1, 3, 5])
+    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table)
     decision = ExactSpsLocalDecision(
         num_requests=3,
         survival=torch.ones((3, 5)),
@@ -162,10 +147,10 @@ def test_exact_allocator_spends_the_modeled_real_row_target() -> None:
 
 def test_unmeasured_exact_cell_is_rejected() -> None:
     table = ExactSpsCostTable(
-        tables={4: SpsCostTable(token_counts=(0, 14), step_time_ms=(8.0, 7.0))},
+        tables={4: ExactSpsCostRow(token_counts=(0, 14), step_time_ms=(8.0, 7.0))},
         max_draft_len=5,
     )
-    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table, tiers=[1, 3, 5])
+    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table)
     decision = ExactSpsLocalDecision(
         num_requests=2,
         survival=torch.ones((2, 5)),
@@ -177,56 +162,24 @@ def test_unmeasured_exact_cell_is_rejected() -> None:
         planner.allocate_exact_sps_candidate(decision, graph_batch_size=4, verifier_budget=16)
 
 
-def test_policy_reassociates_a_lagged_snapshot_by_request_row() -> None:
-    planner = _planner()
-    logits = torch.full((5, 5), -8.0)
-    logits[3] = 8.0
-    _publish_snapshot(planner, logits)
-
-    lens = planner.decide_verify_lens(
-        num_gen_requests=2,
-        rows=[3, 0],
-        reduce_across_ranks=False,
-        budget_override=3,
-    )
-
-    assert lens is not None
-    assert lens[0] > lens[1]
-
-
 def test_policy_fails_closed_on_incomplete_snapshot_mapping() -> None:
-    planner = _planner()
+    table = ExactSpsCostTable(
+        tables={4: ExactSpsCostRow(token_counts=(0, 14), step_time_ms=(8.0, 7.0))},
+        max_draft_len=5,
+    )
+    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table)
     _publish_snapshot(planner, torch.rand(8, 5))
 
-    assert planner.decide_verify_lens(num_gen_requests=4, rows=[0, 1]) is None
+    assert planner.prepare_exact_sps_decision(num_gen_requests=4, rows=[0, 1]) is None
     assert planner.stats["fallback_short_snapshot"] == 1
 
 
-def test_selected_full_budget_uses_the_native_static_path() -> None:
-    batch_size = 4
-    planner = DSparkVerifyPlanner(
-        cfg=_config(),
-        cost_table=SpsCostTable(
-            token_counts=(0, batch_size * 6),
-            step_time_ms=(10.0, 10.01),
-            minimum_predicted_gain=0.01,
-        ),
-        tiers=[1, 3, 5],
-    )
-    planner._gather_rows = lambda **_: torch.full((batch_size, 5), 8.0)
-
-    assert (
-        planner.decide_verify_lens(
-            num_gen_requests=batch_size,
-            reduce_across_ranks=False,
-        )
-        is None
-    )
-    assert planner.stats["fallback_full_k"] == 1
-
-
 def test_device_window_capacity_uses_the_older_snapshot() -> None:
-    planner = _planner(device_windows=True)
+    table = ExactSpsCostTable(
+        tables={4: ExactSpsCostRow(token_counts=(0, 14), step_time_ms=(8.0, 7.0))},
+        max_draft_len=5,
+    )
+    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table, device_windows=True)
     planner._prev_buffer = torch.full((2, 5), -8.0)
     planner._prev_event = None
     planner._prev_valid = True
@@ -234,29 +187,10 @@ def test_device_window_capacity_uses_the_older_snapshot() -> None:
     planner._copy_event = None
     planner._snapshot_valid = True
 
-    expected = planner.decide_verify_budget(num_gen_requests=2)
+    older = planner.prepare_exact_sps_decision(num_gen_requests=2)
     planner._prev_buffer = planner._host_buffer
-    different = planner.decide_verify_budget(num_gen_requests=2)
+    current = planner.prepare_exact_sps_decision(num_gen_requests=2)
 
-    assert expected is not None
-    assert different is None or different[0] > expected[0]
-
-
-def test_policy_records_the_cost_used_for_a_budget_decision() -> None:
-    table = SpsCostTable(
-        token_counts=(0, 16, 32, 48),
-        step_time_ms=(5.0, 6.0, 12.0, 20.0),
-        fixed_overhead_ms=1.0,
-    )
-    planner = DSparkVerifyPlanner(cfg=_config(), cost_table=table, tiers=[1, 3, 5])
-    _publish_snapshot(planner, torch.zeros((8, 5)))
-
-    lens = planner.decide_verify_lens(num_gen_requests=8, reduce_across_ranks=False)
-
-    assert lens is not None
-    budget = sum(lens) - 8 * planner.cfg.min_verify_len
-    submitted_tokens = 8 * (planner.cfg.min_verify_len + 1) + budget
-    expected = float(table.step_times(np.asarray([submitted_tokens]), 8)[0])
-    assert planner.last_predicted_step_ms == pytest.approx(expected)
-    assert planner.stats["predicted_steps"] == 1
-    assert planner.stats["predicted_ms_sum"] == pytest.approx(expected)
+    assert older is not None
+    assert current is not None
+    assert older.survival.sum() < current.survival.sum()
