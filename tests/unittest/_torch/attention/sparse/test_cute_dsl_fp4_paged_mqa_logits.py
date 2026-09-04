@@ -1502,10 +1502,6 @@ def benchmark_fp4_paged_mqa_logits(
 
 if __name__ == "__main__":
     import argparse
-    import os
-    import sys
-
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir))
 
     DT_MAP = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 

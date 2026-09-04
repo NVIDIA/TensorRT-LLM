@@ -26,6 +26,8 @@ are exercised by the topology matrix below.
 """
 
 from collections.abc import Sequence
+from types import SimpleNamespace
+from typing import Any
 
 import kv_transfer_harness as transfer_harness
 import pytest
@@ -93,13 +95,35 @@ def test_v2_disagg_role_mapper_kind_defaults() -> None:
     }
 
 
-def test_minimax_disagg_role_mapper_kinds() -> None:
-    manager = object.__new__(MiniMaxM3KVCacheManagerV2)
+@pytest.mark.parametrize(
+    "implementation,expected_main_mapper",
+    [("triton", MapperKind.NHD), ("msa", MapperKind.HND)],
+)
+def test_minimax_disagg_role_mapper_kinds(
+    monkeypatch: pytest.MonkeyPatch,
+    implementation: str,
+    expected_main_mapper: MapperKind,
+) -> None:
+    def fake_base_init(self: KVCacheManagerV2, *args: Any, **kwargs: Any) -> None:
+        self.is_disagg = kwargs.get("is_disagg", False)
+        self.dtype = kwargs.get("dtype", DataType.BF16)
+        self.layer_offsets = {}
+        self.max_batch_size = 1
+        self.max_seq_len = 1
 
-    role_mapper_kinds = manager.get_disagg_role_mapper_kinds()
+    monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
+    manager = MiniMaxM3KVCacheManagerV2(
+        num_layers=0,
+        sparse_layer_ids=[],
+        disable_index_value_layer_ids=[],
+        sparse_attention_config=SimpleNamespace(
+            implementation=implementation,
+            indexer_kv_dtype="bf16",
+        ),
+    )
 
-    assert role_mapper_kinds == {
-        Role.ALL: MapperKind.NHD,
+    assert manager.get_disagg_role_mapper_kinds() == {
+        Role.ALL: expected_main_mapper,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
 
@@ -152,7 +176,10 @@ def test_minimax_kv_pool_mapping_offset_ignores_layer_grouping_order() -> None:
 
 
 def _create_manager(
-    mapping: Mapping, dtype: DataType, sparse_layers: list[int] | None = None
+    mapping: Mapping,
+    dtype: DataType,
+    sparse_layers: list[int] | None = None,
+    implementation: str = "triton",
 ) -> MiniMaxM3KVCacheManagerV2:
     max_num_tokens = 2048
     kv_cache_dtype = {
@@ -180,6 +207,10 @@ def _create_manager(
         sparse_layer_ids=sparse_layers if sparse_layers is not None else SPARSE_LAYERS,
         disable_index_value_layer_ids=sparse_layers if sparse_layers is not None else SPARSE_LAYERS,
         sparse_index_dim=INDEX_DIM,
+        sparse_attention_config=SimpleNamespace(
+            implementation=implementation,
+            indexer_kv_dtype="bf16",
+        ),
     )
 
 
@@ -243,6 +274,7 @@ def _create_managers(
     enable_dp: bool,
     dtype: DataType = DataType.BF16,
     sparse_layers: list[int] | None = None,
+    implementation: str = "triton",
 ) -> list[MiniMaxM3KVCacheManagerV2]:
     return [
         _create_manager(
@@ -255,6 +287,7 @@ def _create_managers(
             ),
             dtype,
             sparse_layers,
+            implementation,
         )
         for rank in range(tp * pp)
     ]
@@ -314,14 +347,21 @@ def _fill_position_dependent(
     *,
     layer_idx: int,
     first_global_head: int,
+    layout: MapperKind,
 ) -> None:
-    """Fill ``[block, role, token, head, dim]`` with exact small integers."""
+    """Fill an NHD or HND cache view with exact position-dependent integers."""
     block = torch.arange(tensor.shape[0], device=tensor.device)[:, None, None, None, None]
     role = torch.arange(tensor.shape[1], device=tensor.device)[None, :, None, None, None]
-    token = torch.arange(tensor.shape[2], device=tensor.device)[None, None, :, None, None]
-    head = (first_global_head + torch.arange(tensor.shape[3], device=tensor.device))[
-        None, None, None, :, None
-    ]
+    if layout == MapperKind.HND:
+        head = (first_global_head + torch.arange(tensor.shape[2], device=tensor.device))[
+            None, None, :, None, None
+        ]
+        token = torch.arange(tensor.shape[3], device=tensor.device)[None, None, None, :, None]
+    else:
+        token = torch.arange(tensor.shape[2], device=tensor.device)[None, None, :, None, None]
+        head = (first_global_head + torch.arange(tensor.shape[3], device=tensor.device))[
+            None, None, None, :, None
+        ]
     dim = torch.arange(tensor.shape[4], device=tensor.device)[None, None, None, None, :]
     values = (layer_idx * 17 + block * 11 + role * 13 + token * 3 + head * 19 + dim) % 97
     tensor.copy_(values.to(tensor.dtype))
@@ -334,6 +374,8 @@ def _as_nvfp4_scale_tensor(
     scale_view = _get_nvfp4_scale_view(manager, layer_idx)
     if scale_view is None:
         return None
+    if manager._main_kv_mapper_kind != MapperKind.NHD:
+        raise AssertionError("MSA uses an FP8 KV cache; NVFP4 scale pools are NHD-only")
     local_layer_id = manager.layer_offsets[layer_idx]
     local_heads = manager.num_kv_heads_per_layer[local_layer_id]
     bytes_per_token_head = HEAD_DIM // 16
@@ -405,12 +447,13 @@ def _initialize_cache(
             continue
 
         for layer_idx in manager.pp_layers:
-            kv = manager.get_buffers(layer_idx, kv_layout="NHD")
+            kv = manager.get_buffers(layer_idx)
             first_global_head = _first_global_head(manager)
             _fill_position_dependent(
                 kv,
                 layer_idx=layer_idx,
                 first_global_head=first_global_head,
+                layout=manager._main_kv_mapper_kind,
             )
 
             index_key = manager.get_index_k_buffer(layer_idx)
@@ -420,6 +463,7 @@ def _initialize_cache(
                     index_tensor,
                     layer_idx=layer_idx,
                     first_global_head=0,
+                    layout=manager._main_kv_mapper_kind,
                 )
 
             scale_tensor = _as_nvfp4_scale_tensor(manager, layer_idx)
@@ -428,6 +472,7 @@ def _initialize_cache(
                     scale_tensor,
                     layer_idx=layer_idx,
                     first_global_head=first_global_head,
+                    layout=manager._main_kv_mapper_kind,
                 )
 
 
@@ -457,8 +502,9 @@ def _verify_cache(
                 gen_indices = _valid_indices(manager, gen_request_id, layer_idx)
                 assert gen_indices
 
-                gen_kv = manager.get_buffers(layer_idx, kv_layout="NHD")[gen_indices]
-                local_heads = gen_kv.shape[3]
+                gen_kv = manager.get_buffers(layer_idx)[gen_indices]
+                head_axis = 2 if manager._main_kv_mapper_kind == MapperKind.HND else 3
+                local_heads = gen_kv.shape[head_axis]
                 first_global_head = _first_global_head(manager)
                 for kv_idx in range(2):
                     for local_head in range(local_heads):
@@ -474,13 +520,14 @@ def _verify_cache(
                         ctx_indices = _valid_indices(
                             ctx_manager, ctx_request_ids[req_idx], layer_idx
                         )
-                        ctx_kv = ctx_manager.get_buffers(layer_idx, kv_layout="NHD")
-                        torch.testing.assert_close(
-                            gen_kv[:, kv_idx, :, local_head, :],
-                            ctx_kv[ctx_indices, kv_idx, :, ctx_local_head, :],
-                            rtol=0,
-                            atol=0,
-                        )
+                        ctx_kv = ctx_manager.get_buffers(layer_idx)
+                        if manager._main_kv_mapper_kind == MapperKind.HND:
+                            actual = gen_kv[:, kv_idx, local_head, :, :]
+                            expected = ctx_kv[ctx_indices, kv_idx, ctx_local_head, :, :]
+                        else:
+                            actual = gen_kv[:, kv_idx, :, local_head, :]
+                            expected = ctx_kv[ctx_indices, kv_idx, :, ctx_local_head, :]
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
                 index_key = manager.get_index_k_buffer(layer_idx)
                 if index_key is not None:
@@ -519,12 +566,13 @@ def _verify_cache(
                         )
                         ctx_scales = _as_nvfp4_scale_tensor(ctx_manager, layer_idx)
                         assert ctx_scales is not None
-                        torch.testing.assert_close(
-                            gen_scales[gen_indices, :, :, local_head, :],
-                            ctx_scales[ctx_indices, :, :, ctx_local_head, :],
-                            rtol=0,
-                            atol=0,
-                        )
+                        if manager._main_kv_mapper_kind == MapperKind.HND:
+                            actual = gen_scales[gen_indices, :, local_head, :, :]
+                            expected = ctx_scales[ctx_indices, :, ctx_local_head, :, :]
+                        else:
+                            actual = gen_scales[gen_indices, :, :, local_head, :]
+                            expected = ctx_scales[ctx_indices, :, :, ctx_local_head, :]
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 # Production is expected to use TEP/DEP context and DEP generation. Bias the
@@ -600,6 +648,36 @@ def test_minimax_m3_kv_transfer(
         gen_enable_dp=gen_enable_dp,
         update_before_transfer=update_before_transfer,
         manager_factory=lambda tp, pp, enable_dp: _create_managers(tp, pp, enable_dp, cache_dtype),
+        init_fn=_initialize_cache,
+        verify_fn=_verify_cache,
+    )
+
+
+@pytest.mark.cuda
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "update_before_transfer",
+    [True, False],
+    ids=["update_before", "update_after"],
+)
+def test_minimax_m3_msa_hnd_head_mismatch_transfer(
+    update_before_transfer: bool,
+) -> None:
+    transfer_harness.run_kv_transfer_test(
+        ctx_tp=1,
+        ctx_pp=1,
+        gen_tp=4,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        update_before_transfer=update_before_transfer,
+        manager_factory=lambda tp, pp, enable_dp: _create_managers(
+            tp,
+            pp,
+            enable_dp,
+            DataType.FP8,
+            implementation="msa",
+        ),
         init_fn=_initialize_cache,
         verify_fn=_verify_cache,
     )

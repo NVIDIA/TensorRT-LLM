@@ -45,8 +45,6 @@ LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
 
-sys.path.append(str(root_dir / "tests" / "integration"))
-
 
 def test_v1_kv_cache_event_hash_algo_warning_for_non_v1():
     with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"

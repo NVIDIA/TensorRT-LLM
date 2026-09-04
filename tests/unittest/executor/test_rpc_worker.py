@@ -1,6 +1,4 @@
 import asyncio
-import os
-import sys
 import time
 
 from tensorrt_llm.executor.request import GenerationRequest
@@ -9,7 +7,6 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
 # isort: on
 

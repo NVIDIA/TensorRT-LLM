@@ -83,7 +83,7 @@ class TestFlashInferAttention(unittest.TestCase):
         )
         manager.get_batch_cache_indices.assert_called_once_with([99])
 
-    def test_decode_launch_shape_is_part_of_plan_params(self):
+    def test_decode_plan_cache_key_reuses_single_token_batches(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
 
@@ -113,6 +113,39 @@ class TestFlashInferAttention(unittest.TestCase):
                 attention_mask_type=AttentionMaskType.causal.value,
                 flashinfer_backend="trtllm-gen",
             )
+            metadata.seq_lens = torch.tensor([1, 1, 1], dtype=torch.int32)
+            larger_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata.seq_lens = torch.tensor([1, 1], dtype=torch.int32)
+            metadata._uses_full_generation_page_table = True
+            full_page_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata._uses_full_generation_page_table = False
+            metadata._is_shared_kv_draft_view = True
+            shared_draft_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata._is_shared_kv_draft_view = False
             metadata.seq_lens = torch.tensor([6, 6], dtype=torch.int32)
             multi_token_plan = metadata.plan(
                 num_heads=32,
@@ -135,6 +168,14 @@ class TestFlashInferAttention(unittest.TestCase):
             )
 
         self.assertEqual(single_token_plan.q_len_per_req, 1)
+        self.assertEqual(single_token_plan.num_generations, 0)
+        self.assertEqual(larger_single_token_plan.q_len_per_req, 1)
+        self.assertEqual(larger_single_token_plan.num_generations, 0)
+        self.assertEqual(single_token_plan, larger_single_token_plan)
+        self.assertEqual(full_page_single_token_plan.num_generations, 2)
+        self.assertNotEqual(single_token_plan, full_page_single_token_plan)
+        self.assertEqual(shared_draft_single_token_plan.num_generations, 2)
+        self.assertNotEqual(single_token_plan, shared_draft_single_token_plan)
         self.assertEqual(multi_token_plan.q_len_per_req, 6)
         self.assertNotEqual(single_token_plan, multi_token_plan)
         self.assertEqual(multi_token_plan.num_generations, 2)

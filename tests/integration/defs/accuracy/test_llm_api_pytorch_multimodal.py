@@ -766,22 +766,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                         )
                     },
                 ),
-                marks=(
-                    skip_pre_hopper,
-                    # Note: marking as `xfail` so the test still runs in CI, and we can observe
-                    # whether its flakiness is still relevant on main.
-                    (
-                        pytest.mark.xfail(
-                            reason="https://nvbugs/6581049",
-                            raises=pytest.RaisesExc(
-                                AssertionError,
-                                match=r"Expected accuracy >= threshold, but got",
-                            ),
-                        )
-                        if pytest.version_tuple >= (8, 4)
-                        else pytest.mark.xfail(reason="https://nvbugs/6581049")
-                    ),
-                ),
+                marks=(skip_pre_hopper,),
                 id="fp8_mmmu_encoder_cuda_graph",
             ),
             pytest.param(

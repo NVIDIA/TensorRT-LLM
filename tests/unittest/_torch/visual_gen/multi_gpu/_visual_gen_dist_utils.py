@@ -26,18 +26,13 @@ test) can grab the port in the gap between the probe close and the re-bind, so a
 single allocation is not enough on busy nodes -- we must re-allocate and retry.
 """
 
-import sys
-from pathlib import Path
-
 import torch.multiprocessing as mp
 
 # The CI-aware allocator lives in tests/integration/defs/common.py. Adding that
 # directory to sys.path lets us reuse it (it tracks allocated ports per-process
 # so sequential tests don't collide, and honors CONTAINER_PORT_START/NUM).
-_INTEGRATION_DIR = Path(__file__).resolve().parents[4] / "integration"
-if str(_INTEGRATION_DIR) not in sys.path:
-    sys.path.insert(0, str(_INTEGRATION_DIR))
-from defs.common import get_free_port_in_ci  # noqa: E402
+__extra_import_path__ = ["~/tests/integration"]
+from defs.common import get_free_port_in_ci
 
 _ADDR_IN_USE_MARKERS = ("EADDRINUSE", "address already in use")
 

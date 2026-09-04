@@ -15,11 +15,11 @@
 
 import pytest
 import torch
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.modules.mamba.layernorm_gated import RMSNorm
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, unswizzle_sf
 from tensorrt_llm.math_utils import ceil_div, pad_up
-from tests.unittest.utils.util import getSMVersion
 
 
 def fused_gated_rmsnorm_quant_available():

@@ -1,5 +1,3 @@
-import os
-import sys
 import time
 
 import pytest
@@ -12,7 +10,6 @@ from tensorrt_llm.llmapi.utils import logger_debug
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
 from utils.util import similar, skip_single_gpu
 # isort: on

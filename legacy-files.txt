@@ -727,7 +727,7 @@ tests/unittest/scaffolding/test_parallel_process.py
 tests/unittest/scaffolding/test_scaffolding.py
 tests/unittest/scaffolding/test_task_collection.py
 tests/unittest/scaffolding/test_worker.py
-tests/unittest/test_pip_install.py
+tests/unittest/check_pip_install.py
 tests/unittest/tools/__init__.py
 tests/unittest/tools/test_prepare_dataset.py
 tests/unittest/tools/test_test_to_stage_mapping.py

@@ -26,13 +26,8 @@ compare dequantized outputs (fp8 * scale) with tolerances appropriate for
 FP8 E4M3 quantization noise.
 """
 
-import os
-import sys
-
 import pytest
 import torch
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.util import getSMVersion
 
 # Import tensorrt_llm to load custom CUDA operators

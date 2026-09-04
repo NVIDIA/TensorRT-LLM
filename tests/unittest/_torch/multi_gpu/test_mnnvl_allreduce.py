@@ -12,8 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import os
 import pickle
+import platform
 import sys
 import traceback
 
@@ -24,8 +26,10 @@ from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
+from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -200,6 +204,185 @@ def run_reject_single_rank(tensor_parallel_size, single_rank_forward_func,
         traceback.print_exc()
         raise
     return True
+
+
+def mnnvl_checkpoint_graph_forward(tensor_parallel_size: int,
+                                   tensor_parallel_rank: int, num_tokens: int):
+    env_names = ("TLLM_TEST_MNNVL", "TRTLLM_FORCE_MNNVL_AR")
+    previous_env = {
+        name: (name in os.environ, os.environ.get(name))
+        for name in env_names
+    }
+    tensor_parallel_rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(tensor_parallel_rank)
+    os.environ["TLLM_TEST_MNNVL"] = "1"
+    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
+    mapping = None
+    allreduce = None
+    graph = None
+    input_ = None
+    output = None
+    workspace = None
+    try:
+        MPI.COMM_WORLD.barrier()
+
+        mapping = Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        )
+        stale_workspace = MNNVLAllReduce.allreduce_mnnvl_workspaces.pop(
+            mapping, None)
+        del stale_workspace
+        gc.collect()
+        MPI.COMM_WORLD.barrier()
+        with torch.inference_mode():
+            allreduce = AllReduce(
+                mapping=mapping,
+                strategy=AllReduceStrategy.MNNVL,
+                dtype=torch.bfloat16,
+            )
+            input_ = torch.full((num_tokens, 128),
+                                tensor_parallel_rank + 1,
+                                dtype=torch.bfloat16,
+                                device="cuda")
+            output = allreduce(input_)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = allreduce(input_)
+
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, torch.full_like(output, 3))
+
+        workspace = allreduce.mnnvl_allreduce.allreduce_mnnvl_workspaces[
+            mapping]
+        uc_address = workspace["uc_buffer"].data_ptr()
+        mc_address = workspace["handle"].get_mc_buffer((1, ), torch.float32,
+                                                       0).data_ptr()
+
+        for cycle in range(3):
+            allreduce.mnnvl_allreduce.checkpoint_prepare()
+            allreduce.mnnvl_allreduce.checkpoint_prepare()
+            assert not workspace["handle"].is_mapped()
+            with pytest.raises(
+                    RuntimeError,
+                    match="does not have an active MPI communicator"):
+                workspace["handle"].checkpoint_restore_complete(True)
+            with pytest.raises(RuntimeError, match="handles are not attached"):
+                allreduce(input_)
+
+            if cycle == 0:
+                reordered_comm = MPI.COMM_WORLD.Split(
+                    0, tensor_parallel_size - tensor_parallel_rank - 1)
+                with pytest.raises(
+                        RuntimeError,
+                        match="restore communicator validation failed"):
+                    workspace["handle"].checkpoint_restore(
+                        reordered_comm.py2f())
+                reordered_comm.Free()
+
+            fresh_comm = MPI.COMM_WORLD.Split(0, tensor_parallel_rank)
+            allreduce.mnnvl_allreduce.checkpoint_restore(fresh_comm)
+            fresh_comm.Free()
+            allreduce.mnnvl_allreduce.checkpoint_restore(workspace["mpi_comm"])
+            assert workspace["handle"].is_mapped()
+            assert workspace["uc_buffer"].data_ptr() == uc_address
+            assert workspace["handle"].get_mc_buffer((1, ), torch.float32,
+                                                     0).data_ptr() == mc_address
+
+            with torch.inference_mode():
+                input_.fill_(tensor_parallel_rank + 2 + cycle)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output,
+                                       torch.full_like(output, 5 + 2 * cycle))
+
+        allreduce.mnnvl_allreduce.checkpoint_prepare()
+        abort_comm = MPI.COMM_WORLD.Split(0, tensor_parallel_rank)
+        assert workspace["handle"].checkpoint_restore(abort_comm.py2f())
+        with pytest.raises(RuntimeError,
+                           match="all-reduce protocol reset failed"):
+            workspace["handle"].checkpoint_restore_complete(
+                tensor_parallel_rank != 0)
+        assert not workspace["handle"].is_mapped()
+        abort_comm.Free()
+        return tensor_parallel_rank, previous_env
+    finally:
+        workspace = None
+        output = None
+        input_ = None
+        graph = None
+        allreduce = None
+        if mapping is not None:
+            MNNVLAllReduce.allreduce_mnnvl_workspaces.pop(mapping, None)
+        gc.collect()
+        for name, (was_present, value) in previous_env.items():
+            if was_present:
+                os.environ[name] = value
+            else:
+                os.environ.pop(name, None)
+
+
+def mnnvl_checkpoint_worker_env(_: int):
+    MPI.COMM_WORLD.barrier()
+    env_names = ("TLLM_TEST_MNNVL", "TRTLLM_FORCE_MNNVL_AR")
+    return tensorrt_llm.mpi_rank(), {
+        name: (name in os.environ, os.environ.get(name))
+        for name in env_names
+    }
+
+
+def mnnvl_checkpoint_rejects_wrong_membership(world_size: int,
+                                              world_rank: int) -> bool:
+    env_names = ("TLLM_TEST_MNNVL", "TRTLLM_FORCE_MNNVL_AR")
+    previous_env = {
+        name: (name in os.environ, os.environ.get(name))
+        for name in env_names
+    }
+    os.environ["TLLM_TEST_MNNVL"] = "1"
+    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
+    mapping = None
+    allreduce = None
+    try:
+        world_rank = tensorrt_llm.mpi_rank()
+        torch.cuda.set_device(world_rank)
+        MPI.COMM_WORLD.barrier()
+        mapping = Mapping(world_size=world_size,
+                          tp_size=2,
+                          pp_size=2,
+                          rank=world_rank)
+        MNNVLAllReduce.allreduce_mnnvl_workspaces.pop(mapping, None)
+        allreduce = AllReduce(mapping=mapping,
+                              strategy=AllReduceStrategy.MNNVL,
+                              dtype=torch.bfloat16)
+        allreduce(torch.ones((1, 128), dtype=torch.bfloat16, device="cuda"))
+        workspace = MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping]
+        allreduce.mnnvl_allreduce.checkpoint_prepare()
+
+        wrong_group = 0 if world_rank in (0, 3) else 1
+        wrong_comm = MPI.COMM_WORLD.Split(wrong_group, mapping.tp_rank)
+        with pytest.raises(RuntimeError,
+                           match="restore communicator validation failed"):
+            workspace["handle"].checkpoint_restore(wrong_comm.py2f())
+        wrong_comm.Free()
+
+        correct_comm = MPI.COMM_WORLD.Split(mapping.pp_rank, mapping.tp_rank)
+        allreduce.mnnvl_allreduce.checkpoint_restore(correct_comm)
+        correct_comm.Free()
+        assert workspace["handle"].is_mapped()
+        return True
+    finally:
+        allreduce = None
+        if mapping is not None:
+            MNNVLAllReduce.allreduce_mnnvl_workspaces.pop(mapping, None)
+        gc.collect()
+        for name, (was_present, value) in previous_env.items():
+            if was_present:
+                os.environ[name] = value
+            else:
+                os.environ.pop(name, None)
 
 
 @torch.inference_mode()
@@ -477,6 +660,49 @@ def test_mnnvl_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype,
     _run_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype,
                                          AllReduceStrategy.MNNVL, fusion,
                                          mpi_pool_executor)
+
+
+@pytest.mark.skipif(
+    platform.machine().lower() != "aarch64" or torch.cuda.device_count() < 2
+    or not MnnvlMemory.supports_mnnvl(),
+    reason="requires at least two GB200 GPUs with fabric-backed MNNVL",
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.parametrize("num_tokens", [1, 4096], ids=["oneshot", "twoshot"])
+def test_mnnvl_checkpoint_preserves_cuda_graph_addresses(
+        mpi_pool_executor, num_tokens) -> None:
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        mnnvl_checkpoint_graph_forward,
+        [tensor_parallel_size] * tensor_parallel_size,
+        range(tensor_parallel_size),
+        [num_tokens] * tensor_parallel_size,
+    )
+    previous_env_by_rank = dict(results)
+    current_env_by_rank = dict(
+        mpi_pool_executor.map(
+            mnnvl_checkpoint_worker_env,
+            range(tensor_parallel_size),
+        ))
+    assert set(current_env_by_rank) == set(range(tensor_parallel_size))
+    assert current_env_by_rank == previous_env_by_rank
+
+
+@pytest.mark.skipif(
+    platform.machine().lower() != "aarch64" or torch.cuda.device_count() < 4
+    or not MnnvlMemory.supports_mnnvl(),
+    reason="requires four GB200 GPUs with fabric-backed MNNVL",
+)
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_mnnvl_checkpoint_rejects_wrong_group_membership(
+        mpi_pool_executor) -> None:
+    world_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        mnnvl_checkpoint_rejects_wrong_membership,
+        [world_size] * world_size,
+        range(world_size),
+    )
+    assert all(results)
 
 
 def _make_quant_scale(reference_norm: torch.Tensor,

@@ -11,12 +11,13 @@ from torch.profiler import ProfilerActivity, profile
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention, _kda_decode  # noqa: E402
-from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (  # noqa: E402
+from kimi_kda_test_utils import (  # noqa: E402
     KimiKDAReference,
     KimiKDATestCachedState,
     get_production_decode_kernel_path,
 )
+
+from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention, _kda_decode  # noqa: E402
 
 # 73: deliberately odd and > 64 to cover non-power-of-two batched decode.
 BATCH_SIZE = 73

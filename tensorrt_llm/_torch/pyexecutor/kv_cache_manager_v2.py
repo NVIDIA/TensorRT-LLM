@@ -2148,7 +2148,8 @@ class KVCacheManagerV2(BaseResourceManager):
         ``_extra_buffers_per_layer``. Model-specific managers may declare
         logical layouts without requiring the shared extractor to inspect
         private attributes or role names. MiniMax M3, for example, maps
-        ordinary K/V to ``NHD`` and keeps index-key ``REPLICATED``.
+        ordinary K/V to ``HND`` for its MSA backend and ``NHD`` for its
+        Triton backend, while keeping index-key ``REPLICATED``.
 
         This declaration does not influence storage pooling: V2 storage
         coalesces buffers purely by ``(life_cycle, buffer size)``, so roles

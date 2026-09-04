@@ -85,12 +85,8 @@ import urllib.error
 import urllib.request
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from kimi_k3_sa_harness import (  # noqa: E402
-    PROMPTS_AND_CHECKS,
-    _compare_logits_parity,
-    _parity_prompts,
-)
+__extra_import_path__ = ["."]
+from kimi_k3_sa_harness import PROMPTS_AND_CHECKS, _compare_logits_parity, _parity_prompts
 
 # Request-payload variants, tried in order per endpoint until one is
 # accepted (capability is cached per endpoint afterwards):

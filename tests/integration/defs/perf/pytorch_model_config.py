@@ -217,7 +217,7 @@ def get_model_yaml_config(model_label: str,
         },
         # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
         # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
-        # backend (see accuracy/test_llm_api_pytorch.py::TestGLM52).
+        # backend (see accuracy/test_glm52.py::TestGLM52NVFP4).
         # Spec decoding is intentionally left off so the sweep measures kernel
         # time rather than MTP acceptance rate.
         {

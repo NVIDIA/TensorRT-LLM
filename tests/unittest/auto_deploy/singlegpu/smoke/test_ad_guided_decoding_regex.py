@@ -14,9 +14,11 @@
 # limitations under the License.
 
 from _model_test_utils import get_small_model_config
-from build_and_run_ad import ExperimentConfig, main
 
 from tensorrt_llm.llmapi import GuidedDecodingParams
+
+__extra_import_path__ = ["~/examples/auto_deploy"]
+from build_and_run_ad import ExperimentConfig, main
 
 
 def test_ad_guided_decoding_regex_e2e():

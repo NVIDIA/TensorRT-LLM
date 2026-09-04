@@ -25,22 +25,12 @@ genuine finite-precision noise and not a sharding bug is confirmed by the harnes
 tolerance below.
 """
 
-import sys
 from functools import partial
-from pathlib import Path
 
 import pytest
 
 # The generic harness and helpers live alongside this file / under _utils_test.
-_THIS_DIR = Path(__file__).resolve().parent
-if str(_THIS_DIR) not in sys.path:
-    sys.path.insert(0, str(_THIS_DIR))
-
-from test_sharding_num_correctness import (  # noqa: E402
-    _DIST_CONFIGS,
-    _gpu_check,
-    _run_equivalence_job,
-)
+from test_sharding_num_correctness import _DIST_CONFIGS, _gpu_check, _run_equivalence_job
 
 # A bare module name lets the harness resolve the model from either bundled
 # AutoDeploy or the generated standalone package.
