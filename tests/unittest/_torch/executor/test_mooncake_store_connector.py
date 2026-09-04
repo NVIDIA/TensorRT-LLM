@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheLayout,
     KvCacheRegion,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import (
     PageAddressing,
@@ -54,7 +55,6 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     PageTransfer,
     RequestTransfers,
 )
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
@@ -756,9 +756,7 @@ def test_staging_put_hands_the_store_one_host_buffer_per_page(
         assert staged_copies == expected
 
 
-def test_staging_get_scatters_back_to_the_device_regions(
-    store_config, fake_store, staged_copies
-):
+def test_staging_get_scatters_back_to_the_device_regions(store_config, fake_store, staged_copies):
     layout = make_layout(regions_per_group=3)
     with make_staged_worker(fake_store, store_config, layout=layout) as worker:
         block_hash = b"\x03" * 16
@@ -837,7 +835,8 @@ def test_staging_narrows_the_batch_to_the_budget(store_config, fake_store, stage
         worker._put(
             [
                 RequestTransfers(
-                    1, [PageTransfer(block_hash, 0, index) for index, block_hash in enumerate(hashes)]
+                    1,
+                    [PageTransfer(block_hash, 0, index) for index, block_hash in enumerate(hashes)],
                 )
             ]
         )

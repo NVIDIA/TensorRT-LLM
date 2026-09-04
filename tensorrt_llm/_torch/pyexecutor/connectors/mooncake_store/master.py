@@ -137,7 +137,7 @@ def resolve_master_address(address: str, timeout: float) -> str:
     if not address.startswith(ADDRESS_FILE_SCHEME):
         return address
 
-    path = address[len(ADDRESS_FILE_SCHEME):]
+    path = address[len(ADDRESS_FILE_SCHEME) :]
     started = time.monotonic()
     deadline = started + timeout
     announced = started
@@ -267,9 +267,7 @@ def _highest_rate_ib_devices(sysfs_root: Optional[str] = None) -> List[str]:
     return [device for device, rate in sorted(rated.items()) if rate == fastest]
 
 
-def resolve_device_name(protocol: str,
-                        configured: str,
-                        sysfs_root: Optional[str] = None) -> str:
+def resolve_device_name(protocol: str, configured: str, sysfs_root: Optional[str] = None) -> str:
     """The RDMA devices to transfer over, detected if the config left it open.
 
     Which HCAs a node has is a property of the node, not of the deployment, so
@@ -316,15 +314,13 @@ def wait_for_master(master_address: str, timeout: Optional[float] = None) -> Opt
         )
         return None
     elapsed = _wait_until_accepting(*endpoint, timeout)
-    logger.info(
-        f"mooncake-store: the master at {master_address} answered in {elapsed:.1f}s"
-    )
+    logger.info(f"mooncake-store: the master at {master_address} answered in {elapsed:.1f}s")
     return elapsed
 
 
-def _client_config(pool: Any,
-                   master_address: str,
-                   device_name: Optional[str] = None) -> Dict[str, Any]:
+def _client_config(
+    pool: Any, master_address: str, device_name: Optional[str] = None
+) -> Dict[str, Any]:
     """Render the Mooncake client config for a pool.
 
     The schema is vLLM's, so one pool can serve both engines. `role` is written
@@ -548,8 +544,8 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
 
             config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
             config = _client_config(
-                pool, master_address,
-                resolve_device_name(pool.protocol, pool.device_name))
+                pool, master_address, resolve_device_name(pool.protocol, pool.device_name)
+            )
             with open(config_path, "w") as handle:
                 json.dump(config, handle, indent=2)
             # Inherited by the ranks the LLM constructor spawns. Ranks an

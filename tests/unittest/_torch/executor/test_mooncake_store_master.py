@@ -116,7 +116,6 @@ def fake_master(monkeypatch):
             self.process = None
 
         def arm(self, listen_on=None, exit_code=None, log_text=None):
-
             def popen(command, env=None, stdout=None, **_kwargs):
                 # A real master writes its log through this handle.
                 if log_text is not None and stdout is not None:
@@ -496,9 +495,7 @@ def test_a_stopped_master_leaves_no_address_behind(fake_master, tmp_path):
     address_file = tmp_path / "master.addr"
     pool = MooncakeStoreConfig(launch_master=True, master_port=port)
 
-    with master_module.running_master(
-        pool, str(tmp_path / "run"), address_file=str(address_file)
-    ):
+    with master_module.running_master(pool, str(tmp_path / "run"), address_file=str(address_file)):
         assert address_file.exists()
 
     assert not address_file.exists()
@@ -599,8 +596,7 @@ def test_an_address_of_a_shape_we_cannot_probe_is_not_fatal():
 def test_a_master_that_died_starting_is_reported_with_its_last_words(fake_master, tmp_path):
     """The reason is in the master's log, which is only read if the error quotes it."""
     run_dir = tmp_path / "run"
-    fake_master.arm(
-        exit_code=1, log_text="E0903 bind(50051) failed: Address already in use\n")
+    fake_master.arm(exit_code=1, log_text="E0903 bind(50051) failed: Address already in use\n")
     pool = MooncakeStoreConfig(launch_master=True, master_port=free_port())
 
     with pytest.raises(RuntimeError, match="Address already in use"):
@@ -627,14 +623,14 @@ def test_the_compute_fabric_is_picked_over_the_management_adapter(tmp_path):
     fake_hca(tmp_path, "mlx5_3", state="1: DOWN")
     fake_hca(tmp_path, "mlx5_4", link_layer="Ethernet")
 
-    assert master_module.resolve_device_name(
-        "rdma", "", sysfs_root=str(tmp_path)) == "mlx5_0,mlx5_1"
+    assert (
+        master_module.resolve_device_name("rdma", "", sysfs_root=str(tmp_path)) == "mlx5_0,mlx5_1"
+    )
 
 
 def test_a_named_device_is_not_second_guessed(tmp_path):
     fake_hca(tmp_path, "mlx5_0")
-    assert master_module.resolve_device_name(
-        "rdma", "mlx5_7", sysfs_root=str(tmp_path)) == "mlx5_7"
+    assert master_module.resolve_device_name("rdma", "mlx5_7", sysfs_root=str(tmp_path)) == "mlx5_7"
 
 
 def test_tcp_needs_no_device_and_looks_for_none(tmp_path):
@@ -643,12 +639,10 @@ def test_tcp_needs_no_device_and_looks_for_none(tmp_path):
 
 def test_a_node_without_infiniband_is_left_to_mooncake_s_own_discovery(tmp_path):
     """Falling back beats failing, since Mooncake may still find a usable device."""
-    assert master_module.resolve_device_name(
-        "rdma", "", sysfs_root=str(tmp_path / "absent")) == ""
+    assert master_module.resolve_device_name("rdma", "", sysfs_root=str(tmp_path / "absent")) == ""
 
 
-def test_the_detected_device_is_what_the_workers_are_told(fake_master, tmp_path,
-                                                          monkeypatch):
+def test_the_detected_device_is_what_the_workers_are_told(fake_master, tmp_path, monkeypatch):
     sysfs = tmp_path / "sysfs"
     fake_hca(sysfs, "mlx5_0")
     monkeypatch.setattr(master_module, "IB_SYSFS_ROOT", str(sysfs))

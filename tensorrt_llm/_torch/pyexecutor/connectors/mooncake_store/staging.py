@@ -247,9 +247,7 @@ def stage_batch_for_put(
         Per-page address and size lists, each a single staged buffer.
     """
     if len(addresses) > pool.num_slots:
-        raise ValueError(
-            f"batch of {len(addresses)} pages exceeds {pool.num_slots} staging slots"
-        )
+        raise ValueError(f"batch of {len(addresses)} pages exceeds {pool.num_slots} staging slots")
     staged_addresses: List[List[int]] = []
     staged_sizes: List[List[int]] = []
     for index, (page_addresses, page_sizes) in enumerate(zip(addresses, sizes, strict=True)):

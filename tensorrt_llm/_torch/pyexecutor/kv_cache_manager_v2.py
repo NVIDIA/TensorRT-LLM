@@ -2667,9 +2667,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # DISAGG_CONTEXT_TRANS_IN_PROGRESS, out of the schedulable range, and
         # its `_KVCache` keeps holding the pages until every rank reports the
         # save retired through `get_finished`.
-        if self.kv_connector_manager.request_finished(
-            req, self.get_connector_page_indices(req)
-        ):
+        if self.kv_connector_manager.request_finished(req, self.get_connector_page_indices(req)):
             self._pending_preemption[req.py_request_id] = req
             return False
 

@@ -450,11 +450,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             pending_ctx,
             preempted_ids,
             made_progress=bool(
-                scheduled_gen
-                or scheduled_ctx
-                or scheduled_encoder
-                or disagg_candidates
-                or evicted
+                scheduled_gen or scheduled_ctx or scheduled_encoder or disagg_candidates or evicted
             ),
         )
 
@@ -1135,8 +1131,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         num_ctx_candidates = sum(
             1
             for r in pending_ctx
-            if r.py_request_id not in preempted_ids
-            and r.request_id not in inflight_request_ids
+            if r.py_request_id not in preempted_ids and r.request_id not in inflight_request_ids
         )
         if num_gen_candidates == 0 and num_ctx_candidates == 0:
             # Legitimately idle: nothing to schedule.

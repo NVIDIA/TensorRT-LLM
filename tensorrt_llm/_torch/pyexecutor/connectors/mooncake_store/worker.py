@@ -54,9 +54,9 @@ from .staging import (
     describe_batch_for_get,
     plan_slot_geometry,
     stage_batch_for_put,
-    sync_stream as _sync_stream,
     unstage_batch_after_get,
 )
+from .staging import sync_stream as _sync_stream
 from .validation import validate_layout, validate_llm_args
 
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
@@ -265,8 +265,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             self._save_thread.start()
 
         logger.info(
-            f"mooncake-store worker rank {self._rank} registered layout: "
-            f"{addressing.describe()}"
+            f"mooncake-store worker rank {self._rank} registered layout: {addressing.describe()}"
         )
 
     def _open_staging(self, addressing: PageAddressing) -> None:
@@ -523,8 +522,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 # escapes here would be lost, so it is stashed and re-raised on
                 # the executor thread at the next connector call.
                 logger.error(
-                    f"mooncake-store save failed on rank {self._rank}: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"mooncake-store save failed on rank {self._rank}: {type(exc).__name__}: {exc}"
                 )
                 with self._save_lock:
                     if self._save_error is None:

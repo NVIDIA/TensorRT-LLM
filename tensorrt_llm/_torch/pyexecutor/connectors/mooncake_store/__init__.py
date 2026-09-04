@@ -47,11 +47,17 @@ through a pinned host buffer instead; see `staging.py`.
 """
 
 from .config import MooncakeStoreConnectorConfig, StoreRole, parse_size
-from .donor import (DEFAULT_DONOR_LOCAL_BUFFER_SIZE, donate_segment,
-                    maybe_donate_segment)
-from .master import (local_address, master_timeout, maybe_provision_pool,
-                     provision_pool, resolve_device_name,
-                     resolve_master_address, running_master, wait_for_master)
+from .donor import DEFAULT_DONOR_LOCAL_BUFFER_SIZE, donate_segment, maybe_donate_segment
+from .master import (
+    local_address,
+    master_timeout,
+    maybe_provision_pool,
+    provision_pool,
+    resolve_device_name,
+    resolve_master_address,
+    running_master,
+    wait_for_master,
+)
 from .scheduler import MooncakeStoreConnectorScheduler
 from .worker import MooncakeStoreConnectorWorker
 

@@ -68,7 +68,6 @@ def failing_bindings(fake_bindings):
     """Bindings whose `setup` refuses, as an unreachable master would."""
 
     class Refusing(fake_bindings):
-
         def setup(self, *args):
             super().setup(*args)
             return 7
@@ -79,7 +78,8 @@ def failing_bindings(fake_bindings):
 
 @pytest.mark.parametrize("entry", ["direct", "config"])
 def test_a_donor_registers_the_segment_it_was_asked_for(
-        entry, fake_bindings, reachable_master, monkeypatch):
+    entry, fake_bindings, reachable_master, monkeypatch
+):
     """Both entry paths must reach Mooncake with the same seven setup arguments.
 
     The config-driven path is what makes a generation server a donor, and it
@@ -105,7 +105,8 @@ def test_a_donor_registers_the_segment_it_was_asked_for(
                 segment_size="320GiB",
                 protocol="rdma",
                 device_name="mlx5_1",
-            ))
+            )
+        )
 
     with donation as host:
         assert host == expected_host
@@ -135,7 +136,8 @@ def test_a_donor_that_cannot_join_says_which_master_it_could_not_reach(failing_b
 
 
 def test_a_donor_given_no_host_registers_under_the_pool_s_view_of_this_node(
-        fake_bindings, monkeypatch):
+    fake_bindings, monkeypatch
+):
     """The master and the segments registering with it must agree on the host."""
     monkeypatch.setattr(donor_module, "local_address", lambda: "10.1.2.3")
 
@@ -167,8 +169,9 @@ def test_a_server_that_was_not_asked_lends_nothing(fake_bindings):
     assert fake_bindings.instances == []
 
 
-def test_a_published_master_address_is_read_before_joining(fake_bindings, reachable_master,
-                                                           tmp_path):
+def test_a_published_master_address_is_read_before_joining(
+    fake_bindings, reachable_master, tmp_path
+):
     """What lets a generation server name a path instead of a scheduler's choice."""
     address_file = tmp_path / "master.addr"
     address_file.write_text("10.0.0.9:50051\n")
@@ -182,7 +185,8 @@ def test_a_published_master_address_is_read_before_joining(fake_bindings, reacha
 
 
 def test_an_unreachable_master_is_reported_before_the_segment_is_offered(
-        fake_bindings, monkeypatch):
+    fake_bindings, monkeypatch
+):
     """Otherwise this is a status code from setup, with no address in it."""
 
     def refuse(address):

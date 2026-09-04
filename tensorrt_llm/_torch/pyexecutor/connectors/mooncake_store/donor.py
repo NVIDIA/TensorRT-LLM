@@ -40,8 +40,13 @@ from typing import Any, Iterator, Optional
 from tensorrt_llm.logger import logger
 
 from .config import parse_size
-from .master import (local_address, master_timeout, resolve_device_name,
-                     resolve_master_address, wait_for_master)
+from .master import (
+    local_address,
+    master_timeout,
+    resolve_device_name,
+    resolve_master_address,
+    wait_for_master,
+)
 
 __all__ = [
     "DEFAULT_DONOR_LOCAL_BUFFER_SIZE",
@@ -82,7 +87,7 @@ def donate_segment(
         ) from exc
 
     host = hostname or local_address()
-    donated = f"{segment_size / 1024 ** 3:.1f}GiB"
+    donated = f"{segment_size / 1024**3:.1f}GiB"
     # Byte counts are spelled out next to the human-readable form. A misparsed
     # size string otherwise surfaces only as a pool that evicts far too eagerly.
     logger.info(
@@ -154,9 +159,7 @@ def maybe_donate_segment(donation: Any) -> Iterator[Optional[str]]:
         f"memory to the pool at {donation.master_server_address} without using "
         "it; resolving the master now"
     )
-    master_address = resolve_master_address(
-        donation.master_server_address, master_timeout()
-    )
+    master_address = resolve_master_address(donation.master_server_address, master_timeout())
     # Checked before setup so an absent master is reported as such, rather than
     # as the status code setup returns for every kind of failure.
     wait_for_master(master_address)

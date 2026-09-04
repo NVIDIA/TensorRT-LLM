@@ -53,6 +53,7 @@ def make_gen_request(
     req.lora_task_id = lora_task_id
     req.is_context_init_state = False
     req.is_generation_in_progress_state = True
+    req.is_generation_to_complete_state = False
     req.is_first_context_chunk = is_first_context_chunk
     req.py_encoder_output_ready_event = None
     return req
@@ -171,7 +172,13 @@ def make_kv_cache_manager(
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
-    mgr.suspend_request.return_value = None
+
+    def _suspend(req):
+        # Mirrors KVCacheManagerV2.suspend_request: the cache stops being
+        # active on GPU, so the request is no longer an eviction victim.
+        mgr.kv_cache_map[req.py_request_id].is_active = False
+
+    mgr.suspend_request.side_effect = _suspend
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
     # The default here has a cache tier below GPU, which leaves preemption off.
     mgr.has_cache_tier_below_gpu = has_cache_tier_below_gpu
@@ -1069,9 +1076,7 @@ class TestDeadlockDetection:
         def resize_fn(req, n):
             return not fail[0]
 
-        mgr = make_kv_cache_manager(
-            resize_context_fn=resize_fn, has_cache_tier_below_gpu=False
-        )
+        mgr = make_kv_cache_manager(resize_context_fn=resize_fn, has_cache_tier_below_gpu=False)
         sched = make_scheduler(mgr, max_num_tokens=1000)
         sched._DEADLOCK_STALL_ITERS = 3
         reqs = [make_ctx_request(0, 100, is_first_context_chunk=False)]
