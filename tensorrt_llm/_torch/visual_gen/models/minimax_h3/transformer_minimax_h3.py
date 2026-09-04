@@ -17,11 +17,8 @@
 
 """MiniMax-H3 packed audio-video diffusion transformer.
 
-The architecture follows the Apache-2.0 MiniMax-H3 implementations in
-Diffusers and SGLang while using TRT-LLM's linear, attention, normalization,
-and dynamic-weight-loading modules.  The released checkpoint license is
-separate from this implementation; callers are responsible for ensuring that
-they are permitted to use the checkpoint in their deployment territory.
+The architecture follows the Diffusers implementations while using TRT-LLM's
+linear, attention, normalization, and dynamic-weight-loading modules
 """
 
 from dataclasses import dataclass
