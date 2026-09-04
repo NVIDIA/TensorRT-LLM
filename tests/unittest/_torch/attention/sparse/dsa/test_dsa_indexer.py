@@ -24,14 +24,11 @@ This file tests:
 
 import builtins
 import random
-import sys
-from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention_backend.interface import (
@@ -82,6 +79,10 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp8_utils
+
+__extra_import_path__ = ["..", "~/tests/unittest"]
+
+from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 
 def has_deep_gemm():
@@ -478,6 +479,43 @@ def test_indexer_configures_one_top_k_module(
     assert indexer.top_k.decode_implementation == expected_decode
 
 
+@skip_pre_hopper
+@pytest.mark.parametrize(
+    "flag_value,expected_dtype",
+    [
+        (None, torch.float32),
+        ("0", torch.float32),
+        ("1", torch.bfloat16),
+    ],
+)
+def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, expected_dtype):
+    """wk/weights_proj dtype follows TRTLLM_DSA_INDEXER_BF16.
+
+    Unset or "0" keeps the projection in fp32 (default); "1" runs it in the
+    model dtype. create_indexer builds the Indexer with dtype=torch.bfloat16.
+    """
+    if flag_value is None:
+        monkeypatch.delenv("TRTLLM_DSA_INDEXER_BF16", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DSA_INDEXER_BF16", flag_value)
+
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=128,
+    )
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
+        return_value=100,
+    ):
+        indexer = create_indexer(sparse_config)
+
+    assert indexer._indexer_bf16 is (flag_value == "1")
+    assert indexer.wk.dtype == expected_dtype
+    assert indexer.weights_proj.dtype == expected_dtype
+
+
 def _ceil_to_ue8m0(x: torch.Tensor):
     """Round tensor values up to the nearest power of two (UE8M0 format)."""
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
@@ -489,9 +527,6 @@ def cdiv(a: int, b: int) -> int:
 
 
 def _load_cast_back_from_fp4():
-    sparse_test_dir = Path(__file__).resolve().parents[1]
-    if str(sparse_test_dir) not in sys.path:
-        sys.path.insert(0, str(sparse_test_dir))
     from test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
 
     return cast_back_from_fp4

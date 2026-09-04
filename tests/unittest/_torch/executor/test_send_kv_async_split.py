@@ -54,7 +54,7 @@ def test_wrapper_keeps_connector_leg_without_transceiver() -> None:
 
     PyExecutor._send_kv_async(executor, [])
 
-    assert calls == ["disagg_send", "connector_save"]
+    assert calls == ["connector_save"]
 
 
 def test_disagg_send_leg_is_noop_without_transceiver() -> None:

@@ -20,7 +20,7 @@ from ....functional import PositionEmbeddingType
 from ....logger import logger
 from ....mapping import Mapping
 from ....models.modeling_utils import QuantConfig
-from ...attention_backend import AttentionMetadata, TrtllmAttention, TrtllmAttentionMetadata
+from ...attention_backend import TrtllmAttention, TrtllmAttentionMetadata
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
@@ -291,10 +291,9 @@ class KimiK3MLAAttention(MLA):
             rms_norm_eps=rms_norm_eps,
             flashinfer_mla_backend=_select_mla_generation_backend(model_config.get_quant_config()),
         )
-        # K3 calls forward_impl() directly to insert its output gate before
-        # the base row-parallel o_proj. The original executor metadata remains
-        # intact, so MLA performs its native mixed context/generation split.
-        self.register_to_config = False
+        # Keep the base MLA registration enabled so breakable CUDA graphs use
+        # the shared custom op. The output gate is a base hook and runs on both
+        # the registered and eager paths before the row-parallel o_proj.
 
         self.use_output_gate = use_output_gate
 
@@ -341,29 +340,14 @@ class KimiK3MLAAttention(MLA):
         if dtype is not None:
             _meta_safe_cast_dtype(self, dtype)
 
-    def _apply_output_gate_and_o_proj(
+    def _apply_output_gate(
         self,
         hidden_states: torch.Tensor,
-        attn_out: torch.Tensor,
+        attn_output: torch.Tensor,
     ) -> torch.Tensor:
+        # Sigmoid gate on o_proj's input. g_proj matches o_proj's input
+        # sharding, so the multiply composes with the helix-CP output
+        # projection.
         if self.use_output_gate:
-            attn_out = attn_out * self.g_proj(hidden_states).sigmoid()
-        return self.o_proj(attn_out)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
-        # _create_outputs() rather than create_output(): the base implementation
-        # takes a list so a sparse-attention backend can append its own buffers,
-        # and it routes through the sparse hooks when they are installed. The
-        # dense path this module uses is element 0.
-        attn_outputs = self._create_outputs(hidden_states, attn_metadata)
-        super().forward_impl(
-            None,
-            hidden_states,
-            attn_metadata,
-            attn_output=attn_outputs,
-        )
-        return self._apply_output_gate_and_o_proj(hidden_states, attn_outputs[0])
+            return attn_output * self.g_proj(hidden_states).sigmoid()
+        return attn_output

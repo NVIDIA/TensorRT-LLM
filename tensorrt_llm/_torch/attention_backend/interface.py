@@ -1089,14 +1089,26 @@ class AttentionBackend(Generic[TMetadata]):
         """Per-token bytes to reserve for a workspace this backend stages whose size scales with a
         runtime quantity the KV-cache estimator does not drive to its serving maximum while profiling
         (e.g. ``total_kv_len``, inflated by KV-cache reuse). Default ``0`` -- correct for every backend
-        except fp8 context-MLA today.
+        that does not stage such context-MLA data.
 
         A non-zero rate is reserved from the KV budget by the estimator, and the scheduler caps the
         driving sum at what that reserve covers, so the declared buffer stays within its reservation
         (buffers the backend does not declare are still unaccounted for). Keep the rate identical to the
-        runtime allocation's per-token cost. See ``ATTENTION_DEVELOPER_GUIDE.md`` §2.3.
+        runtime allocation's per-token cost or use a documented conservative upper bound. See
+        ``ATTENTION_DEVELOPER_GUIDE.md`` §2.3.
         """
         return 0
+
+    @classmethod
+    def runtime_workspace_is_chunked_prefill_bounded(
+            cls, model_config: "ModelConfig") -> bool:
+        """Whether chunked prefill bounds the declared workspace by the current chunk.
+
+        Backends that still stage data proportional to the complete attended
+        prefix must return ``False`` so KV-cache sizing reserves headroom for
+        that prefix.
+        """
+        return True
 
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
         """

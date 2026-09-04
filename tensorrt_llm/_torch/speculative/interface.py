@@ -1100,10 +1100,6 @@ class SpecMetadata:
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0
 
-        def _first_or_none(values):
-            """Return the first sampling parameter value when present."""
-            return values[0] if values is not None and len(values) > 0 else None
-
         def _normalize_request_sampling_params(
             *,
             temperature: Optional[float],
@@ -1147,9 +1143,9 @@ class SpecMetadata:
 
         for request in requests:
             sampling_config = request.sampling_config
-            temp_val = _first_or_none(sampling_config.temperature)
-            tk_val = _first_or_none(sampling_config.top_k)
-            tp_val = _first_or_none(sampling_config.top_p)
+            temp_val = sampling_config.temperature
+            tk_val = sampling_config.top_k
+            tp_val = sampling_config.top_p
 
             # Context requests have no draft tokens yet.
             num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1

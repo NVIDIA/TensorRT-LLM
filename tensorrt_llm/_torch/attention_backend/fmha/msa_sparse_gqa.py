@@ -204,8 +204,8 @@ class MsaSparseGqaFmha(Fmha):
         if not is_sm_100f() or not msa_package_available():
             return False
         # Only the MiniMax-M3 MSA layer uses this library. Matching the lowered
-        # sparse algorithm lets the base create_fmha_libs add it to that layer
-        # alone, so no create_fmha_libs override is needed.
+        # sparse algorithm lets FmhaManager construction add it to that layer
+        # alone, so no custom library discovery is needed.
         return attn.sparse_params is not None and attn.sparse_params.algorithm == "minimax_m3"
 
     def forward(

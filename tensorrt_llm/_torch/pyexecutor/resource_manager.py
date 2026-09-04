@@ -52,8 +52,7 @@ from ...logger import logger
 from ...mapping import Mapping
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
-                          get_draft_token_length)
+from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .scheduler import ScheduledRequests
 
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
@@ -782,7 +781,7 @@ class KVCacheManager(BaseResourceManager):
             return 0
         if not input_tokens:
             return 0
-        from tensorrt_llm.bindings import SamplingConfig
+        from tensorrt_llm.bindings.executor import SamplingConfig
         from tensorrt_llm.bindings.internal.batch_manager import BlockKey
         from tensorrt_llm.bindings.internal.batch_manager import \
             LlmRequest as CppLlmRequest
@@ -1264,14 +1263,14 @@ class KVCacheManager(BaseResourceManager):
             encoder_input_tokens = ([1] * encoder_output_len
                                     if encoder_output_len is not None else None)
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
-            req = LlmRequest(request_id=req_id,
-                             max_new_tokens=1,
-                             input_tokens=[1] * token_num,
-                             sampling_config=SamplingConfig(
-                                 sampling_params._get_sampling_config()),
-                             is_streaming=False,
-                             encoder_input_tokens=encoder_input_tokens,
-                             encoder_output_len=encoder_output_len)
+            req = LlmRequest(
+                request_id=req_id,
+                max_new_tokens=1,
+                input_tokens=[1] * token_num,
+                sampling_config=sampling_params._get_sampling_config(),
+                is_streaming=False,
+                encoder_input_tokens=encoder_input_tokens,
+                encoder_output_len=encoder_output_len)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:

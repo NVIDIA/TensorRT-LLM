@@ -989,7 +989,7 @@ def test_deepseek_v4_sanity(
     model_config.extra_attrs["kv_cache_dtype"] = kv_cache_dtype
     model = DeepseekV4ForCausalLM(model_config).to(device)
     assert not model.model.layers[0].fusion_config.POST_MOE_FUSION
-    fmha_libs = model.model.layers[0].self_attn.mqa.fmha_libs
+    fmha_libs = model.model.layers[0].self_attn.mqa._fmha_manager.fmha_libs
     if kv_cache_dtype == "fp8_ds_mla":
         assert any(isinstance(fmha, FlashInferSparseMlaFmha) for fmha in fmha_libs)
         assert not any(isinstance(fmha, FallbackFmha) for fmha in fmha_libs)
