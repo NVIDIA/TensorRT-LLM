@@ -112,13 +112,6 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         self._kv_transfer_backend = kv_transfer_backend
         self._probe: Optional[asyncio.Future] = None
 
-    @property
-    def _args(self) -> Any:
-        return getattr(self._llm, "args", None)
-
-    def _arg(self, name: str) -> Any:
-        return getattr(self._args, name, None)
-
     def _engine_is_healthy(self) -> bool:
         """Readiness via the predicate the engine's own HTTP /health uses.
 
@@ -161,14 +154,15 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         )
 
         parallelism = server_pb2.ParallelismInfo()
-        for field, arg in (
-            ("tensor_parallel_size", "tensor_parallel_size"),
-            ("pipeline_parallel_size", "pipeline_parallel_size"),
-            ("decode_context_parallel_size", "context_parallel_size"),
+        args = self._llm.args
+        for field, value in (
+            ("tensor_parallel_size", args.tensor_parallel_size),
+            ("pipeline_parallel_size", args.pipeline_parallel_size),
+            ("decode_context_parallel_size", args.context_parallel_size),
         ):
-            value = _positive_int(self._arg(arg))
-            if value is not None:
-                setattr(parallelism, field, value)
+            size = _positive_int(value)
+            if size is not None:
+                setattr(parallelism, field, size)
         info.parallelism.CopyFrom(parallelism)
 
         if self._kv_transfer_backend:
@@ -191,14 +185,13 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             )
 
         capacity = server_pb2.DeploymentCapacity()
-        max_batch_size = _positive_int(self._arg("max_batch_size"))
+        max_batch_size = _positive_int(self._llm.args.max_batch_size)
         if max_batch_size is not None:
             capacity.max_running_requests = max_batch_size
-        max_num_tokens = _positive_int(self._arg("max_num_tokens"))
+        max_num_tokens = _positive_int(self._llm.args.max_num_tokens)
         if max_num_tokens is not None:
             capacity.max_batched_tokens = max_num_tokens
-        kv_cache_config = self._arg("kv_cache_config")
-        block_size = _positive_int(getattr(kv_cache_config, "tokens_per_block", None))
+        block_size = _positive_int(self._llm.args.kv_cache_config.tokens_per_block)
         if block_size is not None:
             capacity.kv_block_size = block_size
         info.capacity.CopyFrom(capacity)
@@ -221,10 +214,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             # Generate rejects `lora_name` even on an enable_lora build.
             supports_lora=False,
             supports_multimodal=False,
-            reasoning_parser=str(self._arg("reasoning_parser") or ""),
+            reasoning_parser=str(self._llm.args.reasoning_parser or ""),
         )
 
-        max_seq_len = _positive_int(self._arg("max_seq_len"))
+        max_seq_len = _positive_int(self._llm.args.max_seq_len)
         if max_seq_len is not None:
             info.max_context_length = max_seq_len
             info.max_output_tokens = max_seq_len
@@ -238,7 +231,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         )
         generation.output_logprobs.CopyFrom(logprobs)
         generation.prompt_logprobs.CopyFrom(logprobs)
-        guided_backend = str(self._arg("guided_decoding_backend") or "")
+        guided_backend = str(self._llm.args.guided_decoding_backend or "")
         generation.guided_decoding.CopyFrom(
             model_pb2.GuidedDecodingCapabilities(
                 supported=bool(guided_backend),

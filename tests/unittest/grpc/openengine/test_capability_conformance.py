@@ -415,11 +415,13 @@ def test_health_inference_probe_runs_on_a_real_engine(llm):
 
 
 def test_control_reads_only_engine_arguments_that_exist():
-    """Guard against silent drift when an LlmArgs field is renamed upstream.
+    """Guard against drift when an LlmArgs field is renamed upstream.
 
-    Control reads these through `getattr(..., None)`, so a rename does not raise
-    -- it quietly turns the reported field into "unknown". Pin the names here so
-    the break is visible at test time instead of in a deployment.
+    Control reads these directly, so a rename is a hard failure rather than a
+    capability silently reported as "unknown" -- but it would surface on the
+    first GetServerInfo of a deployment. The stubs in the CPU tests are
+    SimpleNamespaces and cannot catch it, so pin the names against the real
+    TorchLlmArgs here.
     """
     read_by_control = {
         "max_seq_len",
@@ -590,16 +592,21 @@ def test_logprobs_stay_aligned_when_the_peer_omitted_the_first_one():
     Slicing positionally against that attributes every logprob to the token
     after the one it describes -- a wrong answer rather than an error.
     """
-    from tensorrt_llm.grpc.openengine.servicer import _aligned_logprobs
+    from tensorrt_llm.grpc.openengine.servicer import _delta_logprobs, _logprob_shortfall
 
-    output = SimpleNamespace(token_ids=[10, 11, 12], logprobs=["b", "c"])
-    assert _aligned_logprobs(output) == [None, "b", "c"]
+    def aligned(output):
+        return list(_delta_logprobs(output, 0, _logprob_shortfall(output)))
 
-    aligned = SimpleNamespace(token_ids=[10, 11], logprobs=["a", "b"])
-    assert _aligned_logprobs(aligned) == ["a", "b"]
+    short = SimpleNamespace(token_ids=[10, 11, 12], logprobs=["b", "c"])
+    assert aligned(short) == [None, "b", "c"]
+    # The pad is not re-materialized once the consumed prefix covers it.
+    assert list(_delta_logprobs(short, 1, _logprob_shortfall(short))) == ["b", "c"]
+    assert list(_delta_logprobs(short, 2, _logprob_shortfall(short))) == ["c"]
+
+    assert aligned(SimpleNamespace(token_ids=[10, 11], logprobs=["a", "b"])) == ["a", "b"]
 
     # No logprobs requested at all stays empty rather than becoming all-None.
-    assert _aligned_logprobs(SimpleNamespace(token_ids=[10], logprobs=[])) == []
+    assert aligned(SimpleNamespace(token_ids=[10], logprobs=[])) == []
 
 
 def test_a_context_request_reports_its_usage():

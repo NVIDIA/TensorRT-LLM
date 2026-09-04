@@ -43,20 +43,50 @@ class _FakeTokenizer:
 
 
 class _FakeResultHandle:
+    """Stands in for GenerationResult, whose __anext__ returns the handle itself.
+
+    Mirrors two properties of the real contract the servicer depends on:
+    ``finished`` is set once every sequence has a finish_reason, and the handle
+    exposes the last result's fields, so the error paths that report usage
+    against the handle see the same data a real one would.
+    """
+
     def __init__(self, results: list[Any]) -> None:
         self._results = results
         self.aborted = False
+        self.finished = False
+        self.prompt_token_ids: list[int] = []
+        self.outputs: list[Any] = []
+        self.cached_tokens = 0
+        self.error = None
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         for result in self._results:
+            if not hasattr(result, "finished"):
+                outputs = getattr(result, "outputs", ()) or ()
+                result.finished = bool(outputs) and all(o.finish_reason for o in outputs)
+            self.finished = result.finished
+            self.prompt_token_ids = getattr(result, "prompt_token_ids", []) or []
+            self.outputs = getattr(result, "outputs", []) or []
+            self.cached_tokens = getattr(result, "cached_tokens", 0)
+            self.error = getattr(result, "error", None)
             yield result
 
     def abort(self) -> None:
         self.aborted = True
 
 
+def _fake_llm_args(**overrides: Any) -> SimpleNamespace:
+    """The LLM.args fields the servicer reads, with engine-like defaults."""
+    args = SimpleNamespace(guided_decoding_backend=None)
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
 class _FakeLlm:
     def __init__(self, results: list[Any]) -> None:
+        self.args = _fake_llm_args()
         self.tokenizer = _FakeTokenizer()
         self.result_handle = _FakeResultHandle(results)
         self.generate_kwargs = None
@@ -724,7 +754,10 @@ def test_generate_does_not_abort_slow_engine(monkeypatch: pytest.MonkeyPatch) ->
         return handle
 
     llm = SimpleNamespace(
-        tokenizer=_FakeTokenizer(), result_handle=handle, generate_async=_generate_async
+        args=_fake_llm_args(),
+        tokenizer=_FakeTokenizer(),
+        result_handle=handle,
+        generate_async=_generate_async,
     )
     servicer = OpenEngineInferenceServicer(llm, model="test-model")
     request = generation_pb2.GenerateRequest(
@@ -946,6 +979,7 @@ def test_stalled_stream_cleanup_does_not_untrack_a_resubmission(
         """Unlike _FakeLlm, hands out a distinct handle per call."""
 
         def __init__(self) -> None:
+            self.args = _fake_llm_args()
             self.tokenizer = _FakeTokenizer()
             self.handles: list[_FakeResultHandle] = []
 

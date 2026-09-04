@@ -16,7 +16,7 @@ from google.protobuf.json_format import MessageToDict
 from openengine.v1 import error_pb2, generation_pb2, kv_pb2, openengine_pb2_grpc
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
-from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
+from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.logger import logger
@@ -487,15 +487,13 @@ def _finish_event(output: Any, end_id: int | None) -> generation_pb2.GenerationF
 
 
 def _usage(result: Any) -> generation_pb2.Usage:
-    prompt_tokens = len(getattr(result, "prompt_token_ids", ()) or ())
-    completion_tokens = sum(
-        len(output.token_ids or []) for output in (getattr(result, "outputs", ()) or ())
-    )
+    prompt_tokens = len(result.prompt_token_ids or ())
+    completion_tokens = sum(len(output.token_ids or []) for output in (result.outputs or ()))
     return generation_pb2.Usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
-        cached_prompt_tokens=getattr(result, "cached_tokens", 0),
+        cached_prompt_tokens=result.cached_tokens,
     )
 
 
@@ -761,16 +759,10 @@ def _prefill_ready_response(
 
 
 @dataclass(kw_only=True)
-class _OpenEngineFormatState(PostprocArgs):
-    """Per-request state for ``_format_result``.
+class _OpenEngineFormatState:
+    """Per-request state for ``_format_result``."""
 
-    Subclasses ``PostprocArgs`` so it can be threaded through the TensorRT-LLM
-    postprocessing worker pool (``num_postprocess_workers``): when workers are
-    enabled the formatting runs in a worker process and this state is created
-    once per request and reused there (the worker injects ``tokenizer``); when
-    disabled the servicer calls ``_format_result`` inline with this same object.
-    """
-
+    tokenizer: Any = None
     request_id: str = ""
     sampling_params: Any = None
     is_context_only: bool = False
@@ -938,14 +930,14 @@ def _format_result(
 class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
     """Translate OpenEngine generation streams to TensorRT-LLM requests."""
 
-    def __init__(self, llm: Any, model: str, kv_transfer_backend: str = "") -> None:
+    def __init__(self, llm: LLM, model: str, kv_transfer_backend: str = "") -> None:
         self._llm = llm
         self._model = model
         # Informational label placed in the KvSessionRef of PrefillReady events so
         # a generation worker/orchestrator can see which KV transfer backend the
         # context worker uses. The actual transfer is driven by opaque_state.
         self._kv_transfer_backend = kv_transfer_backend
-        self._guided_backend = getattr(getattr(llm, "args", None), "guided_decoding_backend", None)
+        self._guided_backend = llm.args.guided_decoding_backend
         self._active_requests: dict[str, Any] = {}
 
     def active_request_count(self) -> int:
@@ -1051,17 +1043,6 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
             return
 
-        # Response formatting state. When postprocessing workers are enabled this
-        # is run in a worker process (off the event loop); otherwise the servicer
-        # calls _format_result inline with the same object.
-        # NOTE: worker offload requires the engine's postproc workers to use the
-        # 'spawn' start method — with fork, deserializing CUDA-resident engine
-        # results in the worker fails ("Cannot re-initialize CUDA in forked
-        # subprocess"). Inline (the default, num_postprocess_workers=0) is
-        # unaffected.
-        postproc_enabled = (
-            getattr(getattr(self._llm, "args", None), "num_postprocess_workers", 0) > 0
-        )
         format_state = _OpenEngineFormatState(
             request_id=request_id,
             sampling_params=sampling_params,
@@ -1072,12 +1053,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             kv_transfer_backend=self._kv_transfer_backend,
             stop_texts=_stop_texts(sampling_params),
             exclude_stop=not sampling_params.include_stop_str_in_output,
-            tokenizer=None if postproc_enabled else getattr(self._llm, "tokenizer", None),
-        )
-        postproc_params = (
-            PostprocParams(post_processor=_format_result, postproc_args=format_state)
-            if postproc_enabled
-            else None
+            tokenizer=self._llm.tokenizer,
         )
 
         try:
@@ -1089,7 +1065,6 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 cache_salt=cache_salt,
                 priority=DEFAULT_REQUEST_PRIORITY,
                 disaggregated_params=disaggregated_params,
-                _postproc_params=postproc_params,
             )
         except ValueError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
@@ -1201,13 +1176,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 if context.cancelled():
                     abort_request("RPC cancelled")
                     return
-                # Formatting (detok + protobuf build) is done in a worker process
-                # when postprocessing workers are enabled, else inline here.
-                responses = (
-                    result.outputs[0]._postprocess_result
-                    if postproc_enabled
-                    else _format_result(result, format_state)
-                )
+                responses = _format_result(result, format_state)
                 for resp in responses or ():
                     mark_pending()
                     yield resp
@@ -1226,14 +1195,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 if result.error:
                     engine_terminal = True
                     return
-                # Terminal when the engine finishes: inline we already tracked all
-                # sequences in format_state; with workers the state lives in the
-                # worker, so use the result's own finished flag.
-                if (
-                    result.finished
-                    if postproc_enabled
-                    else len(format_state.finished_indices) == sampling_params.n
-                ):
+                if result.finished:
                     engine_terminal = True
                     return
 

@@ -65,7 +65,17 @@ def test_openengine_server_serves_the_control_contract() -> None:
     answering rather than falling through to the generated base.
     """
     llm = SimpleNamespace(
-        args=SimpleNamespace(max_seq_len=2048, guided_decoding_backend=None),
+        args=SimpleNamespace(
+            max_seq_len=2048,
+            max_batch_size=8,
+            max_num_tokens=2048,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            context_parallel_size=1,
+            guided_decoding_backend=None,
+            reasoning_parser=None,
+            kv_cache_config=SimpleNamespace(tokens_per_block=32),
+        ),
         llm_id="test-instance",
         tokenizer=object(),
         _check_health=lambda: True,
