@@ -105,6 +105,8 @@ class TritonCustomMaskFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> tuple[bool, str]:
+        if forward_args.block_sparse_inputs is not None:
+            return False, "block_sparse_inputs are not supported."
         if phase != FmhaPhase.CONTEXT:
             return False, "Only context attention is supported."
         if forward_args.attention_mask != CustomAttentionMask.CUSTOM:

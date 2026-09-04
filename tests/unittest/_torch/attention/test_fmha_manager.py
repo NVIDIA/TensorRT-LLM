@@ -22,6 +22,7 @@ import pytest
 import torch
 from fmha_test_utils import FakeAttention, FakeFmha, FakePhasedFmha
 
+from tensorrt_llm._torch.attention_backend.block_sparse import BlockSparseForwardInputs
 from tensorrt_llm._torch.attention_backend.fmha import manager as fmha_manager
 from tensorrt_llm._torch.attention_backend.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention_backend.fmha.interface import FmhaPhase
@@ -536,6 +537,97 @@ def test_fmha_cache_tracks_attention_mask_data() -> None:
         )
         assert manager.select(attn, q, None, None, metadata, mask_data_args) is fallback
         assert len(manager._cache) == 2
+
+
+@pytest.mark.parametrize("block_sparse_first", [False, True])
+def test_fmha_cache_separates_block_sparse_mode(block_sparse_first: bool) -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    block_sparse_fmha = FakeFmha(
+        attn,
+        "block-sparse",
+        events,
+        support_predicate=lambda forward_args: forward_args.block_sparse_inputs is not None,
+    )
+    dense_fmha = FakeFmha(
+        attn,
+        "dense",
+        events,
+        support_predicate=lambda forward_args: forward_args.block_sparse_inputs is None,
+    )
+    manager.fmha_libs = [block_sparse_fmha, dense_fmha]
+    metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
+    q = torch.empty((1, 4))
+    by_mode = {
+        False: AttentionForwardArgs(attention_input_type=AttentionInputType.context_only),
+        True: AttentionForwardArgs(
+            attention_input_type=AttentionInputType.context_only,
+            block_sparse_inputs=BlockSparseForwardInputs(
+                q_block_size=64,
+                kv_block_size=64,
+                exact_block_bits=torch.zeros((1, 1), dtype=torch.uint32),
+            ),
+        ),
+    }
+    order = (True, False) if block_sparse_first else (False, True)
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        selected = {
+            mode: manager.select(attn, q, None, None, metadata, by_mode[mode]) for mode in order
+        }
+
+    assert selected == {False: dense_fmha, True: block_sparse_fmha}
+    assert len(manager._cache) == 2
+
+
+@pytest.mark.parametrize("bsr_first", [False, True])
+def test_fmha_cache_separates_block_sparse_representations(bsr_first: bool) -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    bsr_only = FakeFmha(
+        attn,
+        "bsr",
+        events,
+        support_predicate=lambda forward_args: (
+            forward_args.block_sparse_inputs.sparse_format == "bsr"
+        ),
+    )
+    bitmask_only = FakeFmha(
+        attn,
+        "bitmask",
+        events,
+        support_predicate=lambda forward_args: (
+            forward_args.block_sparse_inputs.sparse_format == "bitmask"
+        ),
+    )
+    manager.fmha_libs = [bsr_only, bitmask_only]
+    metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
+    q = torch.empty((1, 4))
+    bsr_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        block_sparse_inputs=BlockSparseForwardInputs(
+            q_block_size=64,
+            kv_block_size=64,
+            max_blocks_per_row=1,
+            block_indptr=torch.tensor([0, 1], dtype=torch.int32),
+            block_indices=torch.tensor([0], dtype=torch.int32),
+        ),
+    )
+    bitmask_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        block_sparse_inputs=BlockSparseForwardInputs(
+            q_block_size=64,
+            kv_block_size=64,
+            exact_block_bits=torch.zeros((1, 1), dtype=torch.uint32),
+        ),
+    )
+    order = (bsr_args, bitmask_args) if bsr_first else (bitmask_args, bsr_args)
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        selected = [manager.select(attn, q, None, None, metadata, args) for args in order]
+
+    assert selected == ([bsr_only, bitmask_only] if bsr_first else [bitmask_only, bsr_only])
+    assert len(manager._cache) == 2
 
 
 @pytest.mark.parametrize("speculative_first", [False, True])

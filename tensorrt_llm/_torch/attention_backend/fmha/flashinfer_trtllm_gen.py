@@ -678,6 +678,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> Tuple[bool, str]:
+        if fwd.block_sparse_inputs is not None:
+            return False, "block_sparse_inputs are not supported."
         is_mla_enable = attn.is_mla_enable
         if phase is None:
             has_context_phase = fwd.attention_input_type != AttentionInputType.generation_only

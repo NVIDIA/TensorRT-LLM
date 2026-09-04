@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from packaging.version import InvalidVersion, Version
@@ -181,6 +181,8 @@ class PrimsTSFmha(PhasedFmha):
         # dispatch. Accept the phased dispatcher keyword, but do not narrow
         # support until that preparation is phase-aware too.
         del phase
+        if fwd.block_sparse_inputs is not None:
+            return False, "block_sparse_inputs are not supported."
         if q.device.type != "cuda":
             return False, "CUDA tensors are required."
         if not q.is_contiguous():
@@ -429,6 +431,27 @@ class PrimsTSFmha(PhasedFmha):
             )
         return block_tables[:batch_size, 0, :]
 
+    def _get_generation_workspace_layout(
+        self,
+        dtype: torch.dtype,
+        num_requests: int,
+        num_tokens: int,
+    ) -> dict[str, int]:
+        """Return the shared TRT-LLM generation preprocessing layout."""
+
+        return thop.get_trtllm_gen_generation_workspace_layout(
+            dtype,
+            num_requests,
+            num_tokens,
+            self.attn.num_heads,
+            self.attn.head_dim,
+            self.attn.rope_dim,
+            self.attn.num_kv_heads,
+            0,
+            False,
+            skip_fmha_workspace=True,
+        )
+
     @staticmethod
     def _get_sequence_lengths(
         sequence_lengths: torch.Tensor,
@@ -649,17 +672,10 @@ class PrimsTSFmha(PhasedFmha):
                 if input_type == AttentionInputType.generation_only
                 else q.shape[0] - int(metadata.num_ctx_tokens)
             )
-            generation_layout = thop.get_trtllm_gen_generation_workspace_layout(
+            generation_layout = self._get_generation_workspace_layout(
                 q.dtype,
                 int(metadata.num_generations),
                 num_gen_tokens_for_layout,
-                self.attn.num_heads,
-                self.attn.head_dim,
-                self.attn.rope_dim,
-                self.attn.num_kv_heads,
-                0,
-                False,
-                skip_fmha_workspace=True,
             )
             required_preprocess_bytes = max(
                 required_preprocess_bytes, int(generation_layout["total_size"])
@@ -950,6 +966,63 @@ class PrimsTSFmha(PhasedFmha):
             False,
             attention_chunk_size,
             self._multi_processor_count,
+            skip_fmha_workspace=True,
+        )
+
+    def _run_generation_preprocess(self, params: FmhaParams) -> tuple[Any, ...]:
+        """Run the shared TRT-LLM generation QKV and cache preprocessing."""
+
+        if self._multi_processor_count is None:
+            raise RuntimeError("PrimTS generation workspace was not prepared.")
+        attn = params.attn
+        meta = params.meta
+        fwd = params.fwd
+        rope_params = attn.rope_params
+        attention_chunk_size = attn.attention_chunk_size or 0
+        return thop.trtllm_gen_generation_preprocess(
+            params.qkv_input,
+            params.workspace,
+            params.sequence_lengths,
+            params.spec_decoding_generation_lengths,
+            params.spec_decoding_position_offsets,
+            meta.kv_cache_block_offsets,
+            meta.host_kv_cache_pool_pointers,
+            meta.host_kv_cache_pool_mapping,
+            fwd.kv_scale_orig_quant,
+            fwd.kv_scale_quant_orig,
+            fwd.out_scale,
+            attn.rotary_inv_freq,
+            attn.rotary_cos_sin,
+            fwd.mrope_position_deltas,
+            attn.local_layer_idx,
+            params.seq_offset,
+            attn.num_heads,
+            attn.num_kv_heads,
+            attn.head_dim,
+            params.tokens_per_block,
+            attn.quant_mode,
+            params.max_attention_window_size,
+            params.cyclic_attention_window_size,
+            params.num_tokens,
+            params.batch_size,
+            params.input_seq_length,
+            params.max_past_kv_length,
+            rope_params.dim,
+            rope_params.theta,
+            int(rope_params.scale_type),
+            rope_params.scale,
+            rope_params.max_positions,
+            attn.position_embedding_type,
+            self._get_bmm1_scale(attn),
+            1.0,
+            False,
+            attn.predicted_tokens_per_seq,
+            attention_chunk_size,
+            self._multi_processor_count,
+            params.total_num_blocks,
+            params.kv_factor,
+            True,
+            False,
             skip_fmha_workspace=True,
         )
 

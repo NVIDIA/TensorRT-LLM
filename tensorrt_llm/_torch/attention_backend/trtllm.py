@@ -1815,6 +1815,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        has_block_sparse_inputs = forward_args.block_sparse_inputs is not None
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -2016,8 +2017,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     assert v.shape[1] == kv_hidden_size
             num_tokens = q.shape[0]
             if k is not None and not metadata.is_cross:
-                assert k.shape[0] == num_tokens
-                assert v.shape[0] == num_tokens
+                if has_block_sparse_inputs:
+                    assert v is not None and v.shape[0] == k.shape[0]
+                else:
+                    assert k.shape[0] == num_tokens
+                    assert v.shape[0] == num_tokens
         else:
             sparse_attn_indices = forward_args.sparse_runtime_params.sparse_attn_indices
             is_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel(

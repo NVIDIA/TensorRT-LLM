@@ -293,6 +293,8 @@ class CuteDslMlaFmha(PhasedFmha):
         meta: "TrtllmAttentionMetadata",
         fwd: AttentionForwardArgs,
     ) -> tuple[bool, str]:
+        if fwd.block_sparse_inputs is not None:
+            return False, "block_sparse_inputs are not supported."
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
         # Disable mixed context/generation batches until the CuTe DSL host
