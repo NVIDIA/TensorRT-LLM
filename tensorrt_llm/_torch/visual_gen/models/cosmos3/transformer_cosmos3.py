@@ -16,7 +16,7 @@
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Callable, ContextManager, Optional, Tuple, TypeVar
+from typing import Any, Callable, ContextManager, Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -58,6 +58,28 @@ def apply_pretrained_config_compat_defaults(
         if getattr(pretrained_config, key, None) is None:
             setattr(pretrained_config, key, value)
     return pretrained_config
+
+
+def _resolve_cosmos3_cross_attention_backend(
+    backend: str,
+    visual_gen_mapping: Optional[Any],
+) -> str:
+    """Select a backend that preserves padded cross-attention semantics."""
+    if backend == "TRTLLM":
+        return "VANILLA"
+    if backend != "CUTEDSL" or visual_gen_mapping is None:
+        return backend
+
+    attn2d_size = visual_gen_mapping.attn2d_row_size * visual_gen_mapping.attn2d_col_size
+    if attn2d_size > 1:
+        raise ValueError(
+            "Cosmos3 cross-attention with Attention2D does not support the "
+            "CUTEDSL backend: unequal text lengths require a key-padding mask, "
+            "which CUTEDSL does not consume. Use attention backend FA4."
+        )
+    if visual_gen_mapping.ulysses_size > 1:
+        return "VANILLA"
+    return backend
 
 
 def _noop_offload_context(_tower_name: str) -> ContextManager:
@@ -616,32 +638,44 @@ class Cosmos3CrossAttention(Attention):
         module_name: Optional[str] = None,
     ):
         original_backend = model_config.attention.backend
-        if model_config.attention.backend == "TRTLLM":
-            # TRTLLM backend is not supported for Cosmos3CrossAttention
-            model_config.attention.backend = "VANILLA"
+        resolved_backend = _resolve_cosmos3_cross_attention_backend(
+            original_backend,
+            model_config.visual_gen_mapping,
+        )
+        if resolved_backend != original_backend:
+            model_config.attention.backend = resolved_backend
             # Warn once per (module class, requested, resolved) triple so the
             # fallback is visible without per-module-instance log spam.
+            if original_backend == "CUTEDSL":
+                reason = (
+                    "does not support the key-padding mask required by Cosmos3 "
+                    "Ulysses cross-attention"
+                )
+            else:
+                reason = "is not supported for Cosmos3 cross-attention"
             logger.warning_once(
-                f"{type(self).__name__}: requested attention backend {original_backend} is not "
-                f"supported for Cosmos3 cross-attention; falling back to VANILLA.",
-                key=(type(self).__name__, original_backend, "VANILLA"),
+                f"{type(self).__name__}: requested attention backend {original_backend} "
+                f"{reason}; falling back to {resolved_backend}.",
+                key=(type(self).__name__, original_backend, resolved_backend),
             )
 
-        super().__init__(
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
-            qk_norm=False,
-            qk_norm_mode="per_head",
-            bias=False,
-            config=model_config,
-            layer_idx=layer_idx,
-            module_name=module_name,
-            enable_sequence_parallel=True,
-        )
-        model_config.attention.backend = original_backend
+        try:
+            super().__init__(
+                hidden_size=hidden_size,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_dim=head_dim,
+                qkv_mode=QKVMode.FUSE_QKV,
+                qk_norm=False,
+                qk_norm_mode="per_head",
+                bias=False,
+                config=model_config,
+                layer_idx=layer_idx,
+                module_name=module_name,
+                enable_sequence_parallel=True,
+            )
+        finally:
+            model_config.attention.backend = original_backend
         vgm = model_config.visual_gen_mapping
         self._sequence_parallel = vgm is not None and vgm.seq_size > 1
 
