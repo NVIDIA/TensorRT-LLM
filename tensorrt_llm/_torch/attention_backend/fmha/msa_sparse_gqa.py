@@ -176,8 +176,19 @@ def run_msa_paged_gqa(
     if prewritten:
         metadata._msa_prewritten_layer = None
     if k is not None and v is not None and not prewritten:
+        # num_tokens is the padded extent under piecewise CUDA graphs, so the live
+        # count is what separates real slots from the sentinel tail. Only the MSA
+        # metadata pads its slot array, so a backend without the accessor hands
+        # over live rows only.
+        live_token_count = getattr(metadata, "msa_live_token_count", None)
+        num_live_tokens = live_token_count() if live_token_count is not None else num_tokens
         write_msa_main_kv(
-            kv_cache_manager, layer_idx, metadata.msa_out_cache_loc[:num_tokens], k, v
+            kv_cache_manager,
+            layer_idx,
+            metadata.msa_out_cache_loc[:num_tokens],
+            k,
+            v,
+            num_live_tokens=num_live_tokens,
         )
 
     # q may be a strided column-view of a fused [q|k|v] buffer (the model skips
