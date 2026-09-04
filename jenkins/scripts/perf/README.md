@@ -334,7 +334,7 @@ def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCo
 
 When adding a test, either increment `testCount` on an existing entry or add a new `buildStageConfigs` block. Stages are grouped by node count (2 Nodes, 3 Nodes, 4 Nodes, etc.).
 
-For the full step-by-step guide including how to derive test-db filenames and GPU/node counts from disaggregated config YAMLs, see [`tests/scripts/perf-sanity/README.md`](../../tests/scripts/perf-sanity/README.md) ("Step-by-Step: Adding or Re-enabling Disaggregated Perf Sanity Tests").
+For the full step-by-step guide including how to derive test-db filenames and GPU/node counts from disaggregated config YAMLs, see [`tests/integration/defs/perf/README_test_perf_sanity.md`](../../tests/integration/defs/perf/README_test_perf_sanity.md) ("Step-by-Step: Adding or Re-enabling Disaggregated Perf Sanity Tests").
 
 ## Post-Processing and Triage
 
