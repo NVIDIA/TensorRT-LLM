@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+from typing import Optional
 from unittest import mock
 
 import pytest
@@ -7581,6 +7582,119 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
                         moe_backend="CUTEDSL",
                         max_draft_len=None,
                         mocker=mocker)
+
+
+@pytest.mark.timeout(28800)
+class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
+    """Qwen3.8-Flash-Next: Gated-DeltaNet + QSA hybrid with MoE, PLE, and MTP3."""
+
+    MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
+    MAX_NUM_TOKENS = 8192
+    MAX_BATCH_SIZE = 16
+    GSM8K_MAX_OUTPUT_LEN = 512
+    GSM8K_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        system_prompt=("Use at most three short reasoning sentences, then "
+                       "end with `#### NUMBER`. Do not restate the problem."),
+        chat_template_kwargs=dict(enable_thinking=True,
+                                  reasoning_effort="xhigh"),
+    )
+
+    MMLU_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        system_prompt=("Answer with a single letter: A, B, C, or D. "
+                       "Output only that letter and nothing else."),
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    def _build_llm(self, model_path: str, tensor_parallel_size: int,
+                   moe_backend: str, max_draft_len: Optional[int]) -> LLM:
+        """Construct the engine shared by both evaluation tasks."""
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False,
+                                        mamba_ssm_cache_dtype="bfloat16")
+        cuda_graph_config = CudaGraphConfig(max_batch_size=self.MAX_BATCH_SIZE,
+                                            enable_padding=True)
+        mtp_config = (None if max_draft_len is None else MTPDecodingConfig(
+            max_draft_len=max_draft_len))
+        return LLM(model_path,
+                   trust_remote_code=True,
+                   tensor_parallel_size=tensor_parallel_size,
+                   moe_expert_parallel_size=1,
+                   max_num_tokens=self.MAX_NUM_TOKENS,
+                   enable_chunked_prefill=True,
+                   max_batch_size=self.MAX_BATCH_SIZE,
+                   kv_cache_config=kv_cache_config,
+                   cuda_graph_config=cuda_graph_config,
+                   moe_config=MoeConfig(backend=moe_backend),
+                   speculative_config=mtp_config)
+
+    def _run_evals(self, model_path: str, tensor_parallel_size: int,
+                   moe_backend: str, max_draft_len: Optional[int],
+                   expected_quant_algo: Optional[QuantAlgo],
+                   monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
+
+        with self._build_llm(model_path, tensor_parallel_size, moe_backend,
+                             max_draft_len) as llm:
+            assert llm.args.quant_config.quant_algo == expected_quant_algo
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.GSM8K_EVALUATOR_KWARGS)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.MMLU_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(142000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_bf16_tp2_cutlass(self, monkeypatch: pytest.MonkeyPatch,
+                              mocker) -> None:
+        """BF16 TP2, no MTP, PLE offloaded to pinned host memory."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next",
+                        tensor_parallel_size=2,
+                        moe_backend="CUTLASS",
+                        max_draft_len=None,
+                        expected_quant_algo=None,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(145000)
+    @pytest.mark.skip_less_host_memory(98304)
+    def test_fp8_1gpu_mtp3_trtllm_ple_offload(self,
+                                              monkeypatch: pytest.MonkeyPatch,
+                                              mocker) -> None:
+        """Block-FP8 on one GPU with MTP3 and the PLE table offloaded to host."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
+                        tensor_parallel_size=1,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(100000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_1gpu_mtp3_cutedsl_ple_offload(
+            self, monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+        """NVFP4 on one GPU with MTP3 and the PLE table offloaded to host."""
+        self._run_evals(
+            f"{llm_models_root()}/Inferact-Qwen3.8-Flash-Next-NVFP4",
+            tensor_parallel_size=1,
+            moe_backend="CUTEDSL",
+            max_draft_len=3,
+            expected_quant_algo=QuantAlgo.NVFP4,
+            monkeypatch=monkeypatch,
+            mocker=mocker)
 
 
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):

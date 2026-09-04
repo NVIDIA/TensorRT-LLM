@@ -26,6 +26,7 @@ import triton.language as tl
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+    from tensorrt_llm._torch.pyexecutor.config_utils import Qwen4ExpPLECacheParams
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
@@ -138,6 +139,8 @@ class MambaRole:
 
     SSM_STATE = DataRole("ssm_state")
     CONV_STATE = DataRole("conv_state")
+    PLE_NGRAM_CONTEXT = DataRole("ple_ngram_context")
+    PLE_CONV_STATE = DataRole("ple_conv_state")
 
 
 def _mamba_effective_tp_size(mapping: Mapping) -> int:
@@ -2049,6 +2052,54 @@ def _get_local_mamba_cache_layout(
     return params, local_mamba_layers, local_attention_layers
 
 
+# --- Qwen4-Exp PLE ---------------------------------------------------------
+# PLE (the n-gram side path) is a Qwen4-Exp-only feature that rides on the
+# hybrid manager's Mamba slots. It is kept in dedicated helpers so it can be
+# lifted into a model-owned cache manager wholesale later on.
+
+
+def _qwen4_exp_ple_state_bytes_per_rank(
+    model_config,
+    params,
+    mapping,
+    *,
+    spec_config,
+    use_separate_draft_kv_cache: bool,
+) -> int:
+    """Bytes this rank needs for Qwen4-Exp PLE recurrent state; 0 otherwise."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        extract_qwen4_exp_ple_cache_params, is_qwen4_exp)
+
+    # The estimator is also called with minimal model-config stubs that carry no
+    # `pretrained_config`; such a config is definitionally not Qwen4-Exp.
+    pretrained_config = getattr(model_config, "pretrained_config", None)
+    if pretrained_config is None or not is_qwen4_exp(pretrained_config):
+        return 0
+    ple_params = extract_qwen4_exp_ple_cache_params(pretrained_config)
+    mamba_layer_mask, full_attention_layer_mask = params.get_layer_masks(
+        is_draft=False,
+        use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+    )
+    combined_layer_mask = [
+        is_mamba or is_attention for is_mamba, is_attention in zip(
+            mamba_layer_mask, full_attention_layer_mask)
+    ]
+    local_layer_indices, _ = get_pp_layers(
+        sum(combined_layer_mask),
+        mapping,
+        spec_config=spec_config,
+        layer_mask=combined_layer_mask,
+    )
+    local_ple_layers = sum(layer_id < len(ple_params.ple_layer_mask)
+                           and ple_params.ple_layer_mask[layer_id]
+                           for layer_id in local_layer_indices)
+    ple_bytes_per_layer = (
+        ple_params.short_conv_channels * ple_params.short_conv_state_len *
+        ple_params.conv_state_dtype.itemsize +
+        ple_params.ngram_context_len * torch.int64.itemsize)
+    return local_ple_layers * ple_bytes_per_layer
+
+
 def _estimate_mamba_hybrid_cache_cost(
     model_config,
     mapping: Mapping,
@@ -2081,6 +2132,14 @@ def _estimate_mamba_hybrid_cache_cost(
     ) if local_attention_layers > 0 else 0)
     state_bytes_per_rank = (local_mamba_layers *
                             params.get_states_bytes_per_layer(mapping))
+    if not is_draft:
+        state_bytes_per_rank += _qwen4_exp_ple_state_bytes_per_rank(
+            model_config,
+            params,
+            mapping,
+            spec_config=spec_config,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+        )
     max_resident_sequences = max_batch_size * mapping.pp_size
 
     if include_explicit_snapshots:
@@ -2886,6 +2945,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     _supports_additional_snapshot_offsets = True
 
+    # Qwen4-Exp PLE state is opt-in. These class-level defaults keep every other
+    # model — and any partially-constructed instance that sets only the fields it
+    # needs — out of the PLE branches without carrying PLE geometry.
+    # `_init_qwen4_exp_ple_geometry` rebinds all of them per instance.
+    _ple_layer_ids: list[int] = []
+    _ple_conv_state_shape: list[int] = []
+    _ple_ngram_context_shape: list[int] = []
+
     def __init__(
         self,
         # mamba cache parameters
@@ -2916,6 +2983,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         use_replay_state_update: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
         conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
+        qwen4_exp_ple_cache_params: Optional["Qwen4ExpPLECacheParams"] = None,
         **kwargs,
     ) -> None:
         if conv_state_layout not in ("x_b_c", "q_k_v"):
@@ -2978,6 +3046,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                                     max_batch_size))
         self._num_reserved_dummy_slots = (num_cuda_graph_padding_dummy_slots +
                                           int(mapping.enable_attention_dp))
+        # PLE uses the same request slots and snapshots as the GDN state.
+        self._init_qwen4_exp_ple_geometry(qwen4_exp_ple_cache_params,
+                                          total_layers, mamba_cache_dtype)
         self.ssm_state_dtype = (mamba_ssm_cache_dtype if mamba_ssm_cache_dtype
                                 is not None else mamba_cache_dtype)
         self.conv_state_dtype = mamba_cache_dtype
@@ -3131,6 +3202,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     f"{required_live_slots} live/dummy slots. Increase the "
                     "KV cache budget or allocate a larger Mamba pool_ratio.")
             self._setup_states()
+            # PLE pools use exactly the state-slot capacity resolved above.
+            self._setup_ple_states(num_ssm_slots)
             self._setup_replay_buffers(spec_config)
             if self._use_gdn_cached_replay_all_layer_commit:
                 state_layout = ("affine"
@@ -3148,6 +3221,97 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.all_ssm_states = []
             self.all_conv_states = []
             self._setup_replay_buffers(spec_config)
+
+    def _init_qwen4_exp_ple_geometry(
+        self,
+        params: Optional["Qwen4ExpPLECacheParams"],
+        total_layers: int,
+        default_state_dtype: torch.dtype,
+    ) -> None:
+        """Validate and record the Qwen4-Exp PLE pool geometry.
+
+        A no-op for every other model: the fields stay empty and
+        `_ple_buffer_configs` then contributes nothing.
+        """
+        self._ple_layer_ids: list[int] = []
+        self._ple_conv_state_shape: list[int] = []
+        self._ple_ngram_context_shape: list[int] = []
+        self._ple_conv_state_dtype = default_state_dtype
+        self._ple_conv_states: dict[int, torch.Tensor] = {}
+        self._ple_ngram_contexts: dict[int, torch.Tensor] = {}
+        if params is None:
+            return
+        if len(params.ple_layer_mask) != total_layers:
+            raise ValueError(
+                "PLE layer mask length must match the hybrid layer mask: "
+                f"got {len(params.ple_layer_mask)}, expected {total_layers}")
+        self._ple_layer_ids = [
+            layer_id for layer_id, active in enumerate(params.ple_layer_mask)
+            if active
+        ]
+        if len(self._ple_layer_ids) != params.num_ple_layers:
+            raise ValueError(
+                "PLE layer mask count does not match num_ple_layers: "
+                f"got {len(self._ple_layer_ids)}, expected "
+                f"{params.num_ple_layers}")
+        if any(not self._mamba_layer_mask[layer_id]
+               for layer_id in self._ple_layer_ids):
+            raise ValueError("PLE lifecycle state must belong to Mamba layers")
+        if (params.short_conv_channels <= 0 or params.short_conv_state_len <= 0
+                or params.ngram_context_len <= 0):
+            raise ValueError("PLE recurrent-state dimensions must be positive")
+        self._ple_conv_state_shape = [
+            params.short_conv_channels,
+            params.short_conv_state_len,
+        ]
+        self._ple_ngram_context_shape = [params.ngram_context_len]
+        self._ple_conv_state_dtype = params.conv_state_dtype
+
+    def _setup_ple_states(self, num_state_slots: int) -> None:
+        """Bind each local PLE layer to V2-managed recurrent-state views."""
+        if not self._ple_layer_ids:
+            return
+        for layer_id in self._ple_layer_ids:
+            local_layer_idx = self.layer_offsets.get(layer_id)
+            if local_layer_idx is None:
+                continue
+            conv_state = self._get_state_buffer(
+                local_layer_idx,
+                MambaRole.PLE_CONV_STATE,
+                self._ple_conv_state_dtype,
+                self._ple_conv_state_shape,
+            )
+            ngram_context = self._get_state_buffer(
+                local_layer_idx,
+                MambaRole.PLE_NGRAM_CONTEXT,
+                dtype=torch.long,
+                state_shape=self._ple_ngram_context_shape,
+            )
+            if (conv_state.shape[0] != num_state_slots
+                    or ngram_context.shape[0] != num_state_slots):
+                raise RuntimeError(
+                    "PLE and GDN lifecycle buffers must have the same number "
+                    f"of slots: layer={layer_id}, GDN={num_state_slots}, "
+                    f"conv={conv_state.shape[0]}, ngram={ngram_context.shape[0]}"
+                )
+            self._ple_conv_states[layer_id] = conv_state
+            self._ple_ngram_contexts[layer_id] = ngram_context
+        logger.info(
+            "PLE state views bound to V2 lifecycle buffers for local layers "
+            f"{sorted(self._ple_conv_states)}: conv "
+            f"[{num_state_slots}, {', '.join(map(str, self._ple_conv_state_shape))}] "
+            f"({self._ple_conv_state_dtype}), n-gram context "
+            f"[{num_state_slots}, {self._ple_ngram_context_shape[0]}] (int64)")
+
+    def ple_layer_cache(
+            self,
+            layer_idx: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Return persistent ``(conv_state, ngram_context)`` pools for a layer."""
+        conv = self._ple_conv_states.get(layer_idx)
+        ngram = self._ple_ngram_contexts.get(layer_idx)
+        if conv is None or ngram is None:
+            return None
+        return conv, ngram
 
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
@@ -3428,7 +3592,33 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return self.max_batch_size * self.mapping.pp_size
 
     def _mamba_state_bytes_per_slot(self) -> int:
-        return self.local_num_mamba_layers * (self.ssm_bytes + self.conv_bytes)
+        base_bytes = self.local_num_mamba_layers * (self.ssm_bytes +
+                                                    self.conv_bytes)
+        local_ple_layers = sum(layer_id in self.pp_layers
+                               for layer_id in self._ple_layer_ids)
+        if local_ple_layers == 0:
+            return base_bytes
+        ple_bytes = (
+            math.prod(self._ple_conv_state_shape) *
+            self._ple_conv_state_dtype.itemsize +
+            math.prod(self._ple_ngram_context_shape) * torch.int64.itemsize)
+        return base_bytes + local_ple_layers * ple_bytes
+
+    def _ple_buffer_configs(self) -> list[BufferConfig]:
+        if not self._ple_layer_ids:
+            return []
+        return [
+            BufferConfig(
+                role=MambaRole.PLE_NGRAM_CONTEXT,
+                size=(math.prod(self._ple_ngram_context_shape) *
+                      torch.int64.itemsize),
+            ),
+            BufferConfig(
+                role=MambaRole.PLE_CONV_STATE,
+                size=(math.prod(self._ple_conv_state_shape) *
+                      self._ple_conv_state_dtype.itemsize),
+            ),
+        ]
 
     def _num_ssm_snapshots_for_capacity(
         self,
@@ -3566,14 +3756,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         for local_layer_idx, global_layer_idx in enumerate(self.pp_layers):
             if self._mamba_layer_mask[global_layer_idx]:
                 layer_id = LayerId(local_layer_idx)
+                buffers = [
+                    BufferConfig(role=MambaRole.SSM_STATE, size=self.ssm_bytes),
+                    BufferConfig(role=MambaRole.CONV_STATE,
+                                 size=self.conv_bytes),
+                ]
+                if global_layer_idx in self._ple_layer_ids:
+                    buffers.extend(self._ple_buffer_configs())
                 layers[local_layer_idx] = SsmLayerConfig(
                     layer_id=layer_id,
-                    buffers=[
-                        BufferConfig(role=MambaRole.SSM_STATE,
-                                     size=self.ssm_bytes),
-                        BufferConfig(role=MambaRole.CONV_STATE,
-                                     size=self.conv_bytes),
-                    ],
+                    buffers=buffers,
                 )
 
         dummy_requests = [
@@ -3790,6 +3982,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         yield from self.all_ssm_states
         yield from self.all_conv_states
+        yield from self._ple_ngram_contexts.values()
+        yield from self._ple_conv_states.values()
 
     def add_dummy_requests(
         self,
@@ -4042,6 +4236,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._gdn_cached_replay_state_strides = None
         self.all_ssm_states = []
         self.all_conv_states = []
+        self._ple_ngram_contexts = {}
+        self._ple_conv_states = {}
         self.intermediate_ssm_states = None
         self.intermediate_conv_states = None
         self.intermediate_state_indices = None
