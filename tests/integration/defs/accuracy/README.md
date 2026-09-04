@@ -128,6 +128,8 @@ Model data type and quantization decide the precision in model computation, so a
 
 A direct implication is that multiple test cases with different features may share the same accuracy reference. This is by design. For example, we should expect a test case with tensor parallelism to have very similar accuracy to its single-GPU counterpart.
 
+Two optional keys let a reference row express an externally published benchmark gate instead of the derived threshold: `threshold` replaces the computed threshold with an explicit value (the report then prints an accuracy check without the hypothesis-testing statistics), and `reference_note` records the provenance of the reference score (for example the public leaderboard it was taken from). See [references/gsm8k_inferencemax.yaml](./references/gsm8k_inferencemax.yaml) for an example.
+
 #### Testing Logic
 
 As aforementioned, each test case evaluates the accuracy of a model with some specifications by running one or multiple tasks.
