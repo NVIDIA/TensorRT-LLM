@@ -18,7 +18,7 @@ context is faked.
 
 import asyncio
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any
 
 import pytest
 
@@ -27,8 +27,8 @@ pytest.importorskip(
     reason='OpenEngine dependency not installed (pip install "tensorrt_llm[openengine]")',
 )
 
-import grpc  # noqa: E402
 import torch  # noqa: E402
+from conftest import AbortError, FakeServicerContext  # noqa: E402
 from openengine.v1 import generation_pb2, lifecycle_pb2, model_pb2  # noqa: E402
 from utils.llm_data import llm_models_root  # noqa: E402
 
@@ -60,33 +60,6 @@ _MODE_BY_GUIDE_FIELD = {
 }
 
 
-class _AbortError(Exception):
-    """Stands in for the abort grpc.aio raises out of a servicer."""
-
-
-class _FakeContext:
-    """Only the gRPC context is faked; the engine behind it is real."""
-
-    def __init__(self, metadata: Sequence[tuple[str, str]] = ()) -> None:
-        self._metadata = [SimpleNamespace(key=k, value=v) for k, v in metadata]
-        self.abort_code = None
-        self.abort_details = None
-
-    def invocation_metadata(self) -> list[SimpleNamespace]:
-        return self._metadata
-
-    def cancelled(self) -> bool:
-        return False
-
-    def add_done_callback(self, callback: Any) -> None:
-        pass
-
-    async def abort(self, code: grpc.StatusCode, details: str) -> None:
-        self.abort_code = code
-        self.abort_details = details
-        raise _AbortError
-
-
 @pytest.fixture(scope="module")
 def llm():
     """One real engine for the module; building it dominates the runtime."""
@@ -112,7 +85,7 @@ def model_info(llm) -> model_pb2.ModelInfo:
         llm, MODEL_NAME, OpenEngineInferenceServicer(llm, MODEL_NAME)
     )
     return asyncio.run(
-        control.GetModelInfo(model_pb2.GetModelInfoRequest(model=MODEL_NAME), _FakeContext())
+        control.GetModelInfo(model_pb2.GetModelInfoRequest(model=MODEL_NAME), FakeServicerContext())
     )
 
 
@@ -130,7 +103,7 @@ def _request(**kw: Any) -> generation_pb2.GenerateRequest:
     return generation_pb2.GenerateRequest(**base)
 
 
-def _accepted(llm, request, context: _FakeContext | None = None) -> bool:
+def _accepted(llm, request, context: FakeServicerContext | None = None) -> bool:
     """Drive the real Generate against the real engine.
 
     Returns True when the stream completed, False when the servicer aborted it
@@ -138,7 +111,7 @@ def _accepted(llm, request, context: _FakeContext | None = None) -> bool:
     "accepted" means it actually honored the option rather than that a stub
     tolerated it.
     """
-    context = context or _FakeContext()
+    context = context or FakeServicerContext()
     servicer = OpenEngineInferenceServicer(llm, MODEL_NAME)
 
     async def drive() -> bool:
@@ -150,7 +123,7 @@ def _accepted(llm, request, context: _FakeContext | None = None) -> bool:
 
     try:
         return asyncio.run(drive())
-    except _AbortError:
+    except AbortError:
         return False
 
 
@@ -162,7 +135,7 @@ def _accepted(llm, request, context: _FakeContext | None = None) -> bool:
 def test_priority_capability_matches_generate(llm, model_info):
     """`openengine-priority` is the only portable way to express priority."""
     advertised = model_info.generation.supports_priority
-    context = _FakeContext(metadata=(("openengine-priority", "5"),))
+    context = FakeServicerContext(metadata=(("openengine-priority", "5"),))
     accepted = _accepted(llm, _request(), context)
 
     assert advertised == accepted, (
@@ -395,7 +368,7 @@ def test_health_reports_ready_for_a_live_engine(llm):
     control = OpenEngineControlServicer(
         llm, MODEL_NAME, OpenEngineInferenceServicer(llm, MODEL_NAME)
     )
-    response = asyncio.run(control.Health(lifecycle_pb2.HealthRequest(), _FakeContext()))
+    response = asyncio.run(control.Health(lifecycle_pb2.HealthRequest(), FakeServicerContext()))
 
     assert response.state == lifecycle_pb2.HEALTH_STATE_READY
     model_check = next(c for c in response.checks if c.name == "model")
@@ -407,7 +380,9 @@ def test_health_inference_probe_runs_on_a_real_engine(llm):
         llm, MODEL_NAME, OpenEngineInferenceServicer(llm, MODEL_NAME)
     )
     response = asyncio.run(
-        control.Health(lifecycle_pb2.HealthRequest(include_inference_probe=True), _FakeContext())
+        control.Health(
+            lifecycle_pb2.HealthRequest(include_inference_probe=True), FakeServicerContext()
+        )
     )
 
     probe = next(c for c in response.checks if c.name == "inference_probe")

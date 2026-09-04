@@ -13,6 +13,7 @@ pytest.importorskip(
 )
 
 import grpc  # noqa: E402
+from conftest import AbortError, FakeServicerContext  # noqa: E402
 from openengine.v1 import kv_pb2, lifecycle_pb2, lora_pb2, model_pb2, server_pb2  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
@@ -22,26 +23,6 @@ from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  #
 pytestmark = pytest.mark.cpu_only
 
 MODEL = "test-model"
-
-
-class _FakeContext:
-    """Records the status an RPC aborted with."""
-
-    def __init__(self) -> None:
-        self.code: grpc.StatusCode | None = None
-        self.details: str | None = None
-
-    async def abort(self, code: grpc.StatusCode, details: str) -> None:
-        self.code = code
-        self.details = details
-        raise _Aborted(code, details)
-
-
-class _Aborted(Exception):
-    def __init__(self, code: grpc.StatusCode, details: str) -> None:
-        super().__init__(details)
-        self.code = code
-        self.details = details
 
 
 class _FakeHandle:
@@ -112,7 +93,7 @@ def _servicer(inference=None, kv_transfer_backend="NIXL", **overrides):
 
 @pytest.mark.asyncio
 async def test_server_info_reports_identity_parallelism_and_capacity():
-    info = await _servicer().GetServerInfo(server_pb2.GetServerInfoRequest(), _FakeContext())
+    info = await _servicer().GetServerInfo(server_pb2.GetServerInfoRequest(), FakeServicerContext())
 
     assert info.engine_name == "tensorrt_llm"
     assert info.instance_id == "instance-1"
@@ -155,7 +136,7 @@ def test_kv_transfer_backend_detects_an_unset_backend_field():
 @pytest.mark.asyncio
 async def test_server_info_omits_kv_connector_without_a_transceiver():
     info = await _servicer(kv_transfer_backend="").GetServerInfo(
-        server_pb2.GetServerInfoRequest(), _FakeContext()
+        server_pb2.GetServerInfoRequest(), FakeServicerContext()
     )
     assert info.kv_connector.enabled is False
 
@@ -163,7 +144,7 @@ async def test_server_info_omits_kv_connector_without_a_transceiver():
 @pytest.mark.asyncio
 async def test_model_info_reports_the_context_window_and_capabilities():
     info = await _servicer().GetModelInfo(
-        model_pb2.GetModelInfoRequest(model=MODEL), _FakeContext()
+        model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
     )
 
     assert info.model_id == MODEL
@@ -180,7 +161,7 @@ async def test_model_info_reports_the_context_window_and_capabilities():
 async def test_model_info_leaves_the_context_window_unset_when_unknown():
     """An unset limit means "unknown"; advertising zero would be a real claim."""
     info = await _servicer(max_seq_len=None).GetModelInfo(
-        model_pb2.GetModelInfoRequest(), _FakeContext()
+        model_pb2.GetModelInfoRequest(), FakeServicerContext()
     )
     assert not info.HasField("max_context_length")
 
@@ -188,7 +169,7 @@ async def test_model_info_leaves_the_context_window_unset_when_unknown():
 @pytest.mark.asyncio
 async def test_model_info_reports_guided_decoding_unsupported_without_a_backend():
     info = await _servicer(guided_decoding_backend=None).GetModelInfo(
-        model_pb2.GetModelInfoRequest(), _FakeContext()
+        model_pb2.GetModelInfoRequest(), FakeServicerContext()
     )
     assert info.generation.guided_decoding.supported is False
     assert list(info.generation.guided_decoding.modes) == []
@@ -197,7 +178,7 @@ async def test_model_info_reports_guided_decoding_unsupported_without_a_backend(
 @pytest.mark.asyncio
 async def test_get_load_counts_in_flight_requests():
     inference = _inference({"a": _FakeHandle(), "b": _FakeHandle()})
-    load = await _servicer(inference).GetLoad(server_pb2.GetLoadRequest(), _FakeContext())
+    load = await _servicer(inference).GetLoad(server_pb2.GetLoadRequest(), FakeServicerContext())
 
     assert load.running_requests == 2
     assert load.instance_id == "instance-1"
@@ -206,7 +187,7 @@ async def test_get_load_counts_in_flight_requests():
 
 @pytest.mark.asyncio
 async def test_health_reports_ready_with_per_component_checks():
-    response = await _servicer().Health(lifecycle_pb2.HealthRequest(), _FakeContext())
+    response = await _servicer().Health(lifecycle_pb2.HealthRequest(), FakeServicerContext())
 
     assert response.state == lifecycle_pb2.HEALTH_STATE_READY
     names = {check.name for check in response.checks}
@@ -220,7 +201,7 @@ async def test_abort_by_request_id_aborts_the_handle():
     inference = _inference({"req-1": handle})
 
     response = await _servicer(inference).Abort(
-        lifecycle_pb2.AbortRequest(request_id="req-1"), _FakeContext()
+        lifecycle_pb2.AbortRequest(request_id="req-1"), FakeServicerContext()
     )
 
     assert handle.aborted is True
@@ -231,7 +212,7 @@ async def test_abort_by_request_id_aborts_the_handle():
 async def test_abort_of_an_unknown_request_reports_already_finished():
     """The caller's intent already holds, so this is not an error."""
     response = await _servicer().Abort(
-        lifecycle_pb2.AbortRequest(request_id="gone"), _FakeContext()
+        lifecycle_pb2.AbortRequest(request_id="gone"), FakeServicerContext()
     )
     assert response.status == lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED
 
@@ -242,7 +223,7 @@ async def test_abort_all_aborts_every_in_flight_request():
     inference = _inference(dict(handles))
 
     response = await _servicer(inference).Abort(
-        lifecycle_pb2.AbortRequest(all_requests=lifecycle_pb2.AllRequests()), _FakeContext()
+        lifecycle_pb2.AbortRequest(all_requests=lifecycle_pb2.AllRequests()), FakeServicerContext()
     )
 
     assert all(handle.aborted for handle in handles.values())
@@ -253,20 +234,20 @@ async def test_abort_all_aborts_every_in_flight_request():
 @pytest.mark.asyncio
 async def test_abort_by_kv_session_is_unimplemented():
     """session_id is the engine's context request id, not a Generate request_id."""
-    context = _FakeContext()
-    with pytest.raises(_Aborted):
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
         await _servicer().Abort(
             lifecycle_pb2.AbortRequest(kv_session=kv_pb2.KvSessionRef(session_id="7")), context
         )
-    assert context.code == grpc.StatusCode.UNIMPLEMENTED
+    assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
 
 
 @pytest.mark.asyncio
 async def test_abort_without_a_target_is_invalid():
-    context = _FakeContext()
-    with pytest.raises(_Aborted):
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
         await _servicer().Abort(lifecycle_pb2.AbortRequest(), context)
-    assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+    assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
 
 
 @pytest.mark.asyncio
@@ -281,10 +262,10 @@ async def test_abort_without_a_target_is_invalid():
 )
 async def test_unsupported_rpcs_report_unimplemented(rpc, request_message):
     """Explicit UNIMPLEMENTED, so a client can tell "not supported" from "empty"."""
-    context = _FakeContext()
-    with pytest.raises(_Aborted):
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
         await getattr(_servicer(), rpc)(request_message, context)
-    assert context.code == grpc.StatusCode.UNIMPLEMENTED
+    assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
 
 
 @pytest.mark.asyncio
@@ -292,7 +273,7 @@ async def test_unsupported_rpcs_report_unimplemented(rpc, request_message):
 async def test_model_info_never_advertises_lora_that_generate_rejects(enable_lora):
     """Generate rejects `lora_name` unconditionally, even on an enable_lora build."""
     info = await _servicer(enable_lora=enable_lora).GetModelInfo(
-        model_pb2.GetModelInfoRequest(), _FakeContext()
+        model_pb2.GetModelInfoRequest(), FakeServicerContext()
     )
     assert info.supports_lora is False
 
@@ -300,7 +281,7 @@ async def test_model_info_never_advertises_lora_that_generate_rejects(enable_lor
 @pytest.mark.asyncio
 async def test_model_info_capabilities_match_the_generate_path():
     """Advertising a capability Generate rejects turns discovery into failures."""
-    info = await _servicer().GetModelInfo(model_pb2.GetModelInfoRequest(), _FakeContext())
+    info = await _servicer().GetModelInfo(model_pb2.GetModelInfoRequest(), FakeServicerContext())
 
     # `openengine-priority` is rejected by Generate.
     assert info.generation.supports_priority is False
@@ -323,7 +304,9 @@ async def test_abort_leaves_cleanup_to_the_generate_stream():
     handle = _FakeHandle()
     inference = _inference({"req-1": handle})
 
-    await _servicer(inference).Abort(lifecycle_pb2.AbortRequest(request_id="req-1"), _FakeContext())
+    await _servicer(inference).Abort(
+        lifecycle_pb2.AbortRequest(request_id="req-1"), FakeServicerContext()
+    )
 
     assert handle.aborted is True
     assert inference.active_request_count() == 1
@@ -339,13 +322,13 @@ async def test_abort_fails_the_rpc_when_the_engine_refuses():
     """
     handle = _FakeHandle(fail=True)
     inference = _inference({"req-1": handle})
-    context = _FakeContext()
+    context = FakeServicerContext()
 
-    with pytest.raises(_Aborted):
+    with pytest.raises(AbortError):
         await _servicer(inference).Abort(lifecycle_pb2.AbortRequest(request_id="req-1"), context)
 
     assert handle.aborted is False
-    assert context.code == grpc.StatusCode.INTERNAL
+    assert context.abort_code == grpc.StatusCode.INTERNAL
 
 
 @pytest.mark.asyncio
@@ -353,16 +336,16 @@ async def test_abort_all_fails_the_rpc_when_any_abort_is_refused():
     """A partial failure is not a success: the refused requests keep running."""
     good, bad = _FakeHandle(), _FakeHandle(fail=True)
     inference = _inference({"good": good, "bad": bad})
-    context = _FakeContext()
+    context = FakeServicerContext()
 
-    with pytest.raises(_Aborted):
+    with pytest.raises(AbortError):
         await _servicer(inference).Abort(
             lifecycle_pb2.AbortRequest(all_requests=lifecycle_pb2.AllRequests()), context
         )
 
     assert good.aborted is True
-    assert context.code == grpc.StatusCode.INTERNAL
-    assert "still running" in context.details
+    assert context.abort_code == grpc.StatusCode.INTERNAL
+    assert "still running" in context.abort_details
 
 
 @pytest.mark.asyncio
@@ -386,7 +369,7 @@ async def test_health_inference_probe_is_bounded_and_aborts_a_stuck_request():
     control_module._INFERENCE_PROBE_TIMEOUT_SECONDS = 0.05
     try:
         response = await servicer.Health(
-            lifecycle_pb2.HealthRequest(include_inference_probe=True), _FakeContext()
+            lifecycle_pb2.HealthRequest(include_inference_probe=True), FakeServicerContext()
         )
     finally:
         control_module._INFERENCE_PROBE_TIMEOUT_SECONDS = original
@@ -402,7 +385,7 @@ async def test_health_inference_probe_is_bounded_and_aborts_a_stuck_request():
 async def test_health_reports_not_ready_when_the_executor_is_shut_down():
     """A dead engine must not answer READY, or a probe keeps routing traffic in."""
     response = await _servicer(_executor_shutdown=True).Health(
-        lifecycle_pb2.HealthRequest(), _FakeContext()
+        lifecycle_pb2.HealthRequest(), FakeServicerContext()
     )
 
     model_check = next(c for c in response.checks if c.name == "model")
@@ -418,7 +401,7 @@ async def test_health_reports_not_ready_when_the_executor_is_shut_down():
 async def test_guided_modes_follow_the_configured_backend(backend, expects_structural_tag):
     """Only xgrammar builds structural tags; llguidance rejects them."""
     info = await _servicer(guided_decoding_backend=backend).GetModelInfo(
-        model_pb2.GetModelInfoRequest(), _FakeContext()
+        model_pb2.GetModelInfoRequest(), FakeServicerContext()
     )
 
     modes = set(info.generation.guided_decoding.modes)
@@ -432,7 +415,7 @@ async def test_model_info_reports_the_logprob_candidate_ceiling():
     """The limit is a known enforced constant, so "unknown" would be dishonest."""
     from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS
 
-    info = await _servicer().GetModelInfo(model_pb2.GetModelInfoRequest(), _FakeContext())
+    info = await _servicer().GetModelInfo(model_pb2.GetModelInfoRequest(), FakeServicerContext())
 
     assert info.generation.output_logprobs.max_top_n == MAX_TOP_LOGPROBS
     assert info.generation.prompt_logprobs.max_top_n == MAX_TOP_LOGPROBS
@@ -448,7 +431,7 @@ async def test_health_reports_not_ready_for_a_crashed_engine_that_is_not_shut_do
     traffic into an engine where every request fails.
     """
     response = await _servicer(_executor_unhealthy=True).Health(
-        lifecycle_pb2.HealthRequest(), _FakeContext()
+        lifecycle_pb2.HealthRequest(), FakeServicerContext()
     )
 
     model_check = next(c for c in response.checks if c.name == "model")
@@ -466,7 +449,7 @@ async def test_health_survives_a_raising_health_check():
     llm._check_health = lambda: (_ for _ in ()).throw(RuntimeError("engine gone"))
     servicer = OpenEngineControlServicer(llm, MODEL, _inference(), kv_transfer_backend="")
 
-    response = await servicer.Health(lifecycle_pb2.HealthRequest(), _FakeContext())
+    response = await servicer.Health(lifecycle_pb2.HealthRequest(), FakeServicerContext())
 
     model_check = next(c for c in response.checks if c.name == "model")
     assert model_check.state == lifecycle_pb2.HEALTH_STATE_NOT_READY
@@ -476,7 +459,7 @@ async def test_health_survives_a_raising_health_check():
 async def test_text_input_is_not_advertised_without_a_tokenizer():
     """A skip_tokenizer_init engine rejects every string prompt."""
     info = await _servicer(_tokenizer=None).GetModelInfo(
-        model_pb2.GetModelInfoRequest(), _FakeContext()
+        model_pb2.GetModelInfoRequest(), FakeServicerContext()
     )
     assert info.supports_text_input is False
     # Token ids remain usable without a tokenizer.
@@ -485,7 +468,7 @@ async def test_text_input_is_not_advertised_without_a_tokenizer():
 
 @pytest.mark.asyncio
 async def test_text_input_is_advertised_when_a_tokenizer_exists():
-    info = await _servicer().GetModelInfo(model_pb2.GetModelInfoRequest(), _FakeContext())
+    info = await _servicer().GetModelInfo(model_pb2.GetModelInfoRequest(), FakeServicerContext())
     assert info.supports_text_input is True
 
 
@@ -514,7 +497,9 @@ async def test_health_probe_is_counted_by_get_load_and_released():
     servicer = OpenEngineControlServicer(llm, MODEL, inference, kv_transfer_backend="")
 
     probe = asyncio.ensure_future(
-        servicer.Health(lifecycle_pb2.HealthRequest(include_inference_probe=True), _FakeContext())
+        servicer.Health(
+            lifecycle_pb2.HealthRequest(include_inference_probe=True), FakeServicerContext()
+        )
     )
     await started.wait()
     assert inference.active_request_count() == 1
@@ -548,7 +533,9 @@ async def test_concurrent_health_probes_share_one_engine_request():
 
     servicer = OpenEngineControlServicer(llm, MODEL, _inference(), kv_transfer_backend="")
     request = lifecycle_pb2.HealthRequest(include_inference_probe=True)
-    probes = [asyncio.ensure_future(servicer.Health(request, _FakeContext())) for _ in range(5)]
+    probes = [
+        asyncio.ensure_future(servicer.Health(request, FakeServicerContext())) for _ in range(5)
+    ]
     await asyncio.sleep(0)
     release.set()
     await asyncio.gather(*probes)

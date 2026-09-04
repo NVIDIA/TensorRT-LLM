@@ -17,6 +17,7 @@ pytest.importorskip(
 )
 
 import grpc  # noqa: E402
+from conftest import AbortError, FakeServicerContext  # noqa: E402
 from openengine.v1 import generation_pb2  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.disagg as oe_disagg  # noqa: E402
@@ -98,32 +99,6 @@ class _FakeLlm:
         if kwargs["sampling_params"].stop == ["AB"]:
             kwargs["sampling_params"]._stop_word_ids = [[10, 11]]
         return self.result_handle
-
-
-class _FakeContext:
-    def __init__(self, metadata: Sequence[tuple[str, str]] = ()) -> None:
-        self._metadata = [SimpleNamespace(key=key, value=value) for key, value in metadata]
-        self.abort_code = None
-        self.abort_details = None
-        self.done_callbacks = []
-
-    def invocation_metadata(self) -> list[SimpleNamespace]:
-        return self._metadata
-
-    def cancelled(self) -> bool:
-        return False
-
-    def add_done_callback(self, callback: Any) -> None:
-        self.done_callbacks.append(callback)
-
-    async def abort(self, code: grpc.StatusCode, details: str) -> None:
-        self.abort_code = code
-        self.abort_details = details
-        raise _AbortError
-
-
-class _AbortError(Exception):
-    pass
 
 
 def _logprob(value: float, rank: int) -> SimpleNamespace:
@@ -504,7 +479,7 @@ def test_generate_streams_incremental_events_and_final_usage() -> None:
     ]
     llm = _FakeLlm(results)
     servicer = OpenEngineInferenceServicer(llm, model="test-model")
-    context = _FakeContext(
+    context = FakeServicerContext(
         metadata=(
             ("traceparent", "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"),
             ("tracestate", "vendor=value"),
@@ -594,7 +569,7 @@ def test_generate_sets_usage_only_on_last_simultaneous_finish() -> None:
     )
 
     async def collect_responses() -> list[generation_pb2.GenerateResponse]:
-        return [response async for response in servicer.Generate(request, _FakeContext())]
+        return [response async for response in servicer.Generate(request, FakeServicerContext())]
 
     responses = asyncio.run(collect_responses())
     finished = [response for response in responses if response.HasField("finished")]
@@ -640,7 +615,7 @@ def test_generate_does_not_stream_excluded_stop_prefix() -> None:
     )
 
     async def collect_responses() -> list[generation_pb2.GenerateResponse]:
-        return [response async for response in servicer.Generate(request, _FakeContext())]
+        return [response async for response in servicer.Generate(request, FakeServicerContext())]
 
     responses = asyncio.run(collect_responses())
 
@@ -669,7 +644,7 @@ def test_generate_aborts_when_response_stream_closes() -> None:
     )
 
     async def close_after_first_response() -> None:
-        responses = servicer.Generate(request, _FakeContext())
+        responses = servicer.Generate(request, FakeServicerContext())
         response = await responses.__anext__()
         assert response.HasField("token")
         await responses.aclose()
@@ -701,7 +676,7 @@ def test_generate_aborts_stalled_response_consumer(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(openengine_servicer, "RESPONSE_STALL_TIMEOUT_SECONDS", 0.0)
 
     async def stall_after_first_response() -> generation_pb2.GenerateResponse:
-        responses = servicer.Generate(request, _FakeContext())
+        responses = servicer.Generate(request, FakeServicerContext())
         first_response = await responses.__anext__()
         assert first_response.HasField("token")
         await asyncio.sleep(0)
@@ -764,7 +739,7 @@ def test_generate_does_not_abort_slow_engine(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(openengine_servicer, "RESPONSE_STALL_TIMEOUT_SECONDS", 0.02)
 
     async def collect() -> list:
-        return [r async for r in servicer.Generate(request, _FakeContext())]
+        return [r async for r in servicer.Generate(request, FakeServicerContext())]
 
     responses = asyncio.run(collect())
 
@@ -789,7 +764,7 @@ def test_generate_rejects_unsupported_numeric_metadata(key: str, value: str) -> 
     than to correct it.
     """
     servicer = OpenEngineInferenceServicer(_FakeLlm([]), model="test-model")
-    context = _FakeContext(metadata=((key, value),))
+    context = FakeServicerContext(metadata=((key, value),))
     request = generation_pb2.GenerateRequest(
         request_id="request-6",
         model="test-model",
@@ -800,7 +775,7 @@ def test_generate_rejects_unsupported_numeric_metadata(key: str, value: str) -> 
         async for _ in servicer.Generate(request, context):
             pass
 
-    with pytest.raises(_AbortError):
+    with pytest.raises(AbortError):
         asyncio.run(collect_responses())
 
     assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
@@ -855,7 +830,7 @@ def test_generate_context_only_ends_at_prefill_ready() -> None:
     request.extra.update({"request_type": "context_only"})
 
     async def collect_responses() -> list[generation_pb2.GenerateResponse]:
-        return [response async for response in servicer.Generate(request, _FakeContext())]
+        return [response async for response in servicer.Generate(request, FakeServicerContext())]
 
     responses = asyncio.run(collect_responses())
     events = [response.WhichOneof("event") for response in responses]
@@ -903,7 +878,7 @@ def test_generate_rejects_unsupported_features_as_unimplemented(field, mutate) -
     servicer = OpenEngineInferenceServicer(_FakeLlm([]), model="test-model")
     # Priority arrives as metadata rather than a request field.
     metadata = (("openengine-priority", "5"),) if field == "priority" else ()
-    context = _FakeContext(metadata=metadata)
+    context = FakeServicerContext(metadata=metadata)
     request = generation_pb2.GenerateRequest(
         request_id="request-unsupported",
         model="test-model",
@@ -915,7 +890,7 @@ def test_generate_rejects_unsupported_features_as_unimplemented(field, mutate) -
         async for _ in servicer.Generate(request, context):
             pass
 
-    with pytest.raises(_AbortError):
+    with pytest.raises(AbortError):
         asyncio.run(collect_responses())
 
     assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
@@ -993,7 +968,7 @@ def test_stalled_stream_cleanup_does_not_untrack_a_resubmission(
 
     async def scenario() -> int:
         monkeypatch.setattr(openengine_servicer, "RESPONSE_STALL_TIMEOUT_SECONDS", 0.0)
-        first = servicer.Generate(request, _FakeContext())
+        first = servicer.Generate(request, FakeServicerContext())
         assert (await first.__anext__()).HasField("token")
         await asyncio.sleep(0)
         await asyncio.sleep(0)
@@ -1002,7 +977,7 @@ def test_stalled_stream_cleanup_does_not_untrack_a_resubmission(
 
         # Large timeout so the replacement's own watchdog cannot fire here.
         monkeypatch.setattr(openengine_servicer, "RESPONSE_STALL_TIMEOUT_SECONDS", 3600.0)
-        second = servicer.Generate(request, _FakeContext())
+        second = servicer.Generate(request, FakeServicerContext())
         assert (await second.__anext__()).HasField("token")
         assert servicer.active_request_count() == 1
 
@@ -1049,7 +1024,7 @@ def test_terminal_error_yield_is_watched_for_a_stalled_consumer(
     monkeypatch.setattr(openengine_servicer, "RESPONSE_STALL_TIMEOUT_SECONDS", 0.0)
 
     async def abandon_on_terminal_error() -> int:
-        responses = servicer.Generate(request, _FakeContext())
+        responses = servicer.Generate(request, FakeServicerContext())
         assert (await responses.__anext__()).HasField("token")
         terminal = await responses.__anext__()
         assert terminal.error.message == "generation stream ended before all outputs finished"
@@ -1134,3 +1109,39 @@ def test_oversized_prompt_logprobs_are_refused_not_built() -> None:
     assert len(responses) == 1
     assert responses[0].error.code == openengine_servicer.error_pb2.ERROR_CODE_INVALID_ARGUMENT
     assert "prompt logprobs" in responses[0].error.message
+
+
+def test_generate_aborts_the_engine_when_the_rpc_is_cancelled() -> None:
+    """A cancelled RPC must abort the engine request, not just stop streaming.
+
+    The shared context fake makes `cancelled` settable; while every copy
+    hardcoded it to False this branch could not be reached by any test.
+    """
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="A",
+        logprobs=[],
+        prompt_logprobs=[],
+        finish_reason=None,
+        stop_reason=None,
+    )
+    result = SimpleNamespace(prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None)
+    llm = _FakeLlm([result, result])
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext()
+    request = generation_pb2.GenerateRequest(
+        request_id="cancelled-1", model="test-model", prompt="hello"
+    )
+
+    async def cancel_after_first() -> None:
+        responses = servicer.Generate(request, context)
+        assert (await responses.__anext__()).HasField("token")
+        context.is_cancelled = True
+        with pytest.raises(StopAsyncIteration):
+            await responses.__anext__()
+
+    asyncio.run(cancel_after_first())
+
+    assert llm.result_handle.aborted
+    assert servicer.active_request_count() == 0
