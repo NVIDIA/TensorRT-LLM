@@ -41,19 +41,22 @@ from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from .fast_custom_op import fast_custom_op
 
+# FlashInfer's CuTeDSL MXFP8 kernels need the CuTe DSL package; reuse the
+# TRT-LLM probe instead of importing flashinfer.cute_dsl, whose package init
+# eagerly loads unrelated CuTeDSL kernel modules.
 IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE = False
 if IS_FLASHINFER_AVAILABLE:
     from flashinfer.fp4_quantization import \
         nvfp4_quantize as _flashinfer_nvfp4_quantize
     try:
+        # Top-level flashinfer exports; already imported with flashinfer.
+        from flashinfer import autotune as _flashinfer_autotune
         from flashinfer import mm_mxfp8 as _flashinfer_mm_mxfp8
         from flashinfer import mxfp8_quantize as _flashinfer_mxfp8_quantize
-        from flashinfer.autotuner import autotune as _flashinfer_autotune
-        from flashinfer.cute_dsl import is_cute_dsl_available
-
-        IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE = is_cute_dsl_available()
     except ImportError:
         pass
+    else:
+        IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE = IS_CUTLASS_DSL_AVAILABLE
 
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
