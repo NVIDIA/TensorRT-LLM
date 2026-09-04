@@ -543,42 +543,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
         don't participate in the forward pass token budget.
         """
-        if not self._prepare_disagg_gen_init_pair(req):
+        # Cache-transceiver mode disables the separate one-model draft manager,
+        # so disagg generation init has no paired-reuse path. Supporting one
+        # would also require draft KV transfer and history_length=prompt_len.
+        if not self.kv_cache_manager.prepare_disagg_gen_init(req):
             logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0
-
-    def _prepare_disagg_gen_init_pair(self, req: LlmRequest) -> bool:
-        """Prepare a disagg gen-init request in target and draft pools alike.
-
-        This is the one context entry that does not go through
-        ``_prepare_context_pair``, and it advances the same shared cursor: a
-        prefix the target reuses is never recomputed, so the draft pool has to
-        hold that prefix too or its positions ``[0, reuse)`` stay unwritten.
-        """
-        draft_manager = self._joint_draft_manager
-        if draft_manager is None:
-            return self.kv_cache_manager.prepare_disagg_gen_init(req)
-
-        # Claim the draft prefix first and cap the target to it, so the target
-        # can only come up short (same ordering as _prepare_context_pair).
-        draft_reuse = draft_manager.prepare_context_cache(req, self._reuse_claim_limit(req))
-        if draft_reuse is None:
-            self._free_kv_caches(req)
-            return False
-        if not self.kv_cache_manager.prepare_disagg_gen_init(req, draft_reuse):
-            self._free_kv_caches(req)
-            return False
-
-        common_reuse = req.context_current_position
-        if draft_reuse != common_reuse:
-            # Freeing unpins draft pages, so the re-claim can fall short. No
-            # cheap no-reuse retry here: give up and let it be re-scheduled.
-            draft_manager.free_resources(req)
-            if draft_manager.prepare_context_cache(req, common_reuse) != common_reuse:
-                self._free_kv_caches(req)
-                return False
-        return True
 
     def _try_schedule_context(
         self, req: LlmRequest, budget: BudgetTracker
