@@ -26,7 +26,7 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
-def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monkeypatch):
+def test_msa_package_availability_installs_cutlass_compatibility_aliases(monkeypatch):
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
         msa_package_available,
     )

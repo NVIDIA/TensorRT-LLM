@@ -64,6 +64,10 @@ including mixed batches.
 | Sparse granularity | Token |
 | Attention semantics | Causal self-attention |
 
+`Input dtype` refers to model-native MLA inputs, which remain BF16. The FP8
+KV-cache entry and any internal FP8 staging do not indicate raw FP8 model-input
+support.
+
 See
 [`test_sparse_mla_forward.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py)
 for executable sparse MLA examples.
@@ -105,6 +109,10 @@ For an FP8 KV cache, token-sparse Q is quantized to E4M3 during QKV
 preprocessing while the model input remains BF16 or FP16. The path supports
 both BF16 output with an FP8 KV cache and E4M3 FP8 output.
 
+This is distinct from the block-sparse column: its E4M3 input row is a raw Q/K/V
+contract of that dedicated backend. Raw E4M3 fused QKV is not a token-sparse
+MQA/GQA input contract.
+
 Backend developers can use
 [`test_sparse_mqa_gqa.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mqa_gqa.py)
 as an executable integration example.
@@ -131,6 +139,10 @@ the retained KV cache after prefill to reduce cache size and later decode work.
 | KV-cache layout | Paged KV cache; page size is a power of two and at least 8 tokens |
 | Sparse granularity | Positive-size blocks expanded to KV-cache pages |
 | Attention semantics | Causal self-attention |
+
+The E4M3 entries above describe FP8 KV-cache and output paths. The fused model
+QKV input remains BF16 or FP16; raw E4M3 fused QKV is not supported by the
+page-sparse MHA path.
 
 Backend developers can use
 [`test_sparse_mha.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mha.py)

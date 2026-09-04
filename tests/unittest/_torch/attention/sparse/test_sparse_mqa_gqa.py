@@ -39,17 +39,17 @@ import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_sparse_gqa
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.fmha.msa_sparse_gqa import run_msa_sparse_gqa
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionRuntimeFeatures,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa.kernels import (
+from tensorrt_llm._torch.attention.backends.sparse.dsa.kernels import (
     triton_convert_req_index_to_global_index,
 )
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_package_available
-from tensorrt_llm._torch.attention_backend.sparse.params import SparseParams
-from tensorrt_llm._torch.attention_backend.trtllm import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import msa_package_available
+from tensorrt_llm._torch.attention.backends.sparse.params import SparseParams
+from tensorrt_llm._torch.attention.backends.trtllm import (
     TrtllmAttention,
     TrtllmAttentionMetadata,
     generate_spec_decoding_packed_mask,
