@@ -360,6 +360,13 @@ def _load_reference_image(data: bytes):
         ) from exc
 
 
+def _load_action_reference_image(image: Any) -> PIL.Image.Image:
+    """Decode an action image from the internal PIL-or-bytes contract."""
+    if isinstance(image, bytes):
+        return _load_reference_image(image)
+    return pil_to_rgb(image)
+
+
 @dataclass(frozen=True)
 class _ResolvedRequest:
     """Internal request facts after defaults and workflow rules are applied."""
@@ -1541,9 +1548,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         points produce the same conditioning for the same picture.
         """
         if image is not None:
-            if isinstance(image, bytes):
-                image = _load_reference_image(image)
-            return self._preprocess_action_image(pil_to_rgb(image), target_h, target_w)
+            return self._preprocess_action_image(
+                _load_action_reference_image(image), target_h, target_w
+            )
         if not isinstance(video, bytes):
             raise ValueError(
                 "Cosmos3 action conditioning requires an image or encoded MP4/AVI "
@@ -1846,7 +1853,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             probe_error: Optional[Exception] = None
             try:
                 if image is not None and not isinstance(image, PIL.Image.Image):
-                    image = pil_to_rgb(image)
+                    image = _load_action_reference_image(image)
                 action_source_h, action_source_w = action_reference_size(
                     action_mode=normalized_action_mode,
                     image=image,
