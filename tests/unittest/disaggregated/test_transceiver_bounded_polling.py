@@ -27,6 +27,10 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
+    CtxTransferStatus,
+    GenTransferStatus,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
     TransferWorker,
@@ -34,7 +38,6 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TxSession,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import CtxTransferStatus, GenTransferStatus
 from tensorrt_llm.bindings import LlmRequestState
 
 

@@ -364,12 +364,12 @@ def _estimate_swa_cache_size(
 
 def _get_dflash_generation_kv_capacity_headroom(spec_config) -> Optional[int]:
     """DFlash KV capacity reserved ahead of committed history."""
-    from ..speculative.interface import SpeculativeDecodingMode
+    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
     if spec_config is None or spec_config.spec_dec_mode != SpeculativeDecodingMode.DFLASH:
         return None
 
-    from ..speculative import get_num_extra_kv_tokens
+    from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
 
     return get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step
 
