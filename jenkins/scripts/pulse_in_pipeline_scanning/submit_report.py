@@ -147,11 +147,11 @@ def submit_source_code_vulns(
             if package_name not in triaged_deps:
                 risks_to_report.append(doc)
             bulk_documents.append(doc)
-        if risks_to_report:
-            new_tickets, _ = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
-            for doc in bulk_documents:
-                if doc["s_package_name"] in new_tickets:
-                    doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+        # if risks_to_report:
+        #     new_tickets, _ = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+        #     for doc in bulk_documents:
+        #         if doc["s_package_name"] in new_tickets:
+        #             doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
 
         if bulk_documents:
             _, errors = es_post(ES_POST_URL, bulk_documents)
@@ -322,11 +322,11 @@ def submit_container_vulns(
         if package_name not in triaged_deps:
             risks_to_report.append(doc)
         docs.append(doc)
-    if risks_to_report:
-        new_tickets, _ = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
-        for doc in docs:
-            if doc["s_package_name"] in new_tickets:
-                doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+    # if risks_to_report:
+    #     new_tickets, _ = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+    #     for doc in docs:
+    #         if doc["s_package_name"] in new_tickets:
+    #             doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
 
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
