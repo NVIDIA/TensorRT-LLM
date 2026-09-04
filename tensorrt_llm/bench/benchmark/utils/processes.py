@@ -10,6 +10,9 @@ from zmq import PULL, Context
 
 from tensorrt_llm import logger
 
+# How long (ms) the writer waits for a message before re-checking stop_event.
+POLL_INTERVAL_MS = 100
+
 
 # The IterationWriter class implements a multi-process logging system that captures and writes
 # iteration data to a specified file using ZeroMQ (ZMQ) for inter-process communication.
@@ -95,6 +98,11 @@ class IterationWriter:
             yield
         else:
             logger.info(f"Logging iterations to {self.log_path}...")
+            # Create the destination directory up front, the same way
+            # generate_json_report() does for --report_json. Otherwise the
+            # writer process dies with FileNotFoundError, its socket is never
+            # served, and the producer blocks forever in zmq_ctx_term().
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
             stop = Event()
             process = Process(name="IterationWriter",
                               target=self.run,
@@ -133,6 +141,7 @@ class IterationWriter:
         """
         context = None
         socket = None
+        message = None
 
         try:
             # Create a ZeroMQ context and socket for inter-process communication
@@ -146,15 +155,20 @@ class IterationWriter:
                 f"Iteration logging: Listening for messages on {address}...")
             with open(log_path, "w") as f:
                 logger.info(f"Iteration logging: Opened log file {log_path}...")
-                # Receive the first message from the socket
-                message = socket.recv_json()
-                logger.debug(f"Iteration logging: Received initial message")
                 # Continue receiving messages until the stop event is set or an
-                # "end" message is received
-                while not stop_event.is_set() and "end" not in message:
-                    f.write(f"{message}\n")
+                # "end" message is received. Poll instead of blocking in
+                # recv_json(): if the producer tears its context down before
+                # every queued message has been delivered, the "end" sentinel
+                # never arrives and a blocking recv would ignore stop_event
+                # forever, hanging capture()'s process.join().
+                while not stop_event.is_set():
+                    if not socket.poll(timeout=POLL_INTERVAL_MS):
+                        continue
                     message = socket.recv_json()
-                logger.debug(f"Iteration logging: Received end message")
+                    if "end" in message:
+                        logger.debug(f"Iteration logging: Received end message")
+                        break
+                    f.write(f"{message}\n")
         except KeyboardInterrupt:
             # Handle keyboard interrupt by continuing to receive
             # messages until "None" is received. LlmManager will
