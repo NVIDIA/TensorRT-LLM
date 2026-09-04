@@ -19,7 +19,9 @@ identical given pre-rotated Q/K, so it is represented by the base RoPE style
 
 ``rope`` is one of ``None`` / ``"neox"`` / ``"gptj"``. ``mask`` is
 ``"causal"`` / ``"full"`` / ``"sliding"``. ``no_cache=True`` marks the
-bidirectional, KV-cache-free DiT / encoder workloads.
+bidirectional, KV-cache-free DiT / encoder workloads. Sparse models carry the
+same user-facing sparse-attention config that production lowers independently
+for the backend, metadata, and KV-cache manager.
 
 ID naming rule:
 - Use lowercase snake_case:
@@ -45,13 +47,16 @@ elsewhere):
   does not pass it to the dense attention backend.
 - Vision/text encoders (SigLip/Radio/CLIP/Parakeet, MiniMax-VL tower) collapse
   onto the bidirectional MHA tuples already listed (e.g. 16x64 / 12x64 full).
-- Sparse/DSA indexer attention (GLM-DSA, NSA, RocketKV) is a separate paradigm
-  validated under sparse/; there is no dense Vanilla golden for it.
+- Sparse indexer correctness is validated under ``sparse/``. This model sweep
+  injects deterministic backend-neutral selections and validates the selected
+  attention path against the Vanilla golden.
 - Multimodal cross variants (Llama4-vision, Gemma4-MM) reuse the cross tuples.
 """
 
 from dataclasses import dataclass
 from typing import Literal, Optional
+
+from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, SparseAttentionConfig
 
 AttentionPhase = Literal["ctx", "gen"]
 
@@ -79,6 +84,18 @@ class ModelAttnConfig:
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
     v_head_dim: Optional[int] = None
+    hidden_size: Optional[int] = None
+    # User-facing sparse config, lowered by production `to_sparse_params()`. The
+    # sparse sweep derives its other parameters from this and `is_mla`.
+    sparse_attention_config: Optional[SparseAttentionConfig] = None
+
+    @property
+    def sparse_topk(self) -> Optional[int]:
+        """Per-token selection budget (``index_topk``) from the sparse config."""
+        cfg = self.sparse_attention_config
+        if cfg is None:
+            return None
+        return cfg.index_topk
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +515,33 @@ _STANDARD = [
 # MLA (DeepSeek-style absorbed latent attention). num_kv_heads == 1 latent head.
 # ---------------------------------------------------------------------------
 _MLA = [
+    # DeepSeek-V4 ratio-4 layers combine a 128-token sliding window with
+    # compressed-entry selections. The unified sweep uses a reduced top-k to
+    # keep the backend parity case bounded; the native DeepSeek-V4 tests cover
+    # the production top-k and the ratio-1/128 layer variants.
+    ModelAttnConfig(
+        "deepseekv4_sparse_mla",
+        "DeepSeek-V4 ratio-4 layers",
+        num_heads=64,
+        num_kv_heads=1,
+        head_dim=512,
+        rope="gptj",
+        is_mla=True,
+        phases=("ctx", "gen"),
+        kv_lora_rank=448,
+        q_lora_rank=1536,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+        hidden_size=7168,
+        sparse_attention_config=DeepSeekV4SparseAttentionConfig(
+            index_n_heads=64,
+            index_head_dim=128,
+            index_topk=8,
+            compress_ratios=[4],
+            skip_indexer_for_short_seqs=False,
+        ),
+    ),
     # DeepSeek-V3: 128 Q heads, qk_nope=128, qk_rope=64, kv_lora=512, v=128.
     ModelAttnConfig(
         "deepseekv3_mla",

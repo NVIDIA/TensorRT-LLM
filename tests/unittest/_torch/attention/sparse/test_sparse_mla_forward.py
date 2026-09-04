@@ -22,20 +22,18 @@ from typing import List, Optional
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionBackend, PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
-    DeepseekV4CacheManager
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+    DeepseekV4CacheManager, DeepseekV4VanillaIndexer)
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import \
     forward_context_sparse_attn as forward_context_deepseek_v4_mla
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import \
     forward_generation_sparse_attn as forward_generation_deepseek_v4_mla
-from tensorrt_llm._torch.attention_backend.sparse.dsa import (HAS_FAST_HADAMARD,
-                                                              DSACacheManager)
+from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
 from tensorrt_llm._torch.attention_backend.sparse.dsa.module import \
     _forward_dsa_attn
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -53,8 +51,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .deepseek_v4.test_compressor_module import RefCompressor
-from .deepseek_v4.test_compressor_module import \
-    rotate_activation as ref_rotate_activation
 
 # DSACacheManager creates background ThreadPoolExecutor threads.
 pytestmark = pytest.mark.threadleak(enabled=False)
@@ -289,98 +285,6 @@ def _copy_ref_compressor_weights(ref_compressor: RefCompressor,
     ref_compressor.norm.weight.data.copy_(compressor.norm.weight.data)
 
 
-def _topk_from_scores(scores: torch.Tensor, topk_tokens: int) -> torch.Tensor:
-    row = torch.full((topk_tokens, ),
-                     -1,
-                     dtype=torch.int32,
-                     device=scores.device)
-    if scores.numel() == 0:
-        return row
-    k = min(topk_tokens, scores.numel())
-    row[:k] = torch.topk(scores.float(), k, dim=-1).indices.to(torch.int32)
-    return row
-
-
-def _ceil_pow2_scale(amax: torch.Tensor, max_value_inv: float,
-                     min_amax: float) -> torch.Tensor:
-    scaled = torch.clamp(amax.float(), min=min_amax) * max_value_inv
-    bits = scaled.contiguous().view(torch.int32)
-    exp_part = ((bits >> 23) & 0xFF) - 127
-    has_mantissa = (bits & 0x7FFFFF).ne(0).to(torch.int32)
-    log2_ceil = exp_part + has_mantissa
-    pow2_bits = (log2_ceil + 127) << 23
-    return pow2_bits.view(torch.float32)
-
-
-def _e2m1_nibbles_reference(x: torch.Tensor,
-                            round_ties_to_even: bool) -> torch.Tensor:
-    thresholds = torch.tensor([0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
-                              device=x.device)
-    abs_x = x.abs().clamp(max=6.0)
-    idx = torch.zeros_like(abs_x, dtype=torch.uint8)
-    for level_idx in range(1, 8):
-        take_upper = abs_x > thresholds[level_idx]
-        if round_ties_to_even:
-            take_upper = take_upper | ((abs_x == thresholds[level_idx]) &
-                                       (level_idx % 2 == 0))
-        idx = torch.where(take_upper, torch.full_like(idx, level_idx), idx)
-    sign = torch.signbit(x).to(torch.uint8) << 3
-    return idx | sign
-
-
-def _mxfp4_quant_dequant_reference(
-    x: torch.Tensor,
-    *,
-    round_ties_to_even: bool,
-    min_amax: float,
-    block_size: int = 32,
-) -> torch.Tensor:
-    assert x.shape[-1] % block_size == 0
-    fp4_values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-                              device=x.device,
-                              dtype=torch.float32)
-    orig_shape = x.shape
-    blocks = x.float().reshape(-1, x.shape[-1] // block_size, block_size)
-    scale = _ceil_pow2_scale(blocks.abs().amax(dim=-1, keepdim=True), 1.0 / 6.0,
-                             min_amax)
-    nibbles = _e2m1_nibbles_reference(blocks / scale, round_ties_to_even)
-    value_idx = (nibbles & 0x07).to(torch.int64)
-    values = fp4_values[value_idx]
-    values = torch.where((nibbles & 0x08) != 0, -values, values)
-    return (values * scale).reshape(orig_shape)
-
-
-def _maybe_rotate_for_fp4_indexer(x: torch.Tensor) -> torch.Tensor:
-    if not HAS_FAST_HADAMARD:
-        return x
-    return ref_rotate_activation(x)
-
-
-def _prepare_fp4_indexer_q_reference(q: torch.Tensor) -> torch.Tensor:
-    q = _maybe_rotate_for_fp4_indexer(q)
-    # DSv4 Q uses fused_cat_fp4, whose E2M1 thresholds round ties down.
-    return _mxfp4_quant_dequant_reference(q,
-                                          round_ties_to_even=False,
-                                          min_amax=1.0e-12)
-
-
-def _prepare_fp4_indexer_k_reference(k: torch.Tensor) -> torch.Tensor:
-    k = _maybe_rotate_for_fp4_indexer(k)
-    fp4_min_amax = 6.0 * torch.finfo(torch.float32).tiny
-    # The compressor kernel uses the hardware E2M1 cast, which is RNE.
-    return _mxfp4_quant_dequant_reference(k,
-                                          round_ties_to_even=True,
-                                          min_amax=fp4_min_amax)
-
-
-def _reference_indexer_scores(q: torch.Tensor, k: torch.Tensor,
-                              weights: torch.Tensor,
-                              softmax_scale: float) -> torch.Tensor:
-    head_scores = torch.einsum("hd,kd->hk", q.float(), k.float())
-    head_scores = F.relu(head_scores) * softmax_scale
-    return (head_scores * weights.float().unsqueeze(-1)).sum(dim=0)
-
-
 def calculate_reference_deepseek_v4_topk_indices(
     mla,
     ref_indexer_compressor: RefCompressor,
@@ -397,25 +301,15 @@ def calculate_reference_deepseek_v4_topk_indices(
     device: torch.device,
 ) -> torch.Tensor:
     """Independent PyTorch reference for HF DS4 ratio-4 indexer top-k indices."""
-    indexer = mla.mqa.indexer
+    vanilla_indexer = DeepseekV4VanillaIndexer(mla.mqa.indexer)
     num_tokens = hidden_states.shape[0]
     topk_indices = torch.full((num_tokens, topk_tokens),
                               -1,
                               dtype=torch.int32,
                               device=device)
 
-    q_ref = F.linear(qr, indexer.wq_b.weight)
-    q_ref = q_ref.view(num_tokens, indexer.n_heads, indexer.head_dim)
-    q_ref = q_ref.unsqueeze(0)
-    apply_rotary_emb(q_ref[..., -indexer.rope_dim:],
-                     freqs_cis[position_ids.long()])
-    q_ref = q_ref.squeeze(0)
-    use_fp4_indexer = indexer.indexer_k_dtype == "fp4"
-    if use_fp4_indexer:
-        q_ref = _prepare_fp4_indexer_q_reference(q_ref)
-
-    weights = F.linear(hidden_states, indexer.weights_proj.weight)
-    weights = weights.float() * (indexer.n_heads**-0.5)
+    q_ref = vanilla_indexer.project_query(qr, position_ids, freqs_cis)
+    weights = vanilla_indexer.token_weights(hidden_states)
 
     offset = 0
     for req_idx in ctx_indices:
@@ -433,17 +327,15 @@ def calculate_reference_deepseek_v4_topk_indices(
 
         if compressed_kv is not None:
             compressed_kv = compressed_kv.squeeze(0)
-            compressed_kv_for_scores = (
-                _prepare_fp4_indexer_k_reference(compressed_kv)
-                if use_fp4_indexer else compressed_kv)
+            compressed_kv_for_scores = vanilla_indexer.prepare_key(
+                compressed_kv)
             for token_idx in range(seq_len):
                 valid_len = (token_idx + 1) // compress_ratio
                 k_for_scores = compressed_kv_for_scores[:valid_len]
-                scores = _reference_indexer_scores(q_ref[offset + token_idx],
-                                                   k_for_scores,
-                                                   weights[offset + token_idx],
-                                                   indexer.softmax_scale)
-                topk_indices[offset + token_idx] = _topk_from_scores(
+                scores = vanilla_indexer.scores(q_ref[offset + token_idx],
+                                                k_for_scores,
+                                                weights[offset + token_idx])
+                topk_indices[offset + token_idx] = vanilla_indexer.topk(
                     scores, topk_tokens)
 
         offset += seq_len
@@ -482,14 +374,11 @@ def calculate_reference_deepseek_v4_topk_indices(
         if compressed_kv is None or valid_len == 0:
             continue
 
-        compressed_kv_for_scores = (
-            _prepare_fp4_indexer_k_reference(compressed_kv)
-            if use_fp4_indexer else compressed_kv)
-        scores = _reference_indexer_scores(q_ref[token_idx],
-                                           compressed_kv_for_scores[:valid_len],
-                                           weights[token_idx],
-                                           indexer.softmax_scale)
-        topk_indices[token_idx] = _topk_from_scores(scores, topk_tokens)
+        compressed_kv_for_scores = vanilla_indexer.prepare_key(compressed_kv)
+        scores = vanilla_indexer.scores(q_ref[token_idx],
+                                        compressed_kv_for_scores[:valid_len],
+                                        weights[token_idx])
+        topk_indices[token_idx] = vanilla_indexer.topk(scores, topk_tokens)
 
     return topk_indices
 
