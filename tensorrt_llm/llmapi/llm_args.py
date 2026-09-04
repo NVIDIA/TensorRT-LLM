@@ -5085,6 +5085,17 @@ class BaseLlmArgs(StrictBaseModel):
         "the request sets X-TRTLLM-return-metrics: 1.",
         status="prototype")
 
+    per_request_spec_decode_stats: bool = Field(
+        default=False,
+        description=
+        "Include per-request speculative-decoding acceptance statistics on each "
+        "response choice. Server-side opt-in only: unlike return_perf_metrics "
+        "this needs no per-request header, so benchmarking clients that "
+        "discover the payload by shape do not have to know they are talking to "
+        "TensorRT-LLM. Deliberately independent of return_perf_metrics, which "
+        "also mounts the Prometheus endpoint. PyTorch backend only.",
+        status="prototype")
+
     perf_metrics_output_dir: Optional[str] = Field(
         default=None,
         description="Directory for per-process performance metrics JSONL "
