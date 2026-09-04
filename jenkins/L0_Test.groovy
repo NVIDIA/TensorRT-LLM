@@ -1160,7 +1160,13 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     Utils.exec(pipeline, script: "echo 'Script to build fat sqsh inline:' && cat ${scriptFatBuildLocalPath}")
                     Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildLocalPath, scriptFatBuildPathNode, true)
 
-                    def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
+                    // Must match the agent's enroot form, or the two import separate
+                    // copies of the same base sqsh.
+                    def container = LLM_DOCKER_IMAGE
+                    if (cluster.containerRuntime.toString() == "ENROOT") {
+                        container = LLM_DOCKER_IMAGE
+                            .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                    }
                     def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
                     def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${nodeName}-fat_build")
@@ -1201,26 +1207,24 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 }
             }
 
-            boolean isRetry = retryContext != null && ((retryContext.attempt ?: 1) as int) > 1
-            if (!isRetry) {
-                stage("[${stageName}] Prepare Container") {
-                    if (cluster.fatBuilderArgs != null) {
-                        try {
-                            Utils.exec(
-                                pipeline,
-                                timeout: false,
-                                script: Utils.sshUserCmd(remote, scriptPreparePathNode),
-                                numRetries: 3
-                            )
-                        } catch (Exception e) {
-                            echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU agent job will fall back to base sqsh + full install."
-                        }
-                    } else {
-                        echo "No fat sqsh builder configured; skipping Prepare Container."
+            // Runs on every attempt: prepare_container.sh exits immediately if the fat
+            // sqsh already exists, and a retry whose attempt 1 died before the build
+            // still needs one.
+            stage("[${stageName}] Prepare Container") {
+                if (cluster.fatBuilderArgs != null) {
+                    try {
+                        Utils.exec(
+                            pipeline,
+                            timeout: false,
+                            script: Utils.sshUserCmd(remote, scriptPreparePathNode),
+                            numRetries: 3
+                        )
+                    } catch (Exception e) {
+                        echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU agent job will fall back to base sqsh + full install."
                     }
+                } else {
+                    echo "No fat sqsh builder configured; skipping Prepare Container."
                 }
-            } else {
-                echo "[Prepare Container] Skipping on retry attempt ${retryContext.attempt}: reusing fat sqsh built in attempt 1."
             }
 
             stage('Request Node Via Slurm') {
@@ -1269,10 +1273,14 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 def mounts = getMountListForSlurmTest(cluster, false).join(",")
 
-                // Use fat sqsh as the agent container image if it was pre-built by Prepare Container,
-                // so the Jenkins agent runs inside the fat sqsh (TRT-LLM + pip deps pre-baked).
-                def containerImageForAgent = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
-                if (cluster.fatBuilderArgs != null) {
+                def containerImageForAgent = LLM_DOCKER_IMAGE
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    containerImageForAgent = LLM_DOCKER_IMAGE
+                        .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                }
+                // Run the agent inside the pre-built fat sqsh (TRT-LLM + pip deps baked in).
+                // ENROOT only: a .sqsh path is not a valid image for a Docker runtime.
+                if (cluster.fatBuilderArgs != null && cluster.containerRuntime.toString() == "ENROOT") {
                     def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
                     def fatSqsh = computeFatSqshPath(fatSqshDir, llmTarfile, scriptFatBuildLocalPath)
                     def fatHash = fatSqsh.hash
@@ -1981,7 +1989,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptInstallPathNode,
                     true
                 )
-                def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
+                // Defined here, ahead of the fat sqsh block that passes it to the
+                // builder, rather than at the Job Launch Script below.
+                def container = LLM_DOCKER_IMAGE
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    container = LLM_DOCKER_IMAGE
+                        .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                }
                 if (cluster.fatBuilderArgs != null) {
                     Utils.exec(pipeline, script: "echo \"Script to build fat sqsh inline: \" && cat ${scriptFatBuildLocalPath}")
                     Utils.copyFileToRemoteHost(
@@ -2579,27 +2593,22 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
             }
 
-            // On retry the fat sqsh is already on disk from attempt 1; skip
-            // Prepare Container entirely so it doesn't appear in the stage view.
-            boolean isRetry = retryContext != null && ((retryContext.attempt ?: 1) as int) > 1
-            if (!isRetry) {
-                stage("[${stageName}] Prepare Container") {
-                    // Submit the CPU fat-sqsh builder job (if configured) and poll until
-                    // it completes. Non-fatal: any failure here lets the GPU job fall back
-                    // to base sqsh + full pip install.
-                    try {
-                        Utils.exec(
-                            pipeline,
-                            timeout: false,
-                            script: Utils.sshUserCmd(remote, scriptPreparePathNode),
-                            numRetries: 3
-                        )
-                    } catch (Exception e) {
-                        echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU job will fall back to base sqsh + full install."
-                    }
+            // Submit the CPU fat-sqsh builder job (if configured) and poll until it
+            // completes. Non-fatal: any failure here lets the GPU job fall back to base
+            // sqsh + full pip install. Runs on every attempt: prepare_container.sh exits
+            // immediately if the fat sqsh already exists, and a retry whose attempt 1
+            // died before the build still needs one.
+            stage("[${stageName}] Prepare Container") {
+                try {
+                    Utils.exec(
+                        pipeline,
+                        timeout: false,
+                        script: Utils.sshUserCmd(remote, scriptPreparePathNode),
+                        numRetries: 3
+                    )
+                } catch (Exception e) {
+                    echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU job will fall back to base sqsh + full install."
                 }
-            } else {
-                echo "[Prepare Container] Skipping on retry attempt ${retryContext.attempt}: reusing fat sqsh built in attempt 1."
             }
 
             stage("[${stageName}] Run Pytest") {
