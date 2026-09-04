@@ -28,8 +28,8 @@ def _require_supported_gpu() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA GPU required")
     major, minor = torch.cuda.get_device_capability()
-    if (major, minor) not in ((10, 0), (10, 3), (12, 0)):
-        pytest.skip(f"NVFP4 Conv3d requires SM100, SM103, or SM120, got SM{major}{minor}")
+    if (major, minor) not in ((10, 0), (10, 3)):
+        pytest.skip(f"NVFP4 Conv3d requires SM100 or SM103, got SM{major}{minor}")
 
 
 @pytest.mark.parametrize(

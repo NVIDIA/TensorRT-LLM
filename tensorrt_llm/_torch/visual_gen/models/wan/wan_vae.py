@@ -405,7 +405,7 @@ _FP4_FP8_MAX = 448.0
 _FP4_E2M1_MAX = 6.0
 _FP4_SF_VEC = 16
 _FP4_E2M1_VALUES = (0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6)
-_NVFP4_SUPPORTED_SM_VERSIONS = frozenset({100, 103, 120})
+_NVFP4_SUPPORTED_SM_VERSIONS = frozenset({100, 103})
 
 
 class _FP4PrequantizedWeight(TypedDict):
@@ -465,7 +465,7 @@ def _supports_nvfp4_device(device: torch.device) -> bool:
 def _nvfp4_supported_sm_names() -> str:
     """Return provider-validated FP4 Conv3d architectures for diagnostics."""
     names = [f"SM{version}" for version in sorted(_NVFP4_SUPPORTED_SM_VERSIONS)]
-    return f"{', '.join(names[:-1])}, and {names[-1]}"
+    return f"{', '.join(names[:-1])} and {names[-1]}"
 
 
 @lru_cache(maxsize=1)

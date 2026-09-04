@@ -31,7 +31,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
 
 def _require_supported_gpu() -> None:
     if not _supports_nvfp4_device(torch.device("cuda")):
-        pytest.skip("NVFP4 Wan VAE requires an SM100, SM103, or SM120 GPU")
+        pytest.skip("NVFP4 Wan VAE requires an SM100 or SM103 GPU")
 
 
 @pytest.mark.parametrize("channels", [128, 192, 512])
