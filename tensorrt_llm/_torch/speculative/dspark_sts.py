@@ -17,8 +17,8 @@
 ``apply_sts`` computes ``confidence[r][j] = sigmoid(logit[r][j] / T[j])``. The
 planner consumes the cumulative product ``survival[r][j]``, in which
 per-position calibration error compounds geometrically, so the table must be
-fitted against the survival (see ``tests/microbenchmarks/dspark_fit_sts.py``).
-Collection and fitting live in offline tooling and do not run in serving.
+fitted against the survival. Collection and fitting live in offline tooling and
+do not run in serving.
 """
 
 import json
@@ -33,8 +33,8 @@ __all__ = [
 def load_sts_temperatures_from_path(path: str) -> List[float]:
     """Read a temperature vector, accepting either spelling of the key.
 
-    This repo writes ``sts_temperatures``; SGLang writes ``temperatures``.
-    The vectors are interchangeable.
+    TRT-LLM calibration artifacts use ``sts_temperatures``; SGLang uses
+    ``temperatures``. The vectors are interchangeable.
     """
     with open(path, encoding="utf-8") as handle:
         payload = json.load(handle)
