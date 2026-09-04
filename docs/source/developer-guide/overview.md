@@ -122,24 +122,3 @@ export TLLM_LOG_LEVEL_BY_MODULE="debug:_torch,runtime;info:serve"
 ```
 
 This example sets the global level to `warning` but enables `debug` output for `_torch` and `runtime` modules, and `info` for `serve`. Valid levels: `trace`, `debug`, `verbose`, `info`, `warning`, `error`, `internal_error`.
-
-### Diagnosing Slow Iterations
-
-`TRTLLM_STALL_REPORT_SEC` dumps every thread's stack to stderr whenever a single
-executor iteration takes longer than the given number of seconds:
-
-```bash
-# Any iteration slower than 5s dumps all thread stacks.
-export TRTLLM_STALL_REPORT_SEC=5
-```
-
-Set it somewhat above the normal iteration time, which the `host_step_time` field
-of the per-iteration log line reports. Unlike the hang detector, this neither
-kills the process nor stops the run, so it is safe to leave on for a whole
-benchmark. It stays silent while iterations are under the threshold and does not
-report time the loop spends idle waiting for requests.
-
-Background threads are included in the dump, which is usually the point: a slow
-iteration that is not blocked in any obvious call is often waiting on a KV
-transfer, connector or sampler thread that the main thread's stack does not
-explain.

@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import faulthandler
 import os
 import signal
 import sys
@@ -26,13 +25,6 @@ from tensorrt_llm.logger import logger
 
 # 137 == 128 + SIGKILL(9): the exit code a shell reports for a SIGKILL'd process.
 _HARD_KILL_EXIT_CODE = 137
-
-#: Seconds an iteration may take before all thread stacks are dumped to stderr.
-#: Unset or non-positive disables it. This diagnoses a *slow* loop, as opposed to
-#: the hung loop `HangDetector` exists for, so it neither kills the process nor
-#: stops the run. Set it somewhat above the normal iteration time and read the
-#: dumps out of the worker log afterwards.
-STALL_REPORT_ENV = "TRTLLM_STALL_REPORT_SEC"
 
 
 def _best_effort_flush_streams() -> None:
@@ -108,41 +100,6 @@ class HangDetector:
         self.lock = threading.Lock()
         self.active = False
         self._detected = False
-        self._stall_report_sec = self._read_stall_report_sec()
-        if self._stall_report_sec > 0:
-            logger.info(
-                f"Stall reporting enabled: dumping all thread stacks for any "
-                f"iteration exceeding {self._stall_report_sec}s "
-                f"({STALL_REPORT_ENV})."
-            )
-
-    @staticmethod
-    def _read_stall_report_sec() -> float:
-        raw = os.environ.get(STALL_REPORT_ENV, "")
-        if not raw.strip():
-            return 0.0
-        try:
-            return float(raw)
-        except ValueError:
-            logger.warning(f"Ignoring {STALL_REPORT_ENV}={raw!r}: not a number.")
-            return 0.0
-
-    def _arm_stall_report(self) -> None:
-        """Schedule a stack dump if this iteration runs long.
-
-        `faulthandler`'s timer lives in a thread that does not take the GIL, so
-        unlike `print_all_stacks` it still fires when the loop is blocked inside
-        a native call. That is the case worth diagnosing, since a stall in pure
-        Python would already show up in a profile.
-        """
-        if self._stall_report_sec <= 0:
-            return
-        faulthandler.dump_traceback_later(self._stall_report_sec, repeat=False, exit=False)
-
-    def _cancel_stall_report(self) -> None:
-        if self._stall_report_sec <= 0:
-            return
-        faulthandler.cancel_dump_traceback_later()
 
     def start(self):
         """Enable hang detection."""
@@ -172,16 +129,11 @@ class HangDetector:
     def checkpoint(self):
         """Reset hang detection timer."""
         self.cancel_task()
-        self._arm_stall_report()
         if self.active:
             self.task = asyncio.run_coroutine_threadsafe(self._detect_hang(), self.loop)
 
     def cancel_task(self):
         """Cancel the hang detection task."""
-        # Disarmed here rather than in checkpoint() so that pause(), used by the
-        # request-queue wait and the cross-rank broadcast probe, does not report
-        # a stall for time the loop is legitimately idle.
-        self._cancel_stall_report()
         if self.task is not None and not self.task.done():
             self.task.cancel()
             self.task = None
