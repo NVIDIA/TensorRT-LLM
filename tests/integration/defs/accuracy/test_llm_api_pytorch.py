@@ -5710,13 +5710,19 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             # converts it to a byte quota and then inflates it by
             # 1 / max_util_for_resume -- see the _get_quota_from_max_tokens call
             # in tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py and the
-            # note in _util.py::_configure_helix_kv_cache_capacity. With 0.7
-            # below, the pool is sized for roughly 512/0.7 tokens. GPT-OSS is
-            # also a SWA model, so the token->byte rate is not uniform across
-            # layers. Whether any given pair of requests can co-reside is
-            # therefore NOT derivable from this knob -- read `pool_tokens` in the
-            # [I-10 sizing] diagnostic below instead.
-            max_tokens=512,
+            # note in _util.py::_configure_helix_kv_cache_capacity. GPT-OSS is
+            # also a SWA model: the manager derives per-layer windows from its
+            # mixed `layer_types` (sliding layers at 128, full layers at
+            # max_seq_len), so the layers land in two layer groups and the
+            # quota carries a per-request sliding-window term that scales with
+            # max_batch_size, not with max_tokens. With 0.7 below, 128 tokens
+            # here and max_batch_size=4 on the LLM, the pool comes out at
+            # roughly 34 pages of 32 tokens, about 1088 tokens against the four
+            # requests' 1588-token decode peak (max_tokens alone cannot get
+            # there: the batch term keeps the pool above 46 pages). Whether any
+            # given pair of requests can co-reside is NOT derivable from this
+            # knob -- read `pool_tokens` in the [I-10 sizing] diagnostic below.
+            max_tokens=128,
             free_gpu_memory_fraction=0.5,
             # Refuse resume() once the hot tier is above this utilization, so a
             # suspended request genuinely defers before being recalled (V2-only).
@@ -5726,14 +5732,17 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             host_cache_size=4 * (1 << 30),
             use_kv_cache_manager_v2=True)
 
-        llm = LLM(self.MODEL_PATH,
-                  tensor_parallel_size=1,
-                  kv_cache_config=kv_cache_config,
-                  max_batch_size=8,
-                  max_seq_len=1024,
-                  disable_overlap_scheduler=True,
-                  enable_iter_perf_stats=True,
-                  moe_config=MoeConfig(backend="CUTLASS"))
+        llm = LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=1,
+            kv_cache_config=kv_cache_config,
+            # Also a pool-sizing knob for this SWA model (see the NOTE
+            # on kv_cache_config); four prompts run below.
+            max_batch_size=4,
+            max_seq_len=1024,
+            disable_overlap_scheduler=True,
+            enable_iter_perf_stats=True,
+            moe_config=MoeConfig(backend="CUTLASS"))
 
         # Several distinct long prompts. Each alone fits the pool; together they
         # cannot all stay resident at their decode peak, which is what forces
@@ -5826,10 +5835,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             # Checked against the *measured* pool, never against max_tokens --
             # the manager inflates that knob by 1 / max_util_for_resume, so a
             # config-derived bound is wrong by ~1.43x (see the sizing note on
-            # kv_cache_config). Observed on B200/H100 at 1588 vs 736, a ~2.2x
-            # margin; the deliberately weaker two-request form (794 vs 736) is
-            # only ~8% and too tight to gate CI on. Failing here means the
-            # workload stopped being contended, NOT that the KV path broke.
+            # kv_cache_config). Expected on B200 at 1588 vs about 1088 with the
+            # two-layer-group layout (1588 vs 736 with the single-group layout
+            # it replaced), a ~1.5x margin. `pool_tokens` counts the pages of
+            # both layer groups, so it overstates what the full-attention
+            # layers can hold; only the four-request form is gated on. Failing
+            # here means the workload stopped being contended, NOT that the KV
+            # path broke.
             assert concurrent_peak > pool_tokens, (
                 f"workload precondition failed: the pool ({pool_tokens} tokens) "
                 f"can hold all {len(prompts)} requests at their decode peak "
