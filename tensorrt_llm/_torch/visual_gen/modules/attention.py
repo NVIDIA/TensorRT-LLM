@@ -97,13 +97,19 @@ class Attention(nn.Module):
         cp_size = vgm.cp_size if vgm else 1
         base_backend = config.attention.backend
         _sa_cfg = config.attention.sparse_attention_config
-        _is_vsa = (
-            base_backend == "CUTEDSL"
-            and _sa_cfg is not None
-            and getattr(_sa_cfg, "algorithm", None) == "vsa"
-        )
+        _sa_algo = getattr(_sa_cfg, "algorithm", None) if _sa_cfg is not None else None
+        _is_vsa = base_backend == "CUTEDSL" and _sa_algo == "vsa"
+        _is_sol_attn = base_backend == "CUTEDSL" and _sa_algo == "sol_attn"
 
-        # Cross-attention fallback: TRTLLM and CUTEDSL VSA are self-attn only.
+        # SEPARATE_QKV fallback: TRTLLM and CUTEDSL VSA cannot serve it.
+        #
+        # Sol-Attn is deliberately absent: it decides per call (`_can_serve`) and
+        # delegates what it cannot serve to the dense backend of its own family.
+        # A rule here would have to guess from `qkv_mode`, which describes how
+        # Q/K/V are *projected* rather than whether K/V come from another
+        # sequence -- and that guess is wrong wherever SEPARATE_QKV is chosen for
+        # other reasons (Qwen-Image always; WAN's attn1 under async Ulysses),
+        # silently costing those modules their configured backend.
         if self.qkv_mode == QKVMode.SEPARATE_QKV and (base_backend == "TRTLLM" or _is_vsa):
             backend_name = "VANILLA"
             requested = f"{base_backend} (VSA)" if _is_vsa else base_backend
@@ -120,6 +126,12 @@ class Attention(nn.Module):
         if _is_vsa and cp_size > 1:
             raise ValueError(
                 f"VSA needs the full token sequence per rank, so it is incompatible "
+                f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
+                f"ulysses or cfg parallelism instead."
+            )
+        if _is_sol_attn and cp_size > 1:
+            raise ValueError(
+                f"Sol-Attn needs the full token sequence per rank, so it is incompatible "
                 f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
                 f"ulysses or cfg parallelism instead."
             )

@@ -6,6 +6,7 @@ This page is an unindexed draft until the VisualGen documentation hub is introdu
 
 - [Overview](#overview)
   - [Algorithms](#algorithms)
+  - [Sol-Attn](#sol-attn)
 - [Skip Softmax Attention](#skip-softmax-attention)
 - [Video Sparse Attention (VSA)](#video-sparse-attention-vsa)
 
@@ -21,6 +22,38 @@ Sparse attention in VisualGen is configured through `VisualGenArgs.attention_con
 |---|---|---|
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Supported |
 | VSA | TBD | TODO |
+| `sol_attn` | `SolAttentionConfig` | Supported (CUTEDSL, sm100) |
+
+### Sol-Attn
+
+Sol-Attn ([arXiv:2607.24027](https://arxiv.org/abs/2607.24027)) folds dynamic block
+routing, sparse computation, and an approximation-correction term into one
+online-softmax pass. It runs on the **CUTEDSL** backend only, on sm100
+(B200/GB200), and requires `head_dim=128`, bfloat16, and MHA
+(`num_kv_heads == num_heads`).
+
+```yaml
+attention_config:
+  backend: CUTEDSL
+  sparse_attention_config:
+    algorithm: sol_attn
+    tau: 2.0                        # routing threshold; higher routes more blocks sparse
+    thresh_type: diag               # or "exact"
+    disabled_until_timestep: 0.9090 # dense while normalized timestep >= cutoff
+    dense_layers: '0'               # optional: layers forced dense
+```
+
+`disabled_until_timestep` has the same meaning as it does for Skip Softmax:
+attention runs dense while the normalized denoising timestep is at or above the
+cutoff, protecting the high-noise prefix, and switches to the sparse kernel
+below it. Use `None` rather than `0.0` to disable the prefix.
+
+On an input the kernel cannot serve — an unsupported architecture, a
+`head_dim` other than 128, a non-bfloat16 dtype — Sol-Attn falls back to dense
+attention -- the configured backend's dense kernel where available, torch SDPA
+otherwise -- logs the specific reason once, and counts the fallback. Set
+`SOL_ATTN_STRICT=1` to raise instead of falling back, which is useful when
+benchmarking to confirm the kernel actually ran.
 
 ## Skip Softmax Attention
 
@@ -90,7 +123,7 @@ User configuration is supplied through Python or YAML and controls how the check
 
 `threshold_scale_factor` and `target_sparsity` are alternatives: if both are present, `threshold_scale_factor` takes precedence and the calibration formula is not used. User-provided `target_sparsity` and `disabled_until_timestep` override checkpoint defaults. Checkpoint `ignore` patterns always disable Skip Softmax Attention for matching layers.
 
-Skip Softmax Attention works with both the **TRTLLM** and **CUTEDSL** attention backends in VisualGen. Set `attention_config.backend` to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with `quant_attention_config`'s block-scaled Q/K recipes (MXFP8, NVFP4); VSA is the only CUTEDSL sparse-attention algorithm that is mutually exclusive with quantized attention.
+Skip Softmax Attention works with both the **TRTLLM** and **CUTEDSL** attention backends in VisualGen. Set `attention_config.backend` to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with `quant_attention_config`'s block-scaled Q/K recipes (MXFP8, NVFP4); VSA and Sol-Attn each replace the dense CuTeDSL path and are therefore mutually exclusive with quantized attention.
 
 #### Mapping `disabled_until_timestep` to Actual Denoising Steps
 

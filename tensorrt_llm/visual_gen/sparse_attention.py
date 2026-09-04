@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Literal, Optional
 
 from pydantic import Field as PydanticField
+from pydantic import field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
@@ -218,6 +219,112 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             sparse_config = getattr(pretrained_config, "sparse_attention_config", None)
             if isinstance(sparse_config, dict):
                 return sparse_config
+        return None
+
+
+class SolAttentionConfig(BaseSparseAttentionConfig):
+    """Sol-Attn sparse attention configuration for visual generation.
+
+    Dynamic block routing + sparse computation + approximation correction in
+    one online-softmax pass (arXiv:2607.24027). Kernel is CuTeDSL, sm100
+    (B200/GB200) only, head_dim=128, bf16, MHA.
+
+    On an unsupported *shape, dtype, or architecture* the kernel falls back to
+    dense attention -- the configured backend's dense kernel where available,
+    torch SDPA otherwise -- and counts the fallback, so setting this config on the wrong GPU
+    degrades rather than fails. Two cases are not covered by that fallback and do raise: GQA/MQA
+    (num_kv_heads != num_heads) here at construction, and context parallelism
+    (cp_size > 1), rejected in visual_gen/modules/attention.py.
+    """
+
+    algorithm: Literal["sol_attn"] = "sol_attn"
+    tau: float = PydanticField(
+        1.0,
+        description="Per-block routing threshold; higher tau routes more blocks sparse.",
+    )
+    thresh_type: Literal["diag", "exact"] = PydanticField(
+        "diag",
+        description="Threshold policy forwarded to the kernel (kernel default: 'diag').",
+    )
+    kv_splits: Literal["auto", "1"] = PydanticField(
+        "auto",
+        description=(
+            "KV split policy. Only 1 split is valid on the shipped sm100 "
+            "kernels, so 'auto' and '1' are equivalent; the 2/4 path was "
+            "SM90-only and returns with that kernel. Constrained rather than a "
+            "free string because any other value is rejected deep inside the "
+            "kernel, which would silently degrade the whole run to dense."
+        ),
+    )
+    disabled_until_timestep: Optional[float] = PydanticField(
+        None,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Dense-prefix cutoff on the normalized denoising timestep, with the "
+            "same sense as skip_softmax's field of the same name: the layer runs "
+            "dense while timestep >= this value and switches to the sparse kernel "
+            "below it. Larger timesteps are earlier, noisier steps, so this "
+            "protects the high-noise prefix. Use None (not 0.0) to disable the "
+            "prefix; 0.0 is rejected because it would run dense on every step "
+            "and silently turn Sol-Attn off entirely. "
+            "The timestep is supplied as a forward kwarg by every VisualGen "
+            "pipeline, so no per-pipeline wiring is required."
+        ),
+    )
+    dense_layers: Optional[str] = PydanticField(
+        None,
+        description=(
+            "Comma-separated layer indices/ranges (e.g. '0,2-4') forced dense "
+            "regardless of the dense prefix. Evaluated per-layer at construction "
+            "time; no pipeline wiring required."
+        ),
+    )
+
+    @field_validator("dense_layers")
+    @classmethod
+    def _validate_dense_layers(cls, spec: Optional[str]) -> Optional[str]:
+        """Reject malformed specs here rather than deep in the backend.
+
+        Without this a non-numeric token raises from ``_parse_dense_layers``
+        during attention construction, far from the config that caused it, and
+        a descending range such as ``'4-2'`` raises nothing at all -- it yields
+        an empty set, so the layers the user asked to force dense silently stay
+        sparse.
+        """
+        if spec is None:
+            return spec
+        for item in spec.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                if "-" in item:
+                    # A negative index cannot reach here: it also contains '-',
+                    # so it takes this branch and the empty first part fails
+                    # int() below.
+                    start, end = (int(part) for part in item.split("-", 1))
+                    if start > end:
+                        raise ValueError(
+                            f"dense_layers range '{item}' is descending; "
+                            f"write it as '{end}-{start}'"
+                        )
+                else:
+                    int(item)
+            except ValueError as exc:
+                if "descending" in str(exc):
+                    raise
+                raise ValueError(
+                    f"dense_layers entry '{item}' is not a layer index or range; "
+                    "expected a comma-separated list such as '0,2-4'"
+                ) from exc
+        return spec
+
+    def to_sparse_params(self, **kwargs):
+        # Sol-Attn's knobs are consumed directly by SolAttention.__init__
+        # (constructed via CUTEDSL backend dispatch in create_attention), not
+        # lowered into a shared SparseParams -- the vendored kernel has no
+        # checkpoint-calibration step to resolve here, unlike skip_softmax.
         return None
 
 

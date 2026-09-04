@@ -127,13 +127,16 @@ def create_attention(
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
     if backend.upper() == "CUTEDSL" and attention_config is not None:
-        if (
-            attention_config.sparse_attention_config is not None
-            and getattr(attention_config.sparse_attention_config, "algorithm", None) == "vsa"
-        ):
+        sparse_algo = getattr(attention_config.sparse_attention_config, "algorithm", None)
+        if sparse_algo == "vsa":
             from .cute_dsl.vsa import VSAAttention
 
             attn_cls = VSAAttention
+            kwargs["sparse_attention_config"] = attention_config.sparse_attention_config
+        elif sparse_algo == "sol_attn":
+            from .cute_dsl.sol_attn import SolAttention
+
+            attn_cls = SolAttention
             kwargs["sparse_attention_config"] = attention_config.sparse_attention_config
 
     return attn_cls(
