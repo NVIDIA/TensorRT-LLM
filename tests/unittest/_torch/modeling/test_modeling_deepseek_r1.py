@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -10,11 +11,11 @@ import torch
 import tensorrt_llm._torch.models.modeling_deepseekv3 as deepseek_r1_modeling
 
 
-def _make_gate_case() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]:
+def _make_gate_case() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace, SimpleNamespace]:
     mlp = deepseek_r1_modeling.Deepseekv3MoE.__new__(deepseek_r1_modeling.Deepseekv3MoE)
     torch.nn.Module.__init__(mlp)
     mlp.allreduce = None
-    tensor = SimpleNamespace(
+    hidden_states = SimpleNamespace(
         is_cuda=True,
         device=torch.device("cuda"),
         shape=torch.Size((4, 7168)),
@@ -22,6 +23,7 @@ def _make_gate_case() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace
         dim=lambda: 2,
         is_contiguous=lambda: True,
     )
+    residual = SimpleNamespace(**vars(hidden_states))
     norm = SimpleNamespace(
         nvfp4_scale=None,
         return_hp_output=False,
@@ -37,7 +39,7 @@ def _make_gate_case() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace
         fusion_config=SimpleNamespace(POST_MOE_FUSION=False),
         next_layer_layernorm=norm,
     )
-    return layer, tensor, norm
+    return layer, hidden_states, residual, norm
 
 
 def _enable_gate_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -69,9 +71,31 @@ def test_wideep_flashinfer_add_add_rmsnorm_accepts_exact_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_gate_dependencies(monkeypatch)
-    layer, hidden_states, _ = _make_gate_case()
+    layer, hidden_states, residual, _ = _make_gate_case()
 
-    assert _can_use(layer, hidden_states, hidden_states)
+    assert hidden_states is not residual
+    assert _can_use(layer, hidden_states, residual)
+
+
+def test_wideep_flashinfer_add_add_rmsnorm_falls_back_for_missing_shared_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mlp = deepseek_r1_modeling.Deepseekv3MoE.__new__(deepseek_r1_modeling.Deepseekv3MoE)
+    torch.nn.Module.__init__(mlp)
+    mlp.use_dp = True
+    mlp.allreduce = None
+    mlp.shared_experts = None
+    hidden_states = torch.zeros((2, 8), dtype=torch.bfloat16)
+    routed_output = torch.ones_like(hidden_states)
+    monkeypatch.setattr(
+        mlp,
+        "compute_routed_output",
+        MagicMock(return_value=routed_output),
+    )
+
+    output = mlp(hidden_states, defer_shared_routed_add=True)
+
+    assert output is routed_output
 
 
 @pytest.mark.parametrize(
@@ -85,8 +109,13 @@ def test_wideep_flashinfer_add_add_rmsnorm_accepts_exact_contract(
         "not_attention_dp",
         "not_cutedsl",
         "not_cuda",
+        "residual_not_cuda",
+        "device_mismatch",
         "shape_mismatch",
         "not_bf16",
+        "residual_not_bf16",
+        "not_contiguous",
+        "residual_not_contiguous",
         "post_moe_fusion",
         "nvfp4_quant",
         "high_precision_output",
@@ -99,8 +128,7 @@ def test_wideep_flashinfer_add_add_rmsnorm_fails_closed(
     rejection: str,
 ) -> None:
     _enable_gate_dependencies(monkeypatch)
-    layer, hidden_states, norm = _make_gate_case()
-    residual = hidden_states
+    layer, hidden_states, residual, norm = _make_gate_case()
 
     if rejection == "disabled":
         layer.enable_wideep_flashinfer_add_add_rmsnorm = False
@@ -118,11 +146,20 @@ def test_wideep_flashinfer_add_add_rmsnorm_fails_closed(
         layer.model_config.moe_backend = "CUTLASS"
     elif rejection == "not_cuda":
         hidden_states.is_cuda = False
+    elif rejection == "residual_not_cuda":
+        residual.is_cuda = False
+    elif rejection == "device_mismatch":
+        residual.device = torch.device("cuda:1")
     elif rejection == "shape_mismatch":
-        residual = SimpleNamespace(**vars(hidden_states))
         residual.shape = torch.Size((3, 7168))
     elif rejection == "not_bf16":
         hidden_states.dtype = torch.float16
+    elif rejection == "residual_not_bf16":
+        residual.dtype = torch.float16
+    elif rejection == "not_contiguous":
+        hidden_states.is_contiguous = lambda: False
+    elif rejection == "residual_not_contiguous":
+        residual.is_contiguous = lambda: False
     elif rejection == "post_moe_fusion":
         layer.fusion_config.POST_MOE_FUSION = True
     elif rejection == "nvfp4_quant":
