@@ -271,14 +271,38 @@ def test_messages_route_reframes_streaming_response(server_kind):
     assert backend.await_args.args[0].stream
 
 
-def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
-    # The disagg server's register_routes mounts a prometheus multiprocess
-    # collector, which errors unless PROMETHEUS_MULTIPROC_DIR points at a real
-    # directory. Production sets that up in set_prometheus_multiproc_dir()
-    # during startup; building the server with object.__new__ skips startup
-    # entirely, so the directory has to be supplied here. monkeypatch keeps it
-    # from leaking into any other test in the session.
+@pytest.fixture
+def prometheus_multiproc_dir(tmp_path, monkeypatch):
+    """A multiprocess metrics directory that does not outlive the test.
+
+    Setting PROMETHEUS_MULTIPROC_DIR cannot be undone by unsetting it. The
+    first metric built while it is set makes prometheus_client choose
+    ``values.ValueClass`` for the whole process and cache it; monkeypatch then
+    restores the environment at teardown but cannot put the class back. Every
+    later metric in that process is built by MultiProcessValue with no
+    directory to write into and dies with "expected str, bytes or
+    os.PathLike object, not NoneType".
+
+    The damage lands on whichever file runs next, which makes it look like
+    that file's bug: test_disagg_openai_client.py passes alone and fails
+    wholesale -- 14 failures, 11 errors -- when this one precedes it. So the
+    class is restored here, not just the environment.
+    """
+    import prometheus_client.values
+
     monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    saved_value_class = prometheus_client.values.ValueClass
+    try:
+        yield tmp_path
+    finally:
+        prometheus_client.values.ValueClass = saved_value_class
+
+
+def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
+    # register_routes mounts a prometheus multiprocess collector, which needs
+    # PROMETHEUS_MULTIPROC_DIR to name a real directory: building the server
+    # with object.__new__ skips the startup that would normally create one.
+    # See the fixture for why setting the variable is not enough to undo.
 
     standard = object.__new__(OpenAIServer)
     standard.app = FastAPI()
