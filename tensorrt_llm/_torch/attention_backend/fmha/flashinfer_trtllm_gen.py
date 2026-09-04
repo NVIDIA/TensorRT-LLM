@@ -588,6 +588,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
+        num_heads: int,
         tokens_per_block: int,
         mla_backend: str,
         kv_lora_rank: Optional[int],
@@ -625,6 +626,17 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
+            )
+
+        # Decline Kimi K3's H96 shape only from this FlashInfer wrapper's
+        # TRTLLM-Gen MLA path. FMHA selection can then continue to the legacy
+        # thop.attention fallback, whose updated TRTLLM-Gen autotuner supports
+        # H96 through SwapsMmaAb/Q16.
+        if mla_backend == "trtllm-gen" and num_heads == 96:
+            return (
+                False,
+                "[Generation][MLA] FlashInfer TRTLLM-GEN backend is disabled "
+                "for num_heads=96 as it may select unsupported kernels.",
             )
 
         # Scoped to trtllm-gen: SLOWER_MLA_GENERATION_KERNELS was measured on that
@@ -887,6 +899,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 # matching prepare_workspace's is_gen_only branch.
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
+                    num_heads=attn.num_heads,
                     tokens_per_block=tokens_per_block,
                     mla_backend=self._get_effective_mla_backend(meta, q.size(0)),
                     kv_lora_rank=attn.kv_lora_rank,

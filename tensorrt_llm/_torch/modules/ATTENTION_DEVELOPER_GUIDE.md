@@ -352,11 +352,10 @@ rejected at model build). FP8 KV cache forces `trtllm-gen`. K3 also installs a
 per-batch policy that falls back to `trtllm-gen` for mixed
 context/generation batches and multi-token generation (speculative
 verification), keeping `cute-dsl` for plain one-token-per-request decode.
-Any H=96 batch (K3's attention-DP shape) remains on `cute-dsl` regardless of
-batch composition: TRTLLM-Gen may select a 64-head Q tile, which does not
-divide 96 after K3's head padding removal, and its decode gate rejects
-`64 < num_heads_q < 128` — so falling back there would fail engine
-initialization (this covers attention-DP speculative verification).
+H=96 (K3's attention-DP shape) follows the same policy. When the effective
+backend is `trtllm-gen`, the FlashInfer wrapper declines H=96 and selection
+falls through to the legacy `thop.attention` implementation; its TRTLLM-Gen
+autotuner selects the supported path.
 
 The FMHA package is split by role:
 

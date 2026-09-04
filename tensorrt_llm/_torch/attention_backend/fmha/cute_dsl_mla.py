@@ -264,8 +264,6 @@ class CuteDslMlaFmha(PhasedFmha):
             (16, 2): 64,
             (16, 4): 32,
             (16, 8): 16,
-            # Keep H=96 off TRTLLM-Gen: its heuristic may select a 64-head
-            # Q tile, which does not divide 96 and produces an invalid config.
             (96, 1): 1,
             (128, 1): 64,
             (128, 2): 32,
@@ -296,10 +294,8 @@ class CuteDslMlaFmha(PhasedFmha):
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
         # Disable mixed context/generation batches until the CuTe DSL host
-        # overhead is reduced. H=96 is exempt: TRTLLM-Gen may select a
-        # 64-head Q tile, which does not divide 96 and produces an invalid
-        # configuration after K3's 96-to-128 head padding was removed.
-        if (meta.num_contexts != 0 and attn.num_heads != 96) or meta.num_generations <= 0:
+        # overhead is reduced.
+        if meta.num_contexts != 0 or meta.num_generations <= 0:
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."

@@ -38,7 +38,7 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 * **High-throughput and low-latency deployments are provided.** DEP16 (`enable_attention_dp: true`, `moe_expert_parallel_size: 16`) is the high-throughput deployment. TEP16 (`enable_attention_dp: false`, `moe_expert_parallel_size: 16`) is the low-latency deployment. An 8-GPU deployment, TEP8 (`enable_attention_dp: false`, `moe_expert_parallel_size: 8`), is also provided. Select the deployment and concurrency appropriate for your workload.
 * **CUDA graphs and the overlap scheduler are enabled.** The performance-sweep recipes set `disable_overlap_scheduler: false` and enable CUDA graphs. DEP16 additionally sets `cuda_graph_config.enable_padding: true`.
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
-* **`kv_cache_config.tokens_per_block` must be `64`** — required by the MLA (576, 512) trtllm-gen generation kernel.
+* **`kv_cache_config.tokens_per_block` is `64`** — kept for historical reasons: with other page sizes, earlier releases routed Kimi K3's MLA (576, 512) decode to a legacy TRTLLM-Gen path that did not support K3's 96 query heads, and `64` remains the validated configuration.
 * **Speculative decoding and disaggregated serving are not yet available** for Kimi K3; support is under development. See the "Current limitations" section of `examples/kimi_k3/README.md`.
 
 ## Deployment Steps
@@ -211,7 +211,7 @@ These options are set within the YAML file passed to `trtllm-serve` via the `--c
 * **Options:**
   * `enable_block_reuse`: Off by default; set to `true` to enable prefix-cache reuse across requests.
   * `mamba_state_config.periodic_snapshot_interval`: With block reuse on, the KDA recurrent state is snapshotted every this many tokens so prefix hits can restore it (default `0` = snapshots off; hybrid models only expose reusable prefixes at snapshot boundaries, so set e.g. `256` for block reuse to engage; see `examples/kimi_k3/eval_extra_llm_options_reuse.yaml`).
-  * `tokens_per_block`: Must be `64`, required by the MLA (576, 512) trtllm-gen generation kernel.
+  * `tokens_per_block`: `64`, kept for historical reasons (with other page sizes, earlier releases routed Kimi K3's MLA (576, 512) decode to a legacy TRTLLM-Gen path that did not support K3's 96 query heads); this remains the validated configuration.
   * `free_gpu_memory_fraction`: Fraction of free GPU memory reserved for the paged KV cache after model load. The configuration above uses `0.25` to leave runtime headroom. Lower it if you hit out-of-memory errors.
 
 #### `trust_remote_code`
@@ -401,5 +401,5 @@ The TEP16 point illustrates the low-latency deployment at small concurrency. The
 * **Job reaches its Slurm time limit before the model loads:** Weight loading for a checkpoint of this size is dominated by filesystem throughput; request a longer allocation (`--time=...`), particularly with cold caches or a busy filesystem.
 * **Model fails to load:** Make sure `trust_remote_code: true` is set and that the checkpoint path is a complete Hugging Face-format Kimi K3 checkpoint with its tokenizer files.
 * **`fla` / `einops` import errors:** Install the extra dependencies into the in-place environment: `.venv-3.12/bin/python -m pip install fla-core einops`.
-* **Accuracy looks off:** Confirm `tokens_per_block: 64` (a hard constraint for Kimi K3), and that the remaining settings match the tested configuration above.
+* **Accuracy looks off:** Confirm `tokens_per_block: 64` (the validated Kimi K3 page size; other values historically routed MLA decode to a TRTLLM-Gen path that did not support K3's 96 query heads), and that the remaining settings match the tested configuration above.
 * **GPU utilization:** For performance issues, check GPU utilization with `nvidia-smi` on the compute nodes while the server is running.

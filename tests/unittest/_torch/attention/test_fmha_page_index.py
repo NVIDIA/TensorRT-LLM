@@ -360,6 +360,7 @@ def test_mla_generation_declines_slower_trtllm_gen_decode_kernel() -> None:
     # backend must decline and let selection fall through.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
+        num_heads=128,
         tokens_per_block=32,
         mla_backend="trtllm-gen",
         kv_lora_rank=512,
@@ -378,6 +379,7 @@ def test_mla_generation_gate_is_scoped_to_one_page_size(tokens_per_block: int) -
     # served by this backend. Real configs run tokens_per_block=64.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
+        num_heads=128,
         tokens_per_block=tokens_per_block,
         mla_backend="trtllm-gen",
         kv_lora_rank=512,
@@ -392,6 +394,7 @@ def test_mla_generation_gate_is_scoped_to_the_trtllm_gen_backend() -> None:
     # this class and these head dims, and must stay selectable.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
+        num_heads=128,
         tokens_per_block=32,
         mla_backend="cute-dsl",
         kv_lora_rank=512,
@@ -413,6 +416,7 @@ def test_mla_generation_gate_declines_a_policy_downgrade_to_trtllm_gen() -> None
 
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
+        num_heads=128,
         tokens_per_block=32,
         mla_backend=effective,
         kv_lora_rank=512,
@@ -444,12 +448,20 @@ def test_mla_generation_gate_reads_the_effective_mla_backend() -> None:
         isinstance(passed, ast.Call)
         and getattr(passed.func, "attr", None) == "_get_effective_mla_backend"
     ), f"gate must receive the effective backend, got {ast.dump(passed)}"
+    passed_num_heads = kwargs.get("num_heads")
+    assert (
+        isinstance(passed_num_heads, ast.Attribute)
+        and isinstance(passed_num_heads.value, ast.Name)
+        and passed_num_heads.value.id == "attn"
+        and passed_num_heads.attr == "num_heads"
+    ), f"gate must receive attn.num_heads, got {ast.dump(passed_num_heads)}"
 
 
 def test_mla_generation_allows_other_supported_head_dims() -> None:
     # (320, 256) is unaffected at every page size.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=320,
+        num_heads=128,
         tokens_per_block=32,
         mla_backend="trtllm-gen",
         kv_lora_rank=256,

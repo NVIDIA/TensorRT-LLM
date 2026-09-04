@@ -21,6 +21,7 @@ cannot serve a case (dtype/layout/feature) are skipped via the capability matrix
 (``unsupported_reason``), which also gates sm-dependent dtypes.
 """
 
+import backend_case
 import pytest
 import torch
 from backend_case import BACKENDS_UNDER_TEST, BackendCase, generate_inputs, run_backend, run_case
@@ -227,6 +228,53 @@ MODEL_CASES = _model_cases()
 @pytest.mark.parametrize("name", list(MODEL_CASES), ids=lambda n: n)
 def test_attention_backend(name):
     run_case(MODEL_CASES[name])
+
+
+# ---------------------------------------------------------------------------
+# Backend-specific regressions that require a non-default implementation path
+# or workload shape and therefore do not belong in the cross-backend model
+# matrix above.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("page_size", [32, 64], ids=["p32", "p64"])
+def test_trtllm_legacy_fallback_mla_kimi_k3_h96(
+    monkeypatch: pytest.MonkeyPatch,
+    page_size: int,
+) -> None:
+    """K3 H96 must decline FlashInfer TRTLLM-Gen and run the legacy fallback.
+
+    page_size=32 is also declined by the pre-existing slower-kernel gate;
+    page_size=64 (the production K3 page size) reaches the fallback only
+    through the num_heads == 96 gate. Both must land on the legacy path.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Kimi K3 TRTLLM-Gen MLA regression requires SM100 or SM103")
+
+    # The old heuristic selects an invalid KeepsMmaAb/Q64 head tile for the
+    # 96-head group; the updated autotuner must select SwapsMmaAb/Q16.
+    batch_size = 32
+    case = BackendCase(
+        num_heads=96,
+        num_kv_heads=1,
+        head_dim=192,
+        seq_lens=[1] * batch_size,
+        num_cached_tokens=[31] * batch_size,
+        num_contexts=0,
+        dtype="bfloat16",
+        page_size=page_size,
+        kv_layout="HND",
+        is_mla=True,
+        v_head_dim=128,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+    )
+    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "flashinfer_trtllm_gen,fallback")
+    backend_case.run_case(case)
 
 
 # ---------------------------------------------------------------------------

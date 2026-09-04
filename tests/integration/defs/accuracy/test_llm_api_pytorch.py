@@ -4672,8 +4672,9 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         kv_cache_kwargs = dict(
             enable_block_reuse=False,
             free_gpu_memory_fraction=0.25,
-            # tokens_per_block=64 keeps the MLA generation path on the
-            # flashinfer trtllm-gen kernel (K3 has 96 query heads).
+            # Retain the established K3 integration page size. H=96 is
+            # declined by the FlashInfer TRTLLM-Gen wrapper independently of
+            # page size and can run through the legacy TRTLLM-Gen fallback.
             tokens_per_block=64,
         )
         llm_kwargs = dict(
