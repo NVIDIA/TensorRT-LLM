@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -9,6 +10,29 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+
+
+def make_noise_generator(seed: int, device: torch.device | str) -> torch.Generator:
+    """Create the RNG used to sample a pipeline's initial noise.
+
+    Defaults to an **on-device** generator (``device``), matching mainstream
+    diffusion serving (vLLM-omni and SGLang-Diffusion default the noise generator
+    to the compute device) and TRT-LLM's own LLM sampling path, so a fixed seed
+    reproduces the same latent as before on a given GPU.
+
+    Set ``TLLM_VISUALGEN_CPU_RNG=1`` to force a **CPU** generator instead: the
+    caller samples on CPU and copies to the device (``diffusers.randn_tensor`` does
+    this automatically), so a fixed seed yields an identical latent across GPU
+    archs -- an on-device ``torch.randn`` keys its Philox stream to an
+    SM-count-dependent thread grid, so e.g. sm_100 and sm_107 draw different noise
+    for the same seed. Useful for cross-hardware validation or bit-reproducible
+    serving, at the cost of one small host draw plus an H2D copy.
+
+    If a per-request device choice is ever needed, promote this to a
+    ``generator_device`` request/config field (as vLLM-omni / SGLang-Diffusion do).
+    """
+    gen_device = "cpu" if os.environ.get("TLLM_VISUALGEN_CPU_RNG") == "1" else device
+    return torch.Generator(device=gen_device).manual_seed(seed)
 
 
 @torch.compile

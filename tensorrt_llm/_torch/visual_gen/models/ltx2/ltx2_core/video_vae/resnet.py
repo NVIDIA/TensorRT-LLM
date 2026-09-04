@@ -5,6 +5,7 @@
 from typing import Optional, Tuple, Union
 
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 
 from ..normalization import PixelNorm
@@ -104,9 +105,9 @@ class ResnetBlock3D(nn.Module):
         spatial_shape = hidden_states.shape[-2:]
         device = hidden_states.device
         dtype = hidden_states.dtype
-        spatial_noise = torch.randn(spatial_shape, device=device, dtype=dtype, generator=generator)[
-            None
-        ]
+        spatial_noise = randn_tensor(
+            spatial_shape, generator=generator, device=device, dtype=dtype
+        )[None]
         scaled_noise = (spatial_noise * per_channel_scale)[None, :, None, ...]
         hidden_states = hidden_states + scaled_noise
         return hidden_states
