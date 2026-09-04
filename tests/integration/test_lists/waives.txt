@@ -1,5 +1,4 @@
 accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_nvfp4_nixl[cache_mgr_v1] SKIP (https://nvbugs/6619883)
-accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=1-ctx_pp=2] SKIP (https://nvbugs/6435097)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=1-ctx_pp=4] SKIP (https://nvbugs/6428069)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=2-ctx_pp=4] SKIP (https://nvbugs/6428069)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=4] SKIP (https://nvbugs/6428069)
@@ -56,7 +55,6 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency] SKI
 accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] SKIP (https://nvbugs/6665906)
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] SKIP (https://nvbugs/5838199)
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90] SKIP (https://nvbugs/5838199)
-cpp/test_unit_tests.py::test_unit_tests[batch_manager-80] SKIP (https://nvbugs/6674826)
 disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin] SKIP (https://nvbugs/6611817)
 disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6105768)
 disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6428069)
