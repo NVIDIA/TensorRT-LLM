@@ -2369,52 +2369,66 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         PrefillCudaGraphBackend.BREAKABLE,
     ])
     def test_piecewise_and_breakable_use_identical_padding(self, backend):
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            PyTorchModelEngine
+        from tensorrt_llm._torch.pyexecutor.engine.runners import \
+            get_padding_params
 
-        engine = object.__new__(PyTorchModelEngine)
-        engine.enable_attention_dp = False
-        engine.prefill_cuda_graph_backend = backend
-        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
-        assert engine._get_padding_params(129, 1, None) == (256, True, None)
+        assert get_padding_params(
+            129,
+            1,
+            None,
+            dist=None,
+            enable_attention_dp=False,
+            prefill_cuda_graph_backend=backend,
+            prefill_cuda_graph_num_tokens=[128, 256, 512],
+        ) == (256, True, None)
 
     def test_attention_dp_prefill_graph_uses_all_rank_decision(self):
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            PyTorchModelEngine
+        from tensorrt_llm._torch.pyexecutor.engine.runners import \
+            get_padding_params
 
-        class NoExchangeDist:
-            """Fails on any collective.
+        class ContextCountsDist:
 
-            The all-rank decision is derived from the already-gathered
-            per-rank counts, so no further exchange may be issued.
-            """
+            def __init__(self, counts):
+                self.counts = counts
 
-            def __getattr__(self, name):
-                raise AssertionError(f"unexpected collective {name}")
-
-        engine = object.__new__(PyTorchModelEngine)
-        engine.enable_attention_dp = True
-        engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
-        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
-        engine.dist = NoExchangeDist()
+            def tp_allgather_int64(self, values):
+                assert values == [0]
+                return torch.tensor(self.counts).unsqueeze(1)
 
         # A peer rank holds the only context request: every rank pads.
-        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
         all_rank_num_tokens = [1, 129, 1, 1]
-        assert engine._get_padding_params(1, 0,
-                                          all_rank_num_tokens) == (256, True,
-                                                                   [256] * 4)
+        assert get_padding_params(
+            1,
+            0,
+            all_rank_num_tokens,
+            dist=ContextCountsDist([0, 1, 0, 0]),
+            enable_attention_dp=True,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_cuda_graph_num_tokens=[128, 256, 512],
+        ) == (256, True, [256] * 4)
 
         # No rank has a context request: nobody runs the prefill graph.
-        engine._get_all_rank_ctx_requests = lambda _: [0, 0, 0, 0]
-        assert engine._get_padding_params(
-            1, 0, all_rank_num_tokens) == (1, False, all_rank_num_tokens)
+        assert get_padding_params(
+            1,
+            0,
+            all_rank_num_tokens,
+            dist=ContextCountsDist([0, 0, 0, 0]),
+            enable_attention_dp=True,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_cuda_graph_num_tokens=[128, 256, 512],
+        ) == (1, False, all_rank_num_tokens)
 
         # A peer exceeds the largest captured size: nobody runs it either.
-        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
         too_long = [1, 513, 1, 1]
-        assert engine._get_padding_params(1, 0,
-                                          too_long) == (1, False, too_long)
+        assert get_padding_params(
+            1,
+            0,
+            too_long,
+            dist=ContextCountsDist([0, 1, 0, 0]),
+            enable_attention_dp=True,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_cuda_graph_num_tokens=[128, 256, 512],
+        ) == (1, False, too_long)
 
     def test_torch_compile_config_does_not_populate_legacy_capture_buckets(
             self):

@@ -25,6 +25,8 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
+from tensorrt_llm._torch.pyexecutor.engine.runners import \
+    prepare_multimodal_indices
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
@@ -244,6 +246,7 @@ def _make_forward_only_engine(
     engine.moe_load_balancer = None
     engine._is_encoder_decoder_model = Mock(return_value=False)
     engine._get_draft_kv_cache_manager = Mock(return_value=None)
+    engine._runner = None
     engine.cuda_graph_lora_manager = None
     engine._force_lora_graph_for_capture = None
 
@@ -874,6 +877,45 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertEqual(result,
                          (graph_attn_metadata, graph_spec_metadata, key))
 
+    def test_no_cache_forward_delegates_to_resolved_runner(self) -> None:
+        engine, _, _, attn_metadata, _ = _make_forward_only_engine(None)
+        engine._runner = Mock(return_value=None)
+        expected_outputs = {"logits": object()}
+        engine._runner.forward.return_value = expected_outputs
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.return_value = None
+        batch = ScheduledRequests()
+
+        actual_outputs = engine.forward(batch, resource_manager)
+
+        self.assertIs(actual_outputs, expected_outputs)
+        engine._runner.forward.assert_called_once_with(
+            batch,
+            attn_metadata,
+            spec_metadata=None,
+            resource_manager=resource_manager,
+            enable_spec_decode=False,
+            cuda_graph_lora_manager=None,
+            runtime_draft_len=0,
+            moe_load_balancer=None,
+            gather_context_logits=False,
+        )
+        engine._prepare_inputs.assert_not_called()
+
+    def test_forward_rejects_kv_manager_with_no_cache_runner(self) -> None:
+        engine, _, resource_manager, _, _ = _make_forward_only_engine(None)
+        engine._runner = Mock()
+        batch = ScheduledRequests()
+
+        with self.assertRaisesRegex(
+                AssertionError,
+                "no-cache runner, but a KV cache manager was allocated",
+        ):
+            engine.forward(batch, resource_manager)
+
+        engine._set_up_attn_metadata.assert_not_called()
+        engine._runner.forward.assert_not_called()
+
     def test_forward_commits_candidate_only_on_graph_hit(self) -> None:
         key = KeyType(batch_size=2, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, _, outputs = \
@@ -1166,8 +1208,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             "speculative_draft_model",
             "beam",
             "encoder_decoder",
-            "encode_only",
-            "mm_encoder_only",
             "ple_recurrent_state",
             "nested_ple_recurrent_state",
             "context_parallel",
@@ -1189,10 +1229,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                     engine.max_beam_width = 2
                 elif case == "encoder_decoder":
                     engine._is_encoder_decoder_model.return_value = True
-                elif case == "encode_only":
-                    engine._is_encode_only = True
-                elif case == "mm_encoder_only":
-                    engine.llm_args.mm_encoder_only = True
                 elif case == "ple_recurrent_state":
                     engine.model.has_ple = True
                 elif case == "nested_ple_recurrent_state":
@@ -1545,21 +1581,19 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._validate_breakable_cuda_graph_compatibility()
 
     def test_prepare_multimodal_indices_uses_mixin_token_ids(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
-        engine.model = DummyMultimodalIndexModel()
+        model = DummyMultimodalIndexModel()
 
-        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
-            [1, 90, 2, 91, 3])
+        text_indices, multimodal_indices = prepare_multimodal_indices(
+            [1, 90, 2, 91, 3], model=model)
 
         torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
         torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
 
     def test_prepare_multimodal_indices_uses_legacy_token_ids(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
-        engine.model = DummyLegacyMultimodalIndexModel()
+        model = DummyLegacyMultimodalIndexModel()
 
-        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
-            [1, 90, 2, 91, 3])
+        text_indices, multimodal_indices = prepare_multimodal_indices(
+            [1, 90, 2, 91, 3], model=model)
 
         torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
         torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))

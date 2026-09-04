@@ -16,7 +16,7 @@ import sys
 import unittest
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
@@ -184,6 +184,23 @@ def _capture_tllm_logs():
 
 class TestWarmupCleanup(unittest.TestCase):
     """Lock in warmup-cleanup behavior introduced by PR #14609 (Plan B)."""
+
+    def test_no_cache_warmup_delegates_runner_lifecycle(self):
+        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine.moe_load_balancer = None
+        model_engine.is_warmup = False
+        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._runner = Mock()
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.return_value = None
+
+        with patch("tensorrt_llm._torch.pyexecutor.model_engine.warmup_sampling_module"):
+            model_engine.warmup(resource_manager)
+
+        self.assertEqual(
+            model_engine._runner.method_calls,
+            [call.warmup(resource_manager), call.capture_graphs(resource_manager)],
+        )
 
     def test_encoder_decoder_encoder_warmup_is_deferred_and_uses_two_passes(self):
         """Enc-dec encoder warmup is deferred and runs as two passes."""

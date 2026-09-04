@@ -542,8 +542,8 @@ def fuse_input_embeds(
         - Sync-free contract: passing both ``text_token_indices`` and
           ``mm_token_indices`` skips the GPU ``torch.where`` host sync. The
           executor (``model_engine._prepare_inputs`` /
-          ``_prepare_tp_inputs_no_cache``) precomputes them on a CPU
-          ``input_ids`` copy via ``_prepare_multimodal_indices`` (which uses
+          ``runners.no_cache.prepare_no_cache_inputs``) precomputes them on a CPU
+          ``input_ids`` copy via ``runners.prepare_multimodal_indices`` (which uses
           ``filter_mm_token_from_input_ids`` against ``self.model.mm_token_ids``
           when present, else the OOV fallback ``>= vocab_size``) and ships
           them as pinned async H2D tensors in the inputs dict. VLM forwards
