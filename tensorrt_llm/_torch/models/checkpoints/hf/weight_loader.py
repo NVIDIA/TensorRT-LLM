@@ -34,6 +34,10 @@ from mpi4py import MPI as _MPI
 from tensorrt_llm._torch.mmap_utils import populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
+    CheckpointCatalog
+from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_catalog import \
+    build_safetensors_checkpoint_catalog
 from tensorrt_llm._torch.models.checkpoints.hf.rank_striped_read_ahead import (
     RankStripedReadAheadSession, build_local_plan, close_node_communicator,
     coordinate_error, effective_available_host_memory, memory_admission)
@@ -568,6 +572,22 @@ class HfWeightLoader(BaseWeightLoader):
             if ("consolidated" in os.path.split(path)[1]) == use_consolidated
         ]
         return filtered_weight_files or weight_files
+
+    def build_checkpoint_catalog(
+            self,
+            checkpoint_dir: str,
+            use_consolidated: bool = False) -> CheckpointCatalog | None:
+        """Inspect the selected eager SafeTensors files without reading payloads."""
+        if self._requires_lazy_safetensors(checkpoint_dir):
+            return None
+        if (self._partial_model_loading
+                or int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0")) != 0):
+            return None
+        weight_files = self._selected_safetensors_files(checkpoint_dir,
+                                                        use_consolidated)
+        if not weight_files:
+            return None
+        return build_safetensors_checkpoint_catalog(weight_files)
 
     def _close_unactivated_session(
             self,
