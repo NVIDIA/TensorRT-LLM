@@ -21,12 +21,131 @@ on:
   # manage this PR's approval label/comment.
   pull_request_target:
     types: [labeled]
+  workflow_run:
+    workflows: [Full Pre-Merge Approval Signal]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pull_number:
+        description: 'Pull request number to re-check'
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
   pull-requests: write
 
 jobs:
+  auto-full-premerge-approval:
+    if: >-
+      github.repository == 'NVIDIA/TensorRT-LLM' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        startsWith(github.event.workflow_run.display_title,
+                   'Full pre-merge approval candidate for PR #')))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download full approval signal
+        if: github.event_name == 'workflow_run'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: full-premerge-approval-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          path: ${{ runner.temp }}/full-premerge-approval
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Re-check approval and add label
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          AGENT_TOKEN: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
+          DISPATCH_PULL_NUMBER: ${{ inputs.pull_number }}
+          SIGNAL_PATH: ${{ runner.temp }}/full-premerge-approval/pr-number.txt
+        with:
+          github-token: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
+          retries: 2
+          script: |
+            const { readFile } = require('node:fs/promises');
+
+            if (!process.env.AGENT_TOKEN) {
+              core.warning('TRTLLM_AGENT_SHARED_TOKEN is unavailable; skipping auto-labeling.');
+              return;
+            }
+
+            let rawPullNumber = process.env.DISPATCH_PULL_NUMBER;
+            if (context.eventName === 'workflow_run') {
+              try {
+                rawPullNumber = await readFile(process.env.SIGNAL_PATH, 'utf8');
+              } catch (error) {
+                core.warning(`Could not read the full approval signal: ${error.message}`);
+                return;
+              }
+            }
+            rawPullNumber = rawPullNumber?.trim();
+            if (!/^[1-9]\d*$/.test(rawPullNumber || '')) {
+              core.warning('The full approval signal does not contain a valid pull request number.');
+              return;
+            }
+
+            const pullNumber = Number(rawPullNumber);
+            if (!Number.isSafeInteger(pullNumber)) {
+              core.warning('The pull request number is outside the supported integer range.');
+              return;
+            }
+
+            const approvalLabel = 'ci: full pre-merge approved';
+            const query = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    labels(first: 100) {
+                      nodes {
+                        name
+                      }
+                    }
+                    reviewDecision
+                    state
+                  }
+                }
+              }
+            `;
+            try {
+              const result = await github.graphql(query, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: pullNumber,
+              });
+              const pullRequest = result.repository?.pullRequest;
+              if (!pullRequest || pullRequest.state !== 'OPEN') {
+                console.log(`PR #${pullNumber} is not open; skipping auto-labeling.`);
+                return;
+              }
+              if (pullRequest.reviewDecision !== 'APPROVED') {
+                console.log(`PR #${pullNumber} is not fully approved; skipping auto-labeling.`);
+                return;
+              }
+              if (pullRequest.labels.nodes.some(
+                (label) => label.name.toLowerCase() === approvalLabel.toLowerCase()
+              )) {
+                console.log(`PR #${pullNumber} already has the approval label.`);
+                return;
+              }
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pullNumber,
+                labels: [approvalLabel],
+              });
+              console.log(`Added ${approvalLabel} to fully approved PR #${pullNumber}.`);
+            } catch (error) {
+              core.warning(`Could not auto-label PR #${pullNumber}: ${error.message}`);
+            }
+
   guard-full-premerge-approval:
     concurrency:
       group: premerge-label-guard-${{ github.event.pull_request.number }}
