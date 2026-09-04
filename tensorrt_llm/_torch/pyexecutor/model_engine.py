@@ -2049,8 +2049,11 @@ class PyTorchModelEngine(ModelEngine):
         native_mxfp8_methods = [
             method for method in mxfp8_methods if method.needs_native_autotune
         ]
+        # torch.compile owns the decode graphs it captures, and the automatic
+        # FlashInfer path cannot run inside a compiled region. Arming it there
+        # would latch _flashinfer_autotuned after a pass that tuned nothing.
         use_mxfp8_flashinfer_graph_default = (
-            self.cuda_graph_runner.enabled
+            self.cuda_graph_runner.enabled and not self._torch_compile_enabled
             and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ and any(
                 getattr(module, "_use_flashinfer_mxfp8_decode_graph_default",
                         False) for module in self.model.modules()))

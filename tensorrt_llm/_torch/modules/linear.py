@@ -3369,8 +3369,13 @@ class MXFP8LinearMethod(LinearMethodBase):
             # the CUTLASS block-scaled e4m3xe4m3 GEMM.
             act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
                 input.contiguous(), True)
+            # FlashInfer's mm_mxfp8 JIT loader stats the filesystem, so it is
+            # untraceable inside a torch.compile region; the automatic path
+            # must resolve to the native op there. Testing is_compiling()
+            # first also short-circuits the ContextVar reads, which Dynamo
+            # cannot trace either.
             use_flashinfer = self.backend == "flashinfer" or (
-                self.backend == "auto" and
+                self.backend == "auto" and not torch.compiler.is_compiling() and
                 (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
                  (self._flashinfer_autotuned
                   and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
