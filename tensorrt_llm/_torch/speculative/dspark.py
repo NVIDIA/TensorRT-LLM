@@ -459,33 +459,20 @@ class DSv4DSparkWorker(SpecWorkerBase):
         worker creates only the policy state and calibration, then receives
         that exact runtime object before its first decision.
         """
-        from .dspark_planner import SpsCostTable
         from .dspark_schedule import DSparkScheduleConfig
         from .dspark_verify import DSparkVerifyPlanner
 
         cfg = DSparkScheduleConfig(block_size=block_size, min_verify_len=1)
 
-        cost_table = None
         table_path = self.spec_config.confidence_sps_table_path
-        if table_path:
-            # ModelEngine owns the actual CUDA graph ladder, so it is the only
-            # component that may read, validate, and construct the deployment
-            # cost object. Reopening this path here creates a TOCTOU window in
-            # which graph capture and scheduling can observe different files.
-            # PyExecutor installs the already validated object before the first
-            # decision, for both legacy and exact schemas.
-            logger.info(
-                f"DSpark: deferring SPS table {table_path} to the validated "
-                "ModelEngine runtime object"
-            )
-        else:
-            cost_table = SpsCostTable.flat()
-            logger.warning(
-                "DSpark confidence scheduling is enabled but no "
-                "confidence_sps_table_path was provided. Without a profiled step-cost "
-                "curve the planner cannot tell a cheap verify token from an expensive "
-                "one, so it will keep verifying the full block (no scheduling gain)."
-            )
+        # ModelEngine owns the actual CUDA graph ladder, so it is the only
+        # component that may read, authenticate, and construct the deployment
+        # cost object. Reopening this path here creates a TOCTOU window in
+        # which graph capture and scheduling can observe different files.
+        logger.info(
+            f"DSpark: deferring exact SPS table {table_path} to the validated "
+            "ModelEngine runtime object"
+        )
 
         # Calibration lives on the draft's confidence head; fall back to a plain
         # sigmoid when the head is absent (no confidence to calibrate anyway).
@@ -512,17 +499,13 @@ class DSv4DSparkWorker(SpecWorkerBase):
             head.load_sts_temperatures(torch.tensor(temps, dtype=torch.float32))
             logger.info(f"DSpark: loaded STS calibration from {sts_path}")
 
-        tiers = self.spec_config.verify_len_tiers
         self.verify_planner = DSparkVerifyPlanner(
             cfg=cfg,
-            cost_table=cost_table,
-            tiers=tiers,
             apply_calibration=apply_calibration,
             device_windows=bool(self.spec_config.enable_fused_confidence_scheduler),
         )
         logger.info(
-            f"DSpark verify planner: tiers={self.verify_planner.tiers}, "
-            f"profiled_cost_table={cost_table is None or not cost_table.is_flat}, "
+            f"DSpark verify planner: max_verify_len={self.verify_planner.max_verify_len}, "
             f"device_windows={self.verify_planner.device_windows}"
         )
 
