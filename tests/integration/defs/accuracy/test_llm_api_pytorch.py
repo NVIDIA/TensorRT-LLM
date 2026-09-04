@@ -23,6 +23,7 @@ import torch
 from datasets import load_dataset
 from defs.conftest import get_sm_version, is_sm_100f
 from mpi4py.futures import MPIPoolExecutor
+from pytest_mock import MockerFixture
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
@@ -6710,7 +6711,8 @@ class TestLagunaXS_2_1(LlmapiAccuracyTestHarness):
             speculative_model=dflash_model_path,
         )
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        use_kv_cache_manager_v2=True)
 
         with LLM(model_path,
                  max_seq_len=4096,
@@ -6979,6 +6981,44 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=32)
         with LLM(model_dir,
+                 trust_remote_code=True,
+                 tensor_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 max_seq_len=4096,
+                 max_batch_size=32,
+                 cuda_graph_config=cuda_graph_config,
+                 enable_chunked_prefill=True,
+                 kv_cache_config=kv_cache_config,
+                 moe_config=moe_config) as llm:
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @parametrize_with_ids("enable_branch_snapshot", [True])
+    def test_bf16_branch_snapshot(self, enable_branch_snapshot: bool,
+                                  mocker: MockerFixture) -> None:
+        """Branch-point snapshots must not change what the model generates.
+
+        Few-shot GSM8K does fork: every prompt shares the few-shot prefix and
+        diverges at the question, so a request snapshots at that fork and later
+        ones restore from it.
+        """
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.75,
+            enable_block_reuse=True,
+            avg_seq_len=2048,
+            mamba_state_config=MambaStateConfig(
+                additional_snapshot_offsets_from_end=[0],
+                enable_branch_snapshot=enable_branch_snapshot),
+        )
+        # Mirrors test_bf16: TRTLLM MoE is SM100/103 only, so use CUTLASS, which
+        # is supported everywhere this test can run.
+        moe_config = MoeConfig(backend="CUTLASS")
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=32)
+        with LLM(self.MODEL_PATH,
                  trust_remote_code=True,
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
@@ -8463,10 +8503,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      periodic_snapshot_interval, attention_dp,
-                                     use_mtp, monkeypatch):
-        # WAR https://nvbugs/6525008: FlashInfer <=0.6.16 races on shared JIT
-        # workspaces across ranks; remove once fixed upstream.
-        monkeypatch.setenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1")
+                                     use_mtp):
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
             mtp_eagle_one_model=True,
@@ -8793,174 +8830,3 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(model_name)
             task.evaluate(llm)
-
-
-@skip_pre_blackwell
-class TestGLM5FP8(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "zai-org/GLM-5-FP8"
-    MODEL_PATH = f"{llm_models_root()}/GLM-5-FP8"
-
-    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_8gpus(self, tp_size, ep_size):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
-
-        pytorch_config = dict(
-            disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
-                                              enable_padding=True),
-            moe_config=MoeConfig(backend="DEEPGEMM"),
-            speculative_config=MTPDecodingConfig(),
-            enable_chunked_prefill=True,
-        )
-
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=1,
-                 moe_expert_parallel_size=ep_size,
-                 kv_cache_config=kv_cache_config,
-                 max_seq_len=8192,
-                 **pytorch_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-class TestGLM52(LlmapiAccuracyTestHarness):
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
-    def test_nvfp4(self, tp_size, ep_size):
-        # GLM-5.2 reuses the DeepSeek-V3.2 path (MLA + DSA) with cross-layer
-        # indexer sharing. NVFP4 weights run on the CuteDSL MoE backend with
-        # MTP speculative decoding. The checkpoint keeps the leading dense
-        # layers and per-MoE-layer shared_experts / self_attn in higher
-        # precision.
-        model_name = "zai-org/GLM-5.2"
-        model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
-
-        pytorch_config = dict(
-            disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
-                                              enable_padding=True),
-            moe_config=MoeConfig(backend="CUTEDSL"),
-            speculative_config=MTPDecodingConfig(max_draft_len=1),
-            enable_chunked_prefill=True,
-        )
-
-        with LLM(model_path,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=1,
-                 moe_expert_parallel_size=ep_size,
-                 kv_cache_config=kv_cache_config,
-                 max_seq_len=8192,
-                 **pytorch_config) as llm:
-            assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = GSM8K(model_name)
-            task.evaluate(llm)
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
-    def test_nvfp4_mtp_index_share(self, tp_size, ep_size):
-        # Like test_nvfp4 but max_draft_len=3, exercising DSA indexer Top-K reuse
-        # across MTP draft steps (index_share_for_mtp_iteration=true from the checkpoint).
-        model_name = "zai-org/GLM-5.2"
-        model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
-
-        pytorch_config = dict(
-            disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
-                                              enable_padding=True),
-            moe_config=MoeConfig(backend="CUTEDSL"),
-            speculative_config=MTPDecodingConfig(max_draft_len=3),
-            enable_chunked_prefill=True,
-        )
-
-        with LLM(model_path,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=1,
-                 moe_expert_parallel_size=ep_size,
-                 kv_cache_config=kv_cache_config,
-                 max_seq_len=8192,
-                 **pytorch_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = GSM8K(model_name)
-            task.evaluate(llm)
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
-    def test_nvfp4_mtp_index_share_mtp_ar(self, tp_size, ep_size):
-        # Acceptance-rate guard for max_draft_len=3 + index-share; counts accepted
-        # drafts from streaming (get_stats needs enable_iter_perf_stats).
-        model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
-        max_draft_len = 3
-
-        pytorch_config = dict(
-            disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
-                                              enable_padding=True),
-            moe_config=MoeConfig(backend="CUTEDSL"),
-            speculative_config=MTPDecodingConfig(max_draft_len=max_draft_len),
-            enable_chunked_prefill=True,
-        )
-
-        with LLM(model_path,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=1,
-                 moe_expert_parallel_size=ep_size,
-                 kv_cache_config=kv_cache_config,
-                 max_seq_len=8192,
-                 **pytorch_config) as llm:
-            raw_prompts = [
-                "The capital of France is",
-                "The president of the United States is",
-                "The future of AI is",
-            ]
-            prompts = [
-                llm.tokenizer.apply_chat_template(
-                    [{
-                        "role": "user",
-                        "content": p
-                    }],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                ) for p in raw_prompts
-            ]
-            tok_ids = [llm.tokenizer.encode(p) for p in prompts]
-            sampling_params = SamplingParams(max_tokens=128, temperature=0)
-
-            total_drafted = 0
-            total_accepted = 0
-            for i, prompt_ids in enumerate(tok_ids):
-                num_tokens = 0
-                num_drafted = 0
-                num_accepted = 0
-                for output in llm.generate_async(prompt_ids,
-                                                 sampling_params,
-                                                 streaming=True):
-                    new_tokens = output.outputs[0].token_ids
-                    num_drafted += max_draft_len
-                    num_accepted += len(new_tokens) - num_tokens - 1
-                    num_tokens = len(new_tokens)
-
-                accept_rate = num_accepted / num_drafted
-                total_drafted += num_drafted
-                total_accepted += num_accepted
-                print(
-                    f"GLM-5.2 MTP index-share prompt {i} acceptance rate: "
-                    f"{accept_rate:.2%} ({num_accepted}/{num_drafted} tokens)")
-
-            aggregate_accept_rate = (total_accepted / total_drafted
-                                     if total_drafted > 0 else 0.0)
-            print("GLM-5.2 MTP index-share aggregate acceptance rate: "
-                  f"{aggregate_accept_rate:.2%} ({total_accepted}/"
-                  f"{total_drafted} tokens across {len(tok_ids)} prompts)")
-            assert aggregate_accept_rate > 0.2, (
-                f"Aggregate acceptance rate {aggregate_accept_rate:.2%} "
-                f"below threshold 20%")

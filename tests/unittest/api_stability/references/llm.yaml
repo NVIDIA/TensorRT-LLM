@@ -127,6 +127,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      checkpoint_io_policy:
+        annotation: Literal['auto', 'native', 'rank_striped_read_ahead']
+        default: auto
+        status: prototype
       mx_config:
         annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
         default: null
@@ -171,6 +175,14 @@ methods:
         annotation: str
         default: TRTLLM
         status: beta
+      enable_mla_skip_correction:
+        annotation: bool
+        default: False
+        status: prototype
+      mla_skip_correction_threshold:
+        annotation: float
+        default: 8.0
+        status: prototype
       sampler_force_async_worker:
         annotation: bool
         default: False

@@ -179,6 +179,16 @@ def CBTS_COVERAGE_PILOT_USERS = [
 ] as Set
 @Field
 def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
+// `/bot run` key that opts a single run into BOLT consume.
+@Field
+def BOLT_CONSUME = "bolt_consume"
+// Version-controlled rollout switch for BOLT premerge consume. Kept in the
+// infra-owned Groovy boundary like ENABLE_CBTS_COVERAGE above, so turning consume
+// on for every eligible build is a reviewed code change; a `/bot run` with
+// `"bolt_consume": true` opts in a single run without one. Either way
+// resolveBoltConsume() still applies the post-merge and branch restrictions.
+@Field
+def ENABLE_BOLT_PREMERGE_CONSUME = false
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -221,6 +231,8 @@ def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 def RUN_MODE = "run_mode"
 @Field
 def BUILD_BRANCH = "build_branch"
+@Field
+def BOLT_CONSUME_BUILD = "bolt_consume_build"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
@@ -231,6 +243,11 @@ def globalVars = [
     (RUN_MODE): runMode,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
+// Compare against "true" rather than relying on Groovy truthiness: the bot phrase
+// is free-form JSON, and a quoted "false" would otherwise read as opt-in.
+globalVars[BOLT_CONSUME_BUILD] = resolveBoltConsume(
+    ENABLE_BOLT_PREMERGE_CONSUME || gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
+    globalVars[TARGET_BRANCH])
 if (runMode == "nightly_release") {
     globalVars[TRTLLM_VERSION_OVERRIDE] = params.version
 }
@@ -1754,6 +1771,42 @@ def resolveBuildBranch(globalVars)
     return env.gitlabBranch ? env.gitlabBranch : "main"
 }
 
+// Decide whether the build helper jobs should re-BOLT their packed tarball with
+// the target branch's promoted profile bundle (Build.groovy's `boltConsume`).
+// Two restrictions narrow this well below the raw opt-in:
+//
+//  1. Pre-merge only. Post-merge builds the SBSA tarball that the
+//     BOLT-Profile-Gen stage below profiles later in the same run, so BOLTing it
+//     would feed already-BOLTed binaries back into profile generation and yield
+//     circular, meaningless profiles. Post-merge consumers are served instead by
+//     the container overlay (boltOverlayEnabled on the image build) and by
+//     BoltProfileGen applying its own freshly generated bundle in-run.
+//  2. `main` only. scripts/bolt/internal/apply_latest.sh resolves exactly one
+//     branch with no fallback and exits non-zero when that branch has nothing
+//     promoted, so pointing consume at a branch that has never promoted a bundle
+//     hard-fails the build on its first run. `main` is the only branch the
+//     post-merge producer keeps fresh, so stay there until apply_latest.sh grows
+//     a documented fallback.
+//
+// Skips are announced rather than silent: a run that asked for BOLTed binaries
+// and did not get them should say so in the log.
+def resolveBoltConsume(boolean requested, String targetBranch)
+{
+    if (!requested) {
+        return false
+    }
+    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        echo "BOLT consume requested but disabled: the post-merge build is the un-BOLTed input BoltProfileGen profiles."
+        return false
+    }
+    if (targetBranch != "main") {
+        echo "BOLT consume requested but disabled: no promoted bundle is guaranteed for target branch '${targetBranch}' (main only for now)."
+        return false
+    }
+    echo "BOLT consume enabled: build helpers will re-BOLT their tarball with main's promoted profile bundle."
+    return true
+}
+
 def getCommonParameters()
 {
     return [
@@ -1932,6 +1985,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                        // Re-BOLT the packed tarball with the target branch's promoted
+                        // profile bundle so the tests below exercise bolted binaries.
+                        // Off unless resolveBoltConsume() allowed it (pre-merge, main).
+                        'boltConsume': globalVars[BOLT_CONSUME_BUILD],
                     ]
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
@@ -2036,17 +2093,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 // Single-GPU was infra-incomplete (UNSTABLE): its coverage is a
-                // prerequisite for multi-GPU. In pre-merge, skip multi-GPU rather than
-                // spend scarce multi-GPU resource on a partially-unverified premise --
-                // the single-GPU sub-job should be re-run first. Keep the build UNSTABLE
-                // (already set by launchJob); do NOT escalate to FAILURE. Post-merge keeps
-                // running multi-GPU for max signal, mirroring the single-GPU-failed policy.
+                // prerequisite for multi-GPU. In pre-merge, explicitly block multi-GPU
+                // rather than mark it skipped: it is required but cannot run until the
+                // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
+                // maximum signal, mirroring the single-GPU-failed policy.
                 if (singleGpuInfraIncomplete) {
                     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
                         echo "In the official post-merge pipeline, x86_64 single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
                     } else {
-                        stage("[Test-x86_64-Multi-GPU] Skipped - single-GPU infra-incomplete") {
-                            echo "x86_64 single-GPU was infra-incomplete (UNSTABLE); skipping multi-GPU (premise not fully validated). Build stays UNSTABLE."
+                        stage("[Test-x86_64-Multi-GPU] Blocked") {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                error "This pipeline requires running x86_64 multi-GPU test, but x86_64 single-GPU test is infra-incomplete (UNSTABLE)."
+                            }
                         }
                         return
                     }
@@ -2112,6 +2170,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 stage(testStageName) {
                     def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        // Off unless resolveBoltConsume() allowed it. Post-merge is
+                        // excluded there precisely because this tarball is what the
+                        // BOLT-Profile-Gen stage below profiles.
+                        'boltConsume': globalVars[BOLT_CONSUME_BUILD],
                     ]
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
@@ -2238,17 +2300,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 // Single-GPU was infra-incomplete (UNSTABLE): its coverage is a
-                // prerequisite for multi-GPU. In pre-merge, skip multi-GPU rather than
-                // spend scarce multi-GPU resource on a partially-unverified premise --
-                // the single-GPU sub-job should be re-run first. Keep the build UNSTABLE
-                // (already set by launchJob); do NOT escalate to FAILURE. Post-merge keeps
-                // running multi-GPU for max signal, mirroring the single-GPU-failed policy.
+                // prerequisite for multi-GPU. In pre-merge, explicitly block multi-GPU
+                // rather than mark it skipped: it is required but cannot run until the
+                // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
+                // maximum signal, mirroring the single-GPU-failed policy.
                 if (singleGpuInfraIncomplete) {
                     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
                         echo "In the official post-merge pipeline, SBSA single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
                     } else {
-                        stage("[Test-SBSA-Multi-GPU] Skipped - single-GPU infra-incomplete") {
-                            echo "SBSA single-GPU was infra-incomplete (UNSTABLE); skipping multi-GPU (premise not fully validated). Build stays UNSTABLE."
+                        stage("[Test-SBSA-Multi-GPU] Blocked") {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test is infra-incomplete (UNSTABLE)."
+                            }
                         }
                         return
                     }

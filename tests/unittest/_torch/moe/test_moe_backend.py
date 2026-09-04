@@ -48,7 +48,17 @@ from tensorrt_llm._torch.moe.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
 )
+from tensorrt_llm._torch.moe.fused_moe.activation import (
+    DEFAULT_MOE_ACTIVATION,
+    SimpleActivation,
+    SiTuActivation,
+    SwigluActivation,
+    SwigluBiasActivation,
+    materialize_activation_params,
+)
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
@@ -57,8 +67,11 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEEnvironment,
     MoEProblem,
+    MoERejection,
     MoERejectReason,
+    MoEResolutionReport,
     MoERunContext,
+    MoEStaticCapability,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     collect_moe_environment,
@@ -77,12 +90,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
 )
-from tensorrt_llm._torch.utils import (
-    ActivationType,
-    ActType_TrtllmGen,
-    MxFp8QuantizedTensor,
-    is_gated_activation,
-)
+from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -199,7 +207,7 @@ def test_kimi_fused_route_quant_skips_prequantized_input(monkeypatch) -> None:
     )
 
     assert (
-        backend.try_fused_kimi_route_quant(hidden_states, torch.empty(1, 896, dtype=torch.float32))
+        backend.try_fused_route_quant(hidden_states, torch.empty(1, 896, dtype=torch.float32))
         is None
     )
 
@@ -222,6 +230,34 @@ def test_kimi_mxfp8_quantized_tensor_handoff() -> None:
     assert quantized is fp8_tensor
     assert scales.data_ptr() == scaling_factor.data_ptr()
     assert torch.equal(scales, scaling_factor)
+
+
+def build_test_activation(
+    activation_type: ActivationType,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
+) -> "SimpleActivation | SwigluActivation | SwigluBiasActivation | SiTuActivation":
+    """Package the flat parameters these tests parametrize over as one activation.
+
+    The tests still sweep alpha / beta / limit independently because that is
+    what ``quantize_util.get_swiglu_tensors`` produces for the reference
+    implementation. Presence of alpha or beta means the gpt-oss package, which
+    is the same rule the C++ op applied when it upgraded a bare ``Swiglu`` with
+    constants to ``SwigluBias``.
+    """
+    kind = ActivationType(activation_type)
+    if kind is ActivationType.SiTu:
+        return SiTuActivation(gate_softcap=swiglu_alpha, linear_softcap=swiglu_beta)
+    if swiglu_alpha is not None or swiglu_beta is not None:
+        return SwigluBiasActivation(
+            gate_sigmoid_scale=swiglu_alpha,
+            linear_offset=swiglu_beta,
+            clamp=swiglu_limit,
+        )
+    if kind in (ActivationType.Swiglu, ActivationType.SwigluBias):
+        return SwigluActivation(clamp=swiglu_limit)
+    return SimpleActivation(kind=kind)
 
 
 def create_test_backend(
@@ -284,11 +320,8 @@ def create_test_backend(
         model_config=model_config,
         init_load_balancer=False,
         bias=bias,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        swiglu_limit=swiglu_limit,
         weight_loading_mode=weight_loading_mode,
-        activation_type=activation_type,
+        activation=build_test_activation(activation_type, swiglu_alpha, swiglu_beta, swiglu_limit),
     )
     if n_shared_experts > 0:
         backend.create_weights()
@@ -488,10 +521,11 @@ def test_marlin_override_quant_config_degrades_per_layer():
 # ============================================================================
 # TRTLLM-Gen SiTu backend contract
 # ============================================================================
-# SiTu rides the generic SwiGLU geometry and is carried out of band
-# (trtllm_gen_activation_type, not ActivationType), so the host-side wiring is
-# easy to get wrong in ways no shape check catches. Kernel-level coverage --
-# tactic availability, launch evidence and SiTu-vs-SwiGLU numerics -- lives in
+# SiTu rides the generic SwiGLU geometry, so the host-side wiring is easy to
+# get wrong in ways no shape check catches: it reaches the cubin through the
+# same ``gemm1_alpha`` / ``gemm1_beta`` slots SwiGLU's constants use, and only
+# the activation kind separates them. Kernel-level coverage -- tactic
+# availability, launch evidence and SiTu-vs-SwiGLU numerics -- lives in
 # test_kimi_k3_situ_moe.py (and thop/serial/test_moe.py for the runner). These
 # are the contracts that hold without running a cubin.
 
@@ -527,15 +561,6 @@ def _make_trtllm_gen_moe(
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         moe_backend="TRTLLM",
     )
-    situ_kwargs = (
-        dict(
-            trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-            trtllm_gen_activation_alpha=_SITU_GATE_ALPHA,
-            trtllm_gen_activation_beta=_SITU_LINEAR_BETA,
-        )
-        if situ
-        else {}
-    )
     return TRTLLMGenFusedMoE(
         routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
         num_experts=num_experts,
@@ -546,10 +571,16 @@ def _make_trtllm_gen_moe(
         model_config=model_config,
         init_load_balancer=False,
         weight_loading_mode=MoEWeightLoadingMode.VANILLA,
-        # SiTu rides the generic SwiGLU geometry; the fused activation is
-        # selected by trtllm_gen_activation_type, not by activation_type.
-        activation_type=ActivationType.Swiglu,
-        **situ_kwargs,
+        # The soft-caps go out as scalars; the backend's declared
+        # PER_EXPERT_TENSOR shape is what broadcasts them per slot.
+        activation=(
+            SiTuActivation(
+                gate_softcap=_SITU_GATE_ALPHA,
+                linear_softcap=_SITU_LINEAR_BETA,
+            )
+            if situ
+            else DEFAULT_MOE_ACTIVATION
+        ),
     )
 
 
@@ -589,9 +620,9 @@ def _make_loaded_nvfp4_trtllm_gen_moe(situ: bool) -> TRTLLMGenFusedMoE:
 def test_trtllm_gen_nvfp4_situ_selects_padded_quant_method() -> None:
     """``_get_quant_method`` must key off ``is_situ_activation``.
 
-    SiTu fills the swiglu_alpha/swiglu_beta slots from ``create_weights``,
-    i.e. after ``_get_quant_method`` has already run, so keying off
-    ``swiglu_alpha is not None`` would make the selected method depend on
+    SiTu fills the act_alpha/act_beta slots from ``create_weights``, i.e.
+    after ``_get_quant_method`` has already run, so keying off
+    ``act_alpha is not None`` would make the selected method depend on
     *when* it is resolved. Plain SwiGLU is the control: it still gets the
     unpadded base method, so this is not asserting a constant.
     """
@@ -846,44 +877,34 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
     quant_method.cache_derived_state.assert_called_once_with(moe)
 
 
-def test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config():
-    model_config = ModelConfig(
-        pretrained_config=SimpleNamespace(
-            text_config=SimpleNamespace(
-                activation_situ_beta=4.0,
-                activation_situ_linear_beta=25.0,
-            )
-        )
+def test_megamoe_bakes_situ_softcaps_as_uniform_scalars():
+    # MegaMoE declares UNIFORM_SCALAR for alpha/beta because the kernels bake
+    # them at codegen time, so a per-expert tensor is reduced here.
+    params = materialize_activation_params(
+        SiTuActivation(gate_softcap=torch.full((8,), 4.0), linear_softcap=25.0),
+        MegaMoEDeepGemm.activation_support,
+        num_local_experts=8,
+        owner="MegaMoEDeepGemm",
     )
 
-    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
-        model_config,
-        activation=None,
-        situ_beta=None,
-        situ_linear_beta=None,
+    assert params.activation_type is ActivationType.SiTu
+    assert params.alpha == 4.0
+    assert params.beta == 25.0
+
+
+def test_megamoe_plain_swiglu_carries_no_constants():
+    params = materialize_activation_params(
+        SwigluActivation(),
+        MegaMoEDeepGemm.activation_support,
+        num_local_experts=8,
+        owner="MegaMoEDeepGemm",
     )
 
-    assert activation == "situ"
-    assert situ_beta == 4.0
-    assert situ_linear_beta == 25.0
+    assert (params.alpha, params.beta) == (None, None)
+    assert params.clamp is None
 
 
-def test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config():
-    model_config = ModelConfig(pretrained_config=SimpleNamespace())
-
-    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
-        model_config,
-        activation=None,
-        situ_beta=None,
-        situ_linear_beta=None,
-    )
-
-    assert activation == "swiglu"
-    assert situ_beta is None
-    assert situ_linear_beta is None
-
-
-def test_create_moe_forwards_megamoe_activation_options(monkeypatch):
+def test_create_moe_forwards_situ_activation_as_one_carrier(monkeypatch):
     create_moe_module = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.create_moe")
     configurable_moe = MagicMock(return_value=object())
     monkeypatch.setattr(create_moe_module, "ConfigurableMoE", configurable_moe)
@@ -892,6 +913,7 @@ def test_create_moe_forwards_megamoe_activation_options(monkeypatch):
         "resolve_moe_cls",
         MagicMock(return_value=MegaMoEDeepGemm),
     )
+    activation = SiTuActivation(gate_softcap=4.0, linear_softcap=25.0)
 
     result = create_moe_module.create_moe(
         routing_method=MagicMock(),
@@ -900,15 +922,41 @@ def test_create_moe_forwards_megamoe_activation_options(monkeypatch):
         intermediate_size=512,
         dtype=torch.bfloat16,
         model_config=ModelConfig(),
-        activation="situ",
-        situ_beta=4.0,
-        situ_linear_beta=25.0,
+        activation=activation,
     )
 
     assert result is configurable_moe.return_value
-    assert configurable_moe.call_args.kwargs["activation"] == "situ"
-    assert configurable_moe.call_args.kwargs["situ_beta"] == 4.0
-    assert configurable_moe.call_args.kwargs["situ_linear_beta"] == 25.0
+    assert configurable_moe.call_args.kwargs["activation"] is activation
+
+
+def test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration():
+    """The gate runs ahead of every ``moe_cls`` branch, so a class the factory
+    has never heard of still reaches it -- which is the point of reading a
+    declaration instead of matching a class."""
+
+    class _Undeclared:
+        capabilities = MoEStaticCapability()
+
+    with pytest.raises(ValueError, match="apply_router_weight_on_input"):
+        create_moe_backend(
+            moe_cls=_Undeclared,
+            routing_method=MagicMock(),
+            num_experts=8,
+            hidden_size=512,
+            intermediate_size=512,
+            apply_router_weight_on_input=True,
+        )
+
+
+def test_apply_router_weight_on_input_support_is_not_inherited():
+    """``CuteDslB12xFusedMoE`` is the one impl that keeps its ``CutlassFusedMoE``
+    parent, and this is a field where the two disagree: only the NVFP4 prefill
+    chunk reaches the parent's ``run_moe``, while the decode path hands
+    ``token_final_scales`` to the flashinfer wrapper."""
+    assert CutlassFusedMoE.capabilities.supports_apply_router_weight_on_input
+    assert MarlinFusedMoE.capabilities.supports_apply_router_weight_on_input
+    assert not CuteDslB12xFusedMoE.capabilities.supports_apply_router_weight_on_input
+    assert not TRTLLMGenFusedMoE.capabilities.supports_apply_router_weight_on_input
 
 
 def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
@@ -999,7 +1047,7 @@ def test_megamoe_cutedsl_tactic_autotune_defaults_off(
 
 
 def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
-    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
@@ -2187,3 +2235,84 @@ def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
             )
 
             ref_fused_moe.check_accuracy(output, ref_output)
+
+
+def _nvfp4_problem(intermediate_size: Optional[int], activation: str) -> MoEProblem:
+    return MoEProblem(
+        quant=QuantAlgo.NVFP4.value,
+        dtype_act=torch.bfloat16,
+        hidden_size=7168,
+        intermediate_size=intermediate_size,
+        num_experts=256,
+        top_k=8,
+        activation=activation,
+    )
+
+
+def _deployment_at_moe_tp(moe_tp_size: int) -> MoEDeployment:
+    return MoEDeployment(
+        ep_size=1,
+        tp_size=moe_tp_size,
+        parallel_size=moe_tp_size,
+        use_dp=False,
+        num_slots=256,
+        env=MoEEnvironment(sm=100),
+    )
+
+
+@pytest.mark.parametrize(
+    "backend_cls", [CutlassFusedMoE, CuteDslFusedMoE], ids=["cutlass", "cutedsl"]
+)
+@pytest.mark.parametrize(
+    "intermediate_size,activation,moe_tp_size,rejected",
+    [
+        # DeepSeek-R1-0528 NVFP4. moe_tp_size=64 is what tp_size=8 + cp_size=8
+        # HELIX resolves to, and it shards FC1 to 64 rows: CuteDSL dies in
+        # unswizzle_sf, Cutlass returns an all-zero output. NVBUG 5859751.
+        (2048, "Swiglu", 32, False),
+        (2048, "Swiglu", 64, True),
+        # Unknown is not false: an absent shape must abstain, not reject.
+        (None, "Swiglu", 64, False),
+        # Nemotron-3 Nano NVFP4: 128-unaligned, but non-gated FC1 has no
+        # gate/up split so the padding is a zero tail and it loads fine.
+        (1856, "Relu2", 1, False),
+    ],
+    ids=["gated_aligned", "gated_unaligned", "unknown_shape", "non_gated"],
+)
+def test_nvfp4_fc1_row_alignment_gate(
+    backend_cls, intermediate_size, activation, moe_tp_size, rejected
+):
+    """A gated NVFP4 FC1 buffer rounded up to the 128-row block-scale tile
+    splits gate/up on padding, so those layers must be turned down here.
+    """
+    verdict = backend_cls.can_implement(
+        _nvfp4_problem(intermediate_size, activation), _deployment_at_moe_tp(moe_tp_size)
+    )
+    if rejected:
+        assert not verdict.eligible
+        assert verdict.reject_reason is MoERejectReason.SHAPE_UNALIGNED
+        assert "moe_expert_parallel_size" in verdict.detail
+    else:
+        # Other gates may still turn the layer down; this one must not.
+        assert verdict.reject_reason is not MoERejectReason.SHAPE_UNALIGNED
+
+
+def test_unresolvable_layer_error_carries_rejection_details():
+    """describe() prints reason codes only, so impl_class_for has to add the
+    details -- without them a shape rejection reaches the operator as a bare
+    ``shape_unaligned`` with no shapes and no way forward.
+    """
+    report = MoEResolutionReport(
+        problem=_nvfp4_problem(2048, "Swiglu"),
+        deployment=_deployment_at_moe_tp(64),
+        winner=None,
+        selected_by="failed",
+        rejected=(
+            MoERejection(
+                "CUTLASS", MoERejectReason.SHAPE_UNALIGNED, "raise moe_expert_parallel_size"
+            ),
+        ),
+        requested="CUTLASS",
+    )
+    with pytest.raises(ValueError, match="raise moe_expert_parallel_size"):
+        impl_class_for(report)

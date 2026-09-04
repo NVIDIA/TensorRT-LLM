@@ -95,7 +95,8 @@ l0_b200:
   - test_e2e.py::test_ptp_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
   - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
   - test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
-  - unittest/_torch/attention
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+  - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/compilation
   - unittest/_torch/debugger
   - unittest/_torch/peft/test_fp8_lora_grouped_gemm_regressions.py
@@ -119,6 +120,7 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
   - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_k3_mamba_metadata.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
@@ -174,12 +176,14 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
   - unittest/_torch/moe/test_moe_backend.py::test_import_deep_gemm_rejects_pre_situ_mega_moe_api
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_streaming_reload_resets_slot_claims
-  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config
-  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config
-  - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_megamoe_activation_options
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_bakes_situ_softcaps_as_uniform_scalars
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_plain_swiglu_carries_no_constants
+  - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_situ_activation_as_one_carrier
+  - unittest/_torch/moe/test_moe_backend.py::test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration
+  - unittest/_torch/moe/test_moe_backend.py::test_apply_router_weight_on_input_support_is_not_inherited
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
@@ -409,6 +413,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-enable_chunked_prefill=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-CUTLASS]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_branch_snapshot[enable_branch_snapshot=True]
   - accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
