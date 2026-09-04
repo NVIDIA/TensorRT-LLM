@@ -51,6 +51,11 @@ from pydantic import Field, PrivateAttr, ValidationError, create_model, model_va
 from tqdm.asyncio import tqdm
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
+from tensorrt_llm.serve.openai_protocol import (
+    ImageEditRequest,
+    ImageGenerationRequest,
+    VideoGenerationRequest,
+)
 from tensorrt_llm.serve.visual_gen_metrics import (
     SERVER_TIMING_HEADER,
     VISUAL_GEN_DENOISE_TIMING,
@@ -70,6 +75,15 @@ MODALITY_BY_BACKEND = {
     "openai-image-edits": "image",
     VIDEO_BACKEND: "video",
 }
+# The request model each route validates against.
+WIRE_MODEL = {
+    "openai-images": ImageGenerationRequest,
+    "openai-image-edits": ImageEditRequest,
+    VIDEO_BACKEND: VideoGenerationRequest,
+}
+# Where the OpenAI-compatible wire spells a VisualGenParams field differently.
+# The document keeps the API's name; only the payload uses these.
+WIRE_ALIAS = {"num_images_per_prompt": "n", "image_reference": "image"}
 
 # Reference slots the loader resolves itself, so the document can name a local file
 # and the read happens once, before the run. VisualGenParams rejects a bare path.
@@ -122,8 +136,8 @@ def _reject_misplaced_reference(cls, data: Any) -> Any:
     return data
 
 
-class _ResolvedFields(StrictBaseModel):
-    """What resolution records, which the document does not contain.
+class VisualGenBenchRequest(StrictBaseModel):
+    """One entry of ``requests``, in the fields its route accepts.
 
     Resolution replaces what the document named with what a request carries --
     a reference path with its body, a prompt file with its text -- so the
@@ -136,49 +150,93 @@ class _ResolvedFields(StrictBaseModel):
     _original_video_reference: Optional[str] = PrivateAttr(default=None)
 
 
-def _document_model(name: str, extra: dict[str, Any], **kwargs: Any) -> type[StrictBaseModel]:
-    """A document layer, carrying ``VisualGenParams``' fields plus ``extra``.
+class VisualGenBenchWorkload(StrictBaseModel):
+    """The --workload document, and what the CLI spells out.
+
+    Each route subclasses this with the fields that route accepts, so a field
+    the route cannot carry fails at load instead of going out unnoticed.
+    """
+
+    backend: str
+    common_params: StrictBaseModel
+    requests: list[VisualGenBenchRequest] = Field(min_length=1)
+
+
+def _carried(backend: str, field_name: str) -> bool:
+    """Whether this route's request model has a slot for the field."""
+    wire = WIRE_MODEL[backend].model_fields
+    return field_name in wire or WIRE_ALIAS.get(field_name, field_name) in wire
+
+
+def _document_model(
+    name: str,
+    backend: str,
+    extra: dict[str, Any],
+    base: type[StrictBaseModel] = StrictBaseModel,
+    **kwargs: Any,
+) -> type[StrictBaseModel]:
+    """A document layer for one route, carrying the fields that route accepts.
 
     Derived rather than declared so the document cannot name a field the API
     does not have, and a new parameter is expressible without an edit here.
-    Every reference slot is dropped: a request adds back the two the loader
-    resolves, and ``common_params`` gets none, so the schema itself says a
+    Every reference slot is dropped: a request adds back the ones its route
+    carries, and ``common_params`` gets none, so the schema itself says a
     reference conditions one generation rather than every one.
     """
     fields: dict[str, Any] = {
         field_name: (spec.annotation, spec)
         for field_name, spec in VisualGenParams.model_fields.items()
-        if not field_name.endswith("_reference")
+        if not field_name.endswith("_reference") and _carried(backend, field_name)
     }
     fields.update(extra)
-    return create_model(name, __base__=kwargs.pop("base", StrictBaseModel), **kwargs, **fields)
+    return create_model(name, __base__=base, **kwargs, **fields)
 
 
 _PROMPT_FIELDS: dict[str, Any] = {key: (Optional[str], None) for key in COMMON_INPUT_KEYS}
-VisualGenBenchCommon = _document_model(
-    "VisualGenBenchCommon",
-    _PROMPT_FIELDS,
-    __validators__={
-        "_reject_misplaced_reference": model_validator(mode="before")(
-            classmethod(_reject_misplaced_reference)
-        )
-    },
-)
-# A reference is a local path, or the ``{content, format}`` object
-# ``MediaReferenceItem`` declares; both are resolved after the merge.
-VisualGenBenchRequest = _document_model(
-    "VisualGenBenchRequest",
-    {**_PROMPT_FIELDS, **{slot: (Any, None) for slot in REFERENCE_KEYS}},
-    base=_ResolvedFields,
-)
 
 
-class VisualGenBenchWorkload(StrictBaseModel):
-    """The --workload document, and what the CLI spells out."""
+def _reference_fields(backend: str) -> dict[str, Any]:
+    """The reference slots this route carries.
 
-    backend: Literal["openai-images", "openai-image-edits", "openai-videos"]
-    common_params: VisualGenBenchCommon = Field(default_factory=VisualGenBenchCommon)
-    requests: list[VisualGenBenchRequest] = Field(min_length=1)
+    A local path, or the ``{content, format}`` object ``MediaReferenceItem``
+    declares; both are resolved after the merge. ``/v1/images/edits`` has a
+    required ``image``, so its slot is required here rather than checked later.
+    """
+    required = backend == "openai-image-edits"
+    return {
+        slot: (Any, ... if required else None) for slot in REFERENCE_KEYS if _carried(backend, slot)
+    }
+
+
+def _workload_model(backend: str) -> type[VisualGenBenchWorkload]:
+    """The document one route accepts, in three derived layers."""
+    prefix = backend.title().replace("-", "")
+    common = _document_model(
+        f"{prefix}Common",
+        backend,
+        _PROMPT_FIELDS,
+        __validators__={
+            "_reject_misplaced_reference": model_validator(mode="before")(
+                classmethod(_reject_misplaced_reference)
+            )
+        },
+    )
+    request = _document_model(
+        f"{prefix}Request",
+        backend,
+        {**_PROMPT_FIELDS, **_reference_fields(backend)},
+        base=VisualGenBenchRequest,
+    )
+    return create_model(
+        f"{prefix}Workload",
+        __base__=VisualGenBenchWorkload,
+        backend=(Literal[backend], ...),
+        common_params=(common, Field(default_factory=common)),
+        requests=(list[request], Field(min_length=1)),
+    )
+
+
+WORKLOAD_MODEL = {backend: _workload_model(backend) for backend in WIRE_MODEL}
 
 
 def _warn(message: str) -> None:
@@ -378,7 +436,9 @@ def _resolve_prompt_file(reference: Any, base_dir: Path, index: int) -> tuple[st
     return str(path.resolve()), prompt
 
 
-def _resolve_request(merged: dict[str, Any], index: int, base_dir: Path) -> VisualGenBenchRequest:
+def _resolve_request(
+    merged: dict[str, Any], index: int, base_dir: Path, model: type[VisualGenBenchRequest]
+) -> VisualGenBenchRequest:
     """Turn one merged request into the dispatchable form.
 
     Files are read here rather than at dispatch, so a missing one fails before
@@ -404,7 +464,7 @@ def _resolve_request(merged: dict[str, Any], index: int, base_dir: Path) -> Visu
             located[slot], merged[slot] = _resolve_reference(slot, merged[slot], base_dir, index)
 
     try:
-        request = VisualGenBenchRequest(**merged)
+        request = model(**merged)
     except ValidationError as e:
         raise ValueError(f"requests[{index}]: invalid request:\n{e}") from e
     if (request.width is None) != (request.height is None):
@@ -481,14 +541,16 @@ def load_workload(args: argparse.Namespace) -> VisualGenBenchWorkload:
             "no default, because it selects the route and so what the run measures: a "
             "checkpoint serving both modes answers the wrong one without complaining."
         )
+    if backend not in WORKLOAD_MODEL:
+        raise ValueError(f"backend {backend!r} is not one of {', '.join(WORKLOAD_MODEL)}.")
     try:
-        document = VisualGenBenchWorkload(**{**raw, "backend": backend})
+        document = WORKLOAD_MODEL[backend](**{**raw, "backend": backend})
     except ValidationError as e:
         raise ValueError(f"invalid workload:\n{e}") from e
 
     common = document.common_params.model_dump(exclude_unset=True)
     requests = [
-        _resolve_request(_merge_request(common, request, index), index, base_dir)
+        _resolve_request(_merge_request(common, request, index), index, base_dir, type(request))
         for index, request in enumerate(document.requests)
     ]
 
@@ -496,7 +558,7 @@ def load_workload(args: argparse.Namespace) -> VisualGenBenchWorkload:
         requests = _resize_requests(requests, args.num_requests)
 
     workload = document.model_copy(
-        update={"common_params": VisualGenBenchCommon(), "requests": requests}
+        update={"common_params": type(document.common_params)(), "requests": requests}
     )
     _validate_workload(workload)
     return workload
@@ -507,37 +569,23 @@ def load_workload(args: argparse.Namespace) -> VisualGenBenchWorkload:
 # --------------------------------------------------------------------------- #
 
 
-def _validate_reference_backend(workload: VisualGenBenchWorkload) -> None:
-    """Reject the two reference/backend pairings that are a guaranteed 422.
+def _validate_edit_reference(workload: VisualGenBenchWorkload) -> None:
+    """Reject an image_reference /v1/images/edits cannot take.
 
-    ``ImageGenerationRequest`` declares neither ``image`` nor
-    ``image_reference`` and forbids extras; ``ImageEditRequest.image`` is
-    required. Video is unconstrained: I2V/V2V ride the same route.
+    Its ``image`` is one base64 string, while the video route's slot also takes
+    a URL, a path, or a list of them -- a shape difference the field type, which
+    is the same ``Any`` on both, does not express.
     """
+    if workload.backend != "openai-image-edits":
+        return
     for index, request in enumerate(workload.requests):
-        if request.image_reference is not None and workload.backend == "openai-images":
+        wire = request.image_reference
+        if not (isinstance(wire, dict) and wire.get("format") == "base64"):
             raise ValueError(
-                f"requests[{index}]: image_reference is not accepted by 'openai-images'; use "
-                "'openai-image-edits' for image editing or 'openai-videos' for I2V/V2V."
+                f"requests[{index}]: 'openai-image-edits' takes a single base64 image, so "
+                "image_reference must be a local path or one {content, format: base64} "
+                "object; /v1/images/edits does not accept the video route's list form."
             )
-        if request.video_reference is not None and workload.backend != VIDEO_BACKEND:
-            raise ValueError(
-                f"requests[{index}]: video_reference is not accepted by {workload.backend!r}; "
-                "only 'openai-videos' carries a video reference."
-            )
-        if workload.backend == "openai-image-edits":
-            if request.image_reference is None:
-                raise ValueError(
-                    f"requests[{index}]: backend 'openai-image-edits' requires image_reference "
-                    "(/v1/images/edits has a required 'image' field)."
-                )
-            wire = request.image_reference
-            if not (isinstance(wire, dict) and wire.get("format") == "base64"):
-                raise ValueError(
-                    f"requests[{index}]: 'openai-image-edits' takes a single base64 image, so "
-                    "image_reference must be a local path or one {content, format: base64} "
-                    "object; /v1/images/edits does not accept the video route's list form."
-                )
 
 
 def _validate_output_type(workload: VisualGenBenchWorkload) -> None:
@@ -558,7 +606,7 @@ def _validate_output_type(workload: VisualGenBenchWorkload) -> None:
 
 
 def _validate_workload(workload: VisualGenBenchWorkload) -> None:
-    _validate_reference_backend(workload)
+    _validate_edit_reference(workload)
     _validate_output_type(workload)
 
 
@@ -589,11 +637,9 @@ def build_payload(
 ) -> dict[str, Any]:
     """Build the HTTP body for one request on one backend.
 
-    A params dump is not a legal body: ``num_images_per_prompt`` is on no video
-    wire model and ``num_frames`` / ``frame_rate`` on no image wire model, so
-    ``extra="forbid"`` would 422 every request. The frame budget goes out as
-    ``num_frames``; the wire's ``seconds`` alternative is derived server-side as
-    ``int(seconds * frame_rate)``, which drops a frame at 25/30/50/60/120 fps.
+    The frame budget goes out as ``num_frames``; the wire's ``seconds``
+    alternative is derived server-side as ``int(seconds * frame_rate)``, which
+    drops a frame at 25/30/50/60/120 fps.
     """
     payload: dict[str, Any] = {
         "prompt": request.prompt,
@@ -601,7 +647,6 @@ def build_payload(
         "response_format": response_format,
     }
     params = _params_dump(request)
-    num_images = params.pop("num_images_per_prompt", None)
 
     if backend == VIDEO_BACKEND:
         # Typed fields -- the deprecated ``input_reference`` sniffs the
@@ -611,20 +656,16 @@ def build_payload(
                 payload[slot] = getattr(request, slot)
         if output_format is not None:
             payload["format"] = output_format
-    else:
-        params.pop("num_frames", None)
-        params.pop("frame_rate", None)
-        if num_images is not None:
-            payload["n"] = num_images
-        if backend == "openai-image-edits":
-            payload["image"] = request.image_reference["content"]
-            if output_format is not None:
-                # ImageEditRequest's canonical name; ``format`` is only an alias.
-                payload["output_format"] = output_format
-        elif output_format is not None:
-            payload["format"] = output_format
+    elif backend == "openai-image-edits":
+        payload["image"] = request.image_reference["content"]
+        if output_format is not None:
+            # ImageEditRequest's canonical name; ``format`` is only an alias.
+            payload["output_format"] = output_format
+    elif output_format is not None:
+        payload["format"] = output_format
 
-    payload.update(params)
+    wire = WIRE_MODEL[backend].model_fields
+    payload.update({name if name in wire else WIRE_ALIAS[name]: v for name, v in params.items()})
     return payload
 
 
@@ -968,7 +1009,7 @@ def _output_rate(
         count = None if any(n is None for n in frames) else sum(frames)
     else:
         key = "images_per_second"
-        count = sum(int(record.params.get("num_images_per_prompt", 1)) for record in done)
+        count = sum(int(record.params.get("n", 1)) for record in done)
     if count is None:
         return key, None
     return key, count / duration if duration > 0 else 0.0

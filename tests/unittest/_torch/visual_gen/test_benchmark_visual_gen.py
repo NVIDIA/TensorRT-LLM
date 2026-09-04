@@ -22,6 +22,7 @@ import pytest
 from tensorrt_llm.serve.scripts.benchmark_visual_gen import (
     SCALAR_PARAM_FIELDS,
     _make_record,
+    _output_rate,
     build_arg_parser,
     build_payload,
     load_workload,
@@ -207,11 +208,41 @@ def test_record_holds_the_locator_not_the_bytes(slot, reference_file):
     assert payload[slot]["format"] == "base64"
 
 
-@pytest.mark.parametrize("backend", ["openai-images", "openai-image-edits"])
-def test_video_reference_is_rejected_off_the_video_route(backend, reference_file):
-    """Only VideoGenerationRequest declares it; the image models forbid extras."""
-    with pytest.raises(ValueError, match="video_reference is not accepted"):
-        _workload(backend=backend, video_reference=str(reference_file))
+@pytest.mark.parametrize(
+    "backend, field, value",
+    [
+        ("openai-images", "num_frames", 81),
+        ("openai-images", "video_reference", {"content": "aGk=", "format": "base64"}),
+        ("openai-videos", "num_images_per_prompt", 4),
+    ],
+    ids=["frames-on-image", "video-ref-on-image", "n-on-video"],
+)
+def test_a_field_the_route_cannot_carry_fails_at_load(backend, field, value):
+    """The wire model has no slot, so the run would measure something else.
+
+    images_per_second counted a batch size the request never sent.
+    """
+    with pytest.raises(ValueError, match="Extra inputs are not permitted") as excinfo:
+        _workload(backend=backend, **{field: value})
+
+    assert field in str(excinfo.value)
+
+
+def test_images_per_second_counts_the_batch():
+    """The rate reads the payload, where the batch size is spelled 'n'."""
+    workload = _workload(backend="openai-images", num_images_per_prompt=4)
+    payload = build_payload(workload.requests[0], workload.backend, "m", "url", None)
+    record = _make_record(0, workload.requests[0], payload)
+    record.success = True
+
+    assert payload["n"] == 4
+    assert _output_rate([record], workload.backend, 10.0) == ("images_per_second", 0.4)
+
+
+def test_image_edits_requires_its_reference():
+    """/v1/images/edits has a required 'image'; without one the run 422s."""
+    with pytest.raises(ValueError, match="image_reference\n  Field required"):
+        _workload(backend="openai-image-edits")
 
 
 def test_missing_reference_fails_before_the_run(tmp_path):
