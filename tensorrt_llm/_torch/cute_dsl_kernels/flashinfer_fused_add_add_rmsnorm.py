@@ -266,7 +266,7 @@ class FusedAddAddRMSNormKernel(FusedAddRMSNormKernel):
             cute.arch.griddepcontrol_launch_dependents()
 
 
-@functools.cache
+@functools.lru_cache(maxsize=32)
 def _get_compiled_fused_add_add_rmsnorm_kernel(
     dtype_str: str,
     hidden_size: int,
