@@ -537,15 +537,18 @@ def _deserialize_first_gen_log_probs(positions: Sequence[Any]) -> list[Any]:
     return result
 
 
-def _validate_kv_session(session: Any) -> None:
+def _validate_kv_session(session: Any, attrs: Mapping[str, Any]) -> None:
     """Reject a session the generation worker cannot resolve.
 
     The engine consumes the handoff on its executor loop with no timeout and no
     guard: a session naming an unreachable context worker blocks that loop
     indefinitely, so every later request on this engine stalls too. Validating
     what we can here turns an engine-wide hang into one INVALID_ARGUMENT.
+
+    ``attrs`` is the caller's already-converted attributes Struct: converting it
+    twice would walk the whole handoff -- including first_gen_log_probs -- twice
+    per request on the decode server's event loop.
     """
-    attrs = _struct_to_dict(session.attributes_struct)
     endpoint = attrs.get("ctx_info_endpoint") or _endpoint_to_str(session.endpoints)
     if endpoint:
         parts = _split_endpoint(str(endpoint))
@@ -572,7 +575,8 @@ def _disaggregated_params_from_request(
     has_session = request.HasField("kv") and request.kv.HasField("session")
     if has_session:
         session = request.kv.session
-        _validate_kv_session(session)
+        attrs = _struct_to_dict(session.attributes_struct)
+        _validate_kv_session(session, attrs)
         params = DisaggregatedParams(request_type="generation_only")
         if session.session_id:
             try:
@@ -581,52 +585,43 @@ def _disaggregated_params_from_request(
                 raise ValueError(
                     "kv.session.session_id must be an integer context request id"
                 ) from error
-        attrs = _struct_to_dict(session.attributes_struct)
         # Prefer the verbatim endpoint; the structured fields are a fallback for
         # a peer that did not carry it.
         endpoint = attrs.get("ctx_info_endpoint") or _endpoint_to_str(session.endpoints)
         if endpoint:
-            _set_disagg_attr(params, "ctx_info_endpoint", str(endpoint))
+            params.ctx_info_endpoint = str(endpoint)
         opaque_state = attrs.get("opaque_state")
         if opaque_state:
-            _set_disagg_attr(params, "opaque_state", base64.b64decode(opaque_state))
+            params.opaque_state = base64.b64decode(opaque_state, validate=True)
         first_gen_tokens = attrs.get("first_gen_tokens")
         if first_gen_tokens:
             params.first_gen_tokens = [int(token) for token in first_gen_tokens]
         draft_tokens = attrs.get("draft_tokens")
         if draft_tokens:
-            _set_disagg_attr(params, "draft_tokens", [int(t) for t in draft_tokens], optional=True)
+            params.draft_tokens = [int(token) for token in draft_tokens]
         disagg_request_id = attrs.get("disagg_request_id")
         if disagg_request_id is not None:
-            _set_disagg_attr(params, "disagg_request_id", int(disagg_request_id), optional=True)
+            params.disagg_request_id = int(disagg_request_id)
         # ctx_dp_rank: prefer the attribute (preserves an explicit 0 and, by its
         # absence, an unset None) and fall back to the native dp_rank field.
         if "ctx_dp_rank" in attrs:
-            _set_disagg_attr(params, "ctx_dp_rank", int(attrs["ctx_dp_rank"]))
+            params.ctx_dp_rank = int(attrs["ctx_dp_rank"])
         elif session.dp_rank:
-            _set_disagg_attr(params, "ctx_dp_rank", session.dp_rank)
+            params.ctx_dp_rank = session.dp_rank
         schedule_style = attrs.get("schedule_style")
         if schedule_style is not None:
-            _set_disagg_attr(
-                params,
-                "schedule_style",
-                DisaggScheduleStyle(int(schedule_style)),
-                optional=True,
-            )
-        conversation_id = attrs.get("conversation_id")
-        if conversation_id is not None:
-            _set_disagg_attr(params, "conversation_id", str(conversation_id), optional=True)
+            params.schedule_style = DisaggScheduleStyle(int(schedule_style))
         ctx_usage = attrs.get("ctx_usage")
         if ctx_usage is not None:
-            _set_disagg_attr(params, "ctx_usage", ctx_usage, optional=True)
+            # Struct has only a double number type, so token counts come back as
+            # floats; restore the integer typing the engine and Usage expect.
+            params.ctx_usage = {
+                key: int(value) if isinstance(value, float) and value.is_integer() else value
+                for key, value in ctx_usage.items()
+            }
         first_gen_log_probs = attrs.get("first_gen_log_probs")
         if first_gen_log_probs is not None:
-            _set_disagg_attr(
-                params,
-                "first_gen_log_probs",
-                _deserialize_first_gen_log_probs(first_gen_log_probs),
-                optional=True,
-            )
+            params.first_gen_log_probs = _deserialize_first_gen_log_probs(first_gen_log_probs)
         return params
 
     extra = _struct_to_dict(request.extra) if request.HasField("extra") else {}
@@ -640,39 +635,6 @@ def _disaggregated_params_from_request(
     return DisaggregatedParams(request_type=request_type)
 
 
-def _disagg_attr(params: Any, name: str) -> Any:
-    """Read an optional DisaggregatedParams field.
-
-    The dataclass gains and loses fields between releases (`conversation_id` is
-    on 1.3.0rc23 and gone on rc25), so an unconditional read would fail the whole
-    handoff over one missing attribute.
-    """
-    return getattr(params, name, None)
-
-
-def _set_disagg_attr(params: Any, name: str, value: Any, *, optional: bool = False) -> None:
-    """Assign a DisaggregatedParams field, or fail if this build lacks it.
-
-    DisaggregatedParams is a slots dataclass, so assigning an undeclared field
-    raises AttributeError rather than being ignored. Only fields that genuinely
-    come and go across releases are dropped (`conversation_id` is on 1.3.0rc23
-    and not on rc25); dropping a load-bearing one would decode against a missing
-    address or missing context state and produce a wrong answer instead of an
-    error.
-    """
-    if name in getattr(type(params), "__dataclass_fields__", {}):
-        setattr(params, name, value)
-        return
-    if not optional:
-        raise ValueError(
-            f"the peer's handoff carries '{name}', which this TensorRT-LLM build does not support"
-        )
-    logger.warning(
-        f"OpenEngine handoff attribute '{name}' is not supported by this "
-        "TensorRT-LLM build and was dropped"
-    )
-
-
 def _prefill_ready_response(
     request_id: str,
     disaggregated_params: Any,
@@ -684,7 +646,7 @@ def _prefill_ready_response(
     Packs the TensorRT-LLM context handoff into a KvSessionRef: ``ctx_request_id``
     -> session_id, ``ctx_dp_rank`` -> dp_rank, ``ctx_info_endpoint`` -> endpoint,
     and the fields with no native slot (opaque_state as base64, first/draft tokens,
-    disagg_request_id, schedule_style, conversation_id, ctx_usage) into the
+    disagg_request_id, schedule_style, ctx_usage) into the
     session's attributes Struct.
 
     ``first_gen_log_probs`` is carried (serialized) so logprobs-in-disagg returns
@@ -696,10 +658,10 @@ def _prefill_ready_response(
     session = kv_pb2.KvSessionRef(
         session_id="" if ctx_request_id is None else str(ctx_request_id),
         transfer_backend=transfer_backend or "",
-        dp_rank=_disagg_attr(disaggregated_params, "ctx_dp_rank") or 0,
+        dp_rank=disaggregated_params.ctx_dp_rank or 0,
     )
     attributes: dict[str, Any] = {}
-    endpoint = _disagg_attr(disaggregated_params, "ctx_info_endpoint")
+    endpoint = disaggregated_params.ctx_info_endpoint
     if endpoint:
         # Carried verbatim as well as split: the generation worker connects a
         # ZMQ socket straight to this string, so any lossy round trip through
@@ -709,31 +671,28 @@ def _prefill_ready_response(
         if parts is not None:
             host, port, scheme = parts
             session.endpoints.add(host=host, port=port, protocol=scheme or transfer_backend or "")
-    opaque_state = _disagg_attr(disaggregated_params, "opaque_state")
+    opaque_state = disaggregated_params.opaque_state
     if opaque_state is not None:
         attributes["opaque_state"] = base64.b64encode(opaque_state).decode("utf-8")
-    first_gen_tokens = _disagg_attr(disaggregated_params, "first_gen_tokens")
+    first_gen_tokens = disaggregated_params.first_gen_tokens
     if first_gen_tokens:
         attributes["first_gen_tokens"] = list(first_gen_tokens)
-    draft_tokens = _disagg_attr(disaggregated_params, "draft_tokens")
+    draft_tokens = disaggregated_params.draft_tokens
     if draft_tokens:
         attributes["draft_tokens"] = list(draft_tokens)
-    disagg_request_id = _disagg_attr(disaggregated_params, "disagg_request_id")
+    disagg_request_id = disaggregated_params.disagg_request_id
     if disagg_request_id is not None:
         attributes["disagg_request_id"] = str(disagg_request_id)
-    ctx_dp_rank = _disagg_attr(disaggregated_params, "ctx_dp_rank")
+    ctx_dp_rank = disaggregated_params.ctx_dp_rank
     if ctx_dp_rank is not None:
         attributes["ctx_dp_rank"] = ctx_dp_rank
-    schedule_style = _disagg_attr(disaggregated_params, "schedule_style")
+    schedule_style = disaggregated_params.schedule_style
     if schedule_style is not None:
         attributes["schedule_style"] = int(schedule_style)
-    conversation_id = _disagg_attr(disaggregated_params, "conversation_id")
-    if conversation_id is not None:
-        attributes["conversation_id"] = conversation_id
-    ctx_usage = _disagg_attr(disaggregated_params, "ctx_usage")
+    ctx_usage = disaggregated_params.ctx_usage
     if ctx_usage is not None:
         attributes["ctx_usage"] = dict(ctx_usage)
-    first_gen_log_probs = _disagg_attr(disaggregated_params, "first_gen_log_probs")
+    first_gen_log_probs = disaggregated_params.first_gen_log_probs
     if first_gen_log_probs is not None:
         attributes["first_gen_log_probs"] = _serialize_first_gen_log_probs(first_gen_log_probs)
     if attributes:
@@ -857,7 +816,7 @@ def _format_result(
             # ctx_request_id. Emitting without it fabricates a handoff whose
             # session the generation worker cannot resolve.
             out_disagg = getattr(output, "disaggregated_params", None)
-            if out_disagg is not None and _disagg_attr(out_disagg, "ctx_request_id") is not None:
+            if out_disagg is not None and out_disagg.ctx_request_id is not None:
                 args.prefill_ready_sent.add(output.index)
                 responses.append(
                     _prefill_ready_response(

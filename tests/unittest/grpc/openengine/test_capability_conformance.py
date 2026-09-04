@@ -495,23 +495,31 @@ def test_ctx_info_endpoint_survives_the_handoff_round_trip(endpoint):
     assert decoded.ctx_info_endpoint == endpoint
 
 
-def test_an_unsupported_load_bearing_handoff_field_fails_loudly():
-    """Dropping a load-bearing field would decode against missing state.
+def test_every_handoff_attribute_is_a_real_disaggregated_params_field():
+    """The handoff writes and reads only fields DisaggregatedParams declares.
 
-    Only fields that come and go across releases may be dropped; anything the
-    handoff depends on must fail rather than silently produce a wrong answer.
+    DisaggregatedParams ships in the same wheel as this adapter, so the mapping
+    is checkable statically rather than probed with getattr at runtime: a field
+    that is not declared is a typo or a stale name, not cross-release skew.
     """
-    from tensorrt_llm.grpc.openengine.servicer import _set_disagg_attr
+    from dataclasses import fields
 
-    class _NoEndpoint:
-        __dataclass_fields__ = {"request_type": None}
+    from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
-    params = _NoEndpoint()
-    with pytest.raises(ValueError, match="ctx_info_endpoint"):
-        _set_disagg_attr(params, "ctx_info_endpoint", "tcp://h:1")
-
-    # Cross-release metadata is dropped instead.
-    _set_disagg_attr(params, "conversation_id", "abc", optional=True)
+    declared = {f.name for f in fields(DisaggregatedParams)}
+    # Every attribute key the handoff carries maps 1:1 onto a declared field.
+    carried = {
+        "ctx_info_endpoint",
+        "opaque_state",
+        "first_gen_tokens",
+        "draft_tokens",
+        "disagg_request_id",
+        "ctx_dp_rank",
+        "schedule_style",
+        "ctx_usage",
+        "first_gen_log_probs",
+    }
+    assert carried <= declared, f"handoff carries undeclared fields: {sorted(carried - declared)}"
 
 
 # ---------------------------------------------------------------------------

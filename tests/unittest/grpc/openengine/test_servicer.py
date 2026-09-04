@@ -309,7 +309,6 @@ def test_prefill_ready_round_trip_full_handoff() -> None:
         draft_tokens=[2, 3, 4],
         disagg_request_id=123456789012345,
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
-        conversation_id="conv-abc",
         ctx_usage={"prompt_tokens": 5, "total_tokens": 6},
     )
 
@@ -322,7 +321,6 @@ def test_prefill_ready_round_trip_full_handoff() -> None:
     assert decoded.disagg_request_id == 123456789012345
     assert decoded.ctx_dp_rank == 0
     assert decoded.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-    assert decoded.conversation_id == "conv-abc"
     assert decoded.ctx_usage == {"prompt_tokens": 5, "total_tokens": 6}
 
 
