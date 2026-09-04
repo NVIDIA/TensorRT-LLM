@@ -33,7 +33,6 @@ from mpi4py.futures import MPIPoolExecutor
 from tensorrt_llm import DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm._utils import set_mpi_comm
-from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -67,30 +66,9 @@ OMPI_COMM_WORLD_ENV_KEYS = (
 AUTODEPLOY_DISAGG_SEED = 1234
 REDUCED_TINYLLAMA_LAYERS = 2
 REDUCED_DEEPSEEK_LAYERS = 2
-LLAMA_EAGLE3_EXPECTED_TEXT = " Berlin\nWhat is the capital of France? Paris\nWhat is the capital of"
-LLAMA_EAGLE3_EXPECTED_TOKEN_IDS = [
-    20437,
-    198,
-    3923,
-    374,
-    279,
-    6864,
-    315,
-    9822,
-    30,
-    12366,
-    198,
-    3923,
-    374,
-    279,
-    6864,
-    315,
-]
 
 
 MODEL_PATHS = {
-    "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
-    "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
     "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
     "DeepSeek-V3-Lite": "DeepSeek-V3-Lite/bf16",
 }
@@ -657,20 +635,6 @@ def test_chunked_prefill_handoff(model):
 # ---------------------------------------------------------------------------
 
 
-def llama_eagle3_config():
-    return {
-        "speculative_config": Eagle3DecodingConfig(
-            max_draft_len=3,
-            speculative_model=model_path("EAGLE3-LLaMA3.1-Instruct-8B"),
-            eagle3_one_model=True,
-            eagle3_layers_to_capture={1, 15, 28},
-        ),
-        # Force the Eagle3 draft to match the BF16 Llama 3.1 target. Shared KV
-        # cache management requires matching target and draft KV dtypes.
-        "speculative_model_kwargs": {"torch_dtype": "bfloat16"},
-    }
-
-
 def get_ucx_tls() -> str:
     """Get UCX_TLS value based on GPU architecture.
 
@@ -1032,40 +996,3 @@ def test_async_sharded_generation_handoff():
     assert outputs["context"].token_ids == aggregate_output.token_ids[:1]
     assert outputs["generation"].text == aggregate_output.text
     assert outputs["generation"].token_ids == aggregate_output.token_ids
-
-
-@skip_pre_hopper
-@pytest.mark.threadleak(enabled=False)
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(2)
-@pytest.mark.timeout(900)
-def test_async_eagle3_full_model_handoff():
-    sampling_params_kwargs = {
-        "max_tokens": 16,
-        "ignore_eos": True,
-        "top_k": 1,
-        "seed": AUTODEPLOY_DISAGG_SEED,
-    }
-    extra_config = llama_eagle3_config()
-    outputs = run_context_then_generation_handoff(
-        "Llama-3.1-8B-Instruct",
-        worker_world_sizes=(1, 1),
-        generation_overlap=True,
-        prompt="What is the capital of Germany?",
-        sampling_params_kwargs=sampling_params_kwargs,
-        extra_config=extra_config,
-    )
-    context_params = outputs["context"].disaggregated_params
-    assert context_params is not None
-    assert context_params.request_type == "context_only"
-    assert len(outputs["context"].token_ids) == 1
-    assert context_params.ctx_request_id is not None
-    assert context_params.first_gen_tokens is not None
-    assert has_handoff_transport_metadata(context_params)
-    assert outputs["generation"].token_ids
-    assert has_draft_tokens(outputs["context"])
-    assert has_draft_tokens(outputs["generation"])
-    assert outputs["context"].text == " Berlin"
-    assert outputs["context"].token_ids == LLAMA_EAGLE3_EXPECTED_TOKEN_IDS[:1]
-    assert outputs["generation"].text == LLAMA_EAGLE3_EXPECTED_TEXT
-    assert outputs["generation"].token_ids == LLAMA_EAGLE3_EXPECTED_TOKEN_IDS

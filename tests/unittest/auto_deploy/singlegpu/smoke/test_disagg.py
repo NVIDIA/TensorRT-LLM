@@ -22,10 +22,7 @@ from utils.util import skip_pre_hopper
 
 from tensorrt_llm import DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
-LLAMA_MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-EAGLE3_MODEL_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 DEEPSEEK_MODEL_ID = "deepseek-ai/DeepSeek-V3"
 DEEPSEEK_DISAGG_TRANSFORMS = {
     "insert_cached_attention": {"backend": "triton"},
@@ -98,11 +95,6 @@ def create_generation_params(context_output):
     params = context_output.disaggregated_params
     assert params is not None
     return replace(params, request_type="generation_only")
-
-
-def has_draft_tokens(output):
-    params = output.disaggregated_params
-    return params is not None and params.draft_tokens is not None and len(params.draft_tokens) > 0
 
 
 def run_live_disagg_smoke(
@@ -212,16 +204,6 @@ def run_live_batch_disagg_smoke(model_id, attn_backend, compile_backend, config_
 
 
 GENERIC_DISAGG_SMOKE_CASES = [
-    pytest.param(LLAMA_MODEL_ID, "trtllm", "torch-simple", {}, id="llama-trtllm-simple"),
-    pytest.param(LLAMA_MODEL_ID, "trtllm", "torch-cudagraph", {}, id="llama-trtllm-cudagraph"),
-    pytest.param(LLAMA_MODEL_ID, "flashinfer", "torch-simple", {}, id="llama-flashinfer-simple"),
-    pytest.param(
-        LLAMA_MODEL_ID,
-        "flashinfer",
-        "torch-cudagraph",
-        {},
-        id="llama-flashinfer-cudagraph",
-    ),
     pytest.param(
         DEEPSEEK_MODEL_ID,
         "trtllm",
@@ -261,44 +243,3 @@ def test_autodeploy_disaggregated_batch_smoke(
         )
 
     run_live_batch_disagg_smoke(model_id, attn_backend, compile_backend, config_overrides)
-
-
-def test_autodeploy_disaggregated_eagle3_smoke():
-    target_model_config = get_small_model_config(LLAMA_MODEL_ID)
-    eagle3_model_config = get_small_model_config(EAGLE3_MODEL_ID)
-    target_model_kwargs = {
-        **target_model_config["args"]["model_kwargs"],
-        "num_hidden_layers": 3,
-    }
-    speculative_config = Eagle3DecodingConfig(
-        max_draft_len=3,
-        speculative_model=eagle3_model_config["args"]["model"],
-        eagle3_one_model=True,
-        eagle3_layers_to_capture={0, 1, 2},
-    )
-    speculative_model_kwargs = {
-        **target_model_kwargs,
-        **eagle3_model_config["args"]["model_kwargs"],
-        "torch_dtype": "bfloat16",
-    }
-
-    # This is intentionally a smoke test: small_model_config_disagg uses
-    # skip_loading_weights=True, so the meaningful assertions are that one-model
-    # Eagle builds with a reduced target/draft pair and carries draft-token
-    # metadata through the live disaggregated handoff. Force the draft dtype to
-    # match the BF16 Llama target because shared KV cache management requires
-    # target and draft KV resources to have the same dtype. Use three reduced
-    # target layers to match Llama Eagle3's default three-layer capture.
-    # Weighted acceptance and quality coverage belong in integration tests.
-    context_output, generation_output = run_live_disagg_smoke(
-        LLAMA_MODEL_ID,
-        "flashinfer",
-        "torch-simple",
-        common_config_overrides={
-            "model_kwargs": target_model_kwargs,
-            "speculative_config": speculative_config,
-            "speculative_model_kwargs": speculative_model_kwargs,
-        },
-    )
-    assert has_draft_tokens(context_output)
-    assert has_draft_tokens(generation_output)

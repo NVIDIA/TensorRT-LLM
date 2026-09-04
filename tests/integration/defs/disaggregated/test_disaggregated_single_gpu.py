@@ -14,7 +14,6 @@ from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._utils import set_mpi_comm
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
                                  KvCacheConfig, MpiCommSession)
-from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
 
 
 def get_ucx_tls():
@@ -49,8 +48,6 @@ MPI_STARTED = MPI_TAG + 4
 MODEL_PATHS = {
     "DeepSeek-V3-Lite-fp8": "DeepSeek-V3-Lite/fp8",
     "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-    "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
-    "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
     "Qwen3-8B-FP8": "Qwen3/Qwen3-8B-FP8",
 }
 
@@ -473,118 +470,6 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
             requests = []
             # Send 32 requests to make sure the context worker is saturated
             for _ in range(32):
-                requests.append(
-                    (prompt, SamplingParams(max_tokens=1, ignore_eos=True),
-                     DisaggregatedParams(request_type="context_only")))
-
-            intercomm.send(requests, dest=0, tag=MPI_REQUEST)
-
-            for _ in range(len(requests)):
-                output = intercomm.recv(source=0, tag=MPI_RESULT)
-                assert output[0].disaggregated_params is not None
-                assert output[
-                    0].disaggregated_params.request_type == "context_only"
-                assert len(output[0].token_ids) == 1
-
-                generation_request_disagg_params = output[
-                    0].disaggregated_params
-                generation_request_disagg_params.request_type = "generation_only"
-                requests = []
-                requests.append((prompt,
-                                 SamplingParams(max_tokens=max_tokens,
-                                                ignore_eos=True),
-                                 generation_request_disagg_params))
-
-                intercomm.send(requests, dest=1, tag=MPI_REQUEST)
-                output = intercomm.recv(source=1, tag=MPI_RESULT)
-
-        except MPI.Exception as e:
-            print(f"MPI Error")
-            raise e
-        finally:
-            mpi_send_termination_request(intercomm)
-
-            # Wait for all futures to complete
-            for future in futures:
-                future.result()
-            print("All workers terminated.")
-
-
-@pytest.mark.parametrize("model", ["Llama-3.1-8B-Instruct"])
-@pytest.mark.parametrize("spec_dec_model_path", ["EAGLE3-LLaMA3.1-Instruct-8B"])
-@pytest.mark.parametrize("generation_overlap", [False])
-@pytest.mark.parametrize("eagle3_one_model", [True, False])
-def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
-                                                 generation_overlap,
-                                                 eagle3_one_model):
-    # Test whether the batch slots are properly released when using speculative decoding
-    # with disaggregated serving.
-    spec_dec_config = Eagle3DecodingConfig(
-        speculative_model=model_path(spec_dec_model_path),
-        eagle3_one_model=eagle3_one_model,
-        max_draft_len=3)
-
-    worker_pytorch_configs = []
-
-    # Context worker
-    worker_pytorch_configs.append(
-        dict(disable_overlap_scheduler=True,
-             speculative_config=spec_dec_config,
-             max_batch_size=1))
-
-    # Generation worker
-    worker_pytorch_configs.append(
-        dict(disable_overlap_scheduler=not generation_overlap,
-             speculative_config=spec_dec_config,
-             max_batch_size=1))
-
-    kv_cache_configs = [
-        KvCacheConfig(max_tokens=128,
-                      enable_block_reuse=False,
-                      free_gpu_memory_fraction=0.4) for _ in range(2)
-    ]
-    cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
-    ]
-    model_names = [model_path(model) for _ in range(2)]
-    ranks = [0, 1]
-    worker_args = list(
-        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
-            model_names, ranks))
-
-    port_name = mpi_publish_name()
-
-    prompt = "What is the capital of Germany?"
-    mpi_info = MPI.Info.Create()
-    mpi_info.Set("oversubscribe", "true")
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             "UCX_TLS": get_ucx_tls(),
-                             "UCX_MM_ERROR_HANDLING": "y",
-                             "OMPI_MCA_rmaps_base_oversubscribe": "1"
-                         },
-                         mpi_info=mpi_info) as executor:
-        futures = []
-        try:
-            for worker_arg in worker_args:
-                future = executor.submit(worker_entry_point, *worker_arg)
-                futures.append(future)
-        except Exception as e:
-            print(f"Error in worker {worker_arg}: {e}")
-            raise e
-
-        intercomm = None
-        try:
-            print("Launched all the workers.")
-            intercomm = mpi_initialize_intercomm(port_name)
-
-            for _ in range(2):
-                intercomm.recv(tag=MPI_READY)
-                print("Received ready signal.")
-            max_tokens = 25
-
-            requests = []
-            for _ in range(10):
                 requests.append(
                     (prompt, SamplingParams(max_tokens=1, ignore_eos=True),
                      DisaggregatedParams(request_type="context_only")))

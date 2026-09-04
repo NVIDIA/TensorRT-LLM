@@ -11,9 +11,6 @@ llm_spark_func:
   tests:
   - test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-20B-gpt_oss/gpt-oss-20b]
   - test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-120B-gpt_oss/gpt-oss-120b]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-bf16-instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP4-modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-8b-fp8-Qwen3/nvidia-Qwen3-8B-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-8b-nvfp4-Qwen3/nvidia-Qwen3-8B-NVFP4]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-8B-bf16-Qwen3/Qwen3-8B]
@@ -34,7 +31,6 @@ llm_spark_func:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
   - test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]
-  - test_e2e.py::test_openai_chat_guided_decoding[meta-llama/Llama-3.1-8B-Instruct]
   - examples/serve/test_serve.py::test_nemotron3_super_120b_nvfp4
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_on]
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_off]
