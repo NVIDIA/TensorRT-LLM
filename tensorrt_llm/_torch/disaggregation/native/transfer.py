@@ -24,7 +24,7 @@ import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, List, Optional, Union
 
 import msgpack
 import numpy as np
@@ -107,7 +107,6 @@ class _AgentOperationGate:
         self._drain_timeout_s = drain_timeout_s
         self._condition = threading.Condition()
         self._active_transfers = 0
-        self._metadata_pending = False
         self._closing = False
         self._poisoned: Optional[Exception] = None
 
@@ -128,14 +127,6 @@ class _AgentOperationGate:
 
     def acquire_transfer(self) -> Callable[[], None]:
         with self._condition:
-            admitted = self._condition.wait_for(
-                lambda: self._closing or self._poisoned is not None or not self._metadata_pending,
-                timeout=self._drain_timeout_s,
-            )
-            if not admitted:
-                self._poison_locked(
-                    RuntimeError("NIXL transfer admission timed out behind metadata mutation")
-                )
             self._raise_if_unavailable_locked()
             self._active_transfers += 1
         return self._release_transfer
@@ -145,58 +136,22 @@ class _AgentOperationGate:
             self._active_transfers -= 1
             self._condition.notify_all()
 
-    @contextmanager
-    def metadata(self) -> Iterator[None]:
-        with self._condition:
-            self._raise_if_unavailable_locked()
-            if self._metadata_pending:
-                raise RuntimeError("concurrent NIXL metadata mutation")
-            self._metadata_pending = True
-            try:
-                drained = self._condition.wait_for(
-                    lambda: self._closing
-                    or self._poisoned is not None
-                    or self._active_transfers == 0,
-                    timeout=self._drain_timeout_s,
-                )
-                if not drained:
-                    self._poison_locked(
-                        RuntimeError(
-                            "NIXL metadata mutation timed out while transfer ownership "
-                            "remained active"
-                        )
-                    )
-                self._raise_if_unavailable_locked()
-            except Exception:
-                self._metadata_pending = False
-                self._condition.notify_all()
-                raise
-        try:
-            yield
-        finally:
-            with self._condition:
-                self._metadata_pending = False
-                self._condition.notify_all()
-
     def close(self) -> None:
         with self._condition:
             self._closing = True
             self._condition.notify_all()
             drained = self._condition.wait_for(
-                lambda: self._poisoned is not None
-                or (not self._metadata_pending and self._active_transfers == 0),
+                lambda: self._active_transfers == 0,
                 timeout=self._drain_timeout_s,
             )
             if not drained:
-                self._poison_locked(
-                    RuntimeError(
-                        "NIXL agent shutdown timed out while transfer ownership remained active"
-                    )
+                error = RuntimeError(
+                    "NIXL agent shutdown timed out while transfer ownership remained active"
                 )
-            if self._poisoned is not None or self._metadata_pending or self._active_transfers > 0:
+                self._poison_locked(error)
                 raise RuntimeError(
                     "NIXL agent refuses teardown while transfer ownership is active"
-                ) from self._poisoned
+                ) from error
 
 
 @dataclass
@@ -340,6 +295,7 @@ class _ReceiveOperationOwner:
         self._expected_writers: Optional[int] = None
         self._writer_cohort: Optional[frozenset[int]] = None
         self._writer_results: dict[int, bool] = {}
+        self._in_doubt_writers: set[int] = set()
         self._publication_failed = False
         self._local_completion_pending = False
         self._invalid_evidence = False
@@ -403,9 +359,22 @@ class _ReceiveOperationOwner:
             self._publication_pending = False
             return True
 
-    def mark_publication_ambiguous(self) -> None:
+    def record_writer_in_doubt(self, peer_rank: int) -> bool:
+        """Retain ownership after a writer reports no safe terminal evidence."""
         with self._lock:
+            if self._expected_writers is None:
+                self._invalid_evidence = True
+                raise RuntimeError(
+                    f"writer {peer_rank} reported ambiguous evidence before publication"
+                )
+            if self._writer_cohort is not None and peer_rank not in self._writer_cohort:
+                self._invalid_evidence = True
+                raise RuntimeError(f"writer {peer_rank} is outside the sealed cohort")
+            if peer_rank in self._in_doubt_writers:
+                return False
+            self._in_doubt_writers.add(peer_rank)
             self._invalid_evidence = True
+            return True
 
     def record_writer_result(
         self,
@@ -464,14 +433,23 @@ class _ReceiveOperationOwner:
 class AgentResult(Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
+    IN_DOUBT = "IN_DOUBT"
 
 
 # KV_AGENT_RESULT prefix in one struct frame (was ascii frames serialized/parsed under the
 # GIL per slice per writer): instance_rank, unique_rid, slice_id, is_last, status,
 # transfer_size. The optional bounce tail follows at message[2:].
 _KV_RESULT_PREFIX = struct.Struct("<qqq?Bq")
-_AGENT_RESULT_CODE = {AgentResult.SUCCESS: 0, AgentResult.FAILED: 1}
-_AGENT_RESULT_BY_CODE = {0: AgentResult.SUCCESS, 1: AgentResult.FAILED}
+_AGENT_RESULT_CODE = {
+    AgentResult.SUCCESS: 0,
+    AgentResult.FAILED: 1,
+    AgentResult.IN_DOUBT: 2,
+}
+_AGENT_RESULT_BY_CODE = {
+    0: AgentResult.SUCCESS,
+    1: AgentResult.FAILED,
+    2: AgentResult.IN_DOUBT,
+}
 
 
 def _make_kv_result_msg(
@@ -494,6 +472,15 @@ def _make_kv_result_msg(
     if tail:
         msg += tail
     return msg
+
+
+def _make_aux_result_msg(instance_rank: int, unique_rid: int, result: AgentResult) -> list[bytes]:
+    return [
+        MessageType.AUX_AGENT_RESULT,
+        str(instance_rank).encode("ascii"),
+        str(unique_rid).encode("ascii"),
+        result.value.encode("ascii"),
+    ]
 
 
 class SendTaskBase:
@@ -558,6 +545,10 @@ class SendTaskBase:
                 evidence.clear()
                 release_agent()
 
+    def has_started_physical_operation(self, peer_rank: int) -> bool:
+        with self._physical_lock:
+            return peer_rank in self._physical_started
+
     @property
     def resources_drained(self) -> bool:
         with self._physical_lock:
@@ -614,7 +605,7 @@ class Sender(SenderBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         operation_drain_timeout_s: Optional[float] = None,
-    ):
+    ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
@@ -742,7 +733,7 @@ class Sender(SenderBase):
                 for info in req_infos:
                     self._send_failed_result_to_receiver(
                         info,
-                        include_aux=getattr(tx_session, "_need_aux", False),
+                        include_aux=tx_session._claim_unsubmitted_aux_failure(info),
                         defer_to_worker=True,
                     )
             else:
@@ -814,6 +805,14 @@ class Sender(SenderBase):
             dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return dealers[endpoint]
 
+    def _get_result_dealer(
+        self, endpoint: Optional[str], *, legacy_shared: bool = False
+    ) -> ZMQMessenger:
+        """Keep legacy early-failure routing outside the ownership bridge."""
+        if legacy_shared and not self._enforce_physical_ownership:
+            return self._get_or_connect_dealer(endpoint)
+        return self._get_or_connect_thread_dealer(endpoint)
+
     def _submit_transfer(
         self,
         task: SendTaskBase,
@@ -851,6 +850,10 @@ class Sender(SenderBase):
             status = self._agent.submit_transfer_requests(request)
             task.attach_physical_status(peer_rank, status)
             if not status.wait():
+                # A non-success query is a logical transfer failure, but the
+                # current binding does not expose a backend-defined proof that
+                # the request handle has released every memory accessor. Treat
+                # it as physically unresolved until that contract is available.
                 detail = getattr(status, "last_status_str", lambda: "<no detail>")()
                 error = RuntimeError(f"NIXL transfer outcome is ambiguous: {detail}")
                 with self._ownership_poison_lock:
@@ -862,7 +865,7 @@ class Sender(SenderBase):
             with self._ownership_poison_lock:
                 self._ownership_poisoned = error
             self._agent_operation_gate.poison(error)
-            raise
+            return False, str(error)
 
     def _process_task_queue(self, thread_idx: int):
         device_id = self._device_id
@@ -998,7 +1001,7 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
+            self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
@@ -1030,7 +1033,7 @@ class Sender(SenderBase):
                 if owned:
                     task.finish_physical_operation(write_meta.peer_rank)
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
+                self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
                     _make_kv_result_msg(
                         self._instance_rank,
                         write_meta.unique_rid,
@@ -1051,7 +1054,7 @@ class Sender(SenderBase):
                     del request
                     task.finish_physical_operation(write_meta.peer_rank)
                 if not transfer_finished:
-                    agent_result = AgentResult.FAILED
+                    agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
                     agent_name = getattr(self._agent, "name", "<?>")
                     detail = (
                         f"KV transfer agent failed: "
@@ -1068,8 +1071,6 @@ class Sender(SenderBase):
                     logger.error(detail)
                     error = RuntimeError(detail)
                     task.fail(error)
-                    if owned:
-                        raise error
             except _TransferNotSubmittedError as error:
                 # Backend admission failed, so local resources are safe to retire.
                 transfer_finished = True
@@ -1099,7 +1100,10 @@ class Sender(SenderBase):
             transfer_size=transfer_size,
             tail=tail,
         )
-        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
+        self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
+
+        if agent_result == AgentResult.IN_DOUBT:
+            return
 
         if timer:
             timer.record_task_end(write_meta.peer_rank)
@@ -1159,29 +1163,27 @@ class Sender(SenderBase):
                 if owned:
                     aux_task.finish_physical_operation(write_meta.peer_rank)
                 aux_task.fail(RuntimeError(f"build aux transfer request failed: {error}"))
-                self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
-                    [
-                        MessageType.AUX_AGENT_RESULT,
-                        str(self._instance_rank).encode("ascii"),
-                        str(write_meta.unique_rid).encode("ascii"),
-                        AgentResult.FAILED.value.encode("ascii"),
-                    ]
-                )
+                if not owned or session._claim_aux_result(write_meta.peer_rank):
+                    self._get_result_dealer(write_meta.peer_endpoint).send(
+                        _make_aux_result_msg(
+                            self._instance_rank,
+                            write_meta.unique_rid,
+                            AgentResult.FAILED,
+                        )
+                    )
                 return
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
             try:
-                transfer_finished, _ = self._submit_transfer(
+                transfer_finished, last_status = self._submit_transfer(
                     aux_task, write_meta.peer_rank, request
                 )
                 if transfer_finished:
                     del request
                     aux_task.finish_physical_operation(write_meta.peer_rank)
                 if not transfer_finished:
-                    agent_result = AgentResult.FAILED
-                    session.set_exception("aux transfer agent request failed")
-                    if owned:
-                        raise RuntimeError("aux transfer outcome is ambiguous; retaining source")
+                    agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
+                    session.set_exception(f"aux transfer agent request failed: {last_status}")
             except _TransferNotSubmittedError as error:
                 agent_result = AgentResult.FAILED
                 aux_task.fail(error)
@@ -1190,14 +1192,17 @@ class Sender(SenderBase):
         elif owned:
             aux_task.finish_physical_operation(write_meta.peer_rank)
 
-        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
-            [
-                MessageType.AUX_AGENT_RESULT,
-                str(self._instance_rank).encode("ascii"),
-                str(write_meta.unique_rid).encode("ascii"),
-                agent_result.value.encode("ascii"),
-            ]
-        )
+        if not owned or session._claim_aux_result(write_meta.peer_rank):
+            self._get_result_dealer(write_meta.peer_endpoint).send(
+                _make_aux_result_msg(
+                    self._instance_rank,
+                    write_meta.unique_rid,
+                    agent_result,
+                )
+            )
+
+        if agent_result == AgentResult.IN_DOUBT:
+            return
 
         if timer:
             timer.record_task_end(write_meta.peer_rank)
@@ -1519,8 +1524,17 @@ class Sender(SenderBase):
         # critical section small.  When not provided, we fetch it here (legacy / standalone path).
         if req_info_snapshot is None:
             req_info_snapshot = dict(self._get_req_info(task._unique_rid) or {})
+        first_error: Optional[Exception] = None
         for info in req_info_snapshot.values():
-            self._dispatch_task_to_peer(task, info)
+            try:
+                self._dispatch_task_to_peer(task, info)
+            except Exception as error:
+                if not isinstance(task, AuxSendTask):
+                    raise
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     def _dispatch_task_to_peer(self, task: KVSendTask | AuxSendTask, info: RecvReqInfo) -> None:
         owned = False
@@ -1584,14 +1598,18 @@ class Sender(SenderBase):
         ri: RankInfo = RankInfo.from_bytes(message[1])
         agent_name = ri.instance_name + str(ri.instance_rank)
         logger.debug(f"Loading remote transfer agent descriptor for peer '{agent_name}'")
-        with self._agent_operation_gate.metadata():
+        # NIXL serializes descriptor load against submit internally. This lock
+        # only closes the local load-vs-shutdown window; active transfers do
+        # not need to drain before a new peer is registered.
+        with self._loaded_remote_agents_lock:
+            if self._shutdown_requested:
+                return
             self._registrar.register(ri.instance_name, ri.instance_rank, ri)
             self._agent.load_remote_agent(
                 agent_name,
                 ri.transfer_engine_info,
             )
-            with self._loaded_remote_agents_lock:
-                self._loaded_remote_agents.add(agent_name)
+            self._loaded_remote_agents.add(agent_name)
         logger.debug(
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
         )
@@ -1623,26 +1641,31 @@ class Sender(SenderBase):
             with self._sessions_lock:
                 if self._get_session(info.unique_rid) is not session or session._closed:
                     tasks = None
+                    aux_task = None
+                    terminal = True
                 else:
                     self._save_peer_req_info(info)
                     tasks = list(session.kv_tasks)
+                    aux_task = session.aux_task
+                    terminal = session.has_failed()
             if tasks is None:
+                include_aux = bool(session._claim_unsubmitted_aux_failures_locked((info,)))
                 self._send_failed_result_to_receiver(
                     info,
-                    include_aux=getattr(session, "_need_aux", False),
+                    include_aux=include_aux,
                 )
                 return
-            # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
-            # Send it directly to unblock the receiver's TRANSFERRING task future;
-            # CANCEL_SESSION alone would leave it stuck indefinitely.
-            if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+            if terminal:
+                include_aux = bool(session._claim_unsubmitted_aux_failures_locked((info,)))
                 self._send_failed_result_to_receiver(
                     info,
-                    include_aux=getattr(session, "_need_aux", False),
+                    include_aux=include_aux,
                 )
                 return
         for task in tasks:
             self._dispatch_task_to_peer(task, info)
+        if aux_task is not None:
+            self._dispatch_task_to_peer(aux_task, info)
 
     def _send_failed_result_to_receiver(
         self,
@@ -1665,15 +1688,11 @@ class Sender(SenderBase):
             ]
             if include_aux:
                 messages.append(
-                    [MessageType.AUX_AGENT_RESULT]
-                    + [
-                        str(value).encode("ascii")
-                        for value in (
-                            self._instance_rank,
-                            info.unique_rid,
-                            AgentResult.FAILED.value,
-                        )
-                    ]
+                    _make_aux_result_msg(
+                        self._instance_rank,
+                        info.unique_rid,
+                        AgentResult.FAILED,
+                    )
                 )
             if defer_to_worker:
                 thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
@@ -1686,6 +1705,32 @@ class Sender(SenderBase):
         except Exception as e:
             logger.warning(
                 f"_respond_with_kv: failed to abort receiver for rid={info.unique_rid}: {e}"
+            )
+
+    def _send_aux_result_to_receiver(
+        self,
+        info: RecvReqInfo,
+        result: AgentResult,
+        *,
+        defer_to_worker: bool = True,
+    ) -> None:
+        try:
+            endpoint = self._registrar.get_peer_rank_info(
+                info.instance_name, info.instance_rank
+            ).self_endpoint
+            message = _make_aux_result_msg(
+                self._instance_rank,
+                info.unique_rid,
+                result,
+            )
+            if defer_to_worker:
+                thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
+                self._send_task_queues[thread_idx].put((endpoint, message))
+            else:
+                self._get_or_connect_dealer(endpoint).send(message)
+        except Exception as error:
+            logger.warning(
+                f"failed to report auxiliary transfer result for rid={info.unique_rid}: {error}"
             )
 
     def _send_failed_task_result_to_receiver(self, task: SendTaskBase, info: RecvReqInfo) -> None:
@@ -1705,10 +1750,15 @@ class Sender(SenderBase):
                     AgentResult.FAILED,
                 )
             else:
-                message = [MessageType.AUX_AGENT_RESULT] + [
-                    str(value).encode("ascii")
-                    for value in (self._instance_rank, info.unique_rid, AgentResult.FAILED.value)
-                ]
+                with self._sessions_lock:
+                    session = self._get_session(info.unique_rid)
+                if session is not None and not session._claim_aux_result(info.instance_rank):
+                    return
+                message = _make_aux_result_msg(
+                    self._instance_rank,
+                    info.unique_rid,
+                    AgentResult.FAILED,
+                )
             thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
             self._send_task_queues[thread_idx].put((endpoint, message))
         except Exception as error:
@@ -1843,6 +1893,7 @@ class TxSession(TxSessionBase):
         self.receiver_ready: bool = False
         self.kv_tasks = []
         self.aux_task = None
+        self._aux_result_reported: set[int] = set()
         self._has_last_slice = False
         self.lock = threading.Lock()
 
@@ -1912,14 +1963,64 @@ class TxSession(TxSessionBase):
         self._sender.dispatch_task(task, req_info_snapshot)
 
     def send_aux(self) -> AuxSendTask:
+        aux_failures: list[RecvReqInfo] = []
+        terminal_error: Optional[Exception] = None
+        task: Optional[AuxSendTask] = None
         with self.lock:
-            params = self._base_args.params
-            task = AuxSendTask(params, self.aux_slot)
-            task._unique_rid = self.disagg_request_id
-            self.aux_task = task
-            req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
+            req_info_snapshot = dict(self._sender._get_req_info(self.disagg_request_id) or {})
+            if self._closed or self._terminal_status is not None:
+                terminal_error = self._exception or RuntimeError(
+                    f"TxSession {self.disagg_request_id} became terminal before auxiliary submission"
+                )
+                aux_failures = self._claim_unsubmitted_aux_failures_locked(
+                    req_info_snapshot.values()
+                )
+            else:
+                params = self._base_args.params
+                task = AuxSendTask(params, self.aux_slot)
+                task._unique_rid = self.disagg_request_id
+                self.aux_task = task
+        self._report_unsubmitted_aux_failures(aux_failures)
+        if terminal_error is not None:
+            raise terminal_error
+        assert task is not None
         self._sender.dispatch_task(task, req_info_snapshot)
         return task
+
+    def _claim_unsubmitted_aux_failures_locked(
+        self, req_infos: Iterable[RecvReqInfo]
+    ) -> list[RecvReqInfo]:
+        if not self._enforce_physical_ownership or not self._need_aux:
+            return []
+        claimed = []
+        for info in req_infos:
+            peer_rank = info.instance_rank
+            if self.aux_task is not None and self.aux_task.has_started_physical_operation(
+                peer_rank
+            ):
+                continue
+            if not self._claim_aux_result_locked(peer_rank):
+                continue
+            claimed.append(info)
+        return claimed
+
+    def _claim_aux_result_locked(self, peer_rank: int) -> bool:
+        if peer_rank in self._aux_result_reported:
+            return False
+        self._aux_result_reported.add(peer_rank)
+        return True
+
+    def _claim_aux_result(self, peer_rank: int) -> bool:
+        with self.lock:
+            return self._claim_aux_result_locked(peer_rank)
+
+    def _claim_unsubmitted_aux_failure(self, info: RecvReqInfo) -> bool:
+        with self.lock:
+            return bool(self._claim_unsubmitted_aux_failures_locked((info,)))
+
+    def _report_unsubmitted_aux_failures(self, req_infos: list[RecvReqInfo]) -> None:
+        for info in req_infos:
+            self._sender._send_aux_result_to_receiver(info, AgentResult.FAILED)
 
     def pack_aux(self, request: LlmRequest) -> None:
         """Fill the aux buffer slot with token data from the given request."""
@@ -1975,6 +2076,7 @@ class TxSession(TxSessionBase):
         self._sender.send_cancel_to_receivers(self.disagg_request_id)
 
     def cancel_local(self) -> bool:
+        aux_failures: list[RecvReqInfo] = []
         with self.lock:
             if self._terminal_status == SessionStatus.CANCELLED:
                 return False
@@ -1985,7 +2087,10 @@ class TxSession(TxSessionBase):
                     task.fail(exc)
             if self.aux_task is not None and self.aux_task.status == TaskStatus.INIT:
                 self.aux_task.fail(exc)
-            return True
+            req_infos = list((self._sender._get_req_info(self.disagg_request_id) or {}).values())
+            aux_failures = self._claim_unsubmitted_aux_failures_locked(req_infos)
+        self._report_unsubmitted_aux_failures(aux_failures)
+        return True
 
     def has_transferring_tasks(self) -> bool:
         """True if any KV or auxiliary task is currently mid-write.
@@ -2099,10 +2204,11 @@ class TxSession(TxSessionBase):
             else WaitResult.COMPLETED
         )
 
-    def set_exception(self, reason: str = ""):
+    def set_exception(self, reason: str = "") -> None:
         msg = f"TxSession {self.disagg_request_id} exception"
         if reason:
             msg += f": {reason}"
+        aux_failures: list[RecvReqInfo] = []
         with self.lock:
             self._exception = RuntimeError(msg)
             self._terminal_status = SessionStatus.ERROR
@@ -2111,6 +2217,9 @@ class TxSession(TxSessionBase):
                     task.fail(self._exception)
             if self.aux_task is not None and not self.aux_task.is_done:
                 self.aux_task.fail(self._exception)
+            req_infos = list((self._sender._get_req_info(self.disagg_request_id) or {}).values())
+            aux_failures = self._claim_unsubmitted_aux_failures_locked(req_infos)
+        self._report_unsubmitted_aux_failures(aux_failures)
 
     @property
     def exception(self) -> Optional[Exception]:
@@ -2221,8 +2330,8 @@ class KVRecvTask:
     def cancel_unpublished(self) -> bool:
         return self._get_physical_owner().cancel_unpublished()
 
-    def mark_publication_ambiguous(self) -> None:
-        self._get_physical_owner().mark_publication_ambiguous()
+    def record_writer_in_doubt(self, peer_rank: int) -> bool:
+        return self._get_physical_owner().record_writer_in_doubt(peer_rank)
 
     def record_writer_result(
         self,
@@ -2284,6 +2393,8 @@ class Receiver(ReceiverBase):
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
         self._pre_cancelled_rids: set[int] = set()
         self._shutdown = False
+        self._ownership_admission_lock = threading.Lock()
+        self._ownership_poisoned: Optional[Exception] = None
 
         self._start_listener()
         logger.info(f"Receiver init with endpoint: {self._messenger.endpoint}")
@@ -2311,18 +2422,45 @@ class Receiver(ReceiverBase):
         with self._sessions_lock:
             self._sessions.pop(unique_rid, None)
 
+    def _get_ownership_admission_lock(self) -> threading.Lock:
+        lock = getattr(self, "_ownership_admission_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._ownership_admission_lock = lock
+        return lock
+
+    def _acquire_ownership_admission(self) -> Callable[[], None]:
+        lock = self._get_ownership_admission_lock()
+        lock.acquire()
+        error = getattr(self, "_ownership_poisoned", None)
+        if error is not None:
+            lock.release()
+            raise RuntimeError("receiver ownership admission is quarantined") from error
+        return lock.release
+
+    def _poison_ownership_locked(self, error: Exception) -> None:
+        if getattr(self, "_ownership_poisoned", None) is None:
+            self._ownership_poisoned = error
+
     def setup_session(self, rx_session: RxSessionBase):
+        release_admission = None
+        if getattr(rx_session, "_enforce_physical_ownership", False):
+            release_admission = self._acquire_ownership_admission()
         pre_cancel = False
-        with self._sessions_lock:
-            if self._shutdown:
-                raise RuntimeError("cannot create an RxSession after Receiver shutdown")
-            if getattr(rx_session, "_enforce_physical_ownership", False):
-                self._sessions[rx_session.disagg_request_id] = rx_session
-            else:
-                self._sessions[rx_session.disagg_request_id] = weakref.ref(rx_session)
-            if rx_session.disagg_request_id in self._pre_cancelled_rids:
-                pre_cancel = True
-                self._pre_cancelled_rids.discard(rx_session.disagg_request_id)
+        try:
+            with self._sessions_lock:
+                if self._shutdown:
+                    raise RuntimeError("cannot create an RxSession after Receiver shutdown")
+                if getattr(rx_session, "_enforce_physical_ownership", False):
+                    self._sessions[rx_session.disagg_request_id] = rx_session
+                else:
+                    self._sessions[rx_session.disagg_request_id] = weakref.ref(rx_session)
+                if rx_session.disagg_request_id in self._pre_cancelled_rids:
+                    pre_cancel = True
+                    self._pre_cancelled_rids.discard(rx_session.disagg_request_id)
+        finally:
+            if release_admission is not None:
+                release_admission()
         if pre_cancel:
             if getattr(rx_session, "_enforce_physical_ownership", False):
                 rx_session.cancel_local()
@@ -2576,15 +2714,19 @@ class Receiver(ReceiverBase):
         writer_cohort = (
             set(peer_ranks) if sender_dp_rank is not None or peer_infos.dp_size == 1 else None
         )
-        if not session.try_begin_transfer(
-            task.slice_id,
-            sender_endpoints,
-            writer_cohort,
-            publish=publish_requests,
-            published_writers=published_writers,
-        ):
-            self._bounce.release_idle_reservation(key)
-            task.cancel_unpublished()
+        release_admission = self._acquire_ownership_admission()
+        try:
+            if not session.try_begin_transfer(
+                task.slice_id,
+                sender_endpoints,
+                writer_cohort,
+                publish=publish_requests,
+                published_writers=published_writers,
+            ):
+                self._bounce.release_idle_reservation(key)
+                task.cancel_unpublished()
+        finally:
+            release_admission()
         return
 
     @staticmethod
@@ -2815,7 +2957,22 @@ class RxSession(RxSessionBase):
         # publication wins the state transition.
         self._publication_lock = threading.Lock()
         self.lock = threading.Lock()
-        self._receiver.setup_session(self)
+        try:
+            self._receiver.setup_session(self)
+        except Exception:
+            if self._aux_physical_owner is not None:
+                self._aux_physical_owner.cancel_unpublished()
+            with self._receiver._sessions_lock:
+                session_entry = self._receiver._sessions.get(self.disagg_request_id)
+                if (
+                    self._receiver._resolve_session_entry(self.disagg_request_id, session_entry)
+                    is self
+                ):
+                    self._receiver._sessions.pop(self.disagg_request_id, None)
+            if self._aux_buffer is not None and self.aux_slot is not None:
+                self._aux_buffer.free_slot(self.aux_slot)
+                self.aux_slot = None
+            raise
 
     @property
     def disagg_request_id(self) -> int:
@@ -2828,6 +2985,20 @@ class RxSession(RxSessionBase):
         if params.ctx_request_id is not None:
             return params.ctx_request_id
         return self.request_id
+
+    @contextmanager
+    def _ownership_evidence_guard(self) -> Iterator[None]:
+        get_lock = getattr(self._receiver, "_get_ownership_admission_lock", None)
+        if not self._enforce_physical_ownership or get_lock is None:
+            yield
+            return
+        with get_lock():
+            yield
+
+    def _poison_receiver_ownership(self, error: Exception) -> None:
+        poison = getattr(self._receiver, "_poison_ownership_locked", None)
+        if poison is not None:
+            poison(error)
 
     @property
     def status(self) -> SessionStatus:
@@ -2887,10 +3058,7 @@ class RxSession(RxSessionBase):
                     )
                     task.abort_publication(published_writers)
                     if self._aux_physical_owner is not None:
-                        if published_writers:
-                            self._aux_physical_owner.mark_publication_ambiguous()
-                        else:
-                            self._aux_physical_owner.cancel_unpublished()
+                        self._aux_physical_owner.abort_publication(published_writers)
                     raise
             task.finish_publication()
             if self._aux_physical_owner is not None:
@@ -2988,7 +3156,7 @@ class RxSession(RxSessionBase):
         src_base=None,
         transfer_size: int = 0,
     ):
-        with self.lock:
+        with self._ownership_evidence_guard(), self.lock:
             assert receiver_slice_id < len(self._kv_tasks), (
                 f"Receiver got receiver_slice_id={receiver_slice_id} but only has "
                 f"{len(self._kv_tasks)} receive task(s) for request {self.request_id}. "
@@ -2996,10 +3164,40 @@ class RxSession(RxSessionBase):
                 f"address a task this receiver posted."
             )
             task = self._kv_tasks[receiver_slice_id]
-            if status not in (AgentResult.SUCCESS, AgentResult.FAILED):
+            if status not in (
+                AgentResult.SUCCESS,
+                AgentResult.FAILED,
+                AgentResult.IN_DOUBT,
+            ):
                 raise ValueError(
                     f"Session {self.request_id} received unknown task status: {status.value}"
                 )
+            if status == AgentResult.IN_DOUBT:
+                if not self._enforce_physical_ownership:
+                    raise RuntimeError(
+                        "received IN_DOUBT evidence without physical ownership enabled"
+                    )
+                try:
+                    accepted = task.record_writer_in_doubt(peer_rank)
+                except Exception as error:
+                    task.fail(error)
+                    self._exception = error
+                    if self._terminal_status is None:
+                        self._terminal_status = SessionStatus.ERROR
+                    self._poison_receiver_ownership(error)
+                    raise
+                if not accepted:
+                    return
+                error = RuntimeError(
+                    f"KV transfer quiescence is unproven for request {self.request_id} "
+                    f"slice={receiver_slice_id} peer_rank={peer_rank}"
+                )
+                task.fail(error)
+                self._exception = error
+                if self._terminal_status is None:
+                    self._terminal_status = SessionStatus.ERROR
+                self._poison_receiver_ownership(error)
+                return
             if self._enforce_physical_ownership:
                 if status == AgentResult.FAILED or is_last_slice:
                     try:
@@ -3013,6 +3211,7 @@ class RxSession(RxSessionBase):
                         self._exception = error
                         if self._terminal_status is None:
                             self._terminal_status = SessionStatus.ERROR
+                        self._poison_receiver_ownership(error)
                         raise
                     if not accepted:
                         return
@@ -3111,7 +3310,7 @@ class RxSession(RxSessionBase):
     def process_aux_agent_result(self, peer_rank: int, status: AgentResult):
         # Aux is session-level (not per-slice); expected_transfers is identical
         # across all kv_tasks, so any task provides the right count.
-        with self.lock:
+        with self._ownership_evidence_guard(), self.lock:
             if not self._kv_tasks:
                 logger.warning(
                     f"Aux result received before any KV tasks for request {self.request_id}"
@@ -3119,6 +3318,32 @@ class RxSession(RxSessionBase):
                 return
             task = self._kv_tasks[0]
             all_succeeded = False
+            if status == AgentResult.IN_DOUBT:
+                if self._aux_physical_owner is None:
+                    raise RuntimeError(
+                        "received auxiliary IN_DOUBT evidence without physical ownership enabled"
+                    )
+                try:
+                    accepted = self._aux_physical_owner.record_writer_in_doubt(peer_rank)
+                except Exception as error:
+                    self._aux_status = TaskStatus.ERROR
+                    self._exception = error
+                    if self._terminal_status is None:
+                        self._terminal_status = SessionStatus.ERROR
+                    self._poison_receiver_ownership(error)
+                    raise
+                if not accepted:
+                    return
+                error = RuntimeError(
+                    f"auxiliary transfer quiescence is unproven for request "
+                    f"{self.request_id} peer_rank={peer_rank}"
+                )
+                self._aux_status = TaskStatus.ERROR
+                self._exception = error
+                if self._terminal_status is None:
+                    self._terminal_status = SessionStatus.ERROR
+                self._poison_receiver_ownership(error)
+                return
             if self._aux_physical_owner is not None:
                 try:
                     accepted, all_succeeded = self._aux_physical_owner.record_writer_result(
@@ -3131,6 +3356,7 @@ class RxSession(RxSessionBase):
                     self._exception = error
                     if self._terminal_status is None:
                         self._terminal_status = SessionStatus.ERROR
+                    self._poison_receiver_ownership(error)
                     raise
                 if not accepted:
                     return

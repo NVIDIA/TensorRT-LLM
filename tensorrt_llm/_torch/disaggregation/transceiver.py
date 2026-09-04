@@ -25,6 +25,7 @@ import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation.base.agent import use_pure_python_transfer_agent
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     RxSessionBase,
@@ -65,6 +66,8 @@ from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
+_FP4_MLA_OWNERSHIP_BRIDGE_ENV = "TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE"
+
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
     frequency_map = defaultdict(int)
@@ -85,17 +88,18 @@ def _validate_fp4_mla_bridge_profile(
     cache_transceiver_config: CacheTransceiverConfig,
 ) -> bool:
     """Select the bridge only for its explicit no-retry FP4-MLA deployment cell."""
+    if os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") != "1":
+        return False
     fp4_mla_layout = (
         isinstance(kv_cache_manager, KVCacheManagerV2)
         and kv_cache_manager.is_disagg
         and kv_cache_manager.dtype == DataType.NVFP4
         and kv_cache_manager.kv_cache_type == CacheTypeCpp.SELFKONLY
     )
-    if not fp4_mla_layout or os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") != "1":
-        return False
     supported = (
-        cache_transceiver_config.backend == "NIXL"
-        and cache_transceiver_config.transceiver_runtime == "PYTHON"
+        fp4_mla_layout
+        and os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") == "1"
+        and not use_pure_python_transfer_agent()
         and cache_transceiver_config.kv_transfer_timeout_ms is not None
         and cache_transceiver_config.kv_transfer_timeout_ms > 0
         and mapping.enable_attention_dp
@@ -109,8 +113,9 @@ def _validate_fp4_mla_bridge_profile(
     if not supported:
         raise ValueError(
             "FP4 MLA lifecycle bridge requires a disaggregated NVFP4 SELFKONLY "
-            "KVCacheManagerV2, a finite timeout, no-retry ADP, PP1/CP1, "
-            "async monolithic non-layerwise Python/NIXL transfer, and bounce disabled"
+            "KVCacheManagerV2, the C++ NIXL agent binding, a finite timeout, "
+            "no-retry ADP, PP1/CP1, "
+            "async monolithic non-layerwise transfer, and bounce disabled"
         )
     return True
 
@@ -185,7 +190,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             logger.info(
                 "FP4 MLA KV ownership bridge ENABLED: "
                 f"rank={rank}/{mapping.world_size}, backend=NIXL, runtime=PYTHON, "
-                "schedule=GENERATION_FIRST, attention_dp=True, pp=1, cp=1, "
+                "request_schedule_required=GENERATION_FIRST, attention_dp=True, pp=1, cp=1, "
                 "retry=False, async=True, layerwise=False, bounce_mb=0, "
                 f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}"
             )
@@ -536,9 +541,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         params = req.py_disaggregated_params
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
-    def _validate_bridge_req(self, req: LlmRequest, synchronous: bool = False) -> None:
+    def _validate_bridge_req(self, req: LlmRequest, synchronous: bool = False) -> bool:
         if not getattr(self, "_fp4_mla_bridge_enabled", False):
-            return
+            return True
         params = req.py_disaggregated_params
         rid = None if params is None else params.disagg_request_id
         if (
@@ -548,10 +553,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             or type(rid) is not int
             or rid < 0
         ):
-            raise ValueError(
+            logger.error(
                 "FP4 MLA lifecycle bridge requires async generation-first requests "
                 "with a non-negative integer disagg_request_id"
             )
+            req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            return False
+        return True
 
     def _ctx_consensus(self, local_ids: list) -> list:
         # TP consensus: ensure all TP ranks have peer info
@@ -935,7 +943,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def respond_and_send_async(self, req: LlmRequest) -> None:
         """Send the request's next KV slice to the generation server."""
 
-        self._validate_bridge_req(req)
+        if not self._validate_bridge_req(req):
+            return
         self._ever_had_send_session = True
         # Keep the latest slice's transfer-start timestamp.
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
@@ -972,7 +981,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest) -> None:
-        self._validate_bridge_req(req, synchronous=True)
+        if not self._validate_bridge_req(req, synchronous=True):
+            return
         rid = get_unique_rid(req)
         self._ever_had_recv_session = True
         if rid in self._recv_sessions:
@@ -1025,7 +1035,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req: The generation request whose KV cache blocks to receive
                 into.
         """
-        self._validate_bridge_req(req)
+        if not self._validate_bridge_req(req):
+            return
         self._ever_had_recv_session = True
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         rid = get_unique_rid(req)
@@ -1370,7 +1381,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Place new generation-first context requests into wait state, then
         # use allgather consensus to promote ready requests to CONTEXT_INIT.
         for req in requests:
-            self._validate_bridge_req(req)
+            if not self._validate_bridge_req(req):
+                continue
             rid = get_unique_rid(req)
             if rid not in self._send_sessions:
                 self._wait_reqs[rid] = req
