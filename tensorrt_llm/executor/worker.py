@@ -1,5 +1,6 @@
 import gc
 import os
+import sys
 import threading
 import time
 import traceback
@@ -32,6 +33,10 @@ from .worker_process_monitor import capture_worker_process_identity
 __all__ = [
     "GenerationExecutorWorker",
 ]
+
+# Home of the architecture registries, imported on demand: a worker that never
+# touches the PyTorch model zoo should not pay for it.
+_MODELING_UTILS_MODULE = "tensorrt_llm._torch.models.modeling_utils"
 
 
 class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
@@ -178,7 +183,7 @@ def worker_main(
     batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
     worker_cls: type = GenerationExecutorWorker,
     tracer_init_kwargs: Optional[dict] = None,
-    _torch_model_class_mapping: Optional[dict] = None,
+    _torch_external_model_modules: Optional[dict] = None,
     postproc_worker_config: Optional[PostprocWorkerConfig] = None,
     ready_signal: Optional[str] = None,
     worker_process_identities_signal: Optional[bytes] = None,
@@ -238,10 +243,17 @@ def worker_main(
         tracer.start()
         set_global_tracer(tracer)
 
-    if _torch_model_class_mapping is not None:
+    # Architectures the driver registered from outside the built-in zoo, as
+    # module names. Declaring them leaves this process's zoo lazy: the one
+    # module behind an architecture is imported when that architecture is
+    # looked up, not because the driver happened to have imported it. An empty
+    # declaration is still worth making once the registries exist, so a worker
+    # reused by a driver without custom modules releases the previous driver's
+    # providers; before that there is nothing registered to release.
+    if _torch_external_model_modules or _MODELING_UTILS_MODULE in sys.modules:
         from tensorrt_llm._torch.models.modeling_utils import \
-            MODEL_CLASS_MAPPING
-        MODEL_CLASS_MAPPING.update(**_torch_model_class_mapping)
+            register_external_model_modules
+        register_external_model_modules(_torch_external_model_modules or {})
 
     set_mpi_session_cpp(mpi_comm())
 

@@ -13,6 +13,7 @@ loudly.
 
 import os
 import pickle
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,9 +50,10 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
     QWEN3_RECIPE,
     TransformerOutput,
 )
+from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer
 from tensorrt_llm.media.decoding import VideoStreamInfo
-from tensorrt_llm.visual_gen.params import VisualGenParams
+from tensorrt_llm.visual_gen.params import MediaRef, VisualGenParams
 
 pytestmark = pytest.mark.cosmos3
 
@@ -157,8 +159,15 @@ class StubTransformer(nn.Module):
         del text_mask
         token = int(text_ids.reshape(-1)[0].item()) if text_ids.numel() else 0
         control_latents = kwargs.get("control_latents")
+        offload_context = kwargs.get("offload_context")
         torch.testing.assert_close(timestep, raw_timestep / self.calls_num_train_timesteps)
-        self.calls.append({"token": token, "has_control": control_latents is not None})
+        self.calls.append(
+            {
+                "token": token,
+                "has_control": control_latents is not None,
+                "offload_context": offload_context,
+            }
+        )
         if self.cached_kv is None:
             marker = torch.tensor([token], dtype=torch.float32)
             self.cached_kv = [(marker, marker + 100)]
@@ -233,6 +242,8 @@ def _started_timer() -> CudaPhaseTimer:
 def _make_pipeline(sampling=None):
     pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
     nn.Module.__init__(pipeline)
+    # __new__ skips BasePipeline.__init__, which is where ``_device`` is set.
+    pipeline._device = torch.device("cpu")
     pipeline.transformer = StubTransformer()
     # __new__ skips __init__, which is where the real pipeline resolves this
     # from the transformer config; the mode-defaults tables are keyed on it.
@@ -240,7 +251,8 @@ def _make_pipeline(sampling=None):
     pipeline.scheduler = StubScheduler()
     pipeline.sampling = sampling or StubSamplingPolicy()
     pipeline.safety_checker = None
-    pipeline.pipeline_config = SimpleNamespace(torch_dtype=torch.float32)
+    pipeline.pipeline_config = SimpleNamespace(torch_dtype=torch.float32, cpu_offload_config=None)
+    pipeline.offloader = PipelineOffloader(pipeline)
     pipeline.vae_scale_factor_temporal = 4
     pipeline._guidance_scale = None
     pipeline._num_timesteps = None
@@ -416,7 +428,7 @@ class TestSourceDerivedDefaults:
 
     REFERENCE = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"
 
-    def _infer_req(self, _params=None, **extra):
+    def _infer_req(self, _params=None, *, video=None, **extra):
         # Executor-merged shape: num_frames/frame_rate carry pipeline defaults,
         # height/width are declared None, and nothing reads as caller intent.
         params = (
@@ -430,6 +442,10 @@ class TestSourceDerivedDefaults:
             )
         )
         params.extra_params = dict(extra)
+        # The V2V reference reaches a worker resolved, so ``format="bytes"`` is
+        # the only spelling ``infer()`` can see.
+        if video is not None:
+            params.video_reference = [MediaRef(content=video, format="bytes")]
         return SimpleNamespace(params=params, prompt="a prompt")
 
     def _captured(self, req):
@@ -714,6 +730,20 @@ class TestDiffuseTransferCFG:
             (1, True),
         ]
         torch.testing.assert_close(result, torch.full_like(latents, 254.0))
+
+    def test_passes_offload_context_to_each_transformer_branch(self):
+        pipeline = _make_pipeline()
+
+        def offload_context(_component_name):
+            return nullcontext()
+
+        pipeline.offloader.context_if_requested = offload_context
+        self._run(pipeline, timesteps=[7], guidance_scale=3.0, control_guidance=1.5)
+
+        assert len(pipeline.transformer.calls) == 3
+        assert all(
+            call["offload_context"] is offload_context for call in pipeline.transformer.calls
+        )
 
     def test_skips_idle_cfg_branches(self):
         control_only = _make_pipeline()
@@ -1183,6 +1213,12 @@ class TestTransferSamplingAndSafety:
         pipeline = _make_pipeline()
         seen = {}
 
+        def offload_context(component_name):
+            seen["offload_component"] = component_name
+            return nullcontext()
+
+        pipeline.offloader.context_if_requested = offload_context
+
         class Checker:
             pass
 
@@ -1194,6 +1230,9 @@ class TestTransferSamplingAndSafety:
         )
         self._run(pipeline, monkeypatch, use_guardrails=True)
         assert seen.get("called"), "transfer returned generated video unscreened"
+        assert (
+            seen["offload_component"] == pipeline_module.COSMOS3_VIDEO_GUARDRAIL_OFFLOAD_COMPONENT
+        )
 
     def test_phase_timings_are_populated(self, monkeypatch):
         output = self._run(_make_pipeline(), monkeypatch)

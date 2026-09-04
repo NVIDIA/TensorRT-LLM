@@ -31,13 +31,17 @@ overridden by a same-file narrow contribution.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 from typing import Optional
 
 from blocks import Stage, YAMLIndex
 
 from ._helpers import (
+    is_perf_stem,
+    iter_diff_added_post_line_numbers,
     iter_diff_post_line_numbers,
+    iter_diff_pre_image,
     lookup_paths_into_block_filters,
     resolve_affected_stages,
     stages_by_yaml_stem,
@@ -51,6 +55,23 @@ BLAST_RADIUS_FRACTION = 0.8
 
 ACCURACY_REFS_PREFIX = "tests/integration/defs/accuracy/references/"
 ACCURACY_DIR = "tests/integration/defs/accuracy"
+
+_CLASS_RE = re.compile(r"class\s+(\w+)")
+# `acceptance_length.yaml` keys tests directly (`TestC::test_m`) instead of
+# by HF model name, unlike every other reference YAML.
+_TEST_ID_KEY_RE = re.compile(r"^(Test\w+)::(\w+)$")
+
+
+def _scope_start_line(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+    """First line owned by `node`, decorators included.
+
+    `node.lineno` points at the `def` / `class` keyword, so decorators sit
+    above it. A decorator edit belongs to what it decorates — a
+    `@parametrize` change affects that test, a class-level
+    `@skip_pre_blackwell` affects that class — so folding the decorator
+    lines into the node's range keeps them off module scope.
+    """
+    return min([node.lineno, *(d.lineno for d in node.decorator_list)])
 
 
 def _map_lines_to_pytest_scopes(content: str, line_numbers: set[int]) -> Optional[set[str]]:
@@ -72,13 +93,13 @@ def _map_lines_to_pytest_scopes(content: str, line_numbers: set[int]) -> Optiona
             if not node.name.startswith("test"):
                 continue
             end = node.end_lineno or node.lineno
-            for ln in range(node.lineno, end + 1):
+            for ln in range(_scope_start_line(node), end + 1):
                 line_to_scope[ln] = node.name
         elif isinstance(node, ast.ClassDef):
             if not node.name.startswith("Test"):
                 continue
             class_end = node.end_lineno or node.lineno
-            for ln in range(node.lineno, class_end + 1):
+            for ln in range(_scope_start_line(node), class_end + 1):
                 line_to_scope[ln] = node.name
             for child in node.body:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -86,7 +107,7 @@ def _map_lines_to_pytest_scopes(content: str, line_numbers: set[int]) -> Optiona
                         continue
                     method_end = child.end_lineno or child.lineno
                     method_scope = f"{node.name}::{child.name}"
-                    for ln in range(child.lineno, method_end + 1):
+                    for ln in range(_scope_start_line(child), method_end + 1):
                         line_to_scope[ln] = method_scope
 
     scopes: set[str] = set()
@@ -96,10 +117,6 @@ def _map_lines_to_pytest_scopes(content: str, line_numbers: set[int]) -> Optiona
             return None
         scopes.add(scope)
     return scopes if scopes else None
-
-
-def _is_perf_stem(stem: str) -> bool:
-    return stem == "l0_perf" or "perf_sanity" in stem
 
 
 def _diff_has_deletions(diff: str) -> bool:
@@ -112,6 +129,14 @@ def _diff_has_deletions(diff: str) -> bool:
     return False
 
 
+def _yaml_top_key(raw: str) -> Optional[str]:
+    """The key of an unindented `<key>:` line, else None."""
+    if not raw or raw[0].isspace() or raw.lstrip().startswith("#"):
+        return None
+    stripped = raw.split("#", 1)[0].rstrip()
+    return stripped[:-1].strip().strip("'\"") if stripped.endswith(":") else None
+
+
 def _yaml_top_keys_for_lines(content: str, line_numbers: set[int]) -> set[str]:
     """Return the set of top-level YAML keys whose section contains any line in `line_numbers`.
 
@@ -121,12 +146,82 @@ def _yaml_top_keys_for_lines(content: str, line_numbers: set[int]) -> set[str]:
     keys: list[Optional[str]] = []
     current: Optional[str] = None
     for raw in content.splitlines():
-        if raw and not raw[0].isspace() and not raw.lstrip().startswith("#"):
-            stripped = raw.split("#", 1)[0].rstrip()
-            if stripped.endswith(":"):
-                current = stripped[:-1].strip().strip("'\"")
+        key = _yaml_top_key(raw)
+        if key is not None:
+            current = key
         keys.append(current)
     return {keys[i - 1] for i in line_numbers if 1 <= i <= len(keys) and keys[i - 1]}
+
+
+def _yaml_all_top_keys(content: str) -> set[str]:
+    """Every top-level key in the file."""
+    return {k for k in (_yaml_top_key(raw) for raw in content.splitlines()) if k}
+
+
+def _yaml_top_keys_from_deletions(diff: str) -> Optional[set[str]]:
+    """Top-level YAML keys owning each `-` line, read from the pre-image.
+
+    A deleted section's own key line is itself a `-` line, so the
+    pre-image view resolves it directly — which the post-image cannot,
+    since the section is gone. Returns None when any `-` line's owning
+    key is not visible in its hunk (only 3 context lines are guaranteed),
+    so the caller can fall back.
+    """
+    keys: set[str] = set()
+    current: Optional[str] = None
+    for sign, body in iter_diff_pre_image(diff):
+        if sign == "@":
+            current = None
+            continue
+        key = _yaml_top_key(body)
+        if key is not None:
+            current = key
+        if sign != "-" or not body.strip() or body.lstrip().startswith("#"):
+            continue
+        if current is None:
+            return None
+        keys.add(current)
+    return keys or None
+
+
+def _py_class_scopes_from_deletions(diff: str) -> Optional[set[str]]:
+    """`Test*` classes owning each `-` line, read from the pre-image.
+
+    A deleted class's own `class` statement is itself a `-` line, so the
+    pre-image view resolves it where the post-image cannot. Attribution
+    stops at class level: a method-level walk would have to guess which
+    `def` a stray decorator line belongs to, and class level is already
+    narrow enough to matter. Returns None when any `-` line has no
+    enclosing `Test*` class visible in its hunk (module scope, imports,
+    helpers), so the caller can fall back.
+    """
+    scopes: set[str] = set()
+    cls: Optional[tuple[str, int]] = None
+    pending = False  # `-` decorator lines awaiting the class they decorate
+    for sign, body in iter_diff_pre_image(diff):
+        if sign == "@":
+            cls, pending = None, False
+            continue
+        stripped = body.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(body) - len(body.lstrip())
+        match = _CLASS_RE.match(stripped)
+        if match is not None:
+            cls = (match.group(1), indent) if match.group(1).startswith("Test") else None
+        elif cls is not None and indent <= cls[1]:
+            cls = None
+        if sign != "-":
+            continue
+        if cls is None:
+            # A decorator can precede the class statement it decorates.
+            if stripped.startswith("@"):
+                pending = True
+                continue
+            return None
+        scopes.add(cls[0])
+        pending = False
+    return None if pending else (scopes or None)
 
 
 class TestsDefRule(Rule):
@@ -143,6 +238,8 @@ class TestsDefRule(Rule):
         self._stages_by_yaml = stages_by_yaml_stem(stages)
         self._repo_root = repo_root
         self._total_blocks = len(yaml_index.blocks)
+        self._acc_class_indexes: Optional[tuple[dict[str, list[str]], dict[str, list[str]]]] = None
+        self._acc_source_texts: tuple[str, ...] = ()
 
     def _compute_anchors(self, git_path: str, yaml_path: str, diff: str) -> list[str]:
         """Return lookup anchors for one file.
@@ -161,6 +258,8 @@ class TestsDefRule(Rule):
             content = (self._repo_root / git_path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             return [yaml_path]
+        if _diff_has_deletions(diff):
+            return self._recover_deleted_scope_anchors(yaml_path, content, diff)
         line_numbers = iter_diff_post_line_numbers(diff)
         if not line_numbers:
             return [yaml_path]
@@ -169,65 +268,147 @@ class TestsDefRule(Rule):
             return [yaml_path]
         return [f"{yaml_path}::{s}" for s in sorted(scopes)]
 
+    def _recover_deleted_scope_anchors(self, yaml_path: str, content: str, diff: str) -> list[str]:
+        """Combine post-image scopes for `+` lines with pre-image scopes for `-` lines.
+
+        Removed lines can anchor to the next surviving post-image scope,
+        so every diff with deletions takes this path before accepting
+        post-image mappings. Reading deleted lines from the pre-image
+        avoids attributing them to an adjacent surviving scope.
+        """
+        if not _diff_has_deletions(diff):
+            return [yaml_path]
+        deleted_scopes = _py_class_scopes_from_deletions(diff)
+        if deleted_scopes is None:
+            return [yaml_path]
+        scopes = set(deleted_scopes)
+        added = iter_diff_added_post_line_numbers(diff)
+        if added:
+            added_scopes = _map_lines_to_pytest_scopes(content, added)
+            if added_scopes is None:
+                return [yaml_path]
+            scopes |= added_scopes
+        return [f"{yaml_path}::{s}" for s in sorted(scopes)]
+
     def _compute_accuracy_reference_anchors(
         self, git_path: str, yaml_path: str, diff: str
     ) -> list[str]:
-        """Map a `references/<dataset>.yaml` diff to per-class anchors.
+        """Map a `references/<dataset>.yaml` diff to per-test anchors.
 
-        Each top-level YAML key is a HF model name; map those to test
-        classes via the `MODEL_NAME = "<hf>"` literal in
-        `accuracy/test_*.py`. Class-level anchors let
-        `find_match_for_path`'s lineage walk match every parametrization
-        of those classes. Falls back to `[yaml_path]` (→ dir walk-up to
-        `accuracy/`) when refinement isn't possible.
+        Top-level YAML keys name what the section is a reference for:
+        a HF model in most files, a `TestC::test_m` id in
+        `acceptance_length.yaml`. Either way they resolve to anchors
+        under `accuracy/test_*.py`, whose lineage walk then matches every
+        parametrization. Falls back to `[yaml_path]` (→ dir walk-up to
+        `accuracy/`) when the changed sections can't be resolved.
 
-        Refinement is only sound when every changed line has a post-
-        image position whose top-level key can be read directly. A `-`
-        line has no post-image position; `iter_diff_post_line_numbers`
-        anchors it to the next surviving line, which may belong to a
-        different model section (e.g. deleting `ModelA:` and its body
-        attributes those `-` lines to the start of `ModelB:`). Any
-        deletion therefore triggers fallback.
+        Each side of the diff is read from the image that can actually
+        answer for it: `+` lines from the post-image, `-` lines from the
+        diff's own pre-image view. Anchoring a `-` line to the next
+        surviving post-image line would misattribute it — deleting
+        `ModelA:` and its body lands those lines on `ModelB:`.
+
+        An empty anchor list is a zero-impact claim rather than a
+        failure. That is only sound when the sections are gone from the
+        post-PR YAML and their keys are absent from accuracy test sources
+        — the shape of a test-pruning PR, which drops a reference and its
+        test together. Otherwise the file-level fallback is retained.
         """
         if not diff:
-            return [yaml_path]
-        if _diff_has_deletions(diff):
-            return [yaml_path]
-        line_numbers = iter_diff_post_line_numbers(diff)
-        if not line_numbers:
             return [yaml_path]
         try:
             content = (self._repo_root / git_path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             return [yaml_path]
-        changed_models = _yaml_top_keys_for_lines(content, line_numbers)
-        if not changed_models:
+
+        changed_keys: set[str] = set()
+        if _diff_has_deletions(diff):
+            deleted_keys = _yaml_top_keys_from_deletions(diff)
+            if deleted_keys is None:
+                return [yaml_path]
+            changed_keys |= deleted_keys
+        added = iter_diff_added_post_line_numbers(diff)
+        if added:
+            changed_keys |= _yaml_top_keys_for_lines(content, added)
+        if not changed_keys:
             return [yaml_path]
-        model_map = self._accuracy_model_to_classes()
-        anchors = sorted({a for m in changed_models for a in model_map.get(m, ())})
-        return anchors or [yaml_path]
+
+        anchors: set[str] = set()
+        unresolved_keys: set[str] = set()
+        for key in changed_keys:
+            key_anchors = self._reference_key_anchors(key)
+            if key_anchors:
+                anchors.update(key_anchors)
+            else:
+                unresolved_keys.add(key)
+        if unresolved_keys and (
+            unresolved_keys & _yaml_all_top_keys(content)
+            or self._accuracy_sources_contain_any(unresolved_keys)
+        ):
+            return [yaml_path]
+        return sorted(anchors)
+
+    def _reference_key_anchors(self, key: str) -> list[str]:
+        """Anchors for one reference-YAML top-level key.
+
+        A `TestC::test_m` key (`acceptance_length.yaml`) resolves through
+        the class index; any other key is treated as a HF model name.
+        """
+        match = _TEST_ID_KEY_RE.match(key)
+        if match is None:
+            return list(self._accuracy_model_to_classes().get(key, ()))
+        class_name, method = match.groups()
+        return [f"{c}::{method}" for c in self._accuracy_class_to_paths().get(class_name, ())]
 
     def _accuracy_model_to_classes(self) -> dict[str, list[str]]:
-        """Cached: HF model name → list of `accuracy/test_X.py::ClassName`.
+        """HF model name → list of `accuracy/test_X.py::ClassName`."""
+        return self._scan_accuracy_classes()[0]
 
-        Built by AST-scanning `accuracy/test_*.py` for `class TestX:` with
-        a literal `MODEL_NAME = "<hf>"` assignment.
+    def _accuracy_class_to_paths(self) -> dict[str, list[str]]:
+        """Test class name → list of `accuracy/test_X.py::ClassName`.
+
+        A class name can appear in several modules (e.g. `TestKimiK3` in
+        both the text and multimodal accuracy files), so every definition
+        is kept.
         """
-        cached = getattr(self, "_acc_model_map", None)
-        if cached is not None:
-            return cached
-        out: dict[str, list[str]] = {}
+        return self._scan_accuracy_classes()[1]
+
+    def _accuracy_sources_contain_any(self, keys: set[str]) -> bool:
+        """Return whether any changed reference key appears in an accuracy test source."""
+        self._scan_accuracy_classes()
+        return any(key in source for source in self._acc_source_texts for key in keys)
+
+    def _scan_accuracy_classes(self) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        """Cached AST scan of `accuracy/test_*.py` for `Test*` classes.
+
+        Returns (model name → qualified classes, class name → qualified
+        classes). The first index is keyed by the literal
+        `MODEL_NAME = "<hf>"` assignment; classes without one appear only
+        in the second.
+        """
+        if self._acc_class_indexes is not None:
+            return self._acc_class_indexes
+        by_model: dict[str, list[str]] = {}
+        by_class: dict[str, list[str]] = {}
+        source_texts: list[str] = []
         acc_dir = self._repo_root / ACCURACY_DIR
         if acc_dir.is_dir():
             for py in sorted(acc_dir.glob("test_*.py")):
                 try:
-                    tree = ast.parse(py.read_text(encoding="utf-8"))
-                except (OSError, SyntaxError, UnicodeDecodeError):
+                    source = py.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                source_texts.append(source)
+                try:
+                    tree = ast.parse(source)
+                except (SyntaxError, ValueError):
                     continue
                 rel = f"accuracy/{py.name}"
                 for node in tree.body:
                     if not isinstance(node, ast.ClassDef) or not node.name.startswith("Test"):
                         continue
+                    qualified = f"{rel}::{node.name}"
+                    by_class.setdefault(node.name, []).append(qualified)
                     for child in node.body:
                         if not isinstance(child, ast.Assign):
                             continue
@@ -237,10 +418,11 @@ class TestsDefRule(Rule):
                             continue
                         v = child.value
                         if isinstance(v, ast.Constant) and isinstance(v.value, str):
-                            out.setdefault(v.value, []).append(f"{rel}::{node.name}")
+                            by_model.setdefault(v.value, []).append(qualified)
                             break
-        self._acc_model_map = out
-        return out
+        self._acc_source_texts = tuple(source_texts)
+        self._acc_class_indexes = (by_model, by_class)
+        return self._acc_class_indexes
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
         candidates = [
@@ -321,7 +503,7 @@ class TestsDefRule(Rule):
             block_filters, self.yaml_index, self._stages_by_yaml
         )
         sanity_relevant = any(stem == "l0_sanity_check" for stem, _ in block_filters)
-        perfsanity_relevant = any(_is_perf_stem(stem) for stem, _ in block_filters)
+        perfsanity_relevant = any(is_perf_stem(stem) for stem, _ in block_filters)
 
         nonarrow_note = ""
         if no_match:

@@ -1777,7 +1777,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
-        .def("_get_num_tokens_before_hybrid_pruning", &kv::KvCache::numTokensBeforeHybridPruning)
+        .def("_get_num_reusable_tokens_before_hybrid_pruning", &kv::KvCache::numReusableTokensBeforeHybridPruning)
+        .def("_get_num_reusable_tokens_before_pruning", &kv::KvCache::numReusableTokensBeforePruning)
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
             [](kv::KvCache& self, int hist) { self.setHistoryLength(hist); })
         .def_prop_rw("capacity", &kv::KvCache::capacity, [](kv::KvCache& self, int cap) { self.setCapacity(cap); })
@@ -2288,6 +2289,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_and_reset_ssm_snapshot_iteration_stats",
             [](kv::KvCacheManager& self)
             { return castSsmSnapshotIterationStatsByLifeCycle(self.getAndResetSsmSnapshotIterationStats()); })
+        .def("record_request_suspended", &kv::KvCacheManager::recordRequestSuspended)
+        .def("record_request_resumed", &kv::KvCacheManager::recordRequestResumed)
+        .def(
+            "get_and_reset_iteration_suspend_resume_stats", &kv::KvCacheManager::getAndResetIterationSuspendResumeStats)
         .def(
             "get_and_reset_iteration_peak_block_stats",
             [](kv::KvCacheManager& self, int cacheLevel)

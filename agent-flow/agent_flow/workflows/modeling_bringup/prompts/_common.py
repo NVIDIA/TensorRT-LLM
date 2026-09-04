@@ -107,7 +107,7 @@ DOMAIN_PRIMING = """\
   `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` and reason across
   module, backend, runtime contract, and KV-cache semantics.
 - For MoE work, read
-  `tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md` and reason
+  `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` and reason
   across routing, expert parallelism, quantization, and fused-kernel contracts.
 - Use `KVCacheManagerV2` for new-model bring-up. The TRTLLM and FlashInfer
   attention backends are both valid targets when the plan tests the selected
