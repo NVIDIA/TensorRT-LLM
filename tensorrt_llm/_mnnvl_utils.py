@@ -32,7 +32,53 @@ except ImportError:
     from cuda import cuda
 
 from ._dlpack_utils import pack_strided_memory
-from ._utils import get_sm_version, mpi_comm
+from torch.utils._python_dispatch import _disable_current_modes
+
+from ._utils import get_sm_version, mpi_comm, mpi_disabled
+
+
+class ProcessGroupComm:
+    """mpi4py-Comm-shaped adapter over a torch ProcessGroup.
+
+    Under a non-MPI orchestrator (Ray) the workers are not launched by mpirun, so
+    ``mpi_comm()`` is each process's own singleton world and ``Get_size()``
+    returns 1. MnnvlMemory used that size as the number of segments in the
+    strided workspace tensor while the MoE workspace is sized and indexed with
+    ``moe_ep_size``; the resulting geometry mismatch made
+    FusedMoeWorkspace::initializeLocalWorkspace memset past the end of the
+    allocation (CUDA_ERROR_ILLEGAL_ADDRESS, then a poisoned context and an
+    apparently unrelated IMA at the next CUDA call).
+
+    Only the four members MnnvlMemory actually uses are implemented.
+    tensorrt_llm/_torch/distributed/ops.py::_get_mnnvl_workspace_comm already
+    takes this ProcessGroup route; this brings _mnnvl_utils in line with it.
+    """
+
+    def __init__(self, pg):
+        self._pg = pg
+
+    def Get_size(self) -> int:
+        return torch.distributed.get_world_size(group=self._pg)
+
+    def Get_rank(self) -> int:
+        return torch.distributed.get_rank(group=self._pg)
+
+    def allgather(self, obj):
+        gathered = [None] * self.Get_size()
+        # MNNVL workspaces are set up while the model may be under MetaInitMode.
+        # all_gather_object materializes real CPU tensors and calls
+        # aten.set_.source_Storage on them, which that TorchDispatchMode rejects
+        # ("Meta tensor used in unsupported function"). This exchange is host-side
+        # setup, not model construction, so pop the active modes for its duration.
+        with _disable_current_modes():
+            torch.distributed.all_gather_object(gathered, obj, group=self._pg)
+        return gathered
+
+    def barrier(self) -> None:
+        # Same MetaInitMode problem: the public ProcessGroup barrier is a c10d
+        # operator and gets intercepted before it reaches Gloo. Call the CPU
+        # backend directly, as ops.py::_mnnvl_workspace_barrier does.
+        self._pg._get_backend(torch.device("cpu")).barrier().wait()
 from .logger import logger
 from .mapping import Mapping
 
@@ -268,6 +314,10 @@ class MnnvlMemory:
         return type(self).allocated_map[self.ptr].state is _MnnvlAllocationState.MAPPED
 
     def as_torch_strided_tensor(self, dtype):
+        # One segment per rank in the communicator; get_comm() must therefore
+        # agree with the caller's parallel size (e.g. moe_ep_size for the MoE
+        # workspace), or FusedMoeWorkspace::initializeLocalWorkspace indexes and
+        # memsets past the end of the allocation.
         num_segments = type(self).comm.Get_size()
         return pack_strided_memory(
             self.ptr, self.segment_size, self.rank_stride, num_segments, dtype, MnnvlMemory.dev_id
@@ -300,6 +350,11 @@ class MnnvlMemory:
     def get_comm(cls, mapping: Mapping):
         """Get TP-based communicator (ranks grouped by PP+CP+MOE_TP, ordered by TP rank)."""
         if cls.comm is not None:
+            return cls.comm
+        if mpi_disabled():
+            pg = mapping.tp_group_pg
+            assert pg is not None, "TP ProcessGroup not initialised"
+            cls.comm = ProcessGroupComm(pg)
             return cls.comm
         comm = mpi_comm().Split(
             (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size
@@ -926,6 +981,11 @@ class HelixCpMnnvlMemory(MnnvlMemory):
     def get_comm(cls, mapping: Mapping):
         """Get CP-based communicator (ranks grouped by PP+TP+MOE_TP, ordered by CP rank)."""
         if cls.comm is not None:
+            return cls.comm
+        if mpi_disabled():
+            pg = mapping.cp_group_pg
+            assert pg is not None, "CP ProcessGroup not initialised"
+            cls.comm = ProcessGroupComm(pg)
             return cls.comm
         comm = mpi_comm().Split(
             mapping.pp_rank * mapping.tp_size + mapping.tp_rank,
