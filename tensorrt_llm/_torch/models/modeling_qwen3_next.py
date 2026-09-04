@@ -23,7 +23,7 @@
 import copy
 import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional
 
 import torch
 
@@ -199,6 +199,14 @@ class Qwen3NextGate(nn.Module):
                 f"Unsupported routing method: {self.routing_method_type}")
 
 
+class _DeferredSharedExpertFinalize(NamedTuple):
+    """TP1 MoE operands owned by the next Hyper-Connection boundary."""
+
+    routed_output: torch.Tensor
+    shared_output: torch.Tensor
+    shared_gate_logits: torch.Tensor
+
+
 class Qwen3NextSparseMoeBlock(nn.Module):
 
     def __init__(
@@ -312,7 +320,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
         lora_params: Optional[dict] = None,
-    ) -> torch.Tensor:
+        defer_shared_expert_finalize: bool = False,
+    ) -> torch.Tensor | _DeferredSharedExpertFinalize:
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
@@ -364,6 +373,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             return final_hidden_states
 
         shared_expert_output, shared_expert_gate_logits = shared_expert_outputs
+        if (defer_shared_expert_finalize and self.mapping.tp_size == 1
+                and not use_dp_padding and len(orig_shape) == 2):
+            return _DeferredSharedExpertFinalize(
+                final_hidden_states,
+                shared_expert_output,
+                shared_expert_gate_logits,
+            )
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             output_tensor, _ = torch.ops.trtllm.allocate_output(
                 final_hidden_states, self.allreduce.output_buffer_kind,

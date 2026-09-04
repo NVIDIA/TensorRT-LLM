@@ -6,7 +6,17 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.qwen4_exp.hyper_connection import Qwen4ExpHyperConnection
-from tensorrt_llm._torch.modules.qwen4_exp.hyper_connection_kernels import hc_combine_norm
+from tensorrt_llm._torch.modules.qwen4_exp.hyper_connection_kernels import (
+    hc_combine_norm,
+    hc_moe_finalize_combine_norm,
+)
+from tensorrt_llm._torch.moe.fused_shared_expert import fused_sigmoid_gate_mul_add
+from tensorrt_llm._utils import is_sm_100f
+
+_skip_non_sm10x = pytest.mark.skipif(
+    torch.cuda.device_count() == 0 or not is_sm_100f(),
+    reason="requires SM10x GPU (SM100/SM103)",
+)
 
 
 def _reference_mix(module, hyper_input):
@@ -297,6 +307,123 @@ def test_combine_norm_rejects_a_reshaped_norm_weight():
             norm_weight,
             1e-6,
             4,
+        )
+
+
+@_skip_non_sm10x
+@torch.inference_mode()
+def test_deferred_moe_finalize_matches_staged_combine_norm_and_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fused boundary preserves both BF16 stores and padded row strides."""
+    monkeypatch.setenv("TRTLLM_LOW_M_GEMM_FUSED_EPILOGUE", "auto")
+    capability = Qwen4ExpHyperConnection(
+        hc_count=4,
+        hidden_size=8,
+        hc_lowrank=4,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    ).eval()
+    assert capability.can_fuse_deferred_moe(
+        torch.empty((1, 8), dtype=torch.bfloat16, device="cuda")
+    )
+
+    torch.manual_seed(42)
+    hc_count, hidden_size, eps = 4, 2560, 1e-6
+    for rows in (1, 2, 4, 8):
+        residual = torch.randn(
+            rows,
+            hc_count * hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        routed_output = torch.randn(
+            rows,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        shared_output = torch.randn_like(routed_output)
+        shared_gate_storage = torch.randn(
+            rows,
+            3,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        shared_gate_logits = shared_gate_storage[:, :1]
+        injection_storage = torch.randn(
+            rows,
+            hc_count + 4,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        injection_logits = injection_storage[:, :hc_count]
+        norm_weight = torch.randn(
+            hc_count * hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+        block_output = torch.empty_like(routed_output)
+        fused_sigmoid_gate_mul_add(
+            routed_output,
+            shared_gate_logits,
+            shared_output,
+            output=block_output,
+        )
+        expected = hc_combine_norm(
+            residual,
+            block_output,
+            injection_logits,
+            norm_weight,
+            eps,
+            hc_count,
+        )
+        actual = hc_moe_finalize_combine_norm(
+            residual,
+            routed_output,
+            shared_output,
+            shared_gate_logits,
+            injection_logits,
+            norm_weight,
+            eps,
+            hc_count,
+        )
+        for actual_tensor, expected_tensor in zip(actual, expected):
+            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0.0, atol=0.0)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = hc_moe_finalize_combine_norm(
+                residual,
+                routed_output,
+                shared_output,
+                shared_gate_logits,
+                injection_logits,
+                norm_weight,
+                eps,
+                hc_count,
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        for graph_tensor, expected_tensor in zip(graph_output, expected):
+            torch.testing.assert_close(graph_tensor, expected_tensor, rtol=0.0, atol=0.0)
+
+    overlapping_residual = torch.empty(
+        hc_count * hidden_size + 1,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).as_strided((2, hc_count * hidden_size), (1, 1))
+    with pytest.raises(ValueError, match="non-overlapping row-major"):
+        hc_moe_finalize_combine_norm(
+            overlapping_residual,
+            routed_output[:2],
+            shared_output[:2],
+            shared_gate_logits[:2],
+            injection_logits[:2],
+            norm_weight,
+            eps,
+            hc_count,
         )
 
 

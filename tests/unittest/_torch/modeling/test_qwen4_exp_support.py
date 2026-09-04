@@ -377,6 +377,82 @@ def test_text_model_is_eligible_for_online_eplb() -> None:
     assert "Qwen4ExpForConditionalGeneration" in moe_model_arch_list
 
 
+def test_shared_expert_finalize_is_deferred_only_for_requested_tp1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.models import modeling_qwen3_next
+    from tensorrt_llm._torch.models.modeling_qwen3_next import (
+        Qwen3NextSparseMoeBlock,
+        _DeferredSharedExpertFinalize,
+    )
+    from tensorrt_llm._torch.utils import EventType
+
+    block = object.__new__(Qwen3NextSparseMoeBlock)
+    nn.Module.__init__(block)
+    block.hidden_dim = 4
+    block.enable_attention_dp = False
+    block.mapping = SimpleNamespace(tp_size=1)
+    block.event_dict = {EventType.Main: None, EventType.MoeShared: None}
+    block.aux_stream = None
+
+    hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
+    routed_output = torch.randn_like(hidden_states)
+    shared_output = torch.randn_like(hidden_states)
+    shared_gate_logits = torch.randn(2, 1, dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        modeling_qwen3_next,
+        "maybe_execute_in_parallel",
+        lambda *args, **kwargs: (routed_output, (shared_output, shared_gate_logits)),
+    )
+    finalize_calls = 0
+
+    def finalize(
+        routed: torch.Tensor,
+        gate: torch.Tensor,
+        shared: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        nonlocal finalize_calls
+        finalize_calls += 1
+        result = routed + torch.sigmoid(gate) * shared
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
+
+    monkeypatch.setattr(modeling_qwen3_next, "fused_sigmoid_gate_mul_add", finalize)
+    metadata = SimpleNamespace(all_rank_num_tokens=[2])
+
+    deferred = block(
+        hidden_states,
+        metadata,
+        defer_shared_expert_finalize=True,
+    )
+    assert isinstance(deferred, _DeferredSharedExpertFinalize)
+    assert deferred.routed_output is routed_output
+    assert deferred.shared_output is shared_output
+    assert deferred.shared_gate_logits is shared_gate_logits
+    assert finalize_calls == 0
+
+    materialized = block(hidden_states, metadata)
+    torch.testing.assert_close(
+        materialized,
+        routed_output + torch.sigmoid(shared_gate_logits) * shared_output,
+    )
+    assert finalize_calls == 1
+
+    block.mapping.tp_size = 2
+    block.enable_attention_dp = True
+    monkeypatch.setattr(modeling_qwen3_next, "get_sm_version", lambda: 103)
+    materialized_tp2 = block(
+        hidden_states,
+        metadata,
+        defer_shared_expert_finalize=True,
+    )
+    torch.testing.assert_close(materialized_tp2, materialized)
+    assert finalize_calls == 2
+
+
 def test_hybrid_and_ple_layout_is_derived_from_config() -> None:
     from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
     from tensorrt_llm._torch.pyexecutor.config_utils import (
