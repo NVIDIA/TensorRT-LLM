@@ -572,7 +572,7 @@ def test_read_startup_observations_rejects_non_dict_entries(tmp_path: Path) -> N
     ],
 )
 def test_read_startup_observations_rejects_malformed_nested_fields(
-    tmp_path: Path, observation: dict
+    tmp_path: Path, observation: dict[str, object]
 ) -> None:
     perf_sanity.write_startup_observations(
         str(tmp_path), 0, [observation], observation_id="startup-1"
