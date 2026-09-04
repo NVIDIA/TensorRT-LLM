@@ -541,6 +541,26 @@ def test_read_startup_observations_handles_invalid_artifact(tmp_path: Path, cont
     assert bundle["observations"] == []
 
 
+def test_read_startup_observations_handles_invalid_utf8(tmp_path: Path) -> None:
+    (tmp_path / "startup_metrics.0.json").write_bytes(b"\xff")
+
+    bundle = perf_sanity.read_startup_observations(str(tmp_path), 0)
+
+    assert bundle["startup_observation_id"].startswith("startup-invalid-")
+    assert bundle["observations"] == []
+
+
+def test_read_startup_observations_rejects_non_dict_entries(tmp_path: Path) -> None:
+    (tmp_path / "startup_metrics.0.json").write_text(
+        '{"startup_observation_id":"startup-1","observations":[{"role":"aggregate"},42]}',
+        encoding="utf-8",
+    )
+
+    bundle = perf_sanity.read_startup_observations(str(tmp_path), 0)
+
+    assert bundle == {"startup_observation_id": "startup-1", "observations": []}
+
+
 def test_startup_fallback_reasons_are_deduplicated_and_capped() -> None:
     policies = [
         {
