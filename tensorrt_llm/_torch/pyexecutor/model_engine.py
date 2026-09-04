@@ -4056,6 +4056,7 @@ class PyTorchModelEngine(ModelEngine):
             if self.attn_backend.Metadata is TrtllmAttentionMetadata else None,
             kv_cache_manager=kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            enable_ragged_verification=self._dspark_confidence_enabled,
         )
         if isinstance(kv_cache_manager, BaseMambaCacheManager):
             self.attn_metadata.mamba_chunk_size = getattr(
