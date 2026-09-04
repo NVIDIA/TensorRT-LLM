@@ -887,7 +887,13 @@ class KvCacheCreator:
             requests.append(request)
             remaining_tokens -= input_seq_len
         if self._mapping.enable_attention_dp:
-            requests = requests * self._mapping.tp_size
+            # Group copies by request so every full ADP profiling admission
+            # cohort is rank-uniform. This avoids splitting ranks across
+            # separate cold-JIT kernel variants.
+            requests = [
+                base_request for base_request in requests
+                for _ in range(self._mapping.tp_size)
+            ]
         return requests
 
     def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
