@@ -1379,6 +1379,8 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
         self.mamba_ssm_rand_seed = None
+        self._mamba_seed_staging_host = None
+        self._mamba_seed_staging_dev = None
         self._dummy_request_mask = None
         self._dummy_request_mask_host = None
         self.old_x = None
@@ -1394,6 +1396,18 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         assert device is not None
         self.mamba_ssm_rand_seed = _allocate_mamba_seed_buffer(
             cache_size, self._seed_rank_offset, device)
+        # Staging for the per-request seed rewrites in
+        # _reset_context_mamba_slots: writing seeds via
+        # torch.tensor(list, device=...) is a blocking pageable H2D that
+        # stalls the executor thread behind everything already enqueued on
+        # the compute stream. A pinned host bounce plus an async device
+        # copy keeps the rewrite asynchronous; consumers read the seed
+        # buffer on the same stream, so ordering and seed values are
+        # unchanged (mirrors the _dummy_request_mask_host pattern).
+        self._mamba_seed_staging_host = torch.zeros(
+            cache_size, dtype=torch.int64, pin_memory=prefer_pinned())
+        self._mamba_seed_staging_dev = torch.zeros(
+            cache_size, dtype=torch.int64, device=device)
         if spec_config is None or not self._use_replay_state_update:
             return False
 
@@ -1472,11 +1486,11 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
             _compute_deterministic_mamba_seed(counter, slot, rank_offset)
             for slot in host_slots
         ]
-        self.mamba_ssm_rand_seed[context_slots] = torch.tensor(
-            new_seeds,
-            dtype=torch.int64,
-            device=self.mamba_ssm_rand_seed.device,
-        )
+        staging_host = self._mamba_seed_staging_host[:num_contexts]
+        staging_host.copy_(torch.tensor(new_seeds, dtype=torch.int64))
+        staging_dev = self._mamba_seed_staging_dev[:num_contexts]
+        staging_dev.copy_(staging_host, non_blocking=True)
+        self.mamba_ssm_rand_seed[context_slots] = staging_dev
 
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
