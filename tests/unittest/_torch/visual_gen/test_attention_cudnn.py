@@ -57,14 +57,15 @@ def _require_cudnn(recipe: str) -> None:
 
 def _make_qkv(batch, num_heads, num_kv_heads, seq_q, seq_kv, head_dim, device):
     torch.manual_seed(0)
-    q = torch.randn(batch, num_heads, seq_q, head_dim, device=device, dtype=torch.bfloat16)
-    k = torch.randn(batch, num_kv_heads, seq_kv, head_dim, device=device, dtype=torch.bfloat16)
-    v = torch.randn(batch, num_kv_heads, seq_kv, head_dim, device=device, dtype=torch.bfloat16)
+    q = torch.randn(batch, seq_q, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch, seq_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(batch, seq_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
     return q, k, v
 
 
 def _reference(q, k, v, is_causal):
-    """FP32 SDPA reference plus its log-sum-exp, in the backend's [B, S, H] LSE layout."""
+    """FP32 SDPA reference plus its log-sum-exp."""
+    q, k, v = (t.transpose(1, 2) for t in (q, k, v))
     num_heads, num_kv_heads = q.shape[1], k.shape[1]
     out = F.scaled_dot_product_attention(
         q.float(), k.float(), v.float(), is_causal=is_causal, enable_gqa=num_heads != num_kv_heads
@@ -75,7 +76,7 @@ def _reference(q, k, v, is_causal):
         seq_q, seq_kv = q.shape[2], k.shape[2]
         causal_mask = torch.ones(seq_q, seq_kv, device=q.device, dtype=torch.bool)
         logits = logits.masked_fill(causal_mask.triu(seq_kv - seq_q + 1), float("-inf"))
-    return out, torch.logsumexp(logits, dim=-1).transpose(1, 2)
+    return out.transpose(1, 2), torch.logsumexp(logits, dim=-1).transpose(1, 2)
 
 
 @pytest.mark.parametrize("recipe", list(RECIPES))
@@ -101,7 +102,7 @@ def test_cudnn_attention(recipe, shape, is_causal):
     output, lse = attention.forward_with_lse(q, k, v, attention_mask=mask)
 
     ref_out, ref_lse = _reference(q, k, v, is_causal)
-    assert output.shape == (batch, num_heads, seq_q, head_dim)
+    assert output.shape == (batch, seq_q, num_heads, head_dim)
     assert output.dtype == torch.bfloat16
     assert lse.shape == (batch, seq_q, num_heads)
 
@@ -190,5 +191,5 @@ def test_cudnn_backend_wires_validated_recipes():
     )
     assert isinstance(attention, CuDNNAttention)
     assert attention.recipe == "mxfp8"
-    assert attention.preferred_layout == AttentionTensorLayout.HND
+    assert attention.preferred_layout == AttentionTensorLayout.NHD
     assert attention.support_lse() and not attention.support_fused_qkv()

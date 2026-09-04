@@ -26,7 +26,9 @@ Recipe        ``quant_attention_config``                 cuDNN node
 ``mxfp8``     ``qk_dtype='mxfp8'``, ``v_dtype='mxfp8'``  ``sdpa_mxfp8``
 ============  =========================================  ==================
 
-Layout: HND ``[B, H, S, D]``.
+Layout: NHD ``[B, S, H, D]``.  cuDNN takes explicit per-tensor strides, so the
+NHD buffers are described to the graph as ``[B, H, S, D]`` with BSHD strides and
+never transposed into a real HND copy.
 """
 
 import math
@@ -182,8 +184,9 @@ class _CuDNNGraphBundle:
 class _CuDNNProblemShape:
     """Problem geometry shared by all three recipes.
 
-    The Q/K/V strides are part of the geometry, and of the graph cache key; the
-    MXFP8 recipe passes Q/K as views into sequence-padded buffers.
+    Every tensor's strides are part of the geometry, and of the graph cache key:
+    the FP8 and unquantized recipes hand cuDNN BSHD-strided views of NHD buffers,
+    and the MXFP8 recipe passes Q/K as views into sequence-padded buffers.
     """
 
     b: int
@@ -196,6 +199,8 @@ class _CuDNNProblemShape:
     q_strides: Tuple[int, ...]
     k_strides: Tuple[int, ...]
     v_strides: Tuple[int, ...]
+    o_strides: Tuple[int, ...]
+    stats_strides: Tuple[int, ...]
 
 
 # ============================================================================
@@ -217,6 +222,7 @@ class CuDNNAttention(AttentionBackend):
     _cudnn_lib_version = None
     _cudnn_handles: ClassVar[Dict[int, Any]] = {}
     _graph_cache: ClassVar[Dict[Tuple, _CuDNNGraphBundle]] = {}
+    _scales_cache: ClassVar[Dict[Tuple[int, str], Any]] = {}
     _cache_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
@@ -238,7 +244,9 @@ class CuDNNAttention(AttentionBackend):
         self.recipe = self.resolve_recipe(quant_attention_config)
         self.check_library_feature(self.recipe)
         self.scale = 1.0 / math.sqrt(head_dim)
-        self._preferred_layout = AttentionTensorLayout.HND
+
+        # Always use NHD via strides to avoid transpose.
+        self._preferred_layout = AttentionTensorLayout.NHD
 
     @staticmethod
     def resolve_recipe(quant_attention_config: Optional[QuantAttentionConfig]) -> str:
@@ -306,6 +314,7 @@ class CuDNNAttention(AttentionBackend):
         """Drop every compiled cuDNN graph (used by tests)."""
         with cls._cache_lock:
             cls._graph_cache.clear()
+            cls._scales_cache.clear()
 
     @staticmethod
     def _build_graph(
@@ -419,15 +428,15 @@ class CuDNNAttention(AttentionBackend):
             raise ValueError(f"Unknown cuDNN SDPA recipe {recipe!r}.")
 
         out_dims = (s.b, s.h_q, s.s_q, s.d_v)
-        o_t.set_output(True).set_dim(list(out_dims)).set_stride(
-            _row_major_stride(*out_dims)
-        ).set_data_type(out_cudnn_dtype)
+        o_t.set_output(True).set_dim(list(out_dims)).set_stride(list(s.o_strides)).set_data_type(
+            out_cudnn_dtype
+        )
         outputs: Dict[str, Any] = {"o": o_t}
 
         if with_lse:
             stats_dims = (s.b, s.h_q, s.s_q, 1)
             stats_t.set_output(True).set_dim(list(stats_dims)).set_stride(
-                _row_major_stride(*stats_dims)
+                list(s.stats_strides)
             ).set_data_type(f32)
             outputs["stats"] = stats_t
         # The quantized nodes emit amax(S) / amax(O) for calibration; inference binds
@@ -491,11 +500,33 @@ class CuDNNAttention(AttentionBackend):
     # Forward
     # ------------------------------------------------------------------
 
+    @classmethod
+    @torch.compiler.disable
+    def _softmax_scales(cls, recipe: str, device: torch.device) -> Any:
+        """Get the per-device cache for recipe-determined constants.
+
+        - recipe="fp8": (scale_s, descale_s, scale_o) for the FP8 recipe
+          Softmax output lies in [0, 1], so it is scaled by 448 to fill the FP8 range before Bmm2.
+        """
+        key = (device.index if device.index is not None else torch.cuda.current_device(), recipe)
+        with cls._cache_lock:
+            scales = cls._scales_cache.get(key)
+            if scales is None:
+                if recipe == "fp8":
+                    scale_s = torch.full((1, 1, 1, 1), 448.0, dtype=torch.float32, device=device)
+                    scale_o = torch.ones(1, 1, 1, 1, dtype=torch.float32, device=device)
+                    scales = (scale_s, scale_s.reciprocal(), scale_o)
+                    cls._scales_cache[key] = scales
+                else:
+                    # "no_quant" and "mxfp8" don't need device-side constants.
+                    pass
+            return scales
+
     def _validate_inputs(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         for name, tensor in (("q", q), ("k", k), ("v", v)):
             if tensor.dim() != 4:
                 raise ValueError(
-                    f"cuDNN backend expects a 4D [B, H, S, D] {name}; got {tuple(tensor.shape)}."
+                    f"cuDNN backend expects a 4D [B, S, H, D] {name}; got {tuple(tensor.shape)}."
                 )
         if k.shape[:3] != v.shape[:3]:
             raise ValueError(f"K/V shape mismatch: {tuple(k.shape)} vs {tuple(v.shape)}.")
@@ -508,14 +539,14 @@ class CuDNNAttention(AttentionBackend):
                 f"cuDNN backend was configured with head_dim={self.head_dim}, "
                 f"but received head_dim={q.shape[3]}."
             )
-        if q.shape[1] != self.num_heads:
+        if q.shape[2] != self.num_heads:
             raise ValueError(
                 f"cuDNN backend was configured with num_heads={self.num_heads}, "
-                f"but received num_heads={q.shape[1]}."
+                f"but received num_heads={q.shape[2]}."
             )
-        if q.shape[1] % k.shape[1] != 0:
+        if q.shape[2] % k.shape[2] != 0:
             raise ValueError(
-                f"num_heads={q.shape[1]} must be a multiple of num_kv_heads={k.shape[1]} for GQA."
+                f"num_heads={q.shape[2]} must be a multiple of num_kv_heads={k.shape[2]} for GQA."
             )
         # cuDNN's FP8 and MXFP8 SDPA engines support head_dim <= 128.
         if self.recipe != "no_quant" and max(q.shape[3], v.shape[3]) > 128:
@@ -537,37 +568,45 @@ class CuDNNAttention(AttentionBackend):
         with_lse: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         self._validate_inputs(q, k, v)
-        b, h_q, s_q, d_qk = q.shape
-        _, h_kv, s_kv, d_v = v.shape
+        b, s_q, h_q, d_qk = q.shape
+        _, s_kv, h_kv, d_v = v.shape
         device = q.device
         out_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
         q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
 
+        # Q/K/V arrive as NHD [B, S, H, D]. cuDNN wants a [B, H, S, D] *logical* tensor,
+        # but takes the strides explicitly, so `.transpose(1, 2)` stays a view and the
+        # BSHD bytes are fed to the kernel untouched -- no transpose copy anywhere.
         buffers: Dict[str, torch.Tensor] = {}
         if self.recipe == "no_quant":
-            buffers.update(q=q.contiguous(), k=k.contiguous(), v=v.contiguous())
+            buffers.update(
+                q=q.contiguous().transpose(1, 2),
+                k=k.contiguous().transpose(1, 2),
+                v=v.contiguous().transpose(1, 2),
+            )
         elif self.recipe == "fp8":
+            # Quantize in NHD so the fused amax+quantize op sees contiguous input.
             q_q, descale_q = _quantize_fp8(q)
             k_q, descale_k = _quantize_fp8(k)
             v_q, descale_v = _quantize_fp8(v)
-            # Scale the softmax output, which lies in [0, 1], to the FP8 range for the
-            # second GEMM.
-            scale_s = torch.full((1, 1, 1, 1), 448.0, dtype=torch.float32, device=device)
+            scale_s, descale_s, scale_o = self._softmax_scales(self.recipe, device)
             buffers.update(
-                q=q_q,
-                k=k_q,
-                v=v_q,
+                q=q_q.transpose(1, 2),
+                k=k_q.transpose(1, 2),
+                v=v_q.transpose(1, 2),
                 descale_q=descale_q,
                 descale_k=descale_k,
                 descale_v=descale_v,
-                descale_s=scale_s.reciprocal(),
+                descale_s=descale_s,
                 scale_s=scale_s,
-                scale_o=torch.ones(1, 1, 1, 1, dtype=torch.float32, device=device),
+                scale_o=scale_o,
             )
         else:  # mxfp8
-            q_q, descale_q = _quantize_mxfp8_qk(q)
-            k_q, descale_k = _quantize_mxfp8_qk(k)
-            v_q, descale_v = _quantize_mxfp8_v(v)
+            # The MXFP8 quantizers pad along S and emit their own HND buffers, so they
+            # take the [B, H, S, D] view and do the layout change as part of the pack.
+            q_q, descale_q = _quantize_mxfp8_qk(q.transpose(1, 2))
+            k_q, descale_k = _quantize_mxfp8_qk(k.transpose(1, 2))
+            v_q, descale_v = _quantize_mxfp8_v(v.transpose(1, 2))
             buffers.update(
                 q=q_q, k=k_q, v=v_q, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v
             )
@@ -583,6 +622,9 @@ class CuDNNAttention(AttentionBackend):
             q_strides=tuple(buffers["q"].stride()),
             k_strides=tuple(buffers["k"].stride()),
             v_strides=tuple(buffers["v"].stride()),
+            # O and stats are written straight into NHD buffers, likewise via strides.
+            o_strides=(s_q * h_q * d_v, d_v, h_q * d_v, 1),
+            stats_strides=(s_q * h_q, 1, h_q, 1),
         )
         bundle = self._get_or_build_graph(
             self.recipe,
@@ -594,14 +636,14 @@ class CuDNNAttention(AttentionBackend):
             device=device,
         )
 
-        output = torch.empty(b, h_q, s_q, d_v, dtype=out_dtype, device=device)
+        output = torch.empty(b, s_q, h_q, d_v, dtype=out_dtype, device=device)
         tensor_map = {bundle.inputs[name]: tensor for name, tensor in buffers.items()}
-        tensor_map[bundle.outputs["o"]] = output
+        tensor_map[bundle.outputs["o"]] = output.transpose(1, 2)
 
         stats: Optional[torch.Tensor] = None
         if with_lse:
-            stats = torch.empty(b, h_q, s_q, 1, dtype=torch.float32, device=device)
-            tensor_map[bundle.outputs["stats"]] = stats
+            stats = torch.empty(b, s_q, h_q, 1, dtype=torch.float32, device=device)
+            tensor_map[bundle.outputs["stats"]] = stats.transpose(1, 2)
         for amax_name in ("amax_s", "amax_o"):
             if amax_name in bundle.outputs:
                 tensor_map[bundle.outputs[amax_name]] = torch.empty(
@@ -610,8 +652,9 @@ class CuDNNAttention(AttentionBackend):
 
         self._execute_graph(bundle, tensor_map, device)
 
-        # cuDNN returns stats as [B, H, S, 1]; other backends expose LSE as [B, S, H].
-        lse = None if stats is None else stats.squeeze(-1).transpose(1, 2).contiguous()
+        # stats were written with [B, S, H, 1] strides, which is the [B, S, H] LSE
+        # layout the other backends expose once the trailing axis is dropped.
+        lse = None if stats is None else stats.squeeze(-1)
         return output, lse
 
     def forward(
@@ -627,14 +670,14 @@ class CuDNNAttention(AttentionBackend):
         """Run attention.
 
         Args:
-            q: Query tensor ``[B, H, S_q, D]``.
-            k: Key tensor ``[B, H_kv, S_kv, D]``.
-            v: Value tensor ``[B, H_kv, S_kv, D_v]``.
+            q: Query tensor ``[B, S_q, H, D]``.
+            k: Key tensor ``[B, S_kv, H_kv, D]``.
+            v: Value tensor ``[B, S_kv, H_kv, D_v]``.
             attention_mask: ``CAUSAL`` or ``FULL``.
             key_padding_mask: Not supported by this backend.
 
         Returns:
-            Output tensor ``[B, H, S_q, D_v]``.
+            Output tensor ``[B, S_q, H, D_v]``.
         """
         output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
@@ -653,7 +696,7 @@ class CuDNNAttention(AttentionBackend):
         """Same as :meth:`forward`, additionally returning the softmax log-sum-exp.
 
         Returns:
-            output: ``[B, H, S_q, D_v]``
+            output: ``[B, S_q, H, D_v]``
             lse: ``[B, S_q, H]`` float32
         """
         output, lse = self._run(
