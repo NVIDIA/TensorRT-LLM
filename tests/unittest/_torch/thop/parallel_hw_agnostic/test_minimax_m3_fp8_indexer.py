@@ -164,7 +164,8 @@ def _run_with_slot_tail(tail_slot, num_live_tokens, seed):
 
     Mirrors what the model hands over: index-Q is produced for every row, while
     only the live prefix owns a cache slot. Asserts that the tail wrote nothing
-    anywhere and that the live rows still match the reference.
+    anywhere and that the live rows still match the reference. Each live row
+    takes a page of its own, so num_live_tokens must not exceed num_pages.
     """
     torch.manual_seed(seed)
     num_heads_q, page_size, num_pages, padded_tokens = 4, 128, 4, 17
@@ -207,7 +208,7 @@ def _run_with_slot_tail(tail_slot, num_live_tokens, seed):
     _assert_untouched(view[:, 0][~live])
 
 
-@pytest.mark.parametrize("num_live_tokens", [0, 1, 5])
+@pytest.mark.parametrize("num_live_tokens", [0, 1, 4])
 def test_minimax_m3_fp8_indexer_skips_negative_slots(num_live_tokens):
     """A negative slot marks a padded row and must be a cache-write no-op.
 
@@ -229,4 +230,4 @@ def test_minimax_m3_fp8_indexer_skips_slots_past_the_cache(tail_slot):
     out-of-range slot and stay inside the guard pages, so a regression fails an
     assert instead of killing the process.
     """
-    _run_with_slot_tail(tail_slot, num_live_tokens=5, seed=25)
+    _run_with_slot_tail(tail_slot, num_live_tokens=4, seed=25)

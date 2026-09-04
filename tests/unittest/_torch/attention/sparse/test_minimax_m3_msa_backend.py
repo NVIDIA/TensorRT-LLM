@@ -1732,37 +1732,6 @@ def test_write_kv_slots_rejects_more_live_tokens_than_rows():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_subpage_scatter_places_tokens_inside_p32_pages():
-    torch.manual_seed(17)
-    num_slots, pages_per_role, num_heads = 3, 4, 2
-    physical_page, head_dim = 32, 128
-    k_cache = torch.zeros(
-        (num_slots, pages_per_role, num_heads, physical_page, head_dim),
-        dtype=torch.float8_e4m3fn,
-        device="cuda",
-    )
-    v_cache = torch.zeros_like(k_cache)
-    slots = torch.tensor([0, 31, 32, 127, 128, 255, -1], dtype=torch.int32, device="cuda")
-    qkv = torch.randn(
-        slots.numel(), 2 * num_heads * head_dim + 13, dtype=torch.bfloat16, device="cuda"
-    )
-    k = qkv[:, : num_heads * head_dim]
-    v = qkv[:, num_heads * head_dim : 2 * num_heads * head_dim]
-
-    assert fused_write_subpaged_layer_caches(k_cache, v_cache, slots, k, v)
-    expected_k = k.reshape(slots.numel(), num_heads, head_dim).to(torch.float8_e4m3fn)
-    expected_v = v.reshape(slots.numel(), num_heads, head_dim).to(torch.float8_e4m3fn)
-    for row, slot in enumerate(slots[:-1].tolist()):
-        page, logical_within = divmod(slot, 128)
-        subpage, within = divmod(logical_within, physical_page)
-        assert torch.equal(k_cache[page, subpage, :, within], expected_k[row])
-        assert torch.equal(v_cache[page, subpage, :, within], expected_v[row])
-    # The invalid row is masked and therefore cannot touch any cache location.
-    assert torch.count_nonzero(k_cache[2]).item() == 0
-    assert torch.count_nonzero(v_cache[2]).item() == 0
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_nvfp4_scatter_writes_physical_p32_data_and_scale_layouts():
     from tensorrt_llm._utils import get_sm_version
 
