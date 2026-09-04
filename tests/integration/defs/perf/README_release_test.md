@@ -109,8 +109,8 @@ if self._config.backend == "pytorch":
 
 ### 3.1 Full Test Cycles
 
-1. **llm_perf_full.yml** - Release performance test
-   - [test_lists/qa/llm_perf_full.yml](../../test_lists/qa/llm_perf_full.yml)
+1. **llm_perf_core.yml** - Release performance test
+   - [test_lists/qa/llm_perf_core.yml](../../test_lists/qa/llm_perf_core.yml)
 2. **llm_perf_cluster.yml** - Cluster performance test(for Blackwell)
    - [test_lists/qa/llm_perf_cluster.yml](../../test_lists/qa/llm_perf_cluster.yml)
 3. **llm_perf_nim.yml** - NIM performance test
