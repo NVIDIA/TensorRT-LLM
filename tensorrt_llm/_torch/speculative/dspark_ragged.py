@@ -24,7 +24,6 @@ and drives the MoE's chunk count, and an under-filled bucket desynchronizes
 them without raising.
 """
 
-import bisect
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -33,35 +32,16 @@ import torch
 __all__ = [
     "RaggedVerifyLayout",
     "build_qo_indptr",
-    "round_up_to_bucket",
     "row_ids_from_lens",
     "scatter_ragged_to_padded",
     "count_accepted_ragged",
     "fill_padded_rows_onehot",
     "ragged_gather_index_lists",
-    "RaggedCaptureShape",
     "RaggedPadSplit",
-    "choose_ragged_capture_shape",
     "resolve_ragged_pad_split",
     "fill_bucket_device",
     "build_row_maps_device",
 ]
-
-
-def round_up_to_bucket(total: int, buckets: Sequence[int]) -> int:
-    """Smallest captured bucket that fits ``total``.
-
-    Raises rather than clamping; callers must reject an oversized batch before
-    selecting a layout.
-    """
-    if not buckets:
-        raise ValueError("round_up_to_bucket requires a non-empty bucket list")
-    if total > buckets[-1]:
-        raise ValueError(
-            f"total {total} exceeds the largest captured bucket {buckets[-1]}; "
-            f"the caller must reject this batch before building a layout"
-        )
-    return buckets[bisect.bisect_left(buckets, total)]
 
 
 def build_qo_indptr(verify_lens: torch.Tensor) -> torch.Tensor:
@@ -112,24 +92,11 @@ class RaggedVerifyLayout:
         cls,
         verify_lens: torch.Tensor,
         *,
-        graph_num_tokens: Optional[int] = None,
-        buckets: Optional[Sequence[int]] = None,
+        graph_num_tokens: int,
         total_verify_tokens: Optional[int] = None,
     ) -> "RaggedVerifyLayout":
-        """Pack ``[bs]`` per-request lengths, rounding up to a captured bucket.
-
-        Give ``graph_num_tokens`` directly, or ``buckets`` plus a host-side
-        ``total_verify_tokens``; deriving the total from the device tensor
-        would sync.
-        """
+        """Pack ``[bs]`` lengths against an already selected graph token count."""
         lens = verify_lens.to(torch.int32)
-        if graph_num_tokens is None:
-            if buckets is None or total_verify_tokens is None:
-                raise ValueError(
-                    "give graph_num_tokens, or buckets + total_verify_tokens; "
-                    "deriving the total from the device tensor would sync"
-                )
-            graph_num_tokens = round_up_to_bucket(int(total_verify_tokens), buckets)
         indptr = build_qo_indptr(lens)
         return cls(
             verify_lens=lens,
@@ -245,19 +212,6 @@ class RaggedVerifyLayout:
 
 
 @dataclass(frozen=True)
-class RaggedCaptureShape:
-    """The ``(rows, tokens)`` pair a ragged batch is padded up to.
-
-    Attributes:
-        padded_bs: captured batch size (number of rows, real + pad requests).
-        bucket: captured token count, i.e. ``sum(verify_lens)`` after padding.
-    """
-
-    padded_bs: int
-    bucket: int
-
-
-@dataclass(frozen=True)
 class RaggedPadSplit:
     """A shared pad-row window and the token target left for real rows."""
 
@@ -308,88 +262,6 @@ def resolve_ragged_pad_split(
     if not real_floor <= real_target <= real_capacity:
         return None
     return RaggedPadSplit(pad_len=pad_len, real_target=real_target)
-
-
-def choose_ragged_capture_shape(
-    *,
-    num_real_requests: int,
-    total_verify_tokens: int,
-    bs_buckets: Sequence[int],
-    token_buckets: Sequence[int],
-    peer_stats: Optional[Sequence[Sequence[int]]] = None,
-    max_verify_len: Optional[int] = None,
-) -> RaggedCaptureShape:
-    """Pick the captured ``(padded_bs, bucket)`` for a ragged batch.
-
-    Under attention DP every rank must land on the *same* shape or the ranks
-    replay different graphs and their collectives diverge, so agreement comes
-    from rounding a reduction: pass every rank's
-    ``(num_real_requests, total_verify_tokens)`` as ``peer_stats`` (including
-    this rank's own) and each rank computes an identical
-
-        padded_bs = round_up_bs(max_r  num_real_r)
-        bucket    = round_up_bucket(padded_bs + max_r  (total_r - num_real_r))
-
-    where ``slack_r = total_r - num_real_r`` is the drafted-position count on
-    rank ``r`` and the ``padded_bs +`` term is the one-token-per-row floor.
-    Raises when no captured bucket fits; the caller must shrink the batch.
-
-    With ``max_verify_len`` given, the answer is additionally required to be
-    DECOMPOSABLE BY EVERY RANK (see :func:`resolve_ragged_pad_split`): the smallest
-    such bucket is chosen, walking past candidates any rank cannot realise,
-    so accept/decline is a pure function of the allgathered payload -- all
-    ranks pick the same bucket or all raise together.
-    """
-    if not bs_buckets:
-        raise ValueError("choose_ragged_capture_shape requires bs_buckets")
-    if num_real_requests < 0 or total_verify_tokens < num_real_requests:
-        raise ValueError(
-            f"total_verify_tokens {total_verify_tokens} cannot be below "
-            f"num_real_requests {num_real_requests} (every request verifies "
-            f"at least one position)"
-        )
-
-    stats = list(peer_stats) if peer_stats else [(num_real_requests, total_verify_tokens)]
-    # Peer entries may carry extra trailing fields; only the first two are read.
-    max_real = max(int(peer[0]) for peer in stats)
-    max_slack = max(int(peer[1]) - int(peer[0]) for peer in stats)
-
-    sorted_bs = sorted({int(b) for b in bs_buckets})
-    if max_real > sorted_bs[-1]:
-        raise ValueError(
-            f"{max_real} requests exceed the largest captured batch size "
-            f"{sorted_bs[-1]}; the caller must shrink the batch"
-        )
-    padded_bs = sorted_bs[bisect.bisect_left(sorted_bs, max_real)]
-
-    needed = padded_bs + max_slack
-    candidates = sorted({int(t) for t in token_buckets})
-    if max_verify_len is None:
-        bucket = round_up_to_bucket(needed, candidates)
-        return RaggedCaptureShape(padded_bs=padded_bs, bucket=bucket)
-    # Group-consistent choice: smallest captured bucket every rank can
-    # decompose. The floor requirement (bucket >= tokens_r + pad rows at one
-    # token each, i.e. >= needed at the widest rank) is subsumed by the
-    # decomposability test, so no separate >= needed cut is applied.
-    for cand in candidates:
-        if all(
-            resolve_ragged_pad_split(
-                bucket=cand,
-                num_real_requests=int(peer[0]),
-                total_real_tokens=int(peer[1]),
-                padded_bs=padded_bs,
-                max_verify_len=int(max_verify_len),
-            )
-            is not None
-            for peer in stats
-        ):
-            return RaggedCaptureShape(padded_bs=padded_bs, bucket=cand)
-    raise ValueError(
-        f"no captured bucket (grid {candidates}) is decomposable by every "
-        f"rank (peer stats {list(stats)}, padded_bs {padded_bs}, "
-        f"max_verify_len {max_verify_len}); the group falls back to uniform "
-        f"together rather than splitting its graph keys"
-    )
 
 
 def fill_bucket_device(
