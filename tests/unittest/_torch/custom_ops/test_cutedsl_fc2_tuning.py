@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Generator
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_fc2_n_tile_size_override_cache() -> Generator[None, None, None]:
+    cute_dsl_custom_ops._get_cutedsl_fc2_n_tile_size_override.cache_clear()
+    yield
+    cute_dsl_custom_ops._get_cutedsl_fc2_n_tile_size_override.cache_clear()
+
+
 def _make_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> "Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner":
@@ -44,17 +52,30 @@ def _make_runner(
 
 
 @pytest.mark.parametrize(
-    ("env_value", "expected_n_tiles"),
+    ("env_value", "expected_tactics"),
     [
-        (None, {128, 256}),
-        ("128", {128}),
-        ("256", {256}),
+        (
+            None,
+            [
+                ((128, 128), (1, 1), False),
+                ((128, 128), (1, 2), False),
+                ((128, 256), (1, 1), False),
+            ],
+        ),
+        (
+            "128",
+            [
+                ((128, 128), (1, 1), False),
+                ((128, 128), (1, 2), False),
+            ],
+        ),
+        ("256", [((128, 256), (1, 1), False)]),
     ],
 )
 def test_fc2_n_tile_size_override(
     monkeypatch: pytest.MonkeyPatch,
     env_value: str | None,
-    expected_n_tiles: set[int],
+    expected_tactics: list[tuple[tuple[int, int], tuple[int, int], bool]],
 ) -> None:
     if env_value is None:
         monkeypatch.delenv(_CUTEDSL_FC2_N_TILE_SIZE_ENV, raising=False)
@@ -66,7 +87,7 @@ def test_fc2_n_tile_size_override(
 
     tactics = runner.get_valid_tactics(inputs, OptimizationProfile())
 
-    assert {tactic[0][1] for tactic in tactics} == expected_n_tiles
+    assert tactics == expected_tactics
     assert runner._get_default_tactic()[0][1] == (int(env_value) if env_value is not None else 128)
     if env_value is None:
         assert "fc2_n_tile_size_override" not in runner.unique_id()
@@ -75,6 +96,14 @@ def test_fc2_n_tile_size_override(
             "fc2_n_tile_size_override",
             int(env_value),
         )
+
+
+def test_fc2_n_tile_size_override_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_CUTEDSL_FC2_N_TILE_SIZE_ENV, "128")
+    assert cute_dsl_custom_ops._get_cutedsl_fc2_n_tile_size_override() == 128
+
+    monkeypatch.setenv(_CUTEDSL_FC2_N_TILE_SIZE_ENV, "256")
+    assert cute_dsl_custom_ops._get_cutedsl_fc2_n_tile_size_override() == 128
 
 
 @pytest.mark.parametrize("env_value", ["", "64", "128,256", " 128", "invalid"])

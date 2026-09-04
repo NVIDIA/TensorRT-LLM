@@ -123,6 +123,7 @@ def _get_sm107_nvfp4_default_mma_config(
     )
 
 
+@functools.lru_cache(maxsize=1)
 def _get_cutedsl_fc2_n_tile_size_override() -> Optional[int]:
     value = os.environ.get(_CUTEDSL_FC2_N_TILE_SIZE_ENV)
     if value is None:
@@ -2717,11 +2718,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)  # noqa: E741
 
-            mma_tiler_mn_candidates = [(self.tile_size, 128),
-                                       (self.tile_size, 256)]
-            if self.fc2_n_tile_size_override is not None:
-                mma_tiler_mn_candidates = [(self.tile_size,
-                                            self.fc2_n_tile_size_override)]
+            n_tile_size_candidates = ((self.fc2_n_tile_size_override, ) if
+                                      self.fc2_n_tile_size_override is not None
+                                      else _CUTEDSL_FC2_N_TILE_SIZES)
+            mma_tiler_mn_candidates = [(self.tile_size, n_tile_size)
+                                       for n_tile_size in n_tile_size_candidates
+                                       ]
             cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
                                            (self.tile_size // 128, 2)]
             # raster_along_m=False should be theoretically more performant than raster_along_m=True.
