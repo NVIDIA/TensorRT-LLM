@@ -642,6 +642,8 @@ class Cosmos3CrossAttention(Attention):
             enable_sequence_parallel=True,
         )
         model_config.attention.backend = original_backend
+        vgm = model_config.visual_gen_mapping
+        self._sequence_parallel = vgm is not None and vgm.seq_size > 1
 
         # Same flavor note as Cosmos3CausalAttention: attention Q/K norms are
         # fp32-weight-multiply in both recipes.
@@ -662,6 +664,7 @@ class Cosmos3CrossAttention(Attention):
         freqs_sin: torch.Tensor,
         timestep=None,
         real_text_lens: Optional[list[int]] = None,
+        global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -685,7 +688,24 @@ class Cosmos3CrossAttention(Attention):
         q, k = self.apply_qk_norm(q, k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
-        if real_text_lens is not None and batch_size > 1:
+        if self._sequence_parallel:
+            if real_text_lens is None or global_generated_seq_len is None:
+                raise ValueError(
+                    "Sequence-parallel Cosmos3 cross-attention requires text and generated "
+                    "sequence lengths."
+                )
+            out = self._attn_impl(
+                q,
+                k,
+                v,
+                attention_mask=PredefinedAttentionMask.FULL,
+                timestep=timestep,
+                replicated_k=k_und,
+                replicated_v=v_und,
+                replicated_k_lengths=real_text_lens,
+                global_generated_seq_len=global_generated_seq_len,
+            )
+        elif real_text_lens is not None and batch_size > 1:
             outs = []
             for b in range(batch_size):
                 Lb = int(real_text_lens[b])
@@ -853,6 +873,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs: Tuple[torch.Tensor, torch.Tensor],
         timestep=None,
         real_text_lens: Optional[list[int]] = None,
+        global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -866,6 +887,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             freqs_sin=sin,
             timestep=timestep,
             real_text_lens=real_text_lens,
+            global_generated_seq_len=global_generated_seq_len,
         )
         hidden_states = residual + hidden_states
 
@@ -1583,21 +1605,17 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             self.cached_freqs_gen = freqs_gen
 
             if self.sharder.is_active:
-                # Round max_real_len up to next multiple of sharder.size.
-                # At most size-1 extra positions, negligible softmax dilution.
-                val = (self.sharder.size - max_real_len % self.sharder.size) % self.sharder.size
-                S_text_shard_total = int(max_real_len) + val
-
-                self.cached_kv = []
-                for k, v in cached_kv_full:
-                    k = k[:, :S_text_shard_total].clone()
-                    v = v[:, :S_text_shard_total].clone()
-                    if val > 0:
-                        k[:, int(max_real_len) :] = 0
-                        v[:, int(max_real_len) :] = 0
-                    self.cached_kv.append(
-                        (self.sharder.shard(k, dim=1), self.sharder.shard(v, dim=1))
+                # Keep text K/V replicated. Ulysses shards their heads after
+                # its all-to-all; Attention2D partitions their sequence across
+                # partial-attention columns. This preserves a valid-prefix
+                # layout for unequal prompt lengths without padded keys.
+                self.cached_kv = [
+                    (
+                        k[:, : int(max_real_len)].contiguous(),
+                        v[:, : int(max_real_len)].contiguous(),
                     )
+                    for k, v in cached_kv_full
+                ]
             else:
                 self.cached_kv = cached_kv_full
 
@@ -1743,6 +1761,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         v_und,
                         freqs_gen,
                         timestep=timestep,
+                        real_text_lens=real_text_lens,
+                        global_generated_seq_len=S_gen,
                     )
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
