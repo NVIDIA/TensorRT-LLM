@@ -17,6 +17,7 @@ import pytest
 
 from tensorrt_llm._torch.attention_backend.fmha import registry
 from tensorrt_llm._torch.attention_backend.fmha.interface import Fmha
+from tensorrt_llm._torch.attention_backend.sparse.params import SparseRuntimeParams
 
 PRIMS_TS = "prims_ts"
 PRIMS_TS_BLOCK_SPARSE = "prims_ts_block_sparse"
@@ -51,7 +52,11 @@ def test_dense_fmhas_reject_unconsumed_block_sparse_inputs(name: str) -> None:
     attention = type("Attention", (), {})()
     fmha = object.__new__(registry.FMHA_LIBS[name])
     Fmha.__init__(fmha, attention)
-    forward_args = type("ForwardArgs", (), {"block_sparse_inputs": object()})()
+    forward_args = type(
+        "ForwardArgs",
+        (),
+        {"sparse_runtime_params": SparseRuntimeParams(block_sparse_inputs=object())},
+    )()
 
     assert not fmha.is_supported(
         object(),

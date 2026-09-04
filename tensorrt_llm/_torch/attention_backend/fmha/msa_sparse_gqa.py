@@ -5,7 +5,7 @@
 MsaSparseGqaFmha wraps the fmha_sm100 paged sparse GQA kernel and
 participates in the standard TrtllmAttention.forward dispatch loop. The
 owning MiniMax-M3 MSA attention layer runs an MsaIndexer to select the
-per-query KV blocks and publishes them on forward_args.sparse_runtime_params;
+per-query KV blocks and publishes them through the aggregate sparse prediction;
 this class attends over them.
 """
 
@@ -173,7 +173,7 @@ class MsaSparseGqaFmha(Fmha):
     """SM100 paged GQA FMHA powered by MSA's fmha_sm100 kernel.
 
     Handles every MiniMax-M3 MSA layer. Sparse layers pass the indexer's
-    selected KV block indices on forward_args.sparse_runtime_params.sparse_attn_indices
+    selected KV block indices on the aggregate sparse prediction
     and attend those blocks; dense layers leave the indices None and attend the
     full page table.
 
@@ -219,7 +219,8 @@ class MsaSparseGqaFmha(Fmha):
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
         del q, k, v, metadata, phase
-        return forward_args.block_sparse_inputs is None
+        sparse_runtime_params = forward_args.sparse_runtime_params
+        return sparse_runtime_params is None or sparse_runtime_params.block_sparse_inputs is None
 
     def forward(
         self,
@@ -236,7 +237,10 @@ class MsaSparseGqaFmha(Fmha):
         # Sparse layers attend the per-query top-k blocks with the sparse plan;
         # dense layers leave the indices None and attend the full page table
         # with the dense plan.
-        kv_block_indexes = forward_args.sparse_runtime_params.sparse_attn_indices
+        sparse_runtime_params = forward_args.sparse_runtime_params
+        if sparse_runtime_params is None:
+            raise RuntimeError("Sparse attention prediction must be prepared before FMHA dispatch")
+        kv_block_indexes = sparse_runtime_params.sparse_attn_indices
         if kv_block_indexes is not None:
             plan = metadata.msa_decode_gqa_plan
             if plan is None:

@@ -32,7 +32,6 @@ from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
-from .block_sparse import BlockSparseForwardInputs
 from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
                             SparseRuntimeParams)
 
@@ -965,10 +964,8 @@ class AttentionForwardArgs:
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[torch.Tensor] = None
 
-    block_sparse_inputs: Optional[BlockSparseForwardInputs] = None
     sparse_backend_args: Optional[SparseBackendForwardArgs] = None
-    sparse_runtime_params: SparseRuntimeParams = field(
-        default_factory=SparseRuntimeParams)
+    sparse_runtime_params: Optional[SparseRuntimeParams] = None
 
     @property
     def mask_type(self) -> int:

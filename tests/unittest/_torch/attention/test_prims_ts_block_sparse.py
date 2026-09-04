@@ -31,6 +31,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
+from tensorrt_llm._torch.attention_backend.sparse.params import SparseRuntimeParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -70,6 +71,22 @@ def _bitmask_inputs(*, proxy: bool):
         exact_block_bits=torch.ones((2, 1, 1, 1), dtype=torch.uint32),
         **(summaries if proxy else {}),
     )
+
+
+def _set_block_sparse_inputs(
+    forward_args: AttentionForwardArgs,
+    block_sparse_inputs,
+) -> None:
+    forward_args.sparse_runtime_params = SparseRuntimeParams(
+        block_sparse_inputs=block_sparse_inputs
+    )
+
+
+def _get_block_sparse_inputs(forward_args: AttentionForwardArgs):
+    sparse_runtime_params = forward_args.sparse_runtime_params
+    assert sparse_runtime_params is not None
+    assert sparse_runtime_params.block_sparse_inputs is not None
+    return sparse_runtime_params.block_sparse_inputs
 
 
 def _pack_token_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -140,7 +157,7 @@ def _contiguous_case():
         output=torch.empty_like(q),
         attention_input_type=AttentionInputType.context_only,
         attention_mask=PredefinedAttentionMask.FULL,
-        block_sparse_inputs=_bsr_inputs(),
+        sparse_runtime_params=SparseRuntimeParams(block_sparse_inputs=_bsr_inputs()),
     )
     return attention, fmha, q, k, v, metadata, args
 
@@ -183,7 +200,7 @@ def _paged_case():
         attention_mask=PredefinedAttentionMask.CAUSAL,
         attention_window_size=metadata.max_seq_len,
         is_fused_qkv=True,
-        block_sparse_inputs=_bsr_inputs(),
+        sparse_runtime_params=SparseRuntimeParams(block_sparse_inputs=_bsr_inputs()),
     )
     return attention, fmha, q, metadata, args
 
@@ -242,7 +259,7 @@ def test_block_sparse_support_reason_is_formal_and_paged_proxy_is_rejected(
     assert not contiguous.is_supported(q, k, v, metadata, args, phase=FmhaPhase.GENERATION)
 
     _attention, paged, q, metadata, args = _paged_case()
-    args.block_sparse_inputs = _bitmask_inputs(proxy=True)
+    _set_block_sparse_inputs(args, _bitmask_inputs(proxy=True))
     _supported, reason = paged._is_supported_with_reason(
         q, None, None, metadata, args, phase=FmhaPhase.GENERATION
     )
@@ -252,7 +269,7 @@ def test_block_sparse_support_reason_is_formal_and_paged_proxy_is_rejected(
 
 def test_contiguous_proxy_routes_reject_causal_mask_before_planning(monkeypatch) -> None:
     _attention, fmha, q, k, v, metadata, args = _contiguous_case()
-    args.block_sparse_inputs = _bitmask_inputs(proxy=True)
+    _set_block_sparse_inputs(args, _bitmask_inputs(proxy=True))
     args.attention_mask = PredefinedAttentionMask.CAUSAL
     monkeypatch.setattr(fmha, "_common_unsupported_reason", Mock(return_value=None))
 
@@ -327,12 +344,12 @@ def test_contiguous_wrappers_cache_static_profile_and_keep_routes_live(monkeypat
         ),
     ]
     for inputs in bsr_inputs:
-        args.block_sparse_inputs = inputs
+        _set_block_sparse_inputs(args, inputs)
         fmha._forward_contiguous(q, k, v, args)
 
     proxy_inputs = [_bitmask_inputs(proxy=True), _bitmask_inputs(proxy=True)]
     for inputs in proxy_inputs:
-        args.block_sparse_inputs = inputs
+        _set_block_sparse_inputs(args, inputs)
         fmha._forward_contiguous(q, k, v, args)
 
     assert factory.call_count == 2
@@ -444,16 +461,19 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
         )
 
     wrapper.run.side_effect = snapshot
-    first_inputs = args.block_sparse_inputs
+    first_inputs = _get_block_sparse_inputs(args)
     fmha.run_generation(params)
     block_tables[:, 0].add_(10)
     params.sequence_lengths = torch.tensor([130, 194], dtype=torch.int32)
-    args.block_sparse_inputs = _inputs_type(
-        q_block_size=64,
-        kv_block_size=64,
-        max_blocks_per_row=2,
-        block_indptr=torch.tensor([[[0, 1]], [[1, 4]]], dtype=torch.int32),
-        block_indices=torch.tensor([3, 2, 1, 0], dtype=torch.int32),
+    _set_block_sparse_inputs(
+        args,
+        _inputs_type(
+            q_block_size=64,
+            kv_block_size=64,
+            max_blocks_per_row=2,
+            block_indptr=torch.tensor([[[0, 1]], [[1, 4]]], dtype=torch.int32),
+            block_indices=torch.tensor([3, 2, 1, 0], dtype=torch.int32),
+        ),
     )
     fmha.run_generation(params)
 
@@ -468,7 +488,7 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
     torch.testing.assert_close(snapshots[0][2], torch.arange(8, dtype=torch.int32).view(2, 4))
     torch.testing.assert_close(snapshots[1][2], torch.arange(8, dtype=torch.int32).view(2, 4) + 10)
     assert snapshots[0][3] is first_inputs.block_indptr
-    assert snapshots[1][3] is args.block_sparse_inputs.block_indptr
+    assert snapshots[1][3] is _get_block_sparse_inputs(args).block_indptr
 
 
 def test_paged_block_tables_remain_live_across_graph_replay(monkeypatch) -> None:
@@ -619,12 +639,14 @@ def test_real_gpu_proxy_adapter_replays_live_routes_and_summaries() -> None:
         output=output,
         attention_input_type=AttentionInputType.context_only,
         attention_mask=PredefinedAttentionMask.FULL,
-        block_sparse_inputs=inputs_type(
-            q_block_size=64,
-            kv_block_size=64,
-            exact_block_bits=live_exact_bits,
-            k_summary=live_k_summary,
-            v_summary=live_v_summary,
+        sparse_runtime_params=SparseRuntimeParams(
+            block_sparse_inputs=inputs_type(
+                q_block_size=64,
+                kv_block_size=64,
+                exact_block_bits=live_exact_bits,
+                k_summary=live_k_summary,
+                v_summary=live_v_summary,
+            ),
         ),
     )
     metadata = SimpleNamespace(

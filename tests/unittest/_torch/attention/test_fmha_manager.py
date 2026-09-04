@@ -32,6 +32,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
+from tensorrt_llm._torch.attention_backend.sparse.params import SparseRuntimeParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -51,12 +52,14 @@ def _make_metadata(
     num_generations: int,
     num_ctx_tokens: int = 0,
     use_spec_decoding: bool = False,
+    num_sparse_topk: int = 0,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         num_contexts=num_contexts,
         num_generations=num_generations,
         num_ctx_tokens=num_ctx_tokens,
         use_spec_decoding=use_spec_decoding,
+        num_sparse_topk=num_sparse_topk,
     )
 
 
@@ -547,13 +550,19 @@ def test_fmha_cache_separates_block_sparse_mode(block_sparse_first: bool) -> Non
         attn,
         "block-sparse",
         events,
-        support_predicate=lambda forward_args: forward_args.block_sparse_inputs is not None,
+        support_predicate=lambda forward_args: (
+            forward_args.sparse_runtime_params is not None
+            and forward_args.sparse_runtime_params.block_sparse_inputs is not None
+        ),
     )
     dense_fmha = FakeFmha(
         attn,
         "dense",
         events,
-        support_predicate=lambda forward_args: forward_args.block_sparse_inputs is None,
+        support_predicate=lambda forward_args: (
+            forward_args.sparse_runtime_params is None
+            or forward_args.sparse_runtime_params.block_sparse_inputs is None
+        ),
     )
     manager.fmha_libs = [block_sparse_fmha, dense_fmha]
     metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
@@ -562,10 +571,12 @@ def test_fmha_cache_separates_block_sparse_mode(block_sparse_first: bool) -> Non
         False: AttentionForwardArgs(attention_input_type=AttentionInputType.context_only),
         True: AttentionForwardArgs(
             attention_input_type=AttentionInputType.context_only,
-            block_sparse_inputs=BlockSparseForwardInputs(
-                q_block_size=64,
-                kv_block_size=64,
-                exact_block_bits=torch.zeros((1, 1), dtype=torch.uint32),
+            sparse_runtime_params=SparseRuntimeParams(
+                block_sparse_inputs=BlockSparseForwardInputs(
+                    q_block_size=64,
+                    kv_block_size=64,
+                    exact_block_bits=torch.zeros((1, 1), dtype=torch.uint32),
+                ),
             ),
         ),
     }
@@ -589,7 +600,7 @@ def test_fmha_cache_separates_block_sparse_representations(bsr_first: bool) -> N
         "bsr",
         events,
         support_predicate=lambda forward_args: (
-            forward_args.block_sparse_inputs.sparse_format == "bsr"
+            forward_args.sparse_runtime_params.block_sparse_inputs.sparse_format == "bsr"
         ),
     )
     bitmask_only = FakeFmha(
@@ -597,7 +608,7 @@ def test_fmha_cache_separates_block_sparse_representations(bsr_first: bool) -> N
         "bitmask",
         events,
         support_predicate=lambda forward_args: (
-            forward_args.block_sparse_inputs.sparse_format == "bitmask"
+            forward_args.sparse_runtime_params.block_sparse_inputs.sparse_format == "bitmask"
         ),
     )
     manager.fmha_libs = [bsr_only, bitmask_only]
@@ -605,20 +616,24 @@ def test_fmha_cache_separates_block_sparse_representations(bsr_first: bool) -> N
     q = torch.empty((1, 4))
     bsr_args = AttentionForwardArgs(
         attention_input_type=AttentionInputType.context_only,
-        block_sparse_inputs=BlockSparseForwardInputs(
-            q_block_size=64,
-            kv_block_size=64,
-            max_blocks_per_row=1,
-            block_indptr=torch.tensor([0, 1], dtype=torch.int32),
-            block_indices=torch.tensor([0], dtype=torch.int32),
+        sparse_runtime_params=SparseRuntimeParams(
+            block_sparse_inputs=BlockSparseForwardInputs(
+                q_block_size=64,
+                kv_block_size=64,
+                max_blocks_per_row=1,
+                block_indptr=torch.tensor([0, 1], dtype=torch.int32),
+                block_indices=torch.tensor([0], dtype=torch.int32),
+            ),
         ),
     )
     bitmask_args = AttentionForwardArgs(
         attention_input_type=AttentionInputType.context_only,
-        block_sparse_inputs=BlockSparseForwardInputs(
-            q_block_size=64,
-            kv_block_size=64,
-            exact_block_bits=torch.zeros((1, 1), dtype=torch.uint32),
+        sparse_runtime_params=SparseRuntimeParams(
+            block_sparse_inputs=BlockSparseForwardInputs(
+                q_block_size=64,
+                kv_block_size=64,
+                exact_block_bits=torch.zeros((1, 1), dtype=torch.uint32),
+            ),
         ),
     )
     order = (bsr_args, bitmask_args) if bsr_first else (bitmask_args, bsr_args)
@@ -627,6 +642,100 @@ def test_fmha_cache_separates_block_sparse_representations(bsr_first: bool) -> N
         selected = [manager.select(attn, q, None, None, metadata, args) for args in order]
 
     assert selected == ([bsr_only, bitmask_only] if bsr_first else [bitmask_only, bsr_only])
+    assert len(manager._cache) == 2
+
+
+@pytest.mark.parametrize("legacy_field", ["sparse_kv_indices", "sparse_attn_indices"])
+@pytest.mark.parametrize(
+    ("first_state", "second_state"),
+    [
+        ("absent", "empty"),
+        ("empty", "absent"),
+        ("empty", "nonempty"),
+        ("nonempty", "empty"),
+    ],
+)
+def test_fmha_cache_separates_legacy_sparse_index_states(
+    legacy_field: str,
+    first_state: str,
+    second_state: str,
+) -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+
+    def index_state(forward_args: AttentionForwardArgs) -> str:
+        runtime = forward_args.sparse_runtime_params
+        indices = None if runtime is None else getattr(runtime, legacy_field)
+        if indices is None:
+            return "absent"
+        return "empty" if indices.numel() == 0 else "nonempty"
+
+    first_state_fmha = FakeFmha(
+        attn,
+        first_state,
+        events,
+        support_predicate=lambda forward_args: index_state(forward_args) == first_state,
+    )
+    second_state_fmha = FakeFmha(
+        attn,
+        second_state,
+        events,
+        support_predicate=lambda forward_args: index_state(forward_args) == second_state,
+    )
+    manager.fmha_libs = [first_state_fmha, second_state_fmha]
+    metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
+    q = torch.empty((1, 4))
+    by_state = {
+        "absent": AttentionForwardArgs(
+            attention_input_type=AttentionInputType.context_only,
+            sparse_runtime_params=SparseRuntimeParams(),
+        ),
+        "empty": AttentionForwardArgs(
+            attention_input_type=AttentionInputType.context_only,
+            sparse_runtime_params=SparseRuntimeParams(**{legacy_field: torch.empty(0)}),
+        ),
+        "nonempty": AttentionForwardArgs(
+            attention_input_type=AttentionInputType.context_only,
+            sparse_runtime_params=SparseRuntimeParams(**{legacy_field: torch.zeros(1)}),
+        ),
+    }
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        first = manager.select(attn, q, None, None, metadata, by_state[first_state])
+        second = manager.select(attn, q, None, None, metadata, by_state[second_state])
+
+    assert first is first_state_fmha
+    assert second is second_state_fmha
+    assert len(manager._cache) == 2
+
+
+@pytest.mark.parametrize("sparse_first", [False, True])
+def test_fmha_cache_separates_sparse_topk_mode(sparse_first: bool) -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    dense_only = FakeFmha(
+        attn,
+        "dense",
+        events,
+        request_support_predicate=lambda _q, metadata: metadata.num_sparse_topk == 0,
+    )
+    sparse_fmha = FakeFmha(attn, "sparse", events)
+    manager.fmha_libs = [dense_only, sparse_fmha]
+    metadata_by_mode = {
+        False: _make_metadata(num_contexts=1, num_generations=0, num_sparse_topk=0),
+        True: _make_metadata(num_contexts=1, num_generations=0, num_sparse_topk=64),
+    }
+    q = torch.empty((1, 4))
+    args = AttentionForwardArgs(attention_input_type=AttentionInputType.context_only)
+    order = (True, False) if sparse_first else (False, True)
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        selected = {
+            mode: manager.select(attn, q, None, None, metadata_by_mode[mode], args)
+            for mode in order
+        }
+
+    assert selected == {False: dense_only, True: sparse_fmha}
     assert len(manager._cache) == 2
 
 

@@ -290,8 +290,19 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         return None
 
     @staticmethod
-    def _has_legacy_sparse_prediction(forward_args: AttentionForwardArgs) -> bool:
+    def _get_block_sparse_inputs(
+        forward_args: AttentionForwardArgs,
+    ) -> BlockSparseForwardInputs | None:
+        sparse_runtime_params = forward_args.sparse_runtime_params
+        return (
+            sparse_runtime_params.block_sparse_inputs if sparse_runtime_params is not None else None
+        )
+
+    @staticmethod
+    def _has_legacy_sparse_runtime(forward_args: AttentionForwardArgs) -> bool:
         prediction = forward_args.sparse_runtime_params
+        if prediction is None:
+            return False
         return any(
             (
                 prediction.sparse_kv_indices is not None,
@@ -335,7 +346,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
     ) -> str | None:
-        inputs = forward_args.block_sparse_inputs
+        inputs = self._get_block_sparse_inputs(forward_args)
         if not isinstance(inputs, BlockSparseForwardInputs):
             return "live block-sparse forward inputs are required"
         if getattr(metadata, "is_cross", False):
@@ -362,7 +373,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
             return "Helix parallelism is not supported"
         if int(getattr(metadata, "num_sparse_topk", 0)) > 0:
             return "legacy sparse attention metadata is not supported"
-        if self._has_legacy_sparse_prediction(forward_args):
+        if self._has_legacy_sparse_runtime(forward_args):
             return "legacy sparse prediction cannot be combined with block-sparse inputs"
         if forward_args.enable_dsv4_epilogue_fusion:
             return "DSv4 epilogue fusion is not supported"
@@ -440,7 +451,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
     ) -> str | None:
-        inputs = forward_args.block_sparse_inputs
+        inputs = self._get_block_sparse_inputs(forward_args)
         if not isinstance(inputs, BlockSparseForwardInputs):
             return "live block-sparse forward inputs are required"
         if inputs.sparse_format != "bsr" or inputs.use_proxy_routes:
@@ -616,7 +627,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         assert q is not None and output_buffer is not None and sequence_lengths is not None
         metadata = params.meta
         forward_args = params.fwd
-        inputs = forward_args.block_sparse_inputs
+        inputs = self._get_block_sparse_inputs(forward_args)
         assert isinstance(inputs, BlockSparseForwardInputs)
         batch_size = params.num_requests
         seq_len_q = params.input_seq_length
@@ -740,7 +751,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
             return "Q, K, and V must share device and dtype"
         if int(k.shape[1]) != self.attn.num_kv_heads * self.attn.head_dim:
             return "K and V hidden dimensions do not match the attention configuration"
-        inputs = forward_args.block_sparse_inputs
+        inputs = self._get_block_sparse_inputs(forward_args)
         assert isinstance(inputs, BlockSparseForwardInputs)
         if inputs.use_proxy_routes and self._get_prims_mask_type(forward_args) != "dense":
             return "block-sparse proxy routes require mask_type='dense'"
@@ -791,7 +802,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         v: torch.Tensor,
         forward_args: AttentionForwardArgs,
     ) -> None:
-        inputs = forward_args.block_sparse_inputs
+        inputs = self._get_block_sparse_inputs(forward_args)
         assert isinstance(inputs, BlockSparseForwardInputs)
         assert forward_args.output is not None
         q_view, k_view, v_view, out_view = self._contiguous_views(

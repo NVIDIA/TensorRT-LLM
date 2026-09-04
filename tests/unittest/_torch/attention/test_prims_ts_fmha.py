@@ -38,6 +38,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
+from tensorrt_llm._torch.attention_backend.sparse.params import SparseRuntimeParams
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
@@ -185,7 +186,7 @@ def _support_result(
         is_fused_qkv=is_fused_qkv,
     )
     if has_sparse_runtime_metadata:
-        forward_args.sparse_runtime_params.sparse_kv_indices = torch.empty(1)
+        forward_args.sparse_runtime_params = SparseRuntimeParams(sparse_kv_indices=torch.empty(1))
     if attention_input_type == AttentionInputType.context_only:
         num_contexts, num_generations, num_ctx_tokens = 1, 0, 4
         kv_lens = [4]

@@ -81,11 +81,10 @@ def get_vanilla_sparse_attn_attention_backend(
 def get_trtllm_sparse_attn_attention_backend(
     sparse_params: "SparseParams",
 ) -> Type["AttentionBackend"]:
-    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
-
     from .deepseek_v4 import DeepseekV4TrtllmAttention
     from .dsa import DSATrtllmAttention
     from .rocket import RocketTrtllmAttention
+    from .skip_softmax.backend import SkipSoftmaxTrtllmAttention
 
     if sparse_params.algorithm == "rocket":
         return RocketTrtllmAttention
@@ -94,7 +93,7 @@ def get_trtllm_sparse_attn_attention_backend(
     elif sparse_params.algorithm == "deepseek_v4":
         return DeepseekV4TrtllmAttention
     elif sparse_params.algorithm == "skip_softmax":
-        return TrtllmAttention
+        return SkipSoftmaxTrtllmAttention
     elif sparse_params.algorithm == "minimax_m3":
         # The MiniMax-M3 sparse algorithm runs in Python through the
         # model-layer override; this backend exists so the standard

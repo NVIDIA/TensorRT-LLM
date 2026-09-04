@@ -34,6 +34,10 @@ def get_attention_backend(
             return get_flashinfer_sparse_attn_attention_backend(sparse_params)
         return FlashInferAttention
 
+    if sparse_params is not None:
+        raise ValueError(
+            f"Sparse attention algorithm {sparse_params.algorithm!r} cannot use "
+            f"unavailable or unknown attention backend {backend_name!r}.")
     logger.warning("Falling back to TRTLLM attention backend")
     return TrtllmAttention
 

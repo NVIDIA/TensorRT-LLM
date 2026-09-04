@@ -10,9 +10,10 @@ subclass directly.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import replace
 from importlib import import_module
 from typing import TYPE_CHECKING, Optional
+
+from .params import SparseRuntimeParams
 
 if TYPE_CHECKING:
     import torch
@@ -22,14 +23,13 @@ if TYPE_CHECKING:
     from ...modules.mla import MLA
     from ..interface import AttentionForwardArgs, AttentionMask, AttentionMetadata
     from ..trtllm import TrtllmAttention
-    from .params import SparseRuntimeParams
 
 __all__ = [
     "AttentionSparseHooks",
     "MLASparseHooks",
     "get_sparse_attention_hooks",
     "get_sparse_mla_hooks",
-    "prepare_sparse_runtime_params",
+    "prepare_sparse_attention_prediction",
     "register_attention_sparse_hooks",
     "register_mla_sparse_hooks",
 ]
@@ -217,30 +217,16 @@ def get_sparse_attention_hooks(attention: "Attention") -> Optional[AttentionSpar
     return None if hooks is None else hooks()
 
 
-def prepare_sparse_runtime_params(
+def prepare_sparse_attention_prediction(
     backend: "TrtllmAttention",
     q: "torch.Tensor",
     k: Optional["torch.Tensor"],
+    v: Optional["torch.Tensor"],
     metadata: "AttentionMetadata",
     forward_args: "AttentionForwardArgs",
-) -> "SparseRuntimeParams":
-    """Run backend prediction hooks and update attention-op parameters."""
+) -> SparseRuntimeParams:
+    """Return a precomputed prediction or invoke the backend predictor once."""
     runtime_params = forward_args.sparse_runtime_params
-    if backend.sparse_params is None:
+    if runtime_params is not None:
         return runtime_params
-
-    kv_indices, kv_offsets = backend.sparse_kv_predict(q, k, metadata, forward_args)
-    attn_indices, attn_offsets = backend.sparse_attn_predict(q, k, metadata, forward_args)
-    block_size = (
-        backend.sparse_params.indices_block_size
-        if attn_indices is not None or attn_offsets is not None
-        else runtime_params.sparse_attn_indices_block_size
-    )
-    return replace(
-        runtime_params,
-        sparse_kv_indices=kv_indices,
-        sparse_kv_offsets=kv_offsets,
-        sparse_attn_indices=attn_indices,
-        sparse_attn_offsets=attn_offsets,
-        sparse_attn_indices_block_size=block_size,
-    )
+    return backend.predict_sparse_attention(q, k, v, metadata, forward_args)

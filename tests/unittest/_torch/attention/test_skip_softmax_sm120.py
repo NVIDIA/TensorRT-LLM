@@ -30,6 +30,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.attention_backend.sparse.skip_softmax.backend import (
+    SkipSoftmaxTrtllmAttention,
+)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
@@ -75,13 +78,16 @@ def _run_context(
 ) -> tuple:
     """Build a TRTLLM attention layer + no-cache context metadata and run a
     packed-QKV causal prefill. Mirrors ``test_attention_no_cache``."""
-    AttentionCls = get_attention_backend("TRTLLM")
+    sparse_params = (
+        sparse_attention_config.to_sparse_params() if sparse_attention_config is not None else None
+    )
+    AttentionCls = get_attention_backend("TRTLLM", sparse_params=sparse_params)
     layer = AttentionCls(
         layer_idx=0,
         num_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
-        sparse_attention_config=sparse_attention_config,
+        sparse_params=sparse_params,
     )
 
     metadata = AttentionCls.Metadata(
@@ -148,7 +154,7 @@ def test_skip_softmax_context_matches_reference(
     )
     # Skip variant: a tiny threshold selects ENABLE_SKIP_SOFTMAX = true but skips
     # no tile, so it must also reproduce full softmax.
-    _, _, out_skip_softmax = _run_context(
+    skip_softmax_layer, _, out_skip_softmax = _run_context(
         num_heads,
         num_kv_heads,
         head_dim,
@@ -158,6 +164,9 @@ def test_skip_softmax_context_matches_reference(
         v,
         sparse_attention_config=SkipSoftmaxAttentionConfig(threshold_scale_factor=1e-30),
     )
+    assert isinstance(skip_softmax_layer, SkipSoftmaxTrtllmAttention)
+    runtime_params = skip_softmax_layer.sparse_params.scheduler.get_runtime_params()
+    assert runtime_params.threshold_scale_factor_prefill == pytest.approx(1e-30)
     torch.cuda.synchronize()
 
     # Both kernel variants must match the fp32 reference and each other (the

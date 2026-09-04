@@ -177,12 +177,16 @@ class PrimsTSFmha(PhasedFmha):
         phase: Optional[FmhaPhase] = None,
     ) -> tuple[bool, str]:
         """Return a conservative, side-effect-free whole-request support decision."""
+        sparse_runtime_params = fwd.sparse_runtime_params
+        if (
+            sparse_runtime_params is not None
+            and sparse_runtime_params.block_sparse_inputs is not None
+        ):
+            return False, "block_sparse_inputs are not supported."
         # PrimTS prepares workspace for every active request phase before
         # dispatch. Accept the phased dispatcher keyword, but do not narrow
         # support until that preparation is phase-aware too.
         del phase
-        if fwd.block_sparse_inputs is not None:
-            return False, "block_sparse_inputs are not supported."
         if q.device.type != "cuda":
             return False, "CUDA tensors are required."
         if not q.is_contiguous():
@@ -238,9 +242,9 @@ class PrimsTSFmha(PhasedFmha):
 
         if attn.sparse_params is not None:
             return False, "sparse attention is not supported."
-        if (
-            fwd.sparse_runtime_params.sparse_kv_indices is not None
-            or fwd.sparse_runtime_params.sparse_attn_indices is not None
+        if sparse_runtime_params is not None and (
+            sparse_runtime_params.sparse_kv_indices is not None
+            or sparse_runtime_params.sparse_attn_indices is not None
         ):
             return False, "sparse attention metadata is not supported."
         if meta.num_sparse_topk > 0:

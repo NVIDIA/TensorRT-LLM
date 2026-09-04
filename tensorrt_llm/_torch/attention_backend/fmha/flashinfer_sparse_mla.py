@@ -81,7 +81,8 @@ class FlashInferSparseMlaFmha(Fmha):
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
         del q, k, v, metadata, phase
-        return forward_args.block_sparse_inputs is None
+        sparse_runtime_params = forward_args.sparse_runtime_params
+        return sparse_runtime_params is None or sparse_runtime_params.block_sparse_inputs is None
 
     def forward(
         self,
