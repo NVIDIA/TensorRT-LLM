@@ -4586,15 +4586,14 @@ class TestDSparkConfidenceScheduling:
         """Scheduling on with the required profiled cost table."""
         kw["enable_confidence_scheduling"] = True
         kw.setdefault("confidence_sps_table_path", "/tmp/sps.json")
+        kw.setdefault("confidence_sps_live_fingerprint_path",
+                      "/tmp/runtime.json")
         return self._cfg(**kw)
 
     def test_defaults_are_off(self):
         c = self._cfg()
         assert c.enable_confidence_scheduling is False
         assert c.enable_fused_confidence_scheduler is False
-        assert c.confidence_verify_len_tiers is None
-        # With scheduling off the ladder is just the static length.
-        assert c.verify_len_tiers == [5]
 
     def test_knobs_require_the_master_switch(self):
         for kw in ({
@@ -4603,29 +4602,35 @@ class TestDSparkConfidenceScheduling:
                 "confidence_sps_table_path": "/tmp/sps.json"
         }, {
                 "confidence_sps_live_fingerprint_path": "/tmp/runtime.json"
-        }, {
-                "confidence_verify_len_tiers": [1, 5]
         }):
             with pytest.raises(ValueError,
                                match="enable_confidence_scheduling"):
                 self._cfg(**kw)
 
-    def test_default_ladder_is_derived_and_includes_the_full_block(self):
-        c = self._scheduled()
-        assert c.verify_len_tiers == [1, 3, 5]
+    @pytest.mark.parametrize(
+        ("missing", "message"),
+        [
+            ("confidence_sps_table_path", "confidence_sps_table_path"),
+            (
+                "confidence_sps_live_fingerprint_path",
+                "confidence_sps_live_fingerprint_path",
+            ),
+        ],
+    )
+    def test_exact_table_and_live_fingerprint_are_required(
+            self, missing, message):
+        values = {
+            "confidence_sps_table_path": "/tmp/sps.json",
+            "confidence_sps_live_fingerprint_path": "/tmp/runtime.json",
+        }
+        values[missing] = None
+        with pytest.raises(ValueError, match=message):
+            self._scheduled(**values)
 
-    def test_full_block_is_always_reachable(self):
-        """The full block is the fallback when confidence is stale; keep it."""
-        c = self._scheduled(confidence_verify_len_tiers=[1, 2])
-        assert c.verify_len_tiers[-1] == 5
-
-    def test_ladder_cannot_exceed_max_draft_len(self):
-        with pytest.raises(ValueError, match="exceeds max_draft_len"):
-            self._scheduled(confidence_verify_len_tiers=[1, 9])
-
-    def test_ladder_is_deduped_and_sorted(self):
-        c = self._scheduled(confidence_verify_len_tiers=[5, 1, 3, 3])
-        assert c.verify_len_tiers == [1, 3, 5]
+    def test_removed_legacy_verify_len_tiers_are_rejected(self):
+        with pytest.raises(ValidationError,
+                           match="confidence_verify_len_tiers"):
+            self._scheduled(confidence_verify_len_tiers=[1, 3, 5])
 
     def test_fused_scheduler_is_independently_gated(self):
         with pytest.raises(ValueError,

@@ -3098,28 +3098,17 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     confidence_sps_table_path: Optional[str] = Field(
         default=None,
         description=
-        "Path to a JSON file with the profiled decode step cost as a function of "
-        "the total verified token count. Without it the planner has a flat cost "
-        "model, under which every extra verified token looks free and the budget "
-        "degenerates to verify-all (no scheduling gain).",
+        "Path to an authenticated schema-v2 JSON table of measured decode step "
+        "costs keyed by exact rank-local CUDA-graph shape (G, V).",
         status="prototype")
 
     confidence_sps_live_fingerprint_path: Optional[str] = Field(
         default=None,
         description=
         "Path to an independently generated JSON fingerprint of the active "
-        "runtime. Required by schema-v2 exact T(G,V) cost tables so the table "
+        "runtime. Required by exact T(G,V) cost tables so the table "
         "cannot authenticate its own model, source, topology, GPU, or CUDA "
-        "graph ladder. Legacy one-dimensional SPS curves do not require it.",
-        status="prototype")
-
-    confidence_verify_len_tiers: Optional[List[PositiveInt]] = Field(
-        default=None,
-        description=
-        "Legacy uniform-scheduling draft lengths. Exact schema-v2 SPS tables "
-        "derive production CUDA-graph verifier budgets directly from their "
-        "measured T(G,V) cells and ignore this ladder. If None, the legacy "
-        "path defaults to [1, ceil(max_draft_len/2), max_draft_len].",
+        "graph ladder.",
         status="prototype")
 
     enable_fused_confidence_scheduler: bool = Field(
@@ -3153,13 +3142,11 @@ class DSparkDecodingConfig(DecodingBaseConfig):
             if (self.enable_fused_confidence_scheduler
                     or self.confidence_sts_path
                     or self.confidence_sps_table_path
-                    or self.confidence_sps_live_fingerprint_path
-                    or self.confidence_verify_len_tiers):
+                    or self.confidence_sps_live_fingerprint_path):
                 raise ValueError(
                     "enable_fused_confidence_scheduler / confidence_sts_path / "
                     "confidence_sps_table_path / "
-                    "confidence_sps_live_fingerprint_path / "
-                    "confidence_verify_len_tiers require "
+                    "confidence_sps_live_fingerprint_path require "
                     "enable_confidence_scheduling=True")
             return self
 
@@ -3167,29 +3154,12 @@ class DSparkDecodingConfig(DecodingBaseConfig):
             raise ValueError(
                 "enable_confidence_scheduling=True requires "
                 "confidence_sps_table_path from a matched static-cost sweep")
-        if self.max_draft_len is not None:
-            tiers = self.confidence_verify_len_tiers or [
-                1, max(1, (self.max_draft_len + 1) // 2), self.max_draft_len
-            ]
-            tiers = sorted({int(t) for t in tiers})
-            if tiers[-1] > self.max_draft_len:
-                raise ValueError(
-                    f"confidence_verify_len_tiers {tiers} exceeds max_draft_len "
-                    f"({self.max_draft_len}); a request cannot verify more tokens "
-                    f"than the draft proposes")
-            # The full block must stay reachable: it is the fallback used whenever
-            # the confidence snapshot is stale or the cost model is unprofiled.
-            if tiers[-1] != self.max_draft_len:
-                tiers.append(self.max_draft_len)
-            self.confidence_verify_len_tiers = tiers
+        if not self.confidence_sps_live_fingerprint_path:
+            raise ValueError(
+                "enable_confidence_scheduling=True requires "
+                "confidence_sps_live_fingerprint_path generated from the active runtime"
+            )
         return self
-
-    @property
-    def verify_len_tiers(self) -> List[int]:
-        """Captured draft-length ladder; ``[max_draft_len]`` when scheduling is off."""
-        if not self.enable_confidence_scheduling:
-            return [self.max_draft_len]
-        return list(self.confidence_verify_len_tiers or [self.max_draft_len])
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):

@@ -1894,13 +1894,6 @@
       "path": "speculative_config.block_size"
     },
     {
-      "allowed_values": [],
-      "annotation": "Optional[List[Annotated[int, Gt(gt=0)]]]",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.confidence_verify_len_tiers"
-    },
-    {
       "allowed_values": [
         "AUTO",
         "DFlash",
