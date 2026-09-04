@@ -759,9 +759,22 @@ class Indexer(nn.Module):
                 if self.use_cute_dsl_topk
                 else TopKImplementation.CUDA_RADIX
             )
+        # The self-sampling engine has a prefill form (per-row [ks, ke)
+        # windows); select it for prefill on exactly the layers where the
+        # two-level dispatch picks self-sampling for decode, so both phases
+        # share one config and one warmup. The temporal-hint engine has no
+        # prefill form, so those layers keep the exact radix prefill.
+        prefill_top_k_implementation = (
+            TopKImplementation.CUTE_DSL_GVR
+            if (
+                decode_top_k_implementation == TopKImplementation.CUTE_DSL_GVR
+                and self._use_self_sampling_topk
+            )
+            else TopKImplementation.CUDA_RADIX
+        )
         self.top_k = TopK(
             self.index_topk,
-            prefill_implementation=TopKImplementation.CUDA_RADIX,
+            prefill_implementation=prefill_top_k_implementation,
             decode_implementation=decode_top_k_implementation,
             compress_ratio=self.compress_ratio,
             gvr_self_sampling=self._use_self_sampling_topk,

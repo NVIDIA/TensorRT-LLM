@@ -310,6 +310,54 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
         cute_dsl_radix.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "use_self_sampling,sm_version,msl_c,should_warmup",
+    [
+        (True, 100, 65536, True),
+        (True, 100, 30001, True),  # odd msl_c must not skip the prefill leg
+        (False, 100, 65536, False),  # temporal-hint layers: no prefill engine
+        (True, 90, 65536, False),  # non-datacenter Blackwell
+    ],
+)
+def test_metadata_warmup_selfsampling_prefill_leg(
+    use_self_sampling, sm_version, msl_c, should_warmup
+):
+    """The self-sampling warmup drives BOTH the decode (varlen) and the prefill
+    engines; the prefill leg sits before the DeepGEMM decode-stride guard so an
+    odd msl_c cannot skip it."""
+    metadata = SimpleNamespace(
+        enable_gvr_topk=True,
+        use_self_sampling_topk=use_self_sampling,
+        sparse_mla_topk=512,
+        _indexer_compress_ratio=4,
+        kv_cache_manager=SimpleNamespace(),
+        get_indexer_max_seq_len=Mock(return_value=msl_c),
+        sparse_metadata_params=SimpleNamespace(use_cute_dsl_paged_mqa_logits=True),
+        num_sms=148,
+    )
+    ss_host = (
+        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host"
+    )
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
+            return_value=sm_version,
+        ),
+        patch(f"{ss_host}.warmup_prefill") as warmup_prefill,
+        patch(f"{ss_host}.warmup_varlen"),
+    ):
+        DSAtrtllmAttentionMetadata.warmup_selfsampling_topk(metadata, next_n=1, batch_sizes=[8])
+
+    if should_warmup:
+        warmup_prefill.assert_called_once_with(512, max(msl_c, 32768))
+    else:
+        warmup_prefill.assert_not_called()
+
+
 def test_kv_lens_row_reorder_threshold():
     """Prepare row order only when CuTe DSL GVR has enough decode rows."""
     num_sms = 16
@@ -632,6 +680,12 @@ def test_indexer_two_level_gvr_dispatch(
     assert indexer.top_k.gvr_self_sampling == use_self_sampling
     assert indexer.top_k.use_gvr_locality_domain
     assert indexer.top_k.needs_gvr_prior == (not use_self_sampling)
+    # Prefill uses the self-sampling engine on exactly the self-sampling
+    # layers; the temporal-hint layers keep the exact radix prefill.
+    expected_prefill = (
+        TopKImplementation.CUTE_DSL_GVR if use_self_sampling else TopKImplementation.CUDA_RADIX
+    )
+    assert indexer.top_k.prefill_implementation == expected_prefill
 
 
 @skip_pre_hopper

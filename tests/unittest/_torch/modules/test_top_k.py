@@ -466,3 +466,121 @@ def test_gvr_emission_reset_parks_reused_slots(monkeypatch) -> None:
     assert torch.isfinite(lines[0]) and torch.isfinite(lines[3]), (
         "untouched slots must keep their closed-loop state"
     )
+
+
+def _install_fake_prefill_runner(monkeypatch) -> Mock:
+    """Stub both self-sampling entries (a test may exercise decode and prefill
+    through the same lazily imported module); return the prefill Mock."""
+    prefill = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k",
+        SimpleNamespace(
+            selfsampling_topk_run_varlen=Mock(),
+            selfsampling_topk_run_prefill=prefill,
+        ),
+    )
+    return prefill
+
+
+def _prefill_call(top_k: TopK, scores: torch.Tensor, out_width: int = 2):
+    rows = scores.shape[0]
+    row_starts = torch.zeros(rows, dtype=torch.int32)
+    row_ends = torch.full((rows,), scores.shape[1], dtype=torch.int32)
+    output = torch.full((rows, out_width), -1, dtype=torch.int32)
+    top_k(
+        scores,
+        output,
+        is_prefill=True,
+        row_starts=row_starts,
+        row_ends=row_ends,
+    )
+    return row_starts, row_ends, output
+
+
+def test_gvr_v2_prefill_routes_to_selfsampling_runner(monkeypatch) -> None:
+    runner = _install_fake_prefill_runner(monkeypatch)
+    top_k = TopK(
+        2,
+        prefill_implementation=TopKImplementation.CUTE_DSL_GVR,
+        compress_ratio=4,
+    )
+    scores = torch.randn(3, 8)  # fp32, stride(0)=8 %4==0, contiguous -> gate ok
+    row_starts, row_ends, output = _prefill_call(top_k, scores)
+
+    runner.assert_called_once()
+    args, kwargs = runner.call_args
+    assert args[0] is scores and args[1] is row_starts and args[2] is row_ends
+    assert args[3] is output
+    assert kwargs == {}
+
+
+def test_gvr_v2_prefill_format_gate_falls_back_to_radix(monkeypatch) -> None:
+    runner = _install_fake_prefill_runner(monkeypatch)
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    top_k = TopK(
+        2,
+        prefill_implementation=TopKImplementation.CUTE_DSL_GVR,
+        compress_ratio=4,
+    )
+    scores = torch.randn(3, 8, dtype=torch.bfloat16)  # dtype gate miss
+    row_starts, row_ends, output = _prefill_call(top_k, scores)
+
+    runner.assert_not_called()
+    radix.assert_called_once_with(scores, row_starts, row_ends, output, 2)
+
+
+def test_gvr_v2_prefill_odd_stride_falls_back_to_radix(monkeypatch) -> None:
+    runner = _install_fake_prefill_runner(monkeypatch)
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    top_k = TopK(2, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
+    scores = torch.randn(3, 6)  # stride(0)=6, 6 % 4 != 0 -> gate miss
+
+    _prefill_call(top_k, scores)
+
+    runner.assert_not_called()
+    radix.assert_called_once()
+
+
+def test_gvr_v2_prefill_all_short_uses_radix(monkeypatch) -> None:
+    """scores.shape[1] <= top_k: every row is short, so the exact radix
+    identity/-1 path runs (no logits read) with no fallthrough warning."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    top_k = TopK(4, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
+    scores = torch.randn(3, 4)  # shape[1] == top_k
+
+    _prefill_call(top_k, scores, out_width=4)
+
+    runner.assert_not_called()
+    radix.assert_called_once()
+
+
+def test_gvr_v2_prefill_temporal_mode_uses_radix(monkeypatch) -> None:
+    """CUTE_DSL_GVR + gvr_self_sampling=False has no prefill engine -> radix."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    top_k = TopK(
+        2,
+        prefill_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_self_sampling=False,
+    )
+    scores = torch.randn(3, 8)
+
+    _prefill_call(top_k, scores)
+
+    runner.assert_not_called()
+    radix.assert_called_once()
+
+
+def test_gvr_v2_prefill_rejects_output_width_mismatch(monkeypatch) -> None:
+    runner = _install_fake_prefill_runner(monkeypatch)
+    top_k = TopK(2, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
+    scores = torch.randn(3, 8)
+    with pytest.raises(AssertionError):
+        _prefill_call(top_k, scores, out_width=3)
+    runner.assert_not_called()

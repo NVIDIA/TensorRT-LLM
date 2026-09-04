@@ -968,3 +968,316 @@ def test_selfsampling_varlen_heterogeneous_lengths_main():
         ref_v = torch.topk(row, k).values.sort().values
         got = row[out[r].long()].sort().values
         assert torch.equal(got, ref_v), f"row {r}: value multiset mismatch (n={n_r})"
+
+
+# ===========================================================================
+# ==== prefill: per-row [ks, ke) windows (run_prefill) ======================
+# ===========================================================================
+# Contract: row r selects the Top-K of logits[r, ks:ke] (ks=row_starts[r],
+# ke=row_ends[r], compressed column units), output in the LOCAL frame
+# (column - ks) with a trailing -1 pad; nv=ke-ks <= k gives identity 0..nv-1.
+# The base is rounded down to a 16B boundary and the <=3 lead lanes are masked,
+# so ks % 4 in {1,2,3} (2nd+ request of a multi-request chunk) is exercised
+# with poison (+inf/NaN/3e38/-inf) written at [ks-3, ks) and [ke, npad).
+
+
+def _prefill_reference(logits, row_starts, row_ends, top_k):
+    rows, ncols = logits.shape
+    out = torch.full((rows, top_k), -1, dtype=torch.int32, device=logits.device)
+    ks, ke = row_starts.tolist(), row_ends.tolist()
+    for r in range(rows):
+        nv = max(min(ke[r], ncols) - ks[r], 0)
+        if nv == 0:
+            continue
+        if nv <= top_k:
+            out[r, :nv] = torch.arange(nv, dtype=torch.int32, device=logits.device)
+        else:
+            out[r] = torch.topk(logits[r, ks[r] : ks[r] + nv], top_k).indices.to(torch.int32)
+    return out
+
+
+def _check_prefill_exact(logits, got, row_starts, row_ends, top_k):
+    """Tie-aware radix-parity check: trailing -1 pad from lengths; head unique
+    and in [0, nv); identity for nv <= k; exact index set when the k-th value
+    is unique, else strictly-above set + tie-class count (signed zeros and
+    genuine +/-inf compare like radix). NaN-in-window rows are structure-only."""
+    assert got.shape == (logits.shape[0], top_k) and got.dtype == torch.int32
+    ks, ke = row_starts.tolist(), row_ends.tolist()
+    got64 = got.to(torch.int64)
+    dev = logits.device
+    for r in range(logits.shape[0]):
+        nv = max(min(ke[r], logits.shape[1]) - ks[r], 0)
+        m = min(nv, top_k)
+        row = got64[r]
+        assert bool((row[m:] == -1).all()), f"row {r}: pad must be trailing -1 x{top_k - m}"
+        head = row[:m]
+        if m == 0:
+            continue
+        assert bool((head != -1).all()), f"row {r}: -1 inside the valid head"
+        assert int(head.min()) >= 0 and int(head.max()) < nv, f"row {r}: index outside [0,{nv})"
+        assert int(torch.unique(head).numel()) == m, f"row {r}: duplicate indices"
+        win = logits[r, ks[r] : ks[r] + nv]
+        if bool(torch.isnan(win).any()):
+            continue  # NaN out of contract for both kernels; structure only
+        if nv <= top_k:
+            assert torch.equal(torch.sort(head).values, torch.arange(nv, device=dev)), (
+                f"row {r}: short row must be identity"
+            )
+            continue
+        vals = torch.sort(win, descending=True).values
+        v_k, v_next = vals[top_k - 1], vals[top_k]
+        got_vals = win[head]
+        if bool(v_k != v_next):
+            ref = (win >= v_k).nonzero(as_tuple=True)[0]
+            assert ref.numel() == top_k
+            assert torch.equal(torch.sort(head).values, ref), f"row {r}: index set mismatch"
+        else:
+            above = (win > v_k).nonzero(as_tuple=True)[0]
+            got_above = head[got_vals > v_k]
+            assert torch.equal(torch.sort(got_above).values, above), (
+                f"row {r}: strictly-above set mismatch"
+            )
+            assert int((got_vals == v_k).sum()) == top_k - above.numel(), (
+                f"row {r}: wrong number of boundary-tied picks"
+            )
+            assert bool((got_vals >= v_k).all()), f"row {r}: value below k-th selected"
+
+
+def _make_prefill_case(rows, ncols, ks_list, ke_list, *, top_k, seed, dist="randn"):
+    """DeepGEMM-like storage: stride = align(ncols + 256, 256), column slice
+    [:, :ncols]; outside-window columns poisoned so an over-read/frame bug is
+    caught (+inf at [ks-3, ks), rotating NaN/inf/3e38/-inf elsewhere)."""
+    gen = torch.Generator(device=_DEV).manual_seed(seed)
+    stride = ((ncols + 256 + 255) // 256) * 256
+    if dist == "randn":
+        full = torch.randn((rows, stride), generator=gen, dtype=torch.float32, device=_DEV)
+    elif dist == "equal":
+        full = torch.ones((rows, stride), dtype=torch.float32, device=_DEV)
+    elif dist == "twoval":
+        full = torch.randint(0, 2, (rows, stride), generator=gen, device=_DEV).float()
+    else:
+        raise ValueError(dist)
+    logits = full[:, :ncols]
+    row_starts = torch.tensor(ks_list, dtype=torch.int32, device=_DEV)
+    row_ends = torch.tensor(ke_list, dtype=torch.int32, device=_DEV)
+    cols = torch.arange(stride, device=_DEV).unsqueeze(0)
+    outside = (cols < row_starts.unsqueeze(1)) | (cols >= row_ends.unsqueeze(1))
+    pat = torch.tensor([float("nan"), float("inf"), 3e38, float("-inf")], device=_DEV)[
+        cols % 4
+    ].expand(rows, -1)
+    full.masked_scatter_(outside, pat[outside])
+    for r, ks in enumerate(ks_list):
+        full[r, max(ks - 3, 0) : ks] = float("inf")
+    return logits, row_starts, row_ends
+
+
+@pytest.mark.parametrize("top_k", [512, 1024, 2048], ids=lambda k: f"k{k}")
+def test_prefill_causal_ramp(top_k):
+    """Single-request causal ramp (ks=0): a run of short rows then long rows
+    in one launch straddles the k boundary. Covers nv < k, == k, > k."""
+    rows = 148
+    ks = [0] * rows
+    ke = list(range(1, rows + 1))
+    lg, rs, re = _make_prefill_case(rows, rows, ks, ke, top_k=top_k, seed=top_k)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    _check_prefill_exact(lg, out, rs, re, top_k)
+
+
+@pytest.mark.parametrize("lead", [1, 2, 3], ids=lambda x: f"lead{x}")
+@pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
+def test_prefill_packed_misaligned_ks(top_k, lead):
+    """Multi-request chunk: request 2 starts at ks % 4 == lead with +inf poison
+    at [ks-lead, ks). A leaked lead lane would become top-1 (wrong)."""
+    a = 300
+    ks1 = ((a + 3) // 4) * 4 + lead
+    n1 = 4096 + 17
+    rows = a + n1
+    ncols = ks1 + n1
+    ks = [0] * a + [ks1] * n1
+    ke = list(range(1, a + 1)) + [ks1 + n1] * n1
+    lg, rs, re = _make_prefill_case(rows, ncols, ks, ke, top_k=top_k, seed=top_k * 100 + lead)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    assert int(out.min()) >= -1, "negative index leaked (missed -lead correction / guard)"
+    _check_prefill_exact(lg, out, rs, re, top_k)
+
+
+@pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
+def test_prefill_short_rows(top_k):
+    """nv in {0, 1, k-1, k, k+1}: identity 0..nv-1 + trailing -1 (radix short
+    contract); nv==0 (ks==ke) -> all -1."""
+    for nv in (0, 1, top_k - 1, top_k, top_k + 1):
+        rows = 4
+        ncols = max(nv, 1) + 8
+        ks = [0] * rows
+        ke = [nv] * rows
+        lg, rs, re = _make_prefill_case(rows, ncols, ks, ke, top_k=top_k, seed=nv + top_k)
+        out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_prefill(lg, rs, re, out)
+        torch.cuda.synchronize()
+        _check_prefill_exact(lg, out, rs, re, top_k)
+
+
+@pytest.mark.parametrize("dist", ["equal", "twoval"], ids=lambda d: d)
+@pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
+def test_prefill_ties_degenerate(top_k, dist):
+    """All-equal (whole tie class) and two-valued (massive ties) rows drive the
+    degenerate A/B narrowing paths; tie-aware acceptance."""
+    rows = 16
+    n = 4096
+    ks = [0] * rows
+    ke = [n] * rows
+    lg, rs, re = _make_prefill_case(rows, n, ks, ke, top_k=top_k, seed=top_k, dist=dist)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    _check_prefill_exact(lg, out, rs, re, top_k)
+
+
+@pytest.mark.parametrize("lead", [1, 2, 3], ids=lambda x: f"lead{x}")
+@pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
+def test_prefill_neginf_tie_class(top_k, lead):
+    """nv > k with fewer than k finite values -> the k-th boundary is in the
+    -inf tie class (degen B), crossed with misaligned lead. A -inf-valued mask
+    would be emitted here as a negative index (== -lead); assert none leaks."""
+    n_finite = top_k - 100
+    nv = top_k + 400
+    ks1 = ((37 + 3) // 4) * 4 + lead
+    ncols = ks1 + nv
+    rows = 5
+    gen = torch.Generator(device=_DEV).manual_seed(top_k * 10 + lead)
+    stride = ((ncols + 256 + 255) // 256) * 256
+    full = torch.full((rows, stride), float("-inf"), dtype=torch.float32, device=_DEV)
+    for r in range(rows):
+        full[r, ks1 : ks1 + n_finite] = torch.randn(n_finite, generator=gen, device=_DEV)
+        full[r, :ks1] = float("inf")
+        full[r, ks1 + nv :] = 3e38
+    logits = full[:, :ncols]
+    rs = torch.tensor([ks1] * rows, dtype=torch.int32, device=_DEV)
+    re = torch.tensor([ks1 + nv] * rows, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(logits, rs, re, out)
+    torch.cuda.synchronize()
+    assert int(out.min()) >= -1, "negative index leaked in a -inf tie class"
+    _check_prefill_exact(logits, out, rs, re, top_k)
+
+
+@pytest.mark.parametrize("top_k, n", [(512, 4099), (2048, 131075)], ids=lambda v: f"n{v}")
+def test_prefill_deepgemm_single_row_odd_width(top_k, n):
+    """A 1-row tile with an odd num_k_tokens on a DeepGEMM-strided view must
+    use stride(0) (not shape[1]) and stay exact — the fully-cached follow-up
+    turn that the varlen 1-row rule would wrongly reject."""
+    rows = 1
+    ks = [0]
+    ke = [n]
+    lg, rs, re = _make_prefill_case(rows, n, ks, ke, top_k=top_k, seed=n)
+    assert lg.stride(0) % 256 == 0 and lg.shape[1] == n  # DeepGEMM-like view
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    _check_prefill_exact(lg, out, rs, re, top_k)
+
+
+def test_prefill_slab_over_gridy_limit():
+    """> 65535 rows in one call must be slabbed (gridDim.y <= 65535)."""
+    k = 512
+    rows = 70000
+    n = 2048
+    stride = ((n + 256 + 255) // 256) * 256
+    lg = torch.randn((rows, stride), dtype=torch.float32, device=_DEV)[:, :n]
+    rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+    re = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    idx = torch.tensor([0, 1, 32767, 32768, 65535, 65536, 69999], device=_DEV)
+    _check_prefill_exact(lg[idx], out[idx].contiguous(), rs[idx], re[idx], k)
+
+
+def test_prefill_engine_key_distinct_from_decode():
+    """The prefill compile shares the DSv3.2 decode varlen tuple (next_n=1,
+    cr_shift=0) but has a distinct prologue, so the compile keys must differ."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+        gvr_topk_decode_self_sampling as dev,
+    )
+
+    tpl = (256, 8, 4, 256, 2, False, False, 1, 0, 1)
+    a = dev.get_compiled(tpl, hint_free=True)
+    b = dev.get_compiled(tpl, hint_free=True, prefill=True)
+    assert a is not b
+
+
+def test_prefill_guards():
+    k = 512
+    n = 4096
+    stride = ((n + 256 + 255) // 256) * 256
+    lg = torch.randn((3, stride), dtype=torch.float32, device=_DEV)[:, :n]
+    rs = torch.zeros((3,), dtype=torch.int32, device=_DEV)
+    re = torch.full((3,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((3, k), -7, dtype=torch.int32, device=_DEV)
+    with pytest.raises(RuntimeError, match="float32"):
+        ss_host.run_prefill(lg.to(torch.bfloat16), rs, re, out)
+    with pytest.raises(RuntimeError, match="row_starts"):
+        ss_host.run_prefill(lg, rs.to(torch.int64), re, out)
+    with pytest.raises(RuntimeError, match="row_starts/row_ends length"):
+        ss_host.run_prefill(lg, rs[:2], re, out)
+    with pytest.raises(RuntimeError, match="multiple of 4"):
+        ss_host.run_prefill(lg, rs, re, torch.full((3, k + 2), -7, dtype=torch.int32, device=_DEV))
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        ss_host.run_prefill(lg[:, 1:], rs, re, out)  # base offset by 1 float
+
+
+def test_prefill_warmup_idempotent_and_no_rejit():
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+        gvr_topk_decode_self_sampling as dev,
+    )
+
+    k = 512
+    ss_host.warmup_prefill(k, 32768)
+    before = len(ss_host._PREFILL_WARMUP_DONE)
+    ss_host.warmup_prefill(k, 32768)
+    assert len(ss_host._PREFILL_WARMUP_DONE) == before, "warmup not idempotent"
+    orig = dev.get_compiled
+    calls = {"n": 0}
+
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return orig(*a, **kw)
+
+    dev.get_compiled = counting
+    try:
+        for rows in (1, 8, 37, 74, 100, 296, 297, 4096):
+            for nkv in (4096, 16384, 32768):
+                stride = ((nkv + 256 + 255) // 256) * 256
+                lg = torch.zeros((rows, stride), dtype=torch.float32, device=_DEV)[:, :nkv]
+                rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+                re = torch.full((rows,), nkv, dtype=torch.int32, device=_DEV)
+                out = torch.empty((rows, k), dtype=torch.int32, device=_DEV)
+                ss_host.run_prefill(lg, rs, re, out, max_row_len=nkv)
+    finally:
+        dev.get_compiled = orig
+    assert calls["n"] == 0, f"warmup missed keys: {calls['n']} live compiles"
+
+
+def test_prefill_capture_no_host_sync():
+    """After warmup, a run_prefill call captures under a CUDA graph (proves no
+    .item()/.max() host read)."""
+    k = 512
+    n = 8192
+    ss_host.warmup_prefill(k, max(n, 32768))
+    stride = ((n + 256 + 255) // 256) * 256
+    lg = torch.randn((64, stride), dtype=torch.float32, device=_DEV)[:, :n]
+    rs = torch.zeros((64,), dtype=torch.int32, device=_DEV)
+    re = torch.full((64,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((64, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out, max_row_len=n)  # compile outside capture
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        ss_host.run_prefill(lg, rs, re, out, max_row_len=n)
+    g.replay()
+    torch.cuda.synchronize()
+    _check_prefill_exact(lg, out, rs, re, k)
