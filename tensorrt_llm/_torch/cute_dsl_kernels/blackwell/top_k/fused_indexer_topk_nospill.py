@@ -1749,12 +1749,16 @@ def _sm_count():
     return n
 
 
+_WS_FRESH = os.environ.get("TRTLLM_FUSED_TOPK_WS_FRESH", "0") == "1"
+
+
 def _workspace(device, nrep, nsm, key):
     # zero at every launch start: rows re-zero themselves at the end of a launch, so one
-    # tensor per compiled kernel serves eager calls; under graph capture a fresh tensor is
-    # allocated per call so the graph owns its intermediate (memset node) like an activation
-    if torch.cuda.is_current_stream_capturing():
-        return torch.zeros(nsm * WS_ROWW_OF(nrep), dtype=torch.int32, device=device)
+    # tensor per compiled kernel serves eager calls and graph replays alike. Graphs of the
+    # same shape must not replay concurrently on one device; TRTLLM_FUSED_TOPK_WS_FRESH=1
+    # gives every captured launch its own tensor (a memset node per replay) instead.
+    if _WS_FRESH and torch.cuda.is_current_stream_capturing():
+        return torch.zeros(key[0] * WS_ROWW_OF(nrep), dtype=torch.int32, device=device)
     k = (device.index, key)
     ws = _ws.get(k)
     if ws is None:

@@ -354,6 +354,18 @@ def test_fused_indexer_topk_nospill_split_cuda_graph(monkeypatch):
             assert bool(((got - want).abs() <= 1e-2 + 1e-3 * want.abs()).all()), (
                 f"row {i}: replay value set diverged"
             )
+    # eager launches and replays share the workspace: interleaving must stay clean
+    call()
+    torch.cuda.synchronize()
+    indices.fill_(-3)
+    values.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    for i in range(batch):
+        assert indices[i].unique().numel() == k_top
+        got, _ = torch.sort(values[i], descending=True)
+        want, _ = torch.sort(eager_vals[i], descending=True)
+        assert bool(((got - want).abs() <= 1e-2 + 1e-3 * want.abs()).all())
 
 
 @skip_not_sm100
