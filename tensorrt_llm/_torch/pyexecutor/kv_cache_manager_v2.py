@@ -2174,6 +2174,13 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return self.impl.get_page_index_upper_bound(0, Role.KEY)
 
+    def is_attention_layer(self, layer_idx: int) -> bool:
+        """Return whether ``layer_idx`` uses attention KV cache storage."""
+        layer_offset = self.layer_offsets[layer_idx]
+        return isinstance(
+            self.kv_cache_manager_py_config.layers[layer_offset], AttentionLayerConfig
+        )
+
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         layer_offset = self.layer_offsets[layer_idx]
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
