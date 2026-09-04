@@ -2424,17 +2424,52 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         engine.enable_attention_dp = True
         engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
         engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
-        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
+        engine._get_all_rank_ctx_requests = lambda _: [1, 1, 1, 1]
 
-        all_rank_num_tokens = [1, 129, 1, 1]
+        all_rank_num_tokens = [129, 129, 129, 129]
         engine.dist = FakeDist([True, True, True, True])
-        assert engine._get_padding_params(1, 0,
+        assert engine._get_padding_params(129, 1,
                                           all_rank_num_tokens) == (256, True,
                                                                    [256] * 4)
 
         engine.dist = FakeDist([True, False, True, True])
         assert engine._get_padding_params(
-            1, 0, all_rank_num_tokens) == (1, False, all_rank_num_tokens)
+            129, 1, all_rank_num_tokens) == (129, False, all_rank_num_tokens)
+
+    def test_attention_dp_prefill_graph_skips_generation_only_ranks(self):
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            PyTorchModelEngine
+
+        class EchoDist:
+            """Reports the same decision every rank would reach on its own.
+
+            The gate is derived from the gathered context-request counts,
+            which are identical everywhere, so echoing the local answer is
+            what the real all-gather returns.
+            """
+
+            def tp_allgather(self, value):
+                return [value] * 4
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.enable_attention_dp = True
+        engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
+        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
+        engine.dist = EchoDist()
+
+        # Context work on every rank: the group shares one padded bucket.
+        engine._get_all_rank_ctx_requests = lambda _: [1, 1, 1, 1]
+        busy = [129, 129, 129, 129]
+        assert engine._get_padding_params(129, 1,
+                                          busy) == (256, True, [256] * 4)
+
+        # One generation-only rank is enough to keep the whole group out of
+        # the graph. Padding would lift its single token to the busiest
+        # rank's bucket, so it would replay a full prefill to produce one
+        # token -- the aggregate-serving regression this gate prevents.
+        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 1, 1]
+        mixed = [1, 129, 129, 129]
+        assert engine._get_padding_params(1, 0, mixed) == (1, False, mixed)
 
     def test_torch_compile_config_does_not_populate_legacy_capture_buckets(
             self):
