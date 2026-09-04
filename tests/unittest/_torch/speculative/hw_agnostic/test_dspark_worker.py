@@ -103,7 +103,6 @@ def _make_worker(enable_confidence_scheduling=False):
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
         enable_confidence_scheduling=enable_confidence_scheduling,
         enable_fused_confidence_scheduler=False,
-        verify_len_tiers=[1, 3, 5],
         confidence_sps_table_path=None,
         confidence_sts_path=None,
     )
