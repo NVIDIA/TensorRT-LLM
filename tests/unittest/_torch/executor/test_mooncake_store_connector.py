@@ -362,12 +362,23 @@ def test_page_addressing_rejects_mixed_slot_counts():
 # ---- config ----
 
 
-def test_config_reads_sizes_with_units(store_config):
+def test_config_reads_sizes_and_staging_from_the_json(store_config):
+    """Sizes arrive as unit strings, and staging is off until the JSON asks."""
     config = MooncakeStoreConnectorConfig.from_env()
     assert config.global_segment_size == 1024**3
     assert config.local_buffer_size == 256 * 1024**2
     assert config.role is StoreRole.BOTH
     assert config.resolve_model_key("/models/ignored") == "test-model"
+    assert config.stage_through_host is False
+
+    raw = json.loads(store_config.read_text())
+    raw["stage_through_host"] = True
+    raw["staging_buffer_bytes"] = "256MiB"
+    store_config.write_text(json.dumps(raw))
+
+    config = MooncakeStoreConnectorConfig.from_env()
+    assert config.stage_through_host is True
+    assert config.staging_buffer_bytes == 256 * 1024**2
 
 
 def test_config_role_comes_from_environment(store_config, monkeypatch):
@@ -479,23 +490,25 @@ def test_validate_layout_rejects_sliding_window():
 # the reuse the store exists to provide.
 
 
-def test_uses_connector_recognizes_the_preset():
-    config = KvCacheConnectorConfig(connector="mooncake-store")
-    assert uses_connector(config, "mooncake-store")
-
-
-def test_uses_connector_recognizes_a_hand_written_module():
-    config = KvCacheConnectorConfig(
-        connector_module="tensorrt_llm._torch.pyexecutor.connectors.mooncake_store",
-        connector_scheduler_class="MooncakeStoreConnectorScheduler",
-        connector_worker_class="MooncakeStoreConnectorWorker",
-    )
-    assert uses_connector(config, "mooncake-store")
-
-
-def test_uses_connector_separates_connectors_and_tolerates_none():
-    assert not uses_connector(KvCacheConnectorConfig(connector="kvbm"), "mooncake-store")
-    assert not uses_connector(None, "mooncake-store")
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        (KvCacheConnectorConfig(connector="mooncake-store"), True),
+        (
+            KvCacheConnectorConfig(
+                connector_module="tensorrt_llm._torch.pyexecutor.connectors.mooncake_store",
+                connector_scheduler_class="MooncakeStoreConnectorScheduler",
+                connector_worker_class="MooncakeStoreConnectorWorker",
+            ),
+            True,
+        ),
+        (KvCacheConnectorConfig(connector="kvbm"), False),
+        (None, False),
+    ],
+    ids=["preset", "hand_written_module", "another_connector", "no_connector"],
+)
+def test_uses_connector_recognizes_the_connector_however_it_is_spelled(config, expected):
+    assert uses_connector(config, "mooncake-store") is expected
 
 
 def test_uses_connector_rejects_an_unknown_preset():
@@ -682,17 +695,6 @@ def test_plan_slot_geometry_rejects_degenerate_inputs(bad):
         plan_slot_geometry(*bad)
 
 
-def test_config_reads_staging_from_the_json(store_config):
-    raw = json.loads(store_config.read_text())
-    raw["stage_through_host"] = True
-    raw["staging_buffer_bytes"] = "256MiB"
-    store_config.write_text(json.dumps(raw))
-
-    config = MooncakeStoreConnectorConfig.from_env()
-    assert config.stage_through_host is True
-    assert config.staging_buffer_bytes == 256 * 1024**2
-
-
 @pytest.mark.parametrize(
     "value,expected", [("1", True), ("true", True), ("on", True), ("0", False), ("off", False)]
 )
@@ -802,12 +804,7 @@ def test_staging_does_not_scatter_a_failed_load(store_config, fake_store, staged
         assert staged_copies == []
 
 
-def test_worker_captures_the_ranks_device_at_registration(store_config, fake_store, fake_cuda):
-    with make_worker(fake_store, layout=make_layout()) as worker:
-        assert worker._device_index == 3
-
-
-def test_save_thread_adopts_the_ranks_device_not_the_thread_default(
+def test_the_ranks_device_is_captured_and_adopted_by_the_save_thread(
     store_config, fake_store, fake_cuda
 ):
     """The save thread must not run on torch's default device.
@@ -816,7 +813,9 @@ def test_save_thread_adopts_the_ranks_device_not_the_thread_default(
     stream created on device 0 instead fails every copy with
     cudaErrorInvalidValue, and only on ranks other than 0.
     """
-    with make_worker(fake_store, layout=make_layout()):
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._device_index == 3
+
         deadline = time.monotonic() + 5.0
         while 3 not in fake_cuda and time.monotonic() < deadline:
             time.sleep(0.01)

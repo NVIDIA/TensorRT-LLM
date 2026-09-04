@@ -162,20 +162,23 @@ def running_master():
 # ---- configuration ----
 
 
-def test_pool_needs_exactly_one_master():
-    with pytest.raises(ValueError, match="not both"):
-        MooncakeStoreConfig(launch_master=True, master_server_address="host:50051")
-    with pytest.raises(ValueError, match="needs a master"):
-        MooncakeStoreConfig()
-
-
-def test_publishing_an_address_needs_a_master_to_publish():
-    """This option only writes an address; reading one is master_server_address."""
-    with pytest.raises(ValueError, match="needs launch_master"):
-        MooncakeStoreConfig(
-            master_server_address="host:50051",
-            master_address_file="/shared/master.addr",
-        )
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        (dict(launch_master=True, master_server_address="host:50051"), "not both"),
+        (dict(), "needs a master"),
+        # master_address_file only writes an address; reading one is
+        # master_server_address, so publishing without launching is incoherent.
+        (
+            dict(master_server_address="host:50051", master_address_file="/shared/master.addr"),
+            "needs launch_master",
+        ),
+    ],
+    ids=["two_masters", "no_master", "publishing_without_launching"],
+)
+def test_pool_needs_exactly_one_master(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        MooncakeStoreConfig(**kwargs)
 
 
 def test_pool_is_rejected_unless_the_connector_is_mooncake_store():
@@ -224,9 +227,12 @@ def test_client_config_is_what_the_connector_reads_back(tmp_path):
     assert parsed.transfer_batch_size == 32
 
 
-def test_client_config_leaves_an_unset_prefix_to_the_connector():
+def test_client_config_omits_the_fields_the_pool_left_unset():
+    """An absent key leaves the connector its own default; a null would not."""
     pool = MooncakeStoreConfig(master_server_address="host:50051")
-    assert "cache_prefix" not in master_module._client_config(pool, "host:50051")
+    written = master_module._client_config(pool, "host:50051")
+    assert "cache_prefix" not in written
+    assert "staging_buffer_bytes" not in written
 
 
 @pytest.mark.parametrize(
@@ -271,13 +277,6 @@ def test_a_staging_buffer_can_be_sized_where_staging_is_turned_on(running_master
         written = json.loads(open(config_path).read())
         assert written["stage_through_host"] is True
         assert written["staging_buffer_bytes"] == "4GiB"
-
-
-def test_an_unsized_staging_buffer_leaves_the_connector_its_default(running_master):
-    pool = MooncakeStoreConfig(master_server_address=running_master)
-
-    with provision_pool(pool) as config_path:
-        assert "staging_buffer_bytes" not in json.loads(open(config_path).read())
 
 
 def test_provisioning_fails_before_the_model_loads_if_the_master_is_absent(monkeypatch):
@@ -408,20 +407,17 @@ def test_a_run_dir_keeps_the_master_log_and_the_config(fake_master, tmp_path):
 # ---- the entry point servers call ----
 
 
-def test_other_connectors_are_left_alone():
-    config = KvCacheConnectorConfig(connector="lmcache")
-    with maybe_provision_pool(config):
-        assert CONFIG_PATH_ENV not in os.environ
-
-
-def test_no_connector_at_all_is_left_alone():
-    with maybe_provision_pool(None):
-        assert CONFIG_PATH_ENV not in os.environ
-
-
-def test_a_pool_left_undescribed_stays_the_environment_contract():
+@pytest.mark.parametrize(
+    "config",
+    [
+        KvCacheConnectorConfig(connector="lmcache"),
+        None,
+        KvCacheConnectorConfig(connector="mooncake-store"),
+    ],
+    ids=["another_connector", "no_connector", "pool_left_undescribed"],
+)
+def test_provisioning_is_a_no_op_unless_a_pool_is_described(config):
     """Without `mooncake_store`, MOONCAKE_CONFIG_PATH is still the only input."""
-    config = KvCacheConnectorConfig(connector="mooncake-store")
     with maybe_provision_pool(config):
         assert CONFIG_PATH_ENV not in os.environ
 
