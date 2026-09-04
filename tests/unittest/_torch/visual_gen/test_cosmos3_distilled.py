@@ -689,7 +689,7 @@ class TestWarmupAndForwardValidation:
                 prompt="x",
                 seed=0,
                 use_guardrails=False,
-                image="frame.png",
+                image=torch.zeros(3, 32, 32),
                 **sampling_kwargs,
             )
 
@@ -1232,12 +1232,12 @@ class TestRequestCompatibility:
         "overrides",
         [
             {},
-            {"image": "image.png"},
+            {"image": b"image"},
             {"image": torch.zeros(1)},
             {"video": b"video"},
             {"output_type": "image", "enable_audio": True},
             {"enable_audio": True, "audio_gen": True},
-            {"image": "image.png", "action_mode": "policy", "action_gen": True},
+            {"image": b"image", "action_mode": "policy", "action_gen": True},
             {"video": b"video", "transfer_config": object()},
         ],
     )
