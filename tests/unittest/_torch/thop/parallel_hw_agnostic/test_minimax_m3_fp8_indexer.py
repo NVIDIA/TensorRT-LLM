@@ -46,6 +46,36 @@ def _strided_cache(num_pages, page_size=128, stride_scale=7):
     return backing[::stride_scale]
 
 
+def _guarded_cache(num_pages, page_size=128, stride_scale=7, guard_pages=2):
+    """A strided cache view with zeroed guard pages on both sides of it.
+
+    Returns (view, below, above). A store from a negative slot lands in `below`,
+    one from a slot past the last page lands in `above`, so tests can assert on
+    inspectable memory rather than wait for a fault that may never come. Page
+    stride matches _strided_cache, keeping the non-contiguous page axis the op
+    has to support.
+    """
+    total_pages = num_pages + 2 * guard_pages
+    backing = torch.zeros(
+        total_pages * stride_scale,
+        1,
+        page_size,
+        128,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    first = guard_pages * stride_scale
+    last = (guard_pages + num_pages) * stride_scale
+    view = backing[first:last:stride_scale]
+    assert view.shape[0] == num_pages
+    return view, backing[:first], backing[last:]
+
+
+def _assert_untouched(*regions):
+    for region in regions:
+        assert torch.count_nonzero(region.view(torch.uint8)).item() == 0
+
+
 def _run(qk, cache, slots, q_weight, k_weight, position_ids, num_heads_q=4):
     return torch.ops.trtllm.minimax_m3_fp8_indexer_qk_norm_rope(
         qk,
@@ -127,3 +157,77 @@ def test_minimax_m3_fp8_indexer_cuda_graph_replay_updates_outputs():
     assert not torch.equal(q_out.view(torch.uint8), first_q.view(torch.uint8))
     torch.testing.assert_close(q_out.float(), q_ref.float(), rtol=0.13, atol=0.05)
     torch.testing.assert_close(k_out.float(), k_ref.float(), rtol=0.13, atol=0.05)
+
+
+def _run_with_slot_tail(tail_slot, num_live_tokens, seed):
+    """Run the kernel over a padded token extent whose tail carries tail_slot.
+
+    Mirrors what the model hands over: index-Q is produced for every row, while
+    only the live prefix owns a cache slot. Asserts that the tail wrote nothing
+    anywhere and that the live rows still match the reference. Each live row
+    takes a page of its own, so num_live_tokens must not exceed num_pages.
+    """
+    torch.manual_seed(seed)
+    num_heads_q, page_size, num_pages, padded_tokens = 4, 128, 4, 17
+
+    qk = torch.randn(padded_tokens, (num_heads_q + 1) * 128, dtype=torch.bfloat16, device="cuda")
+    q_weight = torch.randn(128, dtype=torch.bfloat16, device="cuda")
+    k_weight = torch.randn(128, dtype=torch.bfloat16, device="cuda")
+    position_ids = torch.arange(padded_tokens, dtype=torch.int32, device="cuda") + 1024
+
+    view, below, above = _guarded_cache(num_pages, page_size)
+    slots = torch.full((padded_tokens,), tail_slot, dtype=torch.int32, device="cuda")
+    pages = torch.arange(num_live_tokens, dtype=torch.int32, device="cuda")
+    within = (pages * 37) % page_size
+    slots[:num_live_tokens] = pages * page_size + within
+
+    q_out = _run(qk, view, slots, q_weight, k_weight, position_ids, num_heads_q)
+    torch.cuda.synchronize()
+
+    _assert_untouched(below, above)
+
+    # The live rows still land where they should, with the right values.
+    q_ref, k_ref = _reference(qk, num_heads_q, q_weight, k_weight, position_ids)
+    torch.testing.assert_close(
+        q_out[:num_live_tokens].float(),
+        q_ref[:num_live_tokens].float(),
+        rtol=0.13,
+        atol=0.05,
+    )
+    if num_live_tokens:
+        torch.testing.assert_close(
+            view[pages.long(), 0, within.long()].float(),
+            k_ref[:num_live_tokens].float(),
+            rtol=0.13,
+            atol=0.05,
+        )
+
+    # Catches a tail store that happens to land on a valid page.
+    live = torch.zeros(num_pages, page_size, dtype=torch.bool, device="cuda")
+    live[pages.long(), within.long()] = True
+    _assert_untouched(view[:, 0][~live])
+
+
+@pytest.mark.parametrize("num_live_tokens", [0, 1, 4])
+def test_minimax_m3_fp8_indexer_skips_negative_slots(num_live_tokens):
+    """A negative slot marks a padded row and must be a cache-write no-op.
+
+    Piecewise CUDA graphs pad token-shaped inputs without adding requests, so
+    the producer takes its token count from the padded height and the sentinel
+    tail of msa_out_cache_loc reaches the kernel. Unguarded, every padded row in
+    every sparse layer stores to the same bytes below the cache base.
+    """
+    _run_with_slot_tail(-1, num_live_tokens, seed=24)
+
+
+@pytest.mark.parametrize("tail_slot", [4 * 128, 4 * 128 + 61, 5 * 128 + 127])
+def test_minimax_m3_fp8_indexer_skips_slots_past_the_cache(tail_slot):
+    """A slot past the last page must not scatter outside the pool.
+
+    out_cache_loc is staged in uninitialized buffers and gathered through an
+    index clamped to the staging width rather than a request's own length, so a
+    stale or garbage slot is reachable. The parameters start at the first
+    out-of-range slot and stay inside the guard pages, so a regression fails an
+    assert instead of killing the process.
+    """
+    _run_with_slot_tail(tail_slot, num_live_tokens=4, seed=25)

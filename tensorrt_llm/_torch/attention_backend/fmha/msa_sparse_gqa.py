@@ -153,8 +153,19 @@ def run_msa_paged_gqa(
     if prewritten:
         metadata._msa_prewritten_layer = None
     if k is not None and v is not None and not prewritten:
+        # num_tokens is the padded extent under piecewise CUDA graphs, so the live
+        # count is what separates real slots from the sentinel tail. Only the MSA
+        # metadata pads its slot array, so a backend without the accessor hands
+        # over live rows only.
+        live_token_count = getattr(metadata, "msa_live_token_count", None)
+        num_live_tokens = live_token_count() if live_token_count is not None else num_tokens
         write_msa_main_kv(
-            kv_cache_manager, layer_idx, metadata.msa_out_cache_loc[:num_tokens], k, v
+            kv_cache_manager,
+            layer_idx,
+            metadata.msa_out_cache_loc[:num_tokens],
+            k,
+            v,
+            num_live_tokens=num_live_tokens,
         )
 
     # q may be a strided column-view of a fused [q|k|v] buffer (the model skips
@@ -227,21 +238,6 @@ def run_msa_paged_gqa(
                 num_rows=gen_row0 if ported else None,
                 out=out_view[:gen_tok0] if ported else out_view,
             )
-        return
-
-    if getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_idx):
-        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode import (
-            minimax_m3_trtllm_gen_dense_attention,
-        )
-
-        minimax_m3_trtllm_gen_dense_attention(
-            q_view,
-            kv_cache_manager,
-            layer_idx,
-            metadata,
-            sm_scale=sm_scale,
-            output=out_view,
-        )
         return
 
     k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)

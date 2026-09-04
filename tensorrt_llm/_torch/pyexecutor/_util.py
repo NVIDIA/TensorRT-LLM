@@ -460,9 +460,9 @@ class KvCacheCreator:
         # (e.g. ``MiniMaxM3KVCacheManagerV2`` from the sparse-attention path)
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
+            # The KV connector is supported on V2 via the pool layout
+            # registration path, so it no longer forces a fallback to V1.
             incompat: List[str] = []
-            if self._kv_connector_manager is not None:
-                incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("max_beam_width > 1")
             if incompat:
@@ -493,8 +493,8 @@ class KvCacheCreator:
                     raise NotImplementedError(
                         "Hybrid Mamba cache managers do not support "
                         f"{incompat_str}; CppMambaHybridCacheManager does not "
-                        "provide a compatible fallback. Use max_beam_width=1 "
-                        "and disable the KV connector.")
+                        "provide a compatible fallback. Disable the listed "
+                        "features to run hybrid linear models.")
                 # Plain V2 (explicitly enabled or selected by a model default):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
@@ -1147,11 +1147,8 @@ class KvCacheCreator:
                 self._kv_cache_manager_cls, 'supports_shared_draft_layers',
                 True):
             # Under attention DP, draft layers share the target manager (the
-            # layout existing deployments were validated with). A manager can
-            # opt out: MiniMax-M3's coalesces an index-K pool into its KV
-            # pages and exposes only synthetic AttentionOp tensors, which the
-            # dense Eagle3 drafter cannot attend against, so it requires the
-            # separate draft manager even under attention DP.
+            # layout existing deployments were validated with). Managers that
+            # cannot expose a draft-compatible view can opt out.
             logger.info("Attention DP: draft layers share the target KV "
                         "cache manager.")
             return False
@@ -1276,23 +1273,12 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
-        # A target manager class may request a different page size for the
-        # separate draft manager (e.g. MiniMax-M3, see
-        # draft_manager_tokens_per_block there for the rationale).
-        draft_tpb = getattr(self._kv_cache_manager_cls,
-                            'draft_manager_tokens_per_block',
-                            self._tokens_per_block)
-        if draft_tpb != self._tokens_per_block:
-            logger.info(
-                f"Draft KV cache manager uses tokens_per_block={draft_tpb} "
-                f"(target uses {self._tokens_per_block}).")
-            draft_kv_config.tokens_per_block = draft_tpb
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=self._mapping,
             kv_cache_config=draft_kv_config,
-            tokens_per_block=draft_tpb,
+            tokens_per_block=self._tokens_per_block,
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
@@ -2044,8 +2030,8 @@ def _create_kv_cache_manager(
         # One-model spec with shared draft layers appends the drafter's
         # layers to this manager; tell the manager how many. Anchor on the
         # pretrained TARGET layer count — local num_hidden_layers may already
-        # include the draft tail. Consumed by managers with a draft sub-page
-        # view (MiniMax-M3); others ignore it. Masked/cross flows yield a
+        # include the draft tail. Consumed by managers with a shared draft
+        # view; others ignore it. Masked/cross flows yield a
         # non-positive delta and correctly report 0.
         target_num_layers = getattr(config, "num_hidden_layers", None)
         num_appended_draft_layers = (len(per_layer_num_kv_heads) -

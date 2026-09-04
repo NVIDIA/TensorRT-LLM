@@ -311,7 +311,7 @@ def _build_transceiver_for_kv_slice(num_extra_kv_tokens: int, prompt_len: int):
         prompt_len=prompt_len,
         py_request_id=0,
         py_beam_width=1,  # beam search disabled; _trim_packed_beam_block_ids is pass-through
-        is_generation_only_request=lambda: False,
+        is_generation_only_request=False,
     )
     return transceiver, req
 

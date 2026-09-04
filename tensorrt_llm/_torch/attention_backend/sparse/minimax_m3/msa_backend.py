@@ -52,7 +52,7 @@ from .msa_utils import (
 )
 from .trtllm_gen_dense_decode import (
     dense_decode_unsupported_reason,
-    uniform_dense_subpage_geometry,
+    uniform_dense_subpages_per_slot,
     write_subpage_block_table,
 )
 
@@ -311,7 +311,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # factor, or 0 where the pool has no single one; see msa_subpage_rows.
     msa_subpage_block_table: Optional[torch.Tensor] = None
     _msa_subpages_per_slot: int = 0
-    _msa_pages_per_dense_role: int = 1
     # Per-request kv_lens as staged by prepare(), before the overlap scheduler
     # corrects them. on_update_kv_lens clamps against this; see there.
     msa_kv_lens_staged: Optional[torch.Tensor] = None
@@ -594,16 +593,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         )
         # Resolved once here rather than per step: the factor is fixed by the
         # pool's layout for the life of the manager.
-        self._msa_subpages_per_slot, self._msa_pages_per_dense_role = (
-            uniform_dense_subpage_geometry(kv_cache_manager)
-        )
+        self._msa_subpages_per_slot = uniform_dense_subpages_per_slot(kv_cache_manager)
         if self._msa_subpages_per_slot > 0:
             self.msa_subpage_block_table = self.get_empty(
                 buffers,
                 (
                     max_num_sequences,
                     2,
-                    max_blocks_per_seq * self._msa_pages_per_dense_role,
+                    max_blocks_per_seq,
                 ),
                 cache_name="msa_subpage_block_table",
                 dtype=torch.int32,
@@ -1340,6 +1337,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Drop any prewritten marker a failed prior step left unconsumed, so
         # it can never suppress a later step's cache write.
         self._msa_prewritten_layer = None
+        # The live counts describe the slot mapping staged at the end of this
+        # method, so clear them with the ready flag. An early return below would
+        # otherwise leave counts describing a batch that is no longer scheduled.
+        self._msa_live_batch = 0
+        self._msa_live_total_q = 0
         if not self._msa_buffers_ready:
             return
         request_ids = self.request_ids
@@ -1470,7 +1472,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 self.msa_block_table[:batch_size],
                 self._msa_subpages_per_slot,
                 self.msa_subpage_block_table[:batch_size],
-                self._msa_pages_per_dense_role,
             )
 
         # Staging for on_update_kv_lens.
@@ -1508,6 +1509,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_page_size = page_size
         self._msa_fields_ready = True
 
+    def msa_live_token_count(self) -> int:
+        """This step's live, unpadded new-token count.
+
+        Cache writers take the padded token extent and need this to find where
+        `msa_out_cache_loc` stops holding real slots. Raising when no mapping is
+        staged keeps an unprepared step from writing against another step's
+        slots, which a stale count would otherwise allow.
+        """
+        if not self._msa_fields_ready:
+            raise RuntimeError(
+                "MiniMax-M3 MSA cache write requires prepared metadata, but "
+                "prepare() did not stage a slot mapping for this step."
+            )
+        return self._msa_live_total_q
+
     def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
         """Return the paged index-K cache in the HND layout MSA consumes."""
         return self.kv_cache_manager.get_index_k_buffer(layer_idx, kv_layout="HND")
@@ -1522,6 +1538,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self.msa_out_cache_loc[:num_tokens],
             idx_k.reshape(num_tokens, 1, sparse_index_dim),
             layout="HND",
+            num_live_tokens=self.msa_live_token_count(),
         )
 
     def msa_write_layer_caches(
@@ -1541,11 +1558,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         Requires prepared metadata (msa_out_cache_loc filled), the same
         contract as the writes it replaces.
         """
-        from .msa_scatter import (
-            fused_write_layer_caches,
-            fused_write_layer_caches_nvfp4,
-            fused_write_subpaged_layer_caches,
-        )
+        from .msa_scatter import fused_write_layer_caches, fused_write_layer_caches_nvfp4
 
         idx_cache = self.msa_idx_k_cache(layer_idx) if idx_k is not None else None
         num_tokens = int(k.shape[0])
@@ -1553,9 +1566,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         is_nvfp4_layer = getattr(self.kv_cache_manager, "is_nvfp4_layer", lambda _layer_idx: False)(
             layer_idx
         )
-        is_fp8_subpaged_layer = getattr(
-            self.kv_cache_manager, "is_fp8_subpaged_layer", lambda _layer_idx: False
-        )(layer_idx)
         if is_nvfp4_layer:
             if kv_scale_orig_quant is None:
                 raise RuntimeError(
@@ -1583,30 +1593,26 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                     "MiniMax-M3 NVFP4 cache writer requires CUDA HND P128/P32 cache views, "
                     "contiguous logical K/V rows, and FP32 K/V quantization scales"
                 )
-        elif is_fp8_subpaged_layer:
-            k_view, v_view = self.kv_cache_manager.get_fp8_dense_buffers(layer_idx)
-            if not fused_write_subpaged_layer_caches(k_view, v_view, out_cache_loc, k, v):
-                raise RuntimeError(
-                    "MiniMax-M3 hybrid FP8 dense/Eagle cache writer requires CUDA "
-                    "HND P32 sub-page views and contiguous logical K/V rows"
-                )
         else:
             buffers = self.kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
             k_view, v_view = buffers[:, 0], buffers[:, 1]
             if not fused_write_layer_caches(k_view, v_view, idx_cache, out_cache_loc, k, v, idx_k):
                 num_kv_heads = int(k_view.shape[1])
                 head_dim = int(k_view.shape[3])
+                num_live_tokens = self.msa_live_token_count()
                 write_kv_slots(
                     k_view,
                     out_cache_loc,
                     k.reshape(num_tokens, num_kv_heads, head_dim),
                     layout="HND",
+                    num_live_tokens=num_live_tokens,
                 )
                 write_kv_slots(
                     v_view,
                     out_cache_loc,
                     v.reshape(num_tokens, num_kv_heads, head_dim),
                     layout="HND",
+                    num_live_tokens=num_live_tokens,
                 )
                 if idx_k is not None:
                     write_kv_slots(
@@ -1614,6 +1620,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                         out_cache_loc,
                         idx_k.reshape(num_tokens, 1, int(idx_cache.shape[-1])),
                         layout="HND",
+                        num_live_tokens=num_live_tokens,
                     )
         self._msa_prewritten_layer = layer_idx
 

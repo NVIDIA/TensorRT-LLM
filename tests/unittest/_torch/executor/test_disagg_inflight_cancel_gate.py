@@ -21,6 +21,7 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor import kv_cache_transceiver as transceiver_module
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import BindKvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
@@ -545,6 +546,57 @@ def test_cpp_runtime_rejects_v2_mamba_manager(runtime):
     manager = object.__new__(MambaHybridCacheManagerV2)
 
     with pytest.raises(ValueError, match="requires transceiver_runtime='PYTHON'"):
+        transceiver_module.create_kv_cache_transceiver(
+            Mock(), Mock(), manager, Mock(), config, manager
+        )
+
+
+@pytest.mark.parametrize("runtime", [None, "CPP", "auto"])
+def test_cpp_runtime_rejects_v2_manager(runtime):
+    """Plain KVCacheManagerV2 cannot drive the C++ transceiver either.
+
+    `CacheTransceiverCpp` is bound to the V1 `BaseKVCacheManager`, while
+    `KVCacheManagerV2.impl` is the Python V2 core's manager. Without this guard
+    the combination reaches `BindKvCacheTransceiver` and dies on a nanobind
+    signature mismatch that names neither the manager nor the way out.
+
+    `auto` is covered because it is the *default*: it resolves from the model's
+    preferred runtime, which knows nothing about which cache manager will be
+    built, so most models land on the C++ transceiver here.
+    """
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime=runtime)
+    manager = object.__new__(KVCacheManagerV2)
+
+    with pytest.raises(ValueError, match="KVCacheManagerV2 requires transceiver_runtime='PYTHON'"):
+        transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), manager, Mock(), config)
+
+
+def test_python_nixl_transceiver_accepts_v2_manager(monkeypatch):
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+    expected = object()
+    constructor = Mock(return_value=expected)
+    fake_module = SimpleNamespace(KvCacheTransceiverV2=constructor)
+    monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.disaggregation.transceiver", fake_module)
+    manager = object.__new__(KVCacheManagerV2)
+
+    result = transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), manager, Mock(), config)
+
+    assert result is expected
+    constructor.assert_called_once()
+
+
+def test_v2_mamba_manager_keeps_its_specific_rejection():
+    """MambaHybridCacheManagerV2 subclasses KVCacheManagerV2.
+
+    So the general guard must sit after the hybrid one, or the more specific
+    message -- the one that tells a hybrid user which manager they are on --
+    would be shadowed. Both messages share the "requires
+    transceiver_runtime='PYTHON'" phrase, so this matches the manager name.
+    """
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP")
+    manager = object.__new__(MambaHybridCacheManagerV2)
+
+    with pytest.raises(ValueError, match="MambaHybridCacheManagerV2 requires"):
         transceiver_module.create_kv_cache_transceiver(
             Mock(), Mock(), manager, Mock(), config, manager
         )

@@ -158,13 +158,15 @@ def test_hybrid_target_dense_pool_stays_fp8_p128_while_sparse_is_nvfp4_p128():
     try:
         buffers = manager.get_buffers(0, "HND")
         k, v = buffers[:, 0], buffers[:, 1]
-        data_pool, slot_stride, pages_per_role = manager.get_dense_kv_subpage_pool(0)
-        assert pages_per_role == 1
+        data_pool, slot_stride = manager.get_kv_subpage_pool(0, "HND")
         assert data_pool.dtype == torch.float8_e4m3fn
         assert data_pool.shape[2:] == (128, HEAD_DIM)
         for slot in (0, int(k.shape[0]) - 1):
             assert data_pool[slot * slot_stride].data_ptr() == k[slot].data_ptr()
             assert data_pool[slot * slot_stride + 1].data_ptr() == v[slot].data_ptr()
+        with pytest.raises(RuntimeError, match="require an NVFP4 KV cache"):
+            manager.get_block_scale_buffers(0, "HND")
+
         dense_buffers = manager.kv_cache_manager_py_config.layers[0].buffers
         assert {buffer.role for buffer in dense_buffers} == {
             manager._get_pool_roles(0)[0],
@@ -180,7 +182,7 @@ def test_hybrid_target_dense_pool_stays_fp8_p128_while_sparse_is_nvfp4_p128():
         manager.shutdown()
 
 
-def test_hybrid_shared_eagle_view_points_at_the_fp8_p32_pool():
+def test_hybrid_shared_eagle_view_points_at_the_fp8_p128_pool():
     from tensorrt_llm.bindings import DataType
 
     manager = _create_manager(
@@ -193,12 +195,12 @@ def test_hybrid_shared_eagle_view_points_at_the_fp8_p32_pool():
     )
     try:
         draft_layer = 4
-        view = manager.get_draft_subpage_view()
+        view = manager.get_draft_kv_cache_view()
         assert view is not None
-        assert view.tokens_per_block == 32
+        assert view.tokens_per_block == 128
         assert view.dtype == DataType.FP8
-        k, _v = manager.get_fp8_dense_buffers(draft_layer)
-        assert int(view.kv_cache_pool_pointers[0, 0]) == k.data_ptr()
+        flat_pool, _slot_stride = manager.get_kv_subpage_pool(draft_layer, "HND")
+        assert int(view.kv_cache_pool_pointers[0, 0]) == flat_pool.data_ptr()
         assert int(view.kv_cache_pool_pointers[0, 1]) == 0
         assert view._source_pool_id == int(
             manager.kv_cache_pool_mapping[manager.layer_offsets[draft_layer], 0]
@@ -208,7 +210,7 @@ def test_hybrid_shared_eagle_view_points_at_the_fp8_p32_pool():
             manager.layer_offsets[draft_layer]
         ].buffers
         assert len(draft_buffers) == 2
-        assert all(buffer.tokens_per_block_override == 32 for buffer in draft_buffers)
+        assert all(buffer.tokens_per_block_override is None for buffer in draft_buffers)
     finally:
         manager.shutdown()
 
@@ -226,15 +228,6 @@ def test_subpage_block_table_splits_k_and_v_rows():
     assert table.dtype == torch.int32
     assert table[:, 0].tolist() == [[0, 27, 63], [18, 45, 99]]
     assert table[:, 1].tolist() == [[1, 28, 64], [19, 46, 100]]
-
-
-def test_subpage_block_table_expands_logical_p128_to_physical_p32():
-    slots = torch.tensor([[0, 3]], device="cuda", dtype=torch.int32)
-    table = subpage_block_table(slots, subpages_per_slot=36, pages_per_role=4)
-
-    assert table.shape == (1, 2, 8)
-    assert table[0, 0].tolist() == [0, 1, 2, 3, 108, 109, 110, 111]
-    assert table[0, 1].tolist() == [4, 5, 6, 7, 112, 113, 114, 115]
 
 
 def test_subpage_block_table_reuses_one_buffer():

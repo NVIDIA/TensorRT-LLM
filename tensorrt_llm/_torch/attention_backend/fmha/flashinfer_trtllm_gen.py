@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
 FlashInfer TRTLLM-Gen FMHA
 
@@ -65,7 +64,6 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
-
 
 _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
 
@@ -752,8 +750,15 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, f"non-positive tokens_per_block ({tokens_per_block})."
         if tokens_per_block & (tokens_per_block - 1) != 0:
             return False, f"tokens_per_block ({tokens_per_block}) that is not a power of 2."
-        if tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK:
-            supported = sorted(self.SUPPORTED_TOKENS_PER_BLOCK)
+        # P128 is not exported for every TRTLLM-Gen shape family, so keep it
+        # out of the global allowlist. Cache-manager views whose exact shapes
+        # are exported may opt in explicitly.
+        extra_tokens_per_block = getattr(
+            meta.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()
+        )
+        supported_tokens_per_block = self.SUPPORTED_TOKENS_PER_BLOCK | set(extra_tokens_per_block)
+        if tokens_per_block not in supported_tokens_per_block:
+            supported = sorted(supported_tokens_per_block)
             return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
 
         return True, ""

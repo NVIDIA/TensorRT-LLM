@@ -20,7 +20,6 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import write
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_scatter import (
     fused_write_layer_caches,
     fused_write_layer_caches_nvfp4,
-    fused_write_subpaged_layer_caches,
 )
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
     msa_ported_decode_active,
@@ -388,6 +387,9 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
     manager = FakeCacheManager()
     metadata.kv_cache_manager = manager
     metadata.msa_out_cache_loc = torch.tensor([2, page_size + 5], dtype=torch.int32)
+    # Stage the prepared state msa_write_idx_k reads: two live slots.
+    metadata._msa_live_total_q = 2
+    metadata._msa_fields_ready = True
     values = torch.arange(2 * head_dim, dtype=torch.float32).reshape(2, 1, head_dim)
 
     returned = metadata.msa_idx_k_cache(3)
@@ -398,6 +400,48 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
     assert manager.calls == [(3, "HND"), (3, "HND")]
     torch.testing.assert_close(hnd_cache[0, 0, 2], values[0, 0].to(torch.bfloat16))
     torch.testing.assert_close(hnd_cache[1, 0, 5], values[1, 0].to(torch.bfloat16))
+
+
+def test_msa_live_token_count_requires_prepared_metadata():
+    """An unprepared step must raise rather than report a live token count.
+
+    Answering with a stale value would write live rows against another step's
+    slot array, and answering zero would drop a required write.
+    """
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_fields_ready = False
+    metadata._msa_live_total_q = 7
+
+    with pytest.raises(RuntimeError, match="requires prepared metadata"):
+        metadata.msa_live_token_count()
+
+    metadata._msa_fields_ready = True
+    assert metadata.msa_live_token_count() == 7
+
+
+def test_msa_build_fields_clears_live_counts_on_early_return():
+    """The live counts must not survive an early return from the field build.
+
+    _build_msa_fields bails when the buffers or request geometry are missing,
+    and a surviving count would describe a batch that is no longer scheduled.
+    """
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_fields_ready = True
+    metadata._msa_live_batch = 3
+    metadata._msa_live_total_q = 11
+    metadata._msa_prewritten_layer = 4
+    metadata._msa_buffers_ready = False
+
+    metadata._build_msa_fields()
+
+    assert metadata._msa_fields_ready is False
+    assert metadata._msa_live_batch == 0
+    assert metadata._msa_live_total_q == 0
+    assert metadata._msa_prewritten_layer is None
+    with pytest.raises(RuntimeError, match="requires prepared metadata"):
+        metadata.msa_live_token_count()
 
 
 def test_msa_indexer_preserves_strided_hnd_index_k(monkeypatch):
@@ -1448,13 +1492,32 @@ def test_build_paged_kv_slot_mapping_out_cache_loc_matches_slot_grid():
         assert slot in req_to_token[b].tolist()
 
 
-def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
+def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k, num_live_tokens=None):
     num_tokens = int(slots.shape[0])
+    live = num_tokens if num_live_tokens is None else int(num_live_tokens)
     num_heads, head_dim = int(k_cache.shape[1]), int(k_cache.shape[3])
-    write_kv_slots(k_cache, slots, k.reshape(num_tokens, num_heads, head_dim), layout="HND")
-    write_kv_slots(v_cache, slots, v.reshape(num_tokens, num_heads, head_dim), layout="HND")
+    write_kv_slots(
+        k_cache,
+        slots,
+        k.reshape(num_tokens, num_heads, head_dim),
+        layout="HND",
+        num_live_tokens=live,
+    )
+    write_kv_slots(
+        v_cache,
+        slots,
+        v.reshape(num_tokens, num_heads, head_dim),
+        layout="HND",
+        num_live_tokens=live,
+    )
     if idx_k is not None:
-        write_kv_slots(idx_cache, slots, idx_k.reshape(num_tokens, 1, head_dim), layout="HND")
+        write_kv_slots(
+            idx_cache,
+            slots,
+            idx_k.reshape(num_tokens, 1, head_dim),
+            layout="HND",
+            num_live_tokens=live,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1506,34 +1569,67 @@ def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_subpage_scatter_places_tokens_inside_p32_pages():
-    torch.manual_seed(17)
-    num_slots, pages_per_role, num_heads = 3, 4, 2
-    physical_page, head_dim = 32, 128
-    k_cache = torch.zeros(
-        (num_slots, pages_per_role, num_heads, physical_page, head_dim),
-        dtype=torch.float8_e4m3fn,
-        device="cuda",
-    )
-    v_cache = torch.zeros_like(k_cache)
-    slots = torch.tensor([0, 31, 32, 127, 128, 255, -1], dtype=torch.int32, device="cuda")
-    qkv = torch.randn(
-        slots.numel(), 2 * num_heads * head_dim + 13, dtype=torch.bfloat16, device="cuda"
-    )
-    k = qkv[:, : num_heads * head_dim]
-    v = qkv[:, num_heads * head_dim : 2 * num_heads * head_dim]
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
+def test_write_kv_slots_drops_padded_rows(num_kv_heads):
+    """write_kv_slots must leave the sentinel tail alone.
 
-    assert fused_write_subpaged_layer_caches(k_cache, v_cache, slots, k, v)
-    expected_k = k.reshape(slots.numel(), num_heads, head_dim).to(torch.float8_e4m3fn)
-    expected_v = v.reshape(slots.numel(), num_heads, head_dim).to(torch.float8_e4m3fn)
-    for row, slot in enumerate(slots[:-1].tolist()):
-        page, logical_within = divmod(slot, 128)
-        subpage, within = divmod(logical_within, physical_page)
-        assert torch.equal(k_cache[page, subpage, :, within], expected_k[row])
-        assert torch.equal(v_cache[page, subpage, :, within], expected_v[row])
-    # The invalid row is masked and therefore cannot touch any cache location.
-    assert torch.count_nonzero(k_cache[2]).item() == 0
-    assert torch.count_nonzero(v_cache[2]).item() == 0
+    Torch wraps negative indices, so a writer that trusts the row count
+    scatters those rows into the last page and corrupts whichever request owns
+    it without faulting. Asserting on the whole pool, not just the live slots,
+    is what catches that wrapped write.
+    """
+    torch.manual_seed(3)
+    device = "cuda"
+    num_pages, tokens_per_block, head_dim = 6, 32, 128
+    live_tokens, padded_tokens = 5, 17
+    inner = num_kv_heads * head_dim
+
+    pool = torch.zeros(
+        num_pages, 2, num_kv_heads, tokens_per_block, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_cache, v_cache = pool[:, 0], pool[:, 1]
+    qkv = torch.randn(padded_tokens, 2 * inner, dtype=torch.bfloat16, device=device)
+    k, v = qkv[:, :inner], qkv[:, inner:]
+
+    # Live slots avoid the last page so a wrapped -1 write is unambiguous.
+    slots = torch.full((padded_tokens,), -1, dtype=torch.int32, device=device)
+    live_slots = torch.randperm((num_pages - 1) * tokens_per_block, device=device)[:live_tokens]
+    slots[:live_tokens] = live_slots.to(torch.int32)
+
+    write_kv_slots(
+        k_cache,
+        slots,
+        k.reshape(padded_tokens, num_kv_heads, head_dim),
+        layout="HND",
+        num_live_tokens=live_tokens,
+    )
+    write_kv_slots(
+        v_cache,
+        slots,
+        v.reshape(padded_tokens, num_kv_heads, head_dim),
+        layout="HND",
+        num_live_tokens=live_tokens,
+    )
+
+    # The fused scatter masks the same rows, so the two writers must agree.
+    ref_pool = torch.zeros_like(pool)
+    assert fused_write_layer_caches(ref_pool[:, 0], ref_pool[:, 1], None, slots, k, v, None)
+    torch.testing.assert_close(pool, ref_pool)
+
+    expected_k = k.reshape(padded_tokens, num_kv_heads, head_dim)
+    for row, slot in enumerate(slots[:live_tokens].tolist()):
+        page, within = divmod(slot, tokens_per_block)
+        assert torch.equal(k_cache[page, :, within], expected_k[row])
+    assert torch.count_nonzero(pool[num_pages - 1]).item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_write_kv_slots_rejects_more_live_tokens_than_rows():
+    cache = torch.zeros(4, 1, 8, 16, dtype=torch.bfloat16, device="cuda")
+    slots = torch.zeros(2, dtype=torch.int32, device="cuda")
+    values = torch.zeros(2, 1, 16, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="exceeds the rows supplied"):
+        write_kv_slots(cache, slots, values, layout="HND", num_live_tokens=3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

@@ -203,11 +203,6 @@ def msa_paged_kv(kv_cache_manager, layer_idx: int) -> Tuple[torch.Tensor, torch.
     runtime and needs only each page's [page_size, head_dim] block to be
     contiguous, which this view satisfies, so no copy is required.
     """
-    if getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_idx):
-        raise RuntimeError(
-            "hybrid FP8 dense/Eagle cache is physically P32; use the direct "
-            "TRTLLM-Gen dense adapter instead of msa_paged_kv"
-        )
     buffers = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
     return buffers[:, 0], buffers[:, 1]
 
@@ -218,33 +213,36 @@ def write_msa_main_kv(
     out_cache_loc: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    num_live_tokens: int,
 ) -> None:
     """Write new-token K and V into the paged main cache at out_cache_loc.
 
     fmha_sm100 reads the paged cache directly, so the new-token K and V must be
     resident before the sparse GQA runs. The write uses the head-major HND view
     so `msa_paged_kv` can return a zero-copy view.
-    """
-    if getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_idx):
-        from .msa_scatter import fused_write_subpaged_layer_caches
 
-        k_view, v_view = kv_cache_manager.get_fp8_dense_buffers(layer_idx)
-        if not fused_write_subpaged_layer_caches(k_view, v_view, out_cache_loc, k, v):
-            raise RuntimeError(
-                "MiniMax-M3 hybrid FP8 dense/Eagle cache write requires CUDA "
-                "P32 sub-page views and contiguous K/V rows"
-            )
-        return
+    `num_live_tokens` is forwarded to `write_kv_slots`. The sub-paged branch
+    below takes no equivalent, since its scatter masks the sentinel itself.
+    """
     buffers = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
     k_view, v_view = buffers[:, 0], buffers[:, 1]
     num_kv_heads = int(k_view.shape[1])
     head_dim = int(k_view.shape[3])
     num_tokens = int(k.shape[0])
     write_kv_slots(
-        k_view, out_cache_loc, k.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+        k_view,
+        out_cache_loc,
+        k.reshape(num_tokens, num_kv_heads, head_dim),
+        layout="HND",
+        num_live_tokens=num_live_tokens,
     )
     write_kv_slots(
-        v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+        v_view,
+        out_cache_loc,
+        v.reshape(num_tokens, num_kv_heads, head_dim),
+        layout="HND",
+        num_live_tokens=num_live_tokens,
     )
 
 

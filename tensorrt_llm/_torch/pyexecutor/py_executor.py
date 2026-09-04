@@ -60,6 +60,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
@@ -1031,8 +1032,16 @@ class PyExecutor:
                     "connector scheduler / worker hooks and are not "
                     "distinguished from real requests.")
 
+            if self.kv_cache_manager is None:
+                raise ValueError(
+                    "KV Cache Connector requires a KV Cache Manager.")
+
+            is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
+                                                KVCacheManagerV2)
+
             kv_cache_config = getattr(self.llm_args, 'kv_cache_config', None)
-            if kv_cache_config is not None and kv_cache_config.host_cache_size:
+            if not is_kv_cache_manager_v2 and (kv_cache_config is not None and
+                                               kv_cache_config.host_cache_size):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with KV cache host "
                     "offloading (KvCacheConfig.host_cache_size). The connector "
@@ -1042,11 +1051,11 @@ class PyExecutor:
                     "streams are not synchronized with the internal "
                     "onboard/offload streams.")
 
-            if self.kv_cache_manager is None:
-                raise ValueError(
-                    "KV Cache Connector requires a KV Cache Manager.")
-
-            if getattr(self.kv_cache_manager, 'is_vswa', False):
+            # VSWA allocates one pool per window size. That is fatal for the V1
+            # single-tensor registration, but is the normal case for V2, whose
+            # layout describes one region set per layer group.
+            if not is_kv_cache_manager_v2 and getattr(self.kv_cache_manager,
+                                                      'is_vswa', False):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with variable "
                     "sliding-window attention (per-layer max_attention_window "
@@ -1062,8 +1071,20 @@ class PyExecutor:
                     "per-layer load/save hooks have nothing meaningful to "
                     "transfer for those layers.")
 
-            kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
-            self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
+            if is_kv_cache_manager_v2:
+                # A registered region is only a valid address while its page is
+                # pinned to GPU. V2 migrates pages between cache tiers, and it
+                # provisions a host tier by default, so reject any non-GPU tier
+                # until the connector participates in migration. Read the
+                # resolved tier list rather than KvCacheConfig.host_cache_size:
+                # the default of None is falsy but still yields a host tier.
+                self._reject_non_gpu_cache_tiers(self.kv_cache_manager)
+                layout = build_kv_cache_layout_v2(self.kv_cache_manager)
+                self.kv_connector_manager.worker.register_kv_cache_layout(
+                    layout)
+            else:
+                kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
+                self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
             # For each of our layers, we need to register the pre/post hooks.
             # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.
@@ -1075,6 +1096,36 @@ class PyExecutor:
                         self.kv_connector_manager.layer_post_hook)
 
             self.kv_connector_manager.wait_for_initialization()
+
+    @staticmethod
+    def _reject_non_gpu_cache_tiers(kv_cache_manager) -> None:
+        """Reject KVCacheManagerV2 cache tiers below GPU while a connector runs.
+
+        A registered region is only a valid device address while its page is
+        pinned to GPU; eviction to another tier reassigns the page's slot. Until
+        the connector participates in migration, allow GPU-only configurations.
+
+        The resolved tier list is read from the manager rather than from
+        ``KvCacheConfig.host_cache_size`` on purpose: V2 provisions a host tier
+        automatically when that field is left at its default of ``None``, which
+        is falsy and would slip past a truthiness check.
+        """
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+
+        cache_tiers = getattr(kv_cache_manager.impl.init_config, "cache_tiers",
+                              None)
+        if not cache_tiers:
+            return
+        extra = [tier for tier in cache_tiers if tier.tier != CacheTier.GPU_MEM]
+        if extra:
+            names = ", ".join(str(tier.tier) for tier in extra)
+            raise NotImplementedError(
+                "KV Cache Connector is not supported with KVCacheManagerV2 "
+                f"cache tiers below GPU (found: {names}). Pages evicted to "
+                "another tier have their GPU slot reassigned, which would "
+                "invalidate the addresses registered with the connector. Set "
+                "KvCacheConfig.host_cache_size=0 and "
+                "KvCacheConfig.disk_cache_size=0 to run GPU-only.")
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
@@ -5540,7 +5591,7 @@ class PyExecutor:
         """Flush generation transfer errors through a TP-uniform path."""
         error_requests = [
             req for req in self._get_disagg_reqs_in_error_state()
-            if req.is_generation_only_request()
+            if req.is_generation_only_request
         ]
         local_needs_flush = bool(error_requests)
 
@@ -5734,11 +5785,6 @@ class PyExecutor:
                 and self.max_num_tokens is not None):
             token_nums = [self.max_num_tokens]
 
-        # A separate draft KV cache manager must also see the dummy, or
-        # its prepare_resources hits an unknown request id.
-        draft_kv_cache_manager = self.resource_manager.get_resource_manager(
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-
         if (not self._enable_dsv4_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
             try:
@@ -5748,12 +5794,11 @@ class PyExecutor:
                     is_gen=self._adp_dummy_is_gen,
                     prepare_resource=True,
                     max_num_draft_tokens=self.max_total_draft_tokens,
-                    draft_kv_cache_manager=draft_kv_cache_manager,
                 )
             except OutOfPagesError:
                 dummy_requests = None
             if not dummy_requests:
-                # Both KV cache managers report allocation failure by returning
+                # The cache manager reports allocation failure by returning
                 # None, expecting the caller to retry on a later iteration. An
                 # empty batch is safe here because _can_queue() allgathers batch
                 # sizes, so every rank skips the forward pass together.
@@ -5786,7 +5831,6 @@ class PyExecutor:
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
-                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         except OutOfPagesError:
             dummy_requests = None
@@ -6037,7 +6081,17 @@ class PyExecutor:
 
         def kv_connector_request_finished(req: LlmRequest):
             try:
-                cache_block_ids = self.kv_cache_manager.get_cache_indices(req)
+                # KVCacheManagerV2 has no primary-pool block list; its page
+                # indices are scoped to a layer group. Without this the lookup
+                # below raises, the warning path swallows it, and
+                # `request_finished` is never called at all on V2 -- so a
+                # connector is never told to save anything.
+                if isinstance(self.kv_cache_manager, KVCacheManagerV2):
+                    cache_block_ids = self.kv_cache_manager.get_connector_page_indices(
+                        req)
+                else:
+                    cache_block_ids = self.kv_cache_manager.get_cache_indices(
+                        req)
             except Exception as e:
                 logger.warning(
                     f"Unable to get cache blocks for request {req.py_request_id}. Skipping asynchronous saving: {e}"
@@ -6797,7 +6851,7 @@ class PyExecutor:
                     new_active_requests.append(request)
                 continue
 
-            if request.is_generation_only_request() and not request.is_finished:
+            if request.is_generation_only_request and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously

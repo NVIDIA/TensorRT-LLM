@@ -580,10 +580,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                         f"hidden_states={hidden_states.shape[0]}")
                 to_save = hidden_states[:num_tokens]
                 if residual is not None:
-                    # residual shares its leading (token) dim with hidden_states
-                    # (both come from the same decoder layer), so the bound
-                    # check above already guarantees num_tokens <=
-                    # residual.shape[0]; no separate check is needed.
+                    # Both values come from the same decoder layer, so the
+                    # hidden-state bound above also covers residual.
                     to_save = to_save + residual[:num_tokens]
                 inplace_slice_copy(self.hidden_states, to_save,
                                    i * self.hidden_size,
@@ -794,7 +792,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # state the target model expects.
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-        # Get the draft KV cache manager if using separate layouts
+        # Resolve a separate draft manager or shared-layout adapter, if needed.
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
 

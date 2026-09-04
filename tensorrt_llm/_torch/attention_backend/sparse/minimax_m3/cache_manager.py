@@ -25,10 +25,8 @@ Provides:
 
 from __future__ import annotations
 
-import os
 from typing import List, Optional, Sequence, Tuple
 
-import numpy as np
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
@@ -144,16 +142,9 @@ def derive_shared_draft_layout(
 ) -> tuple[list[int], Optional[int]]:
     """Locate the appended one-model draft tail in the manager's layer range.
 
-    ``num_layers`` is ambiguous at the creation site: for M3 + Eagle3 it
-    carries the pretrained TARGET count (60) while the per-layer
-    ``num_kv_heads`` list is already extended with the draft entries
-    (61); other flows pass the extended count directly. The heads list's
-    length is the unambiguous total, so anchor on it and fall back to
-    ``num_layers`` for scalar heads.
-
-    Returns ``(draft_layer_ids, num_target_layers)``; the target range is
-    ``[0, num_target_layers)`` and the draft tail sits directly above it.
-    ``num_target_layers`` is ``None`` when neither input pins the range.
+    ``num_layers`` can describe either the pretrained target or the extended
+    target-plus-draft stack. The per-layer KV-head list is the unambiguous
+    total when available, while ``num_draft`` identifies the appended tail.
     """
     total = (
         len(num_kv_heads)
@@ -165,8 +156,7 @@ def derive_shared_draft_layout(
     if num_layers is not None:
         total = max(total, int(num_layers))
     num_target = total - max(0, int(num_draft))
-    draft_ids = list(range(num_target, total))
-    return draft_ids, num_target
+    return list(range(num_target, total)), num_target
 
 
 class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
@@ -188,36 +178,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
       * ``disable_index_value_layer_ids`` — subset whose index-V is
         omitted.
       * ``sparse_index_dim`` — width of the index-K/V vectors.
-      * ``num_one_model_draft_layers`` — how many one-model draft layers
-        the creation site appended after the target's (0 when the drafter
-        is separate or speculation is off).
+      * ``num_one_model_draft_layers`` — number of appended shared draft
+        layers (0 for a separate drafter or when speculation is disabled).
     """
 
-    # One-model speculative draft layers share this manager (unified KV
-    # cache): reuse, eviction, and disaggregated transfer then cover the
-    # drafter's KV natively. Its attention addresses the physical P32 buffer
-    # expansion through ``get_draft_subpage_view``.
-    supports_shared_draft_layers = True
-
-    # WAR: the Eagle draft kernels break at tokens_per_block=128 (the MSA
-    # target's page size) — the SM103 context cubin is missing (its unfused
-    # fallback demands a multi-TiB workspace) and the generation kernel hits
-    # an illegal memory access — so the drafter runs at 32-token pages. This
-    # value sizes both the separate draft manager and the view's sub-pages.
-    # Retirement, once the kernels are fixed (WAR sites point here):
-    #   1. Validate with TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK=128; the view
-    #      degenerates to the identity expansion (unit-tested).
-    #   2. Delete the WAR surface — MiniMaxM3DraftSubpageView,
-    #      ``get_draft_subpage_view``, the ``add_dummy_requests`` override,
-    #      and this attribute; the drafter then attends the shared manager
-    #      directly (validated at acceptance parity, PR #17457).
-    draft_manager_tokens_per_block = 32
-    # The separately allocated Eagle layer cannot inherit an NVFP4 target
-    # cache: the shipped TRTLLM-Gen set has no matching M3 P32 NVFP4 decode
-    # cubin.  Keep the draft on its established FP8/P32 representation while
-    # sparse target layers use NVFP4/P128.
-    draft_manager_kv_cache_dtype = "fp8"
-    nvfp4_dense_tokens_per_block = 32
     _main_kv_layout = "NHD"
 
     def __init__(
@@ -263,9 +227,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         if sparse_index_dim is None:
             sparse_index_dim = int(getattr(sparse_attn_config, "sparse_index_dim", 0) or 0) or 128
-        # One-model speculative decoding with shared draft layers appends the
-        # drafter's layers after the target's (dense, no MSA index cache);
-        # ``_create_kv_cache_manager`` passes the appended count explicitly.
         self._shared_draft_layer_ids, num_target_layers = derive_shared_draft_layout(
             num_layers, kwargs.get("num_kv_heads"), num_one_model_draft_layers
         )
@@ -309,10 +270,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 "[m3-kv] hybrid cache active: "
                 f"{len(self.sparse_layer_ids)} sparse target layer(s)=NVFP4/P128, "
                 f"{len(dense_target_layers)} dense target layer(s)=FP8/P128, "
-                f"{len(self._shared_draft_layer_ids)} shared Eagle layer(s)=FP8/P32"
+                f"{len(self._shared_draft_layer_ids)} shared Eagle layer(s)=FP8/P128"
             )
 
-        self._draft_subpage_view_obj: Optional["MiniMaxM3DraftSubpageView"] = None
+        self._draft_kv_cache_view_obj: Optional["MiniMaxM3DraftKVCacheView"] = None
         if self._shared_draft_layer_ids and self.sparse_layer_ids and not self.is_draft:
             # Paired with the "view active" log at first dispatch.
             logger.info(
@@ -353,18 +314,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         M3's 57 sparse target layers have a native MSA NVFP4 consumer.  The
         three dense target layers and the appended one-model Eagle layer do
         not have a matching TRTLLM-Gen NVFP4 cubin, so those buffers retain
-        the proven FP8 representation.  Target dense layers retain their
-        established P128 layout; only the shared Eagle layer uses physical
-        P32 pages because its SM100/SM103 kernels require that geometry.
+        the proven FP8/P128 representation.
         """
         if self.dtype != DataType.NVFP4:
             return super()._build_cache_config(config)
 
-        physical_page = self.nvfp4_dense_tokens_per_block
-        assert config.tokens_per_block % physical_page == 0, (
-            f"M3 logical page P{config.tokens_per_block} must be divisible by "
-            f"the dense/Eagle physical page P{physical_page}."
-        )
         scale_roles = {Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
         for layer in config.layers:
             local_layer_idx = int(layer.layer_id)
@@ -374,14 +328,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             layer.buffers[:] = [
                 buffer for buffer in layer.buffers if buffer.role not in scale_roles
             ]
-            for buffer in layer.buffers:
-                if buffer.role not in (Role.KEY, Role.VALUE):
-                    continue
-                if global_layer_idx in self._shared_draft_layer_ids:
-                    buffer.size = (
-                        self.get_layer_bytes_per_token(local_layer_idx, buffer.role) * physical_page
-                    )
-                    buffer.tokens_per_block_override = physical_page
         return super()._build_cache_config(config)
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
@@ -414,10 +360,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         """Whether a dense target/Eagle layer is the FP8 half of hybrid KV."""
         return self.dtype == DataType.NVFP4 and int(layer_idx) not in self.sparse_layer_ids
 
-    def is_fp8_subpaged_layer(self, layer_idx: int) -> bool:
-        """Whether the shared Eagle layer uses physical P32 FP8 pages."""
-        return self.is_fp8_dense_layer(layer_idx) and int(layer_idx) in self._shared_draft_layer_ids
-
     @property
     def uses_hybrid_nvfp4_kv_cache(self) -> bool:
         return self.dtype == DataType.NVFP4
@@ -428,8 +370,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         The base NVFP4 implementation assumes every layer has a scale buffer.
         Hybrid M3 deliberately omits scales from dense/Eagle layers, while the
         target metadata still needs the nested NVFP4 pointer envelope for the
-        sparse pools.  Dense consumers use the direct P32 views below and the
-        shared Eagle view publishes itself as an ordinary FP8 manager.
+        sparse pools. Dense consumers use direct P128 views, and the shared
+        Eagle view publishes itself as an ordinary FP8 manager.
         """
         if self.dtype != DataType.NVFP4:
             return super()._build_pool_mapping_tensors()
@@ -501,48 +443,41 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             torch.tensor(mapping_rows, dtype=torch.int32, pin_memory=prefer_pinned()),
         )
 
-    def get_draft_subpage_view(self) -> Optional["MiniMaxM3DraftSubpageView"]:
-        """Sub-page view over the shared drafter pool, or None.
+    def get_draft_kv_cache_view(self) -> Optional["MiniMaxM3DraftKVCacheView"]:
+        """Return a P128 view rooted at the shared draft layer's K page.
 
         Only meaningful on a target manager carrying appended one-model
         draft layers; built lazily so the manager's page tables exist. A
         method rather than a property so ``getattr`` fetches it without
-        executing it (see ``resolve_draft_kv_cache_manager``).
+        executing it (see ``get_draft_kv_cache_manager``).
 
-        Retires with the P128 Eagle kernel fixes; see
-        ``draft_manager_tokens_per_block``.
+        The view is required because M3's sparse layers add an index-K page to
+        the otherwise dense K/V mega-slot layout.
         """
         if self.is_draft or not self._shared_draft_layer_ids:
             return None
-        if self._draft_subpage_view_obj is None:
-            subpage_tokens = (
-                int(os.environ.get("TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK", 0) or 0)
-                or self.draft_manager_tokens_per_block
-            )
-            self._draft_subpage_view_obj = MiniMaxM3DraftSubpageView(
-                self,
-                self._shared_draft_layer_ids,
-                subpage_tokens,
+        if self._draft_kv_cache_view_obj is None:
+            self._draft_kv_cache_view_obj = MiniMaxM3DraftKVCacheView(
+                self, self._shared_draft_layer_ids
             )
             logger.info(
-                f"[unified-kv] draft sub-page view active "
-                f"(tokens_per_block={self._draft_subpage_view_obj.tokens_per_block}, "
-                f"flat_page_bound={self._draft_subpage_view_obj.blocks_in_primary_pool})"
+                "[unified-kv] native P128 draft view active "
+                f"(flat_page_bound={self._draft_kv_cache_view_obj.blocks_in_primary_pool})"
             )
-        return self._draft_subpage_view_obj
+        return self._draft_kv_cache_view_obj
 
     def add_dummy_requests(self, *args, **kwargs):
-        """Drop the draft sub-page view before delegating.
+        """Drop the draft view before delegating.
 
         The base method mirrors dummy KV caches into a *separate* draft
         manager. With shared draft layers a dummy request's blocks already
         span the drafter's pool (pools allocate in lockstep per logical
         block), and the view owns no block lifecycle.
 
-        Retires with the P128 Eagle kernel fixes; see
-        ``draft_manager_tokens_per_block``.
+        This override remains necessary for the rooted P128 view because that
+        view owns no blocks and must not receive duplicate dummy allocations.
         """
-        if isinstance(kwargs.get("draft_kv_cache_manager"), MiniMaxM3DraftSubpageView):
+        if isinstance(kwargs.get("draft_kv_cache_manager"), MiniMaxM3DraftKVCacheView):
             kwargs["draft_kv_cache_manager"] = None
         return super().add_dummy_requests(*args, **kwargs)
 
@@ -639,11 +574,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             kv_layout = self._main_kv_layout
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
-        if self.is_fp8_subpaged_layer(layer_idx):
-            raise RuntimeError(
-                f"hybrid FP8 layer {layer_idx} uses four physical P32 pages; "
-                "use get_fp8_dense_buffers/get_dense_kv_subpage_pool instead"
-            )
         if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
             raise NotImplementedError(
                 "MiniMaxM3KVCacheManagerV2 does not support the SELFKONLY cache type"
@@ -719,23 +649,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
         When omitted, ``kv_layout`` follows the selected sparse backend.
         """
-        if self.is_fp8_subpaged_layer(layer_idx):
-            if kv_layout not in (None, "HND"):
-                raise ValueError(
-                    "hybrid FP8 dense/Eagle buffers have a physical P32 HND layout; "
-                    f"requested {kv_layout}"
-                )
-            k, _v, slot_stride, pages_per_role = self._fp8_dense_data_buffers(layer_idx)
-            num_slots, _pages, num_heads, page_size, head_dim = k.shape
-            full = convert_to_torch_tensor(
-                TensorWrapper(
-                    k.data_ptr(),
-                    k.dtype,
-                    [num_slots, slot_stride, num_heads, page_size, head_dim],
-                )
-            )
-            return full[:, : 2 * pages_per_role].unflatten(1, (2, pages_per_role))
-
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
             layer_idx, kv_layout
         )
@@ -813,78 +726,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
         return full_view[:, :2]
 
-    def _fp8_dense_data_buffers(
-        self, layer_idx: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
-        """Return hybrid FP8 K/V views backed by physical P32 pages.
-
-        Each logical P128 role page is laid out as four consecutive P32 HND
-        pages.  ``slot_stride`` is measured in those physical pages and already
-        includes the V2 converter's expansion factor.
-        """
-        if not self.is_fp8_subpaged_layer(layer_idx):
-            raise RuntimeError(f"layer {layer_idx} is not a physical-P32 hybrid FP8 layer")
-        local_layer_idx = self.layer_offsets[layer_idx]
-        physical_page = self.nvfp4_dense_tokens_per_block
-        pages_per_role = self.tokens_per_block // physical_page
-        addr_key = self.impl.get_mem_pool_base_address(local_layer_idx, Role.KEY)
-        addr_value = self.impl.get_mem_pool_base_address(local_layer_idx, Role.VALUE)
-        page_stride_key = self.impl.get_page_stride(local_layer_idx, Role.KEY)
-        page_stride_value = self.impl.get_page_stride(local_layer_idx, Role.VALUE)
-        assert page_stride_key == page_stride_value
-        assert addr_key + pages_per_role * page_stride_key == addr_value, (
-            "M3 hybrid FP8 storage requires V immediately after K's physical "
-            f"P{physical_page} pages; layer={layer_idx} K={addr_key} "
-            f"stride={page_stride_key} V={addr_value}."
-        )
-
-        converter = self.impl.get_page_index_converter(local_layer_idx, Role.KEY)
-        assert int(converter.expansion) == pages_per_role, (
-            f"layer {layer_idx} expected V2 expansion {pages_per_role}, got "
-            f"{int(converter.expansion)}"
-        )
-        slot_stride = int(converter.scale) * pages_per_role
-        layer_offset_pages = int(converter.layer_offset) * pages_per_role
-        page_upper = self.impl.get_page_index_upper_bound(local_layer_idx, Role.KEY)
-        total_pages = int(page_upper) + layer_offset_pages
-        assert total_pages % slot_stride == 0
-        num_slots = total_pages // slot_stride
-
-        num_heads = self.num_kv_heads_per_layer[local_layer_idx]
-        head_dim = self.head_dim_per_layer[local_layer_idx]
-        full = convert_to_torch_tensor(
-            TensorWrapper(
-                addr_key,
-                torch.float8_e4m3fn,
-                [num_slots, slot_stride, num_heads, physical_page, head_dim],
-            )
-        )
-        return (
-            full[:, :pages_per_role],
-            full[:, pages_per_role : 2 * pages_per_role],
-            slot_stride,
-            pages_per_role,
-        )
-
-    def get_fp8_dense_buffers(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return physical-P32 hybrid FP8 views as ``K, V``."""
-        k, v, _slot_stride, _pages_per_role = self._fp8_dense_data_buffers(layer_idx)
-        return k, v
-
-    def get_dense_kv_subpage_pool(self, layer_idx: int) -> Tuple[torch.Tensor, int, int]:
-        """Flat dense-attention pool, slot stride, and pages per K/V role."""
-        if not self.is_fp8_subpaged_layer(layer_idx):
-            pool, slot_stride = self.get_kv_subpage_pool(layer_idx, "HND")
-            return pool, slot_stride, 1
-        k, _v, slot_stride, pages_per_role = self._fp8_dense_data_buffers(layer_idx)
-        num_slots, _pages, num_heads, page_size, head_dim = k.shape
-        num_pages = (num_slots - 1) * slot_stride + 2 * pages_per_role
-        addr = k.data_ptr()
-        pool = convert_to_torch_tensor(
-            TensorWrapper(addr, k.dtype, [num_pages, num_heads, page_size, head_dim])
-        )
-        return pool, slot_stride, pages_per_role
-
     def get_kv_subpage_pool(
         self, layer_idx: int, kv_layout: str = "HND"
     ) -> Tuple[torch.Tensor, int]:
@@ -902,13 +743,32 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         spanning ``num_slots * scale``, which would run off the pool by
         whatever this layer's K offset is inside a slot.
         """
-        if self.is_fp8_subpaged_layer(layer_idx):
-            if kv_layout != "HND":
-                raise ValueError("hybrid FP8 dense/Eagle sub-pages are HND only")
-            pool, slot_stride, _pages_per_role = self.get_dense_kv_subpage_pool(layer_idx)
-            return pool, slot_stride
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
             layer_idx, kv_layout
+        )
+        num_subpages = (num_slots - 1) * scale + 2
+        flat = convert_to_torch_tensor(
+            TensorWrapper(addr_key, torch_dtype, [num_subpages, *page_shape])
+        )
+        return flat, scale
+
+    def get_kv_scale_subpage_pool(
+        self, layer_idx: int, kv_layout: str = "HND"
+    ) -> Tuple[torch.Tensor, int]:
+        """Return the flat NVFP4 scale pool paired with ``get_kv_subpage_pool``.
+
+        The returned factor must match the packed-data factor so one K/V block
+        table addresses both pools.
+        """
+        addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_scale_slot_geometry(
+            layer_idx, kv_layout
+        )
+        _data_addr, _data_dtype, data_slots, data_scale, _data_shape = self._kv_slot_geometry(
+            layer_idx, kv_layout
+        )
+        assert (num_slots, scale) == (data_slots, data_scale), (
+            "MiniMaxM3 NVFP4 data and scale pools require identical page-index "
+            f"geometry; data={(data_slots, data_scale)} scale={(num_slots, scale)}."
         )
         num_subpages = (num_slots - 1) * scale + 2
         flat = convert_to_torch_tensor(
@@ -1013,99 +873,72 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         return padded_tensor
 
 
-class MiniMaxM3DraftSubpageView:
-    """Present the shared manager's draft-layer pool at a smaller kernel page size.
+class MiniMaxM3DraftKVCacheView:
+    """Present the shared manager's dense draft K/V pages to TRTLLM-Gen.
 
-    With unified KV cache the drafter's KV lives inside the shared manager's
-    128-token logical blocks, but the Eagle3 kernels are only healthy at
-    32-token pages on this architecture. This view flows wherever a separate
-    draft manager would (``get_draft_kv_cache_manager`` and the
-    attention-metadata draft swap) and re-expresses the geometry only:
-
-    * the single pool pointer is re-rooted at the drafter's K address, and
-      the draft layer's row in the pool mapping points at that pool;
-    * the block table expands each logical slot ``s`` into sub-pages —
-      K at ``s*scale*subdiv + j`` (``j < subdiv``), V at ``+subdiv``
-      (``scale`` = the drafter's pages per mega-slot, from
-      ``_kv_slot_geometry``; same layout trick as the dense-layer
-      trtllm-gen adapter).
-
-    The attention op reads ``tokens_per_block`` and the pool pointers from
-    the metadata's manager, so no attention-backend changes are needed. The
-    view owns no blocks: lifecycle stays entirely with the shared manager.
-
-    Retires with the P128 Eagle kernel fixes; see the retirement plan on
-    ``MiniMaxM3KVCacheManagerV2.draft_manager_tokens_per_block``.
+    MiniMax-M3 stores every layer in one non-uniform mega-slot: sparse target
+    layers add an index-K page, while the dense draft layer contributes only K
+    and V. This view roots the pool at the draft K page and maps logical slot
+    ``s`` to ``K=s*scale, V=K+1``. It owns no block lifecycle.
     """
 
-    def __init__(self, manager, draft_layer_ids: Sequence[int], subpage_tokens: int):
+    # P128 is exported for this view's exact dense-GQA shapes, but not for all
+    # shapes in the TRTLLM-Gen artifact.
+    trtllm_gen_extra_tokens_per_block = frozenset({128})
+
+    def __init__(self, manager, draft_layer_ids: Sequence[int]):
         self._manager = manager
-        self.tokens_per_block = int(subpage_tokens)
-        layer_id = draft_layer_ids[0]
-        is_hybrid_fp8 = bool(
-            getattr(manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_id)
-        )
-        if is_hybrid_fp8:
-            assert self.tokens_per_block == manager.nvfp4_dense_tokens_per_block, (
-                "hybrid FP8 Eagle draft attention must use the physical dense-cache "
-                f"page size P{manager.nvfp4_dense_tokens_per_block}, got "
-                f"P{self.tokens_per_block}"
+        if len(draft_layer_ids) != 1:
+            raise ValueError(
+                "MiniMax-M3's native P128 draft view supports exactly one "
+                f"draft layer, got {len(draft_layer_ids)}"
             )
-        assert manager.tokens_per_block % self.tokens_per_block == 0, (
-            f"subpage size {subpage_tokens} must divide manager "
-            f"tokens_per_block {manager.tokens_per_block}"
-        )
-        self._subdiv = manager.tokens_per_block // self.tokens_per_block
-        # The hybrid layout puts dense/Eagle FP8 pages in a separate physical
-        # pool from sparse NVFP4 data/scales.  Root this single-pool view at the
-        # draft layer's K address, while sourcing raw logical slot IDs from the
-        # draft layer's actual V2 pool.
-        local = manager.layer_offsets[layer_id]
-        self._source_pool_id = int(manager.kv_cache_pool_mapping[int(local), 0])
-        if is_hybrid_fp8:
-            k, _v, slot_stride, pages_per_role = manager._fp8_dense_data_buffers(layer_id)
-            assert pages_per_role == self._subdiv
-            addr_key = k.data_ptr()
-            self._num_slots = int(k.shape[0])
-            self._slot_units = slot_stride
+        if manager.tokens_per_block != 128:
+            raise ValueError(
+                "MiniMax-M3's native P128 draft view requires tokens_per_block=128, "
+                f"got {manager.tokens_per_block}"
+            )
+        if manager.enable_swa_scratch_reuse:
+            raise ValueError(
+                "MiniMax-M3's native P128 draft view does not support SWA scratch reuse"
+            )
+
+        layer_id = draft_layer_ids[0]
+        local_layer_id = manager.layer_offsets[layer_id]
+        source_pool_id = int(manager.kv_cache_pool_mapping[int(local_layer_id), 0])
+
+        flat_pool, slot_stride = manager.get_kv_subpage_pool(layer_id, "HND")
+        if int(manager.kv_offset[source_pool_id]) != 1 or manager._stream is None:
+            raise ValueError("MiniMax-M3's native P128 draft block-table mapping is unavailable")
+
+        self._source_pool_id = source_pool_id
+        self._flat_pool = flat_pool
+        if manager.is_fp8_dense_layer(layer_id):
             self.dtype = DataType.FP8
-        else:
-            addr_key, _dt, num_slots, scale, _shape = manager._kv_slot_geometry(layer_id, None)
-            self._num_slots = int(num_slots)
-            self._slot_units = scale * self._subdiv
         self.num_pools = 1
         self.num_attention_op_pools = 1
-        self.max_blocks_per_seq = manager.max_blocks_per_seq * self._subdiv
-        # Single-pool pointer rooted at the drafter's K; the op derives the
-        # page stride from tokens_per_block, so unit indices below address
-        # 32-token drafter pages directly.
+        self.max_blocks_per_seq = manager.max_blocks_per_seq
         self.kv_cache_pool_pointers = torch.tensor(
-            [[addr_key, 0]], dtype=torch.int64, pin_memory=prefer_pinned()
+            [[flat_pool.data_ptr(), 0]], dtype=torch.int64, pin_memory=prefer_pinned()
         )
-        mapping = manager.kv_cache_pool_mapping.clone()
-        mapping[int(local)] = torch.tensor([0, 0], dtype=mapping.dtype)
-        self.kv_cache_pool_mapping = mapping
-        # Placeholder host mirror: the dense TRTLLM path plans from device
-        # offsets; nothing reads the host table during the draft window.
-        self.host_kv_cache_block_offsets = torch.zeros(
-            (1, 1, 2, 1), dtype=torch.int32, pin_memory=prefer_pinned()
+        self.kv_cache_pool_mapping = manager.kv_cache_pool_mapping.clone()
+        self.kv_cache_pool_mapping[int(local_layer_id)] = 0
+        # The view is rooted at this layer's K page, so its block-table scale
+        # is the layer-local stride of ``flat_pool``.  The source pool's scale
+        # is measured in the first layer's page units and can differ for a
+        # heterogeneous NVFP4 mega-slot (for example, 171 versus 8 here).
+        self.index_scales = torch.tensor(
+            [slot_stride], dtype=torch.int32, pin_memory=prefer_pinned()
         )
-        self._slots_host: Optional[np.ndarray] = None
-        self._arange: Optional[torch.Tensor] = None
+        self.kv_offset = manager.kv_offset[source_pool_id : source_pool_id + 1]
+        self.host_kv_cache_block_offsets = manager.host_kv_cache_block_offsets[
+            source_pool_id : source_pool_id + 1
+        ]
 
     @property
     def blocks_in_primary_pool(self) -> int:
-        """Flattened sub-page index bound relative to the draft K pointer.
-
-        ``FlashInferTrtllmGenFmha`` uses this value to size the flat paged-KV
-        tensor passed to FlashInfer. The wrapped V2 manager reports its bound
-        in 128-token page units relative to a different pool base, so
-        delegating that property through ``__getattr__`` under-describes this
-        32-token, draft-K-rooted view. The final slot contributes only this
-        layer's K and V pages; inter-layer padding after V is not addressable
-        from the view and need not be included.
-        """
-        return (self._num_slots - 1) * self._slot_units + 2 * self._subdiv
+        """Return the flat P128 page bound relative to the draft K pointer."""
+        return int(self._flat_pool.shape[0])
 
     def __getattr__(self, name):
         manager = self.__dict__.get("_manager")
@@ -1120,56 +953,6 @@ class MiniMaxM3DraftSubpageView:
     def free_resources(self, request) -> None:
         """No-op: block lifecycle belongs to the shared manager."""
 
-    def _host_block_table(
-        self,
-        slot_rows: Sequence[Sequence[int]],
-        num_seqs: int,
-        max_slots: int,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Expand this batch's slot ids into a freshly allocated pinned table.
-
-        The buffer is allocated per call on purpose: it is the source of an
-        asynchronous H2D copy, whose source is read at copy execution time
-        rather than enqueue time. A persistent buffer refilled in place would
-        let the next iteration's refill clobber a still-pending copy — the
-        drafter would then index another batch's blocks (nvbug 6293536, whose
-        rationale the V1 manager spells out on
-        ``KVCacheManager._stage_block_offsets_for_copy``). The caching host
-        allocator keeps this block alive until the copy retires. The numpy
-        scratch below stays persistent: it is only ever read synchronously.
-        """
-        sub = self._subdiv
-        if (
-            self._slots_host is None
-            or self._slots_host.shape[0] < num_seqs
-            or self._slots_host.shape[1] != max_slots
-        ):
-            self._slots_host = np.zeros((num_seqs, max_slots), dtype=np.int32)
-            self._arange = torch.arange(sub, dtype=dtype)
-        slots_np = self._slots_host[:num_seqs]
-        slots_np.fill(0)
-        # Ragged fill is the only per-row work (numpy parses each row's list at
-        # C speed); the arithmetic below is one fused expansion across the
-        # batch. Pad/BAD_PAGE_INDEX entries clamp to slot 0 (safe pages:
-        # kernels never read past kv_lens).
-        for i, row in enumerate(slot_rows[:num_seqs]):
-            n = min(len(row), max_slots)
-            if n > 0:
-                slots_np[i, :n] = row[:n]
-        np.clip(slots_np, 0, None, out=slots_np)
-        slots = torch.from_numpy(slots_np).to(dtype)
-        host = torch.empty(
-            (num_seqs, 2, max_slots * sub),
-            dtype=dtype,
-            pin_memory=prefer_pinned(),
-            device="cpu",
-        )
-        out = host.view(num_seqs, 2, max_slots, sub)
-        torch.add(slots.unsqueeze(-1) * self._slot_units, self._arange, out=out[:, 0])
-        torch.add(out[:, 0], sub, out=out[:, 1])
-        return host
-
     def copy_batch_block_offsets(
         self,
         dst_tensor: torch.Tensor,
@@ -1179,14 +962,19 @@ class MiniMaxM3DraftSubpageView:
         num_seqs: int,
         max_blocks: Optional[int] = None,
     ) -> None:
-        # Raw logical slot ids from the draft layer's physical pool.
-        slot_rows = self._manager._get_batch_cache_indices_by_pool_id(
-            request_ids, pool_id=self._source_pool_id
+        # Call the V2 implementation unbound so it reads this view's
+        # ``index_scales``, ``kv_offset`` and ``host_kv_cache_block_offsets``
+        # rather than the shared manager's; ``__getattr__`` would bind the
+        # manager's own copy otherwise.
+        KVCacheManagerV2.copy_batch_block_offsets(
+            self,
+            dst_tensor,
+            request_ids,
+            beam_width,
+            num_contexts,
+            num_seqs,
+            max_blocks=max_blocks,
         )
-        host = self._host_block_table(
-            slot_rows, num_seqs, dst_tensor.shape[-1] // self._subdiv, dst_tensor.dtype
-        )
-        dst_tensor[0, :num_seqs].copy_(host, non_blocking=True)
 
 
 def get_minimax_m3_kv_cache_manager_cls():
