@@ -139,6 +139,11 @@ std::string encodeAck(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint
     return encodeHeaderOnly(makeHeader(BounceMsgType::kACK, requestId, chunkIdx, 0, regionHandle, 0, 0));
 }
 
+std::string encodeNack(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint64_t regionHandle)
+{
+    return encodeHeaderOnly(makeHeader(BounceMsgType::kNACK, requestId, chunkIdx, 0, regionHandle, 0, 0));
+}
+
 bool decodeHeader(std::string const& blob, BounceMsgHeader& outHeader)
 {
     if (blob.size() < sizeof(BounceMsgHeader))
@@ -189,6 +194,7 @@ std::string encodeHandshake(BounceHandshake const& handshake)
     su::serialize(static_cast<std::uint8_t>(handshake.controlKind), os);
     su::serialize(handshake.arenaUsableCapacityBytes, os);
     su::serialize(handshake.maxChunkSizeBytes, os);
+    su::serialize(handshake.requestTimeoutMs, os);
     su::serialize(handshake.endpoint, os);
     return os.str();
 }
@@ -207,6 +213,7 @@ bool decodeHandshake(std::string const& blob, BounceHandshake& out)
     out.controlKind = static_cast<BounceControlKind>(su::deserialize<std::uint8_t>(is));
     out.arenaUsableCapacityBytes = su::deserialize<std::uint64_t>(is);
     out.maxChunkSizeBytes = su::deserialize<std::uint64_t>(is);
+    out.requestTimeoutMs = su::deserialize<std::int32_t>(is);
     auto const endpointLen = su::deserialize<std::size_t>(is);
     if (is.fail())
     {

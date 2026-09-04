@@ -151,8 +151,15 @@ struct BounceConfig
     std::uint32_t maxInflightChunksPerRequest{8};            // max_inflight_chunks_per_request
     std::uint32_t copyStreamCount{8};                        // copy_stream_count
     std::uint32_t scatterWorkerCount{4};                     // scatter_worker_count
-    std::size_t minDescriptorCount{1024};                    // min_descriptor_count
-    std::size_t maxAverageDescriptorSizeBytes{16ULL << 10};  // max_average_descriptor_size
+    // THE admission gate, evaluated per request in NixlTransferAgent::shouldUseBounce: at least
+    // minDescriptorCount descriptors averaging <= maxAverageDescriptorSizeBytes. The defaults target
+    // head-mismatch layouts (ctx TP != gen TP / DP) that emit many small per-(block, layer, head-run)
+    // descriptors; head-matched layouts (MLA, symmetric TP) collapse to one ~1-2 MiB descriptor per
+    // block and stay on standard NIXL unless max_average_descriptor_size is raised (e.g. 4MB) and
+    // min_descriptor_count lowered. max_average_descriptor_size = 0 routes EVERY write to standard
+    // NIXL (kill switch, not "no limit"); min_descriptor_count = 0 means no minimum.
+    std::size_t minDescriptorCount{1024};                   // min_descriptor_count
+    std::size_t maxAverageDescriptorSizeBytes{16ULL << 10}; // max_average_descriptor_size
     int requestTimeoutMs{30000}; // request_timeout_ms; must be > 0 — the whole failure model
                                  // (abandoned-flow resolution, receiver lease, quarantine) hangs off
                                  // this timer, so applyParam rejects 0 (negatives already fail the
@@ -163,13 +170,14 @@ struct BounceConfig
     // alone — so a flow whose grants see no progress (no GRANT sent, no DATA received) for this
     // long is reclaimed and its regions quarantined (below) before reuse. The lease must EXCEED
     // the peers' requestTimeoutMs (a live sender abandons + cancels first, so only
-    // dead/unreachable peers ever hit this) — the 2x derivation assumes both ends run the SAME
-    // request_timeout_ms.
+    // dead/unreachable peers ever hit this) — the 2x derivation relies on both ends running the
+    // SAME request_timeout_ms, which the capability handshake enforces (strict equality; a
+    // mismatched peer falls back to standard NIXL).
     int receiverFlowTimeoutMs{60000};
     // How long a receiver-reclaimed, possibly-still-being-written region stays out of the arena
-    // before reuse — DERIVED in deriveDependentTimeouts() as requestTimeoutMs. A one-sided RDMA
-    // write cannot be aborted, so time is the only barrier against re-granting a region a gone
-    // peer's NIC may still be writing.
+    // before reuse — DERIVED in deriveDependentTimeouts() as requestTimeoutMs (equal to the peer's
+    // by the handshake). A one-sided RDMA write cannot be aborted, so time is the only barrier
+    // against re-granting a region a gone peer's NIC may still be writing.
     int quarantineMs{30000};
     bool disableFabricMemory{false}; // disable_fabric_memory
     // enable_eager_gather: launch a chunk's gather at submit() time, before the receiver's GRANT
@@ -248,10 +256,11 @@ struct BounceConfig
                 warnBad();
             }
         };
-        auto setU32 = [&](std::uint32_t& field, bool allowZero)
+        auto setU32 = [&](std::uint32_t& field, bool allowZero,
+                          std::uint64_t maxValue = std::numeric_limits<std::uint32_t>::max())
         {
             auto const v = parseU64Value(value);
-            if (v.has_value() && (allowZero || *v != 0) && *v <= std::numeric_limits<std::uint32_t>::max())
+            if (v.has_value() && (allowZero || *v != 0) && *v <= maxValue)
             {
                 field = static_cast<std::uint32_t>(*v);
             }
@@ -291,11 +300,11 @@ struct BounceConfig
         }
         else if (key == "copy_stream_count")
         {
-            setU32(cfg.copyStreamCount, /*allowZero=*/false);
+            setU32(cfg.copyStreamCount, /*allowZero=*/false, /*maxValue=*/64); // one CUDA stream + ctx each
         }
         else if (key == "scatter_worker_count")
         {
-            setU32(cfg.scatterWorkerCount, /*allowZero=*/false);
+            setU32(cfg.scatterWorkerCount, /*allowZero=*/false, /*maxValue=*/64); // one thread each
         }
         else if (key == "min_descriptor_count")
         {

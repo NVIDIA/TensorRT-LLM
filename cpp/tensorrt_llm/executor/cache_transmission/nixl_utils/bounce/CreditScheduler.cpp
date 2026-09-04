@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/CreditScheduler.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
 
@@ -126,6 +127,10 @@ void CreditScheduler::maybeActivateDrain()
             mDrainFlow = mRing[idx];
         }
     }
+    if (mDrainFlow)
+    {
+        mDrainSince = mClock(); // start the drain time-box
+    }
 }
 
 void CreditScheduler::issueGrant(
@@ -178,18 +183,51 @@ std::vector<Grant> CreditScheduler::schedule()
             auto off = mArena.alloc(want);
             if (!off)
             {
-                // Existing remote regions keep progressing and freeing space, but do not refill them
-                // with smaller chunks. acquireLocal() is deliberately unaffected: this is a
-                // receiver-only admission barrier and cannot introduce a bidirectional circular wait.
-                return grants;
+                auto const waited = mClock() - mDrainSince;
+                if (waited < mDrainTimeout)
+                {
+                    // Existing remote regions keep progressing and freeing space, but do not refill
+                    // them with smaller chunks. acquireLocal() is deliberately unaffected: this is a
+                    // receiver-only admission barrier and cannot introduce a bidirectional circular
+                    // wait.
+                    return grants;
+                }
+                // Time-box expired: the room this head needs is not being freed (typically a silent
+                // peer holding regions). Abandon the drain and fall through to the round-robin sweep
+                // so every other flow progresses again; restarting this flow's bypass count keeps it
+                // from being re-latched on the very next sweep.
+                // Flow keys are "peer\x1f rid": print the separator as '/' so the log is readable. A
+                // permanently blocked head repeats this every mDrainTimeout, so only the first abandon
+                // per scheduler is a WARNING.
+                std::string readable = *mDrainFlow;
+                std::replace(readable.begin(), readable.end(), '\x1f', '/');
+                auto const waitedMs
+                    = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(waited).count());
+                if (!mDrainAbandonWarned)
+                {
+                    mDrainAbandonWarned = true;
+                    TLLM_LOG_WARNING(
+                        "CreditScheduler: abandoning drain for flow %s (want=%u bytes) after %lld ms "
+                        "without room; resuming round-robin grants (further abandons logged at DEBUG)",
+                        readable.c_str(), want, waitedMs);
+                }
+                else
+                {
+                    TLLM_LOG_DEBUG("CreditScheduler: abandoning drain for flow %s (want=%u bytes) after %lld ms",
+                        readable.c_str(), want, waitedMs);
+                }
+                st.blockedAtGrantSequence = mGrantSequence;
+                mDrainFlow.reset();
             }
-
-            auto const ringIt = std::find(mRing.begin(), mRing.end(), *mDrainFlow);
-            TLLM_CHECK_DEBUG(ringIt != mRing.end());
-            std::size_t const idx = static_cast<std::size_t>(ringIt - mRing.begin());
-            issueGrant(*mDrainFlow, st, idx, *off, grants);
-            mDrainFlow.reset();
-            continue;
+            else
+            {
+                auto const ringIt = std::find(mRing.begin(), mRing.end(), *mDrainFlow);
+                TLLM_CHECK_DEBUG(ringIt != mRing.end());
+                std::size_t const idx = static_cast<std::size_t>(ringIt - mRing.begin());
+                issueGrant(*mDrainFlow, st, idx, *off, grants);
+                mDrainFlow.reset();
+                continue;
+            }
         }
 
         bool progress = false;
@@ -362,6 +400,16 @@ std::vector<std::string> CreditScheduler::staleFlows(std::chrono::milliseconds i
         }
     }
     return stale;
+}
+
+std::vector<Grant> CreditScheduler::pollDrain()
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    if (mDrainFlow && mClock() - mDrainSince >= mDrainTimeout)
+    {
+        return schedule(); // its drain branch abandons the expired drain and resumes round-robin
+    }
+    return {};
 }
 
 std::vector<Grant> CreditScheduler::reapQuarantine()

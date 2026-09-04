@@ -129,6 +129,17 @@ TEST(BounceMessageCodec, AckRoundTrip)
     EXPECT_EQ(h.regionHandle, 9u);
 }
 
+TEST(BounceMessageCodec, NackRoundTrip)
+{
+    // Header-only like ACK (payloadBytes 0); a request-level NACK is the same shape with 0/0.
+    auto blob = b::encodeNack(/*rid=*/7, /*chunk=*/3, /*regionHandle=*/9);
+    auto h = decodeOk(blob, b::BounceMsgType::kNACK);
+    EXPECT_EQ(h.requestId, 7u);
+    EXPECT_EQ(h.chunkIdx, 3u);
+    EXPECT_EQ(h.regionHandle, 9u);
+    EXPECT_EQ(h.payloadBytes, 0u);
+}
+
 TEST(BounceMessageCodec, EmptyEntriesSerialize)
 {
     auto blob = b::encodeGrant(1, {});
@@ -228,6 +239,7 @@ TEST(BounceMessageCodec, HandshakeRoundTrip)
     in.controlKind = b::BounceControlKind::kZMQ;
     in.arenaUsableCapacityBytes = 256ULL << 20;
     in.maxChunkSizeBytes = 32ULL << 20;
+    in.requestTimeoutMs = 45000;
     in.endpoint = "tcp://10.0.0.1:5555";
     b::BounceHandshake out;
     ASSERT_TRUE(b::decodeHandshake(b::encodeHandshake(in), out));
@@ -235,6 +247,7 @@ TEST(BounceMessageCodec, HandshakeRoundTrip)
     EXPECT_EQ(out.controlKind, in.controlKind);
     EXPECT_EQ(out.arenaUsableCapacityBytes, in.arenaUsableCapacityBytes);
     EXPECT_EQ(out.maxChunkSizeBytes, in.maxChunkSizeBytes);
+    EXPECT_EQ(out.requestTimeoutMs, in.requestTimeoutMs);
     EXPECT_EQ(out.endpoint, in.endpoint);
 }
 

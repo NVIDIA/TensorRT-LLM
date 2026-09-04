@@ -33,8 +33,10 @@ BounceArena::BounceArena(std::size_t bytes, int deviceId, bool allowFabric)
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
 
     // On MNNVL parts (GH200/GB200) the arena (RDMA src/dst, NIXL-registered) must be fabric memory
-    // to be reachable over the NVLink fabric + GPUDirect-RDMA capable. Elsewhere (and CI, or when
-    // fabric is force-disabled) fall back to cudaMalloc.
+    // to be reachable over the NVLink fabric + GPUDirect-RDMA capable. Fabric memory is only
+    // compiled in on those aarch64 parts; on x86 the fallback is always cudaMalloc, so
+    // disable_fabric_memory (allowFabric=false) has no effect there. It also falls back when the
+    // runtime reports no fabric support or when fabric is force-disabled.
     if (allowFabric && tensorrt_llm::batch_manager::kv_cache_manager::FabricMemory::supportFabricMemory())
     {
         mFabric = std::make_unique<tensorrt_llm::batch_manager::kv_cache_manager::FabricMemory>(bytes);

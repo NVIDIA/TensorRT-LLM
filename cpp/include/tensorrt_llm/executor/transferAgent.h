@@ -374,6 +374,9 @@ class TransferStatus
 {
 public:
     virtual ~TransferStatus() = default;
+    /// NIXL and bounce statuses return true only on success; backends that cannot distinguish
+    /// failure from completion (mooncake) return true on any terminal state — use
+    /// wait()/getLastStatus for the outcome.
     [[nodiscard]] virtual bool isCompleted() const = 0;
     virtual TransferState wait(int64_t timeout_ms = -1) const = 0;
 
@@ -404,7 +407,9 @@ struct BaseAgentConfig
     std::optional<int> worldSize;
     /// Size in MiB of the agent's staging (bounce) buffer, currently implemented by the
     /// NIXL agent. 0 (default) disables the fast path; >0 enables it at that capacity.
-    /// Ignored by agents without bounce support (e.g. mooncake).
+    /// Ignored by agents without bounce support (e.g. mooncake). Routing is decided per request
+    /// by the agent from descriptor shape and peer capability; callers cannot request the bounce
+    /// path per transfer.
     size_t agentBufferSizeMb{0};
     /// Expert tuning knobs for the bounce pipeline, keyed by the TRTLLM_NIXL_BOUNCE_*
     /// environment-variable names without the prefix and the trailing _BYTES, lowercased (e.g.

@@ -19,9 +19,12 @@
 
 #include "nixl.h"
 #include "tensorrt_llm/executor/transferAgent.h"
+#include <array>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <thread>
 
@@ -35,6 +38,21 @@ namespace bounce
 // ENABLE_UCX), an empty struct otherwise; the member below is always present so the
 // NixlTransferAgent layout is identical across all translation units.
 struct NixlBounceState;
+
+/// Why NixlTransferAgent::shouldUseBounce declined a request (bounce enabled + built). `!mBounce`
+/// is "disabled", not a rejection, and is not counted. Order is the evaluation order of the gate.
+enum class BounceRejectReason : std::uint8_t
+{
+    kNotWrite,
+    kNotVram,
+    kSyncMessage,
+    kNoPeerHandshake,
+    kDescriptorCount,
+    kSourceDevice,
+    kDescriptorShape,
+    kAverageDescriptorSize,
+    kCount
+};
 } // namespace bounce
 
 struct NixlHelper
@@ -149,9 +167,42 @@ public:
         return mBounceSubmitCount.load(std::memory_order_relaxed);
     }
 
+    /// snake_case name of a reject reason (also the key of the Python `bounce_reject_counts` dict).
+    [[nodiscard]] static char const* bounceRejectReasonName(bounce::BounceRejectReason reason) noexcept;
+
+    /// Number of transfer requests shouldUseBounce declined (all reasons) while bounce was enabled.
+    [[nodiscard]] std::uint64_t getBounceRejectCount() const noexcept
+    {
+        std::uint64_t total = 0;
+        for (auto const& c : mBounceRejectCounts)
+        {
+            total += c.load(std::memory_order_relaxed);
+        }
+        return total;
+    }
+
+    /// Per-reason rejection counts, indexed by bounce::BounceRejectReason.
+    [[nodiscard]] std::array<std::uint64_t, static_cast<std::size_t>(bounce::BounceRejectReason::kCount)>
+    getBounceRejectCounts() const noexcept
+    {
+        std::array<std::uint64_t, static_cast<std::size_t>(bounce::BounceRejectReason::kCount)> out{};
+        for (std::size_t i = 0; i < out.size(); ++i)
+        {
+            out[i] = mBounceRejectCounts[i].load(std::memory_order_relaxed);
+        }
+        return out;
+    }
+
 private:
     /// Counts requests admitted by shouldUseBounce (see getBounceSubmitCount).
     std::atomic<std::uint64_t> mBounceSubmitCount{0};
+    /// Per-reason rejections by shouldUseBounce; mBounceRejectWarned makes the first one per reason
+    /// a WARNING (later ones are DEBUG). Present in every build so the bindings always link.
+    /// mutable: bumped from the const admission gate (observability only, not logical state).
+    mutable std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(bounce::BounceRejectReason::kCount)>
+        mBounceRejectCounts{};
+    mutable std::array<std::atomic<bool>, static_cast<std::size_t>(bounce::BounceRejectReason::kCount)>
+        mBounceRejectWarned{};
 
     // shared_ptr so outstanding NixlTransferStatus (via weak_ptr) can detect agent reset.
     std::shared_ptr<nixlAgent> mRawAgent;
@@ -187,7 +238,9 @@ private:
     /// TRTLLM_NIXL_BOUNCE_* env fallback (dict > env > default).
     void maybeInitBounce(
         std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& bounceParams);
-    /// Heuristic gate: is this request eligible for the bounce fast path?
+    /// Pure admission gate: nullopt when the request is eligible for the bounce fast path, else why not.
+    [[nodiscard]] std::optional<bounce::BounceRejectReason> bounceRejectReason(TransferRequest const& request) const;
+    /// bounceRejectReason() plus rejection accounting (counter + first-occurrence WARNING).
     [[nodiscard]] bool shouldUseBounce(TransferRequest const& request) const;
 };
 

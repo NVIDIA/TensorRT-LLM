@@ -101,7 +101,10 @@ public:
 
     [[nodiscard]] bool isCompleted() const override
     {
-        return mFut.valid() && mFut.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        // Success only (TransferStatus contract, mirrors NixlTransferStatus): a failed transfer never
+        // reports completed; callers poll wait()/getLastStatusStr for the outcome.
+        return mFut.valid() && mFut.wait_for(std::chrono::seconds(0)) == std::future_status::ready
+            && mFut.get().state == TransferState::kSUCCESS;
     }
 
     [[nodiscard]] TransferState wait(int64_t timeoutMs) const override
@@ -201,10 +204,14 @@ void NixlTransferAgent::maybeInitBounce(
         std::string const localIp = common::getLocalIp(common::getEnvNixlInterface(), mpi::MpiComm::world().getRank());
         std::string const bindAddr
             = (localIp.find(':') != std::string::npos) ? "tcp://[" + localIp + "]:*" : "tcp://" + localIp + ":*";
-        st->channel = std::make_unique<bounce::ZmqControlChannel>(mName, bindAddr);
+        std::size_t const maxDescs = std::max<std::size_t>(1024ULL, cfg.maxChunkSizeBytes / 256ULL);
+        // ROUTER frame cap: the largest legitimate DATA carries up to maxDescs scatter runs (+ header);
+        // 2x headroom, never below 64 MiB. A cap below a real DATA would silently disconnect the peer.
+        std::size_t const maxMsgBytes
+            = std::max<std::size_t>(64ULL << 20, 2 * maxDescs * sizeof(bounce::BounceScatterRun) + 4096);
+        st->channel = std::make_unique<bounce::ZmqControlChannel>(mName, bindAddr, maxMsgBytes);
         std::string const controlDesc = st->channel->localEndpoint();
         st->owner = this;
-        std::size_t const maxDescs = std::max<std::size_t>(1024ULL, cfg.maxChunkSizeBytes / 256ULL);
         // ONE shared arena for both roles (receiver RDMA-write targets + local gather staging),
         // carved into variable-size regions by the scheduler. Register it ONCE NOW (before any
         // metadata exchange) so peers' loaded MD includes it. Exec contexts (streams/scratch) are a
@@ -246,43 +253,40 @@ void NixlTransferAgent::maybeInitBounce(
     }
 }
 
-bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
+std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(TransferRequest const& request) const
 {
-    if (!mBounce)
-    {
-        return false;
-    }
+    using bounce::BounceRejectReason;
     auto const& cfg = mBounce->cfg;
     if (request.getOp() != TransferOp::kWRITE)
     {
-        return false;
+        return BounceRejectReason::kNotWrite;
     }
     if (request.getSrcDescs().getType() != MemoryType::kVRAM || request.getDstDescs().getType() != MemoryType::kVRAM)
     {
-        return false;
+        return BounceRejectReason::kNotVram;
     }
     if (request.getSyncMessage().has_value())
     {
-        return false; // sync message rides the standard notif path
+        return BounceRejectReason::kSyncMessage; // sync message rides the standard notif path
     }
     if (!mBounce->transport->hasPeerHandshake(request.getRemoteName()))
     {
         // The peer did not advertise a compatible bounce handshake (bounce disabled, missing or
-        // malformed handshake, or version/control-kind/chunk-size mismatch). Without a compatible
-        // receiver, WANT would remain unanswered until requestTimeoutMs, so use standard NIXL.
-        return false;
+        // malformed handshake, or version/control-kind/chunk-size/timeout mismatch). Without a
+        // compatible receiver, WANT would remain unanswered until requestTimeoutMs, so use standard NIXL.
+        return BounceRejectReason::kNoPeerHandshake;
     }
     auto const& srcs = request.getSrcDescs().getDescs();
     auto const& dsts = request.getDstDescs().getDescs();
     if (srcs.empty() || srcs.size() != dsts.size() || srcs.size() < cfg.minDescriptorCount)
     {
-        return false;
+        return BounceRejectReason::kDescriptorCount;
     }
     auto const sourceDeviceId = srcs.front().getDeviceId();
     auto const destinationDeviceId = dsts.front().getDeviceId();
     if (sourceDeviceId != static_cast<std::uint32_t>(mBounce->deviceId))
     {
-        return false;
+        return BounceRejectReason::kSourceDevice;
     }
     // Screen every precondition BounceTransferPlan::build enforces with TLLM_CHECK: an admitted
     // request must never throw out of submitTransferRequests — it either runs on bounce or is
@@ -296,12 +300,85 @@ bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
         if (len != dsts[i].getLen() || len > maxChunkSizeBytes || srcs[i].getDeviceId() != sourceDeviceId
             || dsts[i].getDeviceId() != destinationDeviceId)
         {
-            return false;
+            return BounceRejectReason::kDescriptorShape;
         }
         totalBytes += len;
     }
+    // max_average_descriptor_size = 0 is the kill switch: reject unconditionally (an all-zero-length
+    // request would otherwise pass "avg > 0").
     std::uint64_t const avg = totalBytes / srcs.size();
-    return avg <= cfg.maxAverageDescriptorSizeBytes;
+    if (cfg.maxAverageDescriptorSizeBytes == 0 || avg > cfg.maxAverageDescriptorSizeBytes)
+    {
+        return BounceRejectReason::kAverageDescriptorSize;
+    }
+    return std::nullopt;
+}
+
+bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
+{
+    if (!mBounce)
+    {
+        return false; // disabled, not a rejection
+    }
+    auto const reason = bounceRejectReason(request);
+    if (!reason.has_value())
+    {
+        return true;
+    }
+    auto const idx = static_cast<std::size_t>(*reason);
+    mBounceRejectCounts[idx].fetch_add(1, std::memory_order_relaxed);
+    auto const& srcs = request.getSrcDescs().getDescs();
+    // Structural reasons (not a VRAM write, sync message) or ones already warned about at
+    // loadRemoteAgent (no peer handshake) never deserve a WARNING here — DEBUG only. Likewise every
+    // rejection while the operator has disabled the gate (max_average_descriptor_size = 0, the kill
+    // switch), whichever reason happened to fire first.
+    bool const killSwitch = mBounce->cfg.maxAverageDescriptorSizeBytes == 0;
+    bool const quiet = killSwitch || *reason == bounce::BounceRejectReason::kNotWrite
+        || *reason == bounce::BounceRejectReason::kNotVram || *reason == bounce::BounceRejectReason::kSyncMessage
+        || *reason == bounce::BounceRejectReason::kNoPeerHandshake;
+    // First occurrence per reason is a WARNING (a silently-bypassed bounce is the most common
+    // deployment surprise); later ones are DEBUG. Programmatic view: getBounceRejectCounts().
+    // Rejection is the steady state for many layouts, so only the one-shot WARNING pays for the
+    // descriptor sweep that computes the average size. Quiet reasons never consume the warned flag.
+    bool const firstOccurrence = !quiet && !mBounceRejectWarned[idx].exchange(true, std::memory_order_relaxed);
+    if (firstOccurrence)
+    {
+        std::uint64_t totalBytes = 0;
+        for (auto const& d : srcs)
+        {
+            totalBytes += d.getLen();
+        }
+        std::uint64_t const avg = srcs.empty() ? 0 : totalBytes / srcs.size();
+        // The tuning hint only makes sense for the two configurable gates.
+        bool const tunable = *reason == bounce::BounceRejectReason::kDescriptorCount
+            || *reason == bounce::BounceRejectReason::kAverageDescriptorSize;
+        if (tunable)
+        {
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): bounce declined a write to %s (reason=%s, descs=%zu, avgDescBytes=%llu; gate: "
+                "min_descriptor_count=%zu, max_average_descriptor_size=%zu) -> standard NIXL path. Further rejections "
+                "for this reason are logged at DEBUG; tune agent_bounce_params min_descriptor_count / "
+                "max_average_descriptor_size if bounce was expected to engage",
+                mName.c_str(), request.getRemoteName().c_str(), bounceRejectReasonName(*reason), srcs.size(),
+                static_cast<unsigned long long>(avg), mBounce->cfg.minDescriptorCount,
+                mBounce->cfg.maxAverageDescriptorSizeBytes);
+        }
+        else
+        {
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): bounce declined a write to %s (reason=%s, descs=%zu, "
+                "avgDescBytes=%llu) -> standard NIXL path. Further rejections for this reason are "
+                "logged at DEBUG",
+                mName.c_str(), request.getRemoteName().c_str(), bounceRejectReasonName(*reason), srcs.size(),
+                static_cast<unsigned long long>(avg));
+        }
+    }
+    else
+    {
+        TLLM_LOG_DEBUG("NixlTransferAgent(%s): bounce declined request to %s (reason=%s, descs=%zu)", mName.c_str(),
+            request.getRemoteName().c_str(), bounceRejectReasonName(*reason), srcs.size());
+    }
+    return false;
 }
 #else  // !TLLM_BOUNCE_V2 — bounce not built; the member stays null and these are no-ops.
 namespace bounce
@@ -322,11 +399,34 @@ void NixlTransferAgent::maybeInitBounce(
     }
 }
 
+std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(TransferRequest const&) const
+{
+    return std::nullopt;
+}
+
 bool NixlTransferAgent::shouldUseBounce(TransferRequest const&) const
 {
     return false;
 }
 #endif // TLLM_BOUNCE_V2
+
+char const* NixlTransferAgent::bounceRejectReasonName(bounce::BounceRejectReason reason) noexcept
+{
+    using bounce::BounceRejectReason;
+    switch (reason)
+    {
+    case BounceRejectReason::kNotWrite: return "not_write";
+    case BounceRejectReason::kNotVram: return "not_vram";
+    case BounceRejectReason::kSyncMessage: return "sync_message";
+    case BounceRejectReason::kNoPeerHandshake: return "no_peer_handshake";
+    case BounceRejectReason::kDescriptorCount: return "descriptor_count";
+    case BounceRejectReason::kSourceDevice: return "source_device";
+    case BounceRejectReason::kDescriptorShape: return "descriptor_shape";
+    case BounceRejectReason::kAverageDescriptorSize: return "average_descriptor_size";
+    case BounceRejectReason::kCount: break;
+    }
+    return "unknown";
+}
 
 class FileLock
 {
@@ -829,8 +929,8 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
         name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
 #ifdef TLLM_BOUNCE_V2
     // Validate the peer's bounce capability handshake from AgentDesc and register its control
-    // channel. Only peers with the same wire version, control kind and effective maxChunkSizeBytes
-    // pass; missing or incompatible handshakes leave the peer on standard NIXL.
+    // channel. Only peers with the same wire version, control kind, effective maxChunkSizeBytes and
+    // requestTimeoutMs pass; missing or incompatible handshakes leave the peer on standard NIXL.
     if (mBounce)
     {
         mBounce->transport->registerPeerHandshake(name, agentDesc.getBounceHandshake());

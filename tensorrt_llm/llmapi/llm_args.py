@@ -4584,8 +4584,10 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "the per-block path, >0 enables bounce at that capacity. With the "
         "default Python implementation it is per-region (one buffer for send, "
         "one for recv); with agent_bounce_buffer_enable it is one shared "
-        "buffer. Requires the Python (v2) transceiver (transceiver_runtime); "
-        "the C++ transceiver does not support bounce and ignores this field.")
+        "buffer whose usable capacity rounds down to a power of two (e.g. "
+        "384 -> 256), so prefer 256/512/1024. Requires the Python (v2) "
+        "transceiver (transceiver_runtime); the C++ transceiver does not "
+        "support bounce and ignores this field.")
 
     enable_pipelined_transfer: bool = Field(
         default=False,
@@ -4608,7 +4610,17 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "per-region pair for the same number). Configure the context and "
         "generation instances consistently. Requires the Python (v2) "
         "transceiver (transceiver_runtime); the C++ transceiver does not "
-        "support bounce and ignores this field.")
+        "support bounce and ignores this field. Bounce engages per request "
+        "only when a KV write has at least 1024 descriptors averaging at most "
+        "16 KiB; head-matched layouts (MLA, symmetric TP) produce one ~1-2 MiB "
+        "descriptor per block and stay on standard NIXL unless "
+        "agent_bounce_params raises max_average_descriptor_size (e.g. '4MB'; "
+        "max_average_descriptor_size=0 routes every write to standard NIXL, a "
+        "kill switch) and lowers min_descriptor_count (0 = no minimum). "
+        "request_timeout_ms and max_chunk_size (its effective, arena-clamped "
+        "value) in agent_bounce_params must match between context and "
+        "generation; a mismatched pair falls back to standard NIXL with a "
+        "WARNING when the peer is loaded (transfers are then routed silently).")
 
     agent_bounce_params: Optional[Dict[str, str]] = Field(
         default=None,

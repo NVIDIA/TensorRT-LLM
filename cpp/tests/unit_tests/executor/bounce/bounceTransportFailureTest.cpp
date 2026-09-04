@@ -262,6 +262,41 @@ TEST(BounceTransportFailure, WriteFailureFailsRequest)
     bounce_test::freeXferBufs(bufs);
 }
 
+// A receiver that KNOWS a request cannot complete NACKs it, so the sender fails right away
+// (kPeerNack) instead of waiting out requestTimeoutMs (kNoProgressTimeout). Provoked via the WANT
+// chunk-size rejection: the sender's chunk cap exceeds the receiver's, so the single 8 KiB chunk is
+// outside the receiver's (0, 4 KiB]. The cap-equality handshake gate lives in
+// NixlTransferAgent::shouldUseBounce, which BounceTransport::submit never consults (wirePair only does
+// loadRemoteAgent + addPeer), so the mismatched WANT reaches onWant directly.
+TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    constexpr int kTimeoutMs = 20000; // generous: the NACK bound below is timeout/2, the hang guard is 10 s
+    auto senderCfg = cfg(kTimeoutMs);
+    senderCfg.maxChunkSizeBytes = 8192;
+    auto receiverCfg = cfg(kTimeoutMs); // maxChunkSizeBytes = 4096
+    auto A = bounce_test::makeNode("nackA", senderCfg, 1024);
+    auto B = bounce_test::makeNode("nackB", receiverCfg, 1024);
+    if (!A || !B)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    bounce_test::wirePair(*A, *B);
+
+    auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/8192, /*seed=*/12);
+    auto const start = std::chrono::steady_clock::now();
+    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "nackB");
+    // Hang guard = the full request timeout, so a slow NACK fails the timing bound below, not this.
+    ASSERT_EQ(fut.wait_for(std::chrono::milliseconds(kTimeoutMs)), std::future_status::ready) << "NACKed request hung";
+    auto const elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kPeerNack);
+    EXPECT_LT(elapsed, std::chrono::milliseconds(kTimeoutMs / 2)) << "NACK did not short-circuit the timeout";
+
+    A->tx->shutdown();
+    B->tx->shutdown();
+    bounce_test::freeXferBufs(bufs);
+}
+
 // DATA has no retransmission path in this protocol. Receiving it twice for one granted region must
 // therefore produce one scatter and one ACK, rather than adding replay state for an impossible
 // normal-flow event.
@@ -538,6 +573,11 @@ TEST(BounceTransportFailure, RejectsWrongPeerGrantAndInvalidAcks)
     attacker.sendTo("validateSender", b::encodeGrant(/*requestId=*/1, {credit}));
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     EXPECT_EQ(ctl->postCount.load(std::memory_order_acquire), 0u);
+
+    // A wrong-peer NACK (and one for an unknown rid) must not kill the request: still in flight.
+    attacker.sendTo("validateSender", b::encodeNack(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
+    legitimate.sendTo("validateSender", b::encodeNack(/*requestId=*/999, /*chunkIdx=*/0, 0));
+    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
 
     legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
     EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);

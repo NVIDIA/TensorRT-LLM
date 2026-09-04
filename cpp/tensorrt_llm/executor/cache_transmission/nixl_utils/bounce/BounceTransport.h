@@ -26,6 +26,7 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -112,6 +113,7 @@ enum class BounceFailReason : std::uint8_t
     kWriteFailed,       // the RDMA write reported failure (getXferStatus == failed)
     kProtocolError,     // GRANT mispair or plan overflow — the flow was abandoned
     kShutdown,          // transport shut down while the request was still pending
+    kPeerNack,          // receiver reported it cannot complete the chunk/request (NACK)
 };
 
 [[nodiscard]] char const* toString(BounceFailReason reason);
@@ -144,6 +146,9 @@ public:
         , scheduler(arena->baseAddr(), cfg.arenaSizeBytes, cfg.arenaAllocationGranularityBytes,
               cfg.maxInflightChunksPerRequest)
     {
+        // Receiver drain mode must give up well before the request timeout so a silent peer cannot
+        // stall every other flow for the full lease + quarantine (see CreditScheduler::mDrainTimeout).
+        scheduler.setDrainTimeout(std::chrono::milliseconds(std::max(1, cfg.requestTimeoutMs / 2)));
     }
 
     BounceContext(BounceContext const&) = delete;
@@ -231,6 +236,10 @@ private:
         std::function<std::vector<Grant>(std::unordered_set<std::uint64_t> const&, std::vector<std::uint64_t>&)> const&
             reclaim);
     void scatterWorkerLoop();
+    /// Exception recovery for one scatter job (worker thread): release a still-held exec context,
+    /// NACK unless an ACK or NACK was already attempted, and push the ScatterDone unless already pushed.
+    void recoverScatterJob(
+        ScatterJob const& job, ExecCtx* ctx, bool acked, bool nackSent, bool donePushed, char const* what);
 
     BounceContext& mCtx;
     std::vector<std::thread> mWorkers;
@@ -274,6 +283,9 @@ public:
 
     void onGrant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
     void onAck(std::string const& peer, BounceMsgHeader const& h);
+    /// The receiver reported it cannot complete a chunk/request: fail the request now (kPeerNack)
+    /// instead of waiting out requestTimeoutMs. Unknown / wrong-peer NACKs are dropped like ACKs.
+    void onNack(std::string const& peer, BounceMsgHeader const& h);
     /// Issue the RDMA write for any chunk whose gather kernel has now completed (poll ctx->event,
     /// non-blocking). Decouples the IO thread from gather latency on a shared GPU. Returns true if it
     /// posted a write (or failed a request) this pass — used to drive the IO loop's idle backoff.
@@ -386,6 +398,8 @@ private:
         std::unique_ptr<TransferStatus> xfer;
         std::uint64_t offset{};
         std::uint64_t rid{};
+        std::chrono::steady_clock::time_point since{}; // when the write was orphaned (age for the stall warning)
+        bool warned{false};                            // stall WARNING already emitted once
     };
 
     /// GRANT-mispair guard shared by attachCredits()/pumpRequest(): a credit smaller than its chunk

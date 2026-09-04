@@ -163,6 +163,14 @@ TEST(BounceConfig, InvalidResourceCountsFallBackToDefaults)
     EXPECT_EQ(cfg.copyStreamCount, defaults.copyStreamCount);
     EXPECT_EQ(cfg.maxInflightChunksPerRequest, defaults.maxInflightChunksPerRequest);
     EXPECT_EQ(cfg.requestTimeoutMs, defaults.requestTimeoutMs);
+
+    // Stream/worker counts are capped at 64: one above is rejected and the default kept.
+    ScopedEnv over;
+    over.set("TRTLLM_NIXL_BOUNCE_COPY_STREAM_COUNT", "65");
+    over.set("TRTLLM_NIXL_BOUNCE_SCATTER_WORKER_COUNT", "65");
+    auto const capped = b::BounceConfig::fromEnv();
+    EXPECT_EQ(capped.copyStreamCount, defaults.copyStreamCount);
+    EXPECT_EQ(capped.scatterWorkerCount, defaults.scatterWorkerCount);
 }
 
 // The timeout parser admits any value up to INT_MAX, so the 2x lease derivation must clamp instead

@@ -242,6 +242,11 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
     ASSERT_NE(status, nullptr);
     EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS);
     EXPECT_EQ(a->getBounceSubmitCount(), 0);
+    // The one declined request is counted per reason (descriptor_shape: len > effective chunk cap),
+    // so a deployment can tell "bounce silently bypassed" from "bounce engaged" without log parsing.
+    EXPECT_EQ(a->getBounceRejectCount(), 1u);
+    auto const bucket = static_cast<std::size_t>(kvc::bounce::BounceRejectReason::kDescriptorShape);
+    EXPECT_EQ(a->getBounceRejectCounts()[bucket], 1u);
     EXPECT_TRUE(verifyXferBufs(bufs));
     EXPECT_TRUE(status->release());
     status.reset();

@@ -77,6 +77,12 @@ if(NIXL_ROOT)
     # The .cu device symbols must resolve into this shared lib.
     set_target_properties(${NIXL_WRAPPER_TARGET}
                           PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    message(STATUS "NIXL bounce v2: enabled (libzmq found)")
+  else()
+    message(
+      STATUS
+        "NIXL bounce v2: disabled - libzmq/pkg-config not found; with agent_bounce_buffer_enable the runtime will warn and fall back to standard NIXL"
+    )
   endif()
 
   set(NIXL_ENABLED TRUE)

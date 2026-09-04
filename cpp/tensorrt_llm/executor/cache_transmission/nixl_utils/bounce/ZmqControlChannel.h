@@ -47,6 +47,11 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //   + ZMQ_LAST_ENDPOINT). Endpoints are exchanged out-of-band (NIXL agent metadata)
 //   and registered with addPeer() before the first sendTo().
 //
+// Trust model
+//   Peer identity is the ZMQ routing id the connecting DEALER asserts; the control plane
+//   is unauthenticated, like the existing UCX/ZMQ disaggregation control paths, and
+//   assumes a trusted cluster network.
+//
 // Threading
 //   The ROUTER is touched only by the reactor thread (recv). DEALERs (+ the dealer
 //   map) are guarded by mMu so app threads and the reactor can sendTo()/addPeer()
@@ -61,7 +66,11 @@ public:
     /// @param selfName    this agent's name (becomes the zmq routing id).
     /// @param bindAddr    address pattern to bind the ROUTER ("tcp://127.0.0.1:*" by default,
     ///                    "*" picks a free port; query the chosen one via localEndpoint()).
-    explicit ZmqControlChannel(std::string selfName, std::string const& bindAddr = "tcp://127.0.0.1:*");
+    /// @param maxMsgBytes ZMQ_MAXMSGSIZE on the ROUTER: inbound frames above it disconnect the peer.
+    /// The owner derives it from the largest legitimate DATA message (see NixlTransferAgent::
+    /// maybeInitBounce); the default only serves tests.
+    explicit ZmqControlChannel(
+        std::string selfName, std::string const& bindAddr = "tcp://127.0.0.1:*", std::size_t maxMsgBytes = 64ULL << 20);
     ~ZmqControlChannel() override;
 
     [[nodiscard]] std::string localEndpoint() const override;
