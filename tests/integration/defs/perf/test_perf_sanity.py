@@ -918,7 +918,7 @@ def read_startup_observations(test_output_dir: str, server_idx: int) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as input_file:
             payload = json.load(input_file)
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         print_warning(f"Failed to read startup observations from {path}: {error}")
         return {
             "startup_observation_id": f"startup-invalid-{secrets.token_hex(16)}",
@@ -931,11 +931,16 @@ def read_startup_observations(test_output_dir: str, server_idx: int) -> dict:
         }
     observation_id = payload.get("startup_observation_id")
     observations = payload.get("observations")
+    if not isinstance(observations, list) or not all(
+        isinstance(observation, dict) for observation in observations
+    ):
+        print_warning(f"Ignoring malformed startup observations from {path}")
+        observations = []
     return {
         "startup_observation_id": (
             observation_id if isinstance(observation_id, str) and observation_id else "unknown"
         ),
-        "observations": observations if isinstance(observations, list) else [],
+        "observations": observations,
     }
 
 
