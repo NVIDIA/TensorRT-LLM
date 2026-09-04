@@ -51,6 +51,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BufferConfig,
     CacheLevel,
+    CacheTier,
     CacheTierConfig,
     CuError,
     DataRole,
@@ -121,6 +122,15 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
     for field_name in KV_CACHE_ITERATION_STATS_DELTA_FIELDS
     if field_name not in KV_CACHE_ITERATION_STATS_REUSE_FIELDS
 )
+
+# Readable name per CacheTier, used only to label level-indexed counters. The levels themselves
+# come from the configured tier list, so several levels may share a name. Keyed by the enum
+# member because the C++ backend binds CacheTier as a plain nanobind enum, not an IntEnum.
+_CACHE_TIER_NAMES = {
+    CacheTier.GPU_MEM: "gpu",
+    CacheTier.HOST_MEM: "host",
+    CacheTier.DISK: "disk",
+}
 
 
 class Role:
@@ -2645,6 +2655,43 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
                 self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
 
+            if (
+                not self.is_draft
+                and self.kv_cache_type != CacheTypeCpp.CROSS
+                and not req.is_dummy_request
+                and not self.is_estimating_kv_cache
+            ):
+                # This attribution only feeds an observability counter. A mismatch means the
+                # counter would be wrong, not that the request cannot be served, so drop the
+                # sample and log instead of failing the request. The underlying invariant is a
+                # debug-only assertion in both the Python and C++ core for the same reason.
+                counts: Optional[List[int]] = list(kv_cache.cached_tokens_by_level)
+                if any(type(count) is not int or count < 0 for count in counts):
+                    logger.warning_once(
+                        f"Dropping cached-token level attribution for request {req.py_request_id}: "
+                        f"invalid counts {counts!r}",
+                        key="kv_cache_v2_cached_tokens_by_level_invalid",
+                    )
+                    counts = None
+                elif sum(counts) != kv_cache.num_committed_tokens:
+                    logger.warning_once(
+                        f"Dropping cached-token level attribution for request {req.py_request_id}: "
+                        f"{counts!r} does not sum to the reused-token count "
+                        f"{kv_cache.num_committed_tokens}",
+                        key="kv_cache_v2_cached_tokens_by_level_sum_mismatch",
+                    )
+                    counts = None
+                if counts is not None and req.is_disagg_generation_init_state:
+                    counts = self._get_disagg_generation_preserved_cached_tokens_by_level(
+                        counts,
+                        kv_cache.num_committed_tokens,
+                        kv_cache._get_last_cached_token_level(),
+                    )
+                    if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+                        counts = None
+                if counts is not None:
+                    self.impl.record_cached_tokens_by_level(counts)
+
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
                 # scratch blocks are only valid for local prefill chunks.
@@ -2659,6 +2706,39 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache missing for non-first context chunk, request {req.py_request_id}"
             )
             return self._resume_and_restore(req.py_request_id, kv_cache)
+
+    def _get_disagg_generation_preserved_cached_tokens_by_level(
+        self,
+        counts: List[int],
+        num_cached_tokens: int,
+        last_cached_token_level: Optional[int],
+    ) -> Optional[List[int]]:
+        """Keep only complete local blocks not overwritten by P/D transfer.
+
+        Returns None when the attribution cannot be adjusted consistently, so the caller skips
+        recording this sample rather than failing the request over an observability counter.
+        """
+        result = list(counts)
+        partial_tokens = num_cached_tokens % self.tokens_per_block
+        if partial_tokens:
+            if last_cached_token_level is None or not 0 <= last_cached_token_level < len(result):
+                logger.warning_once(
+                    "Dropping cached-token level attribution: partial cached prefix of "
+                    f"{num_cached_tokens} tokens is missing its final cache level "
+                    f"(got {last_cached_token_level!r} for {len(result)} levels)",
+                    key="kv_cache_v2_cached_tokens_by_level_missing_last_level",
+                )
+                return None
+            result[last_cached_token_level] -= partial_tokens
+            if result[last_cached_token_level] < 0:
+                logger.warning_once(
+                    "Dropping cached-token level attribution: removing the "
+                    f"{partial_tokens}-token partial block from level {last_cached_token_level} "
+                    f"of {counts!r} goes negative",
+                    key="kv_cache_v2_cached_tokens_by_level_partial_negative",
+                )
+                return None
+        return result
 
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
@@ -2959,6 +3039,15 @@ class KVCacheManagerV2(BaseResourceManager):
         if slot_sizes is None:
             slot_sizes = getattr(pool_group_stats, "slot_size")
         return tuple(slot_sizes)
+
+    def _stats_cache_level_tier_names(self) -> List[str]:
+        """Name the tier backing each configured cache level, in level order.
+
+        Consumers pair these with the level-indexed counters so a metric can carry both the
+        level and a readable tier name. Two GPU levels stay distinct entries that happen to
+        share the name.
+        """
+        return [_CACHE_TIER_NAMES.get(tier, str(tier)) for tier in self.impl.cache_tier_list]
 
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
         # life cycle (== layer group) -> pool group is static structure exposed by
@@ -3285,6 +3374,7 @@ class KVCacheManagerV2(BaseResourceManager):
         primary_peak_stats,
         secondary_peak_stats_by_level,
         reuse_delta,
+        reused_blocks_by_level=None,
     ) -> KVCacheV2LifeCycleIterationStats:
         pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
         assert kind == "attention"
@@ -3302,6 +3392,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 secondary_peak_stats_by_level,
                 reuse_delta,
                 KV_CACHE_ITERATION_STATS_REUSE_FIELDS,
+            ),
+            full_reused_blocks_by_level=(
+                list(reused_blocks_by_level.full) if reused_blocks_by_level is not None else []
+            ),
+            partial_reused_blocks_by_level=(
+                list(reused_blocks_by_level.partial) if reused_blocks_by_level is not None else []
             ),
         )
 
@@ -3371,6 +3467,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_iteration_stats(self):
         if not self.enable_stats:
             return None
+
+        disk_prefetch_blocks = self.impl.get_and_reset_iteration_disk_prefetch_blocks()
+        cached_tokens_by_level = self.impl.get_and_reset_iteration_cached_tokens_by_level()
+        reused_blocks_by_level = self.impl.get_and_reset_iteration_reused_blocks_by_level()
 
         life_cycle_metadata = self._stats_life_cycle_metadata()
         pool_groups_by_window = self._storage_pool_groups_by_window()
@@ -3442,6 +3542,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 primary_peak_stats,
                 secondary_peak_stats_by_level,
                 reuse_delta,
+                reused_blocks_by_level.get(life_cycle_id),
             )
             for life_cycle_id, reuse_delta in sorted(reuse_deltas_by_life_cycle.items())
         }
@@ -3467,6 +3568,9 @@ class KVCacheManagerV2(BaseResourceManager):
             ),
             suspended_requests=suspended_requests,
             resumed_requests=resumed_requests,
+            disk_prefetch_blocks=disk_prefetch_blocks,
+            cached_tokens_by_level=list(cached_tokens_by_level),
+            cache_level_tiers=self._stats_cache_level_tier_names(),
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
@@ -4258,12 +4362,15 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache = self.impl.create_kv_cache(
                 ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
             )
-            # Prefetch to the first tier below GPU (host if present, otherwise
-            # disk). prefetch() is a best-effort hint either way.
-            if not kv_cache.prefetch(CACHE_LEVEL1):
-                logger.warning("prefetch failed for request %s", req.py_request_id)
-                success = False
-            kv_cache.close()
+            try:
+                # Prefetch to the first tier below GPU (host if present,
+                # otherwise disk). prefetch() is a best-effort hint.
+                prefetched = kv_cache.prefetch(CACHE_LEVEL1)
+                if not prefetched:
+                    logger.warning("prefetch failed for request %s", req.py_request_id)
+                    success = False
+            finally:
+                kv_cache.close()
         return success
 
     def reset_reuse_state(self):

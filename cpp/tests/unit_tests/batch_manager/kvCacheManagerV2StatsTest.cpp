@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <vector>
 
 namespace
@@ -121,6 +122,35 @@ TEST(KvCacheManagerV2StatsTest, PendingReuseSurvivesAllocationRollbackUntilClear
     EXPECT_EQ(iteration.iterPartialReusedBlocks, 1);
 
     pending.clear();
+    EXPECT_TRUE(pending.empty());
+}
+
+TEST(KvCacheManagerV2StatsTest, PendingReuseByLevelRidesAlongWithScalarCounts)
+{
+    PendingStats pending;
+    ReusedBlocksByLevel firstMatch;
+    firstMatch.full = {2, 0, 1};
+    firstMatch.partial = {0, 1, 0};
+    EXPECT_TRUE(pending.recordReuse(LifeCycleId{0}, /*fullReusedBlocks=*/3, /*partialReusedBlocks=*/1, firstMatch));
+
+    // A second match on the same life cycle accumulates element-wise.
+    ReusedBlocksByLevel secondMatch;
+    secondMatch.full = {1, 4, 0};
+    secondMatch.partial = {0, 0, 0};
+    EXPECT_TRUE(pending.recordReuse(LifeCycleId{0}, /*fullReusedBlocks=*/5, /*partialReusedBlocks=*/0, secondMatch));
+
+    auto const& byLevel = pending.reusedBlocksByLevelByLifeCycle().at(LifeCycleId{0});
+    EXPECT_EQ(byLevel.full.raw(), (std::vector<int64_t>{3, 4, 1}));
+    EXPECT_EQ(byLevel.partial.raw(), (std::vector<int64_t>{0, 1, 0}));
+    // The by-level split must agree with the scalar counters it rides along with.
+    auto const& iteration = pending.iterationStatsByLifeCycle().at(LifeCycleId{0});
+    EXPECT_EQ(std::accumulate(byLevel.full.begin(), byLevel.full.end(), int64_t{0}), iteration.iterFullReusedBlocks);
+    EXPECT_EQ(
+        std::accumulate(byLevel.partial.begin(), byLevel.partial.end(), int64_t{0}), iteration.iterPartialReusedBlocks);
+
+    // Discarding the request drops the by-level split together with the scalar counters.
+    pending.clear();
+    EXPECT_TRUE(pending.reusedBlocksByLevelByLifeCycle().empty());
     EXPECT_TRUE(pending.empty());
 }
 

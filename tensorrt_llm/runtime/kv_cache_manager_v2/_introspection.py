@@ -121,6 +121,23 @@ def close_test_block(block: Any) -> None:
     block.close()
 
 
+def set_test_block_page_cache_level(block: Any, life_cycle_id: int, cache_level: int) -> None:
+    """Set synthetic page residency for attribution tests."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        cpp_introspection.set_test_block_page_cache_level(block, life_cycle_id, cache_level)
+        return
+
+    from ._common import CacheLevel
+
+    page = next((page for page in block.pages if page.life_cycle == life_cycle_id), None)
+    if page is None:
+        raise ValueError(f"test block has no page for life cycle {life_cycle_id}")
+    if page.scheduled_for_eviction:
+        page.manager.exclude_from_eviction(page)
+    page.cache_level = CacheLevel(cache_level)
+
+
 def test_block_key(block: Any) -> bytes:
     """Return a test block real radix-tree key."""
     cpp_introspection = _cpp_introspection_module()

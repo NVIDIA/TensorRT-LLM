@@ -391,6 +391,8 @@ class TestStatsSerializer:
                     window_size=16,
                     kind="attention",
                     stats=life_cycle_stats,
+                    full_reused_blocks_by_level=[3, 1, 0],
+                    partial_reused_blocks_by_level=[0, 1, 0],
                 ),
                 4: KVCacheV2SsmLifeCycleIterationStats(
                     life_cycle_id=4,
@@ -462,6 +464,12 @@ class TestStatsSerializer:
         assert life_cycle["iterReusedBlocks"] == 5
         assert life_cycle["iterMissedBlocks"] == 3
         assert "iterGenAllocBlocks" not in life_cycle
+        # Indexed by cache level, so a deployment with a hot and a cold GPU level reports them
+        # separately instead of merging both into one "gpu" bucket.
+        assert life_cycle["iterFullReusedBlocksByLevel"] == [3, 1, 0]
+        assert life_cycle["iterPartialReusedBlocksByLevel"] == [0, 1, 0]
+        # An SSM life cycle carries no block-level reuse split.
+        assert "iterFullReusedBlocksByLevel" not in d["kvCacheIterationStatsByLifecycle"]["4"]
         ssm_life_cycle = d["kvCacheIterationStatsByLifecycle"]["4"]
         assert ssm_life_cycle == {
             "lifeCycleId": 4,
@@ -504,6 +512,9 @@ class TestStatsSerializer:
             },
             suspended_requests=2,
             resumed_requests=1,
+            disk_prefetch_blocks=7,
+            cached_tokens_by_level=[5, 2, 1],
+            cache_level_tiers=["gpu", "host", "disk"],
         )
 
         result = BaseWorker._stats_serializer((iter_stats, None, kv_iter))
@@ -511,6 +522,9 @@ class TestStatsSerializer:
 
         assert d["iterSuspendedRequests"] == 2
         assert d["iterResumedRequests"] == 1
+        assert d["iterDiskPrefetchBlocks"] == 7
+        assert d["iterCachedTokensByLevel"] == [5, 2, 1]
+        assert d["kvCacheLevelTiers"] == ["gpu", "host", "disk"]
         # Manager-level, not nested inside the per-pool-group breakdown.
         pool_group = d["kvCacheIterationStatsByPoolGroup"]["0"]
         assert "iterSuspendedRequests" not in pool_group

@@ -511,7 +511,14 @@ bool KvCache::prefetch(CacheLevel target)
 
     try
     {
-        storageMgr.prefetch(target, allPages);
+        // StorageManager reports what it actually migrated. Blocks, the unit iterOffloadBlocks and
+        // iterOnboardBlocks use: one page per block per life cycle. Unrelated to
+        // mCachedTokensByLevel, which answers where reuse-matched tokens lived.
+        int64_t const diskBlocksMigrated = storageMgr.prefetch(target, allPages);
+        if (diskBlocksMigrated > 0 && _shouldRecordManagerStats())
+        {
+            mManager->recordDiskPrefetchBlocks(diskBlocksMigrated);
+        }
     }
     catch (OutOfPagesError const&)
     {
@@ -605,6 +612,7 @@ KVCacheStatsDelta KvCache::commitPendingStats()
     {
         mManager->commitStats(mPendingStats.globalStats(), mPendingStats.iterationStatsByLifeCycle());
         mManager->commitSsmSnapshotIterationStats(mPendingStats.ssmSnapshotIterationStatsByLifeCycle());
+        mManager->commitReusedBlocksByLevel(mPendingStats.reusedBlocksByLevelByLifeCycle());
     }
     KVCacheStatsDelta const requestStats
         = _shouldRecordRequestStats() ? mPendingStats.requestStats().copy() : KVCacheStatsDelta{};
@@ -2048,6 +2056,46 @@ void KvCache::_onStopCommitting()
 }
 
 // ---------------------------------------------------------------------------
+// _finalizeCachedTokensByLevel: turn the per-block cache levels collected while
+// holding the matched pages into logical token counts.
+//
+// Cache levels are ordered hottest first, so the coldest level backing a block
+// is simply the largest one. Working at level granularity (rather than at the
+// coarser GPU/host/disk tier) keeps a hot and a cold GPU level distinct.
+// ---------------------------------------------------------------------------
+
+void KvCache::_finalizeCachedTokensByLevel(
+    int numTokens, TypedVec<BlockOrdinal, CacheLevel> const& attentionLevels, std::optional<CacheLevel> ssmLevel)
+{
+    mCachedTokensByLevel = CountsByLevel(mManager->storage().numCacheLevels(), 0);
+    mLastCachedTokenLevel.reset();
+    if (numTokens == 0)
+    {
+        return;
+    }
+
+    for (BlockOrdinal ordinal{0}; ordinal < attentionLevels.size(); ++ordinal)
+    {
+        int const blockStart = ordinal.value() * mTokensPerBlock;
+        int const blockEnd = std::min(numTokens, blockStart + mTokensPerBlock);
+        if (blockStart >= blockEnd)
+        {
+            break;
+        }
+        CacheLevel sourceLevel = attentionLevels.at(ordinal);
+        if (ssmLevel.has_value() && *ssmLevel > sourceLevel)
+        {
+            sourceLevel = *ssmLevel;
+        }
+        mLastCachedTokenLevel = sourceLevel;
+        mCachedTokensByLevel.at(sourceLevel) += blockEnd - blockStart;
+    }
+
+    TLLM_CHECK_DEBUG(countsByLevelTotal(mCachedTokensByLevel) == numTokens);
+    TLLM_CHECK_DEBUG(mLastCachedTokenLevel.has_value());
+}
+
+// ---------------------------------------------------------------------------
 // _setupForReuse: find existing blocks in radix tree matching input tokens.
 // ---------------------------------------------------------------------------
 
@@ -2082,6 +2130,15 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
 
     BeamIndex beamIdx = kDefaultBeamIndex;
 
+    auto& storageMgr = mManager->storage();
+    CacheLevel const numCacheLevels = storageMgr.numCacheLevels();
+
+    // Source-level attribution for the reused tokens, merged across attention life cycles at block
+    // granularity. It is observed in this same walk rather than in a separate pre-pass: hold() only
+    // takes a PageHolder and unschedules eviction, it never migrates data, so a page still reports
+    // the level it was matched on. Levels are ordered hottest first, so merging takes the max.
+    TypedVec<BlockOrdinal, CacheLevel> attentionLevels(numMatchedBlocks, CacheLevel{0});
+
     for (LifeCycleId lcId{0}; lcId < numLc; ++lcId)
     {
         // SSM is handled separately below.
@@ -2094,6 +2151,19 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
         bool const isAttention = std::holds_alternative<AttnLifeCycle>(allLc[lcId]);
         int fullReusedBlocks = 0;
         int partialReusedBlocks = 0;
+        // Indexed by CacheLevel, so entry i is the i-th configured tier rather than a fixed
+        // GPU/host/disk bucket; a deployment with two GPU levels gets two distinct entries.
+        ReusedBlocksByLevel reusedByLevel;
+        if (shouldRecordStats && isAttention)
+        {
+            reusedByLevel.full = CountsByLevel(numCacheLevels, 0);
+            reusedByLevel.partial = CountsByLevel(numCacheLevels, 0);
+        }
+        TypedVec<BlockOrdinal, std::optional<CacheLevel>> lifeCycleLevels;
+        if (isAttention)
+        {
+            lifeCycleLevels.resize(numMatchedBlocks);
+        }
 
         // Process a non-stale ordinal: hold the page.
         // For partial blocks (last block, not full), defer the copy to first resume().
@@ -2102,17 +2172,25 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
             auto& blk = *matched.at(ordinal);
             auto* page = blk.storage.at(lcId);
             TLLM_CHECK_DEBUG_WITH_INFO(page, "Expected page in non-stale block");
+            CacheLevel const level = page->cacheLevel;
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
             bpSlot = page->hold();
-            if (shouldRecordStats && isAttention)
+            if (!isAttention)
+            {
+                return;
+            }
+            lifeCycleLevels.at(ordinal) = level;
+            if (shouldRecordStats)
             {
                 if (ordinal < fullReusedEnd)
                 {
                     ++fullReusedBlocks;
+                    ++reusedByLevel.full.at(level);
                 }
                 else if (hasPartialMatch && ordinal == fullReusedEnd && _hasReuseSource(bpSlot))
                 {
                     partialReusedBlocks = 1;
+                    ++reusedByLevel.partial.at(level);
                 }
             }
         };
@@ -2122,22 +2200,54 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
         for (BlockOrdinal ord = staleEnd; ord < numMatchedBlocks; ++ord)
             processOrdinal(ord);
 
+        // For SWA, only sink and live-window pages at the matched endpoint are materialized. Stale
+        // spans inherit the next live page's level, because that later anchor is what enables those
+        // logical tokens to be skipped.
+        if (isAttention)
+        {
+            std::optional<CacheLevel> nextAnchorLevel;
+            for (int i = numMatchedBlocks.value() - 1; i >= 0; --i)
+            {
+                BlockOrdinal const ordinal{i};
+                auto level = lifeCycleLevels.at(ordinal);
+                if (level.has_value())
+                {
+                    nextAnchorLevel = level;
+                }
+                else
+                {
+                    level = nextAnchorLevel;
+                }
+                if (level.has_value() && *level > attentionLevels.at(ordinal))
+                {
+                    attentionLevels.at(ordinal) = *level;
+                }
+            }
+        }
+
         if (shouldRecordStats && isAttention
             && mPendingStats.recordReuse(
-                lcId, fullReusedBlocks, partialReusedBlocks, recordManagerStats, recordRequestStats))
+                lcId, fullReusedBlocks, partialReusedBlocks, reusedByLevel, recordManagerStats, recordRequestStats))
         {
             mManager->markStatsDirty(id);
         }
     }
 
     // SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().
+    // Reuse onboards only this final recurrent checkpoint, and it summarizes the entire matched
+    // prefix, so its source tier applies to every logical reused token; older checkpoints are
+    // traversal history, not inputs.
+    std::optional<CacheLevel> ssmLevel;
     if (ssmLcId.has_value() && !matched.empty())
     {
         auto& snapshotBlock = *matched.back();
         auto* snapshotPage = snapshotBlock.storage[*ssmLcId];
         TLLM_CHECK_DEBUG_WITH_INFO(snapshotPage, "Last matched block must have SSM snapshot after truncation");
+        ssmLevel = snapshotPage->cacheLevel;
         mSsmBlocks[kDefaultBeamIndex][*ssmLcId] = snapshotPage->hold();
     }
+
+    _finalizeCachedTokensByLevel(numTokens, attentionLevels, ssmLevel);
     // Record one SSM snapshot lookup for this reuse-match onboarding (a miss when
     // nothing matched). Mirrors Python's record_ssm_snapshot_lookup call.
     if (_shouldRecordManagerStats() && ssmLcId.has_value())

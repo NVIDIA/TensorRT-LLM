@@ -26,6 +26,7 @@ from .._block_radix_tree import BlockRadixTree, ReuseMatch, ReuseScope
 from .._common import (
     BAD_PAGE_INDEX,
     GPU_LEVEL,
+    NDEBUG,
     PRIORITY_DEFAULT,
     BlockOrdinal,
     CacheLevel,
@@ -41,7 +42,14 @@ from .._config import DataRole, KVCacheManagerConfig
 from .._exceptions import LogicError
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
-from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta, SsmSnapshotIterationStatsDelta
+from .._stats import (
+    CountsByLevel,
+    KVCacheIterationStatsDelta,
+    KVCacheStatsDelta,
+    ReusedBlocksByLevel,
+    SsmSnapshotIterationStatsDelta,
+    add_counts_by_level,
+)
 from .._storage._config import BufferId, SlotDesc, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
 from .._storage_manager import StorageManager
@@ -220,6 +228,9 @@ class KVCacheManager:
         "_stats_excluded_kv_cache_ids",
         "_iter_suspended_requests",
         "_iter_resumed_requests",
+        "_iter_disk_prefetch_blocks",
+        "_iter_cached_tokens_by_level",
+        "_iter_reused_blocks_by_level",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -303,6 +314,9 @@ class KVCacheManager:
         self._stats_excluded_kv_cache_ids = set()
         self._iter_suspended_requests = 0
         self._iter_resumed_requests = 0
+        self._iter_disk_prefetch_blocks = 0
+        self._iter_cached_tokens_by_level = []
+        self._iter_reused_blocks_by_level = {}
 
     def __del__(self) -> None:
         try:
@@ -625,6 +639,31 @@ class KVCacheManager:
         self._ssm_snapshot_iteration_stats_by_life_cycle.clear()
         return stats
 
+    def _commit_reused_blocks_by_level(
+        self, by_life_cycle: dict[LifeCycleId, ReusedBlocksByLevel]
+    ) -> None:
+        """Commit the per-cache-level split of the reuse block counts.
+
+        Committed alongside the scalar iteration stats so both views cover exactly the same
+        requests: a cache whose pending stats are discarded contributes to neither.
+        """
+        if not self._stats_enabled:
+            return
+        for life_cycle, by_level in by_life_cycle.items():
+            if by_level.empty:
+                continue
+            self._iter_reused_blocks_by_level.setdefault(life_cycle, ReusedBlocksByLevel()).add(
+                by_level
+            )
+
+    def get_and_reset_iteration_reused_blocks_by_level(
+        self,
+    ) -> dict[LifeCycleId, ReusedBlocksByLevel]:
+        """Return and reset the per-cache-level reuse block counts for this iteration."""
+        by_life_cycle = self._iter_reused_blocks_by_level
+        self._iter_reused_blocks_by_level = {}
+        return by_life_cycle
+
     def record_request_suspended(self) -> None:
         """Count one ACTIVE->SUSPENDED transition for the current iteration window."""
         if not self._stats_enabled:
@@ -657,6 +696,33 @@ class KVCacheManager:
         self._iter_suspended_requests = 0
         self._iter_resumed_requests = 0
         return suspended, resumed
+
+    def record_disk_prefetch_blocks(self, num_blocks: int) -> None:
+        """Count the blocks a prefetch call actually migrated from disk to host."""
+        assert num_blocks >= 0
+        if self._stats_enabled:
+            self._iter_disk_prefetch_blocks += num_blocks
+
+    def get_and_reset_iteration_disk_prefetch_blocks(self) -> int:
+        """Return and reset disk-to-host prefetch blocks for this iteration."""
+        num_blocks = self._iter_disk_prefetch_blocks
+        self._iter_disk_prefetch_blocks = 0
+        return num_blocks
+
+    def record_cached_tokens_by_level(self, counts: CountsByLevel) -> None:
+        """Accumulate a request's initial cached-token attribution, by cache level, into this
+        iteration."""
+        assert NDEBUG or all(count >= 0 for count in counts)
+        if self._stats_enabled:
+            self._iter_cached_tokens_by_level = add_counts_by_level(
+                self._iter_cached_tokens_by_level, counts
+            )
+
+    def get_and_reset_iteration_cached_tokens_by_level(self) -> CountsByLevel:
+        """Return the per-cache-level cached-token counts since the last drain and reset them."""
+        counts = self._iter_cached_tokens_by_level
+        self._iter_cached_tokens_by_level = []
+        return counts
 
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel

@@ -2113,6 +2113,13 @@ class TestResizeQuota(TestKVCacheManagerV2):
             prefetch_counts_before[HOST_LEVEL] + prefetch_counts_before[DISK_LEVEL],
         )
         self.assertEqual(unscheduled_evictable_after[HOST_LEVEL], 0)
+        # The disk-prefetch counter measures what this call moved: every page that was on disk
+        # beforehand, counted the way iterOnboardBlocks/iterOffloadBlocks count.
+        moved_blocks = self.manager.get_and_reset_iteration_disk_prefetch_blocks()
+        self.assertEqual(moved_blocks, prefetch_counts_before[DISK_LEVEL])
+        # Nothing is left on disk now, so a second prefetch moves nothing and counts nothing.
+        self.assertTrue(prefetch_target.prefetch(HOST_LEVEL))
+        self.assertEqual(self.manager.get_and_reset_iteration_disk_prefetch_blocks(), 0)
         # Now both requests can resume
         for kv_cache in kv_cache_lst:
             success = kv_cache.resume(stream)
@@ -4994,6 +5001,83 @@ class TestSlotAllocatorShrink(unittest.TestCase):
 
         for s in slots[:8]:
             allocator.release(s)
+
+
+class TestCachedTokensByTier(TestKVCacheManagerV2):
+    @contextmanager
+    def _tiered_prefix(self):
+        """Three committed blocks of 4 tokens spread over the configured cache levels.
+
+        Per-(block, life cycle) levels are (0,0), (1,0), (1,2), so a match of 11 tokens makes
+        blocks 0 and 1 full reuses and block 2 a partial one, with the two attention life cycles
+        disagreeing on where the pages sit. Yields (tokens, life_cycles).
+        """
+        self.prepare(16 << 20, 16 << 20, 16 << 20, 2, 16, 0, tokens_per_block=4)
+        tokens = [TokenId(i) for i in range(12)]
+        life_cycles = _introspection.attention_life_cycle_ids(self.manager)
+        coverage = [4 if i in life_cycles else 0 for i in range(max(life_cycles) + 1)]
+        blocks = []
+        try:
+            parent = None
+            for ordinal, levels in enumerate(((0, 0), (1, 0), (1, 2))):
+                block = _introspection.make_test_block(
+                    self.manager, tokens[ordinal * 4 : (ordinal + 1) * 4], coverage, parent
+                )
+                blocks.append(block)
+                for life_cycle, level in zip(life_cycles, levels):
+                    if level:
+                        _introspection.set_test_block_page_cache_level(
+                            block, life_cycle, CacheLevel(level)
+                        )
+                parent = block
+            yield tokens, life_cycles
+        finally:
+            # Put every page back on GPU before closing, so teardown does not trip over a block
+            # whose pages were parked on a cold level.
+            for block in blocks:
+                for life_cycle in life_cycles:
+                    _introspection.set_test_block_page_cache_level(block, life_cycle, CacheLevel(0))
+            for block in reversed(blocks):
+                _introspection.close_test_block(block)
+
+    def test_current_residency(self) -> None:
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                # Levels 0/1/2 are gpu/host/disk in this fixture's configured tier list.
+                self.assertEqual(list(cache.cached_tokens_by_level), [4, 4, 3])
+                self.assertEqual(cache._get_last_cached_token_level(), 2)
+            finally:
+                cache.close()
+
+    def test_reused_blocks_by_level(self) -> None:
+        """Reuse block counts are split by the cache level each reused page sat on."""
+        with self._tiered_prefix() as (tokens, life_cycles):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                cache.commit_pending_stats()
+                by_level = self.manager.get_and_reset_iteration_reused_blocks_by_level()
+
+                # First life cycle: block 0 on level 0, block 1 on level 1 (both full), block 2
+                # on level 1 (partial). Second: blocks 0 and 1 on level 0, block 2 on level 2.
+                self.assertEqual(list(by_level[life_cycles[0]].full), [1, 1, 0])
+                self.assertEqual(list(by_level[life_cycles[0]].partial), [0, 1, 0])
+                self.assertEqual(list(by_level[life_cycles[1]].full), [2, 0, 0])
+                self.assertEqual(list(by_level[life_cycles[1]].partial), [0, 0, 1])
+                # Draining resets the accumulator.
+                self.assertEqual(self.manager.get_and_reset_iteration_reused_blocks_by_level(), {})
+            finally:
+                cache.close()
+
+    def test_iteration_accumulation(self) -> None:
+        self.prepare(16 << 20, 16 << 20, 16 << 20, 2, 16, 0, tokens_per_block=4)
+        self.manager.record_cached_tokens_by_level([3, 1, 0])
+        self.manager.record_cached_tokens_by_level([2, 0, 4])
+        self.assertEqual(
+            list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [5, 1, 4]
+        )
+        # Draining resets the accumulator.
+        self.assertEqual(list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [])
 
 
 @pytest.mark.cpu_only

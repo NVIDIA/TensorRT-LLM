@@ -1171,6 +1171,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__eq__", &kv::KVCacheStatsDelta::operator==, nb::arg("other"))
         .def("__repr__", &statsDeltaRepr);
 
+    // Drained snapshots only: callers read the per-level counts, the accumulation itself stays
+    // in C++.
+    nb::class_<kv::ReusedBlocksByLevel>(m, "ReusedBlocksByLevel")
+        .def_prop_ro("full", [](kv::ReusedBlocksByLevel const& self) { return self.full.raw(); })
+        .def_prop_ro("partial", [](kv::ReusedBlocksByLevel const& self) { return self.partial.raw(); });
+
     nb::class_<kv::KVCacheIterationStatsDelta>(m, "KVCacheIterationStatsDelta")
         .def(
             "__init__",
@@ -1777,6 +1783,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
+        .def_prop_ro("cached_tokens_by_level", [](kv::KvCache const& self) { return self.cachedTokensByLevel().raw(); })
+        .def("_get_last_cached_token_level",
+            [](kv::KvCache const& self) -> std::optional<int>
+            {
+                auto const level = self.lastCachedTokenLevel();
+                if (!level.has_value())
+                {
+                    return std::nullopt;
+                }
+                return level->value();
+            })
         .def("_get_num_reusable_tokens_before_hybrid_pruning", &kv::KvCache::numReusableTokensBeforeHybridPruning)
         .def("_get_num_reusable_tokens_before_pruning", &kv::KvCache::numReusableTokensBeforePruning)
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
@@ -1915,6 +1932,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"), nb::arg("tokens"), nb::arg("coverage_per_lc"), nb::arg("parent").none() = nb::none(),
         nb::arg("reuse_scope").none() = nb::none(), nb::keep_alive<0, 1>(), nb::keep_alive<0, 4>());
+    mIntrospection.def(
+        "set_test_block_page_cache_level",
+        [](EventManagerTestBlock& block, int lifeCycleId, int cacheLevel)
+        {
+            auto const page = std::find_if(block.pages.begin(), block.pages.end(),
+                [lifeCycleId](auto const& candidate) { return candidate->lifeCycle == kv::LifeCycleId{lifeCycleId}; });
+            if (page == block.pages.end())
+            {
+                throw std::invalid_argument("test block has no page for the requested life cycle");
+            }
+            if ((*page)->scheduledForEviction())
+            {
+                (*page)->manager->excludeFromEviction(**page);
+            }
+            (*page)->cacheLevel = kv::CacheLevel{cacheLevel};
+        },
+        nb::arg("block"), nb::arg("life_cycle_id"), nb::arg("cache_level"));
     mIntrospection.def(
         "test_block_key", [](EventManagerTestBlock const& block) { return digestBytes(block.block->key); },
         nb::arg("block"));
@@ -2293,6 +2327,25 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("record_request_resumed", &kv::KvCacheManager::recordRequestResumed)
         .def(
             "get_and_reset_iteration_suspend_resume_stats", &kv::KvCacheManager::getAndResetIterationSuspendResumeStats)
+        .def(
+            "get_and_reset_iteration_disk_prefetch_blocks", &kv::KvCacheManager::getAndResetIterationDiskPrefetchBlocks)
+        .def(
+            "record_cached_tokens_by_level",
+            [](kv::KvCacheManager& self, std::vector<int64_t> counts)
+            { self.recordCachedTokensByLevel(kv::CountsByLevel{std::move(counts)}); },
+            nb::arg("counts"))
+        .def("get_and_reset_iteration_cached_tokens_by_level",
+            [](kv::KvCacheManager& self) { return self.getAndResetIterationCachedTokensByLevel().raw(); })
+        .def("get_and_reset_iteration_reused_blocks_by_level",
+            [](kv::KvCacheManager& self)
+            {
+                nb::dict result;
+                for (auto const& [lifeCycle, byLevel] : self.getAndResetIterationReusedBlocksByLevel())
+                {
+                    result[nb::cast(lifeCycle.value())] = nb::cast(byLevel);
+                }
+                return result;
+            })
         .def(
             "get_and_reset_iteration_peak_block_stats",
             [](kv::KvCacheManager& self, int cacheLevel)

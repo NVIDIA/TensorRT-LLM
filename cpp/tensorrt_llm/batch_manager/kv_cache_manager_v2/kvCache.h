@@ -282,6 +282,18 @@ public:
         return static_cast<int>(mCommittedTokens.size());
     }
 
+    //! Reused-token counts indexed by the cache level each token's coldest required page sat on
+    //! when the reuse match was taken.
+    CountsByLevel const& cachedTokensByLevel() const noexcept
+    {
+        return mCachedTokensByLevel;
+    }
+
+    std::optional<CacheLevel> lastCachedTokenLevel() const noexcept
+    {
+        return mLastCachedTokenLevel;
+    }
+
     // Internal diagnostic: prefix supported by the attention pages alone,
     // before recurrent-state (SSM) snapshot pruning shortened the reuse.
     int numReusableTokensBeforeHybridPruning() const noexcept
@@ -433,6 +445,10 @@ private:
     void activate();
 
     // Internal helpers.
+    // Turn the per-block cache levels observed while holding the matched pages into logical token
+    // counts. Called at the end of _setupForReuse, which collects them in the same walk.
+    void _finalizeCachedTokensByLevel(
+        int numTokens, TypedVec<BlockOrdinal, CacheLevel> const& attentionLevels, std::optional<CacheLevel> ssmLevel);
     void _setupForReuse(BlockRadixTree::ReuseMatch const& match);
     // Reconstruct the committed token sequence from a match's blocks (mirrors
     // Python's _get_matched_tokens); used when reuse-matching no longer has the
@@ -601,6 +617,9 @@ private:
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 
     std::vector<TokenIdExt> mCommittedTokens;
+    // Initial current-residency provenance, observed before reused pages are held or promoted.
+    CountsByLevel mCachedTokensByLevel;
+    std::optional<CacheLevel> mLastCachedTokenLevel;
     // Resolved per-sequence text-only state after applying the manager default.
     bool mTextOnly = false;
     int mNumReusableTokensBeforeHybridPruning;

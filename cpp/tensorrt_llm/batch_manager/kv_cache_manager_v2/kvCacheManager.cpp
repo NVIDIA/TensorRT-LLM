@@ -506,6 +506,24 @@ SsmSnapshotIterationStatsByLifeCycle KvCacheManager::getAndResetSsmSnapshotItera
     return stats;
 }
 
+void KvCacheManager::commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle)
+{
+    for (auto const& [lifeCycle, byLevel] : byLifeCycle)
+    {
+        if (!byLevel.empty())
+        {
+            mIterReusedBlocksByLevel[lifeCycle].add(byLevel);
+        }
+    }
+}
+
+ReusedBlocksByLevelByLifeCycle KvCacheManager::getAndResetIterationReusedBlocksByLevel()
+{
+    ReusedBlocksByLevelByLifeCycle byLifeCycle;
+    byLifeCycle.swap(mIterReusedBlocksByLevel);
+    return byLifeCycle;
+}
+
 void KvCacheManager::recordRequestSuspended()
 {
     if (!mConfig.enableStats)
@@ -522,6 +540,40 @@ void KvCacheManager::recordRequestResumed()
         return;
     }
     ++mIterResumedRequests;
+}
+
+void KvCacheManager::recordDiskPrefetchBlocks(int64_t numBlocks)
+{
+    TLLM_CHECK_DEBUG(numBlocks >= 0);
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    mIterDiskPrefetchBlocks += numBlocks;
+}
+
+int64_t KvCacheManager::getAndResetIterationDiskPrefetchBlocks()
+{
+    auto const numBlocks = mIterDiskPrefetchBlocks;
+    mIterDiskPrefetchBlocks = 0;
+    return numBlocks;
+}
+
+void KvCacheManager::recordCachedTokensByLevel(CountsByLevel const& counts)
+{
+    TLLM_CHECK_DEBUG(std::all_of(counts.begin(), counts.end(), [](int64_t count) { return count >= 0; }));
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    addCountsByLevel(mIterCachedTokensByLevel, counts);
+}
+
+CountsByLevel KvCacheManager::getAndResetIterationCachedTokensByLevel()
+{
+    CountsByLevel counts;
+    std::swap(counts, mIterCachedTokensByLevel);
+    return counts;
 }
 
 std::pair<int64_t, int64_t> KvCacheManager::getAndResetIterationSuspendResumeStats()

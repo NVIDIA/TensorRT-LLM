@@ -1290,10 +1290,11 @@ void StorageManager::batchedMigrateToGpu(
     }
 }
 
-void StorageManager::prefetch(
+int64_t StorageManager::prefetch(
     CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages)
 {
     TypedVec<PoolGroupIndex, SlotCount> numSlotsToMigrate(numPoolGroups(dstLevel), 0);
+    int64_t diskBlocksMigrated = 0;
     std::vector<SharedPtr<Page>> scheduled;
 
     auto reschedulePagesGuard = FuncGuard(
@@ -1353,9 +1354,17 @@ void StorageManager::prefetch(
     }
     for (auto& [migrationPath, migrationPages] : migrationGroups)
     {
-        _batchedMigrate(dstLevel, migrationPath.first, migrationPages, /*updateSrc=*/true);
+        CacheLevel const srcLevel = migrationPath.first;
+        _batchedMigrate(dstLevel, srcLevel, migrationPages, /*updateSrc=*/true);
+        // Per batch, after it landed: the pages are already grouped by source level, so this costs
+        // nothing per page and never credits a batch that did not run.
+        if (cacheTier(srcLevel) == CacheTier::DISK)
+        {
+            diskBlocksMigrated += static_cast<int64_t>(migrationPages.size());
+        }
     }
     reschedulePagesGuard.run();
+    return diskBlocksMigrated;
 }
 
 // ---------------------------------------------------------------------------

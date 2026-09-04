@@ -62,7 +62,12 @@ from .._page import (
     _SharedPageLock,
     batched_lock_to_gpu,
 )
-from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
+from .._stats import (
+    CountsByLevel,
+    KVCacheIterationStatsDelta,
+    KVCacheStatsDelta,
+    ReusedBlocksByLevel,
+)
 from .._storage._core import Slot
 from .._storage_manager import StorageManager
 from .._utils import (
@@ -238,6 +243,8 @@ class _KVCache:
         "_blocks",
         "_base_page_indices",
         "_committed_tokens",
+        "_cached_tokens_by_level",
+        "_last_cached_token_level",
         "_num_reusable_tokens_before_hybrid_pruning",
         "_num_reusable_tokens_before_pruning",
         "_num_committed_blocks",
@@ -276,6 +283,9 @@ class _KVCache:
     # be computed on the fly, but that would be slow due to python.
     _base_page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _committed_tokens: list[TokenIdExt]
+    # Initial current-residency provenance, observed while the reused pages are held.
+    _cached_tokens_by_level: CountsByLevel
+    _last_cached_token_level: CacheLevel | None
     # Internal diagnostic captured from the reuse match: see ReuseMatch.
     _num_reusable_tokens_before_hybrid_pruning: int
     _num_reusable_tokens_before_pruning: int
@@ -338,6 +348,10 @@ class _KVCache:
             self.beam_width,
         )
         self._committed_tokens = []
+        # Filled by _setup_for_reuse(), which observes the source levels in the same walk that
+        # holds the matched pages. Stays all-zero when there is no reuse match.
+        self._cached_tokens_by_level = filled_list(0, manager._storage.num_cache_levels)
+        self._last_cached_token_level = None
         self._num_reusable_tokens_before_hybrid_pruning = (
             reuse_match.num_reusable_tokens_before_hybrid_pruning if reuse_match is not None else 0
         )
@@ -450,6 +464,9 @@ class _KVCache:
             )
             self.manager._commit_ssm_snapshot_iteration_stats(
                 self._pending_stats.ssm_snapshot_iteration_stats_by_life_cycle
+            )
+            self.manager._commit_reused_blocks_by_level(
+                self._pending_stats.reused_blocks_by_level_by_life_cycle
             )
         request_stats = (
             self._pending_stats.request_stats.copy()
@@ -1115,6 +1132,19 @@ class _KVCache:
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
 
+    @property
+    def cached_tokens_by_level(self) -> CountsByLevel:
+        """Reused-token counts indexed by each token's coldest required source cache level."""
+        return list(self._cached_tokens_by_level)
+
+    def _get_last_cached_token_level(self) -> int | None:
+        """Return the source cache level of the last initially reused logical block."""
+        return (
+            int(self._last_cached_token_level)
+            if self._last_cached_token_level is not None
+            else None
+        )
+
     def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int:
         """Return the pre-hybrid-pruning prefix for internal diagnostics."""
         return self._num_reusable_tokens_before_hybrid_pruning
@@ -1451,7 +1481,6 @@ class _KVCache:
 
         num_pool_groups = storage.num_pool_groups
         lc2pg = storage.get_pool_group_index
-
         all_pages = make_typed(
             lambda _: make_typed(lambda _: list[Page](), num_tiers), num_pool_groups
         )
@@ -1468,7 +1497,12 @@ class _KVCache:
             all_pages[pg_idx][lvl].append(page)
 
         try:
-            storage.prefetch(target, all_pages)
+            # StorageManager reports what it actually migrated. Blocks, the unit
+            # iter_offload_blocks and iter_onboard_blocks use: one page per block per life cycle.
+            # Unrelated to _cached_tokens_by_level, which answers where matched tokens lived.
+            disk_blocks_migrated = storage.prefetch(target, all_pages)
+            if disk_blocks_migrated > 0 and self._should_record_manager_stats():
+                manager.record_disk_prefetch_blocks(disk_blocks_migrated)
         except OutOfPagesError:
             return False
         return True
@@ -2108,6 +2142,42 @@ class _KVCache:
         assert remaining == 0
         return ret
 
+    def _finalize_cached_tokens_by_level(
+        self,
+        num_tokens: int,
+        attention_levels: TypedIndexList[BlockOrdinal, CacheLevel],
+        ssm_level: CacheLevel | None,
+    ) -> None:
+        """Turn the per-block cache levels collected while holding the matched pages into logical
+        token counts.
+
+        Cache levels are ordered hottest first, so the coldest level backing a block is simply the
+        largest one. Attention pages cover their block's matched token span; the final SSM
+        checkpoint summarizes the entire recurrent prefix, so it is merged into every block.
+        """
+        counts = filled_list(0, self.manager._storage.num_cache_levels)
+        self._cached_tokens_by_level = counts
+        self._last_cached_token_level = None
+        if num_tokens == 0:
+            return
+
+        tokens_per_block = self.manager.tokens_per_block
+        last_cached_token_level: CacheLevel | None = None
+        for ordinal, attention_level in enumerate(attention_levels):
+            block_start = ordinal * tokens_per_block
+            block_end = min(num_tokens, block_start + tokens_per_block)
+            if block_start >= block_end:
+                break
+            source_level = (
+                max(attention_level, ssm_level) if ssm_level is not None else attention_level
+            )
+            last_cached_token_level = source_level
+            counts[source_level] += block_end - block_start
+
+        self._last_cached_token_level = last_cached_token_level
+        assert NDEBUG or sum(counts) == num_tokens
+        assert NDEBUG or last_cached_token_level is not None
+
     def _setup_for_reuse(self, match: ReuseMatch) -> None:
         manager = self.manager
         matched = match.blocks
@@ -2140,48 +2210,98 @@ class _KVCache:
         record_manager_stats = self._should_record_manager_stats()
         record_request_stats = self._should_record_request_stats()
         record_shared_stats = record_manager_stats or record_request_stats
+        storage = manager._storage
+        num_cache_levels = storage.num_cache_levels
+        # Source-level attribution for the reused tokens, merged across attention life cycles at
+        # block granularity. It is observed in this same walk rather than in a separate pre-pass:
+        # hold() only takes a page holder and unschedules eviction, it never migrates data, so a
+        # page still reports the level it was matched on. Levels are ordered hottest first, so
+        # merging takes the max.
+        attention_levels = filled_list(CacheLevel(0), BlockOrdinal(len(matched)))
         for lc_idx, lc in life_cycles.items():
             if lc_idx == ssm_lc_id:
                 continue  # SSM is handled separately below
             stale_start, stale_end = _KVCache._get_stale_range(tokens_per_block, num_tokens, lc)
+            is_attention = isinstance(lc, AttnLifeCycle)
             full_reused_blocks = 0
             partial_reused_blocks = 0
+            # Indexed by CacheLevel, so entry i is the i-th configured tier rather than a fixed
+            # gpu/host/disk bucket; a deployment with two GPU levels gets two distinct entries.
+            by_level = (
+                ReusedBlocksByLevel(
+                    full=filled_list(0, num_cache_levels),
+                    partial=filled_list(0, num_cache_levels),
+                )
+                if record_shared_stats and is_attention
+                else None
+            )
+            life_cycle_levels: TypedIndexList[BlockOrdinal, CacheLevel | None] = (
+                filled_list(None, BlockOrdinal(len(matched))) if is_attention else []
+            )
             for ordinal in chain(
                 typed_range(stale_start), typed_range(stale_end, BlockOrdinal(len(matched)))
             ):
                 block = self._block(ordinal, beam_idx)
-                holder = unwrap_optional(matched[ordinal].get_page(lc_idx)).hold()
+                page = unwrap_optional(matched[ordinal].get_page(lc_idx))
+                level = page.cache_level
+                holder = page.hold()
                 # For partial blocks (last block, not full), we defer the copy to first resume().
                 # Just store the holder of the original committed page for now.
                 block[lc_idx] = holder
-                if record_shared_stats and isinstance(lc, AttnLifeCycle):
+                if not is_attention:
+                    continue
+                life_cycle_levels[ordinal] = level
+                if record_shared_stats:
+                    assert by_level is not None
                     if ordinal < full_reused_end:
                         full_reused_blocks += 1
+                        by_level.full[level] += 1
                     elif (
                         has_partial_match
                         and ordinal == full_reused_end
                         and self._has_reuse_source(holder)
                     ):
                         partial_reused_blocks = 1
-            if record_shared_stats and isinstance(lc, AttnLifeCycle):
+                        by_level.partial[level] += 1
+            if is_attention:
+                # For SWA, only sink and live-window pages at the matched endpoint are
+                # materialized. Stale spans inherit the next live page's level, because that later
+                # anchor is what enables those logical tokens to be skipped.
+                next_anchor_level: CacheLevel | None = None
+                for ordinal in reversed(range(len(matched))):
+                    level = life_cycle_levels[ordinal]
+                    if level is not None:
+                        next_anchor_level = level
+                    else:
+                        level = next_anchor_level
+                    if level is not None and level > attention_levels[ordinal]:
+                        attention_levels[ordinal] = level
+            if record_shared_stats and is_attention:
                 changed = self._pending_stats.record_reuse(
                     lc_idx,
                     full_reused_blocks=full_reused_blocks,
                     partial_reused_blocks=partial_reused_blocks,
+                    by_level=by_level,
                     record_manager_stats=record_manager_stats,
                     record_request_stats=record_request_stats,
                 )
                 if changed:
                     self.manager.mark_stats_dirty(self.id)
-        # SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().
+        # SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first
+        # resume(). Reuse onboards only this final recurrent checkpoint, and it summarizes the
+        # entire matched prefix, so its source tier applies to every logical reused token; older
+        # checkpoints are traversal history, not inputs.
+        ssm_level: CacheLevel | None = None
         if ssm_lc_id is not None and matched:
             snapshot_block = matched[-1]
             snapshot_page = snapshot_block.get_page(ssm_lc_id)
             assert snapshot_page is not None, (
                 "Last matched block must have SSM snapshot after truncation"
             )
+            ssm_level = snapshot_page.cache_level
             snapshot_holder = snapshot_page.hold()
             self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] = snapshot_holder
+        self._finalize_cached_tokens_by_level(num_tokens, attention_levels, ssm_level)
         if record_manager_stats and ssm_lc_id is not None:
             changed = self._pending_stats.record_ssm_snapshot_lookup(
                 ssm_lc_id,
