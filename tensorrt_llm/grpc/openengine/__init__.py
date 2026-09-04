@@ -5,5 +5,11 @@
 
 from .control import OpenEngineControlServicer
 from .server import OpenEngineServer, launch_server
+from .servicer import OpenEngineInferenceServicer
 
-__all__ = ["OpenEngineControlServicer", "OpenEngineServer", "launch_server"]
+__all__ = [
+    "OpenEngineControlServicer",
+    "OpenEngineInferenceServicer",
+    "OpenEngineServer",
+    "launch_server",
+]

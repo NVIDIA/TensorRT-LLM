@@ -138,10 +138,14 @@ def test_kv_transfer_backend_detects_an_unset_backend_field():
     """
     from tensorrt_llm.grpc.openengine.server import _kv_transfer_backend
 
-    unset = SimpleNamespace(args=SimpleNamespace(cache_transceiver_config=SimpleNamespace(backend=None)))
+    unset = SimpleNamespace(
+        args=SimpleNamespace(cache_transceiver_config=SimpleNamespace(backend=None))
+    )
     assert _kv_transfer_backend(unset) == "DEFAULT"
 
-    named = SimpleNamespace(args=SimpleNamespace(cache_transceiver_config=SimpleNamespace(backend="NIXL")))
+    named = SimpleNamespace(
+        args=SimpleNamespace(cache_transceiver_config=SimpleNamespace(backend="NIXL"))
+    )
     assert _kv_transfer_backend(named) == "NIXL"
 
     absent = SimpleNamespace(args=SimpleNamespace(cache_transceiver_config=None))

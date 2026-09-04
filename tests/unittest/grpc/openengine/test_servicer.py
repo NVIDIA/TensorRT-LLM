@@ -19,11 +19,12 @@ pytest.importorskip(
 import grpc  # noqa: E402
 from openengine.v1 import generation_pb2  # noqa: E402
 
+import tensorrt_llm.grpc.openengine.disagg as oe_disagg  # noqa: E402
+import tensorrt_llm.grpc.openengine.formatting as oe_formatting  # noqa: E402
 import tensorrt_llm.grpc.openengine.servicer as openengine_servicer  # noqa: E402
-from tensorrt_llm.grpc.openengine.servicer import (  # noqa: E402
-    OpenEngineInferenceServicer,
-    sampling_params_from_request,
-)
+import tensorrt_llm.grpc.openengine.streaming as oe_streaming  # noqa: E402
+from tensorrt_llm.grpc.openengine.request_mapping import sampling_params_from_request  # noqa: E402
+from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.sampling_params import SamplingParams  # noqa: E402
 
 # Runs on the CPU stage: the engine is stubbed, so nothing here needs a GPU.
@@ -270,37 +271,34 @@ def test_sampling_params_explicit_truncation_is_preserved() -> None:
 
 def test_token_holdback_from_stop_word_ids() -> None:
     """Holdback withholds (longest stop-word length - 1) trailing tokens."""
-    params = openengine_servicer.SamplingParams(include_stop_str_in_output=False)
+    params = SamplingParams(include_stop_str_in_output=False)
     params._stop_word_ids = [[10, 11], [12]]
-    assert openengine_servicer._token_holdback(params) == 1
+    assert oe_formatting._token_holdback(params) == 1
 
 
 def test_token_holdback_zero_when_including_stop() -> None:
     """No holdback is needed when the stop string is kept in the output."""
-    params = openengine_servicer.SamplingParams(include_stop_str_in_output=True)
+    params = SamplingParams(include_stop_str_in_output=True)
     params._stop_word_ids = [[10, 11]]
-    assert openengine_servicer._token_holdback(params) == 0
+    assert oe_formatting._token_holdback(params) == 0
 
 
 def test_token_holdback_zero_without_stop_words() -> None:
     """Missing/empty _stop_word_ids degrades to no holdback rather than failing."""
-    params = openengine_servicer.SamplingParams(include_stop_str_in_output=False)
-    assert openengine_servicer._token_holdback(params) == 0
+    params = SamplingParams(include_stop_str_in_output=False)
+    assert oe_formatting._token_holdback(params) == 0
 
 
 def test_disaggregated_params_none_for_normal_request() -> None:
     """A request with no phase marker and no kv.session is aggregated (None)."""
-    assert (
-        openengine_servicer._disaggregated_params_from_request(generation_pb2.GenerateRequest())
-        is None
-    )
+    assert oe_disagg.disaggregated_params_from_request(generation_pb2.GenerateRequest()) is None
 
 
 def test_disaggregated_params_context_only_from_extra() -> None:
     """extra.request_type selects the disaggregation phase."""
     request = generation_pb2.GenerateRequest()
     request.extra.update({"request_type": "context_only"})
-    params = openengine_servicer._disaggregated_params_from_request(request)
+    params = oe_disagg.disaggregated_params_from_request(request)
     assert params is not None
     assert params.request_type == "context_only"
 
@@ -309,7 +307,7 @@ def test_disaggregated_params_invalid_request_type() -> None:
     request = generation_pb2.GenerateRequest()
     request.extra.update({"request_type": "bogus"})
     with pytest.raises(ValueError):
-        openengine_servicer._disaggregated_params_from_request(request)
+        oe_disagg.disaggregated_params_from_request(request)
 
 
 def test_disaggregated_params_generation_only_from_session() -> None:
@@ -326,7 +324,7 @@ def test_disaggregated_params_generation_only_from_session() -> None:
         }
     )
 
-    params = openengine_servicer._disaggregated_params_from_request(request)
+    params = oe_disagg.disaggregated_params_from_request(request)
 
     assert params.request_type == "generation_only"
     assert params.ctx_request_id == 42
@@ -340,12 +338,12 @@ def test_disaggregated_params_session_id_must_be_int() -> None:
     request = generation_pb2.GenerateRequest()
     request.kv.session.session_id = "not-an-int"
     with pytest.raises(ValueError):
-        openengine_servicer._disaggregated_params_from_request(request)
+        oe_disagg.disaggregated_params_from_request(request)
 
 
 def test_prefill_ready_round_trip() -> None:
     """A context handoff packs into PrefillReady and decodes back identically."""
-    params = openengine_servicer.DisaggregatedParams(
+    params = oe_disagg.DisaggregatedParams(
         request_type="context_only",
         ctx_request_id=99,
         ctx_dp_rank=2,
@@ -354,7 +352,7 @@ def test_prefill_ready_round_trip() -> None:
         first_gen_tokens=[11, 12],
     )
 
-    resp = openengine_servicer._prefill_ready_response("req-1", params, transfer_backend="NIXL")
+    resp = oe_disagg.prefill_ready_response("req-1", params, transfer_backend="NIXL")
 
     assert resp.WhichOneof("event") == "prefill_ready"
     session = resp.prefill_ready.kv_session
@@ -366,7 +364,7 @@ def test_prefill_ready_round_trip() -> None:
 
     follow_up = generation_pb2.GenerateRequest()
     follow_up.kv.session.CopyFrom(session)
-    decoded = openengine_servicer._disaggregated_params_from_request(follow_up)
+    decoded = oe_disagg.disaggregated_params_from_request(follow_up)
     assert decoded.request_type == "generation_only"
     assert decoded.ctx_request_id == 99
     assert decoded.ctx_dp_rank == 2
@@ -378,7 +376,7 @@ def test_prefill_ready_round_trip_full_handoff() -> None:
     """The full disagg handoff (draft tokens, ids, schedule style, usage, dp_rank=0) round-trips."""
     from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
-    params = openengine_servicer.DisaggregatedParams(
+    params = oe_disagg.DisaggregatedParams(
         request_type="context_only",
         ctx_request_id=7,
         ctx_dp_rank=0,  # explicit 0 must not collapse to "unset"
@@ -390,10 +388,10 @@ def test_prefill_ready_round_trip_full_handoff() -> None:
         ctx_usage={"prompt_tokens": 5, "total_tokens": 6},
     )
 
-    resp = openengine_servicer._prefill_ready_response("r", params, transfer_backend="")
+    resp = oe_disagg.prefill_ready_response("r", params, transfer_backend="")
     follow_up = generation_pb2.GenerateRequest()
     follow_up.kv.session.CopyFrom(resp.prefill_ready.kv_session)
-    decoded = openengine_servicer._disaggregated_params_from_request(follow_up)
+    decoded = oe_disagg.disaggregated_params_from_request(follow_up)
 
     assert decoded.draft_tokens == [2, 3, 4]
     assert decoded.disagg_request_id == 123456789012345
@@ -404,13 +402,13 @@ def test_prefill_ready_round_trip_full_handoff() -> None:
 
 def test_disaggregated_params_dp_rank_none_preserved() -> None:
     """An unset ctx_dp_rank round-trips as None, not 0."""
-    params = openengine_servicer.DisaggregatedParams(
+    params = oe_disagg.DisaggregatedParams(
         request_type="context_only", ctx_request_id=1, opaque_state=b"x"
     )
-    resp = openengine_servicer._prefill_ready_response("r", params, transfer_backend="")
+    resp = oe_disagg.prefill_ready_response("r", params, transfer_backend="")
     follow_up = generation_pb2.GenerateRequest()
     follow_up.kv.session.CopyFrom(resp.prefill_ready.kv_session)
-    decoded = openengine_servicer._disaggregated_params_from_request(follow_up)
+    decoded = oe_disagg.disaggregated_params_from_request(follow_up)
     assert decoded.ctx_dp_rank is None
 
 
@@ -418,7 +416,7 @@ def test_prefill_ready_carries_first_gen_log_probs() -> None:
     """Verbose logprobs (dict[int, Logprob] per position) survive the handoff."""
     from tensorrt_llm.executor.result import Logprob
 
-    params = openengine_servicer.DisaggregatedParams(
+    params = oe_disagg.DisaggregatedParams(
         request_type="context_only",
         ctx_request_id=1,
         opaque_state=b"x",
@@ -426,10 +424,10 @@ def test_prefill_ready_carries_first_gen_log_probs() -> None:
             {3681: Logprob(logprob=-0.68, rank=1), 5982: Logprob(logprob=-1.8, rank=2)},
         ],
     )
-    resp = openengine_servicer._prefill_ready_response("r", params, transfer_backend="")
+    resp = oe_disagg.prefill_ready_response("r", params, transfer_backend="")
     follow_up = generation_pb2.GenerateRequest()
     follow_up.kv.session.CopyFrom(resp.prefill_ready.kv_session)
-    decoded = openengine_servicer._disaggregated_params_from_request(follow_up)
+    decoded = oe_disagg.disaggregated_params_from_request(follow_up)
 
     fglp = decoded.first_gen_log_probs
     assert isinstance(fglp, list) and len(fglp) == 1
@@ -442,8 +440,8 @@ def test_prefill_ready_carries_first_gen_log_probs() -> None:
 
 def test_first_gen_log_probs_simple_format_round_trip() -> None:
     """Simple logprobs (per-token float) survive the serialize/deserialize."""
-    serialized = openengine_servicer._serialize_first_gen_log_probs([-0.1, -0.2])
-    restored = openengine_servicer._deserialize_first_gen_log_probs(serialized)
+    serialized = oe_disagg._serialize_first_gen_log_probs([-0.1, -0.2])
+    restored = oe_disagg._deserialize_first_gen_log_probs(serialized)
     assert restored == [pytest.approx(-0.1), pytest.approx(-0.2)]
 
 
@@ -700,7 +698,7 @@ def test_generate_aborts_stalled_response_consumer(monkeypatch: pytest.MonkeyPat
         model="test-model",
         prompt="hello",
     )
-    monkeypatch.setattr(openengine_servicer, "_RESPONSE_STALL_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(openengine_servicer, "RESPONSE_STALL_TIMEOUT_SECONDS", 0.0)
 
     async def stall_after_first_response() -> generation_pb2.GenerateResponse:
         responses = servicer.Generate(request, _FakeContext())
@@ -763,7 +761,7 @@ def test_generate_does_not_abort_slow_engine(monkeypatch: pytest.MonkeyPatch) ->
     request = generation_pb2.GenerateRequest(
         request_id="slow-1", model="test-model", prompt="hello"
     )
-    monkeypatch.setattr(openengine_servicer, "_RESPONSE_STALL_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(openengine_servicer, "RESPONSE_STALL_TIMEOUT_SECONDS", 0.02)
 
     async def collect() -> list:
         return [r async for r in servicer.Generate(request, _FakeContext())]
@@ -815,7 +813,7 @@ def test_generate_context_only_ends_at_prefill_ready() -> None:
     reads as "the request is complete" to a client, which drops the handoff so
     the decode leg never runs.
     """
-    disagg = openengine_servicer.DisaggregatedParams(
+    disagg = oe_disagg.DisaggregatedParams(
         request_type="context_only",
         ctx_request_id=99,
         ctx_info_endpoint="tcp://1.2.3.4:5555",
@@ -932,23 +930,23 @@ def test_first_gen_log_probs_clamp_masked_candidates() -> None:
     """
     positions = [{7: _logprob(float("-inf"), 2), 9: _logprob(-0.5, 1)}, float("-inf")]
 
-    packed = openengine_servicer._serialize_first_gen_log_probs(positions)
+    packed = oe_disagg._serialize_first_gen_log_probs(positions)
 
-    assert packed[0][0][1] == openengine_servicer._MIN_LOGPROB
-    assert packed[1] == openengine_servicer._MIN_LOGPROB
+    assert packed[0][0][1] == oe_formatting._MIN_LOGPROB
+    assert packed[1] == oe_formatting._MIN_LOGPROB
 
-    params = openengine_servicer.DisaggregatedParams(
+    params = oe_disagg.DisaggregatedParams(
         request_type="context_only",
         ctx_request_id=99,
         ctx_info_endpoint="tcp://1.2.3.4:5555",
         first_gen_log_probs=positions,
     )
-    resp = openengine_servicer._prefill_ready_response("req-1", params, transfer_backend="NIXL")
+    resp = oe_disagg.prefill_ready_response("req-1", params, transfer_backend="NIXL")
     stored = resp.prefill_ready.kv_session.attributes_struct["first_gen_log_probs"]
-    assert stored[1] == openengine_servicer._MIN_LOGPROB
+    assert stored[1] == oe_formatting._MIN_LOGPROB
 
-    restored = openengine_servicer._deserialize_first_gen_log_probs(packed)
-    assert restored[0][7].logprob == openengine_servicer._MIN_LOGPROB
+    restored = oe_disagg._deserialize_first_gen_log_probs(packed)
+    assert restored[0][7].logprob == oe_formatting._MIN_LOGPROB
     assert restored[0][9].logprob == -0.5
 
 
@@ -994,7 +992,7 @@ def test_stalled_stream_cleanup_does_not_untrack_a_resubmission(
     request = generation_pb2.GenerateRequest(request_id="dup", model="test-model", prompt="hello")
 
     async def scenario() -> int:
-        monkeypatch.setattr(openengine_servicer, "_RESPONSE_STALL_TIMEOUT_SECONDS", 0.0)
+        monkeypatch.setattr(openengine_servicer, "RESPONSE_STALL_TIMEOUT_SECONDS", 0.0)
         first = servicer.Generate(request, _FakeContext())
         assert (await first.__anext__()).HasField("token")
         await asyncio.sleep(0)
@@ -1003,7 +1001,7 @@ def test_stalled_stream_cleanup_does_not_untrack_a_resubmission(
         assert servicer.active_request_count() == 0
 
         # Large timeout so the replacement's own watchdog cannot fire here.
-        monkeypatch.setattr(openengine_servicer, "_RESPONSE_STALL_TIMEOUT_SECONDS", 3600.0)
+        monkeypatch.setattr(openengine_servicer, "RESPONSE_STALL_TIMEOUT_SECONDS", 3600.0)
         second = servicer.Generate(request, _FakeContext())
         assert (await second.__anext__()).HasField("token")
         assert servicer.active_request_count() == 1
@@ -1048,7 +1046,7 @@ def test_terminal_error_yield_is_watched_for_a_stalled_consumer(
         model="test-model",
         prompt="hello",
     )
-    monkeypatch.setattr(openengine_servicer, "_RESPONSE_STALL_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(openengine_servicer, "RESPONSE_STALL_TIMEOUT_SECONDS", 0.0)
 
     async def abandon_on_terminal_error() -> int:
         responses = servicer.Generate(request, _FakeContext())
@@ -1077,7 +1075,7 @@ def test_generation_only_requires_a_kv_session() -> None:
     request.extra.update({"request_type": "generation_only"})
 
     with pytest.raises(ValueError, match="kv.session"):
-        openengine_servicer._disaggregated_params_from_request(request)
+        oe_disagg.disaggregated_params_from_request(request)
 
 
 def test_context_only_via_extra_is_still_accepted() -> None:
@@ -1085,7 +1083,7 @@ def test_context_only_via_extra_is_still_accepted() -> None:
     for request_type in ("context_only", "context_and_generation"):
         request = generation_pb2.GenerateRequest(request_id="r", model="m", prompt="hi")
         request.extra.update({"request_type": request_type})
-        params = openengine_servicer._disaggregated_params_from_request(request)
+        params = oe_disagg.disaggregated_params_from_request(request)
         assert params.request_type == request_type
 
 
@@ -1096,7 +1094,7 @@ def test_no_logprobs_token_infos_skip_detokenization() -> None:
         def decode(self, *a: Any, **k: Any) -> str:
             raise AssertionError("detokenization is not needed without logprobs")
 
-    infos = openengine_servicer._token_infos(_ExplodingTokenizer(), [10, 11])
+    infos = oe_formatting._token_infos(_ExplodingTokenizer(), [10, 11])
 
     assert [info.token_id for info in infos] == [10, 11]
     assert all(info.token == "" and not info.candidates for info in infos)
@@ -1109,7 +1107,7 @@ def test_oversized_prompt_logprobs_are_refused_not_built() -> None:
     so an unbounded one stalls every other in-flight stream before producing a
     message too large to send.
     """
-    limit = openengine_servicer._MAX_PROMPT_LOGPROB_ENTRIES
+    limit = oe_formatting._MAX_PROMPT_LOGPROB_ENTRIES
     output = SimpleNamespace(
         index=0,
         token_ids=[],
@@ -1125,13 +1123,13 @@ def test_oversized_prompt_logprobs_are_refused_not_built() -> None:
         cached_tokens=0,
         error=None,
     )
-    state = openengine_servicer._OpenEngineFormatState(
+    state = oe_streaming._OpenEngineFormatState(
         request_id="r",
         sampling_params=SamplingParams(prompt_logprobs=2),
         tokenizer=_FakeTokenizer(),
     )
 
-    responses = openengine_servicer._format_result(result, state)
+    responses = oe_streaming._format_result(result, state)
 
     assert len(responses) == 1
     assert responses[0].error.code == openengine_servicer.error_pb2.ERROR_CODE_INVALID_ARGUMENT

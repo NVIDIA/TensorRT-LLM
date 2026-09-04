@@ -27,9 +27,11 @@ from openengine.v1 import (
 )
 
 from tensorrt_llm import __version__ as trtllm_version
-from tensorrt_llm.grpc.openengine.servicer import AbortFailedError, supported_guides
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS
+
+from .capabilities import supported_guides
+from .errors import AbortFailedError
 
 __all__ = ["OpenEngineControlServicer"]
 
@@ -48,6 +50,7 @@ def _schema_release() -> str:
     except PackageNotFoundError:
         logger.warning(f"OpenEngine schema package '{_SCHEMA_PACKAGE}' is not installed")
         return ""
+
 
 _ENGINE_NAME = "tensorrt_llm"
 

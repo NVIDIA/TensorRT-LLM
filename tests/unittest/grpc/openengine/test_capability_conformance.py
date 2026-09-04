@@ -33,12 +33,12 @@ from openengine.v1 import generation_pb2, lifecycle_pb2, model_pb2  # noqa: E402
 from utils.llm_data import llm_models_root  # noqa: E402
 
 from tensorrt_llm import LLM  # noqa: E402
-from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
-from tensorrt_llm.grpc.openengine.servicer import (  # noqa: E402
+from tensorrt_llm.grpc.openengine.capabilities import (  # noqa: E402
     GUIDE_SUPPORT_BY_BACKEND,
-    OpenEngineInferenceServicer,
     supported_guides,
 )
+from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
+from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.llmapi import KvCacheConfig  # noqa: E402
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs  # noqa: E402
 from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS  # noqa: E402
@@ -467,9 +467,9 @@ def test_ctx_info_endpoint_survives_the_handoff_round_trip(endpoint):
     Splitting it on the first colon takes the scheme for the host and drops the
     rest, which reaches ZMQ as `addr='tcp'`.
     """
-    from tensorrt_llm.grpc.openengine.servicer import (
-        _disaggregated_params_from_request,
-        _prefill_ready_response,
+    from tensorrt_llm.grpc.openengine.disagg import (
+        disaggregated_params_from_request,
+        prefill_ready_response,
     )
 
     ctx_params = SimpleNamespace(
@@ -484,9 +484,9 @@ def test_ctx_info_endpoint_survives_the_handoff_round_trip(endpoint):
         ctx_usage=None,
         first_gen_log_probs=None,
     )
-    ready = _prefill_ready_response("req-1", ctx_params, "NIXL")
+    ready = prefill_ready_response("req-1", ctx_params, "NIXL")
 
-    decoded = _disaggregated_params_from_request(
+    decoded = disaggregated_params_from_request(
         generation_pb2.GenerateRequest(
             request_id="req-2",
             model=MODEL_NAME,
@@ -568,16 +568,16 @@ def test_an_unusable_kv_session_is_rejected_before_the_engine(session, reason):
     later request on the engine stalls too. Rejecting here turns an engine-wide
     hang into one INVALID_ARGUMENT.
     """
-    from tensorrt_llm.grpc.openengine.servicer import _disaggregated_params_from_request
+    from tensorrt_llm.grpc.openengine.disagg import disaggregated_params_from_request
 
     with pytest.raises(ValueError):
-        _disaggregated_params_from_request(_decode_request(session))
+        disaggregated_params_from_request(_decode_request(session))
 
 
 def test_a_usable_kv_session_is_accepted():
-    from tensorrt_llm.grpc.openengine.servicer import _disaggregated_params_from_request
+    from tensorrt_llm.grpc.openengine.disagg import disaggregated_params_from_request
 
-    params = _disaggregated_params_from_request(
+    params = disaggregated_params_from_request(
         _decode_request(
             _session(session_id="7", attributes={"ctx_info_endpoint": "tcp://10.0.0.7:1"})
         )
@@ -592,7 +592,7 @@ def test_logprobs_stay_aligned_when_the_peer_omitted_the_first_one():
     Slicing positionally against that attributes every logprob to the token
     after the one it describes -- a wrong answer rather than an error.
     """
-    from tensorrt_llm.grpc.openengine.servicer import _delta_logprobs, _logprob_shortfall
+    from tensorrt_llm.grpc.openengine.formatting import _delta_logprobs, _logprob_shortfall
 
     def aligned(output):
         return list(_delta_logprobs(output, 0, _logprob_shortfall(output)))
@@ -615,7 +615,8 @@ def test_a_context_request_reports_its_usage():
     Without this the context phase reports no usage at all -- its terminal event
     is suppressed -- and a caller has nothing to attribute the prompt tokens to.
     """
-    from tensorrt_llm.grpc.openengine.servicer import _prefill_ready_response, _usage
+    from tensorrt_llm.grpc.openengine.disagg import prefill_ready_response
+    from tensorrt_llm.grpc.openengine.formatting import _usage
 
     result = SimpleNamespace(
         prompt_token_ids=[1, 2, 3, 4],
@@ -635,7 +636,7 @@ def test_a_context_request_reports_its_usage():
         first_gen_log_probs=None,
     )
 
-    response = _prefill_ready_response("r", params, "NIXL", usage=_usage(result))
+    response = prefill_ready_response("r", params, "NIXL", usage=_usage(result))
 
     assert response.usage.prompt_tokens == 4
     assert response.usage.cached_prompt_tokens == 2
