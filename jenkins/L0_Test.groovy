@@ -3348,9 +3348,7 @@ def getStartingPortForHost(String hostNodeName, String stageName = "") {
  * Falls back to hostname if HOST_NODE_NAME is not set.
  *
  * The name must stay distinct per pod: getStartingPortForHost() hands out a
- * private port section per name. mpi_pod_hostname_fix.sh renames every pod to
- * the same short name but saves the one it replaced, so that file is preferred
- * over the live hostname.
+ * private port section per name.
  *
  * @return The host node name
  */
@@ -3358,8 +3356,6 @@ def getHostNodeName() {
     return sh(script: '''
         if [ -n "$HOST_NODE_NAME" ]; then
             echo "$HOST_NODE_NAME"
-        elif [ -s /etc/mpi-pod-original-hostname ]; then
-            cat /etc/mpi-pod-original-hostname
         else
             hostname -f || hostname
         fi
@@ -5008,13 +5004,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
-
-        // Shorten the pod hostname before anything spawns MPI workers: the
-        // 63-character pod name breaks singleton MPI_Comm_spawn under Open MPI 5
-        // (see the script header). Last in this stage so the pod is logged under
-        // its own name for as long as possible, and not on the multi-node Slurm
-        // path, where every node would answer to the same name.
-        sh "bash ${llmSrc}/jenkins/scripts/mpi_pod_hostname_fix.sh"
     }
 
     if (testFilter[(DEBUG_MODE)]) {
@@ -5394,7 +5383,15 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+        // Open MPI 5 fails a singleton MPI_Comm_spawn -- one per MpiPoolSession
+        // worker -- once the hostname PMIx is handed reaches 31 characters, and the
+        // pod name is 63. PMIX_HOSTNAME replaces only the name PMIx uses, so the pod
+        // keeps its own for logging and for port sectioning in getHostNodeName().
+        // Not inside runLLMTestlistOnPlatformImpl: the SLURM path runs that too, on
+        // the compute node, where one name shared by every node would break locality.
+        withEnv(["PMIX_HOSTNAME=mpi-node0"]) {
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+        }
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -6681,33 +6678,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         }
     }]]}
 
-    // mpi-hostname probe: asks which hostnames a singleton MPI_Comm_spawn
-    // survives, in the stock NGC image and with no TensorRT-LLM in the picture,
-    // so the answer is reportable to the DLFW team as it stands. It runs no
-    // tests and needs no GPU or wheel -- see the script header. On-demand only:
-    // it is a diagnostic, not a gate.
-    // Pod type "cpu", not "build": renaming the pod needs CAP_SYS_ADMIN, which
-    // only the tester pods add (see createKubernetesPodConfig), and without it
-    // every variant after the first is skipped and the run says nothing beyond
-    // what the pod happened to be named. It is the same pod type the failure was
-    // first seen on, and still costs no GPU.
-    mpiHostnameProbeSpec = createKubernetesPodConfig(DLFW_IMAGE, "cpu")
-    def mpiHostnameProbeStageName = "CPU-OnDemand-MPIHostnameProbe"
-    mpiHostnameProbeConfigs = [
-        (mpiHostnameProbeStageName): [mpiHostnameProbeSpec, {
-            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-            sh "bash ${LLM_ROOT}/jenkins/scripts/mpi_hostname_probe.sh"
-        }],
-    ]
-
-    fullSet += mpiHostnameProbeConfigs.keySet()
-
-    mpiHostnameProbeJobs = mpiHostnameProbeConfigs.collectEntries{key, values -> [key, [values[0], { attemptTag, isFinalAttempt, retryContext = null ->
-        stage("[${key}] Run") {
-            cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, isFinalAttempt, retryContext)
-        }
-    }]]}
-
     // Python version and OS for sanity check
     // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall, platName]
     x86SanityCheckConfigs = [
@@ -6877,21 +6847,19 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.12.0+cu130 torchvision==0.27.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                         }
 
-                        // A stock image, so nothing here went through docker/Dockerfile.multi
-                        // or install_base.sh: both things that let a singleton MPI_Comm_spawn
-                        // work under Open MPI 5 have to be redone by hand, or the quickstart
-                        // that checkPipInstall runs hangs in MpiPoolSession until the timeout.
-                        // The script is idempotent.
-                        sh "bash ${LLM_ROOT}/jenkins/scripts/mpi_pod_hostname_fix.sh"
-
-                        // PRRTE refuses to start as root unless told otherwise, and the
-                        // singleton spawn forks a prte DVM. Open MPI 4 only checked this in
-                        // mpirun.
+                        // A stock image, so nothing here went through Dockerfile.multi or
+                        // install_base.sh: what a singleton MPI_Comm_spawn needs has to be
+                        // redone by hand, or checkPipInstall's quickstart hangs in
+                        // MpiPoolSession until the timeout. PRRTE will not fork its DVM as
+                        // root without these (Open MPI 4 only checked that in mpirun), and
+                        // PMIX_HOSTNAME is the 31-character limit -- see
+                        // runLLMTestlistOnPlatform.
                         def libEnv = [
                             "OMPI_ALLOW_RUN_AS_ROOT=1",
                             "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
                             "PRTE_ALLOW_RUN_AS_ROOT=1",
                             "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                            "PMIX_HOSTNAME=mpi-node0",
                         ]
                         if (env.alternativeTRT) {
                             stage("Replace TensorRT") {
@@ -6948,7 +6916,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     parallelJobs += docBuildJobs
     parallelJobs += sanityCheckJobs
     parallelJobs += agentFlowTestJobs
-    parallelJobs += mpiHostnameProbeJobs
 
     onDemandJobs = parallelJobs.findAll {it.key.contains("-OnDemand-")}
     postMergeJobs = parallelJobs.findAll {it.key.contains("Post-Merge")}
