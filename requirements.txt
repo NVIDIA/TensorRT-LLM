@@ -31,8 +31,9 @@ torchvision
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.30.4
 # torch 2.12.0+cu130 uses NCCL 2.29.7; NGC 26.05 uses NCCL 2.30.4.
 nvidia-nccl-cu13>=2.29.7,<=2.30.4
-# NcclEP uses nccl4py's nccl.ep package without changing the NCCL wheel constraint.
-nccl4py>=0.3.1,<0.4
+# NCCL-EP uses nccl4py's nccl.ep package. The nccl-extensions wheel is built
+# from pinned source by CMake so it links against the container's NCCL.
+nccl4py>=0.3.1
 nvidia-cuda-nvrtc
 transformers==5.5.4
 prometheus_client

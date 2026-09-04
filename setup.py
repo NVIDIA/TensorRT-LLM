@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import find_packages, setup
+from setuptools import find_namespace_packages, find_packages, setup
 from setuptools.dist import Distribution
 
 
@@ -65,6 +65,13 @@ def sanity_check():
             '`scripts/build_wheel.py` first (CMake FetchContent stages it under '
             '3rdparty/fmha_sm100), or use TRTLLM_USE_PRECOMPILED to extract it '
             'from a published wheel.')
+
+    if not (Path(__file__).resolve().parent / "3rdparty" / "nccl_extensions" /
+            "nccl" / "ep").is_dir():
+        raise ImportError(
+            "The embedded nccl.ep package is missing. Please execute "
+            "scripts/build_wheel.py first, or use TRTLLM_USE_PRECOMPILED "
+            "with a wheel built with NCCL-EP packaging support.")
 
 
 def get_version():
@@ -334,6 +341,22 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
         elif os.path.isdir(dst_fmha):
             shutil.rmtree(dst_fmha)
         shutil.copytree(source_fmha, dst_fmha)
+
+        source_nccl_extensions = os.path.join(precompiled_location, "3rdparty",
+                                              "nccl_extensions")
+        if not os.path.isdir(source_nccl_extensions):
+            raise SetupError(
+                f"Precompiled directory {precompiled_location} predates NCCL-EP "
+                "packaging and does not contain 3rdparty/nccl_extensions. Use a "
+                "precompiled source built with NCCL-EP packaging support.")
+        dst_nccl_extensions = os.path.join("3rdparty", "nccl_extensions")
+        print("Copying embedded NCCL-EP packages from local directory: "
+              f"{source_nccl_extensions}")
+        if os.path.islink(dst_nccl_extensions):
+            os.unlink(dst_nccl_extensions)
+        elif os.path.isdir(dst_nccl_extensions):
+            shutil.rmtree(dst_nccl_extensions)
+        shutil.copytree(source_nccl_extensions, dst_nccl_extensions)
         return
 
     # Handle local file or remote URL
@@ -370,6 +393,21 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
 
     with zipfile.ZipFile(wheel_path) as wheel:
         dst_fmha = os.path.join("3rdparty", "fmha_sm100")
+        dst_nccl_extensions = os.path.join("3rdparty", "nccl_extensions")
+        nccl_ep_prefixes = ("nccl/_extensions/", "nccl/ep/")
+        wheel_has_nccl_ep = any(
+            file.filename.startswith(nccl_ep_prefixes)
+            for file in wheel.filelist)
+        if not wheel_has_nccl_ep:
+            raise SetupError(
+                f"Precompiled wheel {wheel_path} predates NCCL-EP packaging and "
+                "does not contain the embedded nccl.ep packages. Use a precompiled "
+                "wheel built with NCCL-EP packaging support.")
+        dst_nccl_root = os.path.join(dst_nccl_extensions, "nccl")
+        if os.path.islink(dst_nccl_root):
+            os.unlink(dst_nccl_root)
+        elif os.path.isdir(dst_nccl_root):
+            shutil.rmtree(dst_nccl_root)
         wheel_has_fmha = any(
             file.filename.startswith("fmha_sm100/") for file in wheel.filelist)
         if not wheel_has_fmha:
@@ -382,6 +420,13 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
         elif os.path.isdir(dst_fmha):
             shutil.rmtree(dst_fmha)
         for file in wheel.filelist:
+            if file.filename.startswith(nccl_ep_prefixes):
+                print(
+                    f"Extracting embedded NCCL-EP package {file.filename} from precompiled wheel."
+                )
+                wheel.extract(file, path=dst_nccl_extensions)
+                continue
+
             # Skip yaml files
             if file.filename.endswith(".yaml"):
                 continue
@@ -488,6 +533,15 @@ packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 msa_package_dir = {"fmha_sm100": "3rdparty/fmha_sm100"}
 packages += ["fmha_sm100"]
 
+# nccl4py owns the nccl namespace root, core, and bindings. NCCL-EP owns only
+# these namespace subpackages, staged from the pinned nccl-extensions wheel.
+nccl_extensions_root = "3rdparty/nccl_extensions"
+nccl_extensions_package_dir = {"nccl": f"{nccl_extensions_root}/nccl"}
+packages += find_namespace_packages(
+    where=nccl_extensions_root,
+    include=["nccl._extensions*", "nccl.ep*"],
+)
+
 
 def get_build_state_options():
     """Optionally redirect setuptools build state out of the source tree.
@@ -527,7 +581,10 @@ setup(
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",
     packages=packages,
-    package_dir=msa_package_dir,
+    package_dir={
+        **msa_package_dir,
+        **nccl_extensions_package_dir
+    },
     exclude_package_data=exclude_package_data,
     # TODO Add windows support for python bindings.
     classifiers=[
@@ -552,6 +609,8 @@ setup(
             'cutlass/tools/util/include/**/*',
             'cutlass/LICENSE.txt',
         ],
+        'nccl._extensions': ['**/*'],
+        'nccl.ep': ['**/*'],
     },
     license_files=get_license(),
     entry_points={
