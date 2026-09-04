@@ -175,6 +175,13 @@ class DefaultInputProcessor(InputProcessor):
         """The default input processor handles only tokenization."""
         if self.tokenizer is None:
             raise ValueError("tokenizer is required to tokenize string prompt")
+        # Only when the tokenizer would be called exactly as the cache calls it.
+        if (self._prefix_token_cache is not None
+                and not sampling_params.add_special_tokens
+                and sampling_params.truncate_prompt_tokens is None):
+            with nvtx_range_debug("tokenize prompt (prefix cache)"):
+                return self._prefix_token_cache.encode(self.tokenizer,
+                                                       inputs["prompt"]), None
         kwargs = {}
         if sampling_params.truncate_prompt_tokens is not None:
             kwargs = dict(truncation=True,
@@ -197,27 +204,6 @@ class DefaultInputProcessor(InputProcessor):
             "<|call|>",
             "<|reserved_200013|>",
         }
-        # Reuse the tokenization of the longest cached prefix and tokenize only
-        # the tail. Only for plain text prompts whose tokenization the other
-        # arguments would not alter.
-        prompt = inputs.get("prompt")
-        cache = self._prefix_token_cache
-        if (cache is not None and isinstance(prompt, str)
-                and len(prompt) >= cache.min_chars
-                and inputs.get("query") is None
-                and not sampling_params.add_special_tokens
-                and sampling_params.truncate_prompt_tokens is None):
-            with nvtx_range_debug("tokenize prompt (prefix cache)"):
-                try:
-                    return cache.encode(self.tokenizer, prompt), None
-                except Exception as e:
-                    # A cache bug must never fail a request: disable the cache
-                    # for this processor and tokenize in full.
-                    self._prefix_token_cache = None
-                    logger.warning(
-                        f"Disabling the prefix token cache after an error: {e!r}"
-                    )
-
         with nvtx_range_debug("tokenize prompt"):
             try:
                 token_ids = self.tokenizer.encode(

@@ -10,7 +10,6 @@ the seam-straddling case a char-level stub could never expose is exercised.
 
 from __future__ import annotations
 
-import os
 import threading
 from typing import Any
 from unittest.mock import patch
@@ -33,13 +32,6 @@ def _tok_id(token: str) -> int:
     return int.from_bytes(token.encode(), "big") % 100_000 + 1
 
 
-def _encoding(ids: list[int], offsets: list[tuple[int, int]], with_offsets: bool) -> dict[str, Any]:
-    out: dict[str, Any] = {"input_ids": ids}
-    if with_offsets:
-        out["offset_mapping"] = offsets
-    return out
-
-
 class _MergeTokenizer:
     """Char-level tokenizer with two-char merges.
 
@@ -51,13 +43,7 @@ class _MergeTokenizer:
     is_fast = True
     MERGES = frozenset({"ab", "cd", "th", "he", "in", "er"})
 
-    def __call__(
-        self,
-        text: str,
-        add_special_tokens: bool = False,
-        return_offsets_mapping: bool = False,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
+    def __call__(self, text: str, **kwargs: Any) -> dict[str, Any]:
         ids, offsets, i = [], [], 0
         while i < len(text):
             pair = text[i : i + 2]
@@ -65,9 +51,9 @@ class _MergeTokenizer:
             ids.append(_tok_id(token))
             offsets.append((i, i + width))
             i += width
-        return _encoding(ids, offsets, return_offsets_mapping)
+        return {"input_ids": ids, "offset_mapping": offsets}
 
-    def encode(self, text: str, add_special_tokens: bool = True, **kwargs: Any) -> list[int]:
+    def encode(self, text: str, **kwargs: Any) -> list[int]:
         return self(text)["input_ids"]
 
 
@@ -81,30 +67,24 @@ class _UnsyncableTokenizer:
 
     is_fast = True
 
-    def __call__(
-        self,
-        text: str,
-        add_special_tokens: bool = False,
-        return_offsets_mapping: bool = False,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
+    def __call__(self, text: str, **kwargs: Any) -> dict[str, Any]:
         ids, offsets = [], []
         for i in range(0, len(text), 2):
             token = text[i : i + 2]
             ids.append(_tok_id(token) + 1000 * len(ids))
             offsets.append((i, i + len(token)))
-        return _encoding(ids, offsets, return_offsets_mapping)
+        return {"input_ids": ids, "offset_mapping": offsets}
 
 
-# A shared opening longer than bucket_chars, so growing prompts land in the
-# same bucket and the prefix lookup can find them.
+_MIN_CHARS = 16
+# A shared opening longer than min_chars, so growing prompts land in the same
+# bucket and the prefix lookup can find them.
 _PREAMBLE = "the cabinet had inner thread. " * 4
 
 
 def _cache(**overrides: int) -> PrefixTokenCache:
-    config = dict(max_entries=64, overlap=4, resync=2, min_chars=0, bucket_chars=16)
-    config.update(overrides)
-    return PrefixTokenCache(PrefixTokenCacheConfig(**config))
+    config = dict(max_entries=64, overlap=4, resync=2, min_chars=_MIN_CHARS)
+    return PrefixTokenCache(PrefixTokenCacheConfig(**{**config, **overrides}))
 
 
 def _turns(n: int = 12, preamble: str = _PREAMBLE) -> list[str]:
@@ -118,6 +98,11 @@ def _turns(n: int = 12, preamble: str = _PREAMBLE) -> list[str]:
     return out
 
 
+def _conversations(n: int) -> list[str]:
+    """First turns of ``n`` unrelated conversations."""
+    return [_turns(1, preamble=f"conversation {i:03d}: {_PREAMBLE}")[0] for i in range(n)]
+
+
 def test_multi_turn_growth_is_identical_to_full_tokenization() -> None:
     tokenizer, cache = _MergeTokenizer(), _cache()
     for prompt in _turns():
@@ -125,6 +110,8 @@ def test_multi_turn_growth_is_identical_to_full_tokenization() -> None:
     # The whole point: later turns must actually reuse a cached prefix.
     assert cache.hits > 0
     assert cache.resync_failures == 0
+    # Each turn replaces the entry it extended, so the conversation is one entry.
+    assert len(cache._entries) == 1
 
 
 def test_interleaved_unrelated_prompts_are_correct() -> None:
@@ -143,6 +130,15 @@ def test_resync_failure_falls_back_to_full_tokenization() -> None:
     assert cache.resync_failures > 0
 
 
+def test_short_prompts_are_tokenized_but_not_cached() -> None:
+    tokenizer, cache = _MergeTokenizer(), _cache()
+    prompt = "the cab"
+    assert len(prompt) < _MIN_CHARS
+    assert cache.encode(tokenizer, prompt) == tokenizer(prompt)["input_ids"]
+    assert not cache._entries
+    assert cache.hits == cache.misses == 0
+
+
 def test_repeated_prompt_is_not_stored_twice() -> None:
     tokenizer, cache = _MergeTokenizer(), _cache()
     prompt = _turns(1)[0]
@@ -154,30 +150,28 @@ def test_repeated_prompt_is_not_stored_twice() -> None:
 
 def test_eviction_bounds_entry_count() -> None:
     tokenizer, cache = _MergeTokenizer(), _cache(max_entries=8)
-    for prompt in _turns(40):
+    for prompt in _conversations(40):
         cache.encode(tokenizer, prompt)
     assert len(cache._entries) == 8
     assert sum(len(b) for b in cache._buckets.values()) == 8
 
 
 def test_eviction_bounds_total_chars() -> None:
-    prompts = _turns(40)
-    budget = len(prompts[-1]) * 3
+    prompts = _conversations(40)
+    budget = len(prompts[0]) * 3
     tokenizer, cache = _MergeTokenizer(), _cache(max_total_chars=budget)
     for prompt in prompts:
         cache.encode(tokenizer, prompt)
         assert cache._total_chars <= budget
-    assert 0 < len(cache._entries) < 40
+    assert len(cache._entries) == 3
 
 
 def test_eviction_is_least_recently_used() -> None:
     tokenizer, cache = _MergeTokenizer(), _cache(max_entries=2)
-    hot, cold = _turns(2)
-    unrelated = _turns(1, preamble="a wholly different opening for this prompt. " * 2)[0]
+    hot, cold, unrelated = _conversations(3)
     cache.encode(tokenizer, hot)
     cache.encode(tokenizer, cold)
-    # Touch the older entry, then insert an unrelated third: the untouched
-    # entry must be the one evicted.
+    # Touch the older entry, then insert a third: the untouched one must go.
     assert cache.encode(tokenizer, hot) == tokenizer(hot)["input_ids"]
     cache.encode(tokenizer, unrelated)
     texts = {entry.text for entry in cache._entries.values()}
@@ -206,72 +200,81 @@ def test_concurrent_encode_is_correct() -> None:
     assert not errors
 
 
+def test_error_disables_cache_and_still_returns_ids() -> None:
+    tokenizer, cache = _MergeTokenizer(), _cache()
+    prompt = _turns(1)[0]
+    with patch.object(PrefixTokenCache, "_encode", side_effect=RuntimeError("boom")):
+        assert cache.encode(tokenizer, prompt) == tokenizer(prompt)["input_ids"]
+    assert cache.disabled
+    assert cache.encode(tokenizer, prompt) == tokenizer(prompt)["input_ids"]
+    assert not cache._entries
+
+
 @pytest.mark.parametrize(
     "value,expected", [(None, False), ("0", False), ("", False), ("true", False), ("1", True)]
 )
-def test_enabled_only_for_exactly_one(value: str | None, expected: bool) -> None:
-    env = {} if value is None else {ENABLE_ENV_VAR: value}
-    with patch.dict(os.environ, env, clear=True):
-        assert prefix_cache_enabled() is expected
+def test_enabled_only_for_exactly_one(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
+) -> None:
+    if value is None:
+        monkeypatch.delenv(ENABLE_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(ENABLE_ENV_VAR, value)
+    assert prefix_cache_enabled() is expected
 
 
-def test_config_from_env_reads_overrides() -> None:
-    env = {"TLLM_PREFIX_TOKEN_CACHE_ENTRIES": "7", "TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS": "0"}
-    with patch.dict(os.environ, env, clear=True):
-        config = PrefixTokenCacheConfig.from_env()
+def test_config_from_env_reads_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_ENTRIES", "7")
+    monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", "100")
+    config = PrefixTokenCacheConfig.from_env()
     assert config.max_entries == 7
-    assert config.min_chars == 0
+    assert config.min_chars == 100
     assert config.overlap == PrefixTokenCacheConfig.overlap
 
 
 @pytest.mark.parametrize("value", ["abc", "-1", "0", ""])
-def test_config_from_env_rejects_invalid_values(value: str) -> None:
-    with patch.dict(os.environ, {"TLLM_PREFIX_TOKEN_CACHE_OVERLAP": value}, clear=True):
-        with pytest.raises(ValueError, match="TLLM_PREFIX_TOKEN_CACHE_OVERLAP"):
-            PrefixTokenCacheConfig.from_env()
+def test_config_from_env_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_ENTRIES", value)
+    with pytest.raises(ValueError, match="TLLM_PREFIX_TOKEN_CACHE_ENTRIES"):
+        PrefixTokenCacheConfig.from_env()
 
 
-def test_create_returns_none_when_disabled() -> None:
-    with patch.dict(os.environ, {}, clear=True):
-        assert create_prefix_token_cache(_MergeTokenizer()) is None
-
-
-def test_create_returns_none_for_slow_tokenizer() -> None:
+def test_create_returns_none_for_slow_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:
     class Slow:
         is_fast = False
 
-    with patch.dict(os.environ, {ENABLE_ENV_VAR: "1"}, clear=True):
-        assert create_prefix_token_cache(Slow()) is None
-        assert create_prefix_token_cache(None) is None
+    monkeypatch.setenv(ENABLE_ENV_VAR, "1")
+    assert create_prefix_token_cache(Slow()) is None
+    assert create_prefix_token_cache(None) is None
 
 
-def test_create_returns_none_on_invalid_env() -> None:
-    env = {ENABLE_ENV_VAR: "1", "TLLM_PREFIX_TOKEN_CACHE_ENTRIES": "many"}
-    with patch.dict(os.environ, env, clear=True):
-        assert create_prefix_token_cache(_MergeTokenizer()) is None
-
-
-def test_create_returns_cache_when_enabled() -> None:
-    with patch.dict(os.environ, {ENABLE_ENV_VAR: "1"}, clear=True):
-        assert isinstance(create_prefix_token_cache(_MergeTokenizer()), PrefixTokenCache)
+def test_create_raises_on_invalid_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENABLE_ENV_VAR, "1")
+    monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_ENTRIES", "many")
+    with pytest.raises(ValueError):
+        create_prefix_token_cache(_MergeTokenizer())
 
 
 # --- DefaultInputProcessor integration --------------------------------------
 
 
-def _processor(**env: str) -> DefaultInputProcessor:
-    env = {ENABLE_ENV_VAR: "1", "TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS": "0", **env}
-    with patch.dict(os.environ, env, clear=True):
-        return DefaultInputProcessor(None, None, _MergeTokenizer())
+def _processor(monkeypatch: pytest.MonkeyPatch, enabled: bool = True) -> DefaultInputProcessor:
+    if enabled:
+        monkeypatch.setenv(ENABLE_ENV_VAR, "1")
+        monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", str(_MIN_CHARS))
+    else:
+        monkeypatch.delenv(ENABLE_ENV_VAR, raising=False)
+    return DefaultInputProcessor(None, None, _MergeTokenizer())
 
 
-def test_processor_uses_cache_for_eligible_prompts() -> None:
-    processor = _processor()
+def test_processor_uses_cache_for_eligible_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
+    processor = _processor(monkeypatch)
     cache = processor._prefix_token_cache
     assert cache is not None
     params = SamplingParams(add_special_tokens=False)
-    # Prompts must exceed the default bucket_chars to be cached at all.
-    for prompt in _turns(4, preamble=_PREAMBLE * 20):
+    for prompt in _turns(4):
         ids, extra = processor({"prompt": prompt}, params)
         assert ids == _MergeTokenizer()(prompt)["input_ids"]
         assert extra is None
@@ -285,8 +288,10 @@ def test_processor_uses_cache_for_eligible_prompts() -> None:
         SamplingParams(add_special_tokens=False, truncate_prompt_tokens=8),
     ],
 )
-def test_processor_bypasses_cache_when_arguments_alter_tokenization(params: SamplingParams) -> None:
-    processor = _processor()
+def test_processor_bypasses_cache_when_arguments_alter_tokenization(
+    monkeypatch: pytest.MonkeyPatch, params: SamplingParams
+) -> None:
+    processor = _processor(monkeypatch)
     cache = processor._prefix_token_cache
     prompt = _turns(1)[0]
     ids, _ = processor({"prompt": prompt}, params)
@@ -294,19 +299,9 @@ def test_processor_bypasses_cache_when_arguments_alter_tokenization(params: Samp
     assert cache.hits == cache.misses == 0
 
 
-def test_processor_bypasses_cache_when_disabled() -> None:
-    with patch.dict(os.environ, {}, clear=True):
-        processor = DefaultInputProcessor(None, None, _MergeTokenizer())
+def test_processor_bypasses_cache_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    processor = _processor(monkeypatch, enabled=False)
     assert processor._prefix_token_cache is None
     prompt = _turns(1)[0]
     ids, _ = processor({"prompt": prompt}, SamplingParams(add_special_tokens=False))
     assert ids == _MergeTokenizer().encode(prompt)
-
-
-def test_processor_disables_cache_after_error() -> None:
-    processor = _processor()
-    prompt = _turns(1)[0]
-    with patch.object(PrefixTokenCache, "encode", side_effect=RuntimeError("boom")):
-        ids, _ = processor({"prompt": prompt}, SamplingParams(add_special_tokens=False))
-    assert ids == _MergeTokenizer().encode(prompt)
-    assert processor._prefix_token_cache is None
