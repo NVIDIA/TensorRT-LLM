@@ -44,16 +44,15 @@
 //
 // Vectorization strategy:
 //   All kernels use 128-bit vectorized loads/stores (float4 / 8×bf16).
-//   VEC = number of elements per thread, chosen so that NTHRD = HEAD_DIM/VEC
-//   >= 32. For HEAD_DIM=128, bf16: VEC=4, NTHRD=32.  For HEAD_DIM=512, bf16:
-//   VEC=8, NTHRD=64.
+//   VEC = number of elements per thread, chosen so that NTHRD = HEAD_DIM/VEC >= 32.
+//   For HEAD_DIM=128, bf16: VEC=4, NTHRD=32.  For HEAD_DIM=512, bf16: VEC=8, NTHRD=64.
 //
 // Overlap mode (compress_ratio=4):
 //   When enabled, state_dim = 2*head_dim and the compressor uses overlapping
-//   windows: each compressed output is derived from both the previous and
-//   current chunk of compress_ratio tokens (previous chunk → first head_dim
-//   features, current chunk → second head_dim features). This doubles the state
-//   stored per position but improves compression quality.
+//   windows: each compressed output is derived from both the previous and current
+//   chunk of compress_ratio tokens (previous chunk → first head_dim features,
+//   current chunk → second head_dim features). This doubles the state stored
+//   per position but improves compression quality.
 //
 // Template parameters:
 //   HEAD_DIM            — Head dimension (128 or 512)
@@ -82,8 +81,7 @@ namespace kernels::compressor
 // Helper functions
 // ============================================================================
 
-// Full-warp butterfly reductions via __shfl_xor_sync (all 32 lanes
-// participate).
+// Full-warp butterfly reductions via __shfl_xor_sync (all 32 lanes participate).
 __device__ inline float warpReduceSum(float val)
 {
     for (int mask = 16; mask > 0; mask >>= 1)
@@ -214,8 +212,7 @@ enum class CacheScaleType
 // ============================================================================
 // Decode Kernel: pagedKvCompressKernel
 //
-// Template: <HEAD_DIM, KV_SCORE_ELEM_BYTES, STATE_ELEM_BYTES, COMPRESS_RATIO,
-// NEXT_N, NUM_RED_WARPS>
+// Template: <HEAD_DIM, KV_SCORE_ELEM_BYTES, STATE_ELEM_BYTES, COMPRESS_RATIO, NEXT_N, NUM_RED_WARPS>
 //   NEXT_N: number of new tokens per sequence in this decode step (1-8)
 //
 // Grid:  (batch_size) — one block per batch element
@@ -234,15 +231,10 @@ enum class CacheScaleType
 // (state_dim = 2*head_dim), Phase 1 iterates over 2 column halves.
 //
 // Memory layout:
-//
-//   kv_score: [total_tokens, 2 * state_dim] — interleaved KV and score
-//             projections.
-//
-//   paged_kv: Paged cache for compressor KV state.
-//
-//   paged_score: Paged cache for compressor score state (with APE bias).
-//
-//   output: [total_comp_tokens, head_dim] — compressed output tokens.
+//   kv_score:   [total_tokens, 2 * state_dim] — interleaved KV and score projections
+//   paged_kv:   paged cache for compressor KV state
+//   paged_score: paged cache for compressor score state (with APE bias)
+//   output:     [total_comp_tokens, head_dim] — compressed output tokens
 // ============================================================================
 
 // Helper: vectorized online softmax step reading from paged KV/score state.
@@ -283,10 +275,9 @@ __device__ __forceinline__ void decodeSoftmaxVec(void const* __restrict__ paged_
         // score already includes APE (added during Phase 1 store)
         float sf[4] = {static_cast<float>(se[i]), static_cast<float>(se[i + 1]), static_cast<float>(se[i + 2]),
             static_cast<float>(se[i + 3])};
-        // Online softmax: maintain running (max, sum_exp, weighted_sum) per
-        // element. nm = new max, sc_f = rescale factor for old accumulators, tm =
-        // exp(score - new_max). Final output: rwsum / rsum = weighted average of KV
-        // values.
+        // Online softmax: maintain running (max, sum_exp, weighted_sum) per element.
+        // nm = new max, sc_f = rescale factor for old accumulators, tm = exp(score - new_max).
+        // Final output: rwsum / rsum = weighted average of KV values.
 #pragma unroll
         for (int j = 0; j < 4; j++)
         {
@@ -321,16 +312,10 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     using StateVecT = typename VecType<VEC * STATE_ELEM_BYTES>::type;
     static_assert(VEC >= 4, "VEC must be >= 4 for float4 ape loads");
 
-    // HEAD_BLOCKS splits head_dim across blockIdx.y for better SM utilisation.
-    //
-    //   HD=512, max element size 2: NTHRD_BASE=64, HEAD_BLOCKS=2,
-    //   NTHRD_INNER=32.
-    //
-    //   HD=128, max element size 2 or 4: NTHRD_BASE=32, HEAD_BLOCKS=1,
-    //   NTHRD_INNER=32.
-    //
-    //   HD=512, max element size 4: NTHRD_BASE=128, HEAD_BLOCKS=4,
-    //   NTHRD_INNER=32.
+    // HEAD_BLOCKS: split head_dim across blockIdx.y for better SM utilisation.
+    // For HD=512 and max elem size 2: NTHRD_BASE=64 → HEAD_BLOCKS=2, NTHRD_INNER=32.
+    // For HD=128 and max elem size 2/4: NTHRD_BASE=32 → HEAD_BLOCKS=1, NTHRD_INNER=32.
+    // For HD=512 and max elem size 4: NTHRD_BASE=128 → HEAD_BLOCKS=4, NTHRD_INNER=32.
     constexpr int NTHRD_BASE = HEAD_DIM / VEC;
     constexpr int HEAD_BLOCKS = (NTHRD_BASE > 32) ? (NTHRD_BASE / 32) : 1;
     constexpr int NTHRD_INNER = NTHRD_BASE / HEAD_BLOCKS; // always <= 32
@@ -570,8 +555,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
             float* s_rwsum = s_rsum + NUM_RED_WARPS * ELEM_PER_BLOCK;
 
             // local_elem: index within this block's head slice [0, ELEM_PER_BLOCK).
-            // = tid * VEC + i   (tid = threadIdx.x % NTHRD_INNER, same as eff_tid -
-            // head_blk*NTHRD_INNER)
+            // = tid * VEC + i   (tid = threadIdx.x % NTHRD_INNER, same as eff_tid - head_blk*NTHRD_INNER)
 #pragma unroll
             for (int i = 0; i < VEC; i++)
             {
@@ -701,11 +685,10 @@ FOREACH_DECODE_CONFIG(INST_DECODE)
 // ============================================================================
 // Decode Launch Wrapper
 //
-// Dispatches to the correct template instantiation based on head_dim,
-// elem_bytes, and next_n (number of new tokens per decode step, in the
-// range 1..8). Grid is 2D: (batch_size, head_blocks) where head_blocks =
-// NTHRD_BASE / 32. For HD=512 bf16: head_blocks=2; for HD=128 bf16:
-// head_blocks=1.
+// Dispatches to the correct template instantiation based on head_dim, elem_bytes,
+// and next_n (number of new tokens per decode step, in the range 1..8).
+// Grid is 2D: (batch_size, head_blocks) where head_blocks = NTHRD_BASE / 32.
+// For HD=512 bf16: head_blocks=2; for HD=128 bf16: head_blocks=1.
 // ============================================================================
 
 void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_kv, void* paged_score,
@@ -744,9 +727,8 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     // smem per block = 3 * MULTI_WARP * ELEM_PER_BLOCK * sizeof(float)
     //   where ELEM_PER_BLOCK = nthreads_inner * vec = HEAD_DIM / HEAD_BLOCKS.
     // HD=128: ELEM_PER_BLOCK=128 → 6 KB.
-    // HD=512 with max elem size 2 (vec=8, HEAD_BLOCKS=2): ELEM_PER_BLOCK=256 → 12
-    // KB. HD=512 with max elem size 4 (vec=4, HEAD_BLOCKS=4): ELEM_PER_BLOCK=128
-    // →  6 KB.
+    // HD=512 with max elem size 2 (vec=8, HEAD_BLOCKS=2): ELEM_PER_BLOCK=256 → 12 KB.
+    // HD=512 with max elem size 4 (vec=4, HEAD_BLOCKS=4): ELEM_PER_BLOCK=128 →  6 KB.
     constexpr int MULTI_WARP = 4;
     bool const use_multi_warp = (compress_ratio == 128 && next_n <= 4);
     int const num_red_warps = use_multi_warp ? MULTI_WARP : 1;
@@ -756,9 +738,8 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 
     dim3 grid(batch_size, head_blocks);
 
-    // Walk FOREACH_DECODE_CONFIG until we find a matching (HD, KV, ST, CR, NN,
-    // NRW) tuple, then launch that instantiation. Any unsupported tuple bails via
-    // TLLM_THROW.
+    // Walk FOREACH_DECODE_CONFIG until we find a matching (HD, KV, ST, CR, NN, NRW)
+    // tuple, then launch that instantiation. Any unsupported tuple bails via TLLM_THROW.
 #define TRY_LAUNCH(HD, KV_EB, STATE_EB, CR, NN, NRW)                                                                   \
     if (head_dim == HD && kv_score_elem_bytes == KV_EB && state_elem_bytes == STATE_EB && compress_ratio == CR         \
         && next_n == NN && num_red_warps == NRW)                                                                       \
@@ -787,12 +768,10 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 // ============================================================================
 // Prefill Kernel: prefillReductionKernel
 //
-// Template: <HEAD_DIM, KV_SCORE_ELEM_BYTES, STATE_ELEM_BYTES, COMPRESS_RATIO,
-// NUM_RED_WARPS>
+// Template: <HEAD_DIM, KV_SCORE_ELEM_BYTES, STATE_ELEM_BYTES, COMPRESS_RATIO, NUM_RED_WARPS>
 //
 // Grid:  (batch_size, max_outputs_per_batch, head_blocks)
-// Block: (NTHRD_INNER * NUM_RED_WARPS), where NTHRD_INNER covers one head
-// chunk.
+// Block: (NTHRD_INNER * NUM_RED_WARPS), where NTHRD_INNER covers one head chunk.
 //
 // Unlike the decode kernel (which operates token-by-token from paged state),
 // the prefill kernel processes the full input sequence at once. Each block
@@ -805,15 +784,10 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 // All full chunks are also written to paged kv/score caches for block reuse.
 //
 // Memory layout:
-//
-//   kv_score: [total_tokens, 2*state_dim] — interleaved KV and score from the
-//             linear projection.
-//
-//   paged_kv: Paged cache for compressor state (remainder).
-//
-//   paged_score: Paged cache for compressor score state (remainder, with APE).
-//
-//   output: [total_comp_tokens, head_dim] — compressed output tokens.
+//   kv_score:    [total_tokens, 2*state_dim] — interleaved KV and score from linear projection
+//   paged_kv:    paged cache for compressor state (remainder)
+//   paged_score: paged cache for compressor score state (remainder, with APE)
+//   output:      [total_comp_tokens, head_dim] — compressed output tokens
 // ============================================================================
 
 // Per-element online softmax step on VEC elements via 128-bit vectorized loads.
@@ -1029,8 +1003,7 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
 
     // 1a. Full chunk for this output block.
     // Positions [win_start, sp) are already in paged cache from a prior call;
-    // start the loop at write_r_start to skip them without a per-iteration
-    // branch.
+    // start the loop at write_r_start to skip them without a per-iteration branch.
     if (should_compress)
     {
         int const write_r_start = (win_start < sp) ? (sp - win_start) : 0;
@@ -1040,9 +1013,8 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     // 1b. Remainder tokens (last block only).
     // Tokens past the last complete window are persisted so a later call can
     // continue the same compression window.
-    // rem_start_pos < sp when the chunk has no full window (actual_num_outputs ==
-    // 0); rem_write_start skips those already-paged positions without a
-    // per-iteration branch.
+    // rem_start_pos < sp when the chunk has no full window (actual_num_outputs == 0);
+    // rem_write_start skips those already-paged positions without a per-iteration branch.
     if (local_output_idx == num_outputs - 1)
     {
         int const rem_start_pos = last_abs_idx * COMPRESS_RATIO;
@@ -1077,17 +1049,13 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     int const my_r_start = red_warp * positions_per_warp;
     int const my_r_end = (red_warp == NUM_RED_WARPS - 1) ? COMPRESS_RATIO : (my_r_start + positions_per_warp);
 
-    // Helper: online-softmax reduction over a contiguous window of COMPRESS_RATIO
-    // positions. Positions [range_start, range_start + new_start) come from paged
-    // cache (APE already fused during the call that wrote them); positions
-    // [range_start + new_start, range_start
+    // Helper: online-softmax reduction over a contiguous window of COMPRESS_RATIO positions.
+    // Positions [range_start, range_start + new_start) come from paged cache (APE already
+    // fused during the call that wrote them); positions [range_start + new_start, range_start
     // + COMPRESS_RATIO) are new tokens read from kv_score with live APE addition.
     // Two branch-free loops avoid a per-iteration if/else on pos < sp.
-    //   kv_col_off: Column offset into kv_score / paged state (0 or HEAD_DIM
-    //   for overlap).
-    //
-    //   ape_col_off: Column offset into the APE table for the score column
-    //   (same as kv_col_off).
+    //   kv_col_off  — column offset into kv_score / paged state (0 or HEAD_DIM for overlap)
+    //   ape_col_off — column offset into APE table for the score column (same as kv_col_off)
     auto reduce_window = [&](int range_start, int kv_col_off, int ape_col_off, bool skipNewTokens)
     {
         // Precompute split once for the whole window.
@@ -1216,8 +1184,8 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
 }
 
 // Explicit instantiations.  CR=128 uses four reduction groups to split the long
-// token loop; CR=4 stays single-warp because the reduction is too small to
-// amortize the merge overhead.
+// token loop; CR=4 stays single-warp because the reduction is too small to amortize
+// the merge overhead.
 #define INST_PREFILL(HD, KV_EB, STATE_EB, CR, NRW)                                                                     \
     template __global__ void prefillReductionKernel<HD, KV_EB, STATE_EB, CR, NRW>(void const*, float const*, void*,    \
         void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int32_t const*,  \
@@ -1333,14 +1301,12 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
 //
 // This kernel fuses all post-compression processing with the paged cache write
 // into a single kernel launch, keeping data in float32 registers throughout.
-// This eliminates the DRAM round-trip that a split postprocess+scatter would
-// need.
+// This eliminates the DRAM round-trip that a split postprocess+scatter would need.
 //
 // SCALE_TYPE alone determines the output cache layout:
 //   - kNone:              ELEM_BYTES per value (bf16 / fp32) into kv_cache.
 //   - kFP8PerTensor:      one fp8 byte per value, implicit scale=1.0.
-//   - kFP8Blockwise:      one fp8 byte per value + one fp32 scale per 128
-//   values.
+//   - kFP8Blockwise:      one fp8 byte per value + one fp32 scale per 128 values.
 //   - kMXFP4Blockwise:    packed fp4 (two values per byte) + one ue8m0 byte
 //                         per 32 values.
 //
@@ -1349,11 +1315,9 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
 //   2. RMSNorm: compute sum-of-squares → cross-warp reduce → rsqrt → scale
 //   3. Apply RMSNorm weights
 //   4. RoPE: interleaved even/odd rotation on rope_dim elements (skip nope_dim)
-//   5. Hadamard butterfly transform (3 phases: local → warp shuffle → shared
-//   mem)
+//   5. Hadamard butterfly transform (3 phases: local → warp shuffle → shared mem)
 //   6. Scale by 1/sqrt(HEAD_DIM) (Hadamard normalization)
-//   7. Optionally write postprocessed result to kv_out (for callers that need
-//   it)
+//   7. Optionally write postprocessed result to kv_out (for callers that need it)
 //   8. Binary search cu_kv_comp to find batch_idx for this token
 //   9. Compute paged cache destination (logical→physical block via block table)
 //  10. Store to cache (layout by SCALE_TYPE).
@@ -1362,8 +1326,7 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
 template <int HEAD_DIM, int ELEM_BYTES, CacheScaleType SCALE_TYPE = CacheScaleType::kNone,
     bool ROTATE_ACTIVATION = true>
 __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [total_tokens, head_dim] input
-    void* __restrict__ kv_out,                // [total_tokens, head_dim] postprocessed output
-                                              // (may be nullptr)
+    void* __restrict__ kv_out,                // [total_tokens, head_dim] postprocessed output (may be nullptr)
     void const* __restrict__ rms_weight,      // [head_dim]
     float rms_eps,
     float const* __restrict__ cos_sin_table,  // [max_pos, 2, rope_dim/2]
@@ -1483,8 +1446,7 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
     //
     // Applied only to elements in [nope_dim, nope_dim+rope_dim).
     // Uses interleaved even/odd pairs: (x_even, x_odd) → rotated by (cos, sin).
-    // cos_sin_table layout: [max_pos, rope_dim] where first half is cos, second
-    // is sin.
+    // cos_sin_table layout: [max_pos, rope_dim] where first half is cos, second is sin.
     // ================================================================
     int const half_rope = rope_dim / 2;
     int const pos_id = position_ids[token_idx];
@@ -1510,8 +1472,8 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
     // Step 5: Hadamard butterfly transform (rotate activation)
     //
     // Implements the Walsh-Hadamard transform H_n * v via butterfly network.
-    // H_n has the recursive structure: H_n = [[H_{n/2}, H_{n/2}], [H_{n/2},
-    // -H_{n/2}]] which decomposes into log2(HEAD_DIM) butterfly stages.
+    // H_n has the recursive structure: H_n = [[H_{n/2}, H_{n/2}], [H_{n/2}, -H_{n/2}]]
+    // which decomposes into log2(HEAD_DIM) butterfly stages.
     //
     // Three phases handle increasing stride lengths:
     //   A) Local: strides < VEC — within each thread's register file
@@ -1526,8 +1488,7 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
     if constexpr (ROTATE_ACTIVATION)
     {
 
-        // Phase A: local butterfly (strides 1..VEC-1, within each thread's VEC
-        // registers)
+        // Phase A: local butterfly (strides 1..VEC-1, within each thread's VEC registers)
 #pragma unroll
         for (int stride = 1; stride < VEC; stride <<= 1)
         {
@@ -1543,8 +1504,7 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
             }
         }
 
-        // Phase B: warp shuffle butterfly (strides VEC..32*VEC-1, within a single
-        // warp)
+        // Phase B: warp shuffle butterfly (strides VEC..32*VEC-1, within a single warp)
         if constexpr (NTHRD > 1)
         {
             constexpr int SHFL_END = (NTHRD <= 32) ? NTHRD : 32;
@@ -1562,9 +1522,8 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
             }
         }
 
-        // Phase C: cross-warp butterfly via XOR-swizzled shared memory (strides >=
-        // 32*VEC) Only needed when NTHRD > 32 (i.e., multiple warps, e.g.,
-        // HEAD_DIM=512, VEC=8 → 64 threads)
+        // Phase C: cross-warp butterfly via XOR-swizzled shared memory (strides >= 32*VEC)
+        // Only needed when NTHRD > 32 (i.e., multiple warps, e.g., HEAD_DIM=512, VEC=8 → 64 threads)
         if constexpr (NTHRD > 32)
         {
 #pragma unroll
@@ -1648,8 +1607,7 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
     if constexpr (SCALE_TYPE == CacheScaleType::kNone)
     {
         // Default mode: float→bf16/fp32 pack + vectorized store.
-        // Cache layout per block: [tokens_per_block * HEAD_DIM] elements of
-        // ElementT.
+        // Cache layout per block: [tokens_per_block * HEAD_DIM] elements of ElementT.
         VecT raw_out;
         ElementT* out_elems = reinterpret_cast<ElementT*>(&raw_out);
 #pragma unroll
@@ -1715,8 +1673,7 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
         uint8_t* fp8_dst = block_base + token_offset * HEAD_DIM + tid * VEC;
         *reinterpret_cast<Fp8VecT*>(fp8_dst) = *reinterpret_cast<Fp8VecT const*>(fp8_bytes);
 
-        // Step 11d: Store scale factor (one thread per 128-element group writes
-        // it).
+        // Step 11d: Store scale factor (one thread per 128-element group writes it).
         if (tid % GROUP_SIZE == 0)
         {
             int const scale_idx = tid / GROUP_SIZE;
@@ -1828,12 +1785,11 @@ INST_PPS_AR(512, 2, CacheScaleType::kMXFP4Blockwise)
 // Postprocess + Scatter Launch Wrapper
 //
 // Derives cache layout parameters (cache_stride_blk_bytes, num_scale_blocks)
-// from cache dtype / scale type, then dispatches to the appropriate template
-// instantiation.
+// from cache dtype / scale type, then dispatches to the appropriate template instantiation.
 // ============================================================================
 
-// Compute number of threads per block, mirroring the compile-time VEC/NTHRD
-// logic. Ensures NTHRD >= 32 by reducing VEC when HEAD_DIM is small.
+// Compute number of threads per block, mirroring the compile-time VEC/NTHRD logic.
+// Ensures NTHRD >= 32 by reducing VEC when HEAD_DIM is small.
 static inline int compressorNthreads(int head_dim, int elem_bytes)
 {
     int max_vec = 16 / elem_bytes;

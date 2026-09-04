@@ -93,8 +93,7 @@ void compressorPrefillReductionOp(torch::Tensor kv_score, torch::Tensor ape, tor
         static_cast<int>(max_outputs), kv_score_eb, state_eb, out_eb, stream);
 }
 
-// Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged scatter in one
-// kernel
+// Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged scatter in one kernel
 void compressorPostProcessScatterOp(torch::Tensor kv_comp, // [total_tokens, head_dim] input
     std::optional<torch::Tensor> kv_out,                   // [total_tokens, head_dim] output (optional)
     torch::Tensor rms_weight,                              // [head_dim]

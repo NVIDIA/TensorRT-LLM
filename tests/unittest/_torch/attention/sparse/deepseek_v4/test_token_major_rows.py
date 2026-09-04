@@ -32,7 +32,12 @@ class _StubCacheManager:
 
 
 def _metadata(
-    *, num_pools: int, max_blocks: int, max_seqs: int, draft: int = 5
+    *,
+    num_pools: int,
+    max_blocks: int,
+    max_seqs: int,
+    draft: int = 5,
+    enable_ragged_verification: bool = True,
 ) -> DSAtrtllmAttentionMetadata:
     """A metadata object with just enough state to build its own buffers.
 
@@ -47,17 +52,40 @@ def _metadata(
     meta.max_num_sequences = max_seqs
     meta.max_num_requests = max_seqs
     meta.max_draft_tokens = draft
+    meta.enable_ragged_verification = enable_ragged_verification
     meta.cuda_graph_buffers = None
     meta.num_sms = torch.cuda.get_device_properties(0).multi_processor_count
     meta.runtime_tokens_per_gen_step = 0
     meta.create_expanded_buffers(capture_graph=False)
-    # ``create_buffers_for_indexer`` owns this stable-address repeat vector in
-    # the real runtime.  The focused fixture intentionally bypasses that much
-    # larger initializer, so provide the one buffer the device-layout path
-    # consumes explicitly.
-    meta.gen_token_repeats_cuda = torch.empty(max_seqs, dtype=torch.int64, device="cuda")
     meta.prompt_lens_cpu = torch.zeros(max_seqs, dtype=torch.int32)
     return meta
+
+
+def test_feature_off_skips_ragged_row_buffers() -> None:
+    """Static DSA does not pay for confidence-only row metadata."""
+    torch.cuda.init()
+    meta = _metadata(
+        num_pools=2,
+        max_blocks=8,
+        max_seqs=4,
+        enable_ragged_verification=False,
+    )
+
+    assert meta.gen_token_repeats_cuda is None
+    assert meta.row_kv_lens_cuda is None
+    assert meta.row_req_idx_cuda is None
+    assert meta.attn_row_kv_lens_cuda is None
+    assert meta.attn_row_block_offsets is None
+
+
+def test_feature_off_rejects_ragged_layout() -> None:
+    """An unexpected ragged update fails instead of dereferencing absent buffers."""
+    meta = DSAtrtllmAttentionMetadata.__new__(DSAtrtllmAttentionMetadata)
+    meta.enable_ragged_verification = False
+    meta.ragged_verify_lens = [2]
+
+    with pytest.raises(RuntimeError, match="without enabling ragged-verification buffers"):
+        _ = meta.is_ragged_verify
 
 
 def _expand(

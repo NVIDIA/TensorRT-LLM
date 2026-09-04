@@ -39,47 +39,6 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 # CuTe DSL Top-K compile key, so warmup must use the runtime dtype.
 _INDEXER_LOGITS_DTYPE = torch.float32
 
-# ``prepare()`` is allowed to run ahead of the GPU under the overlap scheduler.
-# Every tensor below is persistent CPU storage that prepare (or the virtual
-# DeepSeek-V4 implementation it dispatches to) rewrites before a non-blocking
-# H2D copy, or exposes as a host runtime view. Keep the list explicit: blindly
-# cloning every CPU tensor on the metadata object would also duplicate cache
-# manager storage and unrelated, potentially very large, host buffers.
-_PREPARE_HOST_STAGE_FIELDS = (
-    # TrtllmAttentionMetadata staging/runtime views.
-    "prompt_lens_cpu",
-    "kv_lens",
-    "host_total_kv_lens",
-    "host_request_types",
-    "host_ctx_cached_token_indptr",
-    "host_ctx_uncached_token_indptr",
-    "host_ctx_kv_indptr",
-    # DSA indexer/MLA staging.
-    "host_gen_cached_token_indptr",
-    "host_gen_kv_indptr",
-    "host_indexer_k_cache_block_offsets",
-    "host_slot_mapping_fp8",
-    "host_slot_mapping_scale",
-    "host_req_idx_per_token",
-    "host_topk_indices_buffer",
-    "kv_lens_expanded_host",
-    "host_block_table_expanded",
-    # Ragged verification staging and token-major host views.
-    "host_gen_token_repeats",
-    "row_kv_lens_host",
-    "row_kv_correction_host",
-    "row_req_idx_host",
-    "attn_row_kv_lens_host",
-    "attn_row_kv_correction_host",
-    "attn_row_req_idx_host",
-    "attn_row_request_types_host",
-    "attn_row_prompt_lens_cpu",
-    # DeepseekV4TrtllmAttentionMetadata staging.
-    "cached_token_lens_cpu",
-    "cu_seq_lens",
-)
-_PREPARE_HOST_STAGE_RING_DEPTH = 2
-
 if TYPE_CHECKING:
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
@@ -184,6 +143,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Query tokens per generation request this step, in batch order. None
     # denotes the uniform runtime stride.
     ragged_verify_lens: Optional[List[int]] = None
+    # Allocate the row-major and token-major buffers used only by ragged
+    # verification. This is fixed before CUDA-graph metadata is created.
+    enable_ragged_verification: bool = False
     # In device-window mode the host split determines only the captured shape;
     # the true windows are installed before replay.
     device_windows_mode: bool = False
@@ -193,6 +155,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     @property
     def is_ragged_verify(self) -> bool:
+        if self.ragged_verify_lens is not None and not self.enable_ragged_verification:
+            raise RuntimeError(
+                "ragged verification metadata was installed without enabling "
+                "ragged-verification buffers"
+            )
         return self.ragged_verify_lens is not None
 
     @property
@@ -201,7 +168,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         return stride if stride > 0 else 1 + self.max_draft_tokens
 
     def gen_token_repeat_list(self) -> List[int]:
-        if self.ragged_verify_lens is None:
+        if not self.is_ragged_verify:
             return [self.gen_token_stride] * self.num_generations
         return list(self.ragged_verify_lens)
 
@@ -212,7 +179,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Repeat request values once per generation query token."""
         repeats = self.gen_token_repeat_list()
         num_tokens = sum(repeats)
-        if self.ragged_verify_lens is None:
+        if not self.is_ragged_verify:
             return values.repeat_interleave(self.gen_token_stride, dim=dim), num_tokens
         if values.device == self.gen_token_repeats_cuda.device:
             repeats_dev = self.gen_token_repeats_cuda[: self.num_generations]
@@ -225,6 +192,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
+        self.enable_ragged_verification = bool(
+            kwargs.pop("enable_ragged_verification", False)
+        )
         sparse_attention_config = kwargs.pop("sparse_attention_config", None)
         if (
             kwargs.get("sparse_metadata_params") is None
@@ -265,6 +235,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def __post_init__(self):
         """Allocate indexer K-cache buffers and heuristic TopK metadata."""
         super().__post_init__()
+        if self.is_cross:
+            # Ragged verification is a target self-attention capability. A
+            # cross-attention metadata object may be a shallow copy of one, but
+            # must not inherit its verifier-only buffers or per-step layout.
+            self.enable_ragged_verification = False
+            self.ragged_verify_lens = None
         if not is_dsa_cache_manager(self.kv_cache_manager):
             has_deepseek_v4_cache_interface = all(
                 hasattr(self.kv_cache_manager, attr)
@@ -310,118 +286,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_indexer(capture_graph=capture_graph)
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
-        # CUDA-graph metadata is made with copy.copy(self) before __post_init__
-        # allocates graph-owned buffers. Do not let that shallow copy share the
-        # live metadata's ring or events.
-        self._reset_prepare_host_stage_ring()
-
     def prepare(self):
-        stage_slot = self._acquire_prepare_host_stage_slot()
-        try:
-            self._prepare_impl()
-        finally:
-            self._record_prepare_host_stage_slot(stage_slot)
-
-    def _reset_prepare_host_stage_ring(self) -> None:
-        """Detach this metadata instance from any shallow-copied stage ring."""
-        self._prepare_host_stage_ring = None
-        self._prepare_host_stage_events = None
-        self._prepare_host_stage_slot = -1
-
-    def _current_prepare_host_stage(self) -> dict[str, torch.Tensor]:
-        """Return the prepare-owned persistent CPU tensors present here."""
-        tensors = {}
-        for name in _PREPARE_HOST_STAGE_FIELDS:
-            value = getattr(self, name, None)
-            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
-                tensors[name] = value
-        return tensors
-
-    def _prepare_host_stage_ring_is_current(self, current: dict[str, torch.Tensor]) -> bool:
-        ring = getattr(self, "_prepare_host_stage_ring", None)
-        if not ring:
-            return False
-        slot = getattr(self, "_prepare_host_stage_slot", -1)
-        slot = 0 if slot < 0 else slot
-        active = ring[slot]
-        return active.keys() == current.keys() and all(
-            current[name] is tensor for name, tensor in active.items()
-        )
-
-    def _drain_prepare_host_stage_ring(self) -> None:
-        """Wait for old ring storage before dropping it after reallocation."""
-        for event in getattr(self, "_prepare_host_stage_events", None) or ():
-            if event is not None and not event.query():
-                event.synchronize()
-
-    def _build_prepare_host_stage_ring(self, current: dict[str, torch.Tensor]) -> None:
-        if not current:
-            self._reset_prepare_host_stage_ring()
-            return
-
-        ring = [current]
-        for _ in range(1, _PREPARE_HOST_STAGE_RING_DEPTH):
-            slot = {}
-            for name, tensor in current.items():
-                replica = torch.empty_like(
-                    tensor,
-                    device="cpu",
-                    pin_memory=tensor.is_pinned(),
-                )
-                replica.copy_(tensor)
-                slot[name] = replica
-            ring.append(slot)
-        self._prepare_host_stage_ring = ring
-        self._prepare_host_stage_events = [None] * len(ring)
-        self._prepare_host_stage_slot = -1
-
-    def _ensure_prepare_host_stage_ring(self) -> bool:
-        current = self._current_prepare_host_stage()
-        if self._prepare_host_stage_ring_is_current(current):
-            return True
-
-        # update_spec_dec_param() may grow expanded buffers after the ring was
-        # first used. That is a rare shape transition, so drain the old slots
-        # before replacing their last references. Steady-state prepare never
-        # takes this path.
-        self._drain_prepare_host_stage_ring()
-        self._build_prepare_host_stage_ring(current)
-        return bool(current)
-
-    def _acquire_prepare_host_stage_slot(self) -> Optional[int]:
-        """Select writable staging storage without waiting on the prior step.
-
-        The producer only blocks if it laps both slots while their H2D copies
-        are still in flight. Event queries are non-blocking, so a normal
-        one-step overlap has no host-side CUDA synchronization.
-        """
-        if torch.cuda.is_current_stream_capturing():
-            return None
-        if not self._ensure_prepare_host_stage_ring():
-            return None
-
-        ring = self._prepare_host_stage_ring
-        slot = (self._prepare_host_stage_slot + 1) % len(ring)
-        event = self._prepare_host_stage_events[slot]
-        if event is not None and not event.query():
-            # Correctness backpressure only when the bounded ring is exhausted.
-            event.synchronize()
-        for name, tensor in ring[slot].items():
-            setattr(self, name, tensor)
-        self._prepare_host_stage_slot = slot
-        return slot
-
-    def _record_prepare_host_stage_slot(self, slot: Optional[int]) -> None:
-        """Record completion of copies sourced from the active host slot."""
-        if slot is None or torch.cuda.is_current_stream_capturing():
-            return
-        event = self._prepare_host_stage_events[slot]
-        if event is None:
-            event = torch.cuda.Event()
-            self._prepare_host_stage_events[slot] = event
-        event.record()
-
-    def _prepare_impl(self) -> None:
         super().prepare()
         self._invalidate_pool_view_cache()
 
@@ -1102,19 +967,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_req_idx_per_token = torch.empty_like(
             self.req_idx_per_token, device="cpu", pin_memory=prefer_pinned()
         )
-        # Stable-address repeat vector used by in-graph ragged expansions.
-        self.gen_token_repeats_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_sequences,),
-            cache_name="gen_token_repeats_cuda",
-            dtype=torch.int64,
-            capture_graph=capture_graph,
-        )
-        self.host_gen_token_repeats = torch.empty_like(
-            self.gen_token_repeats_cuda,
-            device="cpu",
-            pin_memory=prefer_pinned(),
-        )
         # Block table for topk_indices conversion (shared for context and generation)
         self.block_table = self.get_empty(
             self.cuda_graph_buffers,
@@ -1253,8 +1105,82 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
             pin_memory=prefer_pinned(),
         )
-        # Per-query-row causal KV extents for ragged top-k. The uniform path
-        # reconstructs these from next_n and continues to pass no row tensor.
+        self.gen_token_repeats_cuda = None
+        self.host_gen_token_repeats = None
+        self._ragged_num_rows = 0
+        self._attn_num_rows = 0
+        self.row_kv_lens_cuda = None
+        self.row_kv_lens_host = None
+        self.row_kv_correction_cuda = None
+        self.row_kv_correction_host = None
+        self.row_req_idx_cuda = None
+        self.row_req_idx_host = None
+        self.attn_row_kv_lens_cuda = None
+        self.attn_row_kv_correction_cuda = None
+        self.attn_row_req_idx_cuda = None
+        self.attn_row_kv_lens_host = None
+        self.attn_row_kv_correction_host = None
+        self.attn_row_req_idx_host = None
+        self.attn_row_request_types_host = None
+        self.attn_row_prompt_lens_cuda = None
+        self.attn_row_prompt_lens_cpu = None
+        self.attn_row_block_offsets = None
+        if self.enable_ragged_verification:
+            self._create_ragged_verification_buffers(capture_graph)
+        self.block_table_expanded = self.get_empty(
+            self.cuda_graph_buffers,
+            [
+                self.max_num_sequences * (1 + self._draft_sizing_cap),
+                self.kv_cache_manager.max_blocks_per_seq,
+            ],
+            cache_name="block_table_expanded",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.host_block_table_expanded = torch.zeros_like(
+            self.block_table_expanded,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        if is_dsa_cache_manager(self.draft_kv_cache_manager):
+            self.draft_block_table_expanded = self.get_empty(
+                self.cuda_graph_buffers,
+                [
+                    self.max_num_sequences * (1 + self._draft_sizing_cap),
+                    self.draft_kv_cache_manager.max_blocks_per_seq,
+                ],
+                cache_name="draft_block_table_expanded",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.host_draft_block_table_expanded = torch.zeros_like(
+                self.draft_block_table_expanded,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
+        self.scheduler_metadata_buffer_expanded = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.num_sms + 1, 2),
+            cache_name="scheduler_metadata_buffer_expanded",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
+    def _create_ragged_verification_buffers(self, capture_graph: bool) -> None:
+        """Allocate persistent row layouts required only by ragged verification."""
+        # Stable-address repeat vector used by in-graph ragged expansions.
+        self.gen_token_repeats_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences,),
+            cache_name="gen_token_repeats_cuda",
+            dtype=torch.int64,
+            capture_graph=capture_graph,
+        )
+        self.host_gen_token_repeats = torch.empty_like(
+            self.gen_token_repeats_cuda,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
         row_cap = self.max_num_sequences * (1 + self._draft_sizing_cap)
         self.row_kv_lens_cuda = self.get_empty(
             self.cuda_graph_buffers,
@@ -1286,13 +1212,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.row_req_idx_host = torch.zeros_like(
             self.row_req_idx_cuda, device="cpu", pin_memory=prefer_pinned()
         )
-        self._ragged_num_rows = 0
 
-        # Parallel token-major views for MLA RoPE and sparse-MLA generation.
-        # Context requests keep one row; generation contributes one row per
-        # query token. Request-major metadata remains untouched.
+        # MLA RoPE and sparse-MLA generation consume one row per query token;
+        # every other consumer keeps using request-major metadata.
         attn_rows_cap = self.max_num_sequences * (2 + self._draft_sizing_cap)
-        self._attn_num_rows = 0
         self.attn_row_kv_lens_cuda = self.get_empty(
             self.cuda_graph_buffers,
             (attn_rows_cap,),
@@ -1350,44 +1273,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.kv_cache_manager.max_blocks_per_seq,
             ),
             cache_name="attn_row_block_offsets",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.block_table_expanded = self.get_empty(
-            self.cuda_graph_buffers,
-            [
-                self.max_num_sequences * (1 + self._draft_sizing_cap),
-                self.kv_cache_manager.max_blocks_per_seq,
-            ],
-            cache_name="block_table_expanded",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.host_block_table_expanded = torch.zeros_like(
-            self.block_table_expanded,
-            device="cpu",
-            pin_memory=prefer_pinned(),
-        )
-        if is_dsa_cache_manager(self.draft_kv_cache_manager):
-            self.draft_block_table_expanded = self.get_empty(
-                self.cuda_graph_buffers,
-                [
-                    self.max_num_sequences * (1 + self._draft_sizing_cap),
-                    self.draft_kv_cache_manager.max_blocks_per_seq,
-                ],
-                cache_name="draft_block_table_expanded",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
-            )
-            self.host_draft_block_table_expanded = torch.zeros_like(
-                self.draft_block_table_expanded,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            )
-        self.scheduler_metadata_buffer_expanded = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.num_sms + 1, 2),
-            cache_name="scheduler_metadata_buffer_expanded",
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
@@ -1926,6 +1811,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         kv_correction: torch.Tensor,
     ) -> None:
         """Install device-selected windows into stable captured buffers."""
+        if not self.is_ragged_verify:
+            raise RuntimeError("device ragged layout requires enabled ragged verification")
         num_contexts = self.num_contexts
         num_rows = self._ragged_num_rows
         num_generations = self.num_generations
