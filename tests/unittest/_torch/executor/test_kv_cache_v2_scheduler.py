@@ -2805,3 +2805,55 @@ class TestMultimodalAwareChunkingV2:
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == []
         assert resize_calls == []  # SKIP path: no commit to KV cache
+
+
+class TestEqualCostChunking:
+    """Chunks capped by (kv_cost_offset + kv_start) * n against B = (kv_cost_offset + kv_depth_threshold) * max_num_tokens."""
+
+    ENV = {"TLLM_V2_CTX_COST_KV_OFFSET": "140000", "TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD": "64000"}
+
+    def _make(self, env=None, max_num_tokens=8192):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        with patch.dict("os.environ", env or {}):
+            return make_scheduler(mgr, max_num_tokens=max_num_tokens, ctx_chunk_config=(None, 64))
+
+    def _deep_req(self, request_id, kv_start):
+        req = make_ctx_request(
+            request_id,
+            context_remaining_length=2_000_000,
+            is_first_context_chunk=False,
+            is_last_context_chunk=False,
+        )
+        req.context_current_position = kv_start
+        return req
+
+    def test_disabled_without_env(self):
+        req = self._deep_req(0, kv_start=500_000)
+        self._make().schedule_request([req], set())
+        assert req.context_chunk_size == 8192
+
+    def test_shallow_request_unaffected(self):
+        req = self._deep_req(0, kv_start=32_000)
+        self._make(self.ENV).schedule_request([req], set())
+        assert req.context_chunk_size == 8192  # token cap binds below kv_depth_threshold
+
+    def test_deep_request_shrinks_per_formula(self):
+        req = self._deep_req(0, kv_start=500_000)
+        self._make(self.ENV).schedule_request([req], set())
+        # B = 204000 * 8192; affordable = B // 640_000 = 2611 -> 64-aligned 2560
+        assert req.context_chunk_size == 2560
+
+    def test_leftover_cost_backfills_next_request(self):
+        deep, shallow = self._deep_req(0, 500_000), self._deep_req(1, 0)
+        out = self._make(self.ENV).schedule_request([deep, shallow], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert deep.context_chunk_size == 2560
+        # leftover 32_768_000 // 140_000 = 234 -> 64-aligned 192
+        assert shallow.context_chunk_size == 192
+
+    def test_head_of_line_floor(self):
+        env = {"TLLM_V2_CTX_COST_KV_OFFSET": "100", "TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD": "100"}
+        req = self._deep_req(0, kv_start=10_000)
+        self._make(env, max_num_tokens=1024).schedule_request([req], set())
+        # affordable = 204_800 // 10_100 = 20 < unit -> floored to one unit
+        assert req.context_chunk_size == 64
