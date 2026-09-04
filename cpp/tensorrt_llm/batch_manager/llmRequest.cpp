@@ -34,11 +34,11 @@ std::optional<std::chrono::steady_clock::duration>& globalSteadyClockOffset()
 template <typename TTensor, typename TStream>
 runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool const forNextIteration)
 {
-    runtime::SizeType32 beamWidth = mSamplingConfig.beamWidth; // For non-Variable-Beam-Width-Search
-    auto const& beamWidthArray = mSamplingConfig.beamWidthArray;
-    if (beamWidthArray.has_value() && !beamWidthArray.value().empty() && !beamWidthArray.value()[0].empty())
+    runtime::SizeType32 beamWidth = mSamplingConfig.getBeamWidth(); // For non-Variable-Beam-Width-Search
+    auto const beamWidthArray = mSamplingConfig.getBeamWidthArray();
+    if (beamWidthArray.has_value() && !beamWidthArray.value().empty())
     {
-        auto const& requestBeamWidthArray = beamWidthArray.value()[0];
+        auto const& requestBeamWidthArray = beamWidthArray.value();
         auto const iter = mDecodingIter + (forNextIteration ? 1 : 0);
         // Clamp `decodingIter` with the actual array length, so that decoding
         // longer than the array holds the last width instead of reading past
@@ -103,7 +103,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
 
     if ((isDisaggContextTransmissionState() || isDisaggContextCompleteState()) && isContextOnlyRequest())
     {
-        auto const reqBeamWidth = mSamplingConfig.beamWidth;
+        auto const reqBeamWidth = mSamplingConfig.getBeamWidth();
         std::vector<TokenIdType> firstGenTokens;
         for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
         {
@@ -242,7 +242,7 @@ bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
 {
     TLLM_CHECK_WITH_INFO(!isContextFinished(), "not supported after prefill");
 
-    if (mSamplingConfig.beamWidth == 0)
+    if (mSamplingConfig.getBeamWidth() == 0)
     {
         return true;
     }
@@ -314,8 +314,6 @@ void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, Siz
         mMaxNewTokens = maxNewTokens;
     }
 
-    TLLM_CHECK_WITH_INFO(mSamplingConfig.validate(), "Incorrect sampling config");
-
     // validate extra ids when enabling kv cache reuse with prompt table
     if (enableKVCacheReuse && mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value())
     {
@@ -342,16 +340,15 @@ std::shared_ptr<LlmRequest> LlmRequest::createChildRequest(RequestIdType request
     // To ensure different randomness across children, assign a unique random seed to each child
     // by adding its sequence index to the base seed. If no seed is provided, the parent's seed defaults to 0.
     using RandomSeedType = tensorrt_llm::executor::RandomSeedType;
-    if (childReq->mSamplingConfig.randomSeed.has_value())
+    if (auto const childSeed = childReq->mSamplingConfig.getSeed(); childSeed.has_value())
     {
-        childReq->mSamplingConfig.randomSeed->at(0) += static_cast<RandomSeedType>(childReq->mSequenceIndex);
+        childReq->mSamplingConfig.setSeed(childSeed.value() + static_cast<RandomSeedType>(childReq->mSequenceIndex));
     }
     else
     {
         RandomSeedType defaultSeed{0};
-        mSamplingConfig.randomSeed = std::vector<RandomSeedType>(1, defaultSeed);
-        childReq->mSamplingConfig.randomSeed
-            = std::vector<RandomSeedType>(1, defaultSeed + static_cast<RandomSeedType>(childReq->mSequenceIndex));
+        mSamplingConfig.setSeed(defaultSeed);
+        childReq->mSamplingConfig.setSeed(defaultSeed + static_cast<RandomSeedType>(childReq->mSequenceIndex));
     }
 
     mChildRequests.push_back(childReq);

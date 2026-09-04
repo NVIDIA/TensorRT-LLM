@@ -830,10 +830,6 @@ def benchmark_fp8_paged_mqa_logits(
 
 if __name__ == "__main__":
     import argparse
-    import os
-    import sys
-
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir))
 
     parser = argparse.ArgumentParser(description="Benchmark CuTe DSL fp8_paged_mqa_logits kernel")
     parser.add_argument(

@@ -54,6 +54,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from ..speculative import SpecMetadata
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_mixin import (
     EncoderGroup,
@@ -3332,6 +3333,8 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         input_embeds: Optional[torch.Tensor] = None,
         return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -3408,6 +3411,11 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
 
             mm_embedding = find_input_mm_embeds(mm_embedding, ctx_params)
 
+        # `fuse_input_embeds` returns input_ids=None whenever it produced fused
+        # embeddings, so the MTP drafter downstream would lose the prompt
+        # tokens. Keep the pre-fusion ids and hand them over as
+        # `orig_input_ids`, which SpecDecOneEngineForCausalLM falls back to.
+        raw_input_ids = input_ids
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
@@ -3424,9 +3432,16 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
             inputs_embeds=input_embeds,
             return_context_logits=return_context_logits,
             lora_params=kwargs.get("lora_params", None),
+            spec_metadata=spec_metadata,
+            resource_manager=resource_manager,
+            orig_input_ids=raw_input_ids,
         )
 
-        logger.debug(f"output shape: {output_prob.shape}")
+        # One-model MTP returns the spec worker's dict (accepted tokens plus the
+        # next draft tokens) rather than logits. The engine already branches on
+        # that; only this log assumed a tensor.
+        if isinstance(output_prob, torch.Tensor):
+            logger.debug(f"output shape: {output_prob.shape}")
         return output_prob
 
     @staticmethod

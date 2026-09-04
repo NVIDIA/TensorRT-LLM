@@ -67,6 +67,7 @@ def _layer_norm_fwd_1pass_kernel(
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
     GATE_SIGMOID: tl.constexpr,
+    WEIGHT_IS_DELTA: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
@@ -106,6 +107,8 @@ def _layer_norm_fwd_1pass_kernel(
     # Normalize and apply linear transformation
     mask = cols < N
     w = tl.load(W + cols, mask=mask).to(tl.float32)
+    if WEIGHT_IS_DELTA:
+        w += 1.0
     if HAS_BIAS:
         b = tl.load(B + cols, mask=mask).to(tl.float32)
     x_hat = (x - mean) * rstd if not IS_RMS_NORM else x * rstd
@@ -154,6 +157,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
     ROWS: tl.constexpr,  # rows per program
     HEADS_PER_TOK: tl.constexpr,
     GATE_SIGMOID: tl.constexpr,
+    WEIGHT_IS_DELTA: tl.constexpr,
     SAVE_RSTD: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
 ):
@@ -177,6 +181,8 @@ def _rms_norm_gated_fwd_multirow_kernel(
     if SAVE_RSTD:
         tl.store(Rstd + rows, rstd, mask=row_mask)
     w = tl.load(W + cols).to(tl.float32)
+    if WEIGHT_IS_DELTA:
+        w += 1.0
     y = x * rstd[:, None] * w[None, :]
     tok = rows // HEADS_PER_TOK
     head = rows % HEADS_PER_TOK
@@ -270,6 +276,7 @@ def rms_norm_gated_token_major(
             ROWS=_MULTIROW_ROWS,
             HEADS_PER_TOK=heads,
             GATE_SIGMOID=gate_sigmoid,
+            WEIGHT_IS_DELTA=False,
             num_warps=_MULTIROW_NUM_WARPS,
         )
     return out
@@ -301,6 +308,7 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     fp8_scale=None,
     gate_activation="silu",
+    weight_is_delta=False,
 ):
     if gate_activation not in ("silu", "sigmoid"):
         raise ValueError(
@@ -355,6 +363,7 @@ def _layer_norm_fwd(
                 ROWS=_MULTIROW_ROWS,
                 HEADS_PER_TOK=1,
                 GATE_SIGMOID=gate_sigmoid,
+                WEIGHT_IS_DELTA=weight_is_delta,
                 num_warps=_MULTIROW_NUM_WARPS,
             )
         return out, mean, rstd
@@ -387,6 +396,7 @@ def _layer_norm_fwd(
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
             GATE_SIGMOID=gate_sigmoid,
+            WEIGHT_IS_DELTA=weight_is_delta,
             num_warps=num_warps,
         )
     return out, mean, rstd
@@ -403,9 +413,13 @@ class RMSNorm(torch.nn.Module):
         device=None,
         dtype=None,
         is_nvfp4: bool = False,
+        weight_is_delta: bool = False,
     ):
-        """If group_size is not None, we do GroupNorm with each group having group_size elements.
-        group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
+        """Create grouped RMSNorm with an optional activation gate.
+
+        ``group_size=None`` normalizes the full hidden dimension. When
+        ``weight_is_delta`` is true, the checkpoint stores ``weight - 1`` and
+        the kernel applies ``1 + weight`` (the Gemma convention).
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -416,8 +430,13 @@ class RMSNorm(torch.nn.Module):
         self.register_parameter("bias", None)
         self.group_size = group_size if group_size is not None else hidden_size
         self.norm_before_gate = norm_before_gate
+        self.weight_is_delta = weight_is_delta
 
         self.is_nvfp4 = is_nvfp4
+        if self.is_nvfp4 and self.weight_is_delta:
+            raise ValueError(
+                "NVFP4 RMSNorm output quantization requires absolute norm "
+                "weights; delta-form weights are not supported")
         # nvfp4_scale will be set externally if is_nvfp4 is True
         self.nvfp4_scale: torch.Tensor | None = None
         # fp8_scale will be attached from the downstream static FP8 linear.
@@ -484,5 +503,6 @@ class RMSNorm(torch.nn.Module):
             norm_before_gate=self.norm_before_gate,
             is_rms_norm=True,
             fp8_scale=fp8_scale,
+            weight_is_delta=self.weight_is_delta,
         )
         return y.reshape(x_shape_og)

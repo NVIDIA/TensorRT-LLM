@@ -19,19 +19,18 @@
 
 import json
 import os
-import sys
 import tempfile
 
 import jsonschema
 import openai
 import pytest
 import yaml
-from utils.llm_data import llm_models_root
 
 from .openai_server import RemoteOpenAIServer
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+__extra_import_path__ = ["..", "~/tests/unittest"]
 from test_llm import get_model_path
+from utils.llm_data import llm_models_root
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 

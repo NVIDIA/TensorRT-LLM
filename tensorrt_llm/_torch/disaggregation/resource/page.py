@@ -40,7 +40,7 @@ class MapperKind(IntEnum):
     when a role class exists only on some layers). The kind selects how
     bytes move between heterogeneous topologies:
 
-    INDEXED: Head-major (HND) K/V — the layout written by the TRTLLM
+    INDEXED/HND: Head-major (HND) K/V — the layout written by the TRTLLM
         attention kernels and the default for V1 and standard V2 managers.
         Heterogeneous-head transfer selects one contiguous head-major range
         per K/V buffer.
@@ -70,6 +70,7 @@ class MapperKind(IntEnum):
     """
 
     INDEXED = 0
+    HND = INDEXED
     REPLICATED = 1
     NHD = 2
     SECTIONED = 3  # Sectioned layout: [Sec0|Sec1|...], each section independently TP-sharded

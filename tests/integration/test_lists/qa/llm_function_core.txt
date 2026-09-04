@@ -386,10 +386,12 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype[moe_b
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype[moe_backend=TRTLLM]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_4gpus_static_eplb[moe_backend=DEEPGEMM]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_chunked_prefill
-accuracy/test_llm_api_pytorch.py::TestGLM52::test_nvfp4[tp_size=8-ep_size=8]
-accuracy/test_llm_api_pytorch.py::TestGLM52::test_nvfp4_nvfp4kv[tp_size=8-ep_size=8]
-accuracy/test_llm_api_pytorch.py::TestGLM52::test_nvfp4_mtp_index_share[tp_size=8-ep_size=8]
-accuracy/test_llm_api_pytorch.py::TestGLM5FP8::test_8gpus[tp_size=8-ep_size=8]
+accuracy/test_glm52.py::TestGLM52NVFP4::test_tep[tp_size=8-ep_size=8]
+accuracy/test_glm52.py::TestGLM52NVFP4::test_tep_nvfp4kv[tp_size=8-ep_size=8]
+accuracy/test_glm52.py::TestGLM52NVFP4::test_dep[tp_size=8-ep_size=8]
+accuracy/test_glm52.py::TestGLM52NVFP4::test_runtime
+accuracy/test_glm52.py::TestGLM52NVFP4::test_mtp_index_share[tp_size=8-ep_size=8]
+accuracy/test_glm52.py::TestGLM5FP8::test_8gpus[tp_size=8-ep_size=8]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[cutlass-one_model-overlap_scheduler]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[triton-one_model-overlap_scheduler]
@@ -716,6 +718,9 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales_early_first_token_response
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[mxfp8-latency]
+accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_bf16_tp2_cutlass
+accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_1gpu_mtp3_trtllm_ple_offload
+accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_1gpu_mtp3_cutedsl_ple_offload
 accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
 accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_cuda_graph_matches_eager_logits[tinyllama-1.1b]
 accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[gemma-3-1b]
@@ -743,6 +748,7 @@ accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL_MOE::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_27B_VL::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_35B_A3B_VL::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_35B_A3B_VL::test_fp8_prequantized
+accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_8_Flash_Next_VL::test_nvfp4_1gpu_mtp3_cutedsl_ple_offload
 accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
 disaggregated/test_aiperf_gate.py::test_all_cancelled_fails
 disaggregated/test_aiperf_gate.py::test_corrupt_export_fails
