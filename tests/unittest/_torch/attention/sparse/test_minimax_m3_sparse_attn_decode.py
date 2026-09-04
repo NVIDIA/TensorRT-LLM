@@ -13,12 +13,12 @@ truncated at the query token's own causal extent.
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3_kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     msa_package_available,
 )
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3_kernels.triton_sparse_decode import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_sparse_attn_decode,
     resolve_num_topk_chunks,
@@ -37,21 +37,8 @@ skip_not_sm100 = pytest.mark.skipif(
 
 
 def _flat_page_table(block_table: torch.Tensor, kv_lens_cpu: torch.Tensor) -> torch.Tensor:
-    """Flatten a block table into the per-request page ids fmha_sm100 consumes.
-
-    build_kv_page_indices reads those ids out of a token-level slot map, so this
-    rebuilds the map the block table implies and lets the production helper do
-    the flattening.
-    """
-    batch, max_pages = block_table.shape
-    intra = torch.arange(PAGE_SIZE, dtype=torch.int32)
-    req_to_token = (block_table.cpu().to(torch.int32) * PAGE_SIZE).unsqueeze(2) + intra
-    return build_kv_page_indices(
-        req_to_token.reshape(batch, max_pages * PAGE_SIZE),
-        torch.arange(batch, dtype=torch.int32),
-        kv_lens_cpu,
-        PAGE_SIZE,
-    )
+    """Flatten a block table into the per-request page ids fmha_sm100 consumes."""
+    return build_kv_page_indices(block_table.cpu().to(torch.int32), kv_lens_cpu, PAGE_SIZE)
 
 
 def _reference_sparse_decode(
@@ -384,7 +371,7 @@ def test_sparse_decode_cuda_graph_replay_tracks_inputs():
 @pytest.mark.skipif(not msa_package_available(), reason="fmha_sm100 (MSA submodule) required")
 def test_sparse_decode_matches_msa_kernel():
     """A/B against the fmha_sm100 sparse GQA path this kernel replaces."""
-    from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_sparse_gqa
+    from tensorrt_llm._torch.attention_backend.fmha.msa_prefill import run_msa_sparse_gqa
 
     seq_lens = [1025, 4097, 300, 8192]
     q, k_paged, v_paged, topk_idx, block_table, seq_lens_dev = _make_inputs(

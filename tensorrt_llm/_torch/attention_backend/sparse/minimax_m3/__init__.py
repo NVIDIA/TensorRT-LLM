@@ -16,10 +16,6 @@ Layered as:
                                 KV-slot writer, block-priority sentinels, and
                                 the paged-cache slot mapping builder shared by
                                 both backends.
-  * :mod:`.msa_utils`       -- MSA-only (fmha_sm100) helpers: import guard,
-                                kernel precondition constants, HND paged-cache
-                                adapters, main-KV writer, page-table builder,
-                                valid-block counting, and top-k selection.
   * :mod:`.triton_kernels`  -- OpenAI Triton kernels (per-block max
                                 score, masked softmax for sparse GQA).
   * :mod:`.triton_backend`  -- the Triton reference algorithm (vectorized
@@ -35,6 +31,10 @@ Layered as:
                                 selection submodule.
   * :mod:`.msa_availability`-- SM100 and fmha_sm100 gating for the MSA
                                 path.
+
+The kernels themselves, and the paged-cache write they share with these
+backends, live in the sibling :mod:`..minimax_m3_kernels` package so the FMHA
+libraries that drive them do not have to import this one.
 
 This package's public surface re-exports the names callers
 historically imported from ``...sparse.minimax_m3`` so external

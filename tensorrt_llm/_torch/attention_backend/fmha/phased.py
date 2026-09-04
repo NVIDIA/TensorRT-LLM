@@ -53,6 +53,12 @@ class FmhaParams:
     cyclic_attention_window_size: int = 0
     num_tokens: int = 0
     seq_offset: int = 0
+    # First query token of this phase on the axis of the q handed to the
+    # library, which covers the whole batch only where both phases share one
+    # tensor. The phase tensors above are already sliced by it; a library that
+    # indexes a separate per-token input, such as a sparse block table, needs
+    # it to take the matching slice.
+    token_offset: int = 0
     tokens_per_block: int = 64
     kv_factor: int = 0
     total_num_blocks: int = 0
@@ -221,6 +227,7 @@ class PhasedFmha(Fmha):
             params.max_past_kv_length = max_past_kv_len
             params.num_tokens = num_ctx_tokens
             params.seq_offset = seq_offset
+            params.token_offset = token_offset
             params.input_seq_length = max_context_q_len
             params.batch_size = num_seqs
             if attn.is_mla_enable:
@@ -263,6 +270,7 @@ class PhasedFmha(Fmha):
             params.max_past_kv_length = max_past_kv_len
             params.num_tokens = num_gen_tokens
             params.seq_offset = seq_offset
+            params.token_offset = token_offset
             params.input_seq_length = input_seq_length
             params.num_requests = num_seqs // metadata.beam_width
             params.spec_decoding_generation_lengths = spec_gen_lengths

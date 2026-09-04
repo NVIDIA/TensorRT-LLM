@@ -25,7 +25,7 @@ Provides:
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
@@ -309,24 +309,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     def has_index_value(self, layer_idx: int) -> bool:
         return layer_idx in self._index_v_buffers
 
-    def get_buffers(
+    def _kv_slot_geometry(
         self, layer_idx: int, kv_layout: Optional[str] = None
-    ) -> Optional[torch.Tensor]:
-        """Return a paged K+V view with strides spanning the coalesced pool.
+    ) -> Tuple[int, torch.dtype, int, int, List[int]]:
+        """Resolve one layer's position in the coalesced K/V pool.
 
-        The base :meth:`KVCacheManagerV2.get_buffers` produces a
-        ``[num_pages, kv_factor, ...]`` view with contiguous strides
-        that assume the slot holds exactly one layer's K+V. In M3's
-        pool the slot packs K+V for *all* layers of the group
-        (``scale >= 2 * num_layers_in_group``), so the base view's
-        dim-0 stride does not reach the next slot's K for this layer.
-        (When INDEX_KEY's per-block size coincides with K/V's, it is
-        coalesced into the same pool and contributes to ``scale`` too.)
-
-        The override builds a ``[num_slots, scale, ...]`` view rooted
-        at K's base, then slices ``[:, :2]`` to extract K+V. The slice
-        preserves the dim-0 stride (``scale * page_stride``), so
-        ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
+        Returns (addr_key, torch_dtype, num_slots, scale, page_shape), where
+        scale is the number of equal-sized sub-pages a slot packs and
+        page_shape is one sub-page's shape in kv_layout. This layer's K is
+        sub-page 0 and its V sub-page 1, counting from addr_key.
         When omitted, ``kv_layout`` follows the selected sparse backend.
         """
         if kv_layout is None:
@@ -335,7 +326,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
         if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
             raise NotImplementedError(
-                "MiniMaxM3KVCacheManagerV2.get_buffers does not support SELFKONLY cache type"
+                "MiniMaxM3KVCacheManagerV2 does not support the SELFKONLY cache type"
             )
 
         layer_offset = self.layer_offsets[layer_idx]
@@ -346,13 +337,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # V2 always lays V immediately after K within the per-layer
         # contribution to a slot. The slice ``[:, :2]`` depends on this.
         assert addr_key + page_stride_value == addr_value, (
-            f"MiniMaxM3 get_buffers requires addr_K + page_stride "
+            f"MiniMaxM3 requires addr_K + page_stride "
             f"== addr_V (V immediately after K in slot); got "
             f"addr_K={addr_key} page_stride_V={page_stride_value} "
             f"addr_V={addr_value} for layer {layer_idx}."
         )
         assert page_stride_key == page_stride_value, (
-            f"MiniMaxM3 get_buffers requires equal K and V page "
+            f"MiniMaxM3 requires equal K and V page "
             f"strides; got K={page_stride_key} V="
             f"{page_stride_value}."
         )
@@ -379,26 +370,65 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         layer_head_dim = self.head_dim_per_layer[layer_offset]
         num_kv_heads = self.num_kv_heads_per_layer[layer_offset]
+        containers = layer_head_dim // element_per_container
 
         if kv_layout == "NHD":
-            full_slot_shape = [
-                num_slots,
-                scale,
-                self.tokens_per_block,
-                num_kv_heads,
-                layer_head_dim // element_per_container,
-            ]
+            page_shape = [self.tokens_per_block, num_kv_heads, containers]
         else:
-            full_slot_shape = [
-                num_slots,
-                scale,
-                num_kv_heads,
-                self.tokens_per_block,
-                layer_head_dim // element_per_container,
-            ]
+            page_shape = [num_kv_heads, self.tokens_per_block, containers]
+        return addr_key, torch_dtype, num_slots, scale, page_shape
 
+    def get_buffers(
+        self, layer_idx: int, kv_layout: Optional[str] = None
+    ) -> Optional[torch.Tensor]:
+        """Return a paged K+V view with strides spanning the coalesced pool.
+
+        The base :meth:`KVCacheManagerV2.get_buffers` produces a
+        ``[num_pages, kv_factor, ...]`` view with contiguous strides
+        that assume the slot holds exactly one layer's K+V. In M3's
+        pool the slot packs K+V for *all* layers of the group
+        (``scale >= 2 * num_layers_in_group``), so the base view's
+        dim-0 stride does not reach the next slot's K for this layer.
+        (When INDEX_KEY's per-block size coincides with K/V's, it is
+        coalesced into the same pool and contributes to ``scale`` too.)
+
+        The override builds a ``[num_slots, scale, ...]`` view rooted
+        at K's base, then slices ``[:, :2]`` to extract K+V. The slice
+        preserves the dim-0 stride (``scale * page_stride``), so
+        ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
+        """
+        addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
+            layer_idx, kv_layout
+        )
+        full_slot_shape = [num_slots, scale, *page_shape]
         full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
         return full_view[:, :2]
+
+    def get_kv_subpage_pool(
+        self, layer_idx: int, kv_layout: str = "HND"
+    ) -> Tuple[torch.Tensor, int]:
+        """Return (flat_pool, subpages_per_slot) for flat-block consumers.
+
+        trtllm-gen addresses K and V pages independently, through a
+        [batch, 2, max_blocks] block table into one flat
+        [num_subpages, *page_shape] pool. That is expressible here even though
+        the per-layer stride is not uniform: a slot packs scale equal-sized
+        sub-pages, of which this layer owns two adjacent ones, so rooting the
+        flat pool at this layer's K puts slot s's K at s * scale and its V at
+        s * scale + 1.
+
+        The view stops two sub-pages past the last slot's K rather than
+        spanning num_slots * scale, which would run off the pool by whatever
+        this layer's K offset is inside a slot.
+        """
+        addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
+            layer_idx, kv_layout
+        )
+        num_subpages = (num_slots - 1) * scale + 2
+        flat = convert_to_torch_tensor(
+            TensorWrapper(addr_key, torch_dtype, [num_subpages, *page_shape])
+        )
+        return flat, scale
 
     def _kv_pool_mapping_offset(self, layer_id, layer_group_id, key_base_addr) -> int:
         """Pool-mapping offset from the layer's physical position in its pool.
