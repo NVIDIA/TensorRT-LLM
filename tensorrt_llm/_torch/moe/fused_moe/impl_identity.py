@@ -14,6 +14,7 @@
 # limitations under the License.
 """Stable identities, queries, and registration for leaf MoE implementations."""
 
+import difflib
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Type, TypeVar
@@ -25,9 +26,10 @@ _FIELD_RE = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)*$")
 _SEP = "."
 T = TypeVar("T")
 
-# Canonical written order; tokens are assigned to fields by value.
+# Canonical order for rendering an id. Parsing does not depend on it: tokens
+# are assigned to fields by value, so a query may list its segments in any
+# order.
 _ID_FIELDS: Tuple[str, ...] = ("provider", "technique", "kernel_name", "quant")
-_FIELD_INDEX: Dict[str, int] = {name: i for i, name in enumerate(_ID_FIELDS)}
 
 # Explicit "any value here". Never required -- an omitted field is already
 # unconstrained -- but accepted so that a query can be written out at full
@@ -208,8 +210,22 @@ class MoEImplRegistry:
         """Copy of the token vocabulary, for diagnostics and error messages."""
         return dict(self._token_to_field)
 
+    def suggest(self, token: str) -> Tuple[str, ...]:
+        """Nearest known tokens, in descending similarity, for a typo message.
+
+        Empty when nothing is close, which includes the case that matters most
+        during the migration: a registry too sparse to hold a neighbour.
+        """
+        return tuple(difflib.get_close_matches(token, self._token_to_field, n=3))
+
     def parse_query(self, text: str) -> MoEImplQuery:
-        """Parse a partial, canonically ordered implementation query."""
+        """Parse a partial implementation query written in any segment order.
+
+        Every token locates its own field by value, so ``deepgemm.mega_moe``
+        and ``mega_moe.deepgemm`` are the same request and a bare ``mega_moe``
+        is a legal one. Position carries no meaning here; that is what
+        :meth:`_check_tokens_disjoint` buys at registration time.
+        """
         tokens = []
         for raw in text.split(_SEP):
             token = raw.strip().lower()
@@ -217,47 +233,38 @@ class MoEImplRegistry:
                 raise ValueError(f"empty segment in MoE impl specification {text!r}")
             tokens.append(token)
 
-        # Pass 1: assign by value.
+        # The per-field duplicate check below bounds named tokens only. A
+        # wildcard claims no field, so without this nothing would reject
+        # "deepgemm.*.*.*.*".
+        if len(tokens) > len(_ID_FIELDS):
+            raise ValueError(
+                f"MoE impl specification {text!r} has {len(tokens)} segments, more than "
+                f"the {len(_ID_FIELDS)} fields {_SEP.join(_ID_FIELDS)}"
+            )
+
         assignment: Dict[str, str] = {}
         for token in tokens:
             if token == _WILDCARD:
                 continue
             name = self._token_to_field.get(token)
             if name is None:
-                raise ValueError(
-                    f"unknown MoE impl token {token!r} in {text!r}. "
-                    f"Known tokens: {sorted(self._token_to_field)}"
+                near = self.suggest(token)
+                # Near misses while the registry has neighbours to compare
+                # against; the full vocabulary only while it is small enough
+                # for that to be a listing rather than noise.
+                hint = (
+                    f"Closest known values: {list(near)}"
+                    if near
+                    else f"Known tokens: {sorted(self._token_to_field)}"
                 )
+                raise ValueError(f"unknown MoE impl token {token!r} in {text!r}. {hint}")
             if name in assignment:
                 raise ValueError(
                     f"MoE impl specification {text!r} sets field {name!r} twice: "
                     f"{assignment[name]!r} and {token!r}"
                 )
             assignment[name] = token
-        query = MoEImplQuery(**assignment)
-
-        # Pass 2: check canonical order.
-        cursor = 0
-        for token in tokens:
-            if token == _WILDCARD:
-                # Only a wildcard can overrun: a named token past the end is
-                # out of order, and saying so points at the real mistake.
-                if cursor >= len(_ID_FIELDS):
-                    raise ValueError(
-                        f"MoE impl specification {text!r} has more segments than the "
-                        f"{len(_ID_FIELDS)} fields {_SEP.join(_ID_FIELDS)}"
-                    )
-                cursor += 1
-                continue
-            index = _FIELD_INDEX[self._token_to_field[token]]
-            if index < cursor:
-                raise ValueError(
-                    f"MoE impl specification {text!r} is out of order at {token!r}: "
-                    f"segments must follow {_SEP.join(_ID_FIELDS)}. "
-                    f"Write it as {query.describe()!r}."
-                )
-            cursor = index + 1
-        return query
+        return MoEImplQuery(**assignment)
 
     def find(self, query: MoEImplQuery) -> List[Tuple[MoEImplId, Type]]:
         """Every registered impl the query matches, in registration order."""
@@ -270,8 +277,10 @@ class MoEImplRegistry:
         return len(self._store)
 
 
-# Ships EMPTY. Entries are added one per impl class as backends migrate; until
-# then every concrete-impl request fails hard rather than falling back.
+# Created empty; each leaf registers itself at import time as it migrates, so
+# the registry is partial for as long as the migration runs. A pin that names
+# nothing registered fails hard rather than falling back, which is what keeps a
+# partial registry from answering with a kernel the caller did not ask for.
 MOE_IMPL_REGISTRY = MoEImplRegistry()
 
 

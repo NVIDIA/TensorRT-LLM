@@ -35,7 +35,8 @@ from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
                             MoEStaticCapability)
-from .interface import _reject
+from .impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
+from .interface import MoESchedulerKind, _reject
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
@@ -751,8 +752,23 @@ def set_strides(workspace: torch.Tensor, g: int, m: int, k: int):
     return workspace
 
 
-class DeepGemmFusedMoE(MoEImplBase):
-    """DeepGEMM flow of fused mixture of experts (MoE) Layer.
+@register_moe_impl
+class DeepgemmCudaCppFp8BlockScalesImpl(MoEImplBase):
+    """``deepgemm.cuda_cpp.grouped_gemm.fp8_block_scales``.
+
+    DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103. One
+    class carries the identity and the whole contract: construction, the
+    pooled memory buffers, workspace sizing, eligibility, quantization, and
+    ``run_moe``. That is the shape ``MOE_DEVELOPER_GUIDE.md`` asks for while
+    a backend supports a single quantization format -- an abstract parent
+    would carry no identity, implement nothing, and have one subclass.
+
+    The kernel segment is absent from the name because the ``quant`` segment
+    already separates this one from the MegaMoE implementation, with which it
+    shares provider and technique.
+
+    ``DeepGemmFusedMoE`` below is an alias onto this class, so the
+    pre-identity name still resolves for the call sites that use it.
 
     Args:
         num_experts (int): Number of experts in the MoE layer.
@@ -765,13 +781,25 @@ class DeepGemmFusedMoE(MoEImplBase):
         model_config (ModelConfig): Configuration object for the model.
     """
 
-    capabilities = MoEStaticCapability(
-        supports_eplb=True, supports_apply_router_weight_on_input=True)
-
-    input_requirement = MoEInputRequirement(
-        routing_scales_dtype=torch.float32,
-        requires_run_moe_workspace=True,
+    descriptor = MoEImplDescriptor(
+        identity=MoEImplId("deepgemm", "cuda_cpp", "grouped_gemm",
+                           "fp8_block_scales"),
+        scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
+        capabilities=MoEStaticCapability(
+            supports_eplb=True, supports_apply_router_weight_on_input=True),
+        input_requirement=MoEInputRequirement(
+            routing_scales_dtype=torch.float32,
+            requires_run_moe_workspace=True,
+        ),
+        doc="DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103.",
     )
+
+    # Taken off the descriptor rather than restated. The scheduler reads these
+    # three attributes and the registry publishes the descriptor; a second
+    # literal would let what is published and what is executed drift apart.
+    scheduler_kind = descriptor.scheduler_kind
+    capabilities = descriptor.capabilities
+    input_requirement = descriptor.input_requirement
 
     # The DeepGEMM Triton activation kernel implements SwiGLU only, and takes
     # the clamp by value -- a per-expert tensor would never be read.
@@ -904,12 +932,12 @@ class DeepGemmFusedMoE(MoEImplBase):
 
         # create workspace
         fp8_dim = max(hidden_size, intermediate_size)
-        workspace_0 = DeepGemmFusedMoE.buffers.get_buffer(
+        workspace_0 = type(self).buffers.get_buffer(
             (num_experts * m_max * fp8_dim, ),
             dtype=torch.float8_e4m3fn,
             buffer_name='workspace_0',
             reserve_buffer=capture_graph)
-        workspace_1 = DeepGemmFusedMoE.buffers.get_buffer(
+        workspace_1 = type(self).buffers.get_buffer(
             (num_experts * m_max * max(intermediate_size * 2, hidden_size), ),
             dtype=torch.bfloat16,
             buffer_name='workspace_1',
@@ -920,7 +948,7 @@ class DeepGemmFusedMoE(MoEImplBase):
         scale_k = fp8_utils.ceil_div(fp8_dim, group_size)
         scale_k_padded = fp8_utils.align(scale_k, 4)
 
-        workspace_sf = DeepGemmFusedMoE.buffers.get_buffer(
+        workspace_sf = type(self).buffers.get_buffer(
             (num_experts * (scale_k_padded // 4) * m_padded, ),
             dtype=torch.int32,
             buffer_name='workspace_sf',
@@ -1169,3 +1197,10 @@ class DeepGemmFusedMoE(MoEImplBase):
         )
 
         return final_hidden_states
+
+
+# The pre-identity name, kept as an alias rather than a base class: the
+# ``moe_backend="DEEPGEMM"`` call sites, the ``issubclass`` dispatch in
+# ``create_moe.py``, and the comments across the MoE tree that still say
+# ``DeepGemmFusedMoE`` all mean the class above.
+DeepGemmFusedMoE = DeepgemmCudaCppFp8BlockScalesImpl

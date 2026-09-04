@@ -25,7 +25,7 @@ import torch
 from tensorrt_llm._torch.models.modeling_mixtral import MixtralMoE
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepgemmCudaCppFp8BlockScalesImpl
 from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 
@@ -145,11 +145,11 @@ def test_scheduler_threads_lora_params_to_cutlass_run_context():
 def test_scheduler_does_not_thread_lora_params_to_non_lora_backend():
     """Backends that do not declare supports_moe_lora must get lora_params
     cleared, so an adapter never silently no-ops inside their kernel."""
-    ctx = _build_run_context(_make_external_comm_scheduler(DeepGemmFusedMoE))
+    ctx = _build_run_context(_make_external_comm_scheduler(DeepgemmCudaCppFp8BlockScalesImpl))
 
     assert ctx.lora_params is None, (
         "lora_params must only reach backends declaring supports_moe_lora; "
-        f"DeepGemmFusedMoE does not fuse it. Got: {ctx.lora_params}"
+        f"the DeepGEMM impl does not fuse it. Got: {ctx.lora_params}"
     )
 
 

@@ -82,7 +82,11 @@ from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     override_moe_environment,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
-from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
+    DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl,
+    MegaMoECuteDsl,
+    MegaMoEDeepGemm,
+)
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     build_moe_deployment,
     impl_class_for,
@@ -877,7 +881,7 @@ def test_megamoe_cache_derived_state_sets_initial_assignments_once():
 
 
 def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
-    moe = MegaMoEDeepGemm.__new__(MegaMoEDeepGemm)
+    moe = DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl.__new__(DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl)
     torch.nn.Module.__init__(moe)
     quant_method = SimpleNamespace(cache_derived_state=MagicMock())
     moe.quant_method = quant_method
@@ -887,6 +891,40 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
 
     moe._alloc_symm_buffer.assert_called_once_with()
     quant_method.cache_derived_state.assert_called_once_with(moe)
+
+
+def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
+    """The GMS read-only reader reaches the override through the wrapper.
+
+    ``ConfigurableMoE`` marks itself ``_weights_removed`` so the loader does not
+    run the wrapper's hooks on top of the backend's, which leaves the backend
+    reachable only as a registered submodule. Losing the override there is
+    silent -- the SymmBuffer simply never gets allocated and the failure
+    surfaces as the assert in ``run_moe`` -- so the walk itself is asserted,
+    not just the override in isolation.
+    """
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    # ``__new__`` rather than the constructor: the real ``__init__`` would want
+    # MPI, a process group, and a DG SymmBuffer, none of which this walk needs.
+    backend = DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl.__new__(DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl)
+    torch.nn.Module.__init__(backend)
+    backend.quant_method = SimpleNamespace(cache_derived_state=MagicMock())
+    backend._alloc_symm_buffer = MagicMock()
+
+    wrapper = torch.nn.Module()
+    wrapper._weights_removed = True
+    wrapper.cache_derived_state = MagicMock()
+    wrapper.backend = backend
+
+    model = torch.nn.Module()
+    model.moe = wrapper
+
+    ModelLoader._walk_cache_state(model)
+
+    backend._alloc_symm_buffer.assert_called_once_with()
+    backend.quant_method.cache_derived_state.assert_called_once_with(backend)
+    wrapper.cache_derived_state.assert_not_called()
 
 
 def test_megamoe_bakes_situ_softcaps_as_uniform_scalars():
@@ -923,7 +961,7 @@ def test_create_moe_forwards_situ_activation_as_one_carrier(monkeypatch):
     monkeypatch.setattr(
         create_moe_module,
         "resolve_moe_cls",
-        MagicMock(return_value=MegaMoEDeepGemm),
+        MagicMock(return_value=DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl),
     )
     activation = SiTuActivation(gate_softcap=4.0, linear_softcap=25.0)
 
@@ -985,11 +1023,13 @@ def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
         moe_backend=MoeBackendType.MEGAMOE_DEEPGEMM.value,
     )
 
+    # The check runs inside ``__init__``, before any distributed setup, so the
+    # rejection is reachable without a process group.
     with pytest.raises(
         ValueError,
         match=r"MegaMoEDeepGemm requires num_slots \(10\) divisible by ep_size \(4\)",
     ):
-        MegaMoEDeepGemm(
+        DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl(
             routing_method=routing_method,
             num_experts=10,
             hidden_size=512,

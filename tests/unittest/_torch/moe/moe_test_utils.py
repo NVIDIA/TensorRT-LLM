@@ -33,7 +33,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
     TRTLLMGenFusedMoE,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepgemmCudaCppFp8BlockScalesImpl
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
@@ -42,7 +42,10 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE
-from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
+    DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl,
+    MegaMoECuteDsl,
+)
 from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import (
     is_megamoe_cute_dsl_runtime_available,
 )
@@ -71,14 +74,19 @@ class MoeBackendType(str, Enum):
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
-    """Get the MoE backend class for a given backend type."""
+    """Get the MoE backend class for a given backend type.
+
+    The two DeepGEMM entries use the identity-derived names rather than the
+    ``DeepGemmFusedMoE`` / ``MegaMoEDeepGemm`` aliases, matching what resolution
+    reports.
+    """
     backend_class_map = {
         MoeBackendType.CUTLASS: CutlassFusedMoE,
         MoeBackendType.TRTLLM: TRTLLMGenFusedMoE,
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
-        MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
+        MoeBackendType.DEEPGEMM: DeepgemmCudaCppFp8BlockScalesImpl,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
-        MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
+        MoeBackendType.MEGAMOE_DEEPGEMM: DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl,
         MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDsl,
         MoeBackendType.CUTE_DSL_B12X: CuteDslB12xFusedMoE,
         MoeBackendType.MARLIN: MarlinFusedMoE,

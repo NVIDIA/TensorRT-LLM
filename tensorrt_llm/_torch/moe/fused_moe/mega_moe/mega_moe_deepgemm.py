@@ -51,11 +51,12 @@ from ..impl_contract import (
     MoEStaticCapability,
 )
 from ..impl_environment import MoEDep
+from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod, _import_deep_gemm
 from ..routing import BaseMoeRoutingMethod
 
-__all__ = ["MegaMoEDeepGemm"]
+__all__ = ["DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl", "MegaMoEDeepGemm"]
 
 # Process-global DG SymmBuffer cache. The cached object is mutable
 # forward-time activation workspace (input ``x`` / routing slots /
@@ -142,14 +143,51 @@ def _assert_num_slots_divisible_by_ep(num_slots: int, ep_size: int) -> None:
         )
 
 
-class MegaMoEDeepGemm(MoEImplBase):
-    """MoE backend wrapping DeepGEMM's fused ``fp8_fp4_mega_moe`` kernel."""
+@register_moe_impl
+class DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl(MoEImplBase):
+    """``deepgemm.cuda_cpp.mega_moe.w4a8_mxfp4_mxfp8``.
+
+    DeepGEMM fused ``fp8_fp4_mega_moe``: MXFP4 weights, MXFP8 activations,
+    SM100/SM103. One class carries the identity and the whole contract:
+    construction, the MPI/process-group setup, the symmetric-buffer
+    allocation, the weight lifecycle, eligibility, quantization, and
+    ``run_moe``. That is the shape ``MOE_DEVELOPER_GUIDE.md`` asks for while
+    a backend supports a single quantization format -- an abstract parent
+    would carry no identity, implement nothing, and have one subclass.
+
+    The kernel segment is absent from the name because the ``quant`` segment
+    already separates this one from the grouped-GEMM implementation, with which
+    it shares provider and technique.
+
+    ``MegaMoEDeepGemm`` below is an alias onto this class, so the
+    pre-identity name still resolves for the call sites that use it.
+    """
+
+    descriptor = MoEImplDescriptor(
+        identity=MoEImplId("deepgemm", "cuda_cpp", "mega_moe", "w4a8_mxfp4_mxfp8"),
+        # The kernel owns dispatch + GEMM1 + gated activation + GEMM2 + combine
+        # over the NVLink SymmBuffer, so ConfigurableMoE must NOT layer
+        # host-side comm on top.
+        scheduler_kind=MoESchedulerKind.FUSED_COMM,
+        # Static and dynamic EPLB both work: see ``_supports_load_balancer``
+        # below for why slot-id routing and DG-tensor migration are safe here.
+        capabilities=MoEStaticCapability(supports_eplb=True),
+        doc="DeepGEMM fused fp8_fp4_mega_moe: MXFP4 weights, MXFP8 activations, SM100/SM103.",
+    )
+
+    # Taken off the descriptor rather than restated. The scheduler reads these
+    # three attributes and the registry publishes the descriptor; a second
+    # literal would let what is published and what is executed drift apart.
+    # ``input_requirement`` keeps the descriptor default because this backend
+    # prepares its own inputs: ``quantize_input`` emits the FP8 + packed-UE8M0
+    # pair the kernel reads, and ``run_moe`` casts the routing slots itself.
+    scheduler_kind = descriptor.scheduler_kind
+
+    capabilities = descriptor.capabilities
+
+    input_requirement = descriptor.input_requirement
 
     _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
-
-    # Static and dynamic EPLB both work: see ``_supports_load_balancer`` below
-    # for why slot-id routing and DG-tensor migration are safe here.
-    capabilities = MoEStaticCapability(supports_eplb=True)
 
     # ActivationType -> the DeepGEMM library's own ``activation`` argument. The
     # only place that external vocabulary is spoken; keys must cover
@@ -166,10 +204,6 @@ class MegaMoEDeepGemm(MoEImplBase):
         alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
         limit=ActivationParamShape.UNIFORM_SCALAR,
     )
-
-    # Kernel owns dispatch + GEMM1 + gated activation + GEMM2 + combine via NVLink
-    # SymmBuffer; ConfigurableMoE must NOT layer host-side comm on top.
-    scheduler_kind = MoESchedulerKind.FUSED_COMM
 
     # MegaMoE partitions the global slot table, not just the raw expert count.
     # Let backend-specific num_slots checks handle EPLB/non-divisible layouts.
@@ -749,3 +783,10 @@ class MegaMoEDeepGemm(MoEImplBase):
             situ_linear_beta=self.act_beta,
         )
         return y.to(output_dtype)
+
+
+# The pre-identity name, kept as an alias rather than a base class: the
+# ``moe_backend="MEGAMOE_DEEPGEMM"`` call sites, the ``issubclass`` dispatch
+# in ``create_moe.py``, and the comments across the MoE tree that still say
+# ``MegaMoEDeepGemm`` all mean the class above.
+MegaMoEDeepGemm = DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl
