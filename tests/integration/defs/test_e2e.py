@@ -927,7 +927,9 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--disable_kv_cache_reuse",
+            "--trust_remote_code",
             "--max_batch_size=8",
+            "--use_kv_cache_manager_v2=false",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
         ])
