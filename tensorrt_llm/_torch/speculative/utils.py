@@ -701,14 +701,12 @@ def get_spec_decoder(
         # supported yet and are rejected at admission rather than mispenalized.
         penalty_supported = not (getattr(spec_config, "eagle_choices", None)
                                  or _is_effective_dynamic_tree(spec_config))
-        # min_p is admitted only when the deploy selected the fused universal kernel,
-        # which is the only sampling path that applies it.
-        universal_sampling = (spec_config.advanced_sampling_mode.is_universal)
+        fused_sampling = (spec_config.advanced_sampling_mode.is_fused)
         return SpecSampler(sampler_args,
                            accepted_path_len=accepted_path_len,
                            enable_penalty=spec_config.enable_penalty,
                            penalty_supported=penalty_supported,
-                           universal_sampling=universal_sampling)
+                           fused_sampling=fused_sampling)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 

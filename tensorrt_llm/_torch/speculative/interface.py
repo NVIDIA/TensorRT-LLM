@@ -555,10 +555,6 @@ class SpecMetadata:
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
-    # Only read when advanced_sampling_mode is UNIVERSAL -- the other modes reject a
-    # min_p request at admission, so the buffer stays at its neutral 0.0 for them.
-    # Allocated regardless: it is one float per row, and making its existence conditional
-    # would make the CUDA-graph capture depend on the deploy mode for no saving.
     min_ps: Optional[torch.Tensor] = None
     # Pre-computed top_k_max scalar (CPU-side) to avoid CUDA-graph-incompatible
     # dynamic boolean tensor indexing inside verify_dynamic_tree_rejection_from_logits_out.
@@ -1085,11 +1081,6 @@ class SpecMetadata:
             # greedy. Omitting it here would classify a min_p-only request as greedy, send
             # it down the argmax fast path, and drop min_p silently -- and since this flag
             # is part of the CUDA graph key, it would also pick the wrong graph variant.
-            #
-            # Requests only reach here carrying min_p when the deploy selected
-            # advanced_sampling_mode=UNIVERSAL; every other mode rejects them at admission
-            # (SpecSampler.validate_request). So this is unconditional: on the other modes
-            # min_p is always None and the classification is unchanged.
             is_greedy = SamplingParams.params_imply_greedy_decoding(
                 temperature=temperature,
                 top_k=top_k,
@@ -1301,12 +1292,7 @@ class SpecMetadata:
         # forward, so skip whichever group is already current.
         need_update_sampler_param, need_update_expanded_sampler_param = (
             self._sampling_params_buffers_need_update(per_request_normalized))
-        # Only UNIVERSAL reads the min_p buffers. Under every other mode a min_p
-        # request is rejected at admission, so every entry would be the 0.0 sentinel
-        # the buffers were allocated with -- the list build and the H2D copy would
-        # write zeros over zeros. This runs on the host critical path ahead of the
-        # forward, so the existing modes must not pay for a filter they cannot use.
-        fill_min_p = self.advanced_sampling_mode.is_universal
+        fill_min_p = self.advanced_sampling_mode.is_fused
         if not (need_update_sampler_param
                 or need_update_expanded_sampler_param):
             return

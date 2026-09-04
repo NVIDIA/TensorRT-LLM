@@ -19,7 +19,7 @@
 // development; it must build identically either way, so it includes only its own kernel
 // header and ATen.
 
-#include "tensorrt_llm/kernels/universalSamplingKernels.h"
+#include "tensorrt_llm/kernels/fusedSampling/fusedSamplingKernels.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
@@ -34,9 +34,10 @@ namespace
 
 namespace tk = tensorrt_llm::kernels;
 
-//! Three call shapes share one kernel; which outputs are wanted is decided by which
-//! pointers are set, so the kernel is instantiated without the half it does not need.
-tk::UniversalSamplingParams buildParams(torch::Tensor const& logits, torch::Tensor const& temperatures,
+//! Three call shapes share one internal dispatcher; which outputs are wanted is decided
+//! by which pointers are set, so each family is instantiated without the half it does not
+//! need.
+tk::FusedSamplingParams buildParams(torch::Tensor const& logits, torch::Tensor const& temperatures,
     torch::Tensor const& topKs, torch::Tensor const& topPs, torch::Tensor const& minPs,
     std::optional<torch::Tensor> const& seed, std::optional<torch::Tensor> const& offset)
 {
@@ -59,7 +60,7 @@ tk::UniversalSamplingParams buildParams(torch::Tensor const& logits, torch::Tens
     checkRowVector(topPs, "top_ps", torch::kFloat32);
     checkRowVector(minPs, "min_ps", torch::kFloat32);
 
-    tk::UniversalSamplingParams params;
+    tk::FusedSamplingParams params;
     params.logits = logits.const_data_ptr();
     params.temperatures = temperatures.const_data_ptr<float>();
     params.topKs = topKs.const_data_ptr<int32_t>();
@@ -83,21 +84,21 @@ tk::UniversalSamplingParams buildParams(torch::Tensor const& logits, torch::Tens
     return params;
 }
 
-void dispatchByDtype(torch::Tensor const& logits, tk::UniversalSamplingParams const& params)
+void dispatchByDtype(torch::Tensor const& logits, tk::FusedSamplingParams const& params)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     switch (logits.scalar_type())
     {
-    case torch::kFloat32: tk::invokeUniversalSampling<float>(params, stream); break;
-    case torch::kFloat16: tk::invokeUniversalSampling<__half>(params, stream); break;
-    case torch::kBFloat16: tk::invokeUniversalSampling<__nv_bfloat16>(params, stream); break;
-    default: TORCH_CHECK(false, "universal sampling does not support logits dtype ", logits.scalar_type());
+    case torch::kFloat32: tk::invokeFusedSampling<float>(params, stream); break;
+    case torch::kFloat16: tk::invokeFusedSampling<__half>(params, stream); break;
+    case torch::kBFloat16: tk::invokeFusedSampling<__nv_bfloat16>(params, stream); break;
+    default: TORCH_CHECK(false, "fused sampling does not support logits dtype ", logits.scalar_type());
     }
 }
 
 } // namespace
 
-torch::Tensor universal_sample_from_logits(torch::Tensor const& logits, torch::Tensor const& temperatures,
+torch::Tensor fused_sample_from_logits(torch::Tensor const& logits, torch::Tensor const& temperatures,
     torch::Tensor const& topKs, torch::Tensor const& topPs, torch::Tensor const& minPs,
     std::optional<torch::Tensor> const& seed, std::optional<torch::Tensor> const& offset)
 {
@@ -108,7 +109,7 @@ torch::Tensor universal_sample_from_logits(torch::Tensor const& logits, torch::T
     return tokens;
 }
 
-std::tuple<torch::Tensor, torch::Tensor> universal_sample_from_logits_with_probs(torch::Tensor const& logits,
+std::tuple<torch::Tensor, torch::Tensor> fused_sample_from_logits_with_probs(torch::Tensor const& logits,
     torch::Tensor const& temperatures, torch::Tensor const& topKs, torch::Tensor const& topPs,
     torch::Tensor const& minPs, std::optional<torch::Tensor> const& seed, std::optional<torch::Tensor> const& offset)
 {
@@ -121,7 +122,7 @@ std::tuple<torch::Tensor, torch::Tensor> universal_sample_from_logits_with_probs
     return {tokens, probs};
 }
 
-torch::Tensor universal_compute_probs_from_logits(torch::Tensor const& logits, torch::Tensor const& temperatures,
+torch::Tensor fused_compute_probs_from_logits(torch::Tensor const& logits, torch::Tensor const& temperatures,
     torch::Tensor const& topKs, torch::Tensor const& topPs, torch::Tensor const& minPs)
 {
     auto params = buildParams(logits, temperatures, topKs, topPs, minPs, std::nullopt, std::nullopt);
@@ -136,19 +137,19 @@ torch::Tensor universal_compute_probs_from_logits(torch::Tensor const& logits, t
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "universal_sample_from_logits(Tensor logits, Tensor temperatures, Tensor top_ks, "
+        "fused_sample_from_logits(Tensor logits, Tensor temperatures, Tensor top_ks, "
         "Tensor top_ps, Tensor min_ps, Tensor? seed=None, Tensor? offset=None) -> Tensor");
     m.def(
-        "universal_sample_from_logits_with_probs(Tensor logits, Tensor temperatures, Tensor top_ks, "
+        "fused_sample_from_logits_with_probs(Tensor logits, Tensor temperatures, Tensor top_ks, "
         "Tensor top_ps, Tensor min_ps, Tensor? seed=None, Tensor? offset=None) -> (Tensor, Tensor)");
     m.def(
-        "universal_compute_probs_from_logits(Tensor logits, Tensor temperatures, Tensor top_ks, "
+        "fused_compute_probs_from_logits(Tensor logits, Tensor temperatures, Tensor top_ks, "
         "Tensor top_ps, Tensor min_ps) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("universal_sample_from_logits", &torch_ext::universal_sample_from_logits);
-    m.impl("universal_sample_from_logits_with_probs", &torch_ext::universal_sample_from_logits_with_probs);
-    m.impl("universal_compute_probs_from_logits", &torch_ext::universal_compute_probs_from_logits);
+    m.impl("fused_sample_from_logits", &torch_ext::fused_sample_from_logits);
+    m.impl("fused_sample_from_logits_with_probs", &torch_ext::fused_sample_from_logits_with_probs);
+    m.impl("fused_compute_probs_from_logits", &torch_ext::fused_compute_probs_from_logits);
 }

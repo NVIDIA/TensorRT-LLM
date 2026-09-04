@@ -1,23 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""``get_spec_metadata`` must carry advanced_sampling_mode onto the metadata.
-
-The mode has two readers that must agree:
-
-* ``SpecSampler.validate_request`` reads it off the **config**, and decides whether a
-  min_p request is admitted at all;
-* ``populate_sampling_params_for_one_model`` (via ``fill_min_p``) and the sampling
-  dispatcher read it off the **metadata**, and decide whether the buffers are filled and
-  which backend runs.
-
-A disagreement is silent: the request is admitted, its min_p buffers stay at the neutral
-sentinel, and the dispatcher routes to a backend that takes no min_p argument, so the
-filter is dropped without an error. Neither the op-level nor the buffer-level tests can
-see it, because each constructs its own metadata and therefore asserts on a mode the
-factory may never produce.
-
-These tests exercise the factory, which is the only place that disagreement can appear.
-"""
+"""Tests for propagating advanced_sampling_mode into speculative metadata."""
 
 import pytest
 
@@ -63,18 +46,12 @@ def test_metadata_carries_the_configured_sampling_mode(make_config, mode):
     )
 
 
-def test_universal_is_not_silently_downgraded():
-    """The one direction that loses min_p, stated on its own.
-
-    UNIVERSAL on the config and FULL on the metadata is the combination that admits a
-    min_p request and then drops the filter, so it is asserted separately from the
-    parametrized sweep rather than left to be inferred from it.
-    """
+def test_fused_is_not_silently_downgraded():
     metadata = get_spec_metadata(
-        _eagle3_one_model(AdvancedSamplingMode.UNIVERSAL),
+        _eagle3_one_model(AdvancedSamplingMode.FUSED),
         _ModelConfig(),
         max_num_requests=4,
         max_num_tokens=64,
     )
     assert metadata is not None
-    assert metadata.advanced_sampling_mode.is_universal
+    assert metadata.advanced_sampling_mode.is_fused

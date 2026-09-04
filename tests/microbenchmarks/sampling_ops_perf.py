@@ -26,12 +26,6 @@ call shape       op                                                  call sites
 ``tokens_probs`` ``sampling_batch_spec_dec_one_model_for_rejection`` draft sampler + draft probs
 ===============  ==================================================  ==========================
 
-Why it exists: a fused "universal" sampling op that also carries ``min_p`` is
-only worth having if a row that asks for no extra filtering does not pay for
-the capability. That is a claim about numbers, so this measures the current
-flashinfer chain first and stores it as the baseline; the candidate op is
-compared against that stored baseline rather than against an argument.
-
 Both eager and CUDA-graph-replay latency are reported: these ops run inside a
 captured graph in production, so eager latency alone can mislead.
 
@@ -44,7 +38,7 @@ Usage::
     python tests/microbenchmarks/sampling_ops_perf.py --save baseline.json
 
     # candidate vs. the stored baseline, with the acceptance gates applied
-    python tests/microbenchmarks/sampling_ops_perf.py --candidate universal \\
+    python tests/microbenchmarks/sampling_ops_perf.py --candidate fused \\
         --compare baseline.json
 """
 
@@ -118,13 +112,13 @@ FILTER_CASES: tuple[FilterCase, ...] = (
     FilterCase(
         name="top_k",
         top_k=50,
-        baseline_mode=AdvancedSamplingMode.FULL,
+        baseline_mode=AdvancedSamplingMode.NO_TOPP,
         gate=1.25,
     ),
     FilterCase(
         name="top_p",
         top_p=0.9,
-        baseline_mode=AdvancedSamplingMode.FULL,
+        baseline_mode=AdvancedSamplingMode.NO_TOPK,
         gate=1.25,
     ),
     FilterCase(
@@ -239,69 +233,56 @@ def _flashinfer_impl(mode: AdvancedSamplingMode) -> Impl:
 
 
 def available_impls() -> dict[str, Impl]:
-    """Every backend this checkout can measure.
-
-    The universal op is absent until it exists; that is the expected state while
-    the baseline is being taken, not an error.
-    """
+    """Return every available sampling backend."""
     impls: dict[str, Impl] = {}
     if IS_FLASHINFER_AVAILABLE:
-        # Every mode EXCEPT universal, which does not route to the flashinfer chain at
-        # all -- registering it here would measure the wrong backend under its name.
         for mode in AdvancedSamplingMode:
-            if mode.is_universal:
+            if mode.is_fused:
                 continue
             impl = _flashinfer_impl(mode)
             impls[impl.name] = impl
 
     try:
-        from tensorrt_llm._torch.pyexecutor.sampler.ops import universal as uni
+        from tensorrt_llm._torch.pyexecutor.sampler.ops import fused
     except ImportError:
         return impls
-    # Importing the module says nothing about whether the op exists: it ships compiled in
-    # the wheel and is otherwise built on demand from a checkout, so ask.
-    if not uni.is_available():
+    if not fused.is_available():
         return impls
 
     def call(shape: str, inp: Inputs) -> Callable[[], Any]:
         args = (inp.logits, inp.temperatures, inp.top_ks, inp.top_ps, inp.min_ps)
         if shape == "tokens":
-            return lambda: uni.universal_sample_from_logits(*args, seed=inp.seed, offset=inp.offset)
+            return lambda: fused.fused_sample_from_logits(*args, seed=inp.seed, offset=inp.offset)
         if shape == "probs":
-            return lambda: uni.universal_compute_probs_from_logits(*args)
+            return lambda: fused.fused_compute_probs_from_logits(*args)
         if shape == "tokens_probs":
-            return lambda: uni.universal_sample_from_logits_with_probs(
+            return lambda: fused.fused_sample_from_logits_with_probs(
                 *args, seed=inp.seed, offset=inp.offset
             )
         raise ValueError(f"unknown call shape: {shape}")
 
-    impls["universal"] = Impl(name="universal", call=call, supports_min_p=True)
+    impls["fused"] = Impl(name="fused", call=call, supports_min_p=True)
 
-    # The op as production reaches it. interface.py does not call ops/universal.py
-    # directly -- it goes through the dispatcher, which adds a Python call and a mode
-    # lookup per call site per step. Measuring only the bare op would report a number
-    # nothing in the executor can actually observe.
+    # Measure the production dispatcher separately from the bare op.
     from tensorrt_llm._torch.pyexecutor.sampler.ops import spec_dispatch as disp
 
-    universal_mode = AdvancedSamplingMode.UNIVERSAL
+    fused_mode = AdvancedSamplingMode.FUSED
 
     def call_dispatch(shape: str, inp: Inputs) -> Callable[[], Any]:
         args = (inp.logits, inp.temperatures, inp.top_ks, inp.top_ps, inp.min_ps)
         if shape == "tokens":
             return lambda: disp.spec_sample_from_logits(
-                mode, *args, seed=inp.seed, offset=inp.offset
+                fused_mode, *args, seed=inp.seed, offset=inp.offset
             )
         if shape == "probs":
-            return lambda: disp.spec_compute_probs_from_logits(universal_mode, *args)
+            return lambda: disp.spec_compute_probs_from_logits(fused_mode, *args)
         if shape == "tokens_probs":
             return lambda: disp.spec_sample_from_logits_with_probs(
-                universal_mode, *args, seed=inp.seed, offset=inp.offset
+                fused_mode, *args, seed=inp.seed, offset=inp.offset
             )
         raise ValueError(f"unknown call shape: {shape}")
 
-    impls["universal_dispatch"] = Impl(
-        name="universal_dispatch", call=call_dispatch, supports_min_p=True
-    )
+    impls["fused_dispatch"] = Impl(name="fused_dispatch", call=call_dispatch, supports_min_p=True)
     return impls
 
 
@@ -591,7 +572,7 @@ def main() -> int:
     parser.add_argument(
         "--candidate",
         default=None,
-        help="backend to judge against each case's baseline mode (e.g. 'universal')",
+        help="backend to judge against each case's baseline mode (e.g. 'fused')",
     )
     parser.add_argument(
         "--gate-metric",

@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness of the fused universal sampling op against the TorchSampler pipeline.
+"""Correctness of the fused sampling op against Torch references.
 
-The oracle is the production one -- ``min_p_renorm_probs`` then top-k then top-p renorm,
-the order ``sampler_strategy._compute_probs`` uses and ``docs/source/features/sampling.md``
-documents -- not a reimplementation, so a semantic drift in either shows up here.
+Semantic tests use the production pipeline -- ``min_p_renorm_probs`` then top-k then
+top-p renorm, the order ``sampler_strategy._compute_probs`` uses and
+``docs/source/features/sampling.md`` documents.  A separate numerical-error matrix uses
+a mechanically independent pure-Torch implementation, so sharing a backend cannot make
+the fused op and its oracle reproduce the same arithmetic mistake.
 
 What is deliberately NOT asserted: equality of sampled token *ids* against the flashinfer
 path. The two consume their RNG differently, so identical ids are not expected; token
@@ -27,7 +29,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as fi
-from tensorrt_llm._torch.pyexecutor.sampler.ops import universal as uni
+from tensorrt_llm._torch.pyexecutor.sampler.ops import fused
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
 
 DISABLE_TOPK = torch.iinfo(torch.int32).max
@@ -35,8 +37,11 @@ DISABLE_TOPP = 1.0
 DISABLE_MINP = 0.0
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not uni.is_available(),
-    reason="requires CUDA and a build carrying the universal sampling op",
+    not torch.cuda.is_available() or not fused.is_available(),
+    reason=(
+        "requires CUDA and the fused sampling op "
+        "(set TLLM_FUSED_SAMPLING_JIT=1 in an editable checkout)"
+    ),
 )
 
 
@@ -69,8 +74,66 @@ def _reference_probs(logits, temperatures, top_ks, top_ps, min_ps):
     return probs
 
 
+def _pure_torch_reference_probs(logits, temperatures, top_ks, top_ps, min_ps):
+    """Independent Torch implementation of the documented filter pipeline.
+
+    Unlike ``_reference_probs``, this does not call FlashInfer or any fused-op
+    helper.  Keeping the oracle mechanically independent is important for measuring
+    numerical error: a shared backend could otherwise reproduce the same mistake.
+    The row loop is intentional -- this is a correctness oracle for small batches,
+    not an implementation whose performance matters.
+    """
+    rows, vocab = logits.shape
+    scaled_logits = logits.float() / temperatures.unsqueeze(-1)
+    reference = []
+
+    for row_idx in range(rows):
+        row = torch.softmax(scaled_logits[row_idx], dim=-1)
+
+        min_p = min_ps[row_idx]
+        if min_p > 0:
+            row = torch.where(row >= min_p * row.max(), row, 0.0)
+            row = row / row.sum()
+
+        top_k = int(top_ks[row_idx].item())
+        if 0 < top_k < vocab:
+            indices = torch.topk(row, top_k, sorted=False).indices
+            filtered = torch.zeros_like(row)
+            filtered.scatter_(0, indices, row[indices])
+            row = filtered / filtered.sum()
+
+        top_p = top_ps[row_idx]
+        if top_p < 1:
+            sorted_probs, sorted_indices = torch.sort(row, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            cutoff = torch.searchsorted(cumulative_probs, top_p, right=False)
+            keep = torch.arange(vocab, device=logits.device) <= cutoff
+            sorted_probs = torch.where(keep, sorted_probs, 0.0)
+            filtered = torch.zeros_like(row)
+            filtered.scatter_(0, sorted_indices, sorted_probs)
+            row = filtered / filtered.sum()
+
+        reference.append(row)
+
+    return torch.stack(reference)
+
+
 def _l1_per_row(a, b):
     return (a - b).abs().sum(-1)
+
+
+def _print_probability_error(label, actual, expected):
+    absolute_error = (actual - expected).abs()
+    row_l1 = absolute_error.sum(-1)
+    print(
+        "REFERENCE_ERROR "
+        f"case={label} max_abs={absolute_error.max().item():.9e} "
+        f"max_row_l1={row_l1.max().item():.9e} "
+        f"mean_row_l1={row_l1.mean().item():.9e} "
+        f"support_mismatches="
+        f"{(actual > 0).logical_xor(expected > 0).sum().item()}"
+    )
+    return row_l1.max().item()
 
 
 def _rng(rows, device, seed=7, offset=0):
@@ -92,9 +155,9 @@ def test_neutral_row_is_plain_softmax(dtype):
     logits = (torch.randn(16, 4096, device=dev) * 2.0).to(dtype)
     temps, top_ks, top_ps, min_ps = _params(16, device=dev)
 
-    probs = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+    probs = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
     expected = torch.softmax(logits.float() / temps.unsqueeze(-1), dim=-1)
-    assert _l1_per_row(probs, expected).max().item() < 1e-4
+    assert _l1_per_row(probs, expected).max().item() < 2e-5
 
 
 def test_min_p_zero_changes_nothing():
@@ -104,7 +167,7 @@ def test_min_p_zero_changes_nothing():
     logits = torch.randn(8, 8192, device=dev) * 2.0
     temps, top_ks, top_ps, min_ps = _params(8, device=dev)
 
-    with_zero = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+    with_zero = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
     neutral = torch.softmax(logits / temps.unsqueeze(-1), dim=-1)
     torch.testing.assert_close(with_zero, neutral, atol=1e-5, rtol=1e-4)
 
@@ -116,9 +179,10 @@ def test_min_p_matches_reference(min_p):
     logits = torch.randn(16, 8192, device=dev) * 2.0
     temps, top_ks, top_ps, min_ps = _params(16, device=dev, min_p=min_p)
 
-    probs = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+    probs = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
     expected = _reference_probs(logits, temps, top_ks, top_ps, min_ps)
-    assert _l1_per_row(probs, expected).max().item() < 1e-3
+    max_row_l1 = _print_probability_error(f"min_p={min_p}", probs, expected)
+    assert max_row_l1 < 2e-5
     # min-p is a hard support cut, so the kept sets must agree exactly -- there is no
     # boundary-tie excuse here as there is for top-p.
     assert torch.equal(probs > 0, expected > 0)
@@ -131,7 +195,7 @@ def test_min_p_one_keeps_only_the_argmax():
     logits = torch.randn(8, 4096, device=dev) * 3.0
     temps, top_ks, top_ps, min_ps = _params(8, device=dev, min_p=1.0)
 
-    probs = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+    probs = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
     assert torch.equal(probs.argmax(-1), logits.argmax(-1))
     torch.testing.assert_close(
         probs.max(-1).values, torch.ones(8, device=dev), atol=1e-5, rtol=1e-5
@@ -163,10 +227,13 @@ def test_filter_combinations_match_reference(top_k, top_p, min_p):
     logits = torch.randn(16, 16384, device=dev) * 2.0
     temps, top_ks, top_ps, min_ps = _params(16, device=dev, top_k=top_k, top_p=top_p, min_p=min_p)
 
-    probs = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+    probs = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
     expected = _reference_probs(logits, temps, top_ks, top_ps, min_ps)
-    assert _l1_per_row(probs, expected).max().item() < 5e-3
-    torch.testing.assert_close(probs.sum(-1), torch.ones(16, device=dev), atol=1e-4, rtol=1e-4)
+    max_row_l1 = _print_probability_error(
+        f"top_k={top_k},top_p={top_p},min_p={min_p}", probs, expected
+    )
+    assert max_row_l1 < 2e-5
+    torch.testing.assert_close(probs.sum(-1), torch.ones(16, device=dev), atol=1e-6, rtol=1e-6)
 
 
 def test_mixed_batch_rows_are_independent():
@@ -187,9 +254,9 @@ def test_mixed_batch_rows_are_independent():
     min_ps[3] = 0.05
     top_ks[4], top_ps[4], min_ps[4] = 20, 0.8, 0.02
 
-    batched = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+    batched = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
     for r in range(rows):
-        alone = uni.universal_compute_probs_from_logits(
+        alone = fused.fused_compute_probs_from_logits(
             logits[r : r + 1].contiguous(),
             temps[r : r + 1].contiguous(),
             top_ks[r : r + 1].contiguous(),
@@ -197,6 +264,134 @@ def test_mixed_batch_rows_are_independent():
             min_ps[r : r + 1].contiguous(),
         )
         torch.testing.assert_close(batched[r], alone[0], atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("vocab", [65535, 65536, 65537])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_large_vocab_dispatch_boundary_matches_reference(dtype, vocab):
+    """Exercise both sides of the multi-CTA vocabulary boundary."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    rows = 4
+    logits = (torch.randn(rows, vocab, device=dev) * 2.0).to(dtype)
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev)
+    top_ps[1] = 0.9
+    top_ks[2] = 50
+    top_ks[3], top_ps[3], min_ps[3] = 50, 0.9, 0.05
+
+    probs = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+    expected = _reference_probs(logits, temps, top_ks, top_ps, min_ps)
+    max_row_l1 = _print_probability_error(f"large_vocab,dtype={dtype}", probs, expected)
+    assert max_row_l1 < 2e-5
+    torch.testing.assert_close(probs.sum(-1), torch.ones(rows, device=dev), atol=1e-6, rtol=1e-6)
+
+    seed, offset = _rng(rows, dev)
+    tokens, probs_both = fused.fused_sample_from_logits_with_probs(
+        logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
+    )
+    torch.testing.assert_close(probs_both, probs, atol=1e-6, rtol=1e-5)
+    assert (probs_both.gather(1, tokens.long().unsqueeze(-1)) > 0).all()
+
+
+@pytest.mark.parametrize("rows", [1, 8, 31, 32, 33, 64])
+def test_fp32_probability_error_against_pure_torch_reference(rows):
+    """Measure fused-op error against an independent Torch oracle.
+
+    The 128256-token vocabulary is representative of Llama 3.1. Rows 31/32/33
+    exercise both sides of the multi-CTA row boundary, while row 64 covers its fallback.
+    Rows cycle through every combination of min-p, top-k and top-p; the single-row
+    case uses all three filters.  FP32 is intentional: both target and Eagle3 draft
+    logits pass through ``LogitsProcessor``, which casts them before the production
+    fused-op call.
+
+    Keep the metric printout: the test threshold prevents regressions, while the raw
+    values make it possible to judge whether that threshold is defensible.
+    """
+    dev = "cuda"
+    vocab = 128256
+    torch.manual_seed(20260903)
+    # Production enters this op in FP32, where random continuous logits make exact
+    # top-k/min-p ties vanishingly unlikely.  Top-p may still differ by its single
+    # boundary token because the two implementations reduce mass in different orders;
+    # that case is checked explicitly below instead of hidden by a wide L1 tolerance.
+    logits = torch.randn(rows, vocab, device=dev) * 2.0
+    temperatures, top_ks, top_ps, min_ps = _params(rows, device=dev)
+
+    temperatures.copy_(
+        torch.tensor([0.7, 0.8, 1.0, 1.3], device=dev).repeat((rows + 3) // 4)[:rows]
+    )
+    filters = (
+        ("neutral", None, None, None),
+        ("min_p", None, None, 0.05),
+        ("top_k", 50, None, None),
+        ("top_p", None, 0.9, None),
+        ("min_p_top_k", 50, None, 0.05),
+        ("min_p_top_p", None, 0.9, 0.05),
+        ("top_k_top_p", 50, 0.9, None),
+        ("all_filters", 50, 0.9, 0.05),
+    )
+    if rows == 1:
+        filters = (filters[-1],)
+    row_filter_names = []
+    for row_idx in range(rows):
+        filter_name, top_k, top_p, min_p = filters[row_idx % len(filters)]
+        row_filter_names.append(filter_name)
+        if top_k is not None:
+            top_ks[row_idx] = top_k
+        if top_p is not None:
+            top_ps[row_idx] = top_p
+        if min_p is not None:
+            min_ps[row_idx] = min_p
+
+    actual = fused.fused_compute_probs_from_logits(logits, temperatures, top_ks, top_ps, min_ps)
+    expected = _pure_torch_reference_probs(logits, temperatures, top_ks, top_ps, min_ps)
+    absolute_error = (actual - expected).abs()
+    row_l1 = absolute_error.sum(-1)
+    support_difference = (actual > 0).logical_xor(expected > 0)
+    support_mismatches = support_difference.sum().item()
+    max_abs = absolute_error.max().item()
+    mean_abs = absolute_error.mean().item()
+    max_row_l1 = row_l1.max().item()
+    mean_row_l1 = row_l1.mean().item()
+    max_mass_error = (actual.sum(-1) - 1.0).abs().max().item()
+
+    print(
+        "NUMERIC_ERROR "
+        f"dtype={logits.dtype} rows={rows} vocab={vocab} "
+        f"max_abs={max_abs:.9e} mean_abs={mean_abs:.9e} "
+        f"max_row_l1={max_row_l1:.9e} mean_row_l1={mean_row_l1:.9e} "
+        f"max_tv={0.5 * max_row_l1:.9e} "
+        f"support_mismatches={support_mismatches} "
+        f"max_mass_error={max_mass_error:.9e}"
+    )
+    for filter_name in dict.fromkeys(row_filter_names):
+        filter_rows = torch.tensor(
+            [name == filter_name for name in row_filter_names], device=dev, dtype=torch.bool
+        )
+        filter_support_mismatches = (
+            (actual[filter_rows] > 0).logical_xor(expected[filter_rows] > 0).sum().item()
+        )
+        print(
+            "NUMERIC_FILTER "
+            f"dtype={logits.dtype} rows={rows} filter={filter_name} "
+            f"max_row_l1={row_l1[filter_rows].max().item():.9e} "
+            f"mean_row_l1={row_l1[filter_rows].mean().item():.9e} "
+            f"support_mismatches={filter_support_mismatches}"
+        )
+
+    # Measured on H100 against the independent oracle: max row-L1 was 8.01e-6.
+    # Keep modest headroom for reduction-order variance, but reject errors hundreds
+    # of times smaller than the old 5e-3 allowance.
+    assert max_abs < 1e-5
+    assert max_row_l1 < 2e-5
+    assert max_mass_error < 1e-6
+
+    # A top-p reduction may place the one cutoff token on the opposite side of 0.9.
+    # No other filter is allowed a support mismatch, and top-p gets at most that one
+    # boundary token per row -- not a blanket tolerance over the whole distribution.
+    top_p_enabled = top_ps < 1.0
+    assert not support_difference[~top_p_enabled].any()
+    assert support_difference.sum(-1).max().item() <= 1
 
 
 def test_sampled_tokens_lie_in_the_filtered_support():
@@ -210,7 +405,7 @@ def test_sampled_tokens_lie_in_the_filtered_support():
 
     for step in range(8):
         seed, offset = _rng(rows, dev, offset=step)
-        tokens, probs = uni.universal_sample_from_logits_with_probs(
+        tokens, probs = fused.fused_sample_from_logits_with_probs(
             logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
         )
         picked = probs.gather(1, tokens.long().unsqueeze(-1)).squeeze(-1)
@@ -227,10 +422,10 @@ def test_tokens_and_probs_agree_with_the_probs_only_op():
     temps, top_ks, top_ps, min_ps = _params(16, device=dev, top_k=50, top_p=0.9, min_p=0.05)
     seed, offset = _rng(16, dev)
 
-    _, probs_both = uni.universal_sample_from_logits_with_probs(
+    _, probs_both = fused.fused_sample_from_logits_with_probs(
         logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
     )
-    probs_only = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+    probs_only = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
     torch.testing.assert_close(probs_both, probs_only, atol=1e-6, rtol=1e-5)
 
 
@@ -241,10 +436,10 @@ def test_same_seed_and_offset_reproduce_the_same_tokens():
     temps, top_ks, top_ps, min_ps = _params(16, device=dev, top_p=0.95)
     seed, offset = _rng(16, dev, seed=1234, offset=5)
 
-    first = uni.universal_sample_from_logits(
+    first = fused.fused_sample_from_logits(
         logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
     )
-    second = uni.universal_sample_from_logits(
+    second = fused.fused_sample_from_logits(
         logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
     )
     assert torch.equal(first, second)
@@ -267,7 +462,7 @@ def test_sampling_follows_the_filtered_distribution():
     # whole sample.
     seed = torch.tensor([99], dtype=torch.int64, device=dev)
     offset = torch.tensor([0], dtype=torch.int64, device=dev)
-    tokens, probs = uni.universal_sample_from_logits_with_probs(
+    tokens, probs = fused.fused_sample_from_logits_with_probs(
         logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
     )
 
@@ -278,16 +473,17 @@ def test_sampling_follows_the_filtered_distribution():
 
 # --- The tokens-only rejection path ------------------------------------------------
 #
-# ``universal_sample_from_logits`` (tokens, no probs) does not solve for the cutoff at
+# ``fused_sample_from_logits`` (tokens, no probs) does not solve for the cutoff at
 # all: it draws from a superset of the kept set and retries until the draw lands inside.
 # The tests above reach it only through ``test_same_seed_and_offset_reproduce_the_same_
 # tokens``, and determinism says nothing about *which* distribution is reproduced -- so
 # the ones below drive it directly, against the descent path's own probs.
 
-# Rows without top-k take the rejection path; rows with it keep the descent. Both are
-# listed, because the point of the split is that the two agree on the distribution -- a
-# routing change that sends a row the wrong way has to fail here rather than quietly
-# sample from a different set.
+# Rows without top-k take rejection; pure top-k keeps the descent. A small top-k + top-p
+# batch uses the hybrid covered separately below, while these deliberately wide batches
+# exercise its deterministic fallback. All routes are listed because they must agree on
+# the distribution -- a routing change must fail here rather than quietly sample from a
+# different set.
 _REJECT_FILTERS = [
     pytest.param({}, id="neutral"),
     pytest.param({"top_p": 0.8}, id="top_p"),
@@ -308,11 +504,11 @@ def test_rejection_tokens_lie_in_the_filtered_support(filters):
     rows, vocab = 256, 4096
     logits = torch.randn(rows, vocab, device=dev) * 2.0
     temps, top_ks, top_ps, min_ps = _params(rows, device=dev, **filters)
-    reference = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+    reference = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
 
     for step in range(8):
         seed, offset = _rng(rows, dev, offset=step)
-        tokens = uni.universal_sample_from_logits(
+        tokens = fused.fused_sample_from_logits(
             logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
         )
         picked = reference.gather(1, tokens.long().unsqueeze(-1)).squeeze(-1)
@@ -332,12 +528,43 @@ def test_rejection_tokens_follow_the_filtered_distribution(filters):
 
     seed = torch.tensor([99], dtype=torch.int64, device=dev)
     offset = torch.tensor([0], dtype=torch.int64, device=dev)
-    tokens = uni.universal_sample_from_logits(
+    tokens = fused.fused_sample_from_logits(
         logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
     )
-    expected = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)[0]
+    expected = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)[0]
 
     counts = torch.bincount(tokens.long(), minlength=vocab).float() / draws
+    tv = 0.5 * (counts - expected).abs().sum().item()
+    assert tv < 0.05, f"total-variation distance {tv:.3f} from the filtered distribution"
+
+
+def test_small_batch_top_k_top_p_hybrid_follows_filtered_distribution():
+    """Rows <= 8 solve top-k, then reject only for top-p instead of descending twice.
+
+    The large one-row-per-draw distribution test above intentionally exceeds that routing
+    cutoff, so collect independent launches here to exercise the actual small-batch path.
+    Offsets are spaced by the rejection-round budget so one launch cannot reuse another
+    launch's later Philox draw.
+    """
+    dev = "cuda"
+    torch.manual_seed(0)
+    rows, vocab, steps = 8, 64, 1024
+    logits = (torch.randn(1, vocab, device=dev) * 1.5).expand(rows, vocab).contiguous()
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev, temperature=1.0, top_k=16, top_p=0.8)
+    expected = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)[0]
+
+    draws = []
+    for step in range(steps):
+        seed, offset = _rng(rows, dev, seed=99, offset=step * 32)
+        draws.append(
+            fused.fused_sample_from_logits(
+                logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
+            )
+        )
+
+    tokens = torch.stack(draws).flatten().long()
+    assert (expected[tokens] > 0).all(), "hybrid sampled a token outside the filtered support"
+    counts = torch.bincount(tokens, minlength=vocab).float() / tokens.numel()
     tv = 0.5 * (counts - expected).abs().sum().item()
     assert tv < 0.05, f"total-variation distance {tv:.3f} from the filtered distribution"
 
@@ -362,7 +589,7 @@ def test_rejection_converges_when_the_support_barely_shrinks(filters):
 
     for step in range(4):
         seed, offset = _rng(rows, dev, offset=step)
-        tokens = uni.universal_sample_from_logits(
+        tokens = fused.fused_sample_from_logits(
             logits.contiguous(), temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
         )
         assert torch.equal(tokens.long(), torch.full_like(tokens.long(), vocab - 1))
@@ -384,10 +611,10 @@ def test_rejection_and_descent_keep_the_same_set():
     top_ks[4::5] = 32
     top_ps[4::5] = 0.7
 
-    reference = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+    reference = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
     for step in range(8):
         seed, offset = _rng(rows, dev, offset=step)
-        tokens = uni.universal_sample_from_logits(
+        tokens = fused.fused_sample_from_logits(
             logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
         )
         picked = reference.gather(1, tokens.long().unsqueeze(-1)).squeeze(-1)

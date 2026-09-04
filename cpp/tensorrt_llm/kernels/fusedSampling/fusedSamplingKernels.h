@@ -24,12 +24,13 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-//! \brief Inputs and outputs of the fused "universal" sampler.
+//! \brief Inputs and outputs of the fused sampler.
 //!
-//! One kernel applies temperature, min-p, top-k and top-p together and decides per row,
-//! on device, which of them to do any work for. A row that enables no filter costs the
-//! softmax it would have paid anyway; the disable sentinels below are what it is
-//! recognized by.
+//! One fused invocation applies temperature, min-p, top-k and top-p together and decides
+//! per row, on device, which of them to do any work for. The launcher selects a
+//! single-CTA or multi-CTA execution family without changing this interface. A row that
+//! enables no filter costs the softmax it would have paid anyway; the disable sentinels
+//! below are what it is recognized by.
 //!
 //! The unifying observation: after the softmax's own max-reduce, w = exp(l/T - max) is
 //! exactly p / p_max, and all three filters are thresholds on w --
@@ -37,7 +38,7 @@ namespace kernels
 //!   top-k keeps the k largest                   (a threshold found by rank)
 //!   top-p keeps the minimal mass-ordered prefix  (a threshold found by mass)
 //! -- so the whole filter is a single comparison w >= t against the strictest of them.
-struct UniversalSamplingParams
+struct FusedSamplingParams
 {
     //! Input [numRows, vocabSize] of type T. Not modified.
     void const* logits{nullptr};
@@ -73,7 +74,7 @@ struct UniversalSamplingParams
 
 //! \brief Launch the fused sampler. Writes whichever of outputTokens / outputProbs is set.
 template <typename T>
-void invokeUniversalSampling(UniversalSamplingParams const& params, cudaStream_t stream);
+void invokeFusedSampling(FusedSamplingParams const& params, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

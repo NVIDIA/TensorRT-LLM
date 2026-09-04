@@ -30,22 +30,17 @@ from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, DecodingBaseConfi
 def test_enum_skip_properties():
     """Enum members + the skip properties (single source of truth for filter skipping)."""
     M = AdvancedSamplingMode
-    assert [m.value for m in M] == ["full", "no_topk", "no_topp", "no_topk_no_topp", "universal"]
+    assert [m.value for m in M] == ["full", "no_topk", "no_topp", "no_topk_no_topp", "fused"]
     assert (M.FULL.skips_top_k, M.FULL.skips_top_p) == (False, False)
     assert (M.NO_TOPK.skips_top_k, M.NO_TOPK.skips_top_p) == (True, False)
     assert (M.NO_TOPP.skips_top_k, M.NO_TOPP.skips_top_p) == (False, True)
     assert (M.NO_TOPK_NO_TOPP.skips_top_k, M.NO_TOPK_NO_TOPP.skips_top_p) == (True, True)
-    # UNIVERSAL skips neither filter deploy-wide: it skips per row, inside the kernel.
-    # If these ever became True, resolve_advanced_sampling_filters would strip the
-    # filters before the fused op ever saw them.
-    assert (M.UNIVERSAL.skips_top_k, M.UNIVERSAL.skips_top_p) == (False, False)
+    assert (M.FUSED.skips_top_k, M.FUSED.skips_top_p) == (False, False)
 
 
-def test_only_universal_is_universal():
-    """is_universal is the single predicate the admission guard and the op dispatch
-    both read, so it must be true for exactly one mode."""
+def test_only_fused_is_fused():
     M = AdvancedSamplingMode
-    assert [m for m in M if m.is_universal] == [M.UNIVERSAL]
+    assert [m for m in M if m.is_fused] == [M.FUSED]
 
 
 def test_advanced_sampling_mode_on_base_config():
@@ -56,7 +51,7 @@ def test_advanced_sampling_mode_on_base_config():
 
 def test_all_modes_construct_regardless_of_rejection():
     """Every mode constructs with or without rejection sampling (no config gating)."""
-    for mode in ("full", "no_topk", "no_topp", "no_topk_no_topp"):
+    for mode in ("full", "no_topk", "no_topp", "no_topk_no_topp", "fused"):
         for rej in (False, True):
             cfg = MTPDecodingConfig(
                 max_draft_len=1, advanced_sampling_mode=mode, use_rejection_sampling=rej

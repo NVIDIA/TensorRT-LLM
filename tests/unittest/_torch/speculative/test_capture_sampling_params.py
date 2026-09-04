@@ -305,16 +305,9 @@ def _populate_meta(mode, draft_len=1):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "populate allocates CUDA buffers")
-class TestMinPBufferFillIsGatedOnUniversal(unittest.TestCase):
-    """Only UNIVERSAL reads the min_p buffers, so only UNIVERSAL should fill them.
-
-    The cheap direction of a mistake here is wasted host work on every existing deploy.
-    The expensive direction is silent: if UNIVERSAL stopped filling them, every request's
-    min_p would read as the 0.0 sentinel and the filter would vanish without an error.
-    """
-
-    def test_universal_fills_the_min_p_buffers(self):
-        meta = _populate_meta(AdvancedSamplingMode.UNIVERSAL)
+class TestMinPBufferFillIsGatedOnFused(unittest.TestCase):
+    def test_fused_fills_the_min_p_buffers(self):
+        meta = _populate_meta(AdvancedSamplingMode.FUSED)
         SpecMetadata.populate_sampling_params_for_one_model(
             meta, [_request(temperature=1.0, min_p=0.25)]
         )
@@ -386,7 +379,7 @@ class TestMinPExpandsWithTheSameLayoutAsTopP(unittest.TestCase):
         return len(owners)
 
     def test_mixed_context_and_generation_batch(self):
-        meta = _populate_meta(AdvancedSamplingMode.UNIVERSAL, draft_len=self.DRAFT_LEN)
+        meta = _populate_meta(AdvancedSamplingMode.FUSED, draft_len=self.DRAFT_LEN)
         min_ps = [0.1, 0.2, 0.3]
         top_ps = [0.7, 0.8, 0.9]
         requests = [
@@ -406,7 +399,7 @@ class TestMinPExpandsWithTheSameLayoutAsTopP(unittest.TestCase):
         alone, min_p would keep the previous, shorter layout and every token after the
         transition would read its neighbour's filter.
         """
-        meta = _populate_meta(AdvancedSamplingMode.UNIVERSAL, draft_len=self.DRAFT_LEN)
+        meta = _populate_meta(AdvancedSamplingMode.FUSED, draft_len=self.DRAFT_LEN)
         min_ps = [0.1, 0.2]
         top_ps = [0.7, 0.8]
 
@@ -426,7 +419,7 @@ class TestMinPExpandsWithTheSameLayoutAsTopP(unittest.TestCase):
 
     def test_transition_invalidates_only_the_expanded_signature(self):
         """The refill decision itself, stated directly rather than through the buffers."""
-        meta = _populate_meta(AdvancedSamplingMode.UNIVERSAL, draft_len=self.DRAFT_LEN)
+        meta = _populate_meta(AdvancedSamplingMode.FUSED, draft_len=self.DRAFT_LEN)
         as_context = [_context_request(temperature=1.0, min_p=0.1, top_p=0.7, slot=0)]
         as_generation = [_request(temperature=1.0, min_p=0.1, top_p=0.7, slot=0)]
 
