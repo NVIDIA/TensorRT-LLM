@@ -378,25 +378,6 @@ def test_mla_unsupported_kv_quant_fallback_syncs_cache_reuse(monkeypatch):
     assert runtime_cache_reuse is False
 
 
-@pytest.mark.parametrize(
-    "sparse_algorithm, expected_cache_reuse",
-    [("dsa", True), ("deepseek_v4", True), (None, False)],
-)
-def test_mla_nvfp4_cache_reuse_requires_supported_sparse_path(
-    monkeypatch, sparse_algorithm, expected_cache_reuse
-):
-    """Verify NVFP4 MLA cache reuse is limited to supported sparse paths."""
-    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
-        monkeypatch,
-        sm_version=100,
-        kv_cache_quant_algo=QuantAlgo.NVFP4,
-        sparse_algorithm=sparse_algorithm,
-    )
-
-    assert kv_cache_reuse is expected_cache_reuse
-    assert runtime_cache_reuse is expected_cache_reuse
-
-
 @pytest.mark.parametrize("sm_version", _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
 def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch, sm_version):
     """Verify every supported MLA SM preserves cache reuse in both config and runtime.

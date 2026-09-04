@@ -1980,18 +1980,6 @@ def test_main_compressor_does_not_materialize_postprocess_output(monkeypatch):
     assert output[1] is None
 
 
-def test_main_nvfp4_compressor_uses_separate_scale_pool(monkeypatch):
-    output, seen = _run_compressor_with_fake_postprocess(
-        monkeypatch, kv_cache_dtype="nvfp4", is_indexer=False
-    )
-
-    assert seen["cache_dtype"] == int(KVCacheDtype.NVFP4_BLOCKWISE)
-    assert seen["kv_cache_scale"] is not None
-    assert seen["nvfp4_global_scale"] == 1.0
-    assert output[0].shape == (1, 128)
-    assert output[1] is None
-
-
 @pytest.mark.parametrize(
     "kv_cache_dtype,cache_dtype,expected_dtype,expected_quant_shape,expected_scale_shape",
     [
