@@ -3836,10 +3836,9 @@ class PyExecutor:
             at least one rank has an INIT request that cannot fit KV capacity
             and has no transfer progress that can unblock it; otherwise False.
         """
-        if (self.benchmark_req_queues_size <= 0 or self.is_warmup
-                or not self._benchmark_fill_phase_active):
+        if (self.benchmark_req_queues_size <= 0 or self.is_warmup):
             return False
-
+        local_fill_active = bool(self._benchmark_fill_phase_active)
         local_has_stuck = any(req.is_disagg_generation_init_state
                               for req in self.active_requests)
         local_all_fetched = (self.num_fetch_requests
@@ -3847,11 +3846,17 @@ class PyExecutor:
         local_terminal_no_fit = (local_has_stuck and
                                  not scheduler_fitting_disagg_gen_init_requests
                                  and not wait_for_disagg_gen_transfer_progress)
-        local_status = (local_all_fetched, local_terminal_no_fit)
+        local_status = (local_fill_active, local_all_fetched, local_terminal_no_fit)
 
         all_rank_status = self._allgather_model_parallel_status(local_status)
-        all_ranks_fetched = all(status[0] for status in all_rank_status)
-        any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
+        if not all_rank_status:
+            return False
+
+        if not any(status[0] for status in all_rank_status):
+            return False
+
+        all_ranks_fetched = all(status[1] for status in all_rank_status)
+        any_rank_terminal_no_fit = any(status[2] for status in all_rank_status)
         return all_ranks_fetched and any_rank_terminal_no_fit
 
     def _prepare_and_schedule_batch(self):
@@ -7952,6 +7957,16 @@ class PyExecutor:
             scheduled_requests: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
+        mapping = getattr(self, "mapping", getattr(getattr(self, "model_engine", None), "mapping", None))
+        if mapping and getattr(mapping, "enable_attention_dp", False) and mapping.tp_size > 1:
+            local_has_ctx = len(scheduled_requests.context_requests) > 0
+            if hasattr(self, "_allgather_model_parallel_status"):
+                all_rank_status = self._allgather_model_parallel_status((local_has_ctx,))
+                if all_rank_status:
+                    global_has_ctx = any(status[0] for status in all_rank_status)
+                    if global_has_ctx and not local_has_ctx:
+                        scheduled_requests.is_forced_context = True
+
         ExpertStatistic.set_iter(self.iter_counter)
 
         num_ctx_tokens = sum(req.context_chunk_size
