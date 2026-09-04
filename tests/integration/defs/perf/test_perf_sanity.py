@@ -907,6 +907,32 @@ def write_startup_observations(
         json.dump(payload, output_file, indent=2, sort_keys=True)
 
 
+def _is_valid_startup_observation(observation: object) -> bool:
+    """Return whether an artifact entry is safe for metric aggregation."""
+    if not isinstance(observation, dict):
+        return False
+    metrics = observation.get("metrics", {})
+    metadata = observation.get("metadata", {})
+    policies = observation.get("checkpoint_io_policies", [])
+    if not isinstance(metrics, dict) or not all(
+        isinstance(name, str) and isinstance(value, (int, float)) and not isinstance(value, bool)
+        for name, value in metrics.items()
+    ):
+        return False
+    if not isinstance(metadata, dict) or not all(
+        isinstance(name, str) and isinstance(value, str) for name, value in metadata.items()
+    ):
+        return False
+    if not isinstance(policies, list) or not all(isinstance(policy, dict) for policy in policies):
+        return False
+    string_fields = ("requested", "selected", "effective", "fallback_category", "fallback_reason")
+    return all(
+        all(field not in policy or isinstance(policy[field], str) for field in string_fields)
+        and ("activated" not in policy or isinstance(policy["activated"], bool))
+        for policy in policies
+    )
+
+
 def read_startup_observations(test_output_dir: str, server_idx: int) -> dict:
     """Read observations captured while the server was alive."""
     path = os.path.join(test_output_dir, f"startup_metrics.{server_idx}.json")
@@ -932,14 +958,15 @@ def read_startup_observations(test_output_dir: str, server_idx: int) -> dict:
     observation_id = payload.get("startup_observation_id")
     observations = payload.get("observations")
     if not isinstance(observations, list) or not all(
-        isinstance(observation, dict) for observation in observations
+        _is_valid_startup_observation(observation) for observation in observations
     ):
         print_warning(f"Ignoring malformed startup observations from {path}")
         observations = []
+    if not isinstance(observation_id, str) or not observation_id:
+        print_warning(f"Replacing invalid startup observation ID from {path}")
+        observation_id = f"startup-invalid-{secrets.token_hex(16)}"
     return {
-        "startup_observation_id": (
-            observation_id if isinstance(observation_id, str) and observation_id else "unknown"
-        ),
+        "startup_observation_id": observation_id,
         "observations": observations,
     }
 

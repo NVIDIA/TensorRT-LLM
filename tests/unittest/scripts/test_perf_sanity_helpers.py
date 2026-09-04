@@ -443,7 +443,7 @@ def test_add_startup_metric_values_preserves_mixed_policy_activation() -> None:
     assert new_data["s_checkpoint_io_policy_effective"] == "native,rank_striped_read_ahead"
     assert new_data["l_checkpoint_io_policy_status_count"] == 2
     assert new_data["l_checkpoint_io_policy_activated_status_count"] == 1
-    assert "b_checkpoint_io_policy_activated" not in new_data
+    assert new_data["s_checkpoint_io_policy_activated"] == "mixed"
 
 
 def test_collect_startup_observation_records_fetch_failure(
@@ -559,6 +559,47 @@ def test_read_startup_observations_rejects_non_dict_entries(tmp_path: Path) -> N
     bundle = perf_sanity.read_startup_observations(str(tmp_path), 0)
 
     assert bundle == {"startup_observation_id": "startup-1", "observations": []}
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        {"role": "aggregate", "metrics": 1},
+        {"role": "aggregate", "metadata": []},
+        {"role": "aggregate", "checkpoint_io_policies": {}},
+        {"role": "aggregate", "checkpoint_io_policies": ["native"]},
+        {"role": "aggregate", "checkpoint_io_policies": [{"requested": []}]},
+    ],
+)
+def test_read_startup_observations_rejects_malformed_nested_fields(
+    tmp_path: Path, observation: dict
+) -> None:
+    perf_sanity.write_startup_observations(
+        str(tmp_path), 0, [observation], observation_id="startup-1"
+    )
+
+    bundle = perf_sanity.read_startup_observations(str(tmp_path), 0)
+
+    assert bundle == {"startup_observation_id": "startup-1", "observations": []}
+
+
+@pytest.mark.parametrize("observation_id", [None, "", 42])
+def test_read_startup_observations_replaces_invalid_id(
+    tmp_path: Path, observation_id: object
+) -> None:
+    perf_sanity.write_startup_observations(str(tmp_path), 0, [], observation_id="placeholder")
+    artifact = tmp_path / "startup_metrics.0.json"
+    payload = perf_sanity.json.loads(artifact.read_text(encoding="utf-8"))
+    payload["startup_observation_id"] = observation_id
+    artifact.write_text(perf_sanity.json.dumps(payload), encoding="utf-8")
+
+    first = perf_sanity.read_startup_observations(str(tmp_path), 0)
+    second = perf_sanity.read_startup_observations(str(tmp_path), 0)
+
+    assert first["startup_observation_id"].startswith("startup-invalid-")
+    assert second["startup_observation_id"].startswith("startup-invalid-")
+    assert first["startup_observation_id"] != second["startup_observation_id"]
+    assert first["observations"] == []
 
 
 def test_startup_fallback_reasons_are_deduplicated_and_capped() -> None:
