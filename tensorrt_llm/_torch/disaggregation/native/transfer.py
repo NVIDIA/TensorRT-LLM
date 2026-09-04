@@ -83,10 +83,8 @@ if TYPE_CHECKING:
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
-# Number of worker threads for KV transfer queues (default: 4). Each worker owns one FIFO and
-# submits transfers synchronously (blocking wait per slice), so this value is the per-rank cap on
-# concurrent in-flight KV transfer slices.
-KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "4"))
+# Number of worker threads for KV transfer queues (default: 1)
+KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
 
 # Keep standalone TxSession waits responsive to cancellation even when callers
 # do not configure a sender-future wait slice.
