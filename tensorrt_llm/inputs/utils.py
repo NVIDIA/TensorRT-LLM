@@ -20,7 +20,9 @@ from transformers.utils import logging
 
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
-from tensorrt_llm.inputs.media_io import (_get_aiohttp_session,
+from tensorrt_llm.inputs.data import prompt_inputs
+from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY,
+                                          _get_aiohttp_session,
                                           _load_and_convert_image,
                                           _load_video_by_cv2,
                                           _normalize_file_uri,
@@ -818,6 +820,132 @@ async def async_apply_chat_template(
         chat_template_kwargs=chat_template_kwargs,
         enable_tokenize=enable_tokenize,
     )
+
+
+def apply_mm_placeholders(
+    model_type: str,
+    message: ConversationMessage,
+    placeholder_counts: Dict[str, int],
+    mm_data_tracker: "MultimodalDataTracker",
+    *,
+    item_order_start: int = 0,
+    content_format: Optional[ContentFormat] = None,
+) -> None:
+    """Insert this message's multimodal placeholders into its text, in place.
+
+    Only `ContentFormat.STRING` templates need them. For `OPENAI`,
+    `apply_chat_template` rebuilds `content` from `content_parts` via
+    `_build_openai_content`, so pre-inserting here would render every media
+    item twice: once as text and once as the template's own content part.
+
+    When the model opts into interleaving and `content_parts` is available the
+    placeholders keep their original positions; otherwise they are placed in
+    bulk according to the registered placement.
+    """
+    if not placeholder_counts:
+        return
+
+    if content_format is None:
+        registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+            model_type)
+        content_format = (registry_format if registry_format is not None else
+                          ContentFormat.STRING)
+    if content_format != ContentFormat.STRING:
+        return
+
+    content_parts = message.get("content_parts")
+    interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
+        model_type)
+    if content_parts and interleave:
+        message["content"] = interleave_mm_placeholders(
+            model_type, content_parts, placeholder_counts,
+            mm_data_tracker.placeholder_modalities())
+    else:
+        message["content"] = add_multimodal_placeholders(
+            model_type,
+            message["content"],
+            placeholder_counts,
+            item_order=mm_data_tracker.item_order()[item_order_start:],
+        )
+
+
+async def async_build_multimodal_prompt(
+    *,
+    model_type: str,
+    tokenizer: Union[TransformersTokenizer, TokenizerBase],
+    processor: ProcessorMixin,
+    prompt: str,
+    media: List[str],
+    modality: str = "image",
+    add_generation_prompt: bool = True,
+    chat_template: Optional[str] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
+    media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Package one text prompt plus media URLs into engine inputs.
+
+    For callers whose request format is a plain prompt and a list of media
+    references rather than OpenAI chat messages -- the Triton `llmapi` backend,
+    for example. Runs the same steps `trtllm-serve` runs for
+    `v1/chat/completions`: resolve placeholders for the model's content format,
+    render the chat template, and attach the fetched media.
+
+    The media fetches and the template rendering are awaited together, so
+    several items on one request are loaded concurrently.
+
+    Args:
+        model_type: Top-level HF `model_type`, the multimodal registry key.
+        prompt: The user's text, without any placeholder tokens.
+        media: URLs, `data:` URIs or local paths, one per item.
+        modality: Registered media modality, e.g. `"image"`.
+
+    Returns:
+        A `TextPrompt` carrying `multi_modal_data`, ready for
+        `LLM.generate_async`.
+    """
+    media_io_cls = MEDIA_IO_REGISTRY.get(modality)
+    if media_io_cls is None:
+        raise ValueError(f"Unsupported modality {modality!r}. "
+                         f"Registered modalities: {list(MEDIA_IO_REGISTRY)}")
+    media_io = media_io_cls.create((media_io_kwargs or {}).get(modality), None)
+
+    mm_data_tracker = MultimodalDataTracker(model_type)
+    content_parts: List[Union[str, Dict[str, Any]]] = []
+    for index, item in enumerate(media):
+        # `add_data` takes the un-awaited fetch; they run concurrently below.
+        mm_data_tracker.add_data(modality, media_io.async_load(item))
+        content_parts.append({"type": modality, "media_index": index})
+    content_parts.append(prompt)
+
+    message = ConversationMessage(role="user",
+                                  content=prompt,
+                                  media=[],
+                                  content_parts=content_parts)
+    placeholder_counts = mm_data_tracker.placeholder_counts()
+    apply_mm_placeholders(model_type, message, placeholder_counts,
+                          mm_data_tracker)
+
+    prompt_task = async_apply_chat_template(
+        model_type=model_type,
+        tokenizer=tokenizer,
+        processor=processor,
+        conversation=[message],
+        add_generation_prompt=add_generation_prompt,
+        mm_placeholder_counts=[placeholder_counts],
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    rendered, (mm_data,
+               _) = await asyncio.gather(prompt_task,
+                                         mm_data_tracker.retrieve_all_async())
+
+    inputs = prompt_inputs(rendered)
+    if mm_data:
+        inputs["multi_modal_data"] = mm_data
+        item_order = mm_data_tracker.item_order()
+        if item_order:
+            inputs["mm_item_order"] = item_order
+    return inputs
 
 
 def default_multimodal_input_loader(

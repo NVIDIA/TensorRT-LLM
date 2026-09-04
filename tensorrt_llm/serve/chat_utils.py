@@ -17,12 +17,11 @@ from typing_extensions import Required
 
 from tensorrt_llm.inputs import (ContentFormat, ConversationMessage,
                                  MultimodalData, MultimodalDataTracker,
-                                 add_multimodal_placeholders,
                                  load_base64_image_embeds)
 from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
-from tensorrt_llm.inputs.utils import interleave_mm_placeholders
+from tensorrt_llm.inputs.utils import apply_mm_placeholders
 from tensorrt_llm.logger import logger
 
 
@@ -497,25 +496,12 @@ def parse_chat_messages_coroutines(
                         placeholder] = msg_placeholder_counts.get(
                             placeholder, 0) + 1
 
-        if msg_placeholder_counts and content_format == ContentFormat.STRING:
-            # For STRING format, use interleaving when the model opts in
-            # and content_parts is available, otherwise fall back to bulk
-            # prepend/append according to placeholder_placement.
-            content_parts = parsed_msg.get("content_parts")
-            interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
-                model_type)
-            if content_parts and interleave:
-                parsed_msg["content"] = interleave_mm_placeholders(
-                    model_type, content_parts, msg_placeholder_counts,
-                    mm_data_tracker.placeholder_modalities())
-            else:
-                msg_item_order = mm_data_tracker.item_order()[item_order_start:]
-                parsed_msg["content"] = add_multimodal_placeholders(
-                    type(model_config).model_type,
-                    parsed_msg["content"],
-                    msg_placeholder_counts,
-                    item_order=msg_item_order,
-                )
+        apply_mm_placeholders(model_type,
+                              parsed_msg,
+                              msg_placeholder_counts,
+                              mm_data_tracker,
+                              item_order_start=item_order_start,
+                              content_format=content_format)
         mm_placeholder_counts.append(msg_placeholder_counts)
 
     # ``item_order`` is populated synchronously by ``add_data``, so it can

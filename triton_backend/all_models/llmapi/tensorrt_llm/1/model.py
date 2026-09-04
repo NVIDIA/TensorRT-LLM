@@ -52,15 +52,6 @@ from helpers import (get_input_tensor_by_name, get_lora_request_from_request,
 
 
 @dataclass
-class MultimodalContext:
-    """State resolved once at startup and reused for every request."""
-    tokenizer: Any
-    processor: Any
-    model_config: Any
-    model_type: str
-
-
-@dataclass
 class RequestData:
     triton_req_id: int
     triton_user_id: str
@@ -262,9 +253,8 @@ class TritonPythonModel:
 
             self.multimodal_enabled = bool(
                 triton_config.get("multimodal", False))
-            self._multimodal_context = None
             if self.multimodal_enabled:
-                self._init_multimodal_context()
+                self._init_multimodal()
 
             self.req_id_to_request_data = {}
             self.triton_user_id_to_req_ids = {}
@@ -602,16 +592,17 @@ class TritonPythonModel:
                 if triton_user_id is not None and triton_user_id != "" and triton_user_id in self.triton_user_id_to_req_ids:
                     del self.triton_user_id_to_req_ids[triton_user_id]
 
-    def _init_multimodal_context(self):
-        """Resolve the tokenizer, HF processor and pretrained config once."""
+    def _init_multimodal(self):
+        """Resolve the tokenizer, HF processor and model type once."""
         from transformers import AutoProcessor
 
         from tensorrt_llm._torch.pyexecutor.config_utils import \
             load_pretrained_config
 
-        tokenizer = self._llm_engine.tokenizer
+        self._mm_tokenizer = self._llm_engine.tokenizer
         hf_model_dir = self._llm_engine._hf_model_dir or getattr(
-            getattr(tokenizer, "tokenizer", None), "name_or_path", None)
+            getattr(self._mm_tokenizer, "tokenizer", None), "name_or_path",
+            None)
         if hf_model_dir is None:
             raise pb_utils.TritonModelException(
                 "triton_config.multimodal is enabled but the checkpoint directory "
@@ -619,7 +610,7 @@ class TritonPythonModel:
         hf_model_dir = str(hf_model_dir)
         trust_remote_code = self._llm_engine.args.trust_remote_code
         try:
-            processor = AutoProcessor.from_pretrained(
+            self._mm_processor = AutoProcessor.from_pretrained(
                 hf_model_dir, trust_remote_code=trust_remote_code)
             model_config = load_pretrained_config(
                 hf_model_dir,
@@ -633,86 +624,11 @@ class TritonPythonModel:
 
         # Composite configs (e.g. Qwen2_5_VLConfig) delegate the instance
         # attribute to `text_config`, so prefer the class attribute.
-        model_type = getattr(type(model_config), "model_type", None) or getattr(
-            model_config, "model_type", "")
-        self._multimodal_context = MultimodalContext(tokenizer=tokenizer,
-                                                     processor=processor,
-                                                     model_config=model_config,
-                                                     model_type=model_type)
+        self._mm_model_type = getattr(type(model_config),
+                                      "model_type", None) or getattr(
+                                          model_config, "model_type", "")
         self.logger.log_info("[trtllm] multimodal input enabled for model_type "
-                             f"'{self._multimodal_context.model_type}'")
-
-    async def _build_multimodal_prompt(self, text, image_url):
-        """Build a multimodal PromptInputs from a text prompt and image URLs.
-
-        Runs the same sequence `trtllm-serve` uses for `v1/chat/completions`.
-        """
-        from tensorrt_llm.inputs import prompt_inputs
-        from tensorrt_llm.inputs.utils import (ConversationMessage,
-                                               MultimodalDataTracker,
-                                               add_multimodal_placeholders,
-                                               apply_chat_template,
-                                               async_load_image)
-
-        # This directory is not shipped in the tensorrt_llm wheel, so operators
-        # copy it out of a git checkout into their model repository. The TRT-LLM
-        # it runs against is therefore not necessarily the one it was written
-        # for, and the multimodal helpers below gained their current shape after
-        # v1.2.1. Degrade to the older equivalents rather than fail at runtime.
-        try:
-            from tensorrt_llm.inputs.utils import async_apply_chat_template
-        except ImportError:
-
-            async def async_apply_chat_template(**kwargs):
-                return await asyncio.to_thread(apply_chat_template, **kwargs)
-
-        ctx = self._multimodal_context
-        media = [
-            url.decode("utf-8") if isinstance(url, bytes) else str(url)
-            for url in image_url.reshape(-1)
-        ]
-
-        # `add_data` takes the un-awaited fetch, so several images on one
-        # request are fetched concurrently.
-        mm_data_tracker = MultimodalDataTracker(ctx.model_type)
-        for url in media:
-            mm_data_tracker.add_data("image", async_load_image(url))
-        mm_placeholder_counts = mm_data_tracker.placeholder_counts()
-        # `item_order`, and the argument it feeds, also post-date v1.2.1.
-        item_order = getattr(mm_data_tracker, "item_order", lambda: None)()
-
-        # The chat template inserts the per-architecture image placeholders,
-        # so callers send a plain question as `text_input`.
-        if item_order:
-            content = add_multimodal_placeholders(ctx.model_type, text,
-                                                  mm_placeholder_counts,
-                                                  item_order)
-        else:
-            content = add_multimodal_placeholders(ctx.model_type, text,
-                                                  mm_placeholder_counts)
-        conversation = [
-            ConversationMessage(role="user", content=content, media=[])
-        ]
-
-        prompt_task = async_apply_chat_template(
-            model_type=ctx.model_type,
-            tokenizer=ctx.tokenizer,
-            processor=ctx.processor,
-            conversation=conversation,
-            add_generation_prompt=True,
-            mm_placeholder_counts=[mm_placeholder_counts],
-        )
-        # Render the template while the images are still in flight.
-        prompt, (mm_data,
-                 _) = await asyncio.gather(prompt_task,
-                                           mm_data_tracker.retrieve_all_async())
-
-        prompt = prompt_inputs(prompt)
-        if mm_data:
-            prompt["multi_modal_data"] = mm_data
-            if item_order:
-                prompt["mm_item_order"] = item_order
-        return prompt
+                             f"'{self._mm_model_type}'")
 
     async def _convert_request(self, request):
         """Helper function to convert the request into a prompt for LLM.generate_async
@@ -747,7 +663,20 @@ class TritonPythonModel:
         if self.multimodal_enabled:
             image_url = get_input_tensor_by_name(request, 'image_url')
             if image_url is not None and image_url.size > 0:
-                prompt = await self._build_multimodal_prompt(prompt, image_url)
+                from tensorrt_llm.inputs import async_build_multimodal_prompt
+
+                prompt = await async_build_multimodal_prompt(
+                    model_type=self._mm_model_type,
+                    tokenizer=self._mm_tokenizer,
+                    processor=self._mm_processor,
+                    prompt=prompt,
+                    media=[
+                        url.decode("utf-8")
+                        if isinstance(url, bytes) else str(url)
+                        for url in image_url.reshape(-1)
+                    ],
+                    modality="image",
+                )
 
         sampling_params = get_sampling_params_from_request(request)
         output_config = get_output_config_from_request(request)

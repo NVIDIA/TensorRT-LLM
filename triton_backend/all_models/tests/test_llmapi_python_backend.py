@@ -28,7 +28,6 @@ import asyncio
 import json
 import sys
 import threading
-import types
 from dataclasses import dataclass
 from typing import Dict, List, Union
 from unittest.mock import MagicMock, patch
@@ -46,7 +45,7 @@ from helpers import (convert_request_input_to_dict,
                      get_sampling_params_from_request,
                      get_streaming_from_request)
 # Use PYTHONPATH=../llmapi/tensorrt_llm/1/
-from model import MultimodalContext, TritonPythonModel
+from model import TritonPythonModel
 
 
 @dataclass
@@ -371,10 +370,9 @@ def _make_multimodal_model(enabled: bool):
     """A bare model with just the multimodal state `_convert_request` reads."""
     model = TritonPythonModel.__new__(TritonPythonModel)
     model.multimodal_enabled = enabled
-    model._multimodal_context = MultimodalContext(tokenizer="tokenizer",
-                                                  processor="processor",
-                                                  model_config=MagicMock(),
-                                                  model_type="qwen2_5_vl")
+    model._mm_tokenizer = "tokenizer"
+    model._mm_processor = "processor"
+    model._mm_model_type = "qwen2_5_vl"
     return model
 
 
@@ -392,15 +390,15 @@ def test_convert_request_ignores_image_url_when_multimodal_disabled():
     assert prompt == "Tell me a story."
 
 
-def test_convert_request_builds_multimodal_prompt_when_enabled():
+def test_convert_request_delegates_to_shared_inputs_helper():
+    # The backend must not build the multimodal prompt itself: placeholder
+    # handling depends on the model's ContentFormat, which the shared helper in
+    # tensorrt_llm.inputs owns. Assert we hand it the right arguments.
     model = _make_multimodal_model(enabled=True)
     captured = {}
 
-    async def fake_build(text, image_url):
-        captured["text"] = text
-        captured["media"] = [
-            url.decode("utf-8") for url in image_url.reshape(-1)
-        ]
+    async def fake_helper(**kwargs):
+        captured.update(kwargs)
         return {
             "prompt": "rendered",
             "multi_modal_data": {
@@ -408,160 +406,27 @@ def test_convert_request_builds_multimodal_prompt_when_enabled():
             }
         }
 
-    model._build_multimodal_prompt = fake_build
+    inputs_mod = MagicMock()
+    inputs_mod.async_build_multimodal_prompt = fake_helper
     request = make_mock_triton_request({
         **inputs(),
-        "image_url": [b"https://example.com/a.jpg"],
+        "image_url": [b"https://example.com/a.jpg", b"/tmp/b.png"],
     })
 
-    prompt, _, _, _, _ = asyncio.run(model._convert_request(request))
+    with patch.dict(sys.modules, {
+            "tensorrt_llm": MagicMock(),
+            "tensorrt_llm.inputs": inputs_mod,
+    }):
+        prompt, _, _, _, _ = asyncio.run(model._convert_request(request))
 
     assert prompt["multi_modal_data"] == {"image": ["decoded"]}
-    assert captured["text"] == "Tell me a story."
-    assert captured["media"] == ["https://example.com/a.jpg"]
-
-
-def test_build_multimodal_prompt_uses_shared_inputs_primitives():
-    # Mocks the deferred tensorrt_llm imports so the test does not require a
-    # built TRT-LLM. Asserts the backend drives the same placeholder/chat
-    # template primitives `trtllm-serve` uses, without importing
-    # `tensorrt_llm.serve` (which would pull in the OpenAI server stack).
-    model = _make_multimodal_model(enabled=True)
-    captured = {}
-
-    class FakeTracker:
-
-        def __init__(self, model_type):
-            captured["model_type"] = model_type
-            self.items = []
-
-        def add_data(self, modality, data):
-            self.items.append((modality, data))
-
-        def placeholder_counts(self):
-            return {"<|image_pad|>": len(self.items)}
-
-        def item_order(self):
-            return [{
-                "modality": modality,
-                "index": i,
-                "placeholder": "<|image_pad|>"
-            } for i, (modality, _) in enumerate(self.items)]
-
-        async def retrieve_all_async(self):
-            return ({"image": [await data for _, data in self.items]}, None)
-
-    async def fake_async_load_image(url):
-        return f"decoded:{url}"
-
-    def fake_add_placeholders(model_type, text, counts, item_order):
-        captured["placeholder_args"] = (model_type, text, counts, item_order)
-        return "<|image_pad|>" + text
-
-    async def fake_apply_chat_template(**kwargs):
-        captured["template_kwargs"] = kwargs
-        return "rendered:" + kwargs["conversation"][0]["content"]
-
-    inputs_mod = MagicMock()
-    inputs_mod.prompt_inputs = lambda prompt: {"prompt": prompt}
-    utils_mod = MagicMock()
-    utils_mod.ConversationMessage = dict
-    utils_mod.MultimodalDataTracker = FakeTracker
-    utils_mod.add_multimodal_placeholders = fake_add_placeholders
-    utils_mod.async_apply_chat_template = fake_apply_chat_template
-    utils_mod.async_load_image = fake_async_load_image
-
-    with patch.dict(
-            sys.modules, {
-                "tensorrt_llm": MagicMock(),
-                "tensorrt_llm.inputs": inputs_mod,
-                "tensorrt_llm.inputs.utils": utils_mod,
-            }):
-        prompt = asyncio.run(
-            model._build_multimodal_prompt(
-                "Describe this.", np.array([b"https://example.com/a.jpg"])))
-
-    assert prompt == {
-        "prompt":
-        "rendered:<|image_pad|>Describe this.",
-        "multi_modal_data": {
-            "image": ["decoded:https://example.com/a.jpg"]
-        },
-        "mm_item_order": [{
-            "modality": "image",
-            "index": 0,
-            "placeholder": "<|image_pad|>"
-        }],
-    }
-    # The registry key, not the delegated "qwen2_5_vl_text" instance attribute.
     assert captured["model_type"] == "qwen2_5_vl"
-    assert captured["placeholder_args"][1] == "Describe this."
-    assert captured["template_kwargs"]["add_generation_prompt"] is True
-
-
-def test_build_multimodal_prompt_falls_back_on_older_trtllm():
-    # The backend template is copied out of a git checkout, so it can run
-    # against a TRT-LLM older than the one it was written for. On <= v1.2.1
-    # there is no async_apply_chat_template, the tracker has no item_order(),
-    # and add_multimodal_placeholders takes three arguments.
-    model = _make_multimodal_model(enabled=True)
-    captured = {}
-
-    class OldTracker:
-
-        def __init__(self, model_type):
-            self.items = []
-
-        def add_data(self, modality, data):
-            self.items.append(data)
-
-        def placeholder_counts(self):
-            return {"<|image_pad|>": len(self.items)}
-
-        async def retrieve_all_async(self):
-            return ({"image": [await data for data in self.items]}, None)
-
-    async def fake_async_load_image(url):
-        return f"decoded:{url}"
-
-    def fake_add_placeholders(model_type, text, counts):
-        captured["placeholder_argcount"] = 3
-        return "<|image_pad|>" + text
-
-    def fake_apply_chat_template(**kwargs):
-        captured["used_sync_template"] = True
-        return "rendered:" + kwargs["conversation"][0]["content"]
-
-    # SimpleNamespace, not MagicMock: the missing attribute must raise
-    # ImportError so the compatibility path is the one under test.
-    utils_mod = types.SimpleNamespace(
-        ConversationMessage=dict,
-        MultimodalDataTracker=OldTracker,
-        add_multimodal_placeholders=fake_add_placeholders,
-        apply_chat_template=fake_apply_chat_template,
-        async_load_image=fake_async_load_image,
-    )
-    inputs_mod = MagicMock()
-    inputs_mod.prompt_inputs = lambda prompt: {"prompt": prompt}
-
-    with patch.dict(
-            sys.modules, {
-                "tensorrt_llm": MagicMock(),
-                "tensorrt_llm.inputs": inputs_mod,
-                "tensorrt_llm.inputs.utils": utils_mod,
-            }):
-        prompt = asyncio.run(
-            model._build_multimodal_prompt(
-                "Describe this.", np.array([b"https://example.com/a.jpg"])))
-
-    assert prompt == {
-        "prompt": "rendered:<|image_pad|>Describe this.",
-        "multi_modal_data": {
-            "image": ["decoded:https://example.com/a.jpg"]
-        },
-    }
-    assert "mm_item_order" not in prompt
-    assert captured == {"placeholder_argcount": 3, "used_sync_template": True}
+    assert captured["tokenizer"] == "tokenizer"
+    assert captured["processor"] == "processor"
+    assert captured["modality"] == "image"
+    assert captured["prompt"] == "Tell me a story."
+    # Bytes tensors are decoded, order preserved.
+    assert captured["media"] == ["https://example.com/a.jpg", "/tmp/b.png"]
 
 
 def _bare_model_for_execute():
