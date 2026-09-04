@@ -949,8 +949,7 @@ def publishMultiGpuLabelRequiredMarker(pipeline, singleGpuState, stateLockName, 
 }
 
 def resolveMultiGpuGate(pipeline, singleGpuState, stateLockName, globalVars,
-                        boolean isFullSingleGpuRun, boolean currentSingleGpuSucceeded,
-                        String arch) {
+                        boolean isFullSingleGpuRun, String arch) {
     def gate = null
     // Serialize the one-time API decision separately from the short-lived state
     // lock, so a slow GitHub request cannot prevent the sibling from recording
@@ -966,7 +965,7 @@ def resolveMultiGpuGate(pipeline, singleGpuState, stateLockName, globalVars,
             def reason = ""
             if (labelCheck.allowed) {
                 decision = "LABEL_ALLOWED"
-            } else if (!isFullSingleGpuRun || !currentSingleGpuSucceeded) {
+            } else if (!isFullSingleGpuRun) {
                 decision = "DENIED"
                 reason = labelCheck.blockReason
             } else {
@@ -1237,9 +1236,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
 {
     try {
-        def blockReason = requireMultiGpuApprovalLabel(
+        def labelCheck = checkMultiGpuApprovalLabel(
             pipeline, globalVars, "CBTS telemetry")
-        return !blockReason
+        return labelCheck.allowed
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
@@ -2323,7 +2322,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     stateLockName,
                     globalVars,
                     isFullSingleGpuRun,
-                    singleGpuResult == "SUCCESS",
                     "x86_64"
                 )
                 if (x86Gate.decision == "DENIED") {
@@ -2557,7 +2555,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     stateLockName,
                     globalVars,
                     isFullSingleGpuRun,
-                    singleGpuResult == "SUCCESS",
                     "SBSA"
                 )
                 if (sbsaGate.decision == "DENIED") {
