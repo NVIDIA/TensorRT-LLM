@@ -186,8 +186,15 @@ class MsaSparseGqaFmha(Fmha):
 
     @classmethod
     def is_available(cls, attn: Optional["TrtllmAttention"] = None) -> bool:
-        # fmha_sm100 runs only on the SM100 family and ships in the MSA git
-        # submodule, so it is unavailable off SM100 or without the package.
+        if (
+            attn is not None
+            and getattr(attn, "skip_correction_threshold", 0.0) > 0.0
+            and not cls.supports_skip_correction
+        ):
+            return False
+
+        # fmha_sm100 runs only on the SM100 family and is packaged in the
+        # wheel, so it is unavailable off SM100 or without the wheel.
         # Imported lazily because the minimax_m3 package init imports the trtllm
         # attention classes, which a module-scope import here would cycle with.
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
@@ -197,8 +204,8 @@ class MsaSparseGqaFmha(Fmha):
         if not is_sm_100f() or not msa_package_available():
             return False
         # Only the MiniMax-M3 MSA layer uses this library. Matching the lowered
-        # sparse algorithm lets the base create_fmha_libs add it to that layer
-        # alone, so no create_fmha_libs override is needed.
+        # sparse algorithm lets FmhaManager construction add it to that layer
+        # alone, so no custom library discovery is needed.
         return attn.sparse_params is not None and attn.sparse_params.algorithm == "minimax_m3"
 
     def forward(

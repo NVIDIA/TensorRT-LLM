@@ -27,15 +27,18 @@ from pydantic import Field
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.visual_gen.params import MediaRole
 
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
+from .offloading import OffloadPipelineStage, PipelineOffloader, transformer_component_offload_name
 from .profiler import VisualGenProfiler
 
 
@@ -58,6 +61,39 @@ class ExtraParamSchema(StrictBaseModel):
         "values. Must be a module-level function (specs are pickled to the "
         "coordinator in the READY handshake).",
     )
+    requires_tensor_output: bool = Field(
+        default=False,
+        description="Setting this parameter makes the request produce a result "
+        "the media encoders cannot represent (a non-image/video modality), so "
+        "the response must be a tensor payload. Serve resolves 'auto' to a "
+        "tensor format and rejects an explicit encoder format. Declared here "
+        "rather than hard-coded in the routes so the serving layer needs no "
+        "per-model knowledge.",
+    )
+
+
+class RoleSpec(StrictBaseModel):
+    """One accepted role for a reference modality, with its count bounds."""
+
+    role: MediaRole = Field(description="Role of the reference input.")
+    min: int = Field(default=1, description="Minimum count for this role.")
+    max: Optional[int] = Field(
+        default=1, description="Maximum count for this role (None = unbounded)."
+    )
+
+
+class RefSlotSpec(StrictBaseModel):
+    """Reference slot a pipeline accepts for one modality.
+
+    A request item's ``role`` is required only when ``roles`` has more than one
+    entry (same modality carries multiple roles, e.g. first + last frame);
+    otherwise the single declared role is inferred. Exposed via
+    ``VisualGen.ref_slot_specs`` and enforced by ``validate_visual_gen_params``.
+    Pickled to the coordinator in the READY handshake, so keep it plain data.
+    """
+
+    modality: MediaModality = Field(description="Reference modality.")
+    roles: List[RoleSpec] = Field(description="Accepted roles + counts for this modality.")
 
 
 if TYPE_CHECKING:
@@ -69,6 +105,8 @@ class BasePipeline(nn.Module):
     """
     Base class for diffusion pipelines.
     """
+
+    supports_image_edit: bool = False
 
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
@@ -86,9 +124,12 @@ class BasePipeline(nn.Module):
         self.pipeline_config = pipeline_config
         self.config = pipeline_config.primary_pretrained_config
         self.mapping: Mapping = getattr(pipeline_config, "mapping", None) or Mapping()
+        self._device = torch.device(getattr(pipeline_config, "device", "cuda"))
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
+        self.offloader = PipelineOffloader(self)
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
+        self._runtime_lora_applications: List[Any] = []
 
         # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
         self.cache_accelerator: Optional["CacheAccelerator"] = None
@@ -148,6 +189,12 @@ class BasePipeline(nn.Module):
         if not self.pipeline_config.cuda_graph.enable:
             return
 
+        if self.offloader.stages():
+            raise NotImplementedError(
+                "CUDA graphs are not supported with visual generation offloading yet. "
+                "Disable either cuda_graph_config.enable or cpu_offload_config.enable."
+            )
+
         if len(self.transformer_components) > 1:
             logger.info(
                 "CUDA graph runner: multiple transformer components, using shared graph pool"
@@ -197,12 +244,12 @@ class BasePipeline(nn.Module):
 
     @property
     def device(self):
-        return self.transformer.device
+        return self._device
 
     @property
-    def transformer_components(self) -> list:
-        """Return list of transformer components this pipeline needs."""
-        return [PipelineComponent.TRANSFORMER] if self.transformer is not None else []
+    def transformer_components(self) -> list[str]:
+        """Return names of transformer components this pipeline needs."""
+        return [PipelineComponent.TRANSFORMER.value] if self.transformer is not None else []
 
     def warmup_cache_key(self, height: int, width: int, num_frames: int) -> tuple:
         """Return the cache key for a given warmup shape.
@@ -330,6 +377,17 @@ class BasePipeline(nn.Module):
         return {}
 
     @property
+    def ref_slot_specs(self) -> Dict[str, RefSlotSpec]:
+        """Reference slots this pipeline accepts.
+
+        Maps a ``VisualGenParams`` reference field name
+        (``image_reference`` / ``video_reference`` / ``audio_reference``) to a
+        :class:`RefSlotSpec` declaring the accepted roles and per-role counts.
+        Empty by default (pipeline takes no reference inputs).
+        """
+        return {}
+
+    @property
     def default_generation_params(self) -> dict:
         """Model-specific defaults for ``None`` fields in ``VisualGenParams``.
 
@@ -406,6 +464,149 @@ class BasePipeline(nn.Module):
     def post_load_weights(self) -> None:
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
+
+    def default_offload_stages(self) -> tuple[OffloadPipelineStage, ...]:
+        """Return model-specific offload stages requested by shorthand config.
+
+        Each stage is a tuple of component names from ``offload_pipeline_components``.
+        Components in the same stage are brought onto the GPU together.
+        """
+        return ()
+
+    def extra_offload_component_names(self) -> set[str]:
+        """Return component names that are valid in configured stages but may be absent.
+
+        These are accepted during stage validation even when missing from
+        ``offload_pipeline_components`` (e.g. rank-0-only components that other ranks
+        drop later). Defaults to an empty set; models override as needed.
+        """
+        return set()
+
+    def offload_pipeline_components(self) -> dict[str, nn.Module]:
+        """Expose standard component subtrees for offloading.
+
+        This default assumes the common diffusers-style layout: a ``text_encoder``,
+        a ``vae``, and one or more transformers each exposing their decoder layers
+        as ``.blocks``. Models that deviate from this naming/structure (e.g. Cosmos3,
+        whose towers live inside a single ``transformer`` module) must override this
+        to expose their own offloadable components.
+
+        NOTE: this attribute-name based detection is convenient but brittle; if we
+        extend offloading to more model families it may be worth replacing with an
+        explicit per-model declaration instead of relying on these conventions.
+        """
+        components: dict[str, nn.Module] = {}
+        text_encoder = getattr(self, PipelineComponent.TEXT_ENCODER.value, None)
+        if text_encoder is not None:
+            components[PipelineComponent.TEXT_ENCODER.value] = text_encoder
+
+        vae = getattr(self, PipelineComponent.VAE.value, None)
+        if vae is not None:
+            components[PipelineComponent.VAE.value] = vae
+
+        for component_name in self.transformer_components:
+            transformer = getattr(self, component_name, None)
+            blocks = getattr(transformer, "blocks", None) if transformer is not None else None
+            if blocks is not None:
+                public_name = transformer_component_offload_name(
+                    component_name, PipelineComponent.TRANSFORMER.value
+                )
+                components[public_name] = blocks
+        return components
+
+    def initialize_offload_pipeline(self) -> None:
+        """Create and initialize the offload pipeline after weights are loaded."""
+        self.offloader.initialize()
+
+    def _setup_runtime_lora(self) -> None:
+        runtime_lora = getattr(self.pipeline_config, "runtime_lora", None)
+        if runtime_lora is None or self._runtime_lora_applications:
+            return
+
+        from .runtime_lora import (
+            _commit_runtime_lora_plan,
+            _log_runtime_lora_application,
+            _prepare_runtime_lora,
+        )
+
+        transformer_component_names = list(self.transformer_components)
+        transformer_components = set(transformer_component_names)
+        if not runtime_lora.target_components and len(transformer_component_names) > 1:
+            raise ValueError(
+                "runtime_lora_config.target_components must be set when a pipeline "
+                f"has multiple transformer components: {transformer_component_names}. "
+                "A single runtime_lora_config.path cannot be safely applied by default "
+                "to every component."
+            )
+        component_names = runtime_lora.target_components or transformer_component_names
+        if len(component_names) != len(set(component_names)):
+            raise ValueError(
+                f"runtime_lora_config.target_components contains duplicates: {component_names}"
+            )
+        total_applied = 0
+        plans = []
+        require_each_component_match = runtime_lora.strict and bool(runtime_lora.target_components)
+        for component_name in component_names:
+            if component_name not in transformer_components:
+                if runtime_lora.strict:
+                    raise ValueError(
+                        "runtime_lora_config target component "
+                        f"'{component_name}' is not in transformer_components "
+                        f"{sorted(transformer_components)}"
+                    )
+                logger.warning(
+                    f"Runtime LoRA skipping non-transformer component '{component_name}'"
+                )
+                continue
+            component = getattr(self, component_name, None)
+            if component is None:
+                if runtime_lora.strict:
+                    raise ValueError(
+                        f"runtime_lora_config requested missing component '{component_name}'"
+                    )
+                logger.warning(f"Runtime LoRA skipping missing component '{component_name}'")
+                continue
+            if not isinstance(component, nn.Module):
+                if runtime_lora.strict:
+                    raise ValueError(
+                        f"runtime_lora_config requested non-module component '{component_name}'"
+                    )
+                logger.warning(f"Runtime LoRA skipping non-module component '{component_name}'")
+                continue
+
+            component_prefixes = [f"{component_name}.", f"model.{component_name}."]
+            plan = _prepare_runtime_lora(
+                component,
+                runtime_lora,
+                default_strip_prefixes=component_prefixes,
+                raise_on_no_matches=False,
+            )
+            application = plan.application
+            if require_each_component_match and not application.applied_modules:
+                raise ValueError(
+                    f"No Runtime LoRA modules from {runtime_lora.path!r} matched "
+                    f"selected component '{component_name}'."
+                )
+            plans.append((component_name, plan))
+            total_applied += len(application.applied_modules)
+
+        if total_applied == 0 and runtime_lora.strict:
+            raise ValueError(
+                f"No Runtime LoRA modules from {runtime_lora.path!r} matched "
+                f"components {component_names}."
+            )
+
+        applications = []
+        for component_name, plan in plans:
+            application = _commit_runtime_lora_plan(plan)
+            applications.append(application)
+            _log_runtime_lora_application(application)
+            if application.applied_modules:
+                logger.info(
+                    f"Runtime LoRA fused into {component_name}: {list(application.applied_modules)}"
+                )
+
+        self._runtime_lora_applications = applications
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict] = None) -> None:
         """Resolve TeaCache polynomial coefficients into pipeline_config.cache (TeaCacheConfig).
@@ -1093,8 +1294,11 @@ class BasePipeline(nn.Module):
             guidance_interval: Optional ``(lo, hi)`` scheduler-timestep range in which CFG
                               is active. Outside the interval the effective scale is 1.0
                               (conditional prediction only); both branches still run.
-            post_step_fn: Optional callable applied after each scheduler step,
-                         invoked as ``post_step_fn(latents) -> latents``.
+            post_step_fn: Optional callable applied after each scheduler step.
+                         It is invoked as ``post_step_fn(latents,
+                         extra_stream_latents) -> (latents, extra_stream_latents)``,
+                         where ``extra_stream_latents`` is the dict of parallel streams
+                         from ``extra_streams`` (e.g. ``{"action": ...}``).
                          Use for constraints that must hold throughout denoising.
             scheduler_step_kwargs: Extra keyword arguments forwarded to every
                          scheduler's ``step()`` call.
@@ -1204,7 +1408,7 @@ class BasePipeline(nn.Module):
             )
 
             if post_step_fn is not None:
-                latents = post_step_fn(latents)
+                latents, extra_stream_latents = post_step_fn(latents, extra_stream_latents)
 
             # Logging
             if self.rank == 0:
@@ -1227,7 +1431,7 @@ class BasePipeline(nn.Module):
                 stats = self.cache_accelerator.get_stats()
                 if stats:
                     if self.pipeline_config.cache_backend == "cache_dit":
-                        logger.info("Cache-DiT stats: %s", stats)
+                        logger.info(f"Cache-DiT stats: {stats}")
                     elif self.pipeline_config.cache_backend == "teacache":
                         first_val = next(iter(stats.values()), None)
                         if isinstance(first_val, dict):
@@ -1251,6 +1455,7 @@ class BasePipeline(nn.Module):
         """Call before dist.destroy_process_group()."""
         self._profiler.close_window()
 
+        self.offloader.cleanup()
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()

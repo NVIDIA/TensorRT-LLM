@@ -346,7 +346,8 @@ public:
     virtual ~RunnerBase() = default;
     virtual void prepare(AttentionOp& op) const = 0;
     virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0) const
+        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0,
+        int const maxCrossKvLength = 0) const
         = 0;
     // typically, we use single qkv input, but for context MLA, we use separate qkv inputs
     virtual void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
@@ -384,7 +385,8 @@ public:
         std::optional<torch::Tensor> relative_attention_bias,
         std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
         std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt,
-        bool enable_dsv4_epilogue_fusion = false) const
+        bool enable_dsv4_epilogue_fusion = false, std::optional<torch::Tensor> kv_norm_weight = std::nullopt,
+        double kv_norm_eps = 1e-6) const
         = 0;
 };
 
@@ -411,10 +413,11 @@ public:
     }
 
     int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0) const override
+        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0,
+        int const maxCrossKvLength = 0) const override
     {
         size_t const context_workspace_size = op.getWorkspaceSizeForContext(
-            op.mType, max_num_requests, op.mMaxContextLength, 0, num_tokens, ctx_total_kv_len);
+            op.mType, max_num_requests, op.mMaxContextLength, maxCrossKvLength, num_tokens, ctx_total_kv_len);
         size_t const generation_workspace_size = op.getWorkspaceSizeForGeneration(
             op.mType, max_num_sequences, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
 
@@ -454,7 +457,8 @@ public:
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
         std::optional<torch::Tensor> relative_attention_bias, std::optional<torch::Tensor> quant_scale_qkv,
-        std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion) const override
+        std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
+        std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -521,6 +525,44 @@ public:
                     ? reinterpret_cast<float const*>(quant_scale_qkv.value().data_ptr())
                     : nullptr;
                 mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
+
+                // Fused kv_a_layernorm: the norm weight implies `latent_cache` is the
+                // RAW kv_a_proj output, with the caller's RMSNorm and concat dropped.
+                if (kv_norm_weight.has_value())
+                {
+                    TORCH_CHECK(kv_norm_weight->is_cuda(), "kv_norm_weight must be a CUDA tensor");
+                    TORCH_CHECK(kv_norm_weight->is_contiguous(), "kv_norm_weight must be contiguous");
+                    TORCH_CHECK(kv_norm_weight->scalar_type() == qkv_or_q.scalar_type(),
+                        "kv_norm_weight dtype must match the activation dtype");
+                    TORCH_CHECK(latent_cache.has_value(),
+                        "fused kv-norm needs latent_cache (the raw kv_a_proj output) to be provided");
+                    // The kernel norms the whole latent row, so a narrower weight would
+                    // read out of bounds. dsv3RopeOp.cpp checks the same on the
+                    // generation side.
+                    // `mla_params.meta` is not assigned until further below; read the op's copy.
+                    auto const kv_norm_width = op.mMLAParams.kv_lora_rank + op.mMLAParams.qk_rope_head_dim;
+                    TORCH_CHECK(kv_norm_weight->numel() == kv_norm_width,
+                        "kv_norm_weight must span kv_lora_rank + qk_rope_head_dim (", kv_norm_width, "), got ",
+                        kv_norm_weight->numel());
+                    // A last-dim slice, so rows are wider than the row itself. Forward
+                    // the real stride; only the innermost dim must be unit-stride.
+                    TORCH_CHECK(latent_cache->dim() == 2, "latent_cache must be 2D for fused kv-norm, got ",
+                        latent_cache->dim(), "D");
+                    TORCH_CHECK(latent_cache->stride(1) == 1, "latent_cache must be unit-stride in its last dim");
+                    // The kernel walks rows with 16-byte vector loads, so a row start
+                    // that is not 16B-aligned faults with a bare misaligned-address
+                    // error far from here.
+                    auto const kEltsPer16B = 16 / latent_cache->element_size();
+                    TORCH_CHECK(latent_cache->stride(0) % kEltsPer16B == 0, "latent_cache row stride (",
+                        latent_cache->stride(0), ") must be a multiple of ", kEltsPer16B,
+                        " for the fused kv-norm 16B vector loads");
+                    TORCH_CHECK(reinterpret_cast<uintptr_t>(latent_cache->data_ptr()) % 16 == 0,
+                        "latent_cache must be 16B-aligned for the fused kv-norm vector loads");
+                    mla_params.latent_row_stride = static_cast<int>(latent_cache->stride(0));
+                    mla_params.kv_norm_weight = static_cast<void const*>(kv_norm_weight->data_ptr());
+                    mla_params.kv_norm_eps = static_cast<float>(kv_norm_eps);
+                    mla_params.fuse_kv_norm_in_rope = true;
+                }
             }
             else if (is_context)
             {
@@ -714,13 +756,33 @@ public:
         if (op.mKVCacheQuantMode.hasKvCacheQuant() && kv_scale_orig_quant.has_value()
             && kv_scale_quant_orig.has_value())
         {
-            kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
-            kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
             if (op.mKVCacheQuantMode.hasFp4KvCache())
             {
-                TORCH_CHECK(kv_scale_orig_quant.value().size(0) == 3);
-                TORCH_CHECK(kv_scale_quant_orig.value().size(0) == 3);
+                if (op.isMLAEnabled())
+                {
+                    auto const& origQuantScale = kv_scale_orig_quant.value();
+                    auto const& quantOrigScale = kv_scale_quant_orig.value();
+                    TORCH_CHECK(origQuantScale.scalar_type() == torch::kFloat32,
+                        "kv_scale_orig_quant must have float32 dtype for MLA with FP4 KV cache");
+                    TORCH_CHECK(quantOrigScale.scalar_type() == torch::kFloat32,
+                        "kv_scale_quant_orig must have float32 dtype for MLA with FP4 KV cache");
+                    TORCH_CHECK(origQuantScale.is_contiguous(),
+                        "kv_scale_orig_quant must be contiguous for MLA with FP4 KV cache");
+                    TORCH_CHECK(quantOrigScale.is_contiguous(),
+                        "kv_scale_quant_orig must be contiguous for MLA with FP4 KV cache");
+                    TORCH_CHECK(origQuantScale.dim() == 1 && origQuantScale.size(0) == 1,
+                        "kv_scale_orig_quant must have shape [1] for MLA with FP4 KV cache");
+                    TORCH_CHECK(quantOrigScale.dim() == 1 && quantOrigScale.size(0) == 1,
+                        "kv_scale_quant_orig must have shape [1] for MLA with FP4 KV cache");
+                }
+                else
+                {
+                    TORCH_CHECK(kv_scale_orig_quant.value().size(0) == 3);
+                    TORCH_CHECK(kv_scale_quant_orig.value().size(0) == 3);
+                }
             }
+            kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
+            kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
         }
         // For FP8 output, out_scale represents the output scale.
         float const* out_scale_ptr = (op.mFP8ContextFMHA && !op.mFuseFp4Quant && out_scale.has_value())
@@ -774,8 +836,9 @@ public:
         {
             if (host_kv_cache_pool_pointers.has_value())
             {
-                auto* kvCachePool = reinterpret_cast<char*>(
-                    host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
+                auto* kvCachePool = reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().dim() == 3
+                        ? host_kv_cache_pool_pointers.value().index({pool_index, 0, 0}).item<int64_t>()
+                        : host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
                 if (sparse_attn_kv_lens.has_value())
                 {
                     // Deepseek V4 dynamic sparse MLA always uses the SWA pool for now.
@@ -788,7 +851,9 @@ public:
                 }
                 else
                 {
-                    op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = kvCachePool;
+                    op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = aux_kv_cache_pool_ptr.has_value()
+                        ? reinterpret_cast<char*>(aux_kv_cache_pool_ptr.value())
+                        : kvCachePool;
                 }
             }
         }
@@ -896,6 +961,7 @@ public:
                 auto const& cross_kv_tensor = cross_kv.value();
                 enqueue_params.cross_kv = static_cast<T const*>(cross_kv_tensor.data_ptr());
                 enqueue_params.num_encoder_tokens = static_cast<int32_t>(cross_kv_tensor.size(0));
+                // Kept in step with maxCrossKvLength in attention(), which sizes the workspace carved here.
                 enqueue_params.cross_kv_length
                     = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
             }
@@ -1114,7 +1180,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences)
+    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
+    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps, double skip_correction_threshold)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1256,6 +1323,12 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         = static_cast<float>(skip_softmax_threshold_scale_factor_prefill.value_or(0));
     op->mSkipSoftmaxThresholdScaleFactorDecode
         = static_cast<float>(skip_softmax_threshold_scale_factor_decode.value_or(0));
+    auto constexpr maxSkipCorrectionThreshold = 32.0;
+    TORCH_CHECK(skip_correction_threshold >= 0.0 && skip_correction_threshold <= maxSkipCorrectionThreshold,
+        "skip_correction_threshold must be in the range (0, 32] when enabled, or 0 when disabled.");
+    int const smVersion = op->smVersion();
+    bool const applySkipCorrection = is_mla_enable && (smVersion == 100 || smVersion == 103);
+    op->mSkipCorrectionThreshold = applySkipCorrection ? static_cast<float>(skip_correction_threshold) : 0.0F;
 #ifdef SKIP_SOFTMAX_STAT
     op->mSkipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(skip_softmax_stat.value().data_ptr());
     op->mSkipSoftmaxSkippedBlocks = op->mSkipSoftmaxTotalBlocks + 1;
@@ -1314,12 +1387,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             static_cast<int>(v_head_dim.value()), static_cast<int>(predicted_tokens_per_seq),
             static_cast<int>(layer_num), static_cast<int>(rope_append_value)};
 
+        op->mUseNvfp4MlaKvCache = op->mKVCacheQuantMode.hasFp4KvCache() && op->mUseTllmGenSparseAttention
+            && !sparse_attn_kv_lens.has_value() && aux_kv_cache_pool_ptr.has_value();
         op->mFP8ContextMLA
             = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::getSMVersion() == 100
                   || tensorrt_llm::common::getSMVersion() == 103 || tensorrt_llm::common::getSMVersion() == 120)
-            && op->mKVCacheQuantMode.hasFp8KvCache();
+            && (op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache);
         op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
-        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
+        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache;
         // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
         op->mUseGenFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && tokens_per_block == 64 && head_size == 576;
 
@@ -1361,8 +1436,18 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
     int32_t const max_blocks_per_sequence
         = use_kv_cache && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
-    int64_t const workspace_size = runner->getWorkspaceSize(
-        *op, num_tokens, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence, ctx_total_kv_len);
+    // For cross-attention, several unfused-path context buffers scale with the encoder KV length.
+    // Mirror the context-stage enqueue, which uses the max past-KV length over the context sequences
+    // as cross_kv_length; sizing with 0 here under-allocates the workspace and the carved views in
+    // enqueueContext land past the end of the allocation. The enqueue also gates on cross_kv.has_value(),
+    //  so this can over-allocate relative to the carve; that is safe.
+    int32_t maxCrossKvLength = 0;
+    if (op->isCrossAttention() && num_contexts > 0)
+    {
+        maxCrossKvLength = host_past_key_value_lengths.slice(0, 0, num_contexts).max().item<int32_t>();
+    }
+    int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens,
+        max_blocks_per_sequence, ctx_total_kv_len, maxCrossKvLength);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
 
     torch::Tensor workspace;
@@ -1401,7 +1486,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_attn_kv_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, aux_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias, quant_scale_qkv,
-            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
+            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, kv_norm_weight, kv_norm_eps);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1424,7 +1509,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_attn_kv_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, aux_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias, quant_scale_qkv,
-            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
+            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion,
+            // Context-only here; generation gets the fusion from mla_rope_generation.
+            /*kv_norm_weight=*/std::nullopt, kv_norm_eps);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);

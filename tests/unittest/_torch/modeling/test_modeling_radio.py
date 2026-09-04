@@ -8,7 +8,8 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_radio
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel
+from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel, VisionTransformer
+from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -21,13 +22,9 @@ _TINY_VIT = modeling_radio.VITTIMMConfig(
     img_size=32,
 )
 
-# Mirror the engine's encoder runtime sizes (``get_encoder_runtime_sizes`` ->
-# ``encoder_max_batch_size`` / ``encoder_max_num_tokens``, defaulting to
-# ``max_batch_size`` / ``max_num_tokens``). The encoder ``AttentionMetadata`` is
-# sized once at load to this max budget; each forward re-preps it with the real
-# per-image seq lens. Two distinct axes: requests = image/sequence count budget,
-# tokens = total patch budget.
-_ENCODER_TEST_MAX_NUM_REQUESTS = 2048
+# Mirror the engine's ``encoder_max_num_tokens`` runtime budget. The encoder
+# ``AttentionMetadata`` is sized once at load to this maximum; each forward
+# re-preps it with the real per-image sequence lengths.
 _ENCODER_TEST_MAX_NUM_TOKENS = 8192
 
 
@@ -98,7 +95,6 @@ def test_radio_fp8_parent_kv_cache_does_not_leak_into_vit(tiny_vit_config):
     for module in vision_model.modules():
         if isinstance(module, MultimodalEncoderMixin):
             module.setup_attn_metadata(
-                max_num_requests=_ENCODER_TEST_MAX_NUM_REQUESTS,
                 max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS,
             )
 
@@ -137,6 +133,30 @@ def _init_finite_weights(model: torch.nn.Module) -> None:
                 torch.nn.init.normal_(param, std=0.02)
             else:
                 param.zero_()
+
+
+def test_radio_run_blocks_lowers_torch_compiling_for_eager_fallback():
+    """A graph miss must keep RADIO attention off the compiled LM path."""
+    x = torch.zeros(1, 4)
+    attn_metadata = mock.Mock()
+    attn_metadata.seq_lens.tolist.return_value = [1]
+
+    observed = []
+    vision_tower = mock.Mock()
+    vision_tower._blocks_graph_runner.maybe_run.side_effect = lambda **_: observed.append(
+        is_torch_compiling()
+    )
+    vision_tower._run_blocks_eager.side_effect = (
+        lambda x, _: observed.append(is_torch_compiling()) or x
+    )
+
+    with torch_compiling(True):
+        output = VisionTransformer._run_blocks(vision_tower, x, attn_metadata)
+        assert is_torch_compiling(), "RADIO must restore the engine's compile flag"
+
+    assert output is x
+    assert observed == [False, False]
+    assert not is_torch_compiling()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

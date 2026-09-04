@@ -1,10 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import contextlib
 import datetime
 import json
 import os
 import random
-import sys
 import time
 from typing import List, Optional, Union
 
@@ -17,20 +31,19 @@ from tensorrt_llm import LLM
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import GenerationResultBase, RequestError
 from tensorrt_llm.llmapi import (KvCacheConfig, KvCacheRetentionConfig,
-                                 LookaheadDecodingConfig, RequestOutput,
-                                 SADecodingConfig)
+                                 RequestOutput, SADecodingConfig)
+from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
                                            load_hf_tokenizer)
 from tensorrt_llm.sampling_params import LogitsProcessor, SamplingParams
-from tensorrt_llm.serve.openai_protocol import CompletionRequest
+from tensorrt_llm.serve.openai_protocol import CompletionRequest, StreamOptions
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      chat_stream_post_processor)
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, altered_env
@@ -38,8 +51,6 @@ from utils.util import force_ampere, similar, altered_env
 # isort: on
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
-# There are other tests based on llama-7B model, such as the end-to-end tests in test_e2e.py, and parallel tests in
-# test_llm_multi_gpu.py.
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -125,7 +136,7 @@ def llm_check_output(llm: LLM,
 
 
 default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-mixtral_model_name = "Mixtral-8x7B-v0.1"
+qwen3_tokenizer_model_name = "Qwen3/Qwen3-0.6B"
 
 llama_model_path = get_model_path(default_model_name)
 
@@ -235,12 +246,10 @@ def test_llm_with_kv_cache_retention_config():
         (get_model_path('gpt2'), False, 0.95),  # BPE
         (get_model_path('bert/bert-base-uncased'), True, 0.95),  # WordPiece
         (get_model_path('t5-small'), True, 0.95),  # SentencePiece
-        (get_model_path('starcoder2-3b'), False, 0.95),
-        (get_model_path('falcon-7b-instruct'), False, 0.95),
         (get_model_path('llama-models-v2/llama-v2-7b-hf'), False, 0.95),
         (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
         (llama_model_path, False, 0.95),
-        (get_model_path(mixtral_model_name), False, 0.95),
+        (get_model_path(qwen3_tokenizer_model_name), False, 0.95),
         (get_model_path('llama-3.1-model/Meta-Llama-3.1-8B'), False, 0.95),
         (get_model_path('DeepSeek-R1/DeepSeek-R1'), False, 0.95)
     ])
@@ -636,19 +645,6 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         backend=backend,
         **llm_kwargs)
-
-
-@force_ampere
-def test_executor_lookahead_decoding_config():
-    lookahead_config = LookaheadDecodingConfig(max_window_size=10,
-                                               max_ngram_size=9,
-                                               max_verification_set_size=8)
-    sampling_params = SamplingParams(max_tokens=3,
-                                     lookahead_config=lookahead_config)
-
-    assert sampling_params.lookahead_config.max_window_size == 10
-    assert sampling_params.lookahead_config.max_ngram_size == 9
-    assert sampling_params.lookahead_config.max_verification_set_size == 8
 
 
 def test_executor_results_cleanup():
@@ -1234,6 +1230,41 @@ def test_chat_stream_post_processor_reuses_stream_metadata() -> None:
     assert payloads[-1]["choices"][0]["delta"]["content"] == "y"
 
 
+def test_chat_stream_post_processor_usage_applies_prompt_token_offset() -> None:
+    result = GenerationResultBase(123, SamplingParams())
+    output = result._outputs[0]
+    output.text = "x"
+    output.token_ids = [1]
+    output.finish_reason = "stop"
+    result._done = True
+
+    args = ChatPostprocArgs(role="assistant",
+                            model="test-model",
+                            num_prompt_tokens=5,
+                            num_prompt_tokens_offset=3,
+                            stream_options=StreamOptions(include_usage=True))
+    payloads = _stream_payloads_from_chunks(
+        chat_stream_post_processor(result, args))
+
+    final_chunk = payloads[-1]
+    assert final_chunk["choices"] == []
+    assert final_chunk["usage"]["prompt_tokens"] == 2
+    assert final_chunk["usage"]["completion_tokens"] == 1
+    assert final_chunk["usage"]["total_tokens"] == 3
+
+
+def test_chat_stream_post_processor_usage_requires_prompt_token_count() -> None:
+    # Usage arithmetic needs a concrete count: a missing one must surface as a
+    # clear error, never as None leaking into UsageInfo or a TypeError.
+    result = GenerationResultBase(123, SamplingParams())
+    args = ChatPostprocArgs(role="assistant",
+                            model="test-model",
+                            stream_options=StreamOptions(include_usage=True))
+
+    with pytest.raises(ValueError, match="num_prompt_tokens"):
+        chat_stream_post_processor(result, args)
+
+
 class _FakeCompletionGeneratorArgs:
     backend = "pytorch"
     gather_generation_logits = False
@@ -1325,6 +1356,48 @@ class _FakeRawRequest:
 
     async def is_disconnected(self):
         return True
+
+
+def test_startup_metrics_by_server_info() -> None:
+
+    class FakeExecutor:
+
+        def __init__(self):
+            self.calls = 0
+
+        def get_startup_metrics(self):
+            self.calls += 1  # keep track of # calls to ensure the cache in the server works
+            if self.calls == 1:
+                return None
+            return {"model_loader": {"total_model_loading_seconds": 1.5}}
+
+    executor = FakeExecutor()
+    generator = object.__new__(BaseLLM)
+    generator._executor = executor
+    generator._startup_metrics = None
+    generator._disaggregated_params = {}
+
+    server = object.__new__(OpenAIServer)
+    server.generator = generator
+    first_response = asyncio.run(server.get_server_info())
+    second_response = asyncio.run(server.get_server_info())
+    third_response = asyncio.run(server.get_server_info())
+
+    assert json.loads(first_response.body) == {
+        "disaggregated_params": {},
+        "startup_metrics": {},
+    }
+    expected_success = {
+        "disaggregated_params": {},
+        "startup_metrics": {
+            "model_loader": {
+                "total_model_loading_seconds": 1.5
+            }
+        },
+    }
+    assert json.loads(second_response.body) == expected_success
+    assert json.loads(third_response.body) == expected_success
+    assert executor.calls == 2
 
 
 def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:

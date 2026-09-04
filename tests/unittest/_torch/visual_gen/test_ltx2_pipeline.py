@@ -200,7 +200,7 @@ class TestLTX2Quantization:
     """Test LTX2 quantization loading and FP8 weight verification."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_load_with_quantization(self, ltx2_bf16_checkpoint_exists, quant_algo: str):
         """Test loading LTX2 with FP8 quantization and verify FP8 weights."""
         args = VisualGenArgs(
@@ -1288,6 +1288,9 @@ class TestLTX2TwoStageLoRAHelpers:
                 return self.lin(x)
 
         pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        # __init__ is bypassed here; BasePipeline.device now reads self._device
+        # (set in __init__), so initialize it explicitly for the warmup path.
+        pipeline._device = torch.device("cuda")
         pipeline.pipeline_config = DiffusionPipelineConfig(
             cuda_graph=CudaGraphConfig(enable=True),
             torch_compile=TorchCompileConfig(enable=False),
@@ -1682,7 +1685,7 @@ class TestLTX2TwoStagePipelineLoading:
             torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_two_stage_with_quantization(self, ltx2_two_stage_assets_exist, quant_algo: str):
         """Two-stage pipeline loads correctly with FP8 quantization."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (

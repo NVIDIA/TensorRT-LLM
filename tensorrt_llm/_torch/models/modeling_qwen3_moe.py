@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -13,14 +13,14 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
-                                 RenormalizeMoeRoutingMethod,
-                                 RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, TRTLLMGenFusedMoE,
-                                 create_moe, get_moe_cls)
-from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
+                             MoEImplClass, RenormalizeMoeRoutingMethod,
+                             RenormalizeNaiveMoeRoutingMethod,
+                             RoutingMethodType, TRTLLMGenFusedMoE, create_moe,
+                             resolve_moe_cls)
+from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .modeling_qwen3 import Qwen3Attention
@@ -38,7 +38,7 @@ class Qwen3Gate(nn.Module):
         dtype: Optional[torch.dtype] = None,
         apply_routing: bool = False,
         routing_method_type: RoutingMethodType = RoutingMethodType.Renormalize,
-        moe_backend_cls: Type[MoE] = CutlassFusedMoE,
+        moe_backend_cls: MoEImplClass = CutlassFusedMoE,
     ):
         super().__init__()
         self.top_k = top_k
@@ -111,7 +111,16 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             apply_routing=False,
             routing_method_type=RoutingMethodType.Renormalize,
-            moe_backend_cls=get_moe_cls(model_config, layer_idx=layer_idx),
+            moe_backend_cls=resolve_moe_cls(
+                model_config,
+                routing=RoutingMethodType.Renormalize,
+                # Match the create_moe call below, which passes no bias and no
+                # swiglu alpha/beta. Left unknown, gates that create_moe
+                # rejects abstain here and the gate would name a backend the
+                # layer does not run.
+                swiglu_gptoss_style=False,
+                layer_idx=layer_idx,
+            ),
         )
 
         self.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ if config.model_type == "qwen3_vl_moe_text" else MoEWeightLoadingMode.VANILLA

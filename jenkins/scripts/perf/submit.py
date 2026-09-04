@@ -22,12 +22,17 @@ jenkins/scripts/perf/disaggregated/submit.py.
 Three test shapes are supported (all flow through the same parsing logic):
   1. Multi-node aggregated:        aggr[_upload]-{config_base}-{server_name}
         runtime_mode = "aggregated", benchmark_mode = None
-  2. Multi-node ctx_only disagg:   aggr[_upload]-ctx_only-{config_base}
+  2. Multi-node ctx_only disagg:   aggr[_upload]-ctx_only[-{modifier}]-{config_base}
         runtime_mode = "aggregated", benchmark_mode = "ctx_only"
         (reads disagg yaml, but launches via the aggregated single-pytest path
          using the ctx worker's parallel sizes)
-  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|gen_only}-{config_base}
+  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|gen_only}[-{modifier}]-{config_base}
         runtime_mode = "disaggregated", benchmark_mode in {"e2e", "gen_only"}
+
+The optional {modifier} segment is an instrumentation flag that is orthogonal to
+the benchmark mode; the only one today is "time_breakdown", which launches
+exactly like its bare mode and differs only in what the harness asks the servers
+and the client to record.
 
 Test name → yaml folder mapping mirrors test_perf_sanity.py:parse_test_string.
 """
@@ -40,6 +45,7 @@ import os
 import re
 import shlex
 import sys
+from typing import List, Optional, Tuple
 
 import yaml
 from benchmark_utils import parse_positive_concurrency
@@ -61,6 +67,12 @@ def _import_precheck_config(llm_src):
 
 AGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
 DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
+
+# Optional instrumentation segments that may follow the benchmark mode in a test
+# id. Keep in sync with test_perf_sanity.py:TEST_ID_MODIFIERS -- the grammar is
+# only decidable because no config file stem starts with one of these.
+TIME_BREAKDOWN_MODIFIER = "time_breakdown"
+TEST_ID_MODIFIERS = (TIME_BREAKDOWN_MODIFIER,)
 
 
 # --------------------------------------------------------------------------- #
@@ -137,10 +149,51 @@ def _test_nodeid(test_line):
         The pytest node ID from the entry.
     """
     return re.split(
-        r"\s+(?:XFAIL|SKIP|UNSTABLE|TIMEOUT)(?:\s|$)",
+        r"\s+(?:XFAIL|SKIP|UNSTABLE|TIMEOUT)(?=[\s(]|$)",
         test_line,
         maxsplit=1,
     )[0]
+
+
+def _test_marker(test_line):
+    """Return a test-list execution marker, or ``None`` when absent."""
+    line = test_line.partition("#")[0].strip()
+    match = re.search(r"\s+(XFAIL|SKIP|UNSTABLE|TIMEOUT)(?=[\s(]|$)", line)
+    return match.group(1) if match else None
+
+
+def selected_test_is_skip_waived(selected_test_line, waives_file, test_prefix=None):
+    """Whether pytest will skip the selected case before executing its body.
+
+    The CI pipeline merges remote waives into the repository waives file
+    before invoking this launcher. Mirror the exact-nodeid SKIP decision here
+    so a skipped test does not run an otherwise unrelated precheck first.
+    """
+    if _test_marker(selected_test_line) == "SKIP":
+        return True
+
+    selected_nodeid = _test_nodeid(selected_test_line).strip()
+    try:
+        waive_lines = _read_test_list_lines(waives_file)
+    except (FileNotFoundError, ValueError):
+        return False
+
+    for line in waive_lines:
+        if _test_marker(line) != "SKIP":
+            continue
+        waived_nodeid = _test_nodeid(line).strip()
+        if waived_nodeid.startswith("full:"):
+            scope, separator, waived_nodeid = waived_nodeid[5:].partition("/")
+            if not separator or not test_prefix:
+                continue
+            # Match the platform-prefix handling in test_list_parser. SM
+            # waives require runtime GPU discovery and remain pytest-owned.
+            platform_prefix = test_prefix.split("-", 1)[0]
+            if scope.startswith("sm") or platform_prefix not in scope:
+                continue
+        if waived_nodeid == selected_nodeid:
+            return True
+    return False
 
 
 def _load_pytest_split_durations(tokens, llm_src):
@@ -275,11 +328,29 @@ def select_test_case_line(test_list_path, llm_src, script_prefix_lines, split_gr
     return selected[0]
 
 
-def parse_test_case_name(llm_src, selected_line):
+def _split_modifiers(rest: List[str], bracket_content: str) -> Tuple[bool, str]:
+    """Peel the optional modifier segment off the front of the config stem.
+
+    Mirrors test_perf_sanity.py:parse_test_string.split_modifiers.
+    Returns (time_breakdown, config_base_name).
+    """
+    time_breakdown = bool(rest) and rest[0] == TIME_BREAKDOWN_MODIFIER
+    if time_breakdown:
+        rest = rest[1:]
+    if not rest:
+        raise ValueError(f"Test name has a modifier but no config: {bracket_content}")
+    return time_breakdown, "-".join(rest)
+
+
+def parse_test_case_name(
+    llm_src: str, selected_line: str
+) -> Tuple[str, Optional[str], Optional[str], str, bool]:
     """Parse the selected test-list line.
 
-    Returns (config_yaml_path, server_name, benchmark_mode, runtime_mode).
-    See the module docstring for the supported test name shapes.
+    Returns (config_yaml_path, server_name, benchmark_mode, runtime_mode,
+    time_breakdown). server_name is None for every disagg shape and for ctx_only;
+    benchmark_mode is None for a normal aggregated case. See the module docstring
+    for the supported test name shapes.
     """
     line = selected_line
 
@@ -291,12 +362,13 @@ def parse_test_case_name(llm_src, selected_line):
     if len(parts) < 2:
         raise ValueError(f"Invalid test name (need at least prefix and config): {bracket_content}")
 
+    time_breakdown = False
     prefix = parts[0]
     if "disagg" in prefix:
         if len(parts) < 3:
             raise ValueError(
-                f"Invalid disagg test format. Expected disagg[_upload]-{{e2e|gen_only}}-"
-                f"{{config_base}}, got: {bracket_content}"
+                f"Invalid disagg test format. Expected disagg[_upload]-"
+                f"{{e2e|gen_only}}[-{{modifier}}]-{{config_base}}, got: {bracket_content}"
             )
         benchmark_mode = parts[1]
         if benchmark_mode not in ("e2e", "gen_only"):
@@ -305,15 +377,16 @@ def parse_test_case_name(llm_src, selected_line):
             )
         runtime_mode = "disaggregated"
         server_name = None
-        config_base_name = "-".join(parts[2:])
+        time_breakdown, config_base_name = _split_modifiers(parts[2:], bracket_content)
         config_yaml_path = os.path.join(llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml")
     elif "aggr" in prefix:
         if len(parts) > 2 and parts[1] == "ctx_only":
-            # ctx_only: aggr[_upload]-ctx_only-{config_base}; reads disagg yaml.
+            # ctx_only: aggr[_upload]-ctx_only[-{modifier}]-{config_base};
+            # reads disagg yaml.
             benchmark_mode = "ctx_only"
             runtime_mode = "aggregated"
             server_name = None
-            config_base_name = "-".join(parts[2:])
+            time_breakdown, config_base_name = _split_modifiers(parts[2:], bracket_content)
             config_yaml_path = os.path.join(
                 llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml"
             )
@@ -340,7 +413,7 @@ def parse_test_case_name(llm_src, selected_line):
     if not os.path.exists(config_yaml_path):
         raise FileNotFoundError(f"Config file not found: {config_yaml_path}")
 
-    return config_yaml_path, server_name, benchmark_mode, runtime_mode
+    return config_yaml_path, server_name, benchmark_mode, runtime_mode, time_breakdown
 
 
 # --------------------------------------------------------------------------- #
@@ -759,7 +832,17 @@ def main():
         script_prefix_lines,
         args.split_group,
     )
-    config_yaml, server_name, benchmark_mode, runtime_mode = parse_test_case_name(
+    pytest_tokens = _pytest_command_tokens(script_prefix_lines)
+    selected_test_skipped = selected_test_is_skip_waived(
+        selected_test_line,
+        os.path.join(args.llm_src, "tests", "integration", "test_lists", "waives.txt"),
+        test_prefix=_pytest_option(pytest_tokens, "--test-prefix"),
+    )
+    if selected_test_skipped:
+        print("Selected test is SKIP-waived; cache-transceiver precheck will not run")
+    # time_breakdown only changes what the harness records, never the launch
+    # topology or the mode token handed to the precheck, so it is unused here.
+    config_yaml, server_name, benchmark_mode, runtime_mode, _time_breakdown = parse_test_case_name(
         args.llm_src,
         selected_test_line,
     )
@@ -847,9 +930,8 @@ def main():
             srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
         elif benchmark_mode == "gen_only":
             concurrency = benchmark_config.get("concurrency", 1)
-            ctx_worker_env_vars = (
-                f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 {ctx_worker_env_vars}"
-            )
+            # GEN worker only: the same flag on the CTX worker has been seen to
+            # hang gen_only runs with KV blocks never released.
             gen_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
@@ -904,9 +986,22 @@ def main():
         # (single owner, shared with the local flow).
         pcfg = _import_precheck_config(args.llm_src)
         precheck_enabled = pcfg.precheck_enabled(config)
-        llm_models_root = (
-            _resolve_llm_models_root(script_prefix_lines) if precheck_enabled else None
-        )
+        precheck_will_run = precheck_enabled and not selected_test_skipped
+        # The model root is only consumed by the precheck (auto KV-cache-manager
+        # resolution needs the model config). Fail fast only when the precheck
+        # will actually run; otherwise degrade to a warning so stages whose
+        # pytestCommand does not carry LLM_MODELS_ROOT inline keep submitting.
+        llm_models_root = None
+        if precheck_enabled:
+            try:
+                llm_models_root = _resolve_llm_models_root(script_prefix_lines)
+            except ValueError as e:
+                if precheck_will_run:
+                    raise
+                print(
+                    f"WARNING: {e}; "
+                    "cache-transceiver precheck is skipped for this config so continuing"
+                )
         script_prefix_lines.extend(
             pcfg.precheck_prefix_lines(
                 config,
@@ -919,6 +1014,7 @@ def main():
                 ),
                 stage_name=args.stage_name,
                 llm_models_root=llm_models_root,
+                skip_precheck=selected_test_skipped,
             )
         )
         srun_args_lines.extend(

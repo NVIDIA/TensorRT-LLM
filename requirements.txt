@@ -5,7 +5,9 @@ build
 colored
 cuda-python>=13
 # FlowMatchEuler respects a supplied generator starting in 0.39.0 (huggingface/diffusers#13678).
-diffusers>=0.39.0
+# Upper bound: 0.40.0 requires huggingface-hub>=1.23.0, which requires click>=8.4.2
+# and conflicts with the click<8.4 pin below. Lift together with that pin.
+diffusers>=0.39.0,<0.40
 ftfy
 lark
 lazy_loader~=0.5
@@ -22,17 +24,21 @@ h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.12.0a0.
-torch>=2.11.0,<=2.13.0a0
+# The floor admits the NGC alpha builds (2.12.0a0+...); torch<2.12 pins triton==3.6.0,
+# which conflicts with the triton pin below.
+torch>=2.12.0a0,<=2.13.0a0
 torchvision
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.30.4
-# torch 2.11.0+cu130 depends on nvidia-nccl-cu13==2.28.9
-nvidia-nccl-cu13>=2.28.9,<=2.30.4
+# torch 2.12.0+cu130 uses NCCL 2.29.7; NGC 26.05 uses NCCL 2.30.4.
+nvidia-nccl-cu13>=2.29.7,<=2.30.4
 # NcclEP uses nccl4py's nccl.ep package without changing the NCCL wheel constraint.
 nccl4py>=0.3.1,<0.4
 nvidia-cuda-nvrtc
 transformers==5.5.4
 prometheus_client
-prometheus_fastapi_instrumentator
+# 8.x is the first series to allow starlette>=1.0.0; 7.1.0 pins starlette<1.0.0
+# and can no longer resolve against the starlette floor below.
+prometheus_fastapi_instrumentator>=8.1.0
 pydantic>=2.9.1
 pydantic-settings[yaml]
 msgspec
@@ -45,11 +51,11 @@ datasets==3.1.0
 evaluate
 mpmath>=1.3.0
 click>=8.3.1,<8.4
-click_option_group
+click_option_group>=0.5.3
 aenum
 pyzmq
-fastapi>=0.120.1,<=0.121.3
-starlette>=0.49.1
+fastapi>=0.136.3
+starlette>=1.3.1
 uvicorn
 setuptools<80
 # FlashInfer source builds (--no-build-isolation) need packaging>=24.2 for setuptools license-expression validation
@@ -58,7 +64,7 @@ ordered-set
 peft>=0.18.1,<0.19.0
 patchelf
 einops
-flashinfer-python==0.6.16
+flashinfer-python==0.6.18
 xgrammar==0.1.32
 llguidance==0.7.29
 jsonschema
@@ -69,22 +75,24 @@ meson
 ninja
 blake3
 soundfile
-triton==3.6.0 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
+triton==3.7.0 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
 xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeploy
 tiktoken
 blobfile
 openai-harmony==0.0.4
-nvidia-cutlass-dsl[cu13]==4.5.0; python_version >= "3.10"
+# 4.6.1 rejects FlashAttention 4's sm100 split-KV kernel (TYPE_UNSTABLE_JOIN).
+nvidia-cutlass-dsl[cu13]==4.6.2; python_version >= "3.10" # required by Blackwell CuTe DSL kernels
 nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
-quack-kernels>=0.2.10; python_version >= "3.10" # required for MinimaxM3 MSA
+# quack-kernels pins the CUTLASS DSL by equality, so bump the two together.
+quack-kernels==0.6.4; python_version >= "3.10" # required for MinimaxM3 MSA and FlashAttention 4
 jinja2 # required for MinimaxM3 MSA
 plotly
 numexpr
 partial_json_parser
 mcp<2.0.0 # 2.0.0 removed mcp.server.fastmcp; scaffolding still uses the 1.x APIs
-apache-tvm-ffi==0.1.6 # used for reduce nvidia-cutlass-dsl host overhead
+apache-tvm-ffi==0.1.13.post2 # required by the CUTLASS DSL TVM-FFI provider
 torch-c-dlpack-ext==0.1.3 # used for reduce nvidia-cutlass-dsl host overhead, optional package for improved torch tensor calling perf
-flash-attn-4==4.0.0b11
+flash-attn-4==4.0.0b19
 mistral-common>=1.10.0
 torchao>=0.14.1,<0.16.0
 cuda-core

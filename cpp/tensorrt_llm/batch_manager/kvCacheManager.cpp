@@ -1551,13 +1551,19 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
     SizeType32 candidateMatchedTokens{0};
     SizeType32 latestMissingAnchorEndToken{0};
 
+    // Record only the safe-prefix boundary here and materialize result.matches once after the
+    // walk. The original code assigned `result.matches = candidateMatches` inside this lambda,
+    // which is invoked once per matched block -> O(matched_blocks^2) copies of the (growing)
+    // match vector. SWA gating semantics are preserved exactly.
+    std::size_t safeMatchCount{0};
+    SizeType32 safeMatchedTokens{0};
     auto updateSafePrefix = [&]()
     {
         if (!mIsSWA || latestMissingAnchorEndToken == 0
             || candidateMatchedTokens >= latestMissingAnchorEndToken + mWindowSize)
         {
-            result.matches = candidateMatches;
-            result.totalMatchedTokens = candidateMatchedTokens;
+            safeMatchCount = candidateMatches.size();
+            safeMatchedTokens = candidateMatchedTokens;
         }
     };
 
@@ -1628,6 +1634,13 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
         }
         break;
     }
+
+    // Publish the safe prefix once instead of copying the growing match vector on every matched
+    // block (the per-block assignment removed from updateSafePrefix above). Truncate the unsafe
+    // SWA tail (a no-op for non-SWA, where every matched block is safe), then transfer by move.
+    candidateMatches.resize(safeMatchCount);
+    result.matches = std::move(candidateMatches);
+    result.totalMatchedTokens = safeMatchedTokens;
 
     if (result.matches.size() < blockKeys.size())
     {
@@ -3557,7 +3570,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         auto const numSharedBlocks = promptCacheLen / getTokensPerBlock();
         auto const numUnSharedTokens = promptCacheLen % getTokensPerBlock();
         auto const numUnSharedBlocks
-            = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.beamWidth;
+            = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.getBeamWidth();
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
 
         // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention
@@ -3618,7 +3631,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
 
         auto const numCurrBlocks = tc::ceilDiv(numCurrTokens, getTokensPerBlock());
         auto const numNextBlocks = tc::ceilDiv(numNextTokens, getTokensPerBlock());
-        auto const numRequiredBlocks = (numNextBlocks - numCurrBlocks) * req.mSamplingConfig.beamWidth;
+        auto const numRequiredBlocks = (numNextBlocks - numCurrBlocks) * req.mSamplingConfig.getBeamWidth();
         return numRequiredBlocks;
     }
 
@@ -3732,11 +3745,11 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     if (numAllocBlocksPerBeam < effectiveContextBlocks) // Still haven't allocated all context blocks
     {
         return effectiveContextBlocks - numAllocBlocksPerBeam
-            + (numGenBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+            + (numGenBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.getBeamWidth();
     }
 
     SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
-    return (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    return (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.getBeamWidth();
 }
 
 void BlockManager::updateSequenceCacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize)

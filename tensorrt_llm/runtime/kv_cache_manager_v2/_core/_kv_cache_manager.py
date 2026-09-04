@@ -218,6 +218,8 @@ class KVCacheManager:
         "_iteration_peak_num_blocks_by_cache_level",
         "_dirty_stats_kv_cache_ids",
         "_stats_excluded_kv_cache_ids",
+        "_iter_suspended_requests",
+        "_iter_resumed_requests",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -250,15 +252,21 @@ class KVCacheManager:
     ]
     _dirty_stats_kv_cache_ids: set[int]
     _stats_excluded_kv_cache_ids: set[int]
+    _iter_suspended_requests: int
+    _iter_resumed_requests: int
 
     def __init__(
         self,
         config: KVCacheManagerConfig,
         event_manager: "KVCacheEventManager | None" = None,
+        cold_page_codec: object | None = None,
     ) -> None:
+        if cold_page_codec is not None:
+            raise NotImplementedError("Cold-page codecs require the C++ KVCacheManagerV2 backend")
         init_cuda_once()
         config = deepcopy(config)
         self._init_config = config
+        self._living_kv_caches = set[rawref.ref[_KVCache]]()
         self._life_cycles = LifeCycleRegistry(config)
         storage_config = create_storage_config(config)
         storage = StorageManager(
@@ -275,7 +283,6 @@ class KVCacheManager:
         radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         self._storage = storage
         self._radix_tree = radix_tree
-        self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
         self._avg_reused_length = MovingAverage(decay)
         self._avg_sqr_capacity = MovingAverage(decay)
@@ -294,6 +301,8 @@ class KVCacheManager:
         self._reset_iteration_peak_num_blocks()
         self._dirty_stats_kv_cache_ids = set()
         self._stats_excluded_kv_cache_ids = set()
+        self._iter_suspended_requests = 0
+        self._iter_resumed_requests = 0
 
     def __del__(self) -> None:
         try:
@@ -418,6 +427,7 @@ class KVCacheManager:
         __: PRIORITY_DEFAULT,
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
+        enable_request_stats: bool = False,
     ) -> _KVCache:
         """
         Args:
@@ -437,6 +447,9 @@ class KVCacheManager:
                 token IDs; ``False`` permits digest tokens but is invalid when the
                 manager is configured with ``text_only=True``; ``None`` inherits
                 the manager setting.
+            enable_request_stats: Whether to collect request-level allocation and
+                reuse counters for this cache. Manager-level global and iteration
+                statistics remain controlled by ``KVCacheManagerConfig.enable_stats``.
 
         Newly created KV cache is suspended. You need to call resume() with a cuda stream to make it active
         & ready in that stream.
@@ -461,6 +474,7 @@ class KVCacheManager:
             custom_priority_callback,
             expected_prompt_length,
             text_only,
+            enable_request_stats,
         )
 
     def _match_reuse(
@@ -610,6 +624,39 @@ class KVCacheManager:
         }
         self._ssm_snapshot_iteration_stats_by_life_cycle.clear()
         return stats
+
+    def record_request_suspended(self) -> None:
+        """Count one ACTIVE->SUSPENDED transition for the current iteration window."""
+        if not self._stats_enabled:
+            return
+        self._iter_suspended_requests += 1
+
+    def record_request_resumed(self) -> None:
+        """Count one preemption recovery for the current iteration window.
+
+        Only a previously-ACTIVE cache that was suspended and then successfully
+        resumed counts. A freshly-created cache is activated by its first resume()
+        call, but that is an admission, not a recovery, and is not counted.
+        """
+        if not self._stats_enabled:
+            return
+        self._iter_resumed_requests += 1
+
+    def get_and_reset_iteration_suspend_resume_stats(self) -> tuple[int, int]:
+        """Return (suspended, resumed) request counts since the last drain and reset them.
+
+        Suspend/resume is a per-request, manager-level event (not per-pool-group), so it
+        is drained alongside get_and_reset_iteration_stats once per iteration-stats fetch.
+
+        Both counters track the same population, so they are directly comparable:
+        the running (suspended - resumed) total is the number of requests still
+        parked in the SUSPENDED state.
+        """
+        suspended = self._iter_suspended_requests
+        resumed = self._iter_resumed_requests
+        self._iter_suspended_requests = 0
+        self._iter_resumed_requests = 0
+        return suspended, resumed
 
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel
@@ -909,20 +956,20 @@ class KVCacheManager:
         tokens_per_block = self.tokens_per_block
         storage = self._storage
 
-        def ratio_from_length(
-            history_length: int, capacity: int
-        ) -> TypedIndexList[PoolGroupIndex, float]:
-            return storage.ratio_from_length(tokens_per_block, history_length, capacity)
-
         avg_reused_length: int = round(self._avg_reused_length.value)
         avg_capacity: int = round(self._avg_sqr_capacity.value**0.5)
         avg_history_length: int = round(self._avg_sqr_history_length.value**0.5)
         if avg_capacity > 0:
-            self._target_ratio_list_gpu = storage.constrain_ratio(
-                ratio_from_length(avg_history_length, avg_capacity)
+            life_cycle_ratio = storage.ratio_from_length(
+                tokens_per_block, avg_history_length, avg_capacity
             )
+            pool_group_ratio = storage.pool_group_ratio(life_cycle_ratio)
+            self._target_ratio_list_gpu = storage.constrain_pool_group_ratio(pool_group_ratio)
         if avg_reused_length > 0:
-            self._target_ratio_list_other = ratio_from_length(avg_reused_length, avg_reused_length)
+            life_cycle_ratio = storage.ratio_from_length(
+                tokens_per_block, avg_reused_length, avg_reused_length
+            )
+            self._target_ratio_list_other = storage.pool_group_ratio(life_cycle_ratio)
 
     # @TODO: need updating when dynamic resizing is supported.
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int:

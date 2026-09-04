@@ -260,7 +260,7 @@ class FinishReasonsHandler:
         """
 
         self._temp_data.max_lens.append(
-            min(self._max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
+            min(self._max_seq_len, request.py_orig_prompt_len + request.py_max_new_tokens)
         )
         # Beam-search context-only (disaggregated prefill) requests hand off
         # after their single step, so their end id is masked to the "no end
@@ -466,8 +466,7 @@ class FinishReasonsHandler:
 
 
         Args:
-            stop_words_list: A list of two lists: the first contains the token ids of all stop sequences
-              (concatenated); the second contains the cumulative lengths (prefix sum) of the stop word lengths.
+            stop_words_list: A list of stop sequences, each a list of token ids.
 
         Returns:
             stop_words: A padded device tensor containing the stop words
@@ -482,27 +481,18 @@ class FinishReasonsHandler:
             dtype=torch.int32,
         )
         _ = stop_words_host.fill_(self._EMPTY_STOP_WORD_TOKEN_ID)
-        words, cumulative_stop_word_lengths = stop_words_list
-        words_host = torch.tensor(
-            words, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
-        )
-        begin = 0
         max_stop_word_length = 0
         num_stop_words = 0
-        for idx, end in enumerate(cumulative_stop_word_lengths):
-            if end == -1:
-                break
-            length = end - begin
+        for idx, word in enumerate(stop_words_list):
+            length = len(word)
             max_stop_word_length = max(max_stop_word_length, length)
             num_stop_words += 1
             # skip processing if either the length or the index is greater than the current max values.
             # These will be updated outside this function.
             if length > self._max_stop_word_length or idx >= self._max_num_stop_words:
-                begin = end
                 continue
-            stop_words_host[idx, -length:] = words_host[begin:end]
+            stop_words_host[idx, -length:] = torch.tensor(word, dtype=torch.int32)
             stop_words_host[idx, :-length] = self._PAD_STOP_WORD_TOKEN_ID
-            begin = end
         return (
             stop_words_host.to("cuda", non_blocking=True),
             max_stop_word_length,

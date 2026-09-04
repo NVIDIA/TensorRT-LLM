@@ -217,7 +217,7 @@ def get_model_yaml_config(model_label: str,
         },
         # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
         # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
-        # backend (see accuracy/test_llm_api_pytorch.py::TestGLM52).
+        # backend (see accuracy/test_glm52.py::TestGLM52NVFP4).
         # Spec decoding is intentionally left off so the sweep measures kernel
         # time rather than MTP acceptance rate.
         {
@@ -314,17 +314,6 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Qwen3.5-9B hybrid GDN: V2 KV/SSM pool split needs the real seq len.
-        {
-            'patterns': [
-                'qwen3.5_9b-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:500,2000',
-            ],
-            'config': {
-                'kv_cache_config': {
-                    'avg_seq_len': 2500,
-                },
-            }
-        },
         # MiniMax-M3 MXFP8 block-sparse MoE: sparse backend, no KV reuse, trust_remote_code, capped max_seq_len to avoid the 1M-default CUDA-graph OOM.
         {
             'patterns': ['minimax_m3_mxfp8'],
@@ -373,20 +362,6 @@ def get_model_yaml_config(model_label: str,
                 'kv_cache_config': {
                     'enable_block_reuse': False,
                 },
-            }
-        },
-        # Llama-v4 Scout FP4 with cuda graph padding
-        {
-            'patterns': ['llama_v4_scout_17b_16e_instruct_fp4'],
-            'config': {
-                'cuda_graph_config': {
-                    'enable_padding':
-                    True,
-                    'batch_sizes': [
-                        1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048,
-                        4096, 8192
-                    ]
-                }
             }
         },
         # GPT-OSS 120B max throughput test
@@ -653,19 +628,6 @@ def get_model_yaml_config(model_label: str,
                 'max_cpu_loras': lora_count,
             }
         }
-        if 'phi_4_multimodal_instruct' in model_label:
-            lora_config['lora_config']['lora_target_modules'] = [
-                "attn_qkv", "attn_dense", "mlp_gate_up", "mlp_4h_to_h"
-            ]
-            lora_config['lora_config']['trtllm_modules_to_hf_modules'] = {
-                "attn_qkv": "qkv_proj",
-                "attn_dense": "o_proj",
-                "mlp_gate_up": "gate_up_proj",
-                "mlp_4h_to_h": "down_proj"
-            }
-            lora_config['lora_config']['max_lora_rank'] = 320
-            lora_config['lora_config'][
-                'swap_gate_up_proj_lora_b_weight'] = False
         base_config.update(lora_config)
 
     kv_cache_config = base_config.get('kv_cache_config', {})

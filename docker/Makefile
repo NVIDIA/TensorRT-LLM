@@ -50,6 +50,13 @@ CUBLAS_VERSION     ?=
 GIT_COMMIT         ?= $(shell git rev-parse HEAD)
 TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | grep -o '=.*' | tr -d '= "')
 GITHUB_MIRROR      ?=
+# Optional GitHub token used to authenticate the github.com clones performed
+# during the build (see docker/common/github_auth.sh). Usually inherited from the
+# environment, never passed as a build arg -- build-arg values stay readable in
+# `docker history`. Empty means anonymous, rate-limited access.
+GITHUB_CLONE_TOKEN ?=
+COMMA              := ,
+GITHUB_SECRET_ARG  := $(if $(GITHUB_CLONE_TOKEN),--secret id=github_clone_token$(COMMA)env=GITHUB_CLONE_TOKEN)
 PYTHON_VERSION     ?=
 NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
 NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
@@ -87,6 +94,7 @@ base_pull:
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
+		$(GITHUB_SECRET_ARG) \
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
 		$(if $(TRITON_IMAGE), --build-arg TRITON_IMAGE=$(TRITON_IMAGE)) \
@@ -266,10 +274,47 @@ ngc-manifest_create:
 ngc-manifest_push: ngc-manifest_create
 	docker manifest push $(IMAGE_WITH_TAG)
 
+# --- LLVM BOLT profile overlay -------------------------------------------------
+# Bake a merged BOLT profile bundle into an ALREADY-BUILT image as a thin overlay
+# layer (see Dockerfile.bolt). Does NOT rebuild the base image. Invoked by
+# jenkins/BuildDockerImage.groovy after each image build and BEFORE the nspect
+# scan/register step, so the scanned+registered artifact already contains the
+# bundle (no republish of a released image).
+#   BOLT_BASE_IMAGE   : image to extend (required), e.g. <repo>/ngc:<tag>
+#   BOLT_OUTPUT_IMAGE : output tag (default: same as base -> overwrite in staging)
+#   BOLT_CTX_DIR      : docker build context holding the bundle (default: current dir)
+#   BOLT_BUNDLE_DIR   : bundle subdir relative to BOLT_CTX_DIR (default: bolt_bundle)
+#   BOLT_PROFILES_REF : provenance ref recorded as an image LABEL
+#   BOLT_PUSH         : 1 to docker push the overlaid image after build (default 1)
+BOLT_BASE_IMAGE    ?=
+BOLT_OUTPUT_IMAGE  ?= $(BOLT_BASE_IMAGE)
+BOLT_CTX_DIR       ?= .
+BOLT_BUNDLE_DIR    ?= bolt_bundle
+BOLT_PROFILES_REF  ?= unknown
+BOLT_PUSH          ?= 1
+
+bolt_overlay:
+	@if [ -z "$(BOLT_BASE_IMAGE)" ]; then echo "ERROR: BOLT_BASE_IMAGE is required"; exit 1; fi
+	@echo "Overlaying BOLT bundle ($(BOLT_CTX_DIR)/$(BOLT_BUNDLE_DIR), ref=$(BOLT_PROFILES_REF))"
+	@echo "  base:   $(BOLT_BASE_IMAGE)"
+	@echo "  output: $(BOLT_OUTPUT_IMAGE)"
+	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
+		--progress $(DOCKER_PROGRESS) \
+		--build-arg BOLT_BASE_IMAGE=$(BOLT_BASE_IMAGE) \
+		--build-arg BOLT_BUNDLE_DIR=$(BOLT_BUNDLE_DIR) \
+		--build-arg BOLT_PROFILES_REF="$(BOLT_PROFILES_REF)" \
+		--file Dockerfile.bolt \
+		--tag $(BOLT_OUTPUT_IMAGE) \
+		$(BOLT_CTX_DIR)
+	@if [ "$(BOLT_PUSH)" = "1" ]; then \
+		echo "Pushing $(BOLT_OUTPUT_IMAGE)"; \
+		docker push $(BOLT_OUTPUT_IMAGE); \
+	fi
+
 build: devel_build ;
 
 push: devel_push ;
 
 run: devel_run ;
 
-.PHONY: build push run ngc-manifest_create ngc-manifest_push
+.PHONY: build push run ngc-manifest_create ngc-manifest_push bolt_overlay

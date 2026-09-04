@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -36,6 +37,36 @@ def _get_indexer_k_cache_bytes_per_token(
     data_bytes = index_head_dim // 2 if use_fp4 else index_head_dim
     scale_bytes = index_head_dim // quant_block_size * 4
     return data_bytes + scale_bytes
+
+
+def _resolve_fp8_ds_mla_head_dim(
+    kv_cache_config: KvCacheConfig,
+    tokens_per_block: int,
+    head_dim: int,
+    dtype: DataType,
+) -> Tuple[bool, int]:
+    """Validate and lower the inline-scale cache layout to storage elements."""
+    # The Python LLM API config owns ``dtype``; direct cache-manager users and
+    # older fixtures may still pass the mirrored pybind config, which does not
+    # expose Python-only fields.
+    use_fp8_ds_mla = getattr(kv_cache_config, "dtype", "auto") == "fp8_ds_mla"
+    if not use_fp8_ds_mla:
+        return False, head_dim
+
+    from ..inline_scale_kv import PAGE_SIZE, TOKEN_BYTES
+
+    if tokens_per_block != PAGE_SIZE:
+        raise ValueError(
+            f"FlashInfer DSA FMHA requires tokens_per_block={PAGE_SIZE}, got {tokens_per_block}."
+        )
+    if head_dim != 576:
+        raise ValueError(f"inline-scale KV layout requires head_dim=576, got {head_dim}.")
+    elem_bytes = {DataType.BF16: 2, DataType.FP8: 1}.get(dtype)
+    if elem_bytes is None:
+        raise ValueError(f"inline-scale KV layout requires BF16 or FP8, got {dtype}.")
+    if TOKEN_BYTES % elem_bytes != 0:
+        raise ValueError("inline-scale KV token size must align to the cache dtype.")
+    return True, TOKEN_BYTES // elem_bytes
 
 
 def _get_indexer_k_cache_size_per_token(
@@ -124,10 +155,17 @@ class DSACacheManager(KVCacheManager):
             raise ValueError("DSA cache requires DSA sparse parameters")
         self.quant_block_size = 128
         self.index_head_dim = sparse_params.index_head_dim
+        # V1 pool geometry is fixed by the legacy C++ manager. Residual
+        # quantization is enabled by DSACacheManagerV2, whose buffer sizes are
+        # role-configurable.
+        self.mla_kv_cache_residual_dim = 0
         # FP4 mode packs the indexer K cache as head_dim/2 data bytes + 4
         # scale bytes (vs. head_dim + 4 for FP8). The C++ WindowBlockManager
         # allocates the pool with this smaller stride when the flag is set.
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
+        self.use_fp8_ds_mla, head_dim = _resolve_fp8_ds_mla_head_dim(
+            kv_cache_config, tokens_per_block, head_dim, dtype
+        )
 
         from tensorrt_llm._torch.speculative import get_num_spec_layers
 
@@ -250,20 +288,30 @@ class DSACacheManager(KVCacheManager):
         use_fp4 = sparse_params.indexer_k_dtype == "fp4"
         indexer_data_dim = index_head_dim // 2 if use_fp4 else index_head_dim
 
-        # get kv cache dtype bytes
-        mem_per_token = 2
+        # Get latent KV-cache bytes. NVFP4 stores two values per data byte
+        # plus one E4M3 block scale for every 16 values.
         quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
-            mem_per_token = 1
-
-        # get head dim
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers
         )
-        # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
-        mem_per_token *= num_attention_layers * head_dim
+        kv_cache_config = kwargs.get("kv_cache_config")
+        if (
+            kv_cache_config is not None
+            and getattr(kv_cache_config, "dtype", "auto") == "fp8_ds_mla"
+        ):
+            from ..inline_scale_kv import TOKEN_BYTES
+
+            mem_per_token = num_attention_layers * TOKEN_BYTES
+        elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache():
+            mem_per_token = num_attention_layers * (head_dim // 2 + math.ceil(head_dim / 16))
+        else:
+            # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
+            bytes_per_element = (
+                1 if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache() else 2
+            )
+            mem_per_token = num_attention_layers * head_dim * bytes_per_element
 
         if num_layers is not None:
             num_indexer_layers = max(num_layers, 1)
@@ -379,7 +427,32 @@ class DSACacheManagerV2(KVCacheManagerV2):
         self.quant_block_size = 128
         self.index_head_dim = sparse_params.index_head_dim
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
+        residual_config = (
+            pretrained_config
+            if pretrained_config is not None
+            else getattr(model_config, "pretrained_config", None)
+        )
+        rope_head_dim = int(getattr(residual_config, "qk_rope_head_dim", 0))
+        residual_quantization_enabled = (
+            os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1"
+        )
+        self.mla_kv_cache_residual_dim = (
+            rope_head_dim if dtype == DataType.NVFP4 and residual_quantization_enabled else 0
+        )
+        if self.mla_kv_cache_residual_dim % 16 != 0:
+            raise ValueError(
+                "NVFP4 MLA residual dimension must be divisible by 16, got "
+                f"{self.mla_kv_cache_residual_dim}"
+            )
+        if self.mla_kv_cache_residual_dim > head_dim:
+            raise ValueError(
+                "NVFP4 MLA residual dimension cannot exceed the KV head dimension: "
+                f"{self.mla_kv_cache_residual_dim} > {head_dim}"
+            )
         self._unique_primary_pool: Optional[torch.Tensor] = None
+        self.use_fp8_ds_mla, head_dim = _resolve_fp8_ds_mla_head_dim(
+            kv_cache_config, tokens_per_block, head_dim, dtype
+        )
 
         from tensorrt_llm._torch.speculative import get_num_spec_layers
 
@@ -570,8 +643,9 @@ class DSACacheManagerV2(KVCacheManagerV2):
 
         element_per_container = 2 if self.dtype == DataType.NVFP4 else 1
         dtype = torch.int8 if self.dtype == DataType.NVFP4 else self.dtype
+        storage_head_dim = first_head_dim + self.mla_kv_cache_residual_dim
         elements_per_layer = (
-            self.tokens_per_block * first_num_heads * first_head_dim // element_per_container
+            self.tokens_per_block * first_num_heads * storage_head_dim // element_per_container
         )
         shape = [
             self.blocks_in_primary_pool,
@@ -590,6 +664,14 @@ class DSACacheManagerV2(KVCacheManagerV2):
                 self.index_head_dim, self.quant_block_size, self.use_fp4
             )
         cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
+        if self.dtype == DataType.NVFP4 and self.mla_kv_cache_residual_dim > 0:
+            if data_role == Role.KEY:
+                cache_bytes += self.mla_kv_cache_residual_dim // 2
+            elif data_role == Role.KEY_BLOCK_SCALE:
+                cache_bytes += self.mla_kv_cache_residual_dim // 16
+            elif data_role == Role.ALL:
+                cache_bytes += self.mla_kv_cache_residual_dim // 2
+                cache_bytes += self.mla_kv_cache_residual_dim // 16
         if data_role == Role.ALL and self.indexer_k_cache_local_layer_mask[local_layer_idx]:
             cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
         return cache_bytes
@@ -607,9 +689,25 @@ class DSACacheManagerV2(KVCacheManagerV2):
         num_layers: Optional[int] = None,
         **kwargs,
     ):
-        return DSACacheManager.get_cache_size_per_token(
+        cache_bytes = DSACacheManager.get_cache_size_per_token(
             model_config, mapping, num_layers=num_layers, **kwargs
         )
+        quant_config = model_config.quant_config
+        residual_quantization_enabled = (
+            os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1"
+        )
+        if (
+            quant_config is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()
+            and residual_quantization_enabled
+        ):
+            config = model_config.pretrained_config
+            residual_dim = int(getattr(config, "qk_rope_head_dim", 0))
+            num_attention_layers = KVCacheManager._resolve_num_attention_layers(
+                model_config, mapping, num_layers
+            )
+            cache_bytes += num_attention_layers * (residual_dim // 2 + math.ceil(residual_dim / 16))
+        return cache_bytes
 
     def shutdown(self) -> None:
         self.indexer_k_cache_pool_per_layer = []

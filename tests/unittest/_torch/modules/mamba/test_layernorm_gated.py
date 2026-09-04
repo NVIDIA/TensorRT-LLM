@@ -15,11 +15,11 @@
 
 import pytest
 import torch
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.modules.mamba.layernorm_gated import RMSNorm
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, unswizzle_sf
 from tensorrt_llm.math_utils import ceil_div, pad_up
-from tests.unittest.utils.util import getSMVersion
 
 
 def fused_gated_rmsnorm_quant_available():
@@ -177,8 +177,9 @@ class TestRMSNormBasic:
 
     @pytest.mark.parametrize("scale", [32.0, 0.13])
     @pytest.mark.parametrize("num_tokens,heads,N", [(64, 8, 128), (33, 4, 512)])
+    @pytest.mark.parametrize("gate_activation", ["silu", "sigmoid"])
     def test_token_major_fp8_matches_separate_static_quantization(
-        self, scale, num_tokens, heads, N
+        self, scale, num_tokens, heads, N, gate_activation
     ):
         """Both the multi-row (N<=256) and generic-fallback (N>256) paths of
         rms_norm_gated_token_major must quantize identically to norm-then-
@@ -196,9 +197,18 @@ class TestRMSNormBasic:
         z = wide[:, 256:].view(num_tokens, heads, N)
         fp8_scale = torch.tensor(scale, device=device, dtype=torch.float32)
 
-        bf16_output = rms_norm_gated_token_major(x, z, weight, 1e-6)
+        bf16_output = rms_norm_gated_token_major(
+            x, z, weight, 1e-6, gate_activation=gate_activation
+        )
         expected, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(bf16_output, fp8_scale)
-        actual = rms_norm_gated_token_major(x, z, weight, 1e-6, fp8_scale=fp8_scale)
+        actual = rms_norm_gated_token_major(
+            x,
+            z,
+            weight,
+            1e-6,
+            fp8_scale=fp8_scale,
+            gate_activation=gate_activation,
+        )
 
         assert actual.dtype == torch.float8_e4m3fn
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))

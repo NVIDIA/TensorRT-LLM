@@ -41,6 +41,7 @@ The following guidance will mostly focus on benchmarks using `trtllm-bench` CLI.
       - [Running multi-modal models in the PyTorch Workflow](#running-multi-modal-models-in-the-pytorch-workflow)
       - [Quantization in the PyTorch Flow](#quantization-in-the-pytorch-flow)
   - [Online Serving Benchmarking](#online-serving-benchmarking)
+  - [Startup Metrics](#startup-metrics)
 
 To benchmark the OpenAI-compatible `trtllm-serve`, please refer to the [run benchmarking with `trtllm-serve`](../commands/trtllm-serve/run-benchmark-with-trtllm-serve.md) section.
 
@@ -83,7 +84,6 @@ If supported, enable the boost slider using one of the available levels for maxi
 ```shell
 sudo nvidia-smi boost-slider --vboost <max_boost_slider>
 ```
-
 
 ## Throughput Benchmarking
 
@@ -498,3 +498,24 @@ The two valid values for `kv_cache_config.dtype` are `auto` and `fp8`.
 TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command, and `tensorrt_llm.serve.scripts.benchmark_serving` package to benchmark the online server. Alternatively, [AIPerf](https://github.com/ai-dynamo/aiperf) is a comprehensive benchmarking tool that can also measure the performance of the OpenAI-compatible server launched by `trtllm-serve`.
 
 To benchmark the OpenAI-compatible `trtllm-serve`, please refer to the [run benchmarking with `trtllm-serve`](../commands/trtllm-serve/run-benchmark-with-trtllm-serve.md) section.
+
+## Startup Metrics
+
+For the PyTorch backend, `trtllm-bench` prints a `STARTUP METRICS` section before the request and
+performance summaries. The section reports model-loading timings from worker rank 0 in seconds.
+Nested metric names are rendered as dotted paths:
+
+```text
+===========================================================
+= STARTUP METRICS
+===========================================================
+model_loader.checkpoint_preparation_seconds: 1.1774
+model_loader.weight_population_seconds: 0.5979
+model_loader.checkpoint_finalization_seconds: 0.0312
+model_loader.post_load_processing_seconds: 0.0049
+model_loader.total_model_loading_seconds: 1.9708
+```
+
+When `--report_json` is specified, the same values are included in the report's
+`startup_metrics` object with their original nested structure. See [Startup Metrics](../llm-api/index.md#startup-metrics)
+for the payload structure and definitions of the loading phases.

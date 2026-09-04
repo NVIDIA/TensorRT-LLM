@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from typing import Mapping as TMapping
 
 import torch
@@ -51,7 +51,6 @@ from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMax
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
@@ -63,13 +62,9 @@ from ..modules.linear import (
 )
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..utils import (
-    ActivationType,
-    AuxStreamType,
-    EventType,
-    get_model_extra_attrs,
-    is_torch_compiling,
-)
+from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
+from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .modeling_utils import (
@@ -84,6 +79,7 @@ from .modeling_utils import (
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
 # and flash SDPA does not accept attn_mask.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
 
 # ---------------------------------------------------------------------------
 # Config normalization helpers
@@ -160,6 +156,25 @@ def get_text_model_config(
     return cfg
 
 
+def _validate_sparse_attention_runtime_config(
+    model_config: "ModelConfig[PretrainedConfig]",
+) -> None:
+    """Require the runtime backend that owns M3's metadata and index cache.
+
+    Both dense and sparse M3 layers use that cache manager, independent of
+    checkpoint precision or GPU architecture. Backend-specific constraints,
+    such as MSA requiring SM100, are validated by the backend itself.
+    """
+    sparse_config = model_config.sparse_attention_config
+    if sparse_config is None or sparse_config.algorithm != "minimax_m3":
+        raise ValueError(
+            "MiniMax-M3 requires sparse_attention_config.algorithm='minimax_m3' "
+            "to create its KV-cache manager and prepare attn_metadata.minimax_m3. "
+            "Set the following in the LLM API configuration:\n"
+            "sparse_attention_config:\n  algorithm: minimax_m3"
+        )
+
+
 def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
     """Return ``(dense_layer_ids, sparse_layer_ids)`` for the M3 text model."""
     sparse_cfg = getattr(text_config, "sparse_attention_config", None)
@@ -180,7 +195,9 @@ def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List
     return dense, sparse
 
 
-def get_sparse_disable_index_value_layer_ids(text_config: PretrainedConfig) -> List[int]:
+def get_sparse_disable_index_value_layer_ids(
+    text_config: PretrainedConfig,
+) -> List[int]:
     """Return layer ids where the sparse index-value branch is disabled."""
     sparse_cfg = getattr(text_config, "sparse_attention_config", None)
     if sparse_cfg is None:
@@ -278,33 +295,6 @@ def _build_swiglu_oai_dense_mlp(
         reduce_output=reduce_output,
         is_shared_expert=is_shared_expert,
     )
-
-
-def _resolve_minimax_m3_expert_size_per_partition(
-    num_experts: int,
-    mapping: Mapping,
-    moe_load_balancer_config,
-) -> int:
-    """Compute the local expert/slot count the MoE module will resolve.
-
-    Sizes the per-expert SwiGLU parameter tensors we hand to
-    ``create_moe`` to match what the backend sees. Some backends assert
-    ``swiglu_alpha.shape == (expert_size_per_partition,)`` at construct
-    time; a mismatch surfaces as an opaque CUDA-side shape failure.
-
-    Priority:
-      1. EPLB config → ``num_slots // moe_ep_size``.
-      2. Plain EP    → ``num_experts // moe_ep_size`` (with ``max(1, ...)``
-                        for tiny test configs).
-    """
-    ep_size = mapping.moe_ep_size
-    if moe_load_balancer_config is not None and moe_load_balancer_config.num_slots:
-        # Mirror ``MoeLoadBalancerConfig.num_local_slots`` without
-        # requiring ``.setup(ep_rank, ep_size)`` to have been called
-        # (the ``num_local_slots`` property raises otherwise).
-        return moe_load_balancer_config.num_slots // ep_size
-
-    return max(1, num_experts // ep_size)
 
 
 class MiniMaxM3Gate(nn.Module):
@@ -437,31 +427,14 @@ class MiniMaxM3MoE(nn.Module):
         self.swiglu_beta_value = 1.0  # SGLang's ``(up + 1)`` offset in swiglu_no_interleaved.
         self.swiglu_limit_value = float(getattr(config, "swiglu_limit", 7.0))
 
-        # Size the per-expert SwiGLU parameter tensors from the same
-        # ``expert_size_per_partition`` the MoE module will resolve, not
-        # from a hand-rolled ``num_slots // ep_size`` guess. EPLB and
-        # DWDP can shift the local slot count (see
-        # :func:`_resolve_minimax_m3_expert_size_per_partition` for the
-        # priority order), and some backends assert
-        # ``swiglu_alpha.shape == (expert_size_per_partition,)``.
-        moe_load_balancer_config = model_config.moe_load_balancer
-        self.expert_size_per_partition = _resolve_minimax_m3_expert_size_per_partition(
-            num_experts=self.num_experts,
-            mapping=model_config.mapping,
-            moe_load_balancer_config=moe_load_balancer_config,
+        # One value per layer, not per expert: the MoE backend broadcasts these
+        # to whatever per-expert shape its kernels index (or bakes them as
+        # scalars), sized by the slot count it actually resolved.
+        self.moe_activation = SwigluBiasActivation(
+            gate_sigmoid_scale=self.swiglu_alpha_value,
+            linear_offset=self.swiglu_beta_value,
+            clamp=self.swiglu_limit_value,
         )
-        self.swiglu_alpha = torch.tensor(
-            [self.swiglu_alpha_value] * self.expert_size_per_partition,
-            dtype=torch.float32,
-        ).cuda()
-        self.swiglu_beta = torch.tensor(
-            [self.swiglu_beta_value] * self.expert_size_per_partition,
-            dtype=torch.float32,
-        ).cuda()
-        self.swiglu_limit = torch.tensor(
-            [self.swiglu_limit_value] * self.expert_size_per_partition,
-            dtype=torch.float32,
-        ).cuda()
 
         # Router gate owns the float32 projection weight, the per-expert
         # ``e_score_correction_bias``, and the ``routing_method`` it
@@ -488,24 +461,8 @@ class MiniMaxM3MoE(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             override_quant_config=experts_quant_config,
-            swiglu_alpha=self.swiglu_alpha,
-            swiglu_beta=self.swiglu_beta,
-            swiglu_limit=self.swiglu_limit,
-            activation_type=ActivationType.SwigluBias,
+            activation=self.moe_activation,
         )
-        # Defensive: if a future MoE-resolution path (new load-balancer
-        # mode, new DWDP variant) shifts the local expert count in a
-        # way our resolver doesn't yet model, fail here with a
-        # diagnostic message instead of inside a CUDA-side shape
-        # assertion deep in a backend kernel dispatch.
-        resolved = getattr(self.experts, "expert_size_per_partition", None)
-        assert resolved is None or resolved == self.expert_size_per_partition, (
-            f"MiniMax-M3 SwiGLU sizing mismatch: pre-create_moe estimate "
-            f"{self.expert_size_per_partition} != MoE-resolved {resolved}. "
-            f"Update _resolve_minimax_m3_expert_size_per_partition to "
-            f"match the MoE module's resolved layout."
-        )
-
         # Shared expert: dense MLP fused into MoE output. Constructed
         # with ``is_shared_expert=True`` so ``reduce_output=False``
         # (the external AllReduce below performs the combined
@@ -659,6 +616,9 @@ def minimax_m3_attn_custom_op_inplace(
         attn_metadata,
         output[:num_tokens],
     )
+
+
+maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(minimax_m3_attn_custom_op_inplace)
 
 
 class MiniMaxM3Attention(Attention):
@@ -958,6 +918,66 @@ class MiniMaxM3Attention(Attention):
             0,  # mrope_section2
         )
         return qkv
+
+    def _fused_fp8_index_qk_norm_rope(
+        self,
+        idx_qk: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> Optional[torch.Tensor]:
+        """Produce raw-E4M3 index-Q and insert index-K in one M3-only kernel.
+
+        This path is deliberately narrower than the general fused QK kernel:
+        it is enabled only for the MSA FP8-indexer configuration and the exact
+        M3 Gemma-RMSNorm + NeoX partial-RoPE geometry. The kernel rounds the
+        normalized/RoPE values through BF16 before E4M3 conversion, matching
+        the former fused-BF16-kernel followed by ``Tensor.to(E4M3)`` contract.
+        """
+        if not isinstance(self.attn, MiniMaxM3MsaSparseAttention):
+            return None
+        if self.attn.indexer_kv_dtype != "fp8":
+            return None
+        if position_ids is None or idx_qk.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "MiniMax-M3 fused FP8 indexer requires BF16 activations and position_ids."
+            )
+        if (
+            self.rotary_emb is None
+            or self.pos_embd_params is None
+            or self.pos_embd_params.rope is None
+        ):
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires partial RoPE.")
+        if not self.pos_embd_params.is_neox:
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires NeoX RoPE.")
+        if not self.use_gemma_norm:
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires Gemma RMSNorm.")
+        if self.index_q_norm.variance_epsilon != self.index_k_norm.variance_epsilon:
+            raise ValueError(
+                "MiniMax-M3 fused FP8 indexer requires identical index Q/K "
+                "RMSNorm epsilon values because the kernel accepts one epsilon."
+            )
+
+        rotary_dim = int(self.pos_embd_params.rope.dim)
+        index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+        if index_k_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "MiniMax-M3 fused FP8 indexer requires an E4M3 index-K cache, "
+                f"got {index_k_cache.dtype}."
+            )
+        num_tokens = int(idx_qk.shape[0])
+        return torch.ops.trtllm.minimax_m3_fp8_indexer_qk_norm_rope(
+            idx_qk.contiguous(),
+            index_k_cache,
+            attn_metadata.msa_out_cache_loc[:num_tokens],
+            self.sparse_num_index_heads,
+            self.sparse_index_dim,
+            rotary_dim,
+            self.index_q_norm.variance_epsilon,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+            self.pos_embd_params.rope.theta,
+            position_ids.reshape(-1).contiguous().to(torch.int32),
+        ).flatten(1)
 
     def _expect_fused_qk_norm_rope(self, position_ids: Optional[torch.Tensor]) -> bool:
         """Whether the fused kernel is expected to run instead of the fallback.
@@ -1319,10 +1339,11 @@ class MiniMaxM3Attention(Attention):
         # q may be FP8 on the MSA FP8-KV path, so pin the output to the compute
         # dtype rather than inheriting it from q.
         output = q.new_empty(
-            (q.shape[0], self.num_heads * self.head_dim), dtype=self.attn_activation_dtype
+            (q.shape[0], self.num_heads * self.head_dim),
+            dtype=self.attn_activation_dtype,
         )
-        if self.register_to_config and is_torch_compiling():
-            minimax_m3_attn_custom_op_inplace(
+        if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
+            maybe_bcg_minimax_m3_attn_custom_op_inplace(
                 q,
                 k,
                 v,
@@ -1380,7 +1401,7 @@ class MiniMaxM3Attention(Attention):
         builds the forward_args the FMHA reads.
         """
         if self.is_sparse_attention_layer:
-            assert idx_q is not None and idx_k is not None
+            assert idx_q is not None
             # Publish the selected blocks so the FMHA runs the sparse path.
             kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
             forward_args = AttentionForwardArgs(
@@ -1474,6 +1495,10 @@ class MiniMaxM3Attention(Attention):
 
         def _index_norm_rope():
             idx_qk = self.index_qk_proj(hidden_states)
+            fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
+            if fp8_idx_q is not None:
+                # Index-K was inserted directly into the paged side cache.
+                return fp8_idx_q, None
             fused_idx = self._fused_qk_norm_rope(
                 idx_qk,
                 position_ids,
@@ -1856,6 +1881,7 @@ class MiniMaxM3Model(DecoderModel):
     """M3 text decoder model."""
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
+        _validate_sparse_attention_runtime_config(model_config)
         super().__init__(model_config)
         quant_config = model_config.quant_config
         if quant_config is None or (
@@ -1887,6 +1913,10 @@ class MiniMaxM3Model(DecoderModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
+        # The executor owns the authoritative CUDA-graph configuration. Mark
+        # this model as eligible here and let the executor enable the automatic
+        # FlashInfer MXFP8 path only when its decode graph runner is active.
+        self._use_flashinfer_mxfp8_decode_graph_default = True
         # Final norm is a plain (non-Gemma) RMSNorm for the same reason as the
         # layer-boundary norms (see MiniMaxM3DecoderLayer.__init__): it doubles
         # as the last layer's next_layer_layernorm, so the last MoE/MLP output
@@ -2003,6 +2033,27 @@ def _fold_gemma_boundary_norm_weights(weights):
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for MiniMax-M3.
+
+        Sparse attention already routes M3 to a V2-core manager
+        unconditionally; declaring the preference keeps
+        ``kv_cache_config.use_kv_cache_manager_v2`` consistent with the
+        manager actually in use.
+        """
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config: Any = None) -> Literal["PYTHON"]:
+        """Prefer the Python transceiver in disaggregated serving.
+
+        M3 runs a V2-core cache manager, which the C++ transceiver cannot
+        drive; the KV-transfer unit test exercises the Python transceiver
+        directly. This routes the fully-'auto' path to that combination.
+        """
+        return "PYTHON"
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         raw_pretrained = model_config.pretrained_config

@@ -24,14 +24,11 @@ This file tests:
 
 import builtins
 import random
-import sys
-from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention_backend.interface import (
@@ -53,7 +50,16 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
+from tensorrt_llm._torch.attention_backend.sparse.dsa import backend as dsa_backend
+from tensorrt_llm._torch.attention_backend.sparse.dsa.cache_manager import (
+    _resolve_fp8_ds_mla_head_dim,
+)
+from tensorrt_llm._torch.attention_backend.sparse.dsa.indexer import (
+    transform_local_topk_and_prepare_pool_view_grouped,
+)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.speculative.interface import (
@@ -74,6 +80,10 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp8_utils
 
+__extra_import_path__ = ["..", "~/tests/unittest"]
+
+from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
+
 
 def has_deep_gemm():
     """Return True if the DeepGEMM library is available."""
@@ -81,6 +91,39 @@ def has_deep_gemm():
         return deep_gemm is not None
     except Exception:
         return False
+
+
+def test_fp8_ds_mla_layout_resolves_shared_inline_scale_module():
+    enabled, storage_head_dim = _resolve_fp8_ds_mla_head_dim(
+        KvCacheConfig(dtype="fp8_ds_mla"),
+        tokens_per_block=64,
+        head_dim=576,
+        dtype=DataType.BF16,
+    )
+
+    assert enabled is True
+    assert storage_head_dim == 328
+
+
+def test_fp8_ds_mla_layout_treats_binding_config_as_auto():
+    enabled, storage_head_dim = _resolve_fp8_ds_mla_head_dim(
+        BindingKvCacheConfig(),
+        tokens_per_block=64,
+        head_dim=576,
+        dtype=DataType.BF16,
+    )
+
+    assert enabled is False
+    assert storage_head_dim == 576
+
+
+def _set_torch_top_k(indexer: Indexer) -> None:
+    indexer.top_k = TopK(
+        indexer.index_topk,
+        prefill_implementation=TopKImplementation.TORCH,
+        decode_implementation=TopKImplementation.TORCH,
+        compress_ratio=indexer.compress_ratio,
+    )
 
 
 def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
@@ -112,7 +155,168 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     assert metadata._tokens_per_block == 64
 
 
-def test_shared_topk_lifecycle():
+@pytest.mark.parametrize(
+    "enable_heuristic,use_cute_dsl,sm_version,compress_ratio,next_n,should_warmup",
+    [
+        (True, True, 100, 1, 1, False),
+        (False, True, 100, 1, 1, True),
+        (True, True, 90, 1, 1, True),
+        (False, True, 100, 4, 2, False),
+        (False, False, 100, 1, 1, False),
+    ],
+)
+def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
+    enable_heuristic,
+    use_cute_dsl,
+    sm_version,
+    compress_ratio,
+    next_n,
+    should_warmup,
+):
+    metadata = SimpleNamespace(
+        sparse_metadata_params=SimpleNamespace(
+            enable_heuristic_topk=enable_heuristic,
+        ),
+        use_cute_dsl_topk=use_cute_dsl,
+        num_sparse_topk=512,
+        sparse_mla_topk=384,
+        kv_cache_manager=SimpleNamespace(),
+        _indexer_compress_ratio=compress_ratio,
+        get_indexer_max_seq_len=Mock(return_value=32768),
+        num_sms=148,
+    )
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
+            return_value=sm_version,
+        ),
+        patch(
+            "tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops.warmup_cute_dsl_radix_topk_decode"
+        ) as cute_dsl_radix,
+    ):
+        DSAtrtllmAttentionMetadata.warmup_cute_dsl_radix_topk(metadata, next_n)
+
+    if should_warmup:
+        cute_dsl_radix.assert_called_once_with(
+            top_k=384,
+            num_cols=32768,
+            next_n=next_n,
+            dtype=torch.float32,
+            num_sms=148,
+        )
+    else:
+        cute_dsl_radix.assert_not_called()
+
+
+def test_kv_lens_row_reorder_threshold():
+    """Prepare row order only when CuTe DSL GVR has enough decode rows."""
+    num_sms = 16
+    next_n = 2
+
+    def make_mock(num_generations, kv_lens_list):
+        kv_lens_cuda = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
+        row_order_buffer = torch.zeros(64, dtype=torch.int32, device="cuda")
+        return SimpleNamespace(
+            enable_gvr_topk=True,
+            use_cute_dsl_topk=True,
+            num_generations=num_generations,
+            num_sms=num_sms,
+            max_draft_tokens=next_n - 1,
+            num_contexts=0,
+            num_seqs=num_generations,
+            kv_lens_cuda=kv_lens_cuda,
+            kv_lens_row_reorder_buffer=row_order_buffer,
+            kv_lens_row_reorder=None,
+        )
+
+    kv_lens = [4, 1, 8, 2, 16, 3, 12, 6, 7, 9, 5, 11, 13, 10, 14, 15]
+
+    metadata_below = make_mock(1, [1000])
+    DSAtrtllmAttentionMetadata._compute_kv_lens_row_reorder(metadata_below)
+    assert metadata_below.kv_lens_row_reorder is None
+
+    metadata_at = make_mock(num_sms, kv_lens)
+    DSAtrtllmAttentionMetadata._compute_kv_lens_row_reorder(metadata_at)
+    row_order = metadata_at.kv_lens_row_reorder.cpu().tolist()
+    assert [kv_lens[i] for i in row_order] == sorted(kv_lens, reverse=True)
+
+
+@skip_pre_hopper
+def test_gvr_prior_writeback_uses_aux_stream():
+    batch_size = 2
+    index_topk = 4
+    cache_manager, sparse_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=128,
+        tokens_per_block=64,
+        max_seq_len=64,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    try:
+        request_ids = list(range(batch_size))
+        kv_lens = torch.full((batch_size,), index_topk, dtype=torch.int32)
+        cache_manager.add_dummy_requests(
+            request_ids,
+            kv_lens.tolist(),
+            is_gen=False,
+            prepare_resource=True,
+        )
+        metadata = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            num_contexts=0,
+            num_generations=batch_size,
+            seq_lens=torch.ones(batch_size, dtype=torch.int32),
+            kv_lens=kv_lens,
+            num_cached_tokens=[index_topk - 1] * batch_size,
+            cache_manager=cache_manager,
+            num_ctx_tokens=0,
+            num_tokens=batch_size,
+            index_topk=index_topk,
+            enable_indexer_skip=True,
+        )
+        indexer = create_indexer(sparse_config)
+        indexer._enable_heuristic_topk = True
+        indexer.aux_stream = torch.cuda.Stream()
+        metadata.gvr_prior_indices = torch.zeros(
+            (cache_manager.num_local_layers, batch_size, index_topk),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        hidden_states = torch.empty((batch_size, 1), device="cuda")
+        unused = torch.empty((batch_size, 1), device="cuda")
+
+        with with_multi_stream(True):
+            topk_indices = indexer.sparse_attn_indexer(
+                metadata,
+                hidden_states,
+                unused,
+                unused,
+                unused,
+                unused,
+            )
+            assert indexer._prev_topk_copy_pending
+            indexer.maybe_join_prev_topk_copy()
+
+        local_layer = cache_manager.layer_offsets[indexer.layer_idx]
+        torch.testing.assert_close(
+            metadata.gvr_prior_indices[local_layer, :batch_size],
+            topk_indices,
+        )
+        assert not indexer._prev_topk_copy_pending
+    finally:
+        cache_manager.shutdown()
+
+
+def test_shared_topk_lifecycle(monkeypatch):
+    # This test exercises the shared-topk buffer read/write lifecycle, not the
+    # cross-layer group-remap fan-out (covered by the test_group_remap_* tests).
+    # Keep the remap on the per-layer path so it flows through the patched
+    # transform below.
+    monkeypatch.setattr(dsa_backend, "_GROUP_REMAP", False)
+
     sparse_config = DeepSeekSparseAttentionConfig(
         index_n_heads=1,
         index_head_dim=8,
@@ -138,11 +342,11 @@ def test_shared_topk_lifecycle():
     metadata.kv_cache_manager = SimpleNamespace(max_blocks_per_seq=2)
     metadata.enable_context_mla_with_cached_kv = False
     metadata.enable_indexer_skip = False
+    metadata.enable_gvr_topk = False
     metadata.get_empty = Mock(
         side_effect=lambda _, shape, **kwargs: torch.empty(tuple(shape), dtype=kwargs["dtype"])
     )
     metadata._create_kv_lens_2d_buffer = Mock()
-    metadata._create_radix_aux_buffers = Mock()
     metadata.create_expanded_buffers = Mock()
 
     with patch(
@@ -166,6 +370,12 @@ def test_shared_topk_lifecycle():
         indexer=None,
         get_local_layer_idx=Mock(return_value=1),
     )
+    # sparse_attn_predict dispatches the local->global remap through the
+    # backend's own _remap_topk_to_global; bind the real method onto the stubs.
+    for backend in (full_backend, shared_backend):
+        backend._remap_topk_to_global = MethodType(
+            DSATrtllmAttention._remap_topk_to_global, backend
+        )
     metadata._num_ctx_tokens = context_topk.shape[0]
     metadata._num_tokens = context_topk.shape[0] + generation_topk.shape[0]
     backend_args = DSABackendForwardArgs(indexer_intermediates=[])
@@ -229,6 +439,83 @@ def test_indexer_post_load_weights_caches_fused_weight():
     assert not hasattr(indexer, "_weights_transformed")
 
 
+@skip_pre_hopper
+@pytest.mark.parametrize(
+    "use_cute_dsl,enable_heuristic,expected_decode",
+    [
+        (False, False, TopKImplementation.CUDA_RADIX),
+        (True, False, TopKImplementation.CUTE_DSL_RADIX),
+        (False, True, TopKImplementation.CUDA_GVR),
+        (True, True, TopKImplementation.CUTE_DSL_GVR),
+    ],
+)
+def test_indexer_configures_one_top_k_module(
+    use_cute_dsl,
+    enable_heuristic,
+    expected_decode,
+):
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=128,
+        use_cute_dsl_topk=use_cute_dsl,
+        enable_heuristic_topk=enable_heuristic,
+    )
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
+            return_value=100,
+        ),
+    ):
+        indexer = create_indexer(sparse_config)
+
+    assert isinstance(indexer.top_k, TopK)
+    assert indexer.top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
+    assert indexer.top_k.decode_implementation == expected_decode
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize(
+    "flag_value,expected_dtype",
+    [
+        (None, torch.float32),
+        ("0", torch.float32),
+        ("1", torch.bfloat16),
+    ],
+)
+def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, expected_dtype):
+    """wk/weights_proj dtype follows TRTLLM_DSA_INDEXER_BF16.
+
+    Unset or "0" keeps the projection in fp32 (default); "1" runs it in the
+    model dtype. create_indexer builds the Indexer with dtype=torch.bfloat16.
+    """
+    if flag_value is None:
+        monkeypatch.delenv("TRTLLM_DSA_INDEXER_BF16", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DSA_INDEXER_BF16", flag_value)
+
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=128,
+    )
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
+        return_value=100,
+    ):
+        indexer = create_indexer(sparse_config)
+
+    assert indexer._indexer_bf16 is (flag_value == "1")
+    assert indexer.wk.dtype == expected_dtype
+    assert indexer.weights_proj.dtype == expected_dtype
+
+
 def _ceil_to_ue8m0(x: torch.Tensor):
     """Round tensor values up to the nearest power of two (UE8M0 format)."""
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
@@ -240,9 +527,6 @@ def cdiv(a: int, b: int) -> int:
 
 
 def _load_cast_back_from_fp4():
-    sparse_test_dir = Path(__file__).resolve().parents[1]
-    if str(sparse_test_dir) not in sys.path:
-        sys.path.insert(0, str(sparse_test_dir))
     from test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
 
     return cast_back_from_fp4
@@ -330,6 +614,398 @@ def test_transform_local_topk_uses_v2_page_mapping():
 
     torch.testing.assert_close(actual, expected_indices)
     convert.assert_called_once_with(req_idx, block_table, topk_indices, 4, 1, 12, 1)
+
+
+# ===================================================================
+# Cross-layer group-remap fan-out (TRTLLM_DISABLE_DSA_GROUP_REMAP)
+# ===================================================================
+#
+# These tests validate the Python orchestration on top of the
+# convert_req_index_to_global_grouped custom op (the kernel/op arithmetic is
+# covered in test_cpp_custom_ops.py): the group layout built from the indexer
+# layer mask, the leader-computes / follower-reads dispatch, the per-layer
+# fallbacks, and bit-exact equivalence to the single-layer path -- including
+# under CUDA-graph capture/replay. Because the grouped remap is bit-identical to
+# the per-layer path, this equivalence is the feature's correctness contract
+# (there is no runtime shadow check in the model path).
+
+
+def _make_group_remap_metadata(
+    mask, params_by_layer, num_tokens, num_requests, num_topk, block_size, device, seed=7
+):
+    """Build a stub DSA metadata + KV manager that exercises the group-remap path.
+
+    ``mask[i]`` marks layer ``i`` as a full-indexer (group leader) layer;
+    ``params_by_layer[i] == (page_scale, layer_offset)`` is what the KV manager
+    reports for layer ``i``. The cached ``block_table`` / ``req_idx`` are shared
+    across layers (as in a real forward). ``_ensure_group_remap_struct`` is bound
+    from the real metadata class so the actual layout logic is under test.
+    """
+    torch.manual_seed(seed)
+    max_blocks_per_req = 64
+    kvm = SimpleNamespace(
+        indexer_k_cache_local_layer_mask=list(mask),
+        get_primary_pool_page_index_params=lambda i: params_by_layer[i],
+    )
+    req_idx = torch.randint(0, num_requests, (num_tokens,), dtype=torch.int32, device=device)
+    block_table = torch.randint(
+        0, 1000, (num_requests, max_blocks_per_req), dtype=torch.int32, device=device
+    )
+    # Padding (-1) in the later half of the block table.
+    block_table[:, max_blocks_per_req // 2 :] = -1
+    metadata = SimpleNamespace(
+        kv_cache_manager=kvm,
+        shared_topk_indices=torch.empty(0, dtype=torch.int32, device=device),
+        block_table=None,
+        in_mtp_draft_loop=False,
+        _pool_cache_valid=True,
+        _group_remap_struct=None,
+        _group_remap_struct_kv_id=0,
+        _group_remap_batched={},
+        _ensure_pool_view_cached=Mock(),
+        _cached_block_table_gen=block_table,
+        _cached_req_idx_gen=req_idx,
+        _cached_block_table_ctx=block_table,
+        _cached_req_idx_ctx=req_idx,
+        _cached_tokens_per_block=block_size,
+        _cached_pool_view=torch.empty(0, device=device),
+    )
+    metadata._ensure_group_remap_struct = MethodType(
+        DSAtrtllmAttentionMetadata._ensure_group_remap_struct, metadata
+    )
+    # Bind the real per-step cache invalidation so tests exercise the actual
+    # clear of _group_remap_batched at forward boundaries.
+    metadata._invalidate_pool_view_cache = MethodType(
+        DSAtrtllmAttentionMetadata._invalidate_pool_view_cache, metadata
+    )
+    return metadata, block_table, req_idx
+
+
+def _make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=11):
+    """Top-k indices within the valid (non-padded) half of the block table, with
+    ~20% invalid (-1) entries."""
+    torch.manual_seed(seed)
+    max_valid_token = 32 * block_size - 1  # first 32 of 64 blocks are valid
+    topk = torch.randint(
+        0, max(max_valid_token, 1), (num_tokens, num_topk), dtype=torch.int32, device=device
+    )
+    topk[torch.rand(num_tokens, num_topk, device=device) < 0.2] = -1
+    return topk
+
+
+def _make_group_remap_backend(indexer, local_idx):
+    """Minimal DSATrtllmAttention exposing just what the remap helpers touch."""
+    att = DSATrtllmAttention.__new__(DSATrtllmAttention)
+    att.indexer = indexer
+    att.get_local_layer_idx = lambda metadata: local_idx
+    return att
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_remap_struct_layout():
+    """`_ensure_group_remap_struct` groups consecutive shared layers under their
+    leader and only activates genuine (>=2 member, uniform-scale) fan-outs."""
+    device = torch.device("cuda")
+
+    # F,S,S,F,S with a uniform page scale and distinct per-layer offsets.
+    mask = [True, False, False, True, False]
+    params = {0: (2, 0), 1: (2, 1), 2: (2, 2), 3: (2, 3), 4: (2, 4)}
+    md, _, _ = _make_group_remap_metadata(mask, params, 4, 2, 128, 64, device)
+    struct = md._ensure_group_remap_struct()
+    assert struct["leader_of"] == [0, 0, 0, 3, 3]
+    assert struct["slot_of"] == [0, 1, 2, 0, 1]
+    assert struct["group_size"] == {0: 3, 3: 2}
+    assert struct["group_active"] == {0: True, 3: True}
+    assert struct["group_layer_ids"][0].tolist() == [0, 1, 2]
+    assert struct["group_layer_ids"][3].tolist() == [3, 4]
+
+    # All-full (e.g. dense per-layer indexer) -> singleton groups -> inert.
+    md2, _, _ = _make_group_remap_metadata(
+        [True, True, True], {0: (1, 0), 1: (1, 1), 2: (1, 2)}, 4, 2, 128, 64, device
+    )
+    struct2 = md2._ensure_group_remap_struct()
+    assert all(not active for active in struct2["group_active"].values())
+    assert struct2["group_layer_ids"] == {}
+
+    # Non-uniform page scale within a group -> inactive (per-layer fallback).
+    md3, _, _ = _make_group_remap_metadata(
+        [True, False], {0: (2, 0), 1: (3, 1)}, 4, 2, 128, 64, device
+    )
+    struct3 = md3._ensure_group_remap_struct()
+    assert struct3["group_active"][0] is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_topk", [1, 128, 256, 257, 2048])
+@pytest.mark.parametrize(
+    "mask,params",
+    [
+        # F,S,S,F,S -- two groups, uniform scale, monotonic offsets.
+        (
+            [True, False, False, True, False],
+            {0: (2, 0), 1: (2, 1), 2: (2, 2), 3: (2, 3), 4: (2, 4)},
+        ),
+        # F,S,S,S -- one big group, non-monotonic offsets.
+        (
+            [True, False, False, False],
+            {0: (1, 5), 1: (1, 2), 2: (1, 8), 3: (1, 0)},
+        ),
+    ],
+)
+def test_group_remap_matches_per_layer(mask, params, num_topk):
+    """Every grouped slice must be bit-identical to the per-layer single-op path."""
+    device = torch.device("cuda")
+    num_tokens, num_requests, block_size = 8, 4, 64
+    md, _, _ = _make_group_remap_metadata(
+        mask, params, num_tokens, num_requests, num_topk, block_size, device
+    )
+    topk = _make_group_remap_topk(num_tokens, num_topk, block_size, device)
+    struct = md._ensure_group_remap_struct()
+
+    # Leaders compute their whole group's batch in one launch.
+    batched = {}
+    for leader, active in struct["group_active"].items():
+        if active:
+            batched[leader] = transform_local_topk_and_prepare_pool_view_grouped(
+                topk,
+                md,
+                struct["group_layer_ids"][leader],
+                struct["group_scale"][leader],
+                is_generation=True,
+            )
+
+    for local_idx in range(len(mask)):
+        leader = struct["leader_of"][local_idx]
+        assert struct["group_active"].get(leader, False), "expected an active group"
+        grouped_out = batched[leader][struct["slot_of"][local_idx]]
+        baseline, _ = transform_local_topk_and_prepare_pool_view(
+            topk, md, local_idx, is_generation=True
+        )
+        assert torch.equal(grouped_out, baseline), f"layer {local_idx} diverged"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_remap_dispatch_and_fallback(monkeypatch):
+    """Leader computes+caches, followers read the slice, and every fallback
+    condition returns the per-layer result."""
+    device = torch.device("cuda")
+    num_tokens, num_requests, num_topk, block_size = 8, 4, 128, 64
+    mask = [True, False, False, True, False]  # leaders at 0 and 3
+    params = {0: (2, 0), 1: (2, 1), 2: (2, 2), 3: (2, 3), 4: (2, 4)}
+    md, _, _ = _make_group_remap_metadata(
+        mask, params, num_tokens, num_requests, num_topk, block_size, device
+    )
+    topk = _make_group_remap_topk(num_tokens, num_topk, block_size, device)
+
+    def per_layer(idx, is_generation=True):
+        out, _ = transform_local_topk_and_prepare_pool_view(
+            topk, md, idx, is_generation=is_generation
+        )
+        return out
+
+    leader = _make_group_remap_backend(indexer=object(), local_idx=0)
+    follower = _make_group_remap_backend(indexer=None, local_idx=1)
+
+    # Follower before the leader has run -> no cached batch -> fall back (None).
+    assert follower._grouped_remap_topk_to_global(topk, md, 1, True) is None
+
+    # Leader computes + caches; result equals the per-layer path.
+    leader_out = leader._grouped_remap_topk_to_global(topk, md, 0, True)
+    assert torch.equal(leader_out, per_layer(0))
+    assert 0 in md._group_remap_batched
+
+    # Follower now reads the cached slice; equals the per-layer path.
+    follower_out = follower._grouped_remap_topk_to_global(topk, md, 1, True)
+    assert torch.equal(follower_out, per_layer(1))
+
+    # Inactive (singleton) group -> None.
+    md_solo, _, _ = _make_group_remap_metadata(
+        [True], {0: (2, 0)}, num_tokens, num_requests, num_topk, block_size, device
+    )
+    solo = _make_group_remap_backend(indexer=object(), local_idx=0)
+    assert solo._grouped_remap_topk_to_global(topk, md_solo, 0, True) is None
+
+    # Full dispatch via _remap_topk_to_global with the flag forced on: the
+    # generation forward uses the grouped path, while context and MTP-draft keep
+    # the per-layer path. All three must be bit-exact vs the per-layer op.
+    monkeypatch.setattr(dsa_backend, "_GROUP_REMAP", True)
+
+    md._group_remap_batched.clear()
+    assert torch.equal(leader._remap_topk_to_global(topk, md, is_generation=True), per_layer(0))
+
+    assert torch.equal(
+        leader._remap_topk_to_global(topk, md, is_generation=False),
+        per_layer(0, is_generation=False),
+    )
+
+    md.in_mtp_draft_loop = True
+    md._group_remap_batched.clear()
+    assert torch.equal(leader._remap_topk_to_global(topk, md, is_generation=True), per_layer(0))
+    md.in_mtp_draft_loop = False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_remap_matches_per_layer_cuda_graph():
+    """The grouped remap must be CUDA-graph safe: capture once, replay with
+    changed top-k contents, and stay bit-exact vs the per-layer path."""
+    device = torch.device("cuda")
+    num_tokens, num_requests, num_topk, block_size = 8, 4, 256, 64
+    mask = [True, False, False]
+    params = {0: (2, 0), 1: (2, 1), 2: (2, 2)}
+    md, _, _ = _make_group_remap_metadata(
+        mask, params, num_tokens, num_requests, num_topk, block_size, device
+    )
+    struct = md._ensure_group_remap_struct()
+    leader = 0
+    layer_ids = struct["group_layer_ids"][leader]
+    scale = struct["group_scale"][leader]
+
+    topk = _make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=1)
+
+    # Warmup on a side stream, then capture the grouped remap.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        transform_local_topk_and_prepare_pool_view_grouped(
+            topk, md, layer_ids, scale, is_generation=True
+        )
+    torch.cuda.current_stream().wait_stream(s)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        batched = transform_local_topk_and_prepare_pool_view_grouped(
+            topk, md, layer_ids, scale, is_generation=True
+        )
+
+    for seed in (2, 3):
+        topk.copy_(_make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        for local_idx in range(len(mask)):
+            baseline, _ = transform_local_topk_and_prepare_pool_view(
+                topk, md, local_idx, is_generation=True
+            )
+            assert torch.equal(batched[struct["slot_of"][local_idx]], baseline), (
+                f"layer {local_idx} diverged on graph replay (seed={seed})"
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_remap_batched_cleared_per_step():
+    """The leader-written batch must not survive a forward boundary: after the
+    per-step cache invalidation, a follower reached before its leader falls back
+    to the per-layer path instead of consuming a previous step's stale batch."""
+    device = torch.device("cuda")
+    num_tokens, num_requests, num_topk, block_size = 8, 4, 128, 64
+    mask = [True, False]  # leader 0, follower 1
+    params = {0: (2, 0), 1: (2, 1)}
+    md, _, _ = _make_group_remap_metadata(
+        mask, params, num_tokens, num_requests, num_topk, block_size, device
+    )
+    leader = _make_group_remap_backend(indexer=object(), local_idx=0)
+    follower = _make_group_remap_backend(indexer=None, local_idx=1)
+
+    def per_layer(idx, topk):
+        out, _ = transform_local_topk_and_prepare_pool_view(topk, md, idx, is_generation=True)
+        return out
+
+    # Forward 1: leader then follower.
+    md._invalidate_pool_view_cache()  # step boundary
+    topk1 = _make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=1)
+    leader._grouped_remap_topk_to_global(topk1, md, 0, True)
+    assert 0 in md._group_remap_batched
+    f1 = follower._grouped_remap_topk_to_global(topk1, md, 1, True)
+    assert torch.equal(f1, per_layer(1, topk1))
+
+    # Forward 2: the step boundary must have dropped forward 1's batch, so a
+    # follower reached before its leader falls back (None) rather than returning
+    # forward 1's now-stale indices (same shape, so only the clear catches it).
+    md._invalidate_pool_view_cache()
+    assert md._group_remap_batched == {}
+    topk2 = _make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=2)
+    assert follower._grouped_remap_topk_to_global(topk2, md, 1, True) is None
+    # Once the leader runs in forward 2, the follower gets forward-2 data.
+    leader._grouped_remap_topk_to_global(topk2, md, 0, True)
+    assert torch.equal(
+        follower._grouped_remap_topk_to_global(topk2, md, 1, True), per_layer(1, topk2)
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_remap_follower_shape_guard():
+    """A follower whose top-k shape does not match the cached batch falls back to
+    the per-layer path instead of returning a mismatched/out-of-range slice."""
+    device = torch.device("cuda")
+    num_requests, block_size = 4, 64
+    mask = [True, False]
+    params = {0: (2, 0), 1: (2, 1)}
+    md, _, _ = _make_group_remap_metadata(mask, params, 8, num_requests, 256, block_size, device)
+    md._invalidate_pool_view_cache()
+    leader = _make_group_remap_backend(indexer=object(), local_idx=0)
+    follower = _make_group_remap_backend(indexer=None, local_idx=1)
+
+    # Leader caches a batch for a width-256 top-k.
+    topk_wide = _make_group_remap_topk(8, 256, block_size, device, seed=1)
+    leader._grouped_remap_topk_to_global(topk_wide, md, 0, True)
+    assert 0 in md._group_remap_batched
+
+    # A follower arriving with a different-width top-k must not read the stale
+    # batch -> falls back (None).
+    topk_narrow = _make_group_remap_topk(8, 128, block_size, device, seed=2)
+    assert follower._grouped_remap_topk_to_global(topk_narrow, md, 1, True) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_remap_orchestration_cuda_graph():
+    """Capture the real leader-store / follower-read orchestration
+    (`_grouped_remap_topk_to_global`, not just the transform helper) into a
+    graph, replay with changed contents, and stay bit-exact vs the per-layer
+    path for every member."""
+    device = torch.device("cuda")
+    num_tokens, num_requests, num_topk, block_size = 8, 4, 256, 64
+    mask = [True, False, False]
+    params = {0: (2, 0), 1: (2, 1), 2: (2, 2)}
+    md, _, _ = _make_group_remap_metadata(
+        mask, params, num_tokens, num_requests, num_topk, block_size, device
+    )
+    backends = [
+        _make_group_remap_backend(indexer=(object() if mask[i] else None), local_idx=i)
+        for i in range(len(mask))
+    ]
+
+    # The group struct is intentionally not built during capture, so build it
+    # eagerly first; a static top-k buffer feeds the captured kernels.
+    md._ensure_group_remap_struct()
+    topk = _make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=1)
+
+    def run_all():
+        return [
+            backends[i]._grouped_remap_topk_to_global(topk, md, i, True) for i in range(len(mask))
+        ]
+
+    # Warmup on a side stream.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        run_all()
+    torch.cuda.current_stream().wait_stream(s)
+
+    md._group_remap_batched.clear()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outs = run_all()
+    # Every member took the grouped path (leader computed, followers read a slice).
+    assert all(o is not None for o in outs)
+
+    for seed in (2, 3):
+        topk.copy_(_make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        for i in range(len(mask)):
+            baseline, _ = transform_local_topk_and_prepare_pool_view(
+                topk, md, i, is_generation=True
+            )
+            assert torch.equal(outs[i], baseline), f"layer {i} diverged on replay (seed={seed})"
 
 
 def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
@@ -718,6 +1394,7 @@ def _create_mock_metadata(
             self.num_contexts = num_contexts
             self.num_generations = num_generations
             self._num_seqs = num_contexts + num_generations
+            self.max_num_sequences = batch_size
             self.max_draft_tokens = max_draft_tokens
             self.num_sparse_topk = index_topk
             self.enable_indexer_skip = enable_indexer_skip
@@ -856,14 +1533,14 @@ def _create_mock_metadata(
 
             self.runtime_features = RuntimeFeatures()
 
-            # Add expanded buffers for MTP support
-            # DSL kernel supports arbitrary next_n natively, so it never needs expansion.
-            self.use_expanded_buffers_for_mtp = not use_cute_dsl_paged_mqa_logits and (
-                (self.max_draft_tokens > 1 and get_sm_version() == 90)
-                or (
-                    (self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                    and get_sm_version() >= 100
-                )
+            # Add expanded buffers for MTP support. Mirrors the production gate in
+            # DSAtrtllmAttentionMetadata.prepare_for_spec_decode: sm100+ DeepGEMM
+            # runs a native next_n for any MTP depth, so only sm90 expands. The DSL
+            # kernel supports arbitrary next_n natively, so it never needs expansion.
+            self.use_expanded_buffers_for_mtp = (
+                not use_cute_dsl_paged_mqa_logits
+                and self.max_draft_tokens > 1
+                and get_sm_version() == 90
             )
             self.kv_lens_expanded_cuda = torch.zeros(
                 (self.num_seqs * (1 + self.max_draft_tokens),), device="cuda", dtype=torch.int32
@@ -1308,7 +1985,10 @@ def test_fp8_k_cache_roundtrip():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4)])
+# next_n=5 (MTP-4) exercises the native paged-MQA path on sm100+ (no buffer
+# expansion); on sm90 it falls back to the expanded buffers. See
+# DSAtrtllmAttentionMetadata.prepare_for_spec_decode.
+@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4), (2, 5)])
 @pytest.mark.parametrize(
     "backend",
     [
@@ -2660,7 +3340,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compr
 @pytest.mark.parametrize("seq_len_range", [(2048, 8192), (512, 1024)])
 def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_len_range):
     """
-    Test that use_custom_topk=True and use_custom_topk=False produce identical results
+    Test that the production and Torch Top-K modules produce identical results
     in the decode phase of sparse_attn_indexer.
 
     This test validates:
@@ -2806,7 +3486,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(
-            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         pytest.skip(f"Custom topk not available: {e}")
@@ -2830,8 +3510,9 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
+    _set_torch_top_k(indexer)
     topk_indices_fallback = indexer.sparse_attn_indexer(
-        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Test with indexer skip enabled
@@ -2858,7 +3539,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
         try:
             topk_indices_skip = indexer.sparse_attn_indexer(
-                metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+                metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights
             )
         except Exception as e:
             raise RuntimeError(f"Error when testing indexer skip: {e}")
@@ -2975,14 +3656,6 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
             max_draft_tokens=md,
         )
         Indexer.prepare(meta0)
-        # indexer_topk_decode needs caller-owned radix aux buffers for small gen batches.
-        _radix_bp = 10
-        meta0.radix_aux_indices = torch.zeros(
-            (step0_tokens, _radix_bp, index_topk), device="cuda", dtype=torch.int32
-        )
-        meta0.radix_aux_logits = torch.zeros(
-            (step0_tokens, _radix_bp, index_topk), device="cuda", dtype=torch.float32
-        )
     else:  # context: first gen round -- step 0 runs the context/prefill path.
         step0_tokens = kv_lens.sum().item()
         meta0 = _create_mock_metadata(
@@ -3009,9 +3682,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
     h0, q0, k0_fp8, k0_scale, w0 = make_inputs(step0_tokens)
     indexer._update_k_cache(k0_fp8, k0_scale, meta0)
     try:
-        topk0 = indexer.sparse_attn_indexer(
-            meta0, h0, q0, k0_fp8, k0_scale, w0, use_custom_topk=True
-        )
+        topk0 = indexer.sparse_attn_indexer(meta0, h0, q0, k0_fp8, k0_scale, w0)
     except Exception as e:
         pytest.skip(f"Custom topk not available: {e}")
 
@@ -3049,7 +3720,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
         meta.indexer_skip_topk = True
         hs, qs, ks_fp8, ks_scale, ws = make_inputs(batch_size)
         indexer._update_k_cache(ks_fp8, ks_scale, meta)
-        topk = indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws, use_custom_topk=True)
+        topk = indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws)
         assert torch.equal(topk, stash[:batch_size, :]), (
             f"{step0_mode} draft reuse step {step} should copy the stash 1:1 (next_n=1)"
         )
@@ -3062,7 +3733,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
 @pytest.mark.parametrize("chunk_size", [1024, 2048])
 def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chunk_size):
     """
-    Test chunked prefill: use_custom_topk=True vs use_custom_topk=False
+    Test chunked prefill: production Top-K vs Torch Top-K
     with metadata.indexer_prefill_chunks != None.
 
     This test validates:
@@ -3135,7 +3806,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(
-            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         pytest.skip(f"Custom topk not available: {e}")
@@ -3158,8 +3829,9 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
+    _set_torch_top_k(indexer)
     topk_indices_fallback = indexer.sparse_attn_indexer(
-        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Validation
@@ -3179,7 +3851,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 @pytest.mark.parametrize("seq_len_range", [(1, 512)])
 def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, seq_len_range):
     """
-    Test single-pass prefill: use_custom_topk=True vs use_custom_topk=False
+    Test single-pass prefill: production Top-K vs Torch Top-K
     with metadata.indexer_prefill_chunks == None (else branch).
     """
     torch.manual_seed(42)
@@ -3243,7 +3915,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(
-            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         pytest.skip(f"Custom topk not available: {e}")
@@ -3269,8 +3941,9 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
     # Force single-pass path by setting indexer_prefill_chunks to None
     metadata_fallback.indexer_prefill_chunks = None
 
+    _set_torch_top_k(indexer)
     topk_indices_fallback = indexer.sparse_attn_indexer(
-        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Test with indexer skip enabled
@@ -3292,13 +3965,31 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
     Indexer.prepare(metadata_skip)
     indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
     metadata_skip.indexer_prefill_chunks = None
+    indexer.top_k = TopK(
+        index_topk,
+        prefill_implementation=TopKImplementation.CUDA_RADIX,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+    )
+    indexer._enable_heuristic_topk = True
+    metadata_skip.gvr_prior_indices = torch.zeros(
+        (cache_manager.num_local_layers, batch_size, index_topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
 
     try:
         topk_indices_skip = indexer.sparse_attn_indexer(
-            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         raise RuntimeError(f"Indexer skip not available: {e}")
+
+    last_rows = torch.cumsum(metadata_skip.seq_lens[:batch_size], dim=0) - 1
+    local_layer = cache_manager.layer_offsets[layer_idx]
+    torch.testing.assert_close(
+        metadata_skip.gvr_prior_indices[local_layer, :batch_size],
+        topk_indices_skip[last_rows],
+    )
 
     # Validation
     ## Custom vs fallback
@@ -3399,12 +4090,13 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
 
     # Test custom kernel
     topk_custom = indexer.sparse_attn_indexer(
-        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
-    )
+        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights
+    ).clone()
 
     # Test fallback
+    _set_torch_top_k(indexer)
     topk_fallback = indexer.sparse_attn_indexer(
-        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Test with indexer skip enabled
@@ -3428,7 +4120,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         Indexer.prepare(metadata_skip)
         indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
         topk_indices_skip = indexer.sparse_attn_indexer(
-            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
 
     # Validate: custom and fallback should match
@@ -3513,6 +4205,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         meta.kv_cache_block_offsets = torch.tensor([10, 20, 30])
         meta.host_kv_cache_block_offsets = torch.tensor([10, 20, 30])
         meta.draft_kv_cache_block_offsets = torch.tensor([100, 200, 300])
+        meta.prepare_for_draft_forward.return_value = None
         return meta
 
     @staticmethod
@@ -3547,13 +4240,15 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         assert saved is not None
         assert saved["target_kv_cache_manager"] is original_kv_mgr
         assert meta.kv_cache_manager is mgr
-        assert "saved_dsa_state" not in saved
+        assert "saved_backend_state" not in saved
+        meta.prepare_for_draft_forward.assert_called_once_with()
 
         restore_attn_metadata_after_draft_replay(meta, saved)
 
         assert meta.kv_cache_manager is original_kv_mgr
         torch.testing.assert_close(meta.kv_cache_block_offsets, original_offsets)
         torch.testing.assert_close(meta.host_kv_cache_block_offsets, original_host_offsets)
+        meta.restore_after_draft_forward.assert_called_once_with(None)
 
     def test_native_dsa_replay_swaps_and_restores_buffers(self):
         """Switch native DSA metadata to draft buffers and restore it."""
@@ -3583,6 +4278,15 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         del meta.slot_mapping_fp8_fullkv
         del meta.slot_mapping_scale_fullkv
 
+        meta.prepare_for_draft_forward.side_effect = (
+            lambda: DSAtrtllmAttentionMetadata.prepare_for_draft_forward(meta)
+        )
+        meta.restore_after_draft_forward.side_effect = (
+            lambda saved_state: DSAtrtllmAttentionMetadata.restore_after_draft_forward(
+                meta, saved_state
+            )
+        )
+
         def is_attn_metadata(obj, cls):
             if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
                 return obj is meta
@@ -3594,13 +4298,13 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
                 side_effect=is_attn_metadata,
             ),
             patch(
-                "tensorrt_llm._torch.speculative.interface.torch.cuda.is_current_stream_capturing",
+                "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.torch.cuda.is_current_stream_capturing",
                 return_value=True,
             ),
         ):
             saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
 
-        assert "saved_dsa_state" in saved
+        assert "saved_backend_state" in saved
         assert meta.slot_mapping_fp8 is draft_buffers["slot_mapping_fp8"]
         restore_attn_metadata_after_draft_replay(meta, saved)
         assert meta.slot_mapping_fp8 is target_buffers["slot_mapping_fp8"]
@@ -3771,55 +4475,3 @@ def test_topk_indices_buffer_cuda_graph():
     assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
         "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
     )
-
-
-def test_kv_lens_row_reorder_threshold():
-    """_compute_kv_lens_row_reorder engages iff num_generations * next_n >= 2 * num_sms,
-    and produces a descending argsort of gen_kv_lens when active."""
-    num_sms = 16  # small synthetic value; threshold = 2 * 16 = 32 rows
-    next_n = 2  # max_draft_tokens=1 → next_n = 1 + 1 = 2
-
-    def make_mock(num_generations, kv_lens_list):
-        kv_cuda = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
-        buf = torch.zeros(64, dtype=torch.int32, device="cuda")
-        ns = SimpleNamespace(
-            enable_heuristic_topk=True,
-            use_cute_dsl_topk=True,
-            num_generations=num_generations,
-            num_sms=num_sms,
-            max_draft_tokens=next_n - 1,
-            num_contexts=0,
-            num_seqs=num_generations,
-            kv_lens_cuda=kv_cuda,
-            kv_lens_row_reorder_buffer=buf,
-            kv_lens_row_reorder=None,
-        )
-        ns._compute_kv_lens_row_reorder = (
-            lambda: DSAtrtllmAttentionMetadata._compute_kv_lens_row_reorder(ns)
-        )
-        return ns
-
-    # Fixed unsorted sequence for deterministic sort verification (len == num_sms)
-    kv_vals = [4, 1, 8, 2, 16, 3, 12, 6, 7, 9, 5, 11, 13, 10, 14, 15]
-
-    # Below threshold: 1 * 2 = 2 < 32 → None
-    md_below = make_mock(1, [1000])
-    md_below._compute_kv_lens_row_reorder()
-    assert md_below.kv_lens_row_reorder is None
-
-    # At threshold: num_sms * 2 = 32 → engages, verify descending argsort
-    md_at = make_mock(num_sms, kv_vals)
-    md_at._compute_kv_lens_row_reorder()
-    assert md_at.kv_lens_row_reorder is not None
-    reorder = md_at.kv_lens_row_reorder.cpu().tolist()
-    assert [kv_vals[i] for i in reorder] == sorted(kv_vals, reverse=True), (
-        "order_row must be a descending argsort of gen_kv_lens"
-    )
-
-    # Above threshold: (num_sms + 1) * 2 = 34 > 32 → also engages with correct sort
-    kv_vals2 = kv_vals + [100]
-    md_above = make_mock(num_sms + 1, kv_vals2)
-    md_above._compute_kv_lens_row_reorder()
-    assert md_above.kv_lens_row_reorder is not None
-    reorder2 = md_above.kv_lens_row_reorder.cpu().tolist()
-    assert [kv_vals2[i] for i in reorder2] == sorted(kv_vals2, reverse=True)

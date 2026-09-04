@@ -4,18 +4,17 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from types import SimpleNamespace
 
 import pytest
 
-pytestmark = pytest.mark.cpu_only
-
-# Add scripts directory to path
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
-SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
-sys.path.insert(0, SCRIPTS_DIR)
-
+__extra_import_path__ = ["~/scripts"]
 from test_to_stage_mapping import StageQuery
 
+pytestmark = pytest.mark.cpu_only
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
+SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
 GROOVY = os.path.join(REPO_ROOT, 'jenkins', 'L0_Test.groovy')
 DB_DIR = os.path.join(REPO_ROOT, 'tests', 'integration', 'test_lists',
                       'test-db')
@@ -25,6 +24,27 @@ MAX_SAMPLES = 10  # Small number for efficient testing
 MIN_PATTERN_LENGTH = 3  # Minimum length for search patterns
 
 
+def _stage_backed_tests(stage_query: StageQuery) -> list[str]:
+    """Return tests from YAML files that are wired to a Jenkins stage."""
+    return sorted(test for test, mappings in stage_query.test_map.items()
+                  if all(yml in stage_query.yaml_to_stages
+                         for yml, _stage, _backend in mappings))
+
+
+def test_stage_backed_tests_exclude_mixed_mappings() -> None:
+    """A test in any unwired YAML is not a live-stage sampling candidate."""
+    stage_query = SimpleNamespace(
+        test_map={
+            'mixed': [('l0_wired.yml', 'pre_merge', 'pytorch'),
+                      ('perf.yml', 'post_merge', 'pytorch')],
+            'wired': [('l0_wired.yml', 'pre_merge', 'pytorch')],
+        },
+        yaml_to_stages={'l0_wired.yml': ['L0-PyTorch']},
+    )
+
+    assert _stage_backed_tests(stage_query) == ['wired']
+
+
 @pytest.fixture(scope="module")
 def stage_query():
     """Fixture that provides a StageQuery instance."""
@@ -32,30 +52,25 @@ def stage_query():
 
 
 @pytest.fixture(scope="module")
-def sample_test_cases(stage_query):
-    """Fixture that provides sample test cases from actual data."""
-    random.seed(0)  # Ensure deterministic test results
-    all_tests = list(stage_query.test_map.keys())
+def sample_test_cases(stage_query: StageQuery) -> list[str]:
+    """Fixture that samples tests backed by a live Jenkins stage."""
+    all_tests = _stage_backed_tests(stage_query)
     if not all_tests:
         raise RuntimeError(
-            "No tests found in test mapping. This indicates a configuration "
-            "issue - either the test database YAML files are missing/empty "
-            "or the StageQuery is not parsing them correctly. Please check "
-            "that the test database directory exists and contains valid YAML "
-            "files with test definitions.")
+            "No tests are backed by a live Jenkins stage. Check that the "
+            "Groovy stage map and test database reference the same YAML files.")
 
     # Return up to MAX_SAMPLES tests randomly selected
     if len(all_tests) <= MAX_SAMPLES:
         return all_tests
 
-    return random.sample(all_tests, MAX_SAMPLES)
+    return random.Random(0).sample(all_tests, MAX_SAMPLES)
 
 
 @pytest.fixture(scope="module")
-def sample_stages(stage_query):
+def sample_stages(stage_query: StageQuery) -> list[str]:
     """Fixture that provides sample stages from actual data."""
-    random.seed(0)  # Ensure deterministic test results
-    all_stages = list(stage_query.stage_to_yaml.keys())
+    all_stages = sorted(stage_query.stage_to_yaml)
     if not all_stages:
         raise RuntimeError(
             "No stages found in stage mapping. This indicates a configuration "
@@ -68,7 +83,7 @@ def sample_stages(stage_query):
     if len(all_stages) <= MAX_SAMPLES:
         return all_stages
 
-    return random.sample(all_stages, MAX_SAMPLES)
+    return random.Random(0).sample(all_stages, MAX_SAMPLES)
 
 
 def test_data_availability(stage_query):
@@ -80,6 +95,19 @@ def test_data_availability(stage_query):
     print(f"\nTotal tests available: {len(stage_query.test_map)}")
     print(f"Total stages available: {len(stage_query.stage_to_yaml)}")
     print(f"Max samples configured: {MAX_SAMPLES}")
+
+
+def test_all_stage_backed_tests_map(stage_query: StageQuery) -> None:
+    """Every test in a Jenkins-wired YAML must resolve to a live stage."""
+    stage_backed_tests = _stage_backed_tests(stage_query)
+    assert stage_backed_tests, "No tests are backed by a live Jenkins stage"
+
+    unmapped = [
+        test for test in stage_backed_tests
+        if not stage_query.tests_to_stages([test])
+    ]
+    assert not unmapped, \
+        f"Stage-backed tests should map to at least one stage: {unmapped}"
 
 
 def test_documented_stage_examples_are_live(stage_query):
@@ -158,21 +186,17 @@ def test_known_stage_without_tests_is_reported(tmp_path):
     assert 'no tests mapped to: Empty-PyTorch-1' in proc.stderr.decode()
 
 
-@pytest.mark.skip(reason="https://nvbugs/5547275")
 @pytest.mark.parametrize("direction",
                          ["test_to_stage", "stage_to_test", "roundtrip"])
 def test_bidirectional_mapping_consistency(stage_query, sample_test_cases,
                                            sample_stages, direction):
     """Test mapping consistency in both directions with roundtrip validation."""
-
     if direction == "test_to_stage":
         if not sample_test_cases:
             pytest.skip("No test cases available")
 
         for test_case in sample_test_cases:
             stages = stage_query.tests_to_stages([test_case])
-            assert stages, \
-                f"Test '{test_case}' should map to at least one stage"
 
             # Verify all returned stages are valid
             for stage in stages:

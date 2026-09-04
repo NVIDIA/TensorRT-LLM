@@ -17,11 +17,15 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import kv_cache_transceiver as transceiver_module
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import BindKvCacheTransceiver
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    BindKvCacheTransceiver,
+    CtxTransferStatus,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     CppMambaHybridCacheManager,
@@ -66,13 +70,15 @@ def _make_response_handler_stub(active_requests, tp_allgather_result):
     executor.dist = SimpleNamespace(
         rank=0,
         world_size=2,
-        tp_allgather=Mock(return_value=tp_allgather_result),
+        tp_allgather_int64=Mock(
+            return_value=np.array([[int(flag)] for flag in tp_allgather_result])
+        ),
     )
     executor._enqueue_responses = Mock()
     executor._terminate_request = Mock()
     executor._handle_errors = Mock()
     executor._timeout_cleanup_order = Mock()
-    executor._timeout_cleanup_order.attach_mock(executor.dist.tp_allgather, "vote")
+    executor._timeout_cleanup_order.attach_mock(executor.dist.tp_allgather_int64, "vote")
     executor._timeout_cleanup_order.attach_mock(executor._handle_errors, "handle")
     return executor
 
@@ -112,14 +118,14 @@ def test_flag_unset_generation_timeout_uses_rank_uniform_cleanup():
 
     executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
     assert executor.active_requests == []
-    executor.dist.tp_allgather.assert_called_once_with(True)
+    executor.dist.tp_allgather_int64.assert_called_once_with([True])
     executor._handle_errors.assert_called_once_with(
         error_msg="Request timed out (KV transfer)",
         requests=[request],
         charge_budget=False,
     )
     assert executor._timeout_cleanup_order.mock_calls == [
-        call.vote(True),
+        call.vote([True]),
         call.handle(
             error_msg="Request timed out (KV transfer)",
             requests=[request],
@@ -135,14 +141,14 @@ def test_flag_unset_generation_timeout_peer_enters_cleanup():
     PyExecutor._handle_kv_transfer_timeouts_synced(executor)
 
     executor.kv_cache_transceiver.cancel_request.assert_not_called()
-    executor.dist.tp_allgather.assert_called_once_with(False)
+    executor.dist.tp_allgather_int64.assert_called_once_with([False])
     executor._handle_errors.assert_called_once_with(
         error_msg="Request timed out (KV transfer)",
         requests=[],
         charge_budget=False,
     )
     assert executor._timeout_cleanup_order.mock_calls == [
-        call.vote(False),
+        call.vote([False]),
         call.handle(
             error_msg="Request timed out (KV transfer)",
             requests=[],
@@ -195,7 +201,9 @@ def test_flag_unset_context_timeout_preserves_legacy_cleanup():
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
-    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = CtxTransferStatus(
+        [], []
+    )
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.requests_in_transfer.return_value = {
@@ -222,7 +230,9 @@ def test_enabled_context_timeout_defers_cleanup_until_cpp_terminal_state(monkeyp
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
-    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = CtxTransferStatus(
+        [], []
+    )
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
     executor.async_transfer_manager = Mock()
@@ -300,6 +310,8 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
     executor.kv_cache_transceiver = Mock()
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
+    # Transfer ownership is released once the request leaves the manager.
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor._disagg_inflight_cancel_unsupported_logged = False
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.requests_in_transfer.return_value = {
@@ -362,6 +374,7 @@ def test_peer_buffer_poison_triggers_world_consistent_fatal_cleanup(monkeypatch)
         "Disagg KV cache transfer buffer is poisoned; process restart is required",
         requests=None,
         charge_budget=False,
+        fatal_is_collective_aligned=True,
     )
 
 
@@ -376,6 +389,8 @@ def test_preclassified_fatal_error_keeps_adp_response_collectives_aligned():
     executor.executor_request_queue = Mock()
     executor.executor_request_queue.get_request_queue.return_value = raw_queue
     executor.active_requests = []
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
     executor.gather_all_responses = False
     executor.enable_attention_dp = True
     executor.dist = SimpleNamespace(rank=1, world_size=2)
@@ -383,7 +398,11 @@ def test_preclassified_fatal_error_keeps_adp_response_collectives_aligned():
     executor._terminate_request = Mock()
 
     PyExecutor._handle_errors(
-        executor, "poisoned transfer buffer", requests=None, charge_budget=False
+        executor,
+        "poisoned transfer buffer",
+        requests=None,
+        charge_budget=False,
+        fatal_is_collective_aligned=True,
     )
 
     executor._error_budget.consume.assert_not_called()

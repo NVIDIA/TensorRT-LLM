@@ -63,13 +63,8 @@ def fixed_params():
     return {"max_tokens": 8, "max_beam_width": 2}
 
 
-@pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
-def sampling_information(request):
-    return request.param
-
-
 @pytest.fixture(scope="module")
-def model_kwargs(fixed_params, sampling_information) -> dict[str, Any]:
+def model_kwargs(fixed_params) -> dict[str, Any]:
 
     assert fixed_params[
         "max_beam_width"] == 2, "This test only works for a beam width of 2"
@@ -79,7 +74,6 @@ def model_kwargs(fixed_params, sampling_information) -> dict[str, Any]:
             weight_loader=DummyWeightLoader(),
             config_loader=DummyConfigLoader(),
         ),
-        sampler_type=sampling_information,
     )
 
 
@@ -130,8 +124,6 @@ def _single_process_context():
 def llm(fixed_params, input_prompts, model_kwargs, single_process: bool,
         with_cuda_graph_and_overlap: bool):
     check_no_sync = single_process  # single_process only used for sync check
-    if check_no_sync and model_kwargs["sampler_type"] != "TorchSampler":
-        pytest.skip("Sync check only supported for TorchSampler")
 
     gc.collect(
         2)  # force destruction of any other LLM instances (cf. comment above)
@@ -405,19 +397,6 @@ def test_beam_search_e2e(
 ) -> None:
     llm_args = cast(TorchLlmArgs, llm.args)  # type: ignore[redundant-cast]
 
-    if return_log_probs and num_prompts > 1 and llm_args.sampler_type == "TRTLLMSampler":
-        pytest.skip(
-            "Beam search currently does not support return_log_probs with multiple prompts"
-        )
-    if return_log_probs and llm_args.sampler_type == "TRTLLMSampler":
-        pytest.skip(
-            "Beam search on TRTLLMSampler does not correctly handle log_probs if called multiple times"
-        )
-    if stop_token_ids is not None and llm_args.sampler_type == "TRTLLMSampler":
-        pytest.skip(
-            "Beam search on TRTLLMSampler does not correctly handle stop_token_ids"
-        )
-
     # create sampling parameters
     # additional_model_outputs is used to gather the cache indirection from the model.
     sampling_params = SamplingParams(
@@ -535,11 +514,6 @@ def test_beam_search_disagg_first_token_is_end_id(
     once to see what the beams sample, then declare beam 0's token the end id
     and rerun, so the context step finishes on its first and only token.
     """
-    if model_kwargs["sampler_type"] != "TorchSampler":
-        pytest.skip(
-            "The context-side end-id mask is a TorchSampler path; the C++ "
-            "decoder behind TRTLLMSampler pools the end candidate instead.")
-
     beam_width = fixed_params["max_beam_width"]
     base_params = SamplingParams(
         max_tokens=fixed_params["max_tokens"],
@@ -640,7 +614,6 @@ def test_beam_search_large_beam_width_regression(
         llm = LLM(
             model=_pl.Path("dummy_path"),
             checkpoint_loader=checkpoint_loader,
-            sampler_type="TRTLLMSampler",
             max_beam_width=beam_width,
             max_batch_size=beam_width * num_prompts,
             max_seq_len=64,
@@ -805,7 +778,6 @@ def test_beam_search_vbws_e2e(beam_width_array: list[int],
         llm = LLM(
             model=_pl.Path("dummy_path"),
             checkpoint_loader=checkpoint_loader,
-            sampler_type="TorchSampler",
             max_beam_width=max_beam_width,
             max_batch_size=max_beam_width,
             max_seq_len=64,
@@ -1814,9 +1786,9 @@ def test_vbws_cpp_formula_matches_past_array_end():
     kMaxBeamWidthArrayLength rather than the actual array length, so it read
     out of bounds and returned arbitrary widths (observed: 0, 32, 849 for a
     3-entry array). That starved the request in the C++ micro-batch scheduler
-    and hung decoding; it is fixed in llmRequest.cpp. TRTLLMSampler and the
-    scheduler call into C++ directly, so pin the agreement here -- a failure
-    means the two clamps have drifted apart again.
+    and hung decoding; it is fixed in llmRequest.cpp. The scheduler calls into
+    C++ directly, so pin the agreement here -- a failure means the two clamps
+    have drifted apart again.
     """
     beam_width_array = [2, 3, 4]
     request = _vbws_request(beam_width_array)
@@ -1869,12 +1841,15 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     # executor. A test that mirrored the predicate would keep passing if the
     # production check were deleted.
     # Everything _validate_request touches besides the beam checks runs after
-    # them and needs a live engine/sampler, so stub those two out; the beam
-    # width and beam_width_array branches are reached with the real code.
+    # them and needs a live engine/sampler/KV cache manager, so stub those out;
+    # the beam width and beam_width_array branches are reached with the real
+    # code.
     executor = types.SimpleNamespace(
         max_beam_width=request.py_beam_width,
+        kv_cache_transceiver=None,
         _validate_token_id_range=lambda _request: None,
         sampler=types.SimpleNamespace(validate_request=lambda _request: None),
+        _validate_request_budget=lambda _request: None,
     )
     validate = functools.partial(
         PyExecutor._validate_request,
@@ -2277,11 +2252,6 @@ class TestParameterValidation:
     def batch_size(request) -> int:
         return cast(int, request.param)
 
-    @pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
-    @staticmethod
-    def sampler_type(request) -> str:
-        return cast(str, request.param)
-
     @pytest.fixture(scope="module")
     @staticmethod
     def model_kwargs() -> dict[str, Any]:
@@ -2293,16 +2263,11 @@ class TestParameterValidation:
     # NB: Class-level fixture overrides do not work without this
     @pytest.fixture(scope="module")
     @staticmethod
-    def llm(fixed_params, input_prompts, model_kwargs, batch_size: int,
-            sampler_type: str):
+    def llm(fixed_params, input_prompts, model_kwargs, batch_size: int):
         return _build_llm(
             fixed_params,
             input_prompts,
-            (model_kwargs
-             | dict(
-                 max_batch_size=batch_size,
-                 sampler_type=sampler_type,
-             )),
+            (model_kwargs | dict(max_batch_size=batch_size)),
         )
 
     def _check_engine_responds(self, llm: LLM, input_prompts: list[str],
@@ -2325,15 +2290,12 @@ class TestParameterValidation:
         input_prompts: list[str],
         fixed_params: dict[str, Any],
         batch_size: int,
-        sampler_type: str,
         use_beam_search: bool | None,
     ):
         # best_of > 1 without beam search is greedy multi-return, which the LLM
         # API rejects. Covers use_beam_search both explicitly False and omitted.
         if batch_size == 1:
             pytest.skip("Test does not depend on batch size")
-        if sampler_type == "TorchSampler":
-            pytest.skip("Test does not depend on sampler_type")
         assert fixed_params["max_beam_width"] > 2
         params = dict(
             max_tokens=fixed_params["max_tokens"],
@@ -2361,7 +2323,6 @@ class TestParameterValidation:
         input_prompts: list[str],
         fixed_params: dict[str, Any],
         batch_size: int,
-        sampler_type: str,
         early_stopping: int,
     ):
         # Beam search is rejected wholesale under disaggregated serving (the
@@ -2371,8 +2332,6 @@ class TestParameterValidation:
         # testing a bound method rather than calling it.
         if batch_size == 1:
             pytest.skip("Test does not depend on batch size")
-        if sampler_type == "TRTLLMSampler":
-            pytest.skip("Exhaustive early_stopping check is TorchSampler-side")
         outputs = llm.generate(input_prompts,
                                sampling_params=SamplingParams(
                                    max_tokens=fixed_params["max_tokens"],
@@ -2398,7 +2357,6 @@ class TestParameterValidation:
         input_prompts: list[str],
         fixed_params: dict[str, Any],
         batch_size: int,
-        sampler_type: str,
     ):
         if batch_size == 1:
             pytest.skip("Test does not depend on batch size")
@@ -2437,45 +2395,13 @@ class TestParameterValidation:
 
     @pytest.mark.timeout(120)
     @pytest.mark.threadleak(enabled=False)
-    def test_logprobs_trtllm_sampler(
-        self,
-        llm: LLM,
-        input_prompts: list[str],
-        fixed_params: dict[str, Any],
-        batch_size: int,
-        sampler_type: str,
-    ):
-        if sampler_type != "TRTLLMSampler":
-            pytest.skip("Test is specific to TRTLLMSampler")
-
-        with pytest.raises(
-                RequestError,
-                match=
-                ".*Beam search only supports logprobs when batch size is 1.*"
-        ) if batch_size > 1 else nullcontext():
-            _ = llm.generate(input_prompts,
-                             sampling_params=SamplingParams(
-                                 max_tokens=fixed_params["max_tokens"],
-                                 n=1,
-                                 best_of=fixed_params["max_beam_width"],
-                                 use_beam_search=True,
-                                 end_id=-1,
-                                 logprobs=1,
-                             ))
-        self._check_engine_responds(llm, input_prompts, fixed_params)
-
-    @pytest.mark.timeout(120)
-    @pytest.mark.threadleak(enabled=False)
     def test_logprobs_torch_sampler(
         self,
         llm: LLM,
         input_prompts: list[str],
         fixed_params: dict[str, Any],
         batch_size: int,
-        sampler_type: str,
     ):
-        if sampler_type != "TorchSampler":
-            pytest.skip("Test is specific to TorchSampler")
         if batch_size == 1:
             pytest.skip("Test does not depend on batch size")
 

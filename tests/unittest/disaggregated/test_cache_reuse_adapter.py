@@ -20,7 +20,6 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base.transfer import TokenRange
 from tensorrt_llm._torch.disaggregation.native.transfer import Sender
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -350,32 +349,22 @@ class TestTrimReceiverWindowHead:
 
 
 # ---------------------------------------------------------------------------
-# TokenRange dataclass invariants.
+# _create_kv_slice: the block list spans prompt_len, excluding the extra KV
+# slots speculative decoding reserves.
 # ---------------------------------------------------------------------------
 
 
-class TestTokenRange:
-    def test_zero_start(self):
-        tr = TokenRange(start=0, end=256)
-        assert (tr.start, tr.end) == (0, 256)
-
-    def test_nonzero_start(self):
-        # Allowed: caller may pass a non-prompt-zero range (e.g., chunk).
-        tr = TokenRange(start=128, end=256)
-        assert (tr.start, tr.end) == (128, 256)
-
-    def test_start_eq_end_rejected(self):
-        with pytest.raises(ValueError):
-            TokenRange(start=256, end=256)
-
-
-# ---------------------------------------------------------------------------
-# _create_kv_slice: default TokenRange spans prompt_len, matching the
-# trimmed block list actually transferred.
-# ---------------------------------------------------------------------------
-
-
-def _build_transceiver_for_kv_slice(num_extra_kv_tokens: int, prompt_len: int):
+def _build_transceiver_for_kv_slice(
+    num_extra_kv_tokens: int,
+    prompt_len: int,
+    *,
+    tokens_per_block: int = 8,
+    block_ids=None,
+    sliding_window_size=None,
+    cached_tokens: int = 0,
+    is_generation_only: bool = False,
+    beam_width: int = 1,
+):
     """Stub a KvCacheTransceiverV2 so _create_kv_slice runs without dist setup.
 
     Wires only the attributes the method touches:
@@ -383,14 +372,21 @@ def _build_transceiver_for_kv_slice(num_extra_kv_tokens: int, prompt_len: int):
       - page table:    layer groups
       - cache manager: num_extra_kv_tokens (read in this code path)
     """
-    tokens_per_block = 8
-    layer_group = AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1)
+    layer_group = AttentionLayerGroup(
+        pool_group_idx=0,
+        kv_head_num_per_rank=1,
+        sliding_window_size=sliding_window_size,
+    )
     total_blocks = (prompt_len + num_extra_kv_tokens + tokens_per_block - 1) // tokens_per_block
-    block_ids = np.arange(total_blocks, dtype=np.int64)
+    if block_ids is None:
+        block_ids = np.arange(total_blocks, dtype=np.int64)
+    else:
+        block_ids = np.asarray(block_ids, dtype=np.int64)
 
     reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_cached_token_count_per_layer_group=lambda req, layer_groups: [0] * len(layer_groups),
+        get_cached_token_count_per_layer_group=lambda req, layer_groups: [cached_tokens]
+        * len(layer_groups),
         get_block_ids=lambda req, idx, lg: block_ids,
     )
     page_table = SimpleNamespace(layer_groups=[layer_group])
@@ -404,32 +400,32 @@ def _build_transceiver_for_kv_slice(num_extra_kv_tokens: int, prompt_len: int):
     req = SimpleNamespace(
         prompt_len=prompt_len,
         py_request_id=0,
-        py_beam_width=1,  # beam search disabled; _trim_packed_beam_block_ids is pass-through
-        is_generation_only_request=lambda: False,
+        py_beam_width=beam_width,
+        is_generation_only_request=lambda: is_generation_only,
     )
     return transceiver, req
 
 
-class TestCreateKvSliceTokenRange:
-    """token_range.end must be prompt_len, matching the trimmed block list.
+class TestCreateKvSliceBlockSpan:
+    """The block list must span prompt_len, not prompt_len + num_extra_kv_tokens.
 
-    The sender reconstructs total_blocks from token_range.end (ceil(end / tpb)),
-    so end must stay at prompt_len -- not prompt_len + num_extra_kv_tokens --
-    to match the blocks actually transferred.
+    A monolithic slice carries no extent of its own: the sender's suffix
+    arithmetic anchors on the session's prompt_len and assumes the list is the
+    tail of ceil(prompt_len / tpb) blocks. An extra block would shift every
+    per-layer token start.
     """
 
     def test_excludes_num_extra_kv_tokens(self):
         prompt_len = 17
         num_extra_kv_tokens = 7
         transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
+        tpb = transceiver._reuse_adapter.tokens_per_block
 
         kv_slice = transceiver._create_kv_slice(req)
 
-        assert kv_slice.token_range is not None
-        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
+        assert kv_slice.block_ids_per_layer_groups[0].size == (prompt_len + tpb - 1) // tpb
 
     def test_extra_tokens_do_not_cross_block_boundary(self):
-        # Reconstructed total_blocks (ceil(end / tpb)) must match the blocks sent.
         prompt_len = 16
         num_extra_kv_tokens = 7
         transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
@@ -442,20 +438,116 @@ class TestCreateKvSliceTokenRange:
 
         kv_slice = transceiver._create_kv_slice(req)
 
-        end = kv_slice.token_range.end
-        transferred_blocks = kv_slice.block_ids_per_layer_groups[0].size
-        assert (end + tpb - 1) // tpb == transferred_blocks
+        assert kv_slice.block_ids_per_layer_groups[0].size == prompt_len // tpb
 
     def test_defaults_to_prompt_len_when_no_extra(self):
         prompt_len = 17
         transceiver, req = _build_transceiver_for_kv_slice(
             num_extra_kv_tokens=0, prompt_len=prompt_len
         )
+        tpb = transceiver._reuse_adapter.tokens_per_block
 
         kv_slice = transceiver._create_kv_slice(req)
 
-        assert kv_slice.token_range is not None
-        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
+        assert kv_slice.block_ids_per_layer_groups[0].size == (prompt_len + tpb - 1) // tpb
+
+    def test_swa_caps_oversized_non_speculative_v1_list_before_window_trim(self):
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=0,
+            prompt_len=32,
+            block_ids=[100, 101, 102, 103, 104],
+            sliding_window_size=16,
+        )
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        np.testing.assert_array_equal(
+            kv_slice.block_ids_per_layer_groups[0],
+            np.array([102, 103], dtype=np.int64),
+        )
+
+    def test_swa_allocation_cap_preserves_packed_beam_tails(self):
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=0,
+            prompt_len=32,
+            block_ids=[100, 101, 102, 103, 104, 200, 201, 202],
+            sliding_window_size=16,
+            beam_width=4,
+        )
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        np.testing.assert_array_equal(
+            kv_slice.block_ids_per_layer_groups[0],
+            np.array([102, 103, 200, 201, 202], dtype=np.int64),
+        )
+
+    @pytest.mark.parametrize(
+        "block_ids",
+        (
+            pytest.param([100, 101, 102, 103, 104], id="v1-pre-eviction"),
+            pytest.param([102, 103, 104], id="v2-valid-only"),
+        ),
+    )
+    def test_swa_trims_speculative_tail_before_stale_prompt_blocks(self, block_ids):
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=2,
+            prompt_len=32,
+            block_ids=block_ids,
+            sliding_window_size=16,
+            cached_tokens=16,
+            is_generation_only=True,
+        )
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        np.testing.assert_array_equal(
+            kv_slice.block_ids_per_layer_groups[0],
+            np.array([102, 103], dtype=np.int64),
+        )
+
+    def test_swa_speculative_tail_requires_single_beam(self):
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=2,
+            prompt_len=32,
+            block_ids=[100, 101, 102, 103, 104],
+            sliding_window_size=16,
+            beam_width=4,
+        )
+
+        with pytest.raises(ValueError, match="speculative scratch blocks require beam_width == 1"):
+            transceiver._create_kv_slice(req)
+
+    @pytest.mark.parametrize("prompt_len", (1150, 1151))
+    def test_dspark_disagg_boundary_keeps_only_initialized_swa(self, prompt_len):
+        tokens_per_block = 128
+        total_blocks = (prompt_len + tokens_per_block - 1) // tokens_per_block
+        sliding_window_size = 128 + 5
+        stale_end = max(
+            0,
+            (prompt_len + 1 - sliding_window_size) // tokens_per_block,
+        )
+        valid_prompt_blocks = total_blocks - stale_end
+        block_ids = np.arange(
+            200,
+            200 + valid_prompt_blocks + 1,
+            dtype=np.int64,
+        )
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=5,
+            prompt_len=prompt_len,
+            tokens_per_block=tokens_per_block,
+            block_ids=block_ids,
+            sliding_window_size=sliding_window_size,
+            is_generation_only=True,
+        )
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        np.testing.assert_array_equal(
+            kv_slice.block_ids_per_layer_groups[0],
+            block_ids[:-1],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +859,7 @@ class TestTransceiverContextManager:
         tc._send_reqs = {}
         tc._recv_reqs = {}
         tc._transfer_worker = MagicMock()
+        tc._shutdown_complete = False
         return tc
 
     def test_enter_returns_self(self):
@@ -779,7 +872,7 @@ class TestTransceiverContextManager:
         with tc:
             pass
         tc._transfer_worker.shutdown.assert_called_once()
-        assert tc._shutdown is True
+        assert tc._shutdown_complete is True
 
     def test_exit_calls_shutdown_on_exception(self):
         tc = self._tc()
@@ -788,10 +881,10 @@ class TestTransceiverContextManager:
                 raise RuntimeError("boom")
         # __exit__ still ran shutdown despite the in-block exception.
         tc._transfer_worker.shutdown.assert_called_once()
-        assert tc._shutdown is True
+        assert tc._shutdown_complete is True
 
     def test_shutdown_is_idempotent(self):
         tc = self._tc()
         tc.shutdown()
-        tc.shutdown()  # second call short-circuits on the _shutdown guard.
+        tc.shutdown()  # second call short-circuits after completed teardown.
         tc._transfer_worker.shutdown.assert_called_once()

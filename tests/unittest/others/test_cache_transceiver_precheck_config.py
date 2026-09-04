@@ -19,26 +19,19 @@ Target: tests/scripts/perf-sanity/cache_transceiver_precheck/precheck_config.py
 
 import json
 import os
+import shlex
 import subprocess
 import sys
+import time
 import types
 
 import pytest
 
-_PRECHECK_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "..",
-    "..",
-    "tests",
-    "scripts",
-    "perf-sanity",
-    "cache_transceiver_precheck",
-)
-sys.path.insert(0, os.path.abspath(_PRECHECK_DIR))
+__extra_import_path__ = ["~/tests/scripts/perf-sanity/cache_transceiver_precheck"]
+import precheck_config as pcfg
+import run_precheck as rp
 
-import precheck_config as pcfg  # noqa: E402
-import run_precheck as rp  # noqa: E402  (stdlib-only at import time)
+_PRECHECK_DIR = os.path.dirname(os.path.abspath(pcfg.__file__))
 
 
 def _disagg_yaml(ctx_extra=None, gen_extra=None, **overrides):
@@ -474,11 +467,119 @@ class TestRendezvousStaleness:
 
 def test_wireup_timeout_derivation():
     plan = pcfg.resolve_plan(_disagg_yaml())  # ctx dep4 -> gen dep16
-    assert plan["wireup_timeout_s"] == min(1800, 150 * 16)
+    assert plan["wireup_timeout_s"] == 600
     plan = pcfg.resolve_plan(_disagg_yaml(gen_extra={"tensor_parallel_size": 4}))
     assert plan["wireup_timeout_s"] == 600
     plan = pcfg.resolve_plan(_disagg_yaml(cache_transceiver_precheck={"wireup_timeout_s": 42}))
     assert plan["wireup_timeout_s"] == 42
+
+
+def test_timeout_budget_is_bounded_and_layered():
+    one_peer = pcfg.timeout_budget(_disagg_yaml(), max_world=16)
+    assert one_peer == {
+        "wireup_timeout_s": 600,
+        "longest_phase_timeout_s": 900,
+        "watchdog_timeout_s": 960,
+        "step_timeout_s": 1200,
+    }
+
+    cfg = _disagg_yaml(hardware={"gpus_per_node": 4, "num_ctx_servers": 12, "num_gen_servers": 1})
+    multi_peer = pcfg.timeout_budget(cfg, max_world=32)
+    # Even 12 serialized ctx peers retain the 20-minute default health limit.
+    # Progress refreshes protect legitimate per-peer phases without scaling
+    # the external backstop with topology.
+    assert multi_peer["longest_phase_timeout_s"] == 900
+    assert multi_peer["step_timeout_s"] == 1200
+
+    cfg["cache_transceiver_precheck"] = {"step_timeout_s": 900}
+    with pytest.raises(ValueError, match="must exceed the longest phase watchdog"):
+        pcfg.timeout_budget(cfg, max_world=32)
+
+    cfg["cache_transceiver_precheck"] = {"step_timeout_s": 1800}
+    assert pcfg.timeout_budget(cfg, max_world=32)["step_timeout_s"] == 1800
+
+    cfg["cache_transceiver_precheck"] = {"step_timeout_s": 1801}
+    with pytest.raises(ValueError, match="must not exceed the global health-check limit"):
+        pcfg.timeout_budget(cfg, max_world=32)
+
+
+@pytest.mark.parametrize("model_root", ["/models with spaces", "/models/o'hare"])
+def test_precheck_commands_propagate_model_root(monkeypatch, model_root):
+    # CI provides the model root inside its inbound pytest command, not in the
+    # environment of the Python process that generates the launch script.
+    monkeypatch.delenv("LLM_MODELS_ROOT", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    lines = pcfg.precheck_prefix_lines(
+        {},
+        "e2e",
+        "$config",
+        "unset UCX_TLS &&",
+        max_world=8,
+        llm_models_root=model_root,
+    )
+    shell_script = "\n".join(
+        [
+            "CTX_WORKER_ENV_VARS=",
+            "GEN_WORKER_ENV_VARS=",
+            "PYTEST_COMMON_VARS=",
+            "llmSrcNode=/repo",
+            "testOutputDir=/tmp/output",
+            "config=/tmp/config.yaml",
+            *lines,
+            "printf '%s\\n' \"$pytestCommandCTXPrecheck\"",
+            "printf '%s\\n' \"$pytestCommandGENPrecheck\"",
+        ]
+    )
+
+    result = subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+    )
+    commands = result.stdout.splitlines()
+
+    assert len(commands) == 2
+    for command in commands:
+        tokens = shlex.split(command)
+        assignment = f"LLM_MODELS_ROOT={model_root}"
+        assert assignment in tokens
+        assert tokens.index(assignment) < tokens.index("python3")
+
+
+def test_precheck_commands_split_pytest_common_vars(monkeypatch):
+    # $PYTEST_COMMON_VARS is spliced unquoted on purpose: bash word splitting
+    # must yield separate K=V env-assignment tokens ahead of the executable.
+    # Values containing spaces are unsupported by design — this pins the
+    # expected splitting behavior.
+    monkeypatch.delenv("LLM_MODELS_ROOT", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    lines = pcfg.precheck_prefix_lines(
+        {},
+        "e2e",
+        "$config",
+        "unset UCX_TLS &&",
+        max_world=8,
+        llm_models_root="/models",
+    )
+    shell_script = "\n".join(
+        [
+            "CTX_WORKER_ENV_VARS=",
+            "GEN_WORKER_ENV_VARS=",
+            'PYTEST_COMMON_VARS="FOO=1 BAR=two"',
+            "llmSrcNode=/repo",
+            "testOutputDir=/tmp/output",
+            "config=/tmp/config.yaml",
+            *lines,
+            "printf '%s\\n' \"$pytestCommandCTXPrecheck\"",
+        ]
+    )
+
+    result = subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+    )
+    tokens = shlex.split(result.stdout.splitlines()[0])
+
+    python_index = tokens.index("python3")
+    for assignment in ("FOO=1", "BAR=two"):
+        assert tokens.index(assignment) < python_index
 
 
 def _enabled_line(cfg):
@@ -531,7 +632,7 @@ def test_disabled_precheck_does_not_require_or_export_model_root(monkeypatch):
     monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
 
     lines = pcfg.precheck_prefix_lines(
-        _disagg_yaml(),
+        _disagg_yaml(cache_transceiver_precheck={"enabled": False}),
         "e2e",
         "$config",
         "unset UCX_TLS &&",
@@ -557,6 +658,32 @@ def test_enabled_precheck_requires_model_root(monkeypatch, llm_models_root):
         )
 
 
+def test_precheck_enabled_helper(monkeypatch):
+    # submit.py consults this helper to decide whether a missing model root is
+    # fatal — it must mirror the policy encoded in ctPrecheckEnabled.
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    assert pcfg.PRECHECK_DEFAULTS["enabled"] is True
+    assert pcfg.precheck_enabled({}) is True
+    assert pcfg.precheck_enabled({"cache_transceiver_precheck": {"enabled": False}}) is False
+    monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "0")
+    assert pcfg.precheck_enabled({}) is False
+    monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "true")
+    assert pcfg.precheck_enabled({"cache_transceiver_precheck": {"enabled": False}}) is True
+
+
+def test_skip_waived_case_overrides_force_enable(monkeypatch):
+    monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "1")
+    lines = pcfg.precheck_prefix_lines(
+        {},
+        "e2e",
+        "$c",
+        "unset &&",
+        max_world=8,
+        skip_precheck=True,
+    )
+    assert next(x for x in lines if x.startswith("export ctPrecheckEnabled")).endswith("=0")
+
+
 def test_precheck_env_kill_switch_truthy(monkeypatch):
     """The TRTLLM_DISAGG_CT_PRECHECK kill switch parses the usual boolean spellings.
 
@@ -566,7 +693,7 @@ def test_precheck_env_kill_switch_truthy(monkeypatch):
     cfg = {"cache_transceiver_precheck": {"enabled": True}}
     monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
     assert _enabled_line(cfg).endswith("=1")  # yaml opt-in
-    assert _enabled_line({}).endswith("=0")  # off by default (waived)
+    assert _enabled_line({}).endswith("=1")  # on by default
     for v in ("1", "true", "on", "YES", " True "):
         monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", v)
         assert _enabled_line(cfg).endswith("=1"), v
@@ -608,6 +735,114 @@ def test_gate_library_content(tmp_path):
         pcfg.gate_library_content("/nowhere/draft.sh", str(tmp_path / "empty"))
 
 
+@pytest.mark.parametrize(
+    ("exit_code", "expected_verdict"),
+    ((124, "EXTERNAL_TIMEOUT"), (137, "EXTERNAL_KILL")),
+)
+def test_gate_records_external_timeout_verdict(tmp_path, exit_code, expected_verdict):
+    gate = os.path.join(
+        os.path.dirname(_PRECHECK_DIR),
+        "..",
+        "..",
+        "..",
+        "jenkins",
+        "scripts",
+        "perf",
+        "disaggregated",
+        "slurm_ct_precheck_gate.sh",
+    )
+    gate = os.path.abspath(gate)
+    shell_script = f"""
+source {shlex.quote(gate)}
+timeout() {{ return {exit_code}; }}
+sleep() {{ :; }}
+cleanup_on_failure() {{ :; }}
+ctPrecheckEnabled=1
+ctPrecheckTimeout=1200
+testOutputDir={shlex.quote(str(tmp_path / "output"))}
+jobWorkspace={shlex.quote(str(tmp_path / "workspace"))}
+mkdir -p "$jobWorkspace"
+numGenServers=1
+numCtxServers=1
+nodesPerGenServer=1
+nodesPerCtxServer=1
+gpusPerNodePerGenServer=1
+gpusPerNodePerCtxServer=1
+genNodeLists=(gen-node)
+ctxNodeLists=(ctx-node)
+srunArgs=()
+pytestCommandGENPrecheck=gen-command
+pytestCommandCTXPrecheck=ctx-command
+precheckRunScript=/unused
+run_cache_transceiver_precheck
+"""
+    subprocess.run(["bash"], input=shell_script, capture_output=True, check=True, text=True)
+
+    status_dir = tmp_path / "output" / "cache_transceiver_precheck" / "status"
+    for name in ("gen_0", "ctx_0"):
+        verdict = (status_dir / f"{name}.status").read_text()
+        assert verdict.startswith(f"{expected_verdict} {name}:")
+        if exit_code == 124:
+            assert "1200s total-runtime backstop" in verdict
+        else:
+            assert "possibly timeout -k escalation" in verdict
+    junit = (tmp_path / "workspace" / "results-ct-precheck.xml").read_text()
+    assert expected_verdict in junit
+    assert "NO_STATUS" not in junit
+
+
+def test_gate_scopes_precheck_launch_environment(tmp_path):
+    gate = os.path.join(
+        os.path.dirname(_PRECHECK_DIR),
+        "..",
+        "..",
+        "..",
+        "jenkins",
+        "scripts",
+        "perf",
+        "disaggregated",
+        "slurm_ct_precheck_gate.sh",
+    )
+    gate = os.path.abspath(gate)
+    shell_script = f"""
+source {shlex.quote(gate)}
+timeout() {{
+    case "$DISAGG_SERVING_TYPE:$pytestCommand" in
+        "GEN_PRECHECK_0:gen-command --server-idx 0"|\
+        "CTX_PRECHECK_0:ctx-command --server-idx 0") return 0 ;;
+        *) return 99 ;;
+    esac
+}}
+sleep() {{ :; }}
+cleanup_on_failure() {{ return 98; }}
+ctPrecheckEnabled=1
+ctPrecheckTimeout=1200
+testOutputDir={shlex.quote(str(tmp_path / "output"))}
+jobWorkspace={shlex.quote(str(tmp_path / "workspace"))}
+mkdir -p "$jobWorkspace"
+numGenServers=1
+numCtxServers=1
+nodesPerGenServer=1
+nodesPerCtxServer=1
+gpusPerNodePerGenServer=1
+gpusPerNodePerCtxServer=1
+genNodeLists=(gen-node)
+ctxNodeLists=(ctx-node)
+srunArgs=()
+pytestCommandGENPrecheck=gen-command
+pytestCommandCTXPrecheck=ctx-command
+precheckRunScript=/unused
+DISAGG_SERVING_TYPE=REAL_PERF_PARENT
+pytestCommand=real-perf-command
+run_cache_transceiver_precheck
+printf '%s\n%s\n' "$DISAGG_SERVING_TYPE" "$pytestCommand"
+"""
+    result = subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+    )
+    assert result.stdout.splitlines()[-2:] == ["REAL_PERF_PARENT", "real-perf-command"]
+
+
 def test_rid_tags_dense_within_session():
     """Rids must be dense within a (ctx, gen) session.
 
@@ -636,7 +871,7 @@ def test_rid_tags_dense_within_session():
 
 
 class TestMultiPeerOrchestration:
-    """CPU-only end-to-end run of the 2-ctx x 1-gen session protocol.
+    """CPU-only end-to-end runs of the multi-peer session protocol.
 
     Exercises the exact multi-instance logic of the hardware "B" topology:
     real ZMQ sockets + HMAC frames + StatusRecorder + rendezvous files via
@@ -668,8 +903,16 @@ class TestMultiPeerOrchestration:
         ctx_dp_rank = 0
         disagg_info_endpoint = None
 
-    def _mk_runner(self, role, server_idx, plan, work_dir, monkeypatch):
-        import sys
+    def _mk_runner(
+        self,
+        role,
+        server_idx,
+        plan,
+        work_dir,
+        monkeypatch,
+        fail_ctx=False,
+        wave_delay_s=0,
+    ):
         import types
 
         # PrecheckRunner.__init__ imports mpi4py only to ensure MPI init.
@@ -685,6 +928,10 @@ class TestMultiPeerOrchestration:
         calls = {"waves": 0}
 
         def ctx_run_wave(peer_idx, li, req_len, rep, wave):
+            if fail_ctx:
+                raise rp._TransferError("injected ctx failure")
+            if wave_delay_s:
+                time.sleep(wave_delay_s)
             calls["waves"] += 1
             return {p: self._FakeParams() for p in wave}, {}
 
@@ -694,7 +941,16 @@ class TestMultiPeerOrchestration:
         runner._calls = calls
         return runner
 
-    def _run(self, tmp_path, monkeypatch, fail_peer_idx=None):
+    def _run(
+        self,
+        tmp_path,
+        monkeypatch,
+        fail_peer_idx=None,
+        fail_ctx_idx=None,
+        num_ctx_servers=2,
+        first_ctx_wave_delay_s=0,
+        peer_progress_timeout_s=None,
+    ):
         import threading
 
         monkeypatch.setenv("SLURM_JOB_ID", "777")
@@ -702,7 +958,11 @@ class TestMultiPeerOrchestration:
         # resolve in sandboxed/CI environments, and everything is one process.
         monkeypatch.setenv("SLURMD_NODENAME", "127.0.0.1")
         cfg = _disagg_yaml(
-            hardware={"gpus_per_node": 4, "num_ctx_servers": 2, "num_gen_servers": 1},
+            hardware={
+                "gpus_per_node": 4,
+                "num_ctx_servers": num_ctx_servers,
+                "num_gen_servers": 1,
+            },
             cache_transceiver_precheck={
                 "request_lengths": [32],
                 "num_requests": 1,
@@ -713,11 +973,25 @@ class TestMultiPeerOrchestration:
             },
         )
         plan = pcfg.resolve_plan(cfg)
+        if peer_progress_timeout_s is not None:
+            plan["peer_progress_timeout_s"] = peer_progress_timeout_s
+            monkeypatch.setattr(rp, "CONTROL_POLL_INTERVAL_MS", 50)
         work = str(tmp_path)
         noop = lambda *a, **k: None  # noqa: E731 - signal.alarm needs main thread
 
         gen = self._mk_runner("gen", 0, plan, work, monkeypatch)
-        ctxs = [self._mk_runner("ctx", i, plan, work, monkeypatch) for i in range(2)]
+        ctxs = [
+            self._mk_runner(
+                "ctx",
+                i,
+                plan,
+                work,
+                monkeypatch,
+                fail_ctx=(fail_ctx_idx is not None and i == fail_ctx_idx),
+                wave_delay_s=first_ctx_wave_delay_s if i == 0 else 0,
+            )
+            for i in range(num_ctx_servers)
+        ]
 
         if fail_peer_idx is not None:
             real_gen_run_peer = rp.gen_run_peer
@@ -752,16 +1026,21 @@ class TestMultiPeerOrchestration:
         ]
         for t in threads:
             t.start()
+
+        def gen_arm(what, publish_progress=True, **kwargs):
+            if publish_progress:
+                rp.publish_peer_progress(gen, what)
+
         try:
             rp._drive_ctx_peers(
-                gen, noop, noop, rp._make_peer_failure_recorder(gen, noop, {"what": "test"})
+                gen, gen_arm, noop, rp._make_peer_failure_recorder(gen, noop, {"what": "test"})
             )
         finally:
             # Always join every peer, even when the driver raises. Asserting
             # inside the loop can itself strand later peers and trip CI's
             # pytest-threadleak hook.
             for thread in threads:
-                thread.join(timeout=5)
+                thread.join(timeout=60)
             leaked = [thread.name for thread in threads if thread.is_alive()]
             assert not leaked, f"ctx serve threads wedged: {leaked}"
         return plan, gen, ctxs, failures
@@ -780,6 +1059,123 @@ class TestMultiPeerOrchestration:
         for c in ctxs:
             assert c._calls["waves"] == total_waves
             assert [x["status"] for x in c.recorder.cases] == ["PASS"]
+
+    def test_four_ctx_full_pass(self, tmp_path, monkeypatch):
+        # ctx_0's four delayed waves take longer than the one-second queued
+        # wait budget. gen phase progress must refresh ctx_1..ctx_3 rather than
+        # letting their hello watchdog expire cumulatively behind ctx_0.
+        plan, gen, ctxs, failures = self._run(
+            tmp_path,
+            monkeypatch,
+            num_ctx_servers=4,
+            first_ctx_wave_delay_s=0.3,
+            peer_progress_timeout_s=1,
+        )
+        assert not failures
+        assert [c["peer"] for c in gen.recorder.cases] == [
+            "ctx_0",
+            "ctx_1",
+            "ctx_2",
+            "ctx_3",
+        ]
+        assert all(c["status"] == "PASS" for c in gen.recorder.cases)
+        assert all([case["status"] for case in ctx.recorder.cases] == ["PASS"] for ctx in ctxs)
+
+    def test_one_ctx_four_gen_full_pass(self, tmp_path, monkeypatch):
+        """Queued gen instances refresh from the active ctx's progress."""
+        import threading
+
+        monkeypatch.setenv("SLURM_JOB_ID", "778")
+        monkeypatch.setenv("SLURMD_NODENAME", "127.0.0.1")
+        monkeypatch.setattr(rp, "CONTROL_POLL_INTERVAL_MS", 50)
+        cfg = _disagg_yaml(
+            hardware={
+                "gpus_per_node": 4,
+                "num_ctx_servers": 1,
+                "num_gen_servers": 4,
+            },
+            cache_transceiver_precheck={
+                "request_lengths": [32],
+                "num_requests": 1,
+                "warmup_requests": 1,
+                "rendezvous_timeout_s": 30,
+                "wave_timeout_s": 30,
+                "wireup_timeout_s": 0,
+            },
+        )
+        plan = pcfg.resolve_plan(cfg)
+        # One ctx session takes four 0.3s waves, so later gen instances wait
+        # longer than this budget and need ctx progress to avoid false timeout.
+        plan["peer_progress_timeout_s"] = 1
+        work = str(tmp_path)
+        noop = lambda *args, **kwargs: None  # noqa: E731 - signal.alarm needs main thread
+
+        ctx = self._mk_runner(
+            "ctx",
+            0,
+            plan,
+            work,
+            monkeypatch,
+            wave_delay_s=0.3,
+        )
+        gens = [self._mk_runner("gen", i, plan, work, monkeypatch) for i in range(4)]
+        peer_failures = []
+        thread_errors = []
+
+        def record_ctx_peer_failure(peer, exc):
+            peer_failures.append((peer, type(exc).__name__))
+
+        def progress_arm(runner):
+            def arm(what, publish_progress=True, **kwargs):
+                if publish_progress:
+                    rp.publish_peer_progress(runner, what)
+
+            return arm
+
+        def run_ctx():
+            try:
+                rp._serve_gen_peers(
+                    ctx,
+                    plan,
+                    progress_arm(ctx),
+                    noop,
+                    record_ctx_peer_failure,
+                )
+            except Exception as exc:  # noqa: BLE001 - surface thread failures in the test
+                thread_errors.append(("ctx", exc))
+
+        def run_gen(gen):
+            try:
+                rp._drive_ctx_peers(
+                    gen,
+                    progress_arm(gen),
+                    noop,
+                    rp._make_peer_failure_recorder(gen, noop, {"what": "test"}),
+                )
+            except Exception as exc:  # noqa: BLE001 - surface thread failures in the test
+                thread_errors.append((f"gen_{gen.server_idx}", exc))
+
+        threads = [threading.Thread(target=run_ctx, name="ctx_0", daemon=True)]
+        threads.extend(
+            threading.Thread(
+                target=run_gen,
+                args=(gen,),
+                name=f"gen_{gen.server_idx}",
+                daemon=True,
+            )
+            for gen in gens
+        )
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        leaked = [thread.name for thread in threads if thread.is_alive()]
+        assert not leaked, f"orchestration threads wedged: {leaked}"
+        assert not thread_errors
+        assert not peer_failures
+        assert [case["status"] for case in ctx.recorder.cases] == ["PASS"] * 4
+        assert all([case["status"] for case in gen.recorder.cases] == ["PASS"] for gen in gens)
 
     def test_ctx_failure_last_peer(self, tmp_path, monkeypatch):
         # The failing pair is driven LAST: the earlier healthy peer already
@@ -834,7 +1230,6 @@ def test_ctx_run_wave_missing_params_broadcast(tmp_path, monkeypatch):
     delivered via bcast the rank must raise; with a clean (None) broadcast it
     must return normally.
     """
-    import sys
     import types
 
     monkeypatch.setitem(sys.modules, "mpi4py", types.SimpleNamespace(MPI=None))
@@ -980,3 +1375,70 @@ def test_python_transceiver_bandwidth_csv(tmp_path):
     assert abs(bw - 153600 * 1024 * 1024 / 1e9) < 1e-9
     # no perf files -> None
     assert rp.parse_python_bandwidth_gbps(str(tmp_path / "empty")) is None
+
+
+@pytest.mark.parametrize("mode", ["e2e", "gen_only"])
+def test_parse_args_accepts_every_forwarded_benchmark_mode(tmp_path, mode):
+    """--benchmark-mode must admit every mode submit.py can forward.
+
+    jenkins/scripts/perf/submit.py builds pytestCommandCTXPrecheck /
+    pytestCommandGENPrecheck by pasting the test id's mode token in verbatim, so
+    a mode missing from these choices makes the precheck srun die in argparse --
+    before the workload starts, and for a reason that reads as a launch failure
+    rather than an unsupported mode. resolve_plan only distinguishes gen_only;
+    e2e is accepted precisely because the KV transfer it prechecks is the same.
+
+    An instrumentation modifier such as `time_breakdown` is a separate test-id
+    segment and is never forwarded here, which is what keeps this list closed.
+    """
+    args = rp.parse_args(
+        [
+            "--role",
+            "ctx",
+            "--server-idx",
+            "0",
+            "--config",
+            str(tmp_path / "cfg.yaml"),
+            "--work-dir",
+            str(tmp_path),
+            "--benchmark-mode",
+            mode,
+        ]
+    )
+    assert args.benchmark_mode == mode
+
+
+@pytest.mark.parametrize("mode", ["e2e_time_breakdown", "time_breakdown", "ctx_only"])
+def test_parse_args_still_rejects_an_unknown_benchmark_mode(tmp_path, mode):
+    """The choices list must stay a gate, not become a free-text field.
+
+    A typo'd mode has to fail here, where the message names the argument, rather
+    than silently resolving to the e2e plan. The fused spelling
+    `e2e_time_breakdown` and a bare modifier are rejected for the same reason: a
+    caller passing either is a caller that has not split the axis.
+
+    `ctx_only` is in this list rather than the accepted one, which looks odd next
+    to the harness where ctx_only is a real benchmark mode. It is deliberate and
+    not reachable in production: the precheck gate is spliced only into the
+    *disaggregated* launch draft (jenkins/scripts/perf/submit.py, and
+    slurm_ct_precheck_gate.sh's run_cache_transceiver_precheck), and ctx_only runs
+    on the aggregated runtime, so this script is never invoked with it. There is
+    also nothing for it to precheck -- a ctx_only lane has no gen server, so no KV
+    transfer. Rejecting it keeps that assumption falsifiable: the day someone
+    wires the gate into the aggregated path, this test fails and says so.
+    """
+    with pytest.raises(SystemExit):
+        rp.parse_args(
+            [
+                "--role",
+                "ctx",
+                "--server-idx",
+                "0",
+                "--config",
+                str(tmp_path / "cfg.yaml"),
+                "--work-dir",
+                str(tmp_path),
+                "--benchmark-mode",
+                mode,
+            ]
+        )

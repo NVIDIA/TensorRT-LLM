@@ -76,6 +76,26 @@ def forward_context_sparse_attn(
     position_ids: Optional[torch.Tensor] = None,
     indexer_intermediates: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
+    if getattr(self.mqa, "has_fp4_kv_cache", False):
+        if latent_cache is None:
+            raise ValueError("NVFP4 DSA context requires latent_cache")
+        # Append every uncached context token before sparse prediction. The
+        # predictor then dequantizes the union of selected TopK rows into a
+        # compact FP8 pool, while the attention op skips its normal KV append.
+        self.mqa.mla_rope_append_paged_kv_assign_q(
+            q, latent_cache, attn_metadata, is_generation=False
+        )
+        return self.forward_absorption_context(
+            q,
+            compressed_kv,
+            k_pe,
+            attn_metadata,
+            output,
+            position_ids=position_ids,
+            latent_cache=None,
+            q_rope_applied=True,
+            sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=indexer_intermediates),
+        )
     if should_use_short_mha(self, attn_metadata, position_ids):
         return self.forward_context(
             q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
@@ -198,7 +218,7 @@ def forward_sparse_attn_custom_op(
         )
     q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
     indexer_intermediates = proj_outputs[4:]
-    torch.ops.trtllm.mla_dsa_attn_inplace(
+    custom_ops.maybe_bcg_mla_dsa_attn_inplace(
         q,
         compressed_kv,
         k_pe,
@@ -387,6 +407,11 @@ def _forward_dsa_attn(
             indexer_intermediates=indexer_intermediates,
         )
 
+    # Join the prev_topk copy forked in sparse_attn_indexer; CUDA graph
+    # capture requires the join within the same layer's forward.
+    if self.mqa.indexer is not None:
+        self.mqa.indexer.maybe_join_prev_topk_copy()
+
 
 def should_use_short_mha(
     self, attn_metadata: AttentionMetadata, position_ids: Optional[torch.Tensor]
@@ -407,6 +432,7 @@ def should_use_short_mha(
         return False
     if not (
         self.short_seq_mha_threshold > 0
+        and self.kv_cache_dtype != "fp8_ds_mla"
         and not self.apply_rotary_emb
         and self.mapping.cp_size == 1
         and position_ids is not None

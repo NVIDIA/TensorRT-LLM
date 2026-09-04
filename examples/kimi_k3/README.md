@@ -5,8 +5,15 @@ start and configuration for GSM8K evaluation.
 
 ## Hardware support
 
-Only NVIDIA Blackwell GPUs are currently supported and tested. Support for
-other GPU architectures may be added in a future release.
+Only NVIDIA Blackwell GPUs (`SM100` family) are supported. The performance
+results in this example were measured on GB300 NVL (`SM103`). Per-GPU memory
+requirements differ per recipe, and are set by the attention layout rather
+than by the GPU count: DEP16 needs 210 GB per rank and TEP8 needs 213 GB per
+rank, so both require GB300-class per-GPU memory, while TEP16 needs 115 GB
+per rank and is validated end-to-end on GB200 (`SM100`) at 16 GPUs. B200
+(`SM100`) is functionally supported at the kernel and module level and
+covered by unit tests in CI. See Current limitations. Support for other GPU
+architectures may be added in a future release.
 
 ## Prerequisites
 
@@ -21,17 +28,20 @@ other GPU architectures may be added in a future release.
   [build from source](../../docs/source/installation/build-from-source.md)
   for details.
 
-  `build_wheel.py` creates the virtual environment at the repository
-  root, named after the container's Python version: `.venv-3.12` for the
-  current containers (Python 3.12). If your container ships a different
-  Python, substitute the matching `.venv-<major>.<minor>` path in the
-  commands on this page. Adjust `--cuda_architectures` to the target
-  GPUs (`103-real` for GB300).
+  `build_wheel.py` creates the `.venv-3.12` virtual environment at the
+  repository root (named after the container's Python version). If your
+  container ships a different Python, substitute `.venv-<major>.<minor>`
+  for `.venv-3.12` in every command below and export
+  `TRTLLM_VENV=/path/to/repo/.venv-<major>.<minor>` when submitting the
+  Slurm jobs (they default to the repository-root `.venv-3.12`). Adjust
+  `--cuda_architectures` to the target GPUs (`103-real` for GB300,
+  `100-real` for B200).
 - A complete Hugging Face-format Kimi K3 checkpoint and tokenizer, e.g.
   [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) downloaded
   from the Hugging Face Hub (the example scripts take a local filesystem
   path).
-- A Slurm cluster with 16 NVIDIA Blackwell GPUs and a TensorRT-LLM container
+- A Slurm cluster with 16 NVIDIA Blackwell GPUs (GB300-class per-GPU memory
+  for DEP16 and TEP8; see Hardware support) and a TensorRT-LLM container
   image. The image passed as `--image` below must already provide
   TensorRT-LLM's runtime dependencies, that is, a release-style TensorRT-LLM
   container; a build or devel image without them does not work. The Slurm
@@ -70,7 +80,7 @@ other GPU architectures may be added in a future release.
   provides FlashInfer's runtime
   dependencies; `--no-deps` prevents pip from replacing its pinned PyTorch,
   Triton, CUDA, and CuTeDSL packages. Install FlashInfer last: TensorRT-LLM
-  currently pins `flashinfer-python==0.6.16`, so a later
+  currently pins `flashinfer-python==0.6.14`, so a later
   dependency-resolving TensorRT-LLM install can replace this source revision.
 
 ## Run the model
@@ -93,13 +103,13 @@ should report `True` for all four checks.
 For a full GSM8K evaluation, submit:
 
 ```bash
-sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model /path/to/kimi-k3-checkpoint \
     --image /path/to/tensorrt-llm-container.sqsh
 ```
 
 This job writes progress and results to
-`kimi-k3-gsm8k-<job-id>.log`. If no local dataset path is configured,
+`kimi-k3-eval-<job-id>.log`. If no local dataset path is configured,
 `trtllm-eval` downloads GSM8K from the Hugging Face Hub. The completed log
 contains a results table with the normalized GSM8K exact-match scores. With
 the tested checkpoint and the settings in this example, users should expect
@@ -116,7 +126,7 @@ possible with different checkpoint or dependency revisions.
 To evaluate with suffix-automaton (SA) speculative decoding, add `--sa`:
 
 ```bash
-sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model /path/to/kimi-k3-checkpoint \
     --image /path/to/tensorrt-llm-container.sqsh \
     --sa
@@ -184,7 +194,7 @@ Request a longer allocation if the time is not sufficient for your environment:
 sbatch --time=02:00:00 examples/kimi_k3/quick_start_kimi_k3.sbatch \
     --model MODEL --image IMAGE
 
-sbatch --time=04:00:00 examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch --time=04:00:00 examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model MODEL --image IMAGE
 ```
 
@@ -194,28 +204,36 @@ Chunked prefill is supported and enabled by default in this example
 (`enable_chunked_prefill: true` in the quick start and in
 `eval_extra_llm_options.yaml`).
 
-KV-cache block reuse is supported. The LLM API enables it by default
-(`KvCacheConfig.enable_block_reuse` defaults to `true`), but the example
-configurations here explicitly disable it and treat reuse as an opt-in:
-set `kv_cache_config.enable_block_reuse: true`, or use the example
-flags — `--enable-block-reuse` for the quick start and `--reuse` for the
-GSM8K job (which selects `eval_extra_llm_options_reuse.yaml`):
+KV-cache block reuse is supported as an opt-in: set
+`kv_cache_config.enable_block_reuse: true`, or use the example flags —
+`--enable-block-reuse` for the quick start and `--reuse` for the GSM8K
+job (which selects `eval_extra_llm_options_reuse.yaml`):
 
 ```bash
 sbatch examples/kimi_k3/quick_start_kimi_k3.sbatch \
     --model MODEL --image IMAGE --enable-block-reuse
 
-sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model MODEL --image IMAGE --reuse
 ```
 
-Unless one of the flags above is passed, these examples run with block
-reuse disabled; the tested evaluation and serving configurations use the
-default cache manager.
+Block reuse stays off by default because suffix-automaton speculative
+decoding requires the default cache manager, which cannot reuse blocks.
 
 ## Current limitations
 
 - Pipeline parallelism is not supported.
+- **DEP16 and TEP8 require GB300-class per-GPU memory.** Under attention-DP
+  the BF16 non-expert weights are replicated on every rank (114 GB per rank),
+  which together with the MXFP4 routed experts at 16-way expert parallelism
+  (90 GB per rank) needs 210 GB per rank for DEP16; TEP8 needs 213 GB per
+  rank because its 8-way expert share alone is 181 GB. Neither fits `SM100`
+  per-GPU memory. Use TEP16, which shards the non-expert weights and needs
+  115 GB per rank — validated end-to-end on GB200 (16 GPUs, 4 nodes), see the
+  deployment guide. Note that the FP8 weight-read path (TRTLLM-14765) does
+  not lift the DEP16 requirement: the conversion runs after the weights are
+  already resident in BF16, so it lowers the steady-state footprint but
+  leaves the load-time peak unchanged.
 - **Known performance limitation at DEP16 saturation** (attention-DP +
   EP16 throughput recipe): the 8K/1K serving sweep loses several percent
   of output throughput at concurrency ≥ 128 (up to ~15% at concurrency
@@ -223,4 +241,4 @@ default cache manager.
   and the TEP16/TEP8 latency recipes are unaffected. Tracked as
   TRTLLM-14904.
 - FP8 KV cache (`kv_cache_config.dtype: fp8`) is not yet supported.
-- Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). For evaluation, use `eval_extra_llm_options_sa.yaml` (the `--sa` flag of the GSM8K job): that configuration runs with the overlap scheduler off, `max_batch_size` 8, and a matching CUDA-graph `max_batch_size`. Combining speculation with disaggregated serving is not yet supported.
+- Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). For evaluation, use `eval_extra_llm_options_sa.yaml` (the `--sa` flag of the GSM8K job): that configuration runs with the overlap scheduler off, `max_batch_size` 8, and a matching CUDA-graph `max_batch_size`. Suffix-automaton speculation also works under disaggregated serving; enable it on the generation server with `examples/kimi_k3/disagg/gen_config.yaml` (SA runs eager with `max_batch_size` ≤ 8; see `examples/kimi_k3/disagg/README.md`).

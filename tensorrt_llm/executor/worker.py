@@ -1,5 +1,6 @@
 import gc
 import os
+import sys
 import threading
 import time
 import traceback
@@ -12,7 +13,6 @@ import zmq
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
-from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -33,13 +33,16 @@ __all__ = [
     "GenerationExecutorWorker",
 ]
 
+# Home of the architecture registries, imported on demand: a worker that never
+# touches the PyTorch model zoo should not pay for it.
+_MODELING_UTILS_MODULE = "tensorrt_llm._torch.models.modeling_utils"
+
 
 class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
         engine: Path,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
@@ -51,7 +54,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
     ) -> None:
         super().__init__(
             engine=engine,
-            executor_config=executor_config,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
@@ -120,19 +122,11 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             self.engine.shutdown()
             self.engine = None
 
-            if self.llm_args is not None:
-                assert self._executor_config is None, "An empty executor_config is expected in shutdown when LLM arguments are defined."
-                if (self.llm_args.backend == "pytorch"
-                        and hasattr(self, "checkpoint_loader")
-                        and self.checkpoint_loader is not None):
-                    self.checkpoint_loader.cleanup()
-                    self.checkpoint_loader = None
-            else:
-                if hasattr(
-                        self._executor_config, "checkpoint_loader"
-                ) and self._executor_config.checkpoint_loader is not None:
-                    self._executor_config.checkpoint_loader.cleanup()
-                    self._executor_config.checkpoint_loader = None
+            if (self.llm_args.backend == "pytorch"
+                    and hasattr(self, "checkpoint_loader")
+                    and self.checkpoint_loader is not None):
+                self.checkpoint_loader.cleanup()
+                self.checkpoint_loader = None
 
         # Destroy torch distributed process groups so that NCCL communicators
         # are torn down cleanly before MPI session shutdown and process exit.
@@ -174,13 +168,13 @@ def worker_main(
     engine: Path,
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
-    executor_config: Optional[tllm.ExecutorConfig] = None,
     batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
     worker_cls: type = GenerationExecutorWorker,
     tracer_init_kwargs: Optional[dict] = None,
-    _torch_model_class_mapping: Optional[dict] = None,
+    _torch_external_model_modules: Optional[dict] = None,
     postproc_worker_config: Optional[PostprocWorkerConfig] = None,
     ready_signal: Optional[str] = None,
+    worker_process_identities_signal: Optional[bytes] = None,
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     hf_model_dir: Optional[Path] = None,
@@ -237,10 +231,17 @@ def worker_main(
         tracer.start()
         set_global_tracer(tracer)
 
-    if _torch_model_class_mapping is not None:
+    # Architectures the driver registered from outside the built-in zoo, as
+    # module names. Declaring them leaves this process's zoo lazy: the one
+    # module behind an architecture is imported when that architecture is
+    # looked up, not because the driver happened to have imported it. An empty
+    # declaration is still worth making once the registries exist, so a worker
+    # reused by a driver without custom modules releases the previous driver's
+    # providers; before that there is nothing registered to release.
+    if _torch_external_model_modules or _MODELING_UTILS_MODULE in sys.modules:
         from tensorrt_llm._torch.models.modeling_utils import \
-            MODEL_CLASS_MAPPING
-        MODEL_CLASS_MAPPING.update(**_torch_model_class_mapping)
+            register_external_model_modules
+        register_external_model_modules(_torch_external_model_modules or {})
 
     set_mpi_session_cpp(mpi_comm())
 
@@ -341,12 +342,26 @@ def worker_main(
     mpi_comm().barrier()
     worker_process_identities = mpi_comm().allgather(
         capture_worker_process_identity(mpi_rank()))
+
+    # Publish the process identities before backend construction begins. Model
+    # construction can load weights for several minutes, and an externally
+    # killed worker may not complete its MPI future. Registering the workers at
+    # this point lets the proxy observe such a death while it is still waiting
+    # for the READY signal.
+    if is_leader and worker_process_identities_signal is not None:
+        identities_msg = (worker_process_identities_signal, None,
+                          worker_process_identities)
+        if not worker_init_status_queue.notify_with_retry(identities_msg):
+            # The failed status queue cannot report its own failure. Let this
+            # escape through the MPI future so the proxy can observe it.
+            raise RuntimeError(
+                "Failed to deliver worker process identities to proxy")
+
     logger_debug(f"Worker {mpi_rank()} ready to setup backend...\n", "green")
 
     try:
         worker: GenerationExecutorWorker = worker_cls(
             engine,
-            executor_config,
             batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,

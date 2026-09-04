@@ -35,9 +35,9 @@ from transformers import Qwen3NextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._torch.modules.fused_shared_expert import \
-    fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.moe.fused_shared_expert import \
+    fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
 from tensorrt_llm._utils import get_sm_version
@@ -50,15 +50,15 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
-                                 RenormalizeMoeRoutingMethod,
-                                 RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
+                             RenormalizeMoeRoutingMethod,
+                             RenormalizeNaiveMoeRoutingMethod,
+                             RoutingMethodType, create_moe)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .modeling_qwen3 import Qwen3Attention
@@ -881,44 +881,60 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        del all_rank_num_tokens
+        # Install this draft step's attention-DP token distribution: the draft
+        # loop passes it as a kwarg and leaves attn_metadata alone, matching
+        # Eagle3DraftModel.forward. The MoE below reads the per-rank counts off
+        # attn_metadata, and an MTP Eagle draft runs one token per sequence
+        # after step 0, so a stale target value mismatches collective sizes.
+        previous_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
-        def norm_embeds():
-            return self.pre_fc_norm_embedding(embed_tokens(input_ids))
+        try:
 
-        def norm_hidden():
-            return self.pre_fc_norm_hidden(hidden_states)
+            def norm_embeds():
+                return self.pre_fc_norm_embedding(embed_tokens(input_ids))
 
-        inputs_embeds, hidden_states = maybe_execute_in_parallel(
-            norm_embeds,
-            norm_hidden,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared],
-            self.aux_stream,
-            disable_on_compile=True,
-        )
-        hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
+            def norm_hidden():
+                return self.pre_fc_norm_hidden(hidden_states)
 
-        tp_size = self.model_config.mapping.tp_size
-        tp_rank = self.model_config.mapping.tp_rank
-        if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
-            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
+            inputs_embeds, hidden_states = maybe_execute_in_parallel(
+                norm_embeds,
+                norm_hidden,
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared],
+                self.aux_stream,
+                disable_on_compile=True,
+            )
+            hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
 
-        hidden_states = self.fc(hidden_states)
+            tp_size = self.model_config.mapping.tp_size
+            tp_rank = self.model_config.mapping.tp_rank
+            if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
+                hidden_states = torch.chunk(hidden_states, tp_size,
+                                            dim=-1)[tp_rank]
 
-        hidden_states, residual = super().forward(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            residual=None,
-            spec_metadata=spec_metadata,
-            **kwargs,
-        )
-        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-        if spec_metadata is not None:
-            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+            hidden_states = self.fc(hidden_states)
 
-        return hidden_states
+            hidden_states, residual = super().forward(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=None,
+                spec_metadata=spec_metadata,
+                **kwargs,
+            )
+            hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            if spec_metadata is not None:
+                spec_metadata.maybe_capture_hidden_states(
+                    0, hidden_states, None)
+
+            return hidden_states
+        finally:
+            # Shared with the target forward, so restore on the exception path
+            # too; otherwise a failed draft step corrupts every later forward.
+            if all_rank_num_tokens is not None:
+                attn_metadata.all_rank_num_tokens = previous_all_rank_num_tokens
 
 
 ALL_DECODER_LAYER_TYPES = {

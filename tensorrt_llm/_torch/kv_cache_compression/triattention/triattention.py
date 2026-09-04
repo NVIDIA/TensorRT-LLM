@@ -36,6 +36,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.logger import logger
 
 from ...distributed import allgather
+from ...modules.top_k import TopK, TopKImplementation
 from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ...pyexecutor.llm_request import LlmRequestState
 from ...pyexecutor.resource_manager import KVCacheCompressionManager
@@ -149,12 +150,10 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
     def __init__(
         self,
         config: "TriAttentionKvCacheCompressionConfig",
-        kv_cache_manager: KVCacheManagerV2,
-        draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
         *,
         pretrained_config: "PretrainedConfig",
     ) -> None:
-        super().__init__(config, kv_cache_manager, draft_kv_cache_manager)
+        super().__init__(config)
         self.budget = config.budget
         self.beta = config.beta
         self.eviction_mode = config.eviction_mode
@@ -167,6 +166,14 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         self._load_calibration()
 
         self._prepared_generation_batch: Optional["ScheduledRequests"] = None
+
+    def bind_kv_cache_managers(
+        self,
+        kv_cache_manager: KVCacheManagerV2,
+        draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    ) -> None:
+        """Finalize state whose geometry is owned by the constructed KVCMs."""
+        super().bind_kv_cache_managers(kv_cache_manager, draft_kv_cache_manager)
         # Manager-lifetime constants.
         self._num_extra_kv_tokens = int(kv_cache_manager.num_extra_kv_tokens)
         self._protected_tail_capacity = (
@@ -419,7 +426,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
                 # this request (pre-launch) instead of failing the batch.
                 continue
             draft_cache = None
-            if self.draft_kv_cache_manager is not None:
+            if self.has_independent_draft_kv_cache:
                 # A missing draft cache is a wiring bug: keep the precise KeyError.
                 draft_cache = self.draft_kv_cache_manager.kv_cache_map[request_id]
                 if not draft_cache.is_active:
@@ -599,7 +606,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         if self._swa_window is not None:
             swa_offsets = cumulative_offsets([self._swa_window + tail for tail in tails])
         draft_offsets = None
-        if self.draft_kv_cache_manager is not None:
+        if self.has_independent_draft_kv_cache:
             draft_offsets = cumulative_offsets(
                 [self.budget + self._draft_protected_tail_capacity] * len(eviction_requests)
             )
@@ -632,12 +639,13 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         """Select top-k tokens and settle score ties into kept-ordinal rows."""
         rows = request_count * self._selection_rows_per_request
         # The trailing 1 is next_n: decode scores one query token per request.
-        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+        self._selection_top_k(
             self._selection_scores_rows[:rows],
-            self._selection_row_lengths[:rows],
             self._provisional_rows[:rows],
-            self.budget,
-            1,
+            is_prefill=False,
+            sequence_lengths=self._selection_row_lengths[:rows],
+            scan_lengths=self._selection_row_lengths[:rows],
+            next_n=1,
         )
         settle_ties(
             self._selection_scores_rows,
@@ -679,7 +687,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         """Create manager-lifetime state once."""
         target_layout = self._create_kv_layout()
         draft_layout = (
-            self._create_kv_layout(draft=True) if self.draft_kv_cache_manager is not None else None
+            self._create_kv_layout(draft=True) if self.has_independent_draft_kv_cache else None
         )
         self._target_layout = target_layout
         self._draft_layout = draft_layout
@@ -799,6 +807,10 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
 
     def _allocate_selection_buffers(self, device: torch.device, *, tp_size: int) -> None:
         """Allocate fixed manager-lifetime TopK inputs and outputs."""
+        self._selection_top_k = TopK(
+            self.budget,
+            decode_implementation=TopKImplementation.CUTE_DSL_RADIX,
+        )
         request_capacity = self._request_capacity
         selection_width = self._selection_width_capacity
         union = self.eviction_mode == "union"

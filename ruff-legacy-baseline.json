@@ -106,12 +106,6 @@
   "examples/llm-api/llm_sparse_attention.py": {
     "D212": 1
   },
-  "examples/llm-api/star_attention.py": {
-    "D210": 1,
-    "D300": 1,
-    "D403": 1,
-    "D415": 1
-  },
   "examples/longbench/eval_longbench_v1.py": {
     "D202": 1,
     "D212": 1,
@@ -220,24 +214,6 @@
     "E731": 1,
     "F821": 5
   },
-  "tensorrt_llm/_torch/modules/fused_moe/deep_ep_utils.py": {
-    "F821": 2
-  },
-  "tensorrt_llm/_torch/modules/fused_moe/fused_moe_cute_dsl.py": {
-    "E741": 2
-  },
-  "tensorrt_llm/_torch/modules/fused_moe/fused_moe_triton.py": {
-    "F821": 1
-  },
-  "tensorrt_llm/_torch/modules/fused_moe/interface.py": {
-    "E402": 3
-  },
-  "tensorrt_llm/_torch/modules/fused_moe/moe_load_balancer.py": {
-    "E712": 2
-  },
-  "tensorrt_llm/_torch/modules/fused_moe/quantization.py": {
-    "E731": 1
-  },
   "tensorrt_llm/_torch/modules/mamba/selective_state_update.py": {
     "E731": 1
   },
@@ -251,6 +227,24 @@
     "E731": 3
   },
   "tensorrt_llm/_torch/modules/mamba/ssd_state_passing.py": {
+    "E731": 1
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py": {
+    "F821": 2
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py": {
+    "E741": 2
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/fused_moe_triton.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/interface.py": {
+    "E402": 3
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py": {
+    "E712": 2
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/quantization.py": {
     "E731": 1
   },
   "tensorrt_llm/_torch/pyexecutor/model_loader.py": {
@@ -343,7 +337,7 @@
     "D212": 1,
     "E722": 1
   },
-  "tensorrt_llm/executor/ray_executor.py": {
+  "tensorrt_llm/executor/ray/executor.py": {
     "D205": 1,
     "D212": 2,
     "E712": 1

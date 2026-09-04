@@ -38,7 +38,7 @@ from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_
 
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
-    convert_wordlist,
+    LlmRequestState,
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import (
@@ -52,7 +52,10 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
 )
 from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import UtilsSamplingParams
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import (
+    UtilsSamplingParams,
+    _get_max_beam_width,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     GREEDY,
     BeamSearch,
@@ -153,7 +156,7 @@ class TestStrategySelection:
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
         ) -> int:  # Torch sampler accesses this, but it does not affect this test
-            return self.sampling_config.beam_width
+            return cast(int, self.sampling_config.beam_width)
 
     def _check_params(self, params: SamplingParams):
         # cf. description of 'top_p' in doc-string of SamplingParams and
@@ -559,7 +562,7 @@ def test_select_generated_logits(
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
-                return self.sampling_config.beam_width
+                return cast(int, self.sampling_config.beam_width)
 
         class GenRequestMock:
             def __init__(self, draft_len: int):
@@ -571,7 +574,7 @@ def test_select_generated_logits(
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
-                return self.sampling_config.beam_width
+                return cast(int, self.sampling_config.beam_width)
 
         def _build_scheduled_requests() -> ScheduledRequests:
             scheduled_requests = ScheduledRequests()
@@ -960,8 +963,8 @@ class TestFinishReasons:
                 new_tokens=new_tokens,
                 finish_reasons=None,
                 first_finish_reasons=None,
+                single_step_greedy=True,
             ),
-            single_step_greedy=True,
         )
 
         sampler.update_requests(state)
@@ -1000,9 +1003,7 @@ class TestFinishReasons:
                 seq_slot=seq_slot,
                 input_tokens=prompt,
                 max_new_tokens=max_new_tokens,
-                stop_words_list=convert_wordlist(stop_words_list)
-                if stop_words_list is not None
-                else None,
+                stop_words_list=stop_words_list,
                 end_id=end_id,
                 sampling_config=SamplingConfig(),
                 is_streaming=False,
@@ -1014,7 +1015,7 @@ class TestFinishReasons:
 
         def __repr__(self):
             return f"RequestCase({self.prompt=}, {self.new_tokens=}, {self.finish_reasons=}, \
-            {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.stop_words_list=})"
+            {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.py_stop_words_list=})"
 
         @classmethod
         def build(
@@ -1423,6 +1424,125 @@ class TestFinishReasons:
             extra_context=lambda: check_resize_ctx(),
         )
         run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=None)
+
+    @staticmethod
+    def _all_beams_finished_reference(row: torch.Tensor, beam_width: int) -> bool:
+        """The per-request reduction the batched prefix count replaces."""
+        return bool(
+            (row[:beam_width] != FinishReason.NOT_FINISHED.value).sum().item() == beam_width
+        )
+
+    def test_finished_beam_prefix_lengths_matches_per_request_reduction(self):
+        """The batched prefix count answers the per-request question for every width."""
+        store_width = 4
+        reasons = [
+            FinishReason.NOT_FINISHED.value,
+            FinishReason.END_ID.value,
+            FinishReason.STOP_WORDS.value,
+            FinishReason.LENGTH.value,
+        ]
+        rows = list(product(reasons, repeat=store_width))
+        finish_reasons = torch.tensor(rows, dtype=torch.int32)
+
+        prefix_lengths = TorchSampler._finished_beam_prefix_lengths(finish_reasons)
+
+        assert len(prefix_lengths) == len(rows)
+        for row, prefix_length in zip(finish_reasons, prefix_lengths):
+            for beam_width in range(1, store_width + 1):
+                assert (prefix_length >= beam_width) == self._all_beams_finished_reference(
+                    row, beam_width
+                ), f"row={row.tolist()} beam_width={beam_width}"
+
+    def test_finished_beam_prefix_lengths_ignores_columns_past_beam_width(self):
+        """Reasons beyond a request's beam width must not complete it, or vice versa."""
+        # Slot 0 uses 2 beams and both finished; the padding columns are unfinished.
+        # Slot 1 uses 2 beams, only the second finished; the padding columns are set.
+        finish_reasons = torch.tensor(
+            [
+                [FinishReason.END_ID.value, FinishReason.LENGTH.value, 0, 0],
+                [
+                    0,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                ],
+            ],
+            dtype=torch.int32,
+        )
+
+        prefix_lengths = TorchSampler._finished_beam_prefix_lengths(finish_reasons)
+
+        assert prefix_lengths[0] >= 2
+        assert prefix_lengths[1] < 2
+
+    def test_handle_first_finish_reasons_completes_only_fully_finished_requests(self):
+        """Requests are completed, and their per-beam reasons recorded, only when all
+        of their own beams finished -- across differing beam widths in one batch."""
+        sampler = object.__new__(TorchSampler)
+        store_width = 4
+        # Slot 0: beam_width 2, both finished -> completes.
+        # Slot 1: beam_width 4, first beam unfinished -> stays running.
+        # Slot 2: beam_width 1, finished -> completes.
+        finish_reasons = torch.tensor(
+            [
+                [FinishReason.END_ID.value, FinishReason.LENGTH.value, 0, 0],
+                [
+                    0,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                ],
+                [FinishReason.STOP_WORDS.value, 0, 0, 0],
+            ],
+            dtype=torch.int32,
+        )
+        assert finish_reasons.size(1) == store_width
+        prefix_lengths = TorchSampler._finished_beam_prefix_lengths(finish_reasons)
+        finish_reasons_list = finish_reasons.tolist()
+
+        class RecordingLlmRequest(LlmRequest):
+            """LlmRequest that records the per-beam reasons the sampler sets."""
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.recorded_reasons: list[tuple[int, FinishReason]] = []
+
+            def set_finished_reason(self, finish_reason: FinishReason, beam: int) -> None:
+                self.recorded_reasons.append((beam, finish_reason))
+                super().set_finished_reason(finish_reason, beam)
+
+        requests = []
+        for seq_slot, beam_width in enumerate([2, 4, 1]):
+            # The beam width must come from the sampling config: it sizes the
+            # request's C++ per-beam state, which set_finished_reason indexes.
+            request = RecordingLlmRequest(
+                request_id=seq_slot,
+                seq_slot=seq_slot,
+                input_tokens=[1],
+                max_new_tokens=10,
+                end_id=2,
+                sampling_config=SamplingConfig(beam_width=beam_width),
+                is_streaming=False,
+            )
+            assert request.py_beam_width == beam_width
+            requests.append(request)
+
+        completed = [
+            sampler._handle_first_finish_reasons(request, prefix_lengths, finish_reasons_list)
+            for request in requests
+        ]
+
+        assert completed == [True, False, True]
+        assert requests[0].state == LlmRequestState.GENERATION_COMPLETE
+        assert requests[1].state != LlmRequestState.GENERATION_COMPLETE
+        assert requests[2].state == LlmRequestState.GENERATION_COMPLETE
+        # Only the request's own beams are reported, in beam order.
+        assert requests[0].recorded_reasons == [
+            (0, FinishReason.END_ID),
+            (1, FinishReason.LENGTH),
+        ]
+        assert requests[1].recorded_reasons == []
+        assert requests[2].recorded_reasons == [(0, FinishReason.STOP_WORDS)]
 
 
 @pytest.mark.parametrize("min_p", [0.0, 0.1, 0.5, 0.9])
@@ -1866,7 +1986,7 @@ class TestBatchedSampling:
             sample_state.sampler_event.synchronize()
             assert sample_state.host is not None
             host_new_tokens = sample_state.host.new_tokens
-            if sample_state.single_step_greedy:
+            if sample_state.host.single_step_greedy:
                 # The stable greedy path copies one token per active request instead of
                 # the full [step, slot, beam] buffer. This fixture uses dense sequence
                 # slots, so restore that layout before comparing sampling results.
@@ -3299,9 +3419,8 @@ class TestTopPDecay:
     """Minimal functional guards for Top-P Decay in TorchSampler.
 
     Covers strategy routing, the post-sample runtime update (parity with the
-    C++ computeToppDecay recurrence; cases ported from
-    topPSamplingLayerTest.cpp), and per-request rejection of unsupported
-    combinations.
+    recurrence the former C++ computeToppDecay implemented), and per-request
+    rejection of unsupported combinations.
     """
 
     VOCAB_SIZE = 1000
@@ -3495,3 +3614,24 @@ class TestTopPDecay:
             )
         # Same request without decay is accepted.
         sampler.validate_request(self._mock_request(SamplingParams(top_p=0.9), draft_tokens=[1, 2]))
+
+    @pytest.mark.parametrize(
+        "beam_width_array, expected_max_width",
+        [([], 1), (None, 1), ([1], 1), ([1, 2], 2), ([3, 5, 7], 7)],
+    )
+    def test_beam_width_array_max_handles_empty(
+        self, beam_width_array: list[int] | None, expected_max_width: int
+    ) -> None:
+        # An empty beam_width_array reaches the sampler: the executor's
+        # checkBeamWidthArray bounds only the array's length, so [] passes
+        # admission. _get_max_beam_width must fall back to beam_width instead of
+        # reducing over the empty array, and must still take the array's maximum
+        # when it has entries.
+        #
+        # Build the request through SamplingParams, the way production does.
+        request = self._mock_request(SamplingParams(top_p=0.9, beam_width_array=beam_width_array))
+        assert _get_max_beam_width(request) == expected_max_width
+        # The same request must survive admission: top_p_decay is unset, but
+        # TopPDecayHandler.validate_request resolves the sampling params -- and
+        # with them the beam width -- before it checks whether decay is active.
+        self._make_sampler().validate_request(request)

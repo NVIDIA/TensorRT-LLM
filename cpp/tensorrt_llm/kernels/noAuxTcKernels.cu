@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
+#include "tensorrt_llm/kernels/quantization.cuh"
 #include <cmath>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -47,14 +48,10 @@ static __device__ inline float sigmoid_accurate(float x)
 
 template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts, bool UseGroups,
     int MaxNumTopExperts = DefaultMaxNumTopExperts, int MaxNumTopGroups = DefaultMaxNumTopGroups>
-__global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, IdxT* topkIndices, BiasT* routingBias,
-    int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup, int64_t const topk,
-    int64_t const numExperts, int64_t const numExpertsPerGroup, double const routedScalingFactor)
+__device__ __forceinline__ void deepseek_v3_topk_block(InputT* scores, OutputT* topkValues, IdxT* topkIndices,
+    BiasT* routingBias, int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup, int64_t const topk,
+    int64_t const numExperts, int64_t const numExpertsPerGroup, double const routedScalingFactor, int64_t tokenIdx)
 {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-#endif
-
     __shared__ float __attribute((aligned(128))) smemScoreSigmoid[MaxNumExperts];
     __shared__ float __attribute((aligned(128))) smemScoreBias[MaxNumExperts];
 
@@ -66,23 +63,18 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
 
     static constexpr float invalidScoreFloat = float{-INFINITY};
 
-    topkValues += blockIdx.x * topk;
-    topkIndices += blockIdx.x * topk;
+    topkValues += tokenIdx * topk;
+    topkIndices += tokenIdx * topk;
 
     if constexpr (UseGroups)
     {
         int constexpr NumWarps = MaxNumExperts / WARP_SIZE;
         __shared__ float __attribute((aligned(128))) smemGroupScores[NumWarps];
 
-        if (warpIdx >= numGroup)
-        {
-            return;
-        }
-
         auto threadExpert = warpIdx * numExpertsPerGroup + laneIdx;
         bool expertSelected = laneIdx < numExpertsPerGroup;
 
-        auto scoreIdx = int64_t{blockIdx.x} * int64_t{numExperts} + threadExpert;
+        auto scoreIdx = tokenIdx * static_cast<int64_t>(numExperts) + threadExpert;
         auto biasVal = expertSelected ? static_cast<float>(routingBias[threadExpert]) : invalidScoreFloat;
         float score = expertSelected ? static_cast<float>(scores[scoreIdx]) : invalidScoreFloat;
         auto scoreSigmoid = sigmoid_accurate(score);
@@ -149,7 +141,7 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
     {
         for (int e = threadIdx.x; e < numExperts; e += blockDim.x)
         {
-            auto scoreIdx = int64_t{blockIdx.x} * int64_t{numExperts} + e;
+            auto scoreIdx = tokenIdx * static_cast<int64_t>(numExperts) + e;
             auto biasVal = static_cast<float>(routingBias[e]);
             float score = static_cast<float>(scores[scoreIdx]);
             auto scoreSigmoid = sigmoid_accurate(score);
@@ -188,10 +180,99 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
             }
         }
     }
+}
 
+template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts, bool UseGroups,
+    int MaxNumTopExperts = DefaultMaxNumTopExperts, int MaxNumTopGroups = DefaultMaxNumTopGroups>
+__global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, IdxT* topkIndices, BiasT* routingBias,
+    int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup, int64_t const topk,
+    int64_t const numExperts, int64_t const numExpertsPerGroup, double const routedScalingFactor)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+    if constexpr (UseGroups)
+    {
+        if (threadIdx.x / WARP_SIZE >= numGroup)
+        {
+            return;
+        }
+    }
+    deepseek_v3_topk_block<InputT, BiasT, OutputT, IdxT, MaxNumExperts, UseGroups, MaxNumTopExperts, MaxNumTopGroups>(
+        scores, topkValues, topkIndices, routingBias, numTokens, numGroup, topkGroup, topk, numExperts,
+        numExpertsPerGroup, routedScalingFactor, blockIdx.x);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
+}
+
+// K3 decode specialization: CTAs [0, M) route 896 experts to top-16, while
+// CTAs [M, 2M) independently quantize one 3584-wide BF16 activation row to
+// MXFP8 with linear UE8M0 group-32 scales.
+static constexpr int KimiK3NumExperts = 896;
+static constexpr int KimiK3TopK = 16;
+static constexpr int KimiK3HiddenSize = 3584;
+static constexpr int MxFp8SfVecSize = 32;
+static constexpr int KimiK3QuantThreads = KimiK3HiddenSize / CVT_ELTS_PER_THREAD;
+
+__global__ __launch_bounds__(KimiK3QuantThreads) void kimi_k3_noaux_tc_mxfp8_quant_kernel(float* scores,
+    float* routingBias, __nv_bfloat16* hiddenStates, __nv_bfloat16* topkValues, int32_t* topkIndices,
+    int64_t* quantizedHiddenStates, int32_t* hiddenStatesScale, int64_t numTokens, double routedScalingFactor)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    if (blockIdx.x < numTokens)
+    {
+        deepseek_v3_topk_block<float, float, __nv_bfloat16, int32_t, MaxSupportedExpertCount, false,
+            MaxSupportedTopExperts>(scores, topkValues, topkIndices, routingBias, numTokens, 1, 1, KimiK3TopK,
+            KimiK3NumExperts, KimiK3NumExperts, routedScalingFactor, blockIdx.x);
+    }
+    else
+    {
+        using QuantT = __nv_bfloat16;
+        using QuantPackedVec = PackedVec<QuantT>;
+        static constexpr int CvtNumThreadsPerSf = MxFp8SfVecSize / CVT_ELTS_PER_THREAD;
+        int const rowIdx = blockIdx.x - numTokens;
+        int const colIdx = threadIdx.x;
+        int const numColThreads = KimiK3HiddenSize / CVT_ELTS_PER_THREAD;
+
+        std::optional<int> optionalNumRows = numTokens;
+        auto sfOut = cvt_quant_get_sf_out_offset<uint32_t, CvtNumThreadsPerSf>(std::nullopt, rowIdx, colIdx,
+            optionalNumRows, KimiK3HiddenSize / MxFp8SfVecSize, reinterpret_cast<uint32_t*>(hiddenStatesScale),
+            QuantizationSFLayout::LINEAR);
+        int64_t const offset = static_cast<int64_t>(rowIdx) * numColThreads + colIdx;
+        QuantPackedVec inVec = reinterpret_cast<QuantPackedVec const*>(hiddenStates)[offset];
+        reinterpret_cast<uint64_t*>(quantizedHiddenStates)[offset]
+            = cvt_warp_fp16_to_mxfp8<QuantT, MxFp8SfVecSize>(inVec, sfOut);
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    __threadfence();
+    __syncthreads();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+void invokeKimiK3NoAuxTcMxFp8Quant(float* scores, float* bias, __nv_bfloat16* hidden_states, __nv_bfloat16* topk_values,
+    int32_t* topk_indices, int64_t* quantized_hidden_states, int32_t* hidden_states_scale, int64_t const num_tokens,
+    double const routed_scaling_factor, cudaStream_t const stream)
+{
+    cudaLaunchConfig_t config;
+    config.gridDim = 2 * num_tokens;
+    config.blockDim = KimiK3QuantThreads;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    cudaLaunchKernelEx(&config, kimi_k3_noaux_tc_mxfp8_quant_kernel, scores, bias, hidden_states, topk_values,
+        topk_indices, quantized_hidden_states, hidden_states_scale, num_tokens, routed_scaling_factor);
+    sync_check_cuda_error(stream);
 }
 
 template <typename InputT, typename BiasT, typename OutputT, typename IdxT>

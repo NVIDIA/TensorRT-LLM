@@ -15,7 +15,8 @@
 
 import weakref
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from enum import Enum
+from typing import TYPE_CHECKING, NamedTuple, Optional, Protocol
 
 import torch
 
@@ -28,8 +29,63 @@ if TYPE_CHECKING:
     )
 
 
+class _CuteDslMlaStagingKey(NamedTuple):
+    """Identifies CuTe-DSL MLA inputs staged into a shared workspace.
+
+    Attributes:
+        is_capturing: Whether the staging occurred during CUDA graph capture.
+        workspace_ptr: Address of the shared staging workspace.
+        block_tables_ptr: Address of the source block tables.
+        block_tables_shape: Shape of the source block tables.
+        sequence_lengths_ptr: Address of the source sequence lengths.
+        sequence_lengths_offset: Offset applied to the source sequence lengths.
+        batch_beam: Number of generation sequences, including beam expansion.
+        padded_num_pages: Page-table width after CuTe-DSL alignment padding.
+    """
+
+    is_capturing: bool
+    workspace_ptr: int
+    block_tables_ptr: int
+    block_tables_shape: tuple[int, ...]
+    sequence_lengths_ptr: int
+    sequence_lengths_offset: int
+    batch_beam: int
+    padded_num_pages: int
+
+
+class MlaBackendPolicy(Protocol):
+    """Selects the MLA generation backend for one scheduler batch."""
+
+    def __call__(
+        self,
+        requested_backend: str,
+        metadata: "TrtllmAttentionMetadata",
+        num_gen_tokens: int,
+    ) -> str:
+        """Return the backend to use for the supplied batch composition.
+
+        Args:
+            requested_backend: Backend selected by the attention instance.
+            metadata: Runtime metadata for the current scheduler batch.
+            num_gen_tokens: Number of generation tokens in the batch.
+
+        Returns:
+            Backend name to use for MLA generation in this batch.
+        """
+        ...
+
+
+class FmhaPhase(str, Enum):
+    """Attention phase checked by a phased FMHA library."""
+
+    CONTEXT = "context"
+    GENERATION = "generation"
+
+
 class Fmha(ABC):
     """Common runtime contract for TRT-LLM attention FMHA libraries."""
+
+    supports_skip_correction = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
@@ -43,6 +99,16 @@ class Fmha(ABC):
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
+        """Return whether this library can serve the given attention layer.
+
+        Evaluated once per ``FmhaManager`` construction, currently at the end
+        of ``TrtllmAttention.update_quant_config()``. Conditions must depend
+        only on state finalized before manager construction and invariant for
+        its lifetime. Reading state that a model rewrites later, such as a
+        remapped ``layer_idx``, silently leaves the library list stale because
+        it is not revalidated. Request-varying conditions belong in
+        ``is_supported`` instead.
+        """
         return True
 
     def is_supported(
@@ -52,7 +118,17 @@ class Fmha(ABC):
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
     ) -> bool:
+        """Return whether this library supports the request or requested phase.
+
+        Forward-varying selection conditions must be represented in
+        ``FmhaManager._make_cache_key``. Conditions omitted from that key must
+        remain invariant for the attention instance. Size-based conditions
+        must also preserve the same result throughout each FMHA cache grid
+        cell or add the relevant boundary to the grid's candidate list.
+        """
         return True
 
     @abstractmethod

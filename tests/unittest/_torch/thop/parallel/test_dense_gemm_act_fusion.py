@@ -21,18 +21,179 @@ floor); the small-M (m=64) bf16-out cases exercise the path the MLP/GatedMLP
 fall back to below that floor.
 """
 
+from unittest import mock
+
 import pytest
 import torch
 import torch.nn.functional as F
-from utils.util import skip_pre_blackwell
+from utils.util import skip_pre_blackwell, skip_rubin
 
-from tensorrt_llm._torch.modules.fused_moe.quantization import interleave_linear_and_gate
+from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.utils import swizzle_sf, unswizzle_sf
 from tensorrt_llm.math_utils import pad_up
 
 FP4_E2M1_MAX = 6.0
 FP8_E4M3_MAX = 448.0
 SF_VEC = 16
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not hasattr(torch, "_addmm_activation"),
+    reason="requires CUDA torch._addmm_activation",
+)
+def test_mlp_gelu_tanh_backward_uses_unfused_path() -> None:
+    """Autograd keeps eager linear + GELU so bf16 backward remains valid."""
+    from tensorrt_llm._torch.modules.mlp import MLP
+    from tensorrt_llm._torch.utils import gelu_tanh
+
+    mlp = MLP(
+        hidden_size=64,
+        intermediate_size=128,
+        bias=True,
+        activation=gelu_tanh,
+        dtype=torch.bfloat16,
+        reduce_output=False,
+    ).cuda()
+    with torch.no_grad():
+        for parameter in mlp.parameters():
+            parameter.normal_(std=0.02)
+
+    x = torch.randn(2, 4, 64, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    with mock.patch.object(
+        torch,
+        "_addmm_activation",
+        side_effect=AssertionError("inference-only fusion used with autograd"),
+    ):
+        mlp(x).float().sum().backward()
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not hasattr(torch, "_addmm_activation"),
+    reason="requires CUDA torch._addmm_activation",
+)
+@pytest.mark.parametrize(
+    "excluded_linear_path",
+    ["gather_output", "use_custom_cublas_mm", "use_cute_dsl_bf16_gemm"],
+)
+def test_mlp_gelu_tanh_excluded_linear_path_uses_unfused_path(
+    excluded_linear_path: str,
+) -> None:
+    """Linear post-processing and alternate GEMM backends keep their dispatch."""
+    from tensorrt_llm._torch.modules.mlp import MLP
+    from tensorrt_llm._torch.utils import gelu_tanh
+
+    mlp = MLP(
+        hidden_size=64,
+        intermediate_size=128,
+        bias=True,
+        activation=gelu_tanh,
+        dtype=torch.bfloat16,
+        reduce_output=False,
+    )
+    setattr(mlp.up_proj, excluded_linear_path, True)
+
+    x = torch.randn(2, 4, 64, dtype=torch.bfloat16, device="cuda")
+    x_up = torch.randn(2, 4, 128, dtype=torch.bfloat16, device="cuda")
+    x_down = torch.randn_like(x)
+    with (
+        torch.no_grad(),
+        mock.patch.object(
+            mlp,
+            "_fused_up_proj_gelu",
+            side_effect=AssertionError("fusion bypassed Linear dispatch"),
+        ),
+        mock.patch.object(mlp.up_proj, "forward", return_value=x_up) as up_forward,
+        mock.patch.object(mlp.down_proj, "forward", return_value=x_down),
+    ):
+        output = mlp(x)
+
+    up_forward.assert_called_once_with(x)
+    assert output is x_down
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not hasattr(torch, "_addmm_activation"),
+    reason="requires CUDA torch._addmm_activation",
+)
+def test_mlp_gelu_tanh_eligible_path_uses_fused_epilogue() -> None:
+    """An eligible bf16 inference MLP engages the fused epilogue and stays
+    close to the unfused reference."""
+    from tensorrt_llm._torch.modules.mlp import MLP
+    from tensorrt_llm._torch.utils import gelu_tanh
+
+    mlp = MLP(
+        hidden_size=64,
+        intermediate_size=128,
+        bias=True,
+        activation=gelu_tanh,
+        dtype=torch.bfloat16,
+        reduce_output=False,
+    ).cuda()
+    with torch.no_grad():
+        for parameter in mlp.parameters():
+            parameter.normal_(std=0.02)
+
+    x = torch.randn(2, 4, 64, dtype=torch.bfloat16, device="cuda")
+    with (
+        torch.no_grad(),
+        mock.patch.object(mlp, "_fused_up_proj_gelu", wraps=mlp._fused_up_proj_gelu) as fused,
+    ):
+        fused_out = mlp(x)
+    fused.assert_called_once_with(x)
+
+    with (
+        torch.no_grad(),
+        mock.patch.object(mlp, "_unquantized_gelu_fusion_eligible", return_value=False),
+    ):
+        unfused_out = mlp(x)
+
+    assert fused_out.shape == unfused_out.shape
+    torch.testing.assert_close(fused_out.float(), unfused_out.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_mlp_nvfp4_gelu_gather_output_is_ineligible() -> None:
+    """The direct NVFP4 GELU kernels must not bypass column all-gather."""
+    from tensorrt_llm._torch.modules.mlp import MLP
+    from tensorrt_llm._torch.utils import gelu_tanh
+
+    mlp = MLP(
+        hidden_size=64,
+        intermediate_size=128,
+        bias=True,
+        activation=gelu_tanh,
+        dtype=torch.bfloat16,
+        reduce_output=False,
+    )
+    up = torch.nn.Identity()
+    up.gather_output = True
+    up.has_nvfp4_activation_quantization = True
+    mlp.up_proj = up
+    down = torch.nn.Identity()
+    down.has_nvfp4_activation_quantization = True
+    down.force_dynamic_quantization = False
+    down.input_scale = torch.ones(1)
+    down.pre_quant_scale = None
+    mlp.down_proj = down
+
+    with (
+        mock.patch("tensorrt_llm._torch.modules.mlp.get_sm_version", return_value=100),
+        mock.patch.object(
+            torch.ops.trtllm,
+            "cute_dsl_nvfp4_dense_gemm_gelu_blackwell",
+            object(),
+            create=True,
+        ),
+        mock.patch.object(
+            torch.ops.trtllm,
+            "cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell",
+            object(),
+            create=True,
+        ),
+    ):
+        assert mlp._nvfp4_gelu_fusion_eligibility() == (False, False)
 
 
 def _quantize_nvfp4(x_bf16: torch.Tensor):
@@ -69,6 +230,7 @@ def _sf_match(c_sf, ref_sf, m, n):
 # GELU (non-gated, optional bias)
 # ---------------------------------------------------------------------------
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("use_bias", [False, True])
 @pytest.mark.parametrize("m, k, n", [(64, 256, 512), (128, 256, 512), (256, 512, 2048)])
 def test_dense_gemm_gelu_bf16out(m: int, k: int, n: int, use_bias: bool):
@@ -94,6 +256,7 @@ def test_dense_gemm_gelu_bf16out(m: int, k: int, n: int, use_bias: bool):
 
 
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("use_bias", [False, True])
 @pytest.mark.parametrize("m, k, n", [(128, 256, 512), (256, 512, 2048)])
 def test_dense_gemm_gelu_fp4out(m: int, k: int, n: int, use_bias: bool):
@@ -146,6 +309,7 @@ def _swiglu_ref(a, b, a_sf, b_sf, alpha):
 
 
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("m, k, inter", [(64, 256, 512), (128, 256, 512), (256, 512, 1024)])
 def test_dense_gemm_swiglu_bf16out(m: int, k: int, inter: int):
     """bf16-out fused gate-up GEMM + SwiGLU. m=64 < _FP4OUT_MIN_M (fallback)."""
@@ -167,6 +331,7 @@ def test_dense_gemm_swiglu_bf16out(m: int, k: int, inter: int):
 
 
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("m, k, inter", [(128, 256, 512), (256, 512, 1024)])
 def test_dense_gemm_swiglu_fp4out(m: int, k: int, inter: int):
     """fp4-out fused gate-up GEMM + SwiGLU + NVFP4 quant (m >= _FP4OUT_MIN_M)."""
@@ -235,6 +400,47 @@ def test_mlp_fp4out_min_m_switch():
         assert seen["fp4_out"] == expected, (
             f"m={m}: expected fp4_out={expected}, got {seen['fp4_out']}"
         )
+
+
+@pytest.mark.parametrize(
+    "sm_version, partitioned, expected",
+    [
+        (100, False, True),
+        (103, False, True),
+        (100, True, False),
+        (107, False, False),
+    ],
+)
+# TODO: drop this skip when the locality-domain wiring PR lands.
+@pytest.mark.skip(reason="requires locality-domain wiring from a later PR in this series")
+def test_nvfp4_swiglu_blackwell_capability(monkeypatch, sm_version, partitioned, expected):
+    """SM107 and locality domain shards must keep gate/up weights in the Rubin layout."""
+    import types
+
+    from tensorrt_llm._torch.modules import linear as linear_module
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    layer = Linear.__new__(Linear)
+    torch.nn.Module.__init__(layer)
+    layer.use_cute_dsl_blockscaling_mm = True
+    layer.use_cute_dsl_nvfp4_swiglu_blackwell = True
+    layer.has_bias = False
+    layer.partition_plan = types.SimpleNamespace(enabled=partitioned)
+    layer._weights_created = True
+    layer.quant_config = types.SimpleNamespace(
+        layer_quant_mode=types.SimpleNamespace(has_nvfp4=lambda: True),
+    )
+
+    monkeypatch.setattr(linear_module, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(linear_module, "get_sm_version", lambda: sm_version)
+
+    mlp = GatedMLP.__new__(GatedMLP)
+    torch.nn.Module.__init__(mlp)
+    mlp.gate_up_proj = layer
+
+    assert layer.can_use_cute_dsl_nvfp4_swiglu_blackwell() is expected
+    assert mlp._can_fuse_gate_up_swiglu() is expected
 
 
 # ---------------------------------------------------------------------------

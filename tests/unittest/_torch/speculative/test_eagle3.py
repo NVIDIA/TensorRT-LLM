@@ -15,7 +15,6 @@
 
 import json
 import os
-import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -35,19 +34,23 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSACacheManagerV2, DSAtrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor._util import \
-    _derive_draft_max_attention_window
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.pyexecutor._util import (
+    _derive_draft_max_attention_window,
+    _expand_attention_window_pattern_to_global_layers)
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     _extend_full_attention_windows_for_spec_decode
-from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
+from tensorrt_llm._torch.speculative.eagle3 import (Eagle3OneModelSpecMetadata,
+                                                    MTPEagleWorker)
+from tensorrt_llm._torch.speculative.eagle3_dynamic_tree import \
+    Eagle3OneModelDynamicTreeWorker
+from tensorrt_llm._torch.speculative.interface import \
+    INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.mtp_dynamic_tree import \
     MTPEagleDynamicTreeWorker
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig)
-from tensorrt_llm.lora_helper import LoraConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
@@ -185,6 +188,77 @@ def test_mtp_dynamic_tree_relocation_uses_full_attention_window(
     assert args[10] is attention_block_offsets
 
 
+def test_eagle3_dynamic_tree_relocation_uses_local_cache_shape(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = object.__new__(Eagle3OneModelDynamicTreeWorker)
+    worker._kv_head_dim_bytes = 256
+    worker._accepted_draft_indices_tensor = torch.tensor([[0, 1], [2, -1]],
+                                                         dtype=torch.int32)
+    worker._num_accepted_tokens_buf = torch.tensor([2, 1], dtype=torch.int32)
+
+    local_pool_pointers = object()
+    local_block_offsets = object()
+    cache_manager = SimpleNamespace(
+        num_layers=8,
+        num_local_layers=2,
+        num_kv_heads_per_layer=[8, 8],
+        max_attention_window_vec=[None, None],
+        max_seq_len=8192,
+        max_total_draft_tokens=31,
+        max_blocks_per_seq=256,
+        tokens_per_block=32,
+        kv_cache_pool_mapping=[[1, 0], [1, 1]],
+        kv_cache_pool_pointers=[object(), local_pool_pointers],
+    )
+    attention_metadata = SimpleNamespace(
+        kv_cache_manager=cache_manager,
+        kv_lens_cuda=torch.tensor([128, 256], dtype=torch.int32),
+        kv_cache_block_offsets=[object(), local_block_offsets],
+    )
+    update_op = MagicMock()
+    monkeypatch.setattr(
+        torch.ops.tensorrt_llm,
+        "update_kv_cache_draft_token_location_2d",
+        update_op,
+        raising=False,
+    )
+
+    worker._relocate_kv_eagerly(attention_metadata, batch_size=2)
+
+    update_op.assert_called_once()
+    (
+        accepted_draft_indices,
+        num_accepted_tokens,
+        past_key_value_lengths,
+        use_paged_kv_cache,
+        layer_count,
+        num_kv_heads,
+        head_size_in_bytes,
+        rewind_draft_token_count,
+        max_kv_cache_len,
+        pool_pointers,
+        block_offsets,
+        max_blocks_per_seq,
+        tokens_per_block,
+        stream,
+    ) = update_op.call_args.args
+    assert torch.equal(accepted_draft_indices,
+                       worker._accepted_draft_indices_tensor)
+    assert torch.equal(num_accepted_tokens, worker._num_accepted_tokens_buf)
+    assert torch.equal(past_key_value_lengths, attention_metadata.kv_lens_cuda)
+    assert use_paged_kv_cache is True
+    assert layer_count == cache_manager.num_local_layers
+    assert num_kv_heads == 8
+    assert head_size_in_bytes == worker._kv_head_dim_bytes
+    assert rewind_draft_token_count == cache_manager.max_total_draft_tokens
+    assert max_kv_cache_len == cache_manager.max_seq_len
+    assert pool_pointers is local_pool_pointers
+    assert block_offsets is local_block_offsets
+    assert max_blocks_per_seq == cache_manager.max_blocks_per_seq
+    assert tokens_per_block == cache_manager.tokens_per_block
+    assert stream is None
+
+
 def test_eagle3_draft_kv_cache_uses_full_window_when_draft_has_no_swa() -> None:
     kv_cache_config = KvCacheConfig(max_attention_window=[128, 131072])
     draft_pretrained_config = SimpleNamespace(num_hidden_layers=3)
@@ -199,7 +273,7 @@ def test_eagle3_draft_kv_cache_uses_full_window_when_draft_has_no_swa() -> None:
     assert max_attention_window is None
 
 
-def test_eagle3_draft_kv_cache_uses_draft_layer_types_for_swa() -> None:
+def test_eagle3_draft_kv_cache_expands_swa_in_global_layer_order() -> None:
     kv_cache_config = KvCacheConfig(max_attention_window=[128, 131072])
     draft_pretrained_config = SimpleNamespace(
         sliding_window=512,
@@ -213,7 +287,14 @@ def test_eagle3_draft_kv_cache_uses_draft_layer_types_for_swa() -> None:
         num_draft_layers=3,
     )
 
-    assert max_attention_window == [512, 4096, 512]
+    global_windows = _expand_attention_window_pattern_to_global_layers(
+        max_attention_window=max_attention_window,
+        layer_mask=[False, False, False, False, False, True, True, True],
+    )
+
+    # Slots 0-4 are inactive fillers; physical draft layers 5-7 preserve the
+    # derived sliding/full/sliding pattern.
+    assert global_windows == [512, 512, 512, 512, 512, 512, 4096, 512]
 
 
 def test_eagle3_draft_kv_cache_rejects_multiple_sliding_window_sizes() -> None:
@@ -288,6 +369,100 @@ def test_eagle3_one_model_capture_uses_real_token_count() -> None:
     assert torch.equal(spec_metadata.hidden_states[:4, :2],
                        hidden_states[:4] + residual[:4])
     assert spec_metadata.hidden_states.shape == (4, 2)
+
+
+@skip_num_gpus_less_than(1)
+def test_mtp_eagle_context_input_uses_prompt_lookahead() -> None:
+    invalid = INVALID_PROMPT_LOOKAHEAD_TOKEN
+    spec_config = MTPDecodingConfig(max_draft_len=3, mtp_eagle_one_model=True)
+    spec_metadata = Eagle3OneModelSpecMetadata(
+        max_num_requests=2,
+        max_draft_len=3,
+        max_total_draft_tokens=3,
+        spec_dec_mode=spec_config.spec_dec_mode,
+        num_layers=1,
+        hidden_size=4,
+        max_num_tokens=5,
+    )
+    spec_metadata.gather_ids = torch.tensor([2, 4],
+                                            dtype=torch.int32,
+                                            device="cuda")
+    spec_metadata.runtime_draft_len = 3
+    graph_metadata = spec_metadata.create_cuda_graph_metadata(1)
+    assert graph_metadata.context_prompt_lookahead_tokens.shape == (1, )
+    assert (graph_metadata.context_prompt_lookahead_tokens.data_ptr()
+            != spec_metadata.context_prompt_lookahead_tokens.data_ptr())
+    assert torch.all(graph_metadata.context_prompt_lookahead_tokens == invalid)
+
+    # Seed both rows with stale values, including token ID zero, then clear the
+    # final-chunk row with the sentinel below.
+    spec_metadata.populate_context_prompt_lookahead([0, 22])
+    torch.testing.assert_close(
+        spec_metadata.context_prompt_lookahead_tokens[:2],
+        torch.tensor([0, 22], dtype=torch.int32, device="cuda"),
+    )
+    spec_metadata.populate_context_prompt_lookahead([0, invalid])
+
+    worker = MTPEagleWorker(spec_config)
+    draft_inputs = worker.prepare_1st_drafter_inputs(
+        input_ids=torch.tensor([10, 11, 12, 20, 21],
+                               dtype=torch.int32,
+                               device="cuda"),
+        position_ids=torch.arange(5, dtype=torch.int32,
+                                  device="cuda").unsqueeze(0),
+        hidden_states=torch.zeros((5, 4), device="cuda"),
+        accepted_tokens=torch.tensor(
+            [[99, 0, 0, 0], [88, 0, 0, 0]],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        attn_metadata=SimpleNamespace(num_contexts=2, num_ctx_tokens=5),
+        spec_metadata=spec_metadata,
+        draft_model=SimpleNamespace(),
+    )
+
+    torch.testing.assert_close(
+        draft_inputs["input_ids"],
+        torch.tensor([11, 12, 0, 21, 88], dtype=torch.int32, device="cuda"),
+    )
+    torch.testing.assert_close(
+        spec_metadata.context_prompt_lookahead_tokens[:2],
+        torch.tensor([0, invalid], dtype=torch.int32, device="cuda"),
+    )
+
+
+@skip_num_gpus_less_than(1)
+def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
+    invalid = INVALID_PROMPT_LOOKAHEAD_TOKEN
+    worker = object.__new__(MTPEagleDynamicTreeWorker)
+    lookahead_tokens = torch.tensor(
+        [13, invalid],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    draft_inputs = worker._prepare_step0_drafter_inputs(
+        input_ids=torch.tensor([10, 11, 12, 20, 21],
+                               dtype=torch.int32,
+                               device="cuda"),
+        position_ids=torch.arange(5, dtype=torch.int32, device="cuda"),
+        last_tokens_idx=torch.tensor([2, 4], dtype=torch.int32, device="cuda"),
+        hidden_states=torch.zeros((5, 4), device="cuda"),
+        accepted_tokens=torch.tensor(
+            [[99, 0, 0, 0], [88, 0, 0, 0]],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        attn_metadata=SimpleNamespace(num_contexts=2,
+                                      num_seqs=2,
+                                      num_ctx_tokens=5),
+        spec_metadata=SimpleNamespace(
+            context_prompt_lookahead_tokens=lookahead_tokens),
+    )
+
+    torch.testing.assert_close(
+        draft_inputs["input_ids"],
+        torch.tensor([11, 12, 13, 21, 88], dtype=torch.int32, device="cuda"),
+    )
 
 
 def test_eagle3_resource_manager_shares_padding_dummy_slot() -> None:
@@ -472,69 +647,35 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp,use_hf_speculative_model",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,multi_batch,attention_dp,use_hf_speculative_model",
     [
-        [True, "TRTLLM", True, False, False, False, True, False, False, False],
-        [True, "TRTLLM", True, False, False, False, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, True, False, False, False],
-        [
-            False, "TRTLLM", True, False, False, False, False, False, False,
-            False
-        ],
-        [
-            True, "FLASHINFER", True, False, False, False, True, False, False,
-            False
-        ],
-        [
-            False, "FLASHINFER", True, False, False, False, True, False, False,
-            False
-        ],
-        [False, "TRTLLM", False, True, True, False, True, False, False, False],
-        [True, "TRTLLM", False, True, True, False, True, False, False, False],
-        [True, "TRTLLM", True, False, True, True, True, False, False, False],
-        [True, "TRTLLM", True, False, True, False, True, False, False, False],
-        [True, "TRTLLM", True, False, False, True, True, False, False, False],
-        [True, "TRTLLM", False, False, False, False, True, False, False, False],
-        [
-            False, "TRTLLM", False, False, False, False, True, False, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, False, False, True, True, False],
-        [
-            False, "TRTLLM", False, False, False, False, False, True, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, False, True, True, False, False],
-        [False, "TRTLLM", False, False, False, False, True, True, False, False],
-        [
-            True, "TRTLLM", False, False, False, False, False, False, False,
-            False
-        ],
-        [
-            False, "TRTLLM", False, False, False, False, False, False, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, True, True, False, False, False],
-        [True, "TRTLLM", False, False, False, True, False, False, False, False],
-        [
-            True, "FLASHINFER", False, False, False, False, True, False, False,
-            False
-        ],
-        [
-            False, "FLASHINFER", False, False, False, False, True, False, False,
-            False
-        ],
+        [True, "TRTLLM", True, False, False, False, False, False, False],
+        [False, "TRTLLM", True, False, False, False, False, False, False],
+        [True, "FLASHINFER", True, False, False, False, False, False, False],
+        [False, "FLASHINFER", True, False, False, False, False, False, False],
+        [False, "TRTLLM", False, True, True, False, False, False, False],
+        [True, "TRTLLM", False, True, True, False, False, False, False],
+        [True, "TRTLLM", True, False, True, True, False, False, False],
+        [True, "TRTLLM", True, False, True, False, False, False, False],
+        [True, "TRTLLM", True, False, False, True, False, False, False],
+        [True, "TRTLLM", False, False, False, False, False, False, False],
+        [False, "TRTLLM", False, False, False, False, False, False, False],
+        [True, "TRTLLM", False, False, False, False, True, False, False],
+        [True, "TRTLLM", False, False, False, False, True, True, False],
+        [False, "TRTLLM", False, False, False, False, True, False, False],
+        [True, "TRTLLM", False, False, False, True, False, False, False],
+        [True, "FLASHINFER", False, False, False, False, False, False, False],
+        [False, "FLASHINFER", False, False, False, False, False, False, False],
         # Tests (mocked) speculative model auto-download from HuggingFace
-        [False, "TRTLLM", True, False, False, False, True, False, False, True],
+        [False, "TRTLLM", True, False, False, False, False, False, True],
     ])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool, enable_chunked_prefill: bool,
-                      use_chain_drafter: bool, multi_batch: bool,
-                      attention_dp: bool, use_hf_speculative_model: bool):
+                      multi_batch: bool, attention_dp: bool,
+                      use_hf_speculative_model: bool):
     if not use_one_model:
         pytest.skip("Two model Eagle3 is deprecated")
 
@@ -586,7 +727,6 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         # Llama 3 does not support one model eagle.
         eagle3_one_model=use_one_model,
     )
-    spec_config._allow_chain_drafter = use_chain_drafter
 
     # Create the LLM instance
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
@@ -984,56 +1124,6 @@ def test_multi_eagle3(use_one_model: bool):
                                               sampling_params,
                                               streaming=True):
             pass
-
-
-@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
-def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
-    """Test CDL sampling with 2 requests and max_batch_size=2."""
-    attn_backend = "TRTLLM"
-    enable_block_reuse = False
-    use_one_model = False
-    enable_chunked_prefill = False
-
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 35:
-        pytest.skip("Not enough memory to load target + draft model")
-
-    models_path = llm_models_root()
-    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-
-    max_batch_size = 1
-    max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(batch_sizes=[1, 2, 4],
-                                        enable_padding=True)
-
-    llm_common_config = dict(
-        model=target_model_dir,
-        attn_backend=attn_backend,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        cuda_graph_config=cuda_graph_config,
-        max_batch_size=max_batch_size,
-        kv_cache_config=kv_cache_config,
-        max_seq_len=8192,
-        enable_chunked_prefill=enable_chunked_prefill,
-    )
-
-    spec_config = Eagle3DecodingConfig(
-        max_draft_len=max_draft_len,
-        speculative_model=eagle_model_dir,
-        eagle3_one_model=use_one_model,
-    )
-
-    # Create the LLM instance
-    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-
-    prompts = ["The president of the United States is"]
-
-    sampling_params = SamplingParams(max_tokens=20, temperature=1.0, top_p=0.9)
-    llm_spec.generate(prompts, sampling_params)
-    llm_spec.shutdown()
 
 
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],

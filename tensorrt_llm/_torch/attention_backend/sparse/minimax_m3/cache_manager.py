@@ -30,7 +30,12 @@ from typing import List, Optional, Sequence
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
+from tensorrt_llm._utils import (
+    TensorWrapper,
+    binding_to_torch_dtype,
+    convert_to_torch_tensor,
+    prefer_pinned,
+)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
@@ -150,6 +155,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
       * ``sparse_index_dim`` — width of the index-K/V vectors.
     """
 
+    _main_kv_mapper_kind = MapperKind.NHD
+
     def __init__(
         self,
         *args,
@@ -158,15 +165,26 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         sparse_index_dim: Optional[int] = None,
         **kwargs,
     ):
-        # Resolve M3 sparse-layer metadata from explicit kwargs first,
-        # then from ``sparse_attn_config``, then from the M3 checkpoint
-        # convention (layers 0..2 dense, 3..N-1 sparse,
-        # disable_index_value=True, sparse_index_dim=128).
-        sparse_attn_config = kwargs.get("sparse_attn_config")
+        # Resolve M3 sparse-layer metadata from explicit kwargs first, then
+        # from the executor's ``sparse_attention_config`` keyword, then from
+        # the M3 checkpoint convention (layers 0..2 dense, 3..N-1 sparse,
+        # disable_index_value=True, sparse_index_dim=128). Honoring the
+        # executor keyword also makes non-default sparse_index_dim values
+        # authoritative for the cache layout instead of falling back to 128.
+        sparse_attention_config = kwargs.get("sparse_attention_config")
         num_layers = kwargs.get("num_layers")
+        implementation = getattr(sparse_attention_config, "implementation", "triton")
+        self._main_kv_mapper_kind = MapperKind.HND if implementation == "msa" else MapperKind.NHD
 
         if sparse_index_dim is None:
-            sparse_index_dim = int(getattr(sparse_attn_config, "sparse_index_dim", 0) or 0) or 128
+            sparse_index_dim = getattr(sparse_attention_config, "sparse_index_dim", None)
+            if sparse_index_dim is None:
+                sparse_index_dim = 128
+        sparse_index_dim = int(sparse_index_dim)
+        if sparse_index_dim <= 0:
+            raise ValueError(
+                f"MiniMax M3 sparse_index_dim must be greater than 0, got {sparse_index_dim}."
+            )
         if sparse_layer_ids is None:
             if num_layers is not None:
                 sparse_layer_ids = list(range(3, int(num_layers)))
@@ -180,8 +198,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # which reads these attributes.
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
-        self.sparse_index_dim = int(sparse_index_dim)
-
+        self.sparse_index_dim = sparse_index_dim
+        self.indexer_kv_dtype = str(getattr(sparse_attention_config, "indexer_kv_dtype", "bf16"))
+        if self.indexer_kv_dtype not in ("bf16", "fp8"):
+            raise ValueError(
+                "MiniMax M3 indexer_kv_dtype must be 'bf16' or 'fp8', got "
+                f"{self.indexer_kv_dtype!r}."
+            )
         super().__init__(*args, **kwargs)
 
         index_v_layer_ids = set(self.sparse_layer_ids) - self.disable_index_value_layer_ids
@@ -230,11 +253,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         }
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
-        """Declare MiniMax M3's token-major K/V and replicated index-K."""
+        """Declare the backend's main K/V layout and replicated index-K."""
         return {
-            Role.ALL: MapperKind.NHD,
+            Role.ALL: self._main_kv_mapper_kind,
             Role.INDEX_KEY: MapperKind.REPLICATED,
         }
+
+    def _main_kv_layout_name(self) -> str:
+        """Return the tensor-view layout name for the selected mapper kind."""
+        return "HND" if self._main_kv_mapper_kind == MapperKind.HND else "NHD"
 
     def _compute_num_total_slots(self) -> int:
         """Total token slots across all blocks in the main K pool.
@@ -251,19 +278,22 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         return int((page_upper // kv_factor) * self.tokens_per_block)
 
     def _torch_dtype_for_index_cache(self) -> torch.dtype:
-        """Match the main cache dtype where possible, fall back to bf16."""
-        if self.dtype == DataType.HALF:
-            return torch.float16
-        if self.dtype == DataType.FLOAT:
-            return torch.float32
+        """Return the independently configured index-cache storage dtype."""
+        if self.indexer_kv_dtype == "fp8":
+            return torch.float8_e4m3fn
         return torch.bfloat16
 
-    def get_index_k_buffer(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+    def get_index_k_buffer(
+        self, layer_idx: int, kv_layout: Optional[str] = None
+    ) -> Optional[torch.Tensor]:
         """Return the V2-managed paged index-K view for ``layer_idx``.
 
         NHD shape is ``[num_pages, tokens_per_block, 1, sparse_index_dim]``;
         HND shape is ``[num_pages, 1, tokens_per_block, sparse_index_dim]``.
+        When omitted, ``kv_layout`` follows the selected sparse backend.
         """
+        if kv_layout is None:
+            kv_layout = self._main_kv_layout_name()
         return super().get_index_k_buffer(
             layer_idx,
             num_heads=1,
@@ -279,7 +309,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     def has_index_value(self, layer_idx: int) -> bool:
         return layer_idx in self._index_v_buffers
 
-    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+    def get_buffers(
+        self, layer_idx: int, kv_layout: Optional[str] = None
+    ) -> Optional[torch.Tensor]:
         """Return a paged K+V view with strides spanning the coalesced pool.
 
         The base :meth:`KVCacheManagerV2.get_buffers` produces a
@@ -295,7 +327,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         at K's base, then slices ``[:, :2]`` to extract K+V. The slice
         preserves the dim-0 stride (``scale * page_stride``), so
         ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
+        When omitted, ``kv_layout`` follows the selected sparse backend.
         """
+        if kv_layout is None:
+            kv_layout = self._main_kv_layout_name()
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
         if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
@@ -443,20 +478,22 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         Drops the base's final ``i // num_local_layers`` step (paired
         with the base ``index_scales`` multiplication that's also
         bypassed here). Pads with ``0`` to preserve shape.
+
+        The rows are written through a numpy view of a single zero-filled,
+        pinned result, so the attention metadata builders ship it to the device
+        in one asynchronous copy.
         """
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
-        block_ids_per_seq_tensors = [
-            torch.tensor(
-                [i if i != BAD_PAGE_INDEX else 0 for i in sublist],
-                dtype=torch.int,
-            )
-            for sublist in block_ids_per_seq
-        ]
-        padded_tensor = torch.nn.utils.rnn.pad_sequence(
-            block_ids_per_seq_tensors,
-            batch_first=True,
-            padding_value=0,
+        batch = len(block_ids_per_seq)
+        max_blocks = max((len(block_ids) for block_ids in block_ids_per_seq), default=0)
+        padded_tensor = torch.zeros(
+            (batch, max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
         )
+        rows = padded_tensor.numpy()
+        for row, block_ids in zip(rows, block_ids_per_seq):
+            row[: len(block_ids)] = block_ids
+        # BAD_PAGE_INDEX marks padding, which this tensor reports as 0.
+        rows[rows == BAD_PAGE_INDEX] = 0
         return padded_tensor
 
 

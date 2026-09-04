@@ -17,7 +17,7 @@ import concurrent.futures
 import os
 import re
 from collections import defaultdict
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import pytest
 import requests
@@ -46,6 +46,11 @@ EXCEPTION_URLS = [
 ]
 
 HTML_LINK_PATTERN = re.compile(r'<a\s+(?:[^>]*?\s+)?href="([^"]*)"')
+TRTLLM_GITHUB_PATH_PATTERN = re.compile(
+    r"^/nvidia/tensorrt-llm/(?P<link_type>blob|tree)/"
+    r"(?P<git_ref>[^/]+)/(?P<repo_path>.+)$",
+    re.IGNORECASE,
+)
 
 
 def _get_session():
@@ -145,7 +150,7 @@ def _extract_urls(file_path):
     return normalized
 
 
-def _check_url(url_info):
+def _check_url(url_info, root_dir):
     """Return (is_valid, url, line_num, reason)."""
     url, line_num = url_info
 
@@ -159,8 +164,30 @@ def _check_url(url_info):
         return True, url, line_num, "local"
     if "drive.google.com" in parsed.netloc:
         return True, url, line_num, "Google Drive (auth required)"
-    if parsed.netloc == "github.com" and ("/blob/" in parsed.path or "/tree/" in parsed.path):
-        return True, url, line_num, "GitHub repo-internal ref"
+    github_path = parsed.path.lower()
+    if (
+        parsed.netloc.lower() == "github.com"
+        and github_path.startswith("/nvidia/tensorrt-llm/")
+        and ("/blob/" in github_path or "/tree/" in github_path)
+    ):
+        path_match = TRTLLM_GITHUB_PATH_PATTERN.fullmatch(parsed.path)
+        if path_match and path_match.group("git_ref") == "main":
+            link_type = path_match.group("link_type").lower()
+            repo_path = unquote(path_match.group("repo_path"))
+            local_path = os.path.abspath(os.path.join(root_dir, repo_path))
+            root_dir = os.path.abspath(root_dir)
+            if os.path.commonpath((root_dir, local_path)) != root_dir:
+                return False, url, line_num, "Path escapes the TensorRT-LLM repository"
+
+            if link_type == "blob":
+                is_valid = os.path.isfile(local_path)
+                target_type = "file"
+            else:
+                is_valid = os.path.isdir(local_path)
+                target_type = "directory"
+            reason = f"TensorRT-LLM {target_type} {'exists' if is_valid else 'not found'} locally"
+            return is_valid, url, line_num, reason
+        return True, url, line_num, "TensorRT-LLM repo-internal ref"
 
     session = _get_session()
     try:
@@ -214,7 +241,7 @@ def test_url_validity(llm_root):
 
     invalid = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(_check_url, item): item for item in url_items}
+        futures = {executor.submit(_check_url, item, llm_root): item for item in url_items}
         for future in concurrent.futures.as_completed(futures):
             is_valid, url, _, reason = future.result()
             if not is_valid:

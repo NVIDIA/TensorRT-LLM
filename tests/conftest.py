@@ -18,7 +18,8 @@ the first).
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(__file__))  # make test_common importable
+# Bootstrap: make test_common importable, __extra_import_path__ cannot help here
+sys.path.insert(0, os.path.dirname(__file__))
 
 from test_common import session_prefetcher_hooks as _prefetch  # noqa: E402
 from test_common import session_reuse_hooks as _reuse  # noqa: E402

@@ -18,7 +18,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, NamedTuple,
-                    Optional, Tuple, Union)
+                    Optional, Protocol, Sequence, Tuple, Union, cast)
 
 import torch
 import triton
@@ -27,9 +27,12 @@ import triton.language as tl
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+    from tensorrt_llm.sampling_params import SamplingParams
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy, KVCacheManagerV2, Role)
+from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
+    KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -50,9 +53,20 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
-                                                      SsmLayerConfig)
+                                                      SsmLayerConfig,
+                                                      TokenIdExt, _KVCache)
 
 GB = 1 << 30
+
+
+class _PrefixReuseDiagnostics(Protocol):
+
+    def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int:
+        ...
+
+    def _get_num_reusable_tokens_before_pruning(self) -> int:
+        ...
+
 
 # Replay kernels pad the token/window dimension to at least 16 for tensor-core
 # tiles, so history sizes below 16 are no faster when not writing and do
@@ -124,6 +138,19 @@ class MambaRole:
 
     SSM_STATE = DataRole("ssm_state")
     CONV_STATE = DataRole("conv_state")
+
+
+def _mamba_effective_tp_size(mapping: Mapping) -> int:
+    """TP degree for sizing per-rank mamba/KDA state pools.
+
+    Attention-DP replicates the state and takes precedence; helix
+    repurposes CP ranks as plain TP for recurrent-state layers.
+    """
+    if mapping.enable_attention_dp:
+        return 1
+    if mapping.has_cp_helix():
+        return mapping.tp_size * mapping.cp_size
+    return mapping.tp_size
 
 
 def get_tensor_size_bytes(tensor):
@@ -339,6 +366,13 @@ class PythonMambaCacheManager(BaseResourceManager):
                     kwargs[k] = v[layer]
             return type(self)(**kwargs)
 
+        @property
+        def has_kda_replay_caches(self) -> bool:
+            """Whether the Kimi K3 KDA fused-verify replay caches are
+            allocated. The base (non-speculative) state never has them; the
+            speculative state overrides this."""
+            return False
+
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
         """Speculative state with intermediate states for draft tokens.
@@ -396,6 +430,26 @@ class PythonMambaCacheManager(BaseResourceManager):
         old_dt: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
         old_dA_cumsum: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
 
+        @property
+        def has_kda_replay_caches(self) -> bool:
+            """True when the KDA fused-verify replay caches were allocated
+            (the fused ``trtllm::kda_mtp_decode`` verify path)."""
+            return self.kda_qkg_cache is not None
+
+        def commit_conv_window(self, slot_indices: torch.Tensor,
+                               conv_pool: torch.Tensor) -> None:
+            """Seed the KDA replay caches from the live ``W - 1`` conv pool."""
+            from ..modules.kimi_kda._kda_kernels import \
+                copy_kda_replay_conv_window
+
+            copy_kda_replay_conv_window(
+                conv_pool,
+                self.kda_conv_q,
+                self.kda_conv_k,
+                self.kda_conv_v,
+                slot_indices,
+            )
+
     def __init__(
         self,
         d_state: int,
@@ -449,7 +503,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._seed_request_counter = 0
 
         # get tp size
-        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        tp_size = _mamba_effective_tp_size(mapping)
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
@@ -553,10 +607,9 @@ class PythonMambaCacheManager(BaseResourceManager):
                     "KDA replay caches expect the [q | k | v] conv-state "
                     "sectioning (3 equal sections)")
                 section_dim = conv_dim // 3
-                # d_conv is short_conv_kernel_size + 1 for kimi_linear (the
-                # pool trick that stores the full FLA window); the kernel's
-                # conv width is the FLA window size.
-                w_kernel = d_conv - 1
+                # d_conv is KDA's convolution width; the live pool stores
+                # its W - 1 committed input columns.
+                w_kernel = d_conv
                 extended_s = w_kernel - 1 + M
 
                 def _dim_contiguous_conv_cache():
@@ -789,9 +842,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         the recurrent state from the first verify step onward. Call this
         after the state transfer completes, before the first generation
         forward. Mirrors ``_sync_kda_replay_conv_window``: the conv pool row
-        stores the full FLA window (width W); its last ``W - 1`` columns are
-        the committed window of the replay caches. Pending-draft scratch is
-        cleared (no drafts are pending for a freshly transferred request).
+        stores the committed ``W - 1`` raw inputs directly. Pending-draft
+        scratch is cleared (no drafts are pending for a freshly transferred
+        request).
         """
         if not (self._use_kda_replay_update
                 and isinstance(self.mamba_cache, self.SpeculativeState)):
@@ -802,12 +855,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         ]
         if not blocks:
             return
-        conv = self.mamba_cache.conv  # [L, slots, 3D, W]
+        conv = self.mamba_cache.conv  # [L, slots, 3D, W - 1]
         idx = torch.tensor(sorted(set(blocks)),
                            dtype=torch.long,
                            device=conv.device)
         d = conv.shape[2] // 3
-        committed = conv.shape[3] - 1  # W - 1
+        committed = conv.shape[3]
         cs = conv.index_select(1, idx)
         for cache, section in (
             (self.mamba_cache.kda_conv_q, cs[:, :, :d]),
@@ -820,7 +873,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 (cache.shape[0], idx.numel()) + cache.shape[2:],
                 dtype=cache.dtype,
                 device=cache.device)
-            seeded[:, :, :, :committed] = section[:, :, :, 1:].to(cache.dtype)
+            seeded[:, :, :, :committed] = section.to(cache.dtype)
             cache.index_copy_(1, idx, seeded)
         for buf in (self.mamba_cache.kda_qkg_cache,
                     self.mamba_cache.kda_v_cache,
@@ -1578,6 +1631,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         max_seq_len: int,
         max_batch_size: int,
         mapping: Mapping,
+        max_num_tokens: int = 8192,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_estimating_kv_cache: bool = False,
@@ -1642,6 +1696,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
@@ -2189,6 +2244,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 layer_mask=full_attention_layer_mask,
                 is_estimating_kv_cache=is_estimating_kv_cache,
                 is_draft=is_draft,
+                **kwargs,
             )
             # PP ranks replay the same scheduling decisions, so a rank without
             # local Mamba layers must still publish the configured boundaries.
@@ -2200,7 +2256,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        tp_size = _mamba_effective_tp_size(mapping)
         d_inner = mamba_head_dim * mamba_num_heads
         conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
         nheads = mamba_num_heads
@@ -2276,12 +2332,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             )
             kv_cache_config.enable_partial_reuse = False
 
-        kv_cache_config.max_attention_window = []
-        for i in range(len(layer_mask)):
-            if layer_mask[i]:
-                kv_cache_config.max_attention_window.append(
-                    LinearCacheType.RECURRENT_STATES.
-                    value if mamba_layer_mask[i] else max_seq_len)
+        # Keep the vector in physical global-layer order. Disabled entries are
+        # placeholders that are never projected into this manager.
+        kv_cache_config.max_attention_window = [
+            LinearCacheType.RECURRENT_STATES.value
+            if mamba_layer_mask[layer_idx] else max_seq_len
+            for layer_idx in range(len(layer_mask))
+        ]
 
         recurrent_states_window = LinearCacheType.RECURRENT_STATES.value
         local_windows = {
@@ -2485,12 +2542,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        # For capturable drafting loops. During normal inference, the draft model always
-        # has enough KV cache space to fit all of our draft tokens. During warmup, however,
-        # we need to make the KV cache manager aware that multiple autoregressive steps will
-        # occur.
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
+        capture_sampling_params: Optional["SamplingParams"] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -2502,8 +2555,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
-            num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params,
         )
         if requests:
             self.requests.extend(requests)
@@ -2749,9 +2802,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
         is_dummy = [req.is_dummy for req in requests]
-        self._refresh_dummy_request_mask(
-            is_dummy if requests is
-            self.requests else [req.is_dummy for req in self.requests])
+        self._refresh_dummy_request_mask(is_dummy)
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
@@ -2910,6 +2961,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
         self._seed_rank_offset = _mamba_rank_offset(mapping)
         self._seed_request_counter = 0
+        self._recurrent_evicted_blocks_total = 0
+        self._recurrent_onboarded_blocks_total = 0
+        self._recurrent_dropped_blocks_total = 0
+        self._recurrent_status_logged = False
+        # Branch points keyed by request id. prepare_expect_snapshot_points()
+        # overwrites the per-request list on every scheduler pass, so the point
+        # has to be re-merged from here rather than stored only on the request.
+        self._branch_snapshot_points: Dict[int, int] = {}
+        self._snapshot_pruned_tokens_total = 0
+        self._page_pruned_tokens_total = 0
+        self._branch_snapshots_taken_total = 0
+        self._branch_snapshots_skipped_total: Dict[str, int] = {}
         num_cuda_graph_padding_dummy_slots = (
             _get_num_cuda_graph_padding_dummy_slots(spec_config,
                                                     max_batch_size))
@@ -2935,7 +2998,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and self.local_num_mamba_layers > 0)
 
         if self.local_num_mamba_layers > 0:
-            tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+            tp_size = _mamba_effective_tp_size(mapping)
             d_inner = mamba_head_dim * mamba_num_heads
             grouped_state_dim = mamba_n_groups * mamba_d_state
             conv_dim = d_inner + 2 * grouped_state_dim
@@ -3135,6 +3198,195 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             n_writes=mamba_metadata.replay_n_writes,
             history_size=self.replay_history_size,
         )
+
+    def _create_kv_cache(
+        self,
+        request_id: int,
+        lora_task_id: Optional[int],
+        input_tokens: Optional[Sequence[TokenIdExt]],
+        *,
+        cache_salt: Optional[str] = None,
+        is_dummy: bool = False,
+        enable_request_stats: bool = False,
+        expected_prompt_length: Optional[int] = None,
+    ) -> Optional[_KVCache]:
+        kv_cache = super()._create_kv_cache(
+            request_id,
+            lora_task_id,
+            input_tokens,
+            cache_salt=cache_salt,
+            is_dummy=is_dummy,
+            enable_request_stats=enable_request_stats,
+            expected_prompt_length=expected_prompt_length,
+        )
+        if (self.mapping.rank == 0 and kv_cache is not None
+                and input_tokens is not None and not is_dummy
+                and self.local_num_mamba_layers > 0):
+            # Prefix lookup excludes the final prompt token because it must be
+            # recomputed by prefill. Restore it for the request-length metric.
+            request_total_tokens = len(input_tokens) + 1
+            prefix_reuse_diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
+            logger.debug(
+                f"[MambaHybridCacheManagerV2] prefix reuse rank={self.mapping.rank} "
+                f"request_id={request_id} "
+                f"request_total_tokens={request_total_tokens} "
+                f"longest_attention_match_tokens="
+                f"{prefix_reuse_diagnostics._get_num_reusable_tokens_before_hybrid_pruning()} "
+                f"content_divergence_tokens="
+                f"{prefix_reuse_diagnostics._get_num_reusable_tokens_before_pruning()} "
+                f"latest_recurrent_snapshot_tokens="
+                f"{kv_cache.num_committed_tokens}")
+        return kv_cache
+
+    def _skip_branch_snapshot(self, reason: str) -> None:
+        self._branch_snapshots_skipped_total[reason] = (
+            self._branch_snapshots_skipped_total.get(reason, 0) + 1)
+
+    def _format_branch_snapshot_counters(self) -> str:
+        """Attribute reuse loss between missing snapshots and evicted pages.
+
+        A flat cache hit rate means something different depending on whether
+        branch points were never found or were found and not reused, so the
+        skip reasons are reported alongside the totals.
+        """
+        skipped = self._branch_snapshots_skipped_total
+        return (f"snapshot_pruned_tokens={self._snapshot_pruned_tokens_total} "
+                f"page_pruned_tokens={self._page_pruned_tokens_total} "
+                f"branch_snapshots_taken={self._branch_snapshots_taken_total} "
+                f"branch_snapshots_skipped={sum(skipped.values())} "
+                f"branch_snapshots_skipped_by_reason="
+                f"{dict(sorted(skipped.items()))}")
+
+    def _record_branch_snapshot_point(self, req: LlmRequest, kv_cache: _KVCache,
+                                      num_lookup_tokens: Optional[int]) -> None:
+        """Snapshot where this request leaves the reuse tree, for its siblings."""
+        if not self.kv_cache_config.mamba_state_config.enable_branch_snapshot:
+            return
+        if req.is_dummy_request:
+            return
+        if num_lookup_tokens is None:
+            self._skip_branch_snapshot("no_fresh_match")
+            return
+
+        diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
+        divergence = diagnostics._get_num_reusable_tokens_before_pruning()
+        reused = kv_cache.num_committed_tokens
+        if self.local_num_mamba_layers > 0:
+            hybrid_depth = (
+                diagnostics._get_num_reusable_tokens_before_hybrid_pruning())
+            # Loss attributable to a missing recurrent snapshot, versus loss
+            # attributable to attention pages having been evicted. These call
+            # for different fixes, so they are counted apart.
+            self._snapshot_pruned_tokens_total += max(0, hybrid_depth - reused)
+            self._page_pruned_tokens_total += max(0, divergence - hybrid_depth)
+
+        # The whole lookup range matched, so there is no fork here.
+        if divergence >= num_lookup_tokens:
+            self._skip_branch_snapshot("no_divergence")
+            return
+        # Align down: tokens past a block boundary come from a partial-match
+        # child rather than a confirmed shared prefix, and an unaligned commit
+        # takes the partial-block snapshot path.
+        point = (divergence // self.tokens_per_block) * self.tokens_per_block
+        if point == 0:
+            self._skip_branch_snapshot("aligned_to_zero")
+            return
+        # Reuse already reached the fork, so a snapshot there exists.
+        if point <= req.context_current_position:
+            self._skip_branch_snapshot("already_reused")
+            return
+        # The prompt end is snapshotted unconditionally anyway.
+        if point >= req.prompt_len:
+            self._skip_branch_snapshot("at_prompt_end")
+            return
+
+        self._branch_snapshot_points[req.py_request_id] = point
+        self._apply_branch_snapshot_point(req)
+
+    def prepare_expect_snapshot_points(self,
+                                       requests: List[LlmRequest]) -> None:
+        super().prepare_expect_snapshot_points(requests)
+        if (not self.enable_block_reuse or not self.kv_cache_config.
+                mamba_state_config.enable_branch_snapshot):
+            return
+        for request in requests:
+            self._apply_branch_snapshot_point(request)
+
+    def _apply_branch_snapshot_point(self, request: LlmRequest) -> None:
+        # prompt_len is unioned in unconditionally: try_commit_blocks derives
+        # commit_limit from max(snapshot_points), so a lone branch point below
+        # the prompt end would silently stop commits there and lose the
+        # prompt-end snapshot. It also makes the flag usable on its own.
+        points = set(request.expect_snapshot_points)
+        points.add(request.prompt_len)
+        point = self._branch_snapshot_points.get(request.py_request_id)
+        if point is not None and point > request.context_current_position:
+            points.add(point)
+        request.expect_snapshot_points = sorted(points)
+
+    def get_iteration_stats(self) -> Optional[KVCacheV2IterationStatsReport]:
+        """Log recurrent-cache movement; this is KDA state for Kimi K3."""
+        report = super().get_iteration_stats()
+        if report is None:
+            return None
+
+        pool_group_ids = sorted({
+            pool_group_id
+            for pool_group_id, _, kind in
+            self._stats_life_cycle_metadata().values() if kind == "ssm"
+        })
+        if not pool_group_ids:
+            return report
+        pool_group_reports = [
+            report.by_pool_group[pool_group_id]
+            for pool_group_id in pool_group_ids
+        ]
+
+        stats = [
+            pool_group_report.stats for pool_group_report in pool_group_reports
+        ]
+        evicted_blocks = sum(stat.iter_offload_blocks for stat in stats)
+        evicted_bytes = sum(stat.iter_offload_bytes for stat in stats)
+        onboarded_blocks = sum(stat.iter_onboard_blocks for stat in stats)
+        onboarded_bytes = sum(stat.iter_onboard_bytes for stat in stats)
+        dropped_blocks = sum(stat.iter_host_dropped_blocks for stat in stats)
+        dropped_bytes = sum(stat.iter_host_dropped_bytes for stat in stats)
+        has_movement = bool(evicted_blocks or onboarded_blocks
+                            or dropped_blocks)
+        if has_movement:
+            self._recurrent_evicted_blocks_total += evicted_blocks
+            self._recurrent_onboarded_blocks_total += onboarded_blocks
+            self._recurrent_dropped_blocks_total += dropped_blocks
+        if (self.mapping.rank == 0
+                and (has_movement or not self._recurrent_status_logged)):
+            logger.debug(
+                f"[MambaHybridCacheManagerV2] recurrent cache status "
+                f"rank={self.mapping.rank} pool_group_ids={pool_group_ids} "
+                f"evicted_recurrent_blocks={evicted_blocks} "
+                f"evicted_recurrent_bytes={evicted_bytes} "
+                f"onboarded_recurrent_blocks={onboarded_blocks} "
+                f"onboarded_recurrent_bytes={onboarded_bytes} "
+                f"dropped_recurrent_blocks={dropped_blocks} "
+                f"dropped_recurrent_bytes={dropped_bytes} "
+                f"total_evicted_recurrent_blocks="
+                f"{self._recurrent_evicted_blocks_total} "
+                f"total_onboarded_recurrent_blocks="
+                f"{self._recurrent_onboarded_blocks_total} "
+                f"total_dropped_recurrent_blocks="
+                f"{self._recurrent_dropped_blocks_total} "
+                f"gpu_used_recurrent_blocks="
+                f"{sum(stat.primary_used_num_blocks for stat in stats)} "
+                f"gpu_free_recurrent_blocks="
+                f"{sum(stat.primary_free_num_blocks for stat in stats)} "
+                f"gpu_evictable_recurrent_blocks="
+                f"{sum(stat.primary_evictable_num_blocks for stat in stats)} "
+                f"host_used_recurrent_blocks="
+                f"{sum(stat.secondary_used_num_blocks for stat in stats)} "
+                f"host_free_recurrent_blocks="
+                f"{sum(stat.secondary_free_num_blocks for stat in stats)} "
+                f"{self._format_branch_snapshot_counters()}")
+            self._recurrent_status_logged = True
+        return report
 
     @staticmethod
     def get_cache_size_per_token(model_config,
@@ -3550,8 +3802,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
+        capture_sampling_params: Optional["SamplingParams"] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -3563,8 +3815,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
-            num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params,
         )
         if requests and prepare_resource:
             self._setup_state_indices(requests)
@@ -3576,6 +3828,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.try_commit_blocks(request, kv_cache)
         self._request_id_to_state_index.pop(request.py_request_id, None)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
+        self._branch_snapshot_points.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -3740,6 +3993,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 end=commit_end,
             )
             kv_cache.commit(tokens)
+            if (self.local_num_mamba_layers > 0
+                    and self._branch_snapshot_points.get(
+                        request.py_request_id) == commit_end):
+                self._branch_snapshots_taken_total += 1
         if request.context_current_position >= commit_limit:
             self._mark_context_position_as_history(request, kv_cache)
         if request.context_remaining_length == 0:
@@ -3797,4 +4054,5 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.old_B = None
         self.old_dt = None
         self.old_dA_cumsum = None
+        self._branch_snapshot_points.clear()
         super().shutdown()

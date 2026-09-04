@@ -29,7 +29,15 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.activation import (
+    ACTIVATION_PAYLOAD,
+    MoEActivation,
+    SimpleActivation,
+    SiTuActivation,
+    SwigluBiasActivation,
+)
+from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -83,6 +91,24 @@ def _comm_method_name(moe) -> str:
     return type(comm).__name__
 
 
+def _epilogue_activation_name(moe) -> str:
+    """Return the epilogue the built module actually runs: ``"situ"`` or ``"swiglu"``.
+
+    The SiTU request can be dropped for reasons the spec cannot see (wrong
+    backend, wrong quant, upstream fallback), so read it back rather than
+    reporting what was asked for. Every impl records the resolved kind in
+    ``activation_type``; TRTLLM-Gen additionally exposes a predicate, which is
+    checked first because SiTU shares its constant slots with SwiGLU there.
+    """
+    backend = getattr(moe, "backend", None) or moe
+    if getattr(backend, "is_situ_activation", False):
+        return "situ"
+    activation_type = getattr(backend, "activation_type", None)
+    if activation_type is not None and ActivationType(activation_type) == ActivationType.SiTu:
+        return "situ"
+    return "swiglu"
+
+
 def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[int]:
     """Best-effort lookup of ``num_chunks`` for the case we are about to time."""
     scheduler = getattr(moe, "scheduler", None)
@@ -97,9 +123,61 @@ def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[
         return None
 
 
+#: Backends whose kernels implement the SiTU epilogue, with the quant they
+#: implement it on. Not a capability check -- ``create_moe`` does that, and
+#: rejects rather than degrades; this is the bench choosing which cases are
+#: worth asking for.
+_SITU_PATHS = frozenset(
+    {
+        ("MEGAMOE_DEEPGEMM", QuantAlgo.W4A8_MXFP4_MXFP8),
+        ("MEGAMOE_CUTEDSL", QuantAlgo.NVFP4),
+        ("TRTLLM", QuantAlgo.W4A8_MXFP4_MXFP8),
+        ("CUTLASS", QuantAlgo.NVFP4),
+    }
+)
+
+
+def _situ_kwargs(
+    model: ModelSpec,
+    moe_backend: str,
+    quant_algo: Optional[QuantAlgo],
+) -> Dict:
+    """``create_moe`` kwargs that switch the epilogue to SiTU, or ``{}``.
+
+    A spec carrying SiTU constants falls back to the SwiGLU proxy on any other
+    backend/quant pair rather than failing the case -- SiTU is gated, so the
+    GEMM shapes and comm volume are the same either way.
+
+    The constants go out as scalars for every backend: each one's
+    ``activation_support`` decides whether its kernels read them as a baked
+    scalar or a per-expert ``float32`` buffer, so the bench no longer sizes
+    tensors against the EP partition to match a particular kernel ABI.
+    """
+    if model.situ_beta is None:
+        return {}
+    if (moe_backend.upper(), quant_algo) not in _SITU_PATHS:
+        return {}
+    return {
+        "activation": SiTuActivation(
+            gate_softcap=float(model.situ_beta),
+            linear_softcap=float(model.situ_linear_beta),
+        )
+    }
+
+
+def _plain_activation(kind: ActivationType) -> MoEActivation:
+    """The spec's ``activation_type`` as a carrier, for the no-constants case.
+
+    Reads ``ACTIVATION_PAYLOAD`` rather than naming the two kinds ``specs.py``
+    currently allows, so a third one added there needs no change here.
+    """
+    payload = ACTIVATION_PAYLOAD[ActivationType(kind)]
+    return SimpleActivation(kind) if payload is SimpleActivation else payload()
+
+
 def _create_moe_for_benchmark(**kwargs):
     ensure_cute_dsl_importable_for_benchmark()
-    from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 
     return create_moe(**kwargs)
 
@@ -220,6 +298,7 @@ def _build_moe_module(
 
     mc = model.to_moe_model_config()
     swiglu_gptoss_style = model.swiglu_gptoss_style
+    activation_type = model.activation_type_enum
 
     routing_method = _create_routing_method(
         model.routing_method_cls,
@@ -264,6 +343,7 @@ def _build_moe_module(
         swiglu_beta=model.swiglu_beta if swiglu_gptoss_style else None,
         swiglu_limit=model.swiglu_limit if swiglu_gptoss_style else None,
         num_local_experts=num_local_experts,
+        activation_type=activation_type,
     )
 
     weight_loading_mode = getattr(
@@ -272,7 +352,8 @@ def _build_moe_module(
 
     swiglu_tensors = quantize_util.get_swiglu_tensors()
 
-    moe = _create_moe_for_benchmark(
+    # Merge then unpack so SiTU can override activation_type / swiglu_alpha-beta.
+    moe_kwargs = dict(
         routing_method=routing_method,
         num_experts=mc.num_experts,
         hidden_size=mc.hidden_size,
@@ -282,10 +363,18 @@ def _build_moe_module(
         model_config=model_config,
         weight_loading_mode=weight_loading_mode,
         bias=swiglu_gptoss_style,
-        swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
-        swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
-        swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+        activation=(
+            SwigluBiasActivation(
+                gate_sigmoid_scale=swiglu_tensors["swiglu_alpha"],
+                linear_offset=swiglu_tensors["swiglu_beta"],
+                clamp=swiglu_tensors["swiglu_limit"],
+            )
+            if swiglu_tensors
+            else _plain_activation(activation_type)
+        ),
     )
+    moe_kwargs.update(_situ_kwargs(model, moe_backend, quant_algo))
+    moe = _create_moe_for_benchmark(**moe_kwargs)
 
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
         weights, _ref_weights, _ref_kwargs = quantize_util.prepare_weights_from_backend(

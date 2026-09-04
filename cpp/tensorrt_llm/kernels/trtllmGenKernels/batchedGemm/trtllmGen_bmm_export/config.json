@@ -20,7 +20,10 @@
             "clampLimit": 2,
             "numTokens": 2,
             "topK": 2,
-            "useTmaOobOpt": true
+            "useTmaOobOpt": true,
+            "fineGrainedForceValid": false,
+            "fineGrainedProducer": false,
+            "fineGrainedConsumerB": false
         },
         "BatchedGemmNonDsBase": {
             "_template": "BatchedGemmDefault",
@@ -240,7 +243,17 @@
             "listN": "8,8",
             "numExperts": 2,
             "numStagesMma": 1,
-            "tileScheduler": "static"
+            "tileScheduler": "static",
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
+            ]
         },
         {
             "_template": "BatchedGemmPerTensorScalingFp8LowLatency",
@@ -264,7 +277,17 @@
             "listN": "8,8",
             "numExperts": 2,
             "numStagesMma": 1,
-            "tileScheduler": "static"
+            "tileScheduler": "static",
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
         },
         {
             "_template": "BatchedGemmDeepSeekFp8LowLatency",
@@ -284,7 +307,17 @@
             "numStagesMma": 2,
             "tileScheduler": "static",
             "useShuffledMatrix": false,
-            "layoutA": "T"
+            "layoutA": "T",
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    32,
+                    "107a"
+                ]
+            ]
         },
         {
             "_comment": "FP4_FC1_LowLatency",
@@ -299,6 +332,11 @@
                 [
                     true,
                     "geglu",
+                    "none"
+                ],
+                [
+                    true,
+                    "situ",
                     "none"
                 ],
                 [
@@ -415,6 +453,11 @@
                     "none"
                 ],
                 [
+                    true,
+                    "situ",
+                    "none"
+                ],
+                [
                     false,
                     "none",
                     "relu2"
@@ -480,7 +523,36 @@
                 ]
             ],
             "numStagesMma": 2,
-            "tileScheduler": "persistent"
+            "tileScheduler": "persistent",
+            "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,useTmaOobOpt,fineGrainedForceValid,fineGrainedProducer": [
+                [
+                    64,
+                    "100f",
+                    true,
+                    true,
+                    true,
+                    false,
+                    false
+                ],
+                [
+                    128,
+                    "107a",
+                    true,
+                    true,
+                    true,
+                    false,
+                    false
+                ],
+                [
+                    128,
+                    "107a",
+                    false,
+                    false,
+                    false,
+                    true,
+                    true
+                ]
+            ]
         },
         {
             "_comment": "FP4_FC1_HighThroughput",
@@ -495,6 +567,11 @@
                 [
                     true,
                     "geglu",
+                    "none"
+                ],
+                [
+                    true,
+                    "situ",
                     "none"
                 ],
                 [
@@ -545,6 +622,16 @@
                     "128x4",
                     "ldgsts"
                 ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
             ]
         },
         {
@@ -561,6 +648,11 @@
                 [
                     true,
                     "geglu",
+                    "none"
+                ],
+                [
+                    true,
+                    "situ",
                     "none"
                 ],
                 [
@@ -593,6 +685,16 @@
                     3,
                     "128x4"
                 ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
             ]
         },
         {
@@ -608,6 +710,11 @@
                 [
                     true,
                     "geglu",
+                    "none"
+                ],
+                [
+                    true,
+                    "situ",
                     "none"
                 ],
                 [
@@ -645,6 +752,16 @@
                     4,
                     "128x4"
                 ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
             ]
         },
         {
@@ -661,6 +778,11 @@
                 [
                     true,
                     "geglu",
+                    "none"
+                ],
+                [
+                    true,
+                    "situ",
                     "none"
                 ],
                 [
@@ -696,6 +818,16 @@
                     4,
                     "128x4"
                 ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
             ]
         },
         {
@@ -711,6 +843,11 @@
                 [
                     true,
                     "geglu",
+                    "none"
+                ],
+                [
+                    true,
+                    "situ",
                     "none"
                 ],
                 [
@@ -743,6 +880,16 @@
                     "128x4",
                     "ldgsts"
                 ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
             ]
         },
         {
@@ -758,6 +905,11 @@
                 [
                     true,
                     "geglu",
+                    "none"
+                ],
+                [
+                    true,
+                    "situ",
                     "none"
                 ],
                 [
@@ -793,6 +945,16 @@
                     104,
                     256,
                     "rasterizeAlongN"
+                ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
                 ]
             ]
         },
@@ -922,7 +1084,33 @@
                     5
                 ]
             ],
-            "tileScheduler": "persistent"
+            "tileScheduler": "persistent",
+            "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,gridWaitForPrimaryEarlyExit,fineGrainedConsumerB": [
+                [
+                    64,
+                    "100f",
+                    true,
+                    true,
+                    true,
+                    false
+                ],
+                [
+                    128,
+                    "107a",
+                    true,
+                    true,
+                    true,
+                    false
+                ],
+                [
+                    128,
+                    "107a",
+                    true,
+                    true,
+                    false,
+                    true
+                ]
+            ]
         },
         {
             "_comment": "FP4_FC2_HighThroughput",
@@ -936,7 +1124,17 @@
             "dtypeC": "bf16",
             "tileScheduler": "persistent",
             "numStagesMma": 2,
-            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB,": [
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
+            ],
+            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB": [
                 [
                     64,
                     64,
@@ -975,6 +1173,16 @@
                     5,
                     "128x4"
                 ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
             ]
         },
         {
@@ -986,7 +1194,17 @@
             "dtypeC": "bf16",
             "tileScheduler": "persistent",
             "numStagesMma": 2,
-            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutA,": [
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
+            ],
+            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutA": [
                 [
                     128,
                     128,
@@ -1015,6 +1233,16 @@
                     256,
                     5,
                     "128x4"
+                ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
                 ]
             ]
         },
@@ -1087,7 +1315,13 @@
                 ]
             ],
             "useShuffledMatrix": false,
-            "layoutA": "T"
+            "layoutA": "T",
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ]
+            ]
         },
         {
             "_comment": "DS_FP8_FC2",
@@ -1152,7 +1386,13 @@
                 ]
             ],
             "useShuffledMatrix": false,
-            "layoutA": "T"
+            "layoutA": "T",
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ]
+            ]
         },
         {
             "_comment": "PerTensor_FP8_FC1_LowLatency",
@@ -1210,6 +1450,35 @@
                 [
                     "persistent",
                     2
+                ]
+            ],
+            "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,useTmaOobOpt,fineGrainedForceValid,fineGrainedProducer": [
+                [
+                    32,
+                    "100f",
+                    true,
+                    true,
+                    true,
+                    false,
+                    false
+                ],
+                [
+                    64,
+                    "107a",
+                    true,
+                    true,
+                    true,
+                    false,
+                    false
+                ],
+                [
+                    64,
+                    "107a",
+                    false,
+                    false,
+                    false,
+                    true,
+                    true
                 ]
             ]
         },
@@ -1276,7 +1545,17 @@
                 ]
             ],
             "numStagesMma": 2,
-            "tileScheduler": "persistent"
+            "tileScheduler": "persistent",
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
         },
         {
             "_comment": "PerTensor_FP8_FC2_LowLatency",
@@ -1320,6 +1599,32 @@
                 [
                     "persistent",
                     2
+                ]
+            ],
+            "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,gridWaitForPrimaryEarlyExit,fineGrainedConsumerB": [
+                [
+                    32,
+                    "100f",
+                    true,
+                    true,
+                    true,
+                    false
+                ],
+                [
+                    64,
+                    "107a",
+                    true,
+                    true,
+                    true,
+                    false
+                ],
+                [
+                    64,
+                    "107a",
+                    true,
+                    true,
+                    false,
+                    true
                 ]
             ]
         },
@@ -1374,6 +1679,16 @@
                 [
                     "persistent",
                     2
+                ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    64,
+                    "107a"
                 ]
             ]
         },
@@ -1433,6 +1748,16 @@
                     "persistent",
                     2
                 ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
             ]
         },
         {
@@ -1490,6 +1815,16 @@
                 [
                     "persistent",
                     2
+                ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    64,
+                    "107a"
                 ]
             ]
         },
@@ -1702,7 +2037,17 @@
                     48
                 ]
             ],
-            "tileScheduler": "persistent"
+            "tileScheduler": "persistent",
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
         },
         {
             "_comment": "MxFp4xMxFp8_FC1_HighThroughput_LdgstsRoute",
@@ -1748,6 +2093,16 @@
                     7,
                     "128x4"
                 ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
             ]
         },
         {
@@ -1790,7 +2145,17 @@
                 ]
             ],
             "tileScheduler": "persistent",
-            "numStagesMma": 2
+            "numStagesMma": 2,
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
         },
         {
             "_comment": "MxFp4xMxFp8_FC1_HighThroughput_tileN_256",
@@ -1845,7 +2210,17 @@
                 ]
             ],
             "tileScheduler": "persistent",
-            "numStagesMma": 1
+            "numStagesMma": 1,
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
         },
         {
             "_comment": "MxFp4xMxFp8_FC2_LowLatency",
@@ -2014,7 +2389,17 @@
                     2
                 ]
             ],
-            "tileScheduler": "persistent"
+            "tileScheduler": "persistent",
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
         },
         {
             "_comment": "MxFp4xMxFp8_FC2_HighThroughput_tileN_256",
@@ -2038,7 +2423,17 @@
                 ]
             ],
             "tileScheduler": "persistent",
-            "numStagesMma": 1
+            "numStagesMma": 1,
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
         },
         {
             "_comment": "MxFp4xBf16_FC1_LowLatency",
@@ -2118,6 +2513,35 @@
                     "persistent",
                     2
                 ]
+            ],
+            "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,useTmaOobOpt,fineGrainedForceValid,fineGrainedProducer": [
+                [
+                    16,
+                    "100f",
+                    true,
+                    true,
+                    true,
+                    false,
+                    false
+                ],
+                [
+                    16,
+                    "107a",
+                    true,
+                    true,
+                    true,
+                    false,
+                    false
+                ],
+                [
+                    16,
+                    "107a",
+                    false,
+                    false,
+                    false,
+                    true,
+                    true
+                ]
             ]
         },
         {
@@ -2164,6 +2588,32 @@
                 [
                     "persistent",
                     2
+                ]
+            ],
+            "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,gridWaitForPrimaryEarlyExit,fineGrainedConsumerB": [
+                [
+                    16,
+                    "100f",
+                    true,
+                    true,
+                    true,
+                    false
+                ],
+                [
+                    16,
+                    "107a",
+                    true,
+                    true,
+                    true,
+                    false
+                ],
+                [
+                    16,
+                    "107a",
+                    true,
+                    true,
+                    false,
+                    true
                 ]
             ]
         },
@@ -2283,6 +2733,650 @@
                 [
                     "persistent",
                     2
+                ]
+            ]
+        },
+        {
+            "_comment": "FP4_FC1_LowLatency_1CTA",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": "tma",
+            "fusedAct,act,eltwiseActType": [
+                [
+                    true,
+                    "swiglu",
+                    "none"
+                ],
+                [
+                    true,
+                    "geglu",
+                    "none"
+                ],
+                [
+                    false,
+                    "swiglu",
+                    "relu2"
+                ],
+                [
+                    false,
+                    "none",
+                    "silu"
+                ]
+            ],
+            "sfLayoutB": "linear",
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "dtypeC": "e2m1",
+            "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages,routeSfsAct": [
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    512,
+                    1,
+                    1,
+                    1,
+                    5,
+                    "tma"
+                ],
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    256,
+                    1,
+                    1,
+                    1,
+                    9,
+                    "ldgsts"
+                ],
+                [
+                    128,
+                    16,
+                    16,
+                    16,
+                    256,
+                    1,
+                    1,
+                    1,
+                    9,
+                    "ldgsts"
+                ],
+                [
+                    128,
+                    32,
+                    32,
+                    32,
+                    256,
+                    1,
+                    1,
+                    1,
+                    9,
+                    "ldgsts"
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "static",
+                    1
+                ],
+                [
+                    "persistent",
+                    2
+                ]
+            ],
+            "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,useTmaOobOpt,fineGrainedForceValid,fineGrainedProducer": [
+                [
+                    128,
+                    "107a",
+                    true,
+                    true,
+                    true,
+                    false,
+                    false
+                ],
+                [
+                    128,
+                    "107a",
+                    false,
+                    false,
+                    false,
+                    true,
+                    true
+                ]
+            ]
+        },
+        {
+            "_comment": "FP4_FC1_LowLatency_2CTA - No FineGrained: clusterDimX=2 incompatible with FineGrained pipeline",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": "tma",
+            "fusedAct,act,eltwiseActType": [
+                [
+                    true,
+                    "swiglu",
+                    "none"
+                ],
+                [
+                    true,
+                    "geglu",
+                    "none"
+                ],
+                [
+                    false,
+                    "swiglu",
+                    "relu2"
+                ],
+                [
+                    false,
+                    "none",
+                    "silu"
+                ]
+            ],
+            "sfLayoutB": "linear",
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "dtypeC": "e2m1",
+            "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages,routeSfsAct": [
+                [
+                    256,
+                    16,
+                    16,
+                    16,
+                    512,
+                    1,
+                    2,
+                    1,
+                    5,
+                    "tma"
+                ],
+                [
+                    256,
+                    32,
+                    32,
+                    32,
+                    512,
+                    1,
+                    2,
+                    1,
+                    5,
+                    "tma"
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "static",
+                    1
+                ],
+                [
+                    "persistent",
+                    2
+                ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    128,
+                    "107a"
+                ]
+            ]
+        },
+        {
+            "_comment": "FP4_FC2_LowLatency_1CTA",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "dtypeC": "bf16",
+            "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages": [
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    512,
+                    1,
+                    1,
+                    1,
+                    5
+                ],
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    256,
+                    1,
+                    1,
+                    1,
+                    9
+                ],
+                [
+                    128,
+                    16,
+                    16,
+                    16,
+                    256,
+                    1,
+                    1,
+                    1,
+                    9
+                ],
+                [
+                    128,
+                    32,
+                    32,
+                    32,
+                    256,
+                    1,
+                    1,
+                    1,
+                    9
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "static",
+                    1
+                ],
+                [
+                    "persistent",
+                    2
+                ]
+            ],
+            "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,gridWaitForPrimaryEarlyExit,fineGrainedConsumerB": [
+                [
+                    128,
+                    "107a",
+                    true,
+                    true,
+                    true,
+                    false
+                ],
+                [
+                    128,
+                    "107a",
+                    true,
+                    true,
+                    false,
+                    true
+                ]
+            ]
+        },
+        {
+            "_comment": "FP4_FC2_LowLatency_2CTA - No FineGrained: clusterDimX=2 incompatible with FineGrained pipeline",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "dtypeC": "bf16",
+            "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages": [
+                [
+                    256,
+                    16,
+                    16,
+                    16,
+                    512,
+                    1,
+                    2,
+                    1,
+                    5
+                ],
+                [
+                    256,
+                    32,
+                    32,
+                    32,
+                    512,
+                    1,
+                    2,
+                    1,
+                    5
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "static",
+                    1
+                ],
+                [
+                    "persistent",
+                    2
+                ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    128,
+                    "107a"
+                ]
+            ]
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC1_LowLatency_1CTA",
+            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
+            "routeAct": "tma",
+            "routeSfsAct": "ldgsts",
+            "fusedAct": true,
+            "sfLayoutB": "linear",
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages": [
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    512,
+                    1,
+                    1,
+                    1,
+                    3
+                ],
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    512,
+                    2,
+                    1,
+                    2,
+                    3
+                ],
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    256,
+                    1,
+                    1,
+                    1,
+                    6
+                ],
+                [
+                    128,
+                    16,
+                    16,
+                    16,
+                    256,
+                    1,
+                    1,
+                    1,
+                    5
+                ],
+                [
+                    128,
+                    32,
+                    32,
+                    32,
+                    256,
+                    1,
+                    1,
+                    1,
+                    5
+                ],
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    256,
+                    2,
+                    1,
+                    2,
+                    6
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "static",
+                    1
+                ],
+                [
+                    "persistent",
+                    2
+                ]
+            ],
+            "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,useTmaOobOpt,fineGrainedForceValid,fineGrainedProducer": [
+                [
+                    64,
+                    "107a",
+                    true,
+                    true,
+                    true,
+                    false,
+                    false
+                ],
+                [
+                    64,
+                    "107a",
+                    false,
+                    false,
+                    false,
+                    true,
+                    true
+                ]
+            ]
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC1_LowLatency_2CTA - No FineGrained: clusterDimX=2 incompatible with FineGrained pipeline",
+            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
+            "routeAct": "tma",
+            "routeSfsAct": "ldgsts",
+            "fusedAct": true,
+            "sfLayoutB": "linear",
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages": [
+                [
+                    256,
+                    16,
+                    16,
+                    16,
+                    256,
+                    1,
+                    2,
+                    1,
+                    6
+                ],
+                [
+                    256,
+                    32,
+                    32,
+                    32,
+                    256,
+                    1,
+                    2,
+                    1,
+                    5
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "static",
+                    1
+                ],
+                [
+                    "persistent",
+                    2
+                ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "107a"
+                ]
+            ]
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC2_LowLatency_1CTA",
+            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "dtypeC": "bf16",
+            "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages": [
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    512,
+                    1,
+                    1,
+                    1,
+                    3
+                ],
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    512,
+                    2,
+                    1,
+                    2,
+                    3
+                ],
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    256,
+                    1,
+                    1,
+                    1,
+                    6
+                ],
+                [
+                    128,
+                    16,
+                    16,
+                    16,
+                    256,
+                    1,
+                    1,
+                    1,
+                    5
+                ],
+                [
+                    128,
+                    32,
+                    32,
+                    32,
+                    256,
+                    1,
+                    1,
+                    1,
+                    5
+                ],
+                [
+                    128,
+                    8,
+                    8,
+                    8,
+                    256,
+                    2,
+                    1,
+                    2,
+                    6
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "static",
+                    1
+                ],
+                [
+                    "persistent",
+                    2
+                ]
+            ],
+            "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,gridWaitForPrimaryEarlyExit,fineGrainedConsumerB": [
+                [
+                    64,
+                    "107a",
+                    true,
+                    true,
+                    true,
+                    false
+                ],
+                [
+                    64,
+                    "107a",
+                    true,
+                    true,
+                    false,
+                    true
+                ]
+            ]
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC2_LowLatency_2CTA - No FineGrained: clusterDimX=2 incompatible with FineGrained pipeline",
+            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "dtypeC": "bf16",
+            "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages": [
+                [
+                    256,
+                    16,
+                    16,
+                    16,
+                    256,
+                    1,
+                    2,
+                    1,
+                    6
+                ],
+                [
+                    256,
+                    32,
+                    32,
+                    32,
+                    256,
+                    1,
+                    2,
+                    1,
+                    5
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "static",
+                    1
+                ],
+                [
+                    "persistent",
+                    2
+                ]
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "107a"
                 ]
             ]
         }

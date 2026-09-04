@@ -24,9 +24,9 @@ from ..modules.embedding import Embedding
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
-from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
-                                 RenormalizeMoeRoutingMethod, TritonFusedMoE,
-                                 create_moe)
+from ..moe.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
+                             SwigluBiasActivation, TritonFusedMoE, create_moe,
+                             is_moe_weight_owner)
 # isort: on
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
@@ -173,15 +173,12 @@ class MLPBlock(torch.nn.Module):
             output_dtype=torch.bfloat16
             if config.moe_backend.upper() == "TRTLLM" else torch.float32)
 
-        self.swiglu_alpha = torch.tensor(
-            [1.702] * (self.num_slots // config.mapping.moe_ep_size),
-            dtype=torch.float32).cuda()
-        self.swiglu_beta = torch.tensor(
-            [1.0] * (self.num_slots // config.mapping.moe_ep_size),
-            dtype=torch.float32).cuda()
-        self.swiglu_limit = torch.tensor(
-            [7.0] * (self.num_slots // config.mapping.moe_ep_size),
-            dtype=torch.float32).cuda()
+        # gpt-oss constants are uniform across experts; the backend broadcasts
+        # them to whatever per-expert shape its kernels index, sized by the
+        # local slot count it resolved.
+        self.moe_activation = SwigluBiasActivation(gate_sigmoid_scale=1.702,
+                                                   linear_offset=1.0,
+                                                   clamp=7.0)
         # Prepare MoE creation parameters
         moe_params = {
             'routing_method': self.routing_method,
@@ -193,9 +190,7 @@ class MLPBlock(torch.nn.Module):
             'model_config': config,
             'weight_loading_mode': MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             'bias': True,
-            'swiglu_alpha': self.swiglu_alpha,
-            'swiglu_beta': self.swiglu_beta,
-            'swiglu_limit': self.swiglu_limit,
+            'activation': self.moe_activation,
             'layer_idx': self.layer_idx,
         }
 
@@ -697,13 +692,13 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             # We need to use parent module name (without .backend) to match saved weight names.
             # After MoE refactoring is fully complete, all paths will follow this branch.
             names = name.split('.')
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 # Backend is under experts module (ConfigurableMoE wrapper)
                 name = '.'.join(names[:-1])
 
             module_weights = filter_weights(name, weights)
 
-            if isinstance(module, MoE):
+            if is_moe_weight_owner(module):
                 try:
                     # For BF16 ckpt.
                     # Deinterleave for gate and up.
@@ -826,13 +821,13 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                 name = name.replace(k, v)
 
             names = name.split('.')
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 # Backend is under experts module (ConfigurableMoE wrapper)
                 name = '.'.join(names[:-1])
 
             module_weights = filter_weights(name, weights)
 
-            if isinstance(module, MoE):
+            if is_moe_weight_owner(module):
                 assert getattr(module, "quant_config", None) is not None and \
                    module.quant_config.quant_mode.has_nvfp4()
                 gate_up = module_weights.get('gate_up_proj', None)

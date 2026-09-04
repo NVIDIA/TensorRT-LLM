@@ -22,9 +22,17 @@ Non-streaming request opt-in and response example::
     HTTP/1.1 200 OK
     Content-Type: application/json
     Server-Timing: server_queue;dur=1.250000, server_ttft;dur=8.500000, server_e2e;dur=24.000000
-    X-TRTLLM-Start-End-Time: server-start;ts=12345.123456, server-end;ts=12345.147456
+    X-TRTLLM-Start-End-Time: server-start;ts=12345.123456, server-end;ts=12345.147456,
+        server-srv-start;ts=12345.122000, server-srv-ttft;ts=12345.132000
     X-TRTLLM-Step-Metrics: server-step-0-forward;dur=2.100000, server-step-0-sample;dur=0.400000
     X-TRTLLM-Ctx-Chunk-Metrics: server-ctx-chunk-0-forward;dur=4.200000
+
+``X-TRTLLM-Start-End-Time`` carries absolute timestamps. ``start``/``end`` are the
+executor's arrival and last-token times; ``srv-start``/``srv-ttft`` are the HTTP
+server's arrival and first-token times; ``kv-start``/``kv-end`` bracket the
+KV-cache transfer on a disaggregated generation worker. A disaggregated server
+needs all of them to reconstruct a request's full lifecycle from a worker
+response -- see :func:`build_metrics_record_from_headers`.
 
 Streaming responses carry the same fields in a named SSE event after ``[DONE]``::
 
@@ -49,6 +57,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._perf_metrics_schema import (
@@ -191,7 +200,9 @@ STEP_METRICS_HEADER = "X-TRTLLM-Step-Metrics"
 CTX_CHUNK_METRICS_HEADER = "X-TRTLLM-Ctx-Chunk-Metrics"
 SSE_METRICS_EVENT = "trtllm.perf_metrics"
 RETURN_METRICS_HEADER = "X-TRTLLM-return-metrics"
+CLOCK_SYNC_HEADER = "X-TRTLLM-Clock-Sync"
 _RETURN_METRICS_HEADER_BYTES = RETURN_METRICS_HEADER.lower().encode()
+_CLOCK_SYNC_HEADER_BYTES = CLOCK_SYNC_HEADER.encode()
 
 _SCHEMA_VERSION = 1
 _PERF_METRICS_HEADER_BUDGET_BYTES = 80 * 1024
@@ -218,19 +229,27 @@ _KV_FIELDS = (
 _SPEC_FIELDS = ("acceptance_rate", "total_accepted_draft_tokens", "total_draft_tokens")
 
 
-def _as_seconds(value: Any, offset: float = 0) -> Optional[float]:
+def _as_seconds(value: Any) -> Optional[float]:
     try:
         seconds = float(value.total_seconds())
     except (AttributeError, TypeError, ValueError):
         return None
-    return seconds + offset if seconds > 0 else None
+    return seconds if seconds > 0 else None
+
+
+def _to_reference_time(
+    value: Optional[float], adjusted_clock: Optional[AdjustedSteadyClock]
+) -> Optional[float]:
+    if value is None or adjusted_clock is None:
+        return value
+    return adjusted_clock.to_reference_time(value)
 
 
 def build_request_metrics_record(
     result: Any,
     raw_request: Any = None,
     phase: str = "server",
-    steady_clock_offset: float = 0,
+    adjusted_clock: Optional[AdjustedSteadyClock] = None,
 ) -> Optional[Dict[str, Any]]:
     """Convert a completed RequestOutput metrics snapshot to JSON-safe data."""
     if not result or not getattr(result, "outputs", None):
@@ -242,13 +261,15 @@ def build_request_metrics_record(
 
     timing = metrics.timing_metrics
     timing_metrics = {
-        name: _as_seconds(getattr(timing, name), steady_clock_offset) for name in _TIMING_FIELDS
+        name: _to_reference_time(_as_seconds(getattr(timing, name)), adjusted_clock)
+        for name in _TIMING_FIELDS
     }
     timing_metrics["kv_cache_size"] = timing.kv_cache_size
     if raw_request is not None:
+        # Frontend timestamps are captured from this same adjusted clock.
         for name in ("server_arrival_time", "server_first_token_time"):
             value = getattr(raw_request.state, name, None)
-            timing_metrics[name] = value + steady_clock_offset if value is not None else None
+            timing_metrics[name] = value
 
     phase_record: Dict[str, Any] = {
         "first_iter": metrics.first_iter,
@@ -300,9 +321,19 @@ def build_metrics_headers(records: List[Dict[str, Any]]) -> Dict[str, str]:
     for record in records:
         for phase, phase_record in record.get("phases", {}).items():
             timing = phase_record.get("timing_metrics", {})
+            # Absolute timestamps forwarded verbatim. The four "srv-"/"kv-" names
+            # are what let a disagg server reconstruct the full request lifecycle
+            # from a worker response; without them the per-phase breakdown
+            # silently collapses to zero-width spans. Names must not contain a
+            # second "server-"/"server_" substring, because the receiving side
+            # rewrites the phase prefix with an unqualified str.replace().
             for name, field in (
                 ("start", "arrival_time"),
                 ("end", "last_token_time"),
+                ("srv-start", "server_arrival_time"),
+                ("srv-ttft", "server_first_token_time"),
+                ("kv-start", "kv_cache_transfer_start"),
+                ("kv-end", "kv_cache_transfer_end"),
             ):
                 timestamp = timing.get(field)
                 if timestamp is not None:
@@ -358,6 +389,7 @@ def build_metrics_record_from_headers(
     headers: Any,
     phase: str,
     request_id: str = "",
+    adjusted_clock: Optional[AdjustedSteadyClock] = None,
 ) -> Optional[Dict[str, Any]]:
     """Build a request-local phase from standard metrics fields."""
     metrics_headers = {}
@@ -378,12 +410,16 @@ def build_metrics_record_from_headers(
     fields = {
         f"{phase}-start": "arrival_time",
         f"{phase}-end": "last_token_time",
+        f"{phase}-srv-start": "server_arrival_time",
+        f"{phase}-srv-ttft": "server_first_token_time",
+        f"{phase}-kv-start": "kv_cache_transfer_start",
+        f"{phase}-kv-end": "kv_cache_transfer_end",
     }
     for item in metrics_headers.get(START_END_TIME_HEADER, "").split(","):
         name, separator, timestamp = item.strip().partition(";ts=")
         if separator and name in fields:
             try:
-                timing_metrics[fields[name]] = float(timestamp)
+                timing_metrics[fields[name]] = _to_reference_time(float(timestamp), adjusted_clock)
             except ValueError:
                 logger.warning("Ignoring invalid %s timestamp: %s", name, timestamp)
 
@@ -417,6 +453,49 @@ def build_metrics_record_from_headers(
         "metrics_headers": metrics_headers,
         "phases": {phase: phase_record},
     }
+
+
+def build_clock_sync_header(receive_time: float, transmit_time: float) -> str:
+    """Serialize worker receive/transmit timestamps for clock normalization."""
+    return f"receive;ts={receive_time:.9f}, transmit;ts={transmit_time:.9f}"
+
+
+def adjusted_clock_from_headers(
+    headers: Any,
+    originate_time: float,
+    destination_time: float,
+) -> AdjustedSteadyClock:
+    """Build a clock that maps response timestamps to the client clock."""
+    value = headers.get(CLOCK_SYNC_HEADER)
+    if not value:
+        return AdjustedSteadyClock()
+
+    timestamps = {}
+    for item in value.split(","):
+        name, separator, timestamp = item.strip().partition(";ts=")
+        if separator:
+            try:
+                timestamps[name] = float(timestamp)
+            except ValueError:
+                logger.warning("Ignoring invalid clock sync timestamp: %s", timestamp)
+                return AdjustedSteadyClock()
+
+    try:
+        receive_time = timestamps["receive"]
+        transmit_time = timestamps["transmit"]
+    except KeyError:
+        logger.warning("Ignoring incomplete clock sync header: %s", value)
+        return AdjustedSteadyClock()
+
+    values = (originate_time, receive_time, transmit_time, destination_time)
+    if not all(math.isfinite(timestamp) for timestamp in values):
+        logger.warning("Ignoring non-finite clock sync header: %s", value)
+        return AdjustedSteadyClock()
+
+    # NTP offset is worker clock minus client clock. Metrics need the inverse
+    # correction because combined disaggregated records use the client clock.
+    offset = ((receive_time - originate_time) + (transmit_time - destination_time)) / 2
+    return AdjustedSteadyClock(-offset)
 
 
 def _limit_metrics_headers(headers: Dict[str, str]) -> Dict[str, str]:
@@ -484,7 +563,23 @@ def _jsonl_perf_metrics(phase_record: Dict[str, Any]) -> PerfMetrics:
 
     timing_metrics = dict(perf_metrics.get("timing_metrics", {}))
     if not timing_metrics.get("kv_cache_size"):
-        for name in ("kv_cache_size", "kv_cache_transfer_start", "kv_cache_transfer_end"):
+        timing_metrics.pop("kv_cache_size", None)
+    # Drop the KV-transfer timestamps only when they were never populated. Keying
+    # this off kv_cache_size instead discards timestamps that the Server-Timing
+    # header transport carried successfully, because kv_cache_size is worker-local
+    # and never reaches a header-derived record -- which zeroed the KV-transfer
+    # span for every disaggregated request.
+    #
+    # Falsy, not `is None`: a request that never transferred KV reaches here with
+    # 0.0, not None, because the aggregated path reads these off a default-
+    # initialised C++ duration (`timing_metrics.kv_cache_transfer_start
+    # .total_seconds()` in executor/result.py). Testing only for None would write
+    # `kv_cache_transfer_start: 0.0` into the JSONL where the key used to be
+    # absent, and a consumer checking presence rather than truthiness would read a
+    # zero-width transfer as a real measurement. A populated timestamp is a
+    # steady-clock reading, so it is never 0.
+    for name in ("kv_cache_transfer_start", "kv_cache_transfer_end"):
+        if not timing_metrics.get(name):
             timing_metrics.pop(name, None)
     perf_metrics["timing_metrics"] = timing_metrics
 
@@ -669,11 +764,16 @@ class PerfMetricsMiddleware:
     """Expose request metrics and optionally persist completed records."""
 
     def __init__(
-        self, app: Any, expose_headers: bool, writer: Optional[PerfMetricsJsonlWriter] = None
+        self,
+        app: Any,
+        expose_headers: bool,
+        writer: Optional[PerfMetricsJsonlWriter] = None,
+        adjusted_clock: Optional[AdjustedSteadyClock] = None,
     ):
         self._app = app
         self._expose_headers = expose_headers
         self._writer = writer
+        self._adjusted_clock = adjusted_clock
 
     async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -701,6 +801,14 @@ class PerfMetricsMiddleware:
                     headers.extend(
                         (name.encode(), value.encode()) for name, value in public_headers.items()
                     )
+                if return_metrics and self._adjusted_clock is not None:
+                    receive_time = scope.get("state", {}).get("server_arrival_time")
+                    if receive_time is not None:
+                        clock_sync = build_clock_sync_header(
+                            receive_time,
+                            self._adjusted_clock.now(),
+                        )
+                        headers.append((_CLOCK_SYNC_HEADER_BYTES, clock_sync.encode()))
                 message["headers"] = headers
 
             elif message["type"] == "http.response.body" and not message.get("more_body", False):

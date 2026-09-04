@@ -2,13 +2,125 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.logger import logger
+
+
+def resolve_cache_transceiver_config(
+        cache_transceiver_config: Optional[CacheTransceiverConfig]) -> None:
+    """Resolve defaults and validate runtime-independent configuration."""
+    if cache_transceiver_config is None or cache_transceiver_config.backend is None:
+        return
+
+    # Paths that skip model defaults treat "auto" as the C++ runtime.
+    if cache_transceiver_config.transceiver_runtime == "auto":
+        cache_transceiver_config.transceiver_runtime = None
+
+    # Keep "DEFAULT" on the config until in-flight-cancel validation runs.
+    effective_backend = cache_transceiver_config.backend
+    if effective_backend == "DEFAULT":
+        effective_backend, _ = cache_transceiver_config._resolve_default_backend(
+        )
+
+    runtime = cache_transceiver_config.transceiver_runtime
+    enable_pipelined_transfer = cache_transceiver_config.enable_pipelined_transfer
+    if runtime is None and enable_pipelined_transfer:
+        if effective_backend != "NIXL":
+            raise ValueError(
+                f"enable_pipelined_transfer is set but backend "
+                f"'{effective_backend}' requires the C++ "
+                f"transceiver, which does not support pipelined transfer. Use NIXL backend to "
+                f"enable pipelined transfer.")
+        logger.warning(
+            "enable_pipelined_transfer is set; auto-selecting the Python "
+            "transceiver instead of the C++ transceiver to enable "
+            "pipelined KV cache transfer. "
+            "Set transceiver_runtime='CPP' to disable this auto-selection.")
+        cache_transceiver_config.transceiver_runtime = "PYTHON"
+    elif runtime == "CPP" and enable_pipelined_transfer:
+        raise ValueError(
+            "enable_pipelined_transfer is set but transceiver_runtime='CPP' "
+            "explicitly disables Python auto-selection. Use transceiver_runtime='PYTHON' to enable pipelined transfer."
+        )
+
+    if (cache_transceiver_config.transceiver_runtime == "PYTHON"
+            and effective_backend != "NIXL"):
+        raise ValueError(
+            f"Python transceiver currently only supports NIXL backend, "
+            f"got {effective_backend}. "
+            f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
+        )
+
+
+def uses_vswa_kv_cache_layout(
+        max_attention_windows: Optional[Sequence[Optional[int]]]) -> bool:
+    """Return whether windows require a variable-window KV cache layout.
+
+    Recurrent-state cache sentinels are negative and do not represent
+    attention windows, so hybrid linear-attention layouts are not VSWA.
+    """
+    return (max_attention_windows is not None
+            and len(set(max_attention_windows)) > 1
+            and all(window is None or window > 0
+                    for window in max_attention_windows))
+
+
+def _is_sliding_attention_layer(layer_type: object) -> bool:
+    """Return whether a config layer type denotes sliding attention."""
+    layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
+    return "sliding" in layer_type_name
+
+
+def get_layer_attention_window(
+    config: object,
+    layer_idx: int,
+) -> Optional[int]:
+    """Return the active sliding window for one layer, or ``None``.
+
+    An explicit ``use_sliding_window=False`` disables sliding attention.
+    Otherwise, infer it from ``sliding_window`` and ``layer_types`` so legacy
+    configs that omit the flag continue to work. Qwen2-style configs that omit
+    ``layer_types`` use ``max_window_layers`` as the first sliding-layer index.
+    """
+    use_sliding_window = getattr(config, "use_sliding_window", None)
+    if use_sliding_window is False:
+        return None
+
+    sliding_window = getattr(config, "sliding_window", None)
+    if isinstance(sliding_window, (list, tuple)):
+        raise NotImplementedError(
+            "Attention-window derivation assumes a single sliding-window "
+            f"size, got multiple: {sliding_window}")
+    if sliding_window is None:
+        if use_sliding_window is True:
+            raise ValueError(
+                "use_sliding_window=True requires a positive integer "
+                "sliding_window.")
+        return None
+
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types:
+        layer_type = layer_types[layer_idx % len(layer_types)]
+        if not _is_sliding_attention_layer(layer_type):
+            return None
+    else:
+        max_window_layers = getattr(config, "max_window_layers", None)
+        if (isinstance(max_window_layers, int)
+                and not isinstance(max_window_layers, bool)
+                and layer_idx < max_window_layers):
+            return None
+
+    if (not isinstance(sliding_window, int) or isinstance(sliding_window, bool)
+            or sliding_window <= 0):
+        raise ValueError(
+            "Sliding attention requires a positive integer sliding_window.")
+    return sliding_window
 
 
 def is_gemma4_hybrid(config):
@@ -357,12 +469,11 @@ def extract_mamba_kv_cache_params(
         #            = 3 * num_heads * head_dim  -> [q | k | v] short-conv
         #   ssm state shape = [num_heads, head_dim, state_size]
         #            = [H, V, K] fp32 delta-rule recurrent state.
-        # conv_kernel is set to short_conv_kernel_size + 1 so the pool's
-        # (conv_kernel - 1) columns hold the FULL FLA ShortConvolution cache
-        # window of `short_conv_kernel_size` columns.
+        # The pool stores the W - 1 raw inputs needed by the production
+        # causal-convolution kernels, where W is short_conv_kernel_size.
         lin = unwrap_kimi_text_config(config).linear_attn_config
         state_size = lin["head_dim"]
-        conv_kernel = lin["short_conv_kernel_size"] + 1
+        conv_kernel = lin["short_conv_kernel_size"]
         num_heads = lin["num_heads"]
         n_groups = lin["num_heads"]
         head_dim = lin["head_dim"]
@@ -513,6 +624,26 @@ def _build_minicpmv4_6_config(
     return composite_config
 
 
+def is_kimi_k3_multimodal_config(config_dict: dict) -> bool:
+    """Detect Kimi K3's composite multimodal VLM checkpoint config.
+
+    The released Kimi K3 VLM checkpoint advertises ``model_type: kimi_k3`` with
+    nested ``text_config`` (the ``kimi_linear`` text core) and ``vision_config``
+    (the MoonViT-3D tower + projector). When both sub-configs are present and
+    multimodal is not explicitly disabled, TRT-LLM keeps the composite
+    ``KimiK3Config`` and routes the checkpoint to
+    ``KimiK3ForConditionalGeneration``. Text-only ``kimi_linear`` checkpoints (or
+    a ``kimi_k3`` config with ``language_model_only: true`` / no vision_config)
+    fall through to the text-only flatten path.
+    """
+    text_config = config_dict.get("text_config")
+    vision_config = config_dict.get("vision_config")
+    return (config_dict.get("model_type") == "kimi_k3"
+            and config_dict.get("language_model_only") is not True
+            and isinstance(text_config, dict) and bool(text_config)
+            and isinstance(vision_config, dict) and bool(vision_config))
+
+
 # TODO: remove this once the transformers can support all of those models in _CONFIG_REGISTRY
 class LazyConfigDict(dict):
 
@@ -552,8 +683,8 @@ def load_pretrained_config(model_name_or_path: str,
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
     elif is_qwen_image_bench_config(config_dict):
-        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
-            Qwen35ConfigCompat
+        from tensorrt_llm._torch.models.modeling_qwen3_5 import (
+            Qwen35ConfigCompat, _normalize_qwen35_quantization_config)
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)
         # Keep the composite VLM config so the vision encoder and multimodal
@@ -562,6 +693,7 @@ def load_pretrained_config(model_name_or_path: str,
         model_config.architectures = ["QwenImageBenchForConditionalGeneration"]
         model_config.text_config = transformers.Qwen3NextConfig.from_dict(
             Qwen35ConfigCompat.normalize(config_dict, require_text_config=True))
+        _normalize_qwen35_quantization_config(model_config)
     elif model_type == "glm_moe_dsa":
         # GLM-MoE-DSA configs tag every layer with
         # layer_types=['deepseek_sparse_attention', ...] for HF bookkeeping.
@@ -597,11 +729,19 @@ def load_pretrained_config(model_name_or_path: str,
             model_name_or_path, **kwargs)
         _normalize_qwen35_vl_config(model_config,
                                     inner_arch="Qwen3_5ForCausalLM")
+    elif is_kimi_k3_multimodal_config(config_dict):
+        # Kimi K3 multimodal VLM: keep the composite KimiK3Config so the vision
+        # tower, projector, and multimodal token id remain available, and route
+        # to KimiK3ForConditionalGeneration. Must precede the text-only flatten
+        # branch below so vision_config isn't dropped. Built from the in-tree
+        # config classes (no trust_remote_code needed for the config).
+        from tensorrt_llm._torch.configs import KimiK3Config
+        model_config = KimiK3Config.from_dict(config_dict, **kwargs)
+        model_config.architectures = ["KimiK3ForConditionalGeneration"]
     elif model_type in ("kimi_k3", "kimi_linear"):
-        # Kimi K3: the checkpoint ships a composite VLM config
-        # (model_type "kimi_k3" with text/vision sub-configs). TRT-LLM runs
-        # the text model only, so flatten to the in-tree KimiLinearConfig
-        # (this also avoids trust_remote_code for the config).
+        # Kimi K3 text-only (or multimodal explicitly disabled): flatten to the
+        # in-tree KimiLinearConfig and run the text model only (this also avoids
+        # trust_remote_code for the config).
         from tensorrt_llm._torch.configs import KimiLinearConfig
         text_dict = dict(config_dict.get("text_config") or config_dict)
         model_config = KimiLinearConfig.from_dict(text_dict)

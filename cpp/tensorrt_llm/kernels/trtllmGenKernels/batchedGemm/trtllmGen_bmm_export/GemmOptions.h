@@ -25,12 +25,12 @@
 #include "KernelTraits.h"
 #include "trtllm/gen/CudaArchDecl.h"
 #include "trtllm/gen/DtypeDecl.h"
-#include "trtllm/gen/MmaDecl.h"
 #include "trtllm/gen/SfLayoutDecl.h"
 #include "trtllm/gen/SparsityDecl.h"
+#include "trtllm/gen/MmaDecl.h"
 #ifndef TLLM_GEN_EXPORT_INTERFACE
-#include "trtllm/gen/CudaRunner.h"
 #include "trtllm/gen/GenCtx.h"
+#include "trtllm/gen/CudaRunner.h"
 #else
 #ifdef TLLM_GEN_EXPORT_FLASHINFER
 #include <string>
@@ -134,20 +134,21 @@ struct GemmOptions
         int fallbackClusterDimY, int fallbackClusterDimZ, FusedBiasShuffleMode fusedBiasShuffleMode,
         bool fuseLoadSfTask, bool fuseUtccpWithUtcmma, bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
         bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit,
-        bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits, MatrixLayout layoutA, MatrixLayout layoutB, int m,
-        int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN, int mmaTileK, bool mockAllReduce, int n,
-        int numEpilogueWarps, int numRegsCastAWarps, int numRegsCopySfLdsSttm, int numRegsCopySparsityInfo,
-        int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK, int numStagesA,
-        int numStagesB, int numStagesMma, int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile,
-        int numStagesSmemSfA, int numStagesSmemSfB, int numStagesTmemSfA, int numStagesTmemSfB, int numStagesWorkId,
-        bool outputDebugTensors, bool patchF2fp, tg::Dtype perTokenSfDtype, SchedHostTask schedHostTask,
-        int32_t sfBlockSizeA, int32_t sfBlockSizeB, int32_t sfBlockSizeC, tg::SfLayout sfLayoutA,
-        tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, int sfReshapeFactor, tg::Sparsity sparsityA, SplitK splitK,
-        int tileK, int tileM, int tileN, TileScheduler tileScheduler, bool transposeMmaOutput,
-        bool useCustomizedMma3xNvFp4, bool useCustomMmaSchedule, bool useDeepSeekFp8, bool useFlexibleClusterDims,
-        bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap, bool usePerTokenSfA, bool usePerTokenSfB,
-        bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps,
-        bool useUnrollLoop2xForMma, int validM, int validN, int validK, int worldSize)
+        bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits, bool fineGrainedConsumerA,
+        bool fineGrainedConsumerB, bool fineGrainedForceValid, bool fineGrainedProducer, MatrixLayout layoutA,
+        MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN, int mmaTileK,
+        bool mockAllReduce, int n, int numEpilogueWarps, int numRegsCastAWarps, int numRegsCopySfLdsSttm,
+        int numRegsCopySparsityInfo, int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp,
+        int numSlicesForSplitK, int numStagesA, int numStagesB, int numStagesMma, int numStagesMmaWithinWorkTile,
+        int numStagesMmaAcrossWorkTile, int numStagesSmemSfA, int numStagesSmemSfB, int numStagesTmemSfA,
+        int numStagesTmemSfB, int numStagesWorkId, bool outputDebugTensors, bool patchF2fp, tg::Dtype perTokenSfDtype,
+        SchedHostTask schedHostTask, int32_t sfBlockSizeA, int32_t sfBlockSizeB, int32_t sfBlockSizeC,
+        tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, int sfReshapeFactor,
+        tg::Sparsity sparsityA, SplitK splitK, int tileK, int tileM, int tileN, TileScheduler tileScheduler,
+        bool transposeMmaOutput, bool useCustomizedMma3xNvFp4, bool useCustomMmaSchedule, bool useDeepSeekFp8,
+        bool useFlexibleClusterDims, bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap,
+        bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps,
+        bool useTwoMmaWarps, bool useUnrollLoop2xForMma, int validM, int validN, int validK, int worldSize)
         : mAllReduceAlgo{allReduceAlgo}
         , mBiasDtype{biasDtype}
         , mBiasType{biasType}
@@ -186,6 +187,10 @@ struct GemmOptions
         , mHoistMmaTaskTryWaits{hoistMmaTaskTryWaits}
         , mK{k}
         , mKernelTraits{kernelTraits}
+        , mFineGrainedConsumerA(fineGrainedConsumerA)
+        , mFineGrainedConsumerB(fineGrainedConsumerB)
+        , mFineGrainedForceValid(fineGrainedForceValid)
+        , mFineGrainedProducer(fineGrainedProducer)
         , mLayoutA{layoutA}
         , mLayoutB{layoutB}
         , mM{m}
@@ -339,6 +344,15 @@ struct GemmOptions
     int mK{16 * 16};
     // Traits of the kernel.
     KernelTraits mKernelTraits{};
+    // Whether the load task A uses a FineGrained pipeline.
+    bool mFineGrainedConsumerA{false};
+    // Whether the load task B uses a FineGrained pipeline.
+    bool mFineGrainedConsumerB{false};
+    // Whether the kernel forces the output to be valid values (not -0.0 for FP and NAN for UE8m0).
+    bool mFineGrainedForceValid{false};
+    // Whether the kernel is a FineGrained producer (invalidates output buffer prior to writing
+    // results).
+    bool mFineGrainedProducer{false};
     // Layout of A matrix
     MatrixLayout mLayoutA{MatrixLayout::MajorK};
     // Layout of B matrix
@@ -669,6 +683,10 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
     }
     ss << "mKernelTraits={}"
        << "," << std::endl;
+    ss << "mFineGrainedConsumerA=" << options.mFineGrainedConsumerA << "," << std::endl;
+    ss << "mFineGrainedConsumerB=" << options.mFineGrainedConsumerB << "," << std::endl;
+    ss << "mFineGrainedForceValid=" << options.mFineGrainedForceValid << "," << std::endl;
+    ss << "mFineGrainedProducer=" << options.mFineGrainedProducer << "," << std::endl;
     ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")"
        << "," << std::endl;
     ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")"
@@ -930,12 +948,13 @@ inline bool checkAndUpdateGemmOptions(
             options.mValidM, " validN=", options.mValidN, " validK=", options.mValidK);
     }
 
-#ifdef TLLM_PUBLIC_RELEASE
+#ifndef TLLM_GEN_EXPORT_INTERFACE
+    // JIT compilation from public sources does not support E2m1 x E4m3; prebuilt cubins do.
     if (options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeMmaA == tg::Dtype::E4m3)
     {
         TLLM_CHECK_ERROR(false, "E2m1 x E4m3 is not supported for JIT compile. Use cubins instead.");
     }
-#endif // TLLM_PUBLIC_RELEASE
+#endif // TLLM_GEN_EXPORT_INTERFACE
 
     // Check that the A cast is supported.
     // Currently, we only support {MxFp4, NvFp4, MxInt4} -> Bf16.
@@ -963,9 +982,7 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(options.mDtypeA == tg::Dtype::MxE2m1 && options.mDtypeMmaA == tg::Dtype::Bfloat16,
             "PatchF2fp is only supported for MxFp4 to Bf16 casts.");
     }
-#ifdef TLLM_PUBLIC_RELEASE
     options.mPatchF2fp = false;
-#endif // TLLM_PUBLIC_RELEASE
 
     // FIXME: We do not support different dtypes for A and B when not on Blackwell.
     if (!isBlackwell)
@@ -1164,6 +1181,9 @@ inline bool checkAndUpdateGemmOptions(
             "The sparsity information for one tile row must be a multiple of 16B. Use larger tileK.");
         TLLM_CHECK_ERROR(options.mDtypeA == options.mDtypeMmaA, "Sparsity is not supported with on-the-fly upcasting.");
         TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "Sparsity is not supported with DeepSeek Fp8.");
+        // Note: we could probably support FineGrained + sparsity, but it is not necessary if we use
+        // sparsity only for weights, and FineGrained for activations.
+        TLLM_CHECK_ERROR(!options.mFineGrainedConsumerA, "Sparsity is not supported with FineGrained consumer.");
     }
 
     if (options.mMmaKind == tg::MmaKind::Fp8Fp6Fp4)
@@ -2080,6 +2100,49 @@ inline bool checkAndUpdateGemmOptions(
             "TileN must be a multiple of EpilogueTileN * numEpilogueWrpGrps");
     }
 
+    if (options.mFineGrainedConsumerA)
+    {
+        // TODO This should be easy to enable, just need to modify the consumer arrival count.
+        TLLM_CHECK_ERROR(options.mDtypeA == options.mDtypeMmaA, "FineGrained pipeline does not support casting");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "FineGrained Consumer does not support DeepSeek FP8 format");
+        TLLM_CHECK_ERROR(padMultiplierA == 1,
+            "FineGrained consumer does not support bit padding for dtypeA=", tg::dtypeToString(options.mDtypeA));
+    }
+    if (options.mFineGrainedConsumerB)
+    {
+        TLLM_CHECK_ERROR(options.mDtypeB == options.mDtypeMmaB, "FineGrained pipeline does not support casting");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "FineGrained Consumer does not support DeepSeek FP8 format");
+        TLLM_CHECK_ERROR(padMultiplierB == 1,
+            "FineGrained consumer does not support bit padding for dtypeB=", tg::dtypeToString(options.mDtypeB));
+    }
+    if (options.mFineGrainedConsumerA || options.mFineGrainedConsumerB)
+    {
+        TLLM_CHECK_ERROR(
+            options.mUseTwoTmaLoadWarps, "Separate load warps must be used when FineGrained pipeline is enabled");
+
+        TLLM_CHECK_ERROR(!options.mGridWaitForPrimaryEarlyExit, "FineGrained consumer should not wait for primary");
+
+        // TODO Update the FineGrained pipeline to use CGA barriers. Note, the SplitK implementation
+        // does not use CGA barriers within the DMA pipelines, so that feature is enabled.
+        TLLM_CHECK_ERROR(options.mClusterDimX == 1 && options.mClusterDimY == 1,
+            "FineGrained pipeline does not support 2 CTA mode or features requiring CGA "
+            "barriers in DMA pipeline");
+    }
+    if (options.mFineGrainedForceValid)
+    {
+        TLLM_CHECK_ERROR(
+            options.mDtypeC != tg::Dtype::Fp32, "FineGrainedForceValid is not implemented for Fp32 output");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "FineGrainedForceValid is not implemented for DeepSeekFp8");
+    }
+    if (options.mFineGrainedProducer)
+    {
+        TLLM_CHECK_ERROR(options.mUseTmaStore, "FineGrained producer requires Tma store");
+        TLLM_CHECK_ERROR(options.mFineGrainedForceValid, "FineGrained producer should always force valid values");
+        TLLM_CHECK_ERROR(!options.mGridTriggerSecondaryA, "FineGrained producer cannot trigger secondary in A");
+        TLLM_CHECK_ERROR(!options.mGridTriggerSecondaryB, "FineGrained producer cannot trigger secondary in B");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "FineGrained producer is not implemented for DeepSeekFp8");
+    }
+
     if (updateOptions)
     {
         // Init kernel traits.
@@ -2148,8 +2211,8 @@ inline CUresult loadCubinData(CUmodule* module, Config const& config)
     // Trtllm links the cubin into the executable while Flashinfer loads the cubin from storage.
 #ifdef TLLM_GEN_EXPORT_FLASHINFER
 #ifdef TLLM_GEN_GEMM_CUBIN_PATH
-    static std::string const tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
-    std::string const sha256 = config.mHash ? config.mHash : "";
+    static const std::string tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
+    const std::string sha256 = config.mHash ? config.mHash : "";
     std::string fileName = config.mFunctionName;
     if (!fileName.empty())
     {

@@ -44,6 +44,7 @@ from ..attention_backend.sparse.hooks import get_sparse_mla_hooks
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph
 from ..utils import (
     AuxStreamType,
     Fp4QuantizedTensor,
@@ -111,24 +112,27 @@ def _extract_mla_extra_attrs(layer_idx: str):
     return metadata, mla_layer
 
 
-def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> list[torch.Tensor]:
+def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> torch.Tensor:
     metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
-    return mla_layer._create_outputs(hidden_states, metadata)
+    outputs = mla_layer._create_outputs(hidden_states, metadata)
+    if len(outputs) != 1:
+        raise RuntimeError("MLA custom ops require exactly one output tensor.")
+    return outputs[0]
 
 
 @torch.library.custom_op("trtllm::create_mla_outputs", mutates_args=())
-def create_mla_outputs(hidden_states: torch.Tensor, layer_idx: str) -> list[torch.Tensor]:
+def create_mla_outputs(hidden_states: torch.Tensor, layer_idx: str) -> torch.Tensor:
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
 
 @create_mla_outputs.register_fake
-def _create_mla_outputs_fake(hidden_states, layer_idx):
+def _create_mla_outputs_fake(hidden_states: torch.Tensor, layer_idx: str) -> torch.Tensor:
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
 
 @torch.library.custom_op(
     "trtllm::mla_custom_op_inplace",
-    mutates_args=("output", "sparse_output", "sparse_output_sf"),
+    mutates_args=("output",),
 )
 def mla_custom_op_inplace(
     hidden_states: torch.Tensor,
@@ -136,8 +140,6 @@ def mla_custom_op_inplace(
     layer_idx: str,
     output: torch.Tensor,
     latent_cache_gen: Optional[torch.Tensor],
-    sparse_output: Optional[torch.Tensor],
-    sparse_output_sf: Optional[torch.Tensor],
     hidden_states_fp4: Optional[torch.Tensor] = None,
     hidden_states_sf: Optional[torch.Tensor] = None,
 ) -> None:
@@ -151,20 +153,16 @@ def mla_custom_op_inplace(
             scaling_factor=hidden_states_sf,
             unquantized_hidden_states=hidden_states,
         )
-    attn_output = [output]
-    if sparse_output is not None:
-        attn_output.append(sparse_output)
-    if sparse_output_sf is not None:
-        if sparse_output is None:
-            raise RuntimeError("sparse_output_sf requires sparse_output")
-        attn_output.append(sparse_output_sf)
     mla_layer.forward_impl(
         position_ids,
         hidden_states,
         metadata,
-        attn_output=attn_output,
+        attn_output=[output],
         latent_cache_gen=latent_cache_gen,
     )
+
+
+maybe_bcg_mla_custom_op_inplace = eager_on_graph(mla_custom_op_inplace)
 
 
 def fp8_block_scaling_bmm_out(
@@ -231,7 +229,8 @@ class MLA(nn.Module):
         o_lora_rank: int = 1024,
         fuse_qkv_a_proj: bool = True,
         rms_norm_eps: Optional[float] = None,
-    ):
+        flashinfer_mla_backend: Optional[str] = None,
+    ) -> None:
         """
         Initialize the MLA module.
 
@@ -262,6 +261,9 @@ class MLA(nn.Module):
             rms_norm_eps (Optional[float]): Override the RMSNorm epsilon from
                 the pretrained config. If neither source provides a value
                 (e.g. config.pretrained_config is None), falls back to 1e-6.
+            flashinfer_mla_backend (Optional[str]): Generation backend for the
+                FlashInfer/TRTLLM-Gen MLA dispatcher. ``None`` preserves the
+                attention backend default.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -314,6 +316,7 @@ class MLA(nn.Module):
             self.register_to_config = True
 
         config = config or ModelConfig()
+        self.kv_cache_dtype = config.extra_attrs.get("kv_cache_dtype", "auto")
         sparse_attn_cfg = config.sparse_attention_config
         sparse_params = (
             sparse_attn_cfg.to_sparse_params(
@@ -333,6 +336,18 @@ class MLA(nn.Module):
                 "Sparse MLA requires "
                 "fuse_qkv_a_proj=True; the separate q_a_proj layout is not "
                 "supported with sparse MLA."
+            )
+        if self.sparse_attn_hooks is not None and type(self)._apply_output_gate is not (
+            MLA._apply_output_gate
+        ):
+            # _apply_output_gate is defined against the dense output path, where
+            # attn_output[0] is o_proj's input. Sparse hooks own _create_outputs
+            # and _project_output, so the tensor's rank, shape and projection
+            # differ and the gate would not compose.
+            raise NotImplementedError(
+                f"{type(self).__name__} overrides _apply_output_gate, which is "
+                "only defined for the dense MLA output path; it cannot be "
+                "combined with sparse MLA hooks."
             )
 
         # Fold the residual-less q_a_layernorm -> q_b_proj NVFP4 input
@@ -558,7 +573,10 @@ class MLA(nn.Module):
             sparse_params=self.sparse_params,
             dtype=dtype,
             aux_stream=mqa_aux_stream,
-            rope_append=True,
+            rope_append=(self.sparse_attn_hooks is None or self.sparse_attn_hooks.mqa_rope_append),
+            kv_cache_dtype=self.kv_cache_dtype,
+            flashinfer_mla_backend=flashinfer_mla_backend,
+            skip_correction_threshold=config.skip_correction_threshold,
         )
         if self.mqa is None:
             raise RuntimeError("MLA requires a non-null MQA attention backend")
@@ -587,6 +605,7 @@ class MLA(nn.Module):
                 predicted_tokens_per_seq=self.predicted_tokens_per_seq,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 sparse_params=mha_sparse_params,
+                skip_correction_threshold=config.skip_correction_threshold,
             )
         else:
             self.mha = None
@@ -1416,14 +1435,14 @@ class MLA(nn.Module):
         cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
         cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
         fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q.device)
-        has_fp8_kv_cache = (
-            self.mqa.has_fp8_kv_cache if hasattr(self.mqa, "has_fp8_kv_cache") else False
+        use_fp8_mla = getattr(self.mqa, "has_fp8_kv_cache", False) or getattr(
+            self.mqa, "has_fp4_kv_cache", False
         )
 
         mla_bmm1_scale = None
         mla_bmm2_scale = None
         quant_q_buffer = None
-        if has_fp8_kv_cache:
+        if use_fp8_mla:
             mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=q.device)
             mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=q.device)
             quant_q_buffer = torch.empty(
@@ -1460,20 +1479,23 @@ class MLA(nn.Module):
                 else:
                     # Fused backend (TRTLLM): RoPE, latent-cache append and the
                     # trtllm-gen scheduler buffers are all produced in-kernel.
-                    self.mqa.mla_rope_generation(
-                        fused_q,
-                        q_pe,
-                        latent_cache,
-                        attn_metadata,
-                        cu_q_seqlens,
-                        cu_kv_seqlens,
-                        fmha_scheduler_counter,
-                        mla_bmm1_scale,
-                        mla_bmm2_scale,
-                        quant_q_buffer,
-                    )
+                    if self.kv_cache_dtype == "fp8_ds_mla":
+                        fused_q[..., self.kv_lora_rank :] = q_pe
+                    else:
+                        self.mqa.mla_rope_generation(
+                            fused_q,
+                            q_pe,
+                            latent_cache,
+                            attn_metadata,
+                            cu_q_seqlens,
+                            cu_kv_seqlens,
+                            fmha_scheduler_counter,
+                            mla_bmm1_scale,
+                            mla_bmm2_scale,
+                            quant_q_buffer,
+                        )
 
-            rope_stream = self.aux_stream if not has_fp8_kv_cache else None
+            rope_stream = self.aux_stream if not use_fp8_mla else None
             if self.k_b_proj_trans.dtype == torch.bfloat16:
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
                 q_nope_t = q_nope.transpose(0, 1)
@@ -1595,6 +1617,7 @@ class MLA(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
+        q_rope_applied = kwargs.pop("q_rope_applied", False)
 
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -1645,7 +1668,7 @@ class MLA(nn.Module):
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}."
                 )
 
-            if self.apply_rotary_emb:
+            if self.kv_cache_dtype == "fp8_ds_mla" or self.apply_rotary_emb or q_rope_applied:
                 fused_q[..., self.kv_lora_rank :] = q_pe
             fused_q = fused_q.view(
                 [
@@ -1723,37 +1746,48 @@ class MLA(nn.Module):
             return
 
         output = attn_output[0]
-        sparse_output = None
-        sparse_output_sf = None
-        if len(attn_output) > 3:
-            raise RuntimeError("MLA output hooks may return at most two sparse output buffers.")
-        if len(attn_output) > 1:
-            sparse_output = attn_output[1]
-        if len(attn_output) > 2:
-            sparse_output_sf = attn_output[2]
+        if len(attn_output) != 1:
+            raise RuntimeError("MLA custom ops require exactly one output tensor.")
 
         if isinstance(hidden_states, Fp4QuantizedTensor):
-            torch.ops.trtllm.mla_custom_op_inplace(
+            maybe_bcg_mla_custom_op_inplace(
                 hidden_states.unquantized_hidden_states,
                 position_ids,
                 self.layer_idx_str,
                 output,
                 latent_cache_gen,
-                sparse_output,
-                sparse_output_sf,
                 hidden_states.fp4_tensor,
                 hidden_states.scaling_factor,
             )
         else:
-            torch.ops.trtllm.mla_custom_op_inplace(
+            maybe_bcg_mla_custom_op_inplace(
                 hidden_states,
                 position_ids,
                 self.layer_idx_str,
                 output,
                 latent_cache_gen,
-                sparse_output,
-                sparse_output_sf,
             )
+
+    def _apply_output_gate(
+        self,
+        hidden_states: torch.Tensor,
+        attn_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Transform the attention output before the output projection.
+
+        ``attn_output`` is the row-parallel ``o_proj``'s input and
+        ``hidden_states`` is the unquantized module input, so an override that
+        derives a gate from ``hidden_states`` must match ``o_proj``'s input
+        sharding. Runs on both the ``register_to_config`` and eager branches,
+        and ahead of the helix-CP reduce-scatter.
+
+        Dense output path only: ``__init__`` rejects an override combined with
+        sparse MLA hooks, which replace ``o_proj`` and may hand
+        ``attn_output[0]`` on in a different rank and layout.
+
+        The base is the identity.
+        """
+        return attn_output
 
     def _project_output(
         self,
@@ -1808,17 +1842,20 @@ class MLA(nn.Module):
             hidden_states, attn_metadata, self.mapping, self.layer_idx
         )
 
-        if self.register_to_config:
-            output_hidden_states = hidden_states
-            if isinstance(hidden_states, Fp4QuantizedTensor):
-                assert hidden_states.unquantized_hidden_states is not None, (
-                    "MLA.forward received an Fp4QuantizedTensor without a "
-                    "unquantized_hidden_states view"
-                )
-                output_hidden_states = hidden_states.unquantized_hidden_states
-            attn_output = torch.ops.trtllm.create_mla_outputs(
-                output_hidden_states, self.layer_idx_str
+        # Unquantized view of the module input, used by create_mla_outputs and
+        # by _apply_output_gate.
+        output_hidden_states = hidden_states
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            assert hidden_states.unquantized_hidden_states is not None, (
+                "MLA.forward received an Fp4QuantizedTensor without a "
+                "unquantized_hidden_states view"
             )
+            output_hidden_states = hidden_states.unquantized_hidden_states
+
+        if self.register_to_config:
+            attn_output = [
+                torch.ops.trtllm.create_mla_outputs(output_hidden_states, self.layer_idx_str)
+            ]
             self._forward_custom_op(
                 hidden_states,
                 position_ids,
@@ -1835,6 +1872,7 @@ class MLA(nn.Module):
                 latent_cache_gen=latent_cache_gen,
             )
 
+        attn_output[0] = self._apply_output_gate(output_hidden_states, attn_output[0])
         return self._project_output(attn_output, position_ids, attn_metadata, all_reduce_params)
 
     def resmooth_parameters(self, module_weight, module_weight_scale, recipe=(1, 128, 128)):

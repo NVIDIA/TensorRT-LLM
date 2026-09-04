@@ -426,20 +426,37 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             "update_kv_cache_draft_token_location_2d requires uniform num_kv_heads across all layers, "
             f"but got {cache_mgr.num_kv_heads_per_layer}"
         )
+        assert len(set(cache_mgr.max_attention_window_vec)) == 1, (
+            "update_kv_cache_draft_token_location_2d requires uniform "
+            "attention windows across all local layers, but got "
+            f"{cache_mgr.max_attention_window_vec}"
+        )
+        max_attention_window = cache_mgr.max_attention_window_vec[0]
+        if max_attention_window is None:
+            max_attention_window = cache_mgr.max_seq_len
+        local_pool_ids = {
+            int(cache_mgr.kv_cache_pool_mapping[layer_idx][0])
+            for layer_idx in range(cache_mgr.num_local_layers)
+        }
+        assert len(local_pool_ids) == 1, (
+            "update_kv_cache_draft_token_location_2d requires all local "
+            f"layers in one KV pool, got pools {sorted(local_pool_ids)}"
+        )
+        pool_idx = local_pool_ids.pop()
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d(
             self._accepted_draft_indices_tensor[:batch_size],
             self._num_accepted_tokens_buf[:batch_size],
             attn_metadata.kv_lens_cuda[:batch_size],
             True,
-            cache_mgr.num_layers,
+            cache_mgr.num_local_layers,
             # Use TP-sharded num_kv_heads (per-rank) instead of the unsharded
             # total so the C++ kernel computes correct strides and grid dims.
             cache_mgr.num_kv_heads_per_layer[0],
             self._kv_head_dim_bytes,
             cache_mgr.max_total_draft_tokens,
-            cache_mgr.max_attention_window_vec[0],
-            cache_mgr.kv_cache_pool_pointers,
-            attn_metadata.kv_cache_block_offsets,
+            max_attention_window,
+            cache_mgr.kv_cache_pool_pointers[pool_idx],
+            attn_metadata.kv_cache_block_offsets[pool_idx],
             cache_mgr.max_blocks_per_seq,
             cache_mgr.tokens_per_block,
             None,
@@ -766,19 +783,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         num_flat_tokens = logits.shape[0]
         if not spec_metadata.is_all_greedy_sample:
             # Non-greedy: sample target tokens with per-request temperature/top_k/top_p.
-            # Lazily initialize RNG tensors for CUDA graph compatibility.
-            if self.seed is None:
-                self.seed = torch.tensor([0], dtype=torch.int64, device=logits.device)
-                self.offset = torch.tensor([0], dtype=torch.int64, device=logits.device)
-            self.seed.add_(1).remainder_(2**31)
             top_ks = spec_metadata.top_ks[:num_flat_tokens]
+            seed, offset = self._rng_state_per_token(spec_metadata, num_flat_tokens)
             sampled = sample_from_logits_op(
                 logits,
                 spec_metadata.temperatures[:num_flat_tokens],
                 top_ks,
                 spec_metadata.top_ps[:num_flat_tokens],
-                seed=self.seed,
-                offset=self.offset,
+                seed=seed,
+                offset=offset,
             )
             self._target_tokens_buf[:num_flat_tokens].copy_(sampled)
         else:
@@ -862,7 +875,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         N = self.tokens_per_gen_step
         max_path_len = self._max_path_len
         vocab_size = logits.shape[-1]
-        device = logits.device
 
         # Reset output buffers
         self._accepted_tokens_buf[:batch_size].zero_()
@@ -871,22 +883,17 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         num_accepted_tokens = self._num_accepted_tokens_buf[:batch_size]
         self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
 
-        # Lazily initialize RNG tensors (needed by rejection kernel).
-        if self.seed is None:
-            self.seed = torch.tensor([0], dtype=torch.int64, device=device)
-            self.offset = torch.tensor([0], dtype=torch.int64, device=device)
-        self.seed.add_(1).remainder_(2**31)
-
         # Context tokens bypass the rejection kernel — sample them directly.
         if num_contexts > 0:
             top_ks_ctx = spec_metadata.top_ks[:num_contexts]
+            seed_ctx, offset_ctx = self._rng_state_per_token(spec_metadata, num_contexts)
             sampled_ctx = sample_from_logits_op(
                 logits[:num_contexts],
                 spec_metadata.temperatures[:num_contexts],
                 top_ks_ctx,
                 spec_metadata.top_ps[:num_contexts],
-                seed=self.seed,
-                offset=self.offset,
+                seed=seed_ctx,
+                offset=offset_ctx,
             )
             accepted_tokens[:num_contexts, 0].copy_(sampled_ctx)
 
@@ -909,6 +916,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             temps = spec_metadata.request_temperatures[gen_slice]
             top_ks_rej = spec_metadata.request_top_ks[gen_slice]
             top_ps_rej = spec_metadata.request_top_ps[gen_slice]
+            seed_rej, offset_rej = self._rng_state_per_request(
+                spec_metadata, num_contexts, num_contexts + num_gens
+            )
 
             slot_storage = spec_tree_manager.slot_storage
             gen_slot_ids = slot_storage.all_ids_buf[num_contexts : num_contexts + num_gens]
@@ -930,8 +940,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     top_ps_rej,
                     num_gens,
                     self._max_path_len,
-                    seed=self.seed,
-                    offset=self.offset,
+                    seed=seed_rej,
+                    offset=offset_rej,
                 )
             )
 
