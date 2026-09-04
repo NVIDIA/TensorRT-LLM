@@ -124,14 +124,16 @@ _FMHA_CACHE_SANITY_CHECK_ENV = "TRTLLM_FMHA_CACHE_SANITY_CHECK"
 
 
 class _FmhaCacheKey(NamedTuple):
+    """Inputs that may vary between requests and change FMHA selection.
+
+    Values invariant for a model or layer within one LLM instance must be excluded.
+    """
+
     context_batch_size: int
     generation_batch_size: int
     generation_seq_len_q: int
     attention_mask_type: AttentionMaskType
     use_spec_decoding: bool
-    is_cuda_graph: bool
-    is_fused_qkv: bool
-    update_kv_cache: bool
     # LoRA can change the effective output from packed NVFP4 to unpacked BF16
     # without changing the request shape. Keep those selection regimes apart.
     output_dtype: torch.dtype | None
@@ -370,9 +372,6 @@ class FmhaManager:
             generation_seq_len_q=generation_seq_len_q,
             attention_mask_type=attention_mask_type,
             use_spec_decoding=metadata.use_spec_decoding,
-            is_cuda_graph=metadata.is_cuda_graph,
-            is_fused_qkv=forward_args.is_fused_qkv,
-            update_kv_cache=forward_args.update_kv_cache,
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,
         )
