@@ -50,6 +50,43 @@ std::tuple<at::Tensor, int64_t> allocateOutputOp(at::Tensor const& like, int64_t
     return {tensor, static_cast<int64_t>(actual_kind)};
 }
 
+std::tuple<at::Tensor, int64_t, int64_t> allocateOutputWithNcclWindowOp(at::Tensor const& like,
+    int64_t output_buffer_kind, c10::optional<torch::List<int64_t>> group, c10::optional<at::IntArrayRef> shape,
+    c10::optional<at::ScalarType> out_dtype)
+{
+    auto const outShape = (shape.has_value() && !shape->empty())
+        ? std::vector<int64_t>(shape->begin(), shape->end())
+        : std::vector<int64_t>(like.sizes().begin(), like.sizes().end());
+    auto const dtype = out_dtype.value_or(like.scalar_type());
+#if ENABLE_MULTI_DEVICE
+    if (static_cast<BufferKind>(output_buffer_kind) == BufferKind::NcclWindow && group.has_value() && group->size() > 0)
+    {
+        std::set<int> groupSet;
+        for (auto const& rank : *group)
+            groupSet.insert(static_cast<int>(rank));
+        try
+        {
+            auto commPtr = getComm(groupSet);
+            if (commPtr && *commPtr != nullptr)
+            {
+                auto [tensor, buffer]
+                    = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(commPtr, outShape, dtype);
+                if (tensor.defined() && buffer.isValid())
+                    return {tensor, static_cast<int64_t>(BufferKind::NcclWindow),
+                        static_cast<int64_t>(reinterpret_cast<uintptr_t>(buffer.window))};
+            }
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_DEBUG("[allocate_output_with_nccl_window] NCCL window alloc failed: %s", e.what());
+        }
+    }
+#endif
+    auto const [tensor, actualKind]
+        = allocate_output(outShape, dtype, like.device(), static_cast<BufferKind>(output_buffer_kind), group);
+    return {tensor, static_cast<int64_t>(actualKind), 0};
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -59,9 +96,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "allocate_output(Tensor like, int output_buffer_kind, int[]? group, "
         "int[]? shape=None, ScalarType? out_dtype=None) -> (Tensor, int)");
+    m.def(
+        "allocate_output_with_nccl_window(Tensor like, int output_buffer_kind, int[]? group, int[]? shape=None, "
+        "ScalarType? out_dtype=None) -> (Tensor, int, int)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("allocate_output", &tensorrt_llm::torch_ext::allocateOutputOp);
+    m.impl("allocate_output_with_nccl_window", &tensorrt_llm::torch_ext::allocateOutputWithNcclWindowOp);
 }
