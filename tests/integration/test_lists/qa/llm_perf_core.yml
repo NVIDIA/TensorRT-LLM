@@ -8,7 +8,7 @@ llm_perf_core:
 # 3: H100, H20 test cases
 # 4: H100, H20, GB200, B200, B300, GB300, RTX6000-Server test cases
 # 5: GB200, B200, B300, GB300, RTX6000-Server test cases
-# 6: B200, GB200, B300, GB300 test cases
+# 6: B200, GB200, B300, GB300, VR200 test cases
 # 7: B200, B300 test cases
 # 8: B300 test cases
 # 9: H100, H20, B200, B300, RTX6000-Server test cases
@@ -80,13 +80,19 @@ llm_perf_core:
 
 # 4: H100, H20, GB200, B200, B300, GB300, RTX6000-Server test cases
 - condition:
+    terms:
+      compute_capability:
+      - 9.0
+      - 10.0
+      - 10.3
+      - 12.0
     ranges:
       system_gpu_count:
         gte: 2
-      compute_capability:
-        gte: 9.0
-        lte: 12.0
   tests:
+  # compute_capability is a list, not a range: a range from Hopper to
+  # RTX-6000-Server (12.0) also spans Rubin (10.7), and these cases have not been
+  # run there. A new architecture opts in by being added to the list.
   - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-input_output_len:512,512]
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp8-bench-pytorch-float8-input_output_len:1000,2000-con:256-ep:8-gpus:8]
   #nemotron_nano_12b_v2
@@ -117,25 +123,32 @@ llm_perf_core:
 
 # 5: GB200, B200, B300, GB300, RTX6000-Server test cases
 - condition:
+    terms:
+      compute_capability:
+      - 10.0
+      - 10.3
+      - 12.0
     ranges:
       system_gpu_count:
         gte: 4
-      compute_capability:
-        gte: 10.0
-        lte: 12.0
   tests:
+  # compute_capability is a list, not a range: a range from Hopper to
+  # RTX-6000-Server (12.0) also spans Rubin (10.7), and these cases have not been
+  # run there. A new architecture opts in by being added to the list.
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:512-ep:4-gpus:4]
 
 
-# 6: B200, GB200, B300, GB300 test cases
+# 6: B200, GB200, B300, GB300, VR200 test cases
 - condition:
     ranges:
       system_gpu_count:
         gte: 4
       compute_capability:
         gte: 10.0
-        lte: 10.3
+        lte: 10.7
   tests:
+  # Upper bound is 10.7 so Rubin shares this set: a VR200 NVL72 node exposes 4 GPUs,
+  # the same shape these cases are sized for, so it runs them rather than a copy.
   #qwen3.5_27b (dense BF16 52G, 1-GPU): maxbs 512 mamba states need >95G
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:128,128]
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:500,2000]
