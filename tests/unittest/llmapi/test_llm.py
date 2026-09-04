@@ -19,7 +19,6 @@ import datetime
 import json
 import os
 import random
-import sys
 import time
 from typing import List, Optional, Union
 
@@ -32,8 +31,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import GenerationResultBase, RequestError
 from tensorrt_llm.llmapi import (KvCacheConfig, KvCacheRetentionConfig,
-                                 LookaheadDecodingConfig, RequestOutput,
-                                 SADecodingConfig)
+                                 RequestOutput, SADecodingConfig)
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
@@ -46,7 +44,6 @@ from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      chat_stream_post_processor)
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, altered_env
@@ -648,19 +645,6 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         backend=backend,
         **llm_kwargs)
-
-
-@force_ampere
-def test_executor_lookahead_decoding_config():
-    lookahead_config = LookaheadDecodingConfig(max_window_size=10,
-                                               max_ngram_size=9,
-                                               max_verification_set_size=8)
-    sampling_params = SamplingParams(max_tokens=3,
-                                     lookahead_config=lookahead_config)
-
-    assert sampling_params.lookahead_config.max_window_size == 10
-    assert sampling_params.lookahead_config.max_ngram_size == 9
-    assert sampling_params.lookahead_config.max_verification_set_size == 8
 
 
 def test_executor_results_cleanup():

@@ -7,8 +7,6 @@ Algorithms register typed module adapters from
 subclass directly.
 """
 
-from __future__ import annotations
-
 from abc import ABC, abstractmethod
 from dataclasses import replace
 from importlib import import_module
@@ -143,6 +141,7 @@ _MLA_HOOK_MODULE_PATHS = {
     "deepseek_v4": ".deepseek_v4.module",
 }
 _ATTENTION_HOOK_MODULE_PATHS = {
+    "qsa": ".qsa.module",
     "rocket": ".rocket.module",
 }
 _MLA_HOOKS: dict[str, type[MLASparseHooks]] = {}

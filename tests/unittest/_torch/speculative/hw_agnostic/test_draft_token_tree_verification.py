@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 
 import torch
@@ -11,8 +9,6 @@ from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def run_test(

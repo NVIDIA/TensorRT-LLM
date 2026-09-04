@@ -15,7 +15,6 @@
 
 import json
 import os
-import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -36,12 +35,15 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
-from tensorrt_llm._torch.pyexecutor._util import \
-    _derive_draft_max_attention_window
+from tensorrt_llm._torch.pyexecutor._util import (
+    _derive_draft_max_attention_window,
+    _expand_attention_window_pattern_to_global_layers)
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     _extend_full_attention_windows_for_spec_decode
 from tensorrt_llm._torch.speculative.eagle3 import (Eagle3OneModelSpecMetadata,
                                                     MTPEagleWorker)
+from tensorrt_llm._torch.speculative.eagle3_dynamic_tree import \
+    Eagle3OneModelDynamicTreeWorker
 from tensorrt_llm._torch.speculative.interface import \
     INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.mtp_dynamic_tree import \
@@ -49,8 +51,6 @@ from tensorrt_llm._torch.speculative.mtp_dynamic_tree import \
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig)
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
@@ -188,6 +188,77 @@ def test_mtp_dynamic_tree_relocation_uses_full_attention_window(
     assert args[10] is attention_block_offsets
 
 
+def test_eagle3_dynamic_tree_relocation_uses_local_cache_shape(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = object.__new__(Eagle3OneModelDynamicTreeWorker)
+    worker._kv_head_dim_bytes = 256
+    worker._accepted_draft_indices_tensor = torch.tensor([[0, 1], [2, -1]],
+                                                         dtype=torch.int32)
+    worker._num_accepted_tokens_buf = torch.tensor([2, 1], dtype=torch.int32)
+
+    local_pool_pointers = object()
+    local_block_offsets = object()
+    cache_manager = SimpleNamespace(
+        num_layers=8,
+        num_local_layers=2,
+        num_kv_heads_per_layer=[8, 8],
+        max_attention_window_vec=[None, None],
+        max_seq_len=8192,
+        max_total_draft_tokens=31,
+        max_blocks_per_seq=256,
+        tokens_per_block=32,
+        kv_cache_pool_mapping=[[1, 0], [1, 1]],
+        kv_cache_pool_pointers=[object(), local_pool_pointers],
+    )
+    attention_metadata = SimpleNamespace(
+        kv_cache_manager=cache_manager,
+        kv_lens_cuda=torch.tensor([128, 256], dtype=torch.int32),
+        kv_cache_block_offsets=[object(), local_block_offsets],
+    )
+    update_op = MagicMock()
+    monkeypatch.setattr(
+        torch.ops.tensorrt_llm,
+        "update_kv_cache_draft_token_location_2d",
+        update_op,
+        raising=False,
+    )
+
+    worker._relocate_kv_eagerly(attention_metadata, batch_size=2)
+
+    update_op.assert_called_once()
+    (
+        accepted_draft_indices,
+        num_accepted_tokens,
+        past_key_value_lengths,
+        use_paged_kv_cache,
+        layer_count,
+        num_kv_heads,
+        head_size_in_bytes,
+        rewind_draft_token_count,
+        max_kv_cache_len,
+        pool_pointers,
+        block_offsets,
+        max_blocks_per_seq,
+        tokens_per_block,
+        stream,
+    ) = update_op.call_args.args
+    assert torch.equal(accepted_draft_indices,
+                       worker._accepted_draft_indices_tensor)
+    assert torch.equal(num_accepted_tokens, worker._num_accepted_tokens_buf)
+    assert torch.equal(past_key_value_lengths, attention_metadata.kv_lens_cuda)
+    assert use_paged_kv_cache is True
+    assert layer_count == cache_manager.num_local_layers
+    assert num_kv_heads == 8
+    assert head_size_in_bytes == worker._kv_head_dim_bytes
+    assert rewind_draft_token_count == cache_manager.max_total_draft_tokens
+    assert max_kv_cache_len == cache_manager.max_seq_len
+    assert pool_pointers is local_pool_pointers
+    assert block_offsets is local_block_offsets
+    assert max_blocks_per_seq == cache_manager.max_blocks_per_seq
+    assert tokens_per_block == cache_manager.tokens_per_block
+    assert stream is None
+
+
 def test_eagle3_draft_kv_cache_uses_full_window_when_draft_has_no_swa() -> None:
     kv_cache_config = KvCacheConfig(max_attention_window=[128, 131072])
     draft_pretrained_config = SimpleNamespace(num_hidden_layers=3)
@@ -202,7 +273,7 @@ def test_eagle3_draft_kv_cache_uses_full_window_when_draft_has_no_swa() -> None:
     assert max_attention_window is None
 
 
-def test_eagle3_draft_kv_cache_uses_draft_layer_types_for_swa() -> None:
+def test_eagle3_draft_kv_cache_expands_swa_in_global_layer_order() -> None:
     kv_cache_config = KvCacheConfig(max_attention_window=[128, 131072])
     draft_pretrained_config = SimpleNamespace(
         sliding_window=512,
@@ -216,7 +287,14 @@ def test_eagle3_draft_kv_cache_uses_draft_layer_types_for_swa() -> None:
         num_draft_layers=3,
     )
 
-    assert max_attention_window == [512, 4096, 512]
+    global_windows = _expand_attention_window_pattern_to_global_layers(
+        max_attention_window=max_attention_window,
+        layer_mask=[False, False, False, False, False, True, True, True],
+    )
+
+    # Slots 0-4 are inactive fillers; physical draft layers 5-7 preserve the
+    # derived sliding/full/sliding pattern.
+    assert global_windows == [512, 512, 512, 512, 512, 512, 4096, 512]
 
 
 def test_eagle3_draft_kv_cache_rejects_multiple_sliding_window_sizes() -> None:
