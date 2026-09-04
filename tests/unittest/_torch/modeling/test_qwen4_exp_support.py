@@ -433,7 +433,9 @@ def test_ple_cache_layout_excludes_separate_mtp_draft() -> None:
 def test_v2_cache_estimator_counts_ple_lifecycle_state() -> None:
     from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
     from tensorrt_llm._torch.pyexecutor.config_utils import extract_qwen4_exp_ple_cache_params
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        MambaHybridCacheManagerV2,
+    )
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
 
@@ -463,7 +465,7 @@ def test_v2_cache_estimator_counts_ple_lifecycle_state() -> None:
 
 
 def test_ple_states_use_v2_lifecycle_buffers(monkeypatch) -> None:
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
         MambaHybridCacheManagerV2,
         MambaRole,
     )
