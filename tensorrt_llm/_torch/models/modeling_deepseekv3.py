@@ -1212,13 +1212,22 @@ class Deepseekv3MoE(nn.Module):
             routed_output = _compute_routed_output()
 
         if defer_shared_routed_add:
-            assert do_finalize
-            assert self.use_dp and self.allreduce is None
-            assert isinstance(shared_output, torch.Tensor)
-            assert isinstance(routed_output, torch.Tensor)
-            assert shared_output.dim() == 2 and routed_output.dim() == 2
-            assert shared_output.size() == routed_output.size()
-            return shared_output, routed_output
+            can_defer = (do_finalize and self.use_dp and self.allreduce is None
+                         and isinstance(shared_output, torch.Tensor)
+                         and isinstance(routed_output, torch.Tensor)
+                         and shared_output.is_cuda and routed_output.is_cuda
+                         and shared_output.device == hidden_states.device
+                         and routed_output.device == hidden_states.device
+                         and shared_output.dim() == 2
+                         and routed_output.dim() == 2
+                         and shared_output.shape == hidden_states.shape
+                         and routed_output.shape == hidden_states.shape
+                         and shared_output.dtype == torch.bfloat16
+                         and routed_output.dtype == torch.bfloat16
+                         and shared_output.is_contiguous()
+                         and routed_output.is_contiguous())
+            if can_defer:
+                return shared_output, routed_output
 
         if not do_finalize:
             return [shared_output, *routed_output]
@@ -1615,7 +1624,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             defer_shared_routed_add=defer_shared_routed_add,
         )
 
-        if defer_shared_routed_add:
+        if defer_shared_routed_add and isinstance(hidden_states, tuple):
             shared_output, routed_output = hidden_states
             return self.next_layer_layernorm.forward_with_additional_residual(
                 shared_output, routed_output, residual)
