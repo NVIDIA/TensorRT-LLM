@@ -192,9 +192,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
-        self.enable_ragged_verification = bool(
-            kwargs.pop("enable_ragged_verification", False)
-        )
+        self.enable_ragged_verification = bool(kwargs.pop("enable_ragged_verification", False))
         sparse_attention_config = kwargs.pop("sparse_attention_config", None)
         if (
             kwargs.get("sparse_metadata_params") is None
@@ -1672,7 +1670,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         assert num_rows <= self.row_kv_lens_cuda.shape[0]
         self._ragged_num_rows = num_rows
         self.row_kv_lens_host[:num_rows].copy_(torch.tensor(rows, dtype=torch.int32))
-        self.row_kv_lens_cuda[:num_rows].copy_(self.row_kv_lens_host[:num_rows], non_blocking=True)
         self.row_kv_correction_host[:num_rows].copy_(torch.tensor(corrections, dtype=torch.int32))
         self.row_req_idx_host[:num_rows].copy_(torch.tensor(request_indices, dtype=torch.long))
         self.row_kv_correction_cuda[:num_rows].copy_(
@@ -1736,9 +1733,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.attn_row_request_types_host[:num_contexts].zero_()
         self.attn_row_request_types_host[num_contexts:num_rows].fill_(1)
 
-        self.attn_row_kv_lens_cuda[:num_rows].copy_(
-            self.attn_row_kv_lens_host[:num_rows], non_blocking=True
-        )
         self.attn_row_kv_correction_cuda[:num_rows].copy_(
             self.attn_row_kv_correction_host[:num_rows], non_blocking=True
         )

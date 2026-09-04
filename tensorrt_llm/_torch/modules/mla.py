@@ -1438,9 +1438,13 @@ class MLA(nn.Module):
         # count of presented rows, which equals num_seqs only while every
         # request contributes the same number of query tokens. Under the
         # token-major presentation a row is a token, so size these by the token
-        # count -- which is also an upper bound on num_seqs on every other path,
-        # so this is safe rather than merely sufficient.
-        cu_seqlens_rows = max(num_seqs, num_tokens) + 1
+        # count. Uniform verification keeps the established request-major
+        # allocation rather than scaling these temporary buffers by K.
+        cu_seqlens_rows = (
+            max(num_seqs, num_tokens) + 1
+            if getattr(attn_metadata, "is_ragged_verify", False)
+            else num_seqs + 1
+        )
         cu_q_seqlens = torch.empty(cu_seqlens_rows, dtype=torch.int32, device=q.device)
         cu_kv_seqlens = torch.empty(cu_seqlens_rows, dtype=torch.int32, device=q.device)
         fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q.device)
