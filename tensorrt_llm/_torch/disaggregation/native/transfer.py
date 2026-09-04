@@ -1938,7 +1938,8 @@ class TxSession(TxSessionBase):
                 SessionStatus.FULLY_TRANSFERRED,
             )
         return logically_completed and (
-            not self._enforce_physical_ownership or self.resources_drained()
+            not getattr(self, "_enforce_physical_ownership", False)
+            or self.resources_drained()
         )
 
     def has_failed(self) -> bool:
@@ -1950,7 +1951,7 @@ class TxSession(TxSessionBase):
         return self.aux_task is not None and self.aux_task.status == TaskStatus.ERROR
 
     def resources_drained(self) -> bool:
-        if not self._enforce_physical_ownership:
+        if not getattr(self, "_enforce_physical_ownership", False):
             return not any(task.status == TaskStatus.TRANSFERRING for task in self.kv_tasks)
         tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
         return all(task.resources_drained for task in tasks)
@@ -1958,7 +1959,8 @@ class TxSession(TxSessionBase):
     def _failed_wait_result(self) -> Optional[WaitResult]:
         return (
             None
-            if self._enforce_physical_ownership and not self.resources_drained()
+            if getattr(self, "_enforce_physical_ownership", False)
+            and not self.resources_drained()
             else WaitResult.FAILED
         )
 
@@ -2120,7 +2122,10 @@ class TxSession(TxSessionBase):
         with self.lock:
             if self._closed:
                 return True
-            if self._enforce_physical_ownership and not self.resources_drained():
+            if (
+                getattr(self, "_enforce_physical_ownership", False)
+                and not self.resources_drained()
+            ):
                 return False
             self._closed = True
         if self._aux_buffer is not None and self.aux_slot is not None:
