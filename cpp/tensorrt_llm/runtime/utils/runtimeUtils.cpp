@@ -17,9 +17,11 @@
 #include "runtimeUtils.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 #include <cassert>
 #include <cstddef>
+#include <fstream>
 
 namespace tensorrt_llm::runtime::utils
 {
