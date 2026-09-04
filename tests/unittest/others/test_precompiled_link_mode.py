@@ -151,6 +151,30 @@ def test_link_mode_rejects_a_wheel(extract_from_precompiled, build_tree, tmp_pat
         _run(extract_from_precompiled, wheel, tmp_path, link=True)
 
 
+def test_wheel_extracts_embedded_nccl_ep(extract_from_precompiled, tmp_path, monkeypatch):
+    """Wheel inputs stage NCCL-EP below 3rdparty for repackaging."""
+    import zipfile
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    monkeypatch.chdir(checkout)
+    (checkout / "3rdparty" / "nccl_extensions").mkdir(parents=True)
+    (checkout / "3rdparty" / "nccl_extensions" / "stale").write_text("stale")
+    wheel = tmp_path / "tensorrt_llm-0.0.0.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("fmha_sm100/__init__.py", "")
+        archive.writestr("nccl/ep/__init__.py", "")
+        archive.writestr("nccl/ep/lib/libnccl_ep.so", "ep")
+        archive.writestr("nccl/_extensions/bindings/binding.so", "binding")
+
+    _run(extract_from_precompiled, wheel, tmp_path, link=False)
+
+    package_root = checkout / "3rdparty" / "nccl_extensions"
+    assert not (package_root / "stale").exists()
+    assert (package_root / "nccl" / "ep" / "lib" / "libnccl_ep.so").read_text() == "ep"
+    assert (package_root / "nccl" / "_extensions" / "bindings" / "binding.so").is_file()
+
+
 # --------------------------------------------------------------------------
 # Build-skew warning
 # --------------------------------------------------------------------------
