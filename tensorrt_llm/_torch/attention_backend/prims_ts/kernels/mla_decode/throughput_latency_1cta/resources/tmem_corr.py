@@ -78,7 +78,7 @@ from ...helpers.ops import (
     vector_from_scalars,
 )
 from ...helpers.query import (
-    groups_tokens_heads_q_row_state,
+    flat_query_row_state,
     public_query_flat_row,
     split_o_element_offset,
 )
@@ -408,10 +408,10 @@ class TmemCorrResource(MlaResource):
                 cfg.num_heads_q
             ):
                 storage_flat_query_row, _, _, _, valid_output_row = (
-                    groups_tokens_heads_q_row_state(
+                    flat_query_row_state(
                         global_head_idx,
                         cta_idx_q,
-                        cfg.groups_tokens_heads_q_ratio,
+                        cfg.tile_size_q,
                         cfg.logical_num_heads_q,
                         cfg.logical_seq_len_q,
                         cu_seqlens_q=self.cu_seqlens_q,
@@ -508,10 +508,10 @@ class TmemCorrResource(MlaResource):
                 self.cfg.num_heads_q
             ):
                 storage_flat_query_row, _, _, _, valid_output_row = (
-                    groups_tokens_heads_q_row_state(
+                    flat_query_row_state(
                         head_idx,
                         cta_idx_q,
-                        self.cfg.groups_tokens_heads_q_ratio,
+                        self.cfg.tile_size_q,
                         self.cfg.logical_num_heads_q,
                         self.cfg.logical_seq_len_q,
                         cu_seqlens_q=self.cu_seqlens_q,
@@ -743,10 +743,10 @@ class TmemCorrResource(MlaResource):
                                 _,
                                 _,
                                 valid_output_row,
-                            ) = groups_tokens_heads_q_row_state(
+                            ) = flat_query_row_state(
                                 global_head_idx,
                                 cta_idx_q,
-                                cfg.groups_tokens_heads_q_ratio,
+                                cfg.tile_size_q,
                                 cfg.logical_num_heads_q,
                                 cfg.logical_seq_len_q,
                                 cu_seqlens_q=self.cu_seqlens_q,
@@ -1373,16 +1373,14 @@ class TmemCorrResource(MlaResource):
         # the row index; the upper lane bit selects the head-dim half.
         local_row_idx = warp_idx * Int32(16) + (lane_idx & Int32(0xF))
         global_head_idx = head_base_idx + local_row_idx
-        storage_flat_query_row, _, _, _, valid_output_row = (
-            groups_tokens_heads_q_row_state(
-                global_head_idx,
-                cta_idx_q,
-                cfg.groups_tokens_heads_q_ratio,
-                cfg.logical_num_heads_q,
-                cfg.logical_seq_len_q,
-                cu_seqlens_q=self.cu_seqlens_q,
-                batch_idx=batch_idx,
-            )
+        storage_flat_query_row, _, _, _, valid_output_row = flat_query_row_state(
+            global_head_idx,
+            cta_idx_q,
+            cfg.tile_size_q,
+            cfg.logical_num_heads_q,
+            cfg.logical_seq_len_q,
+            cu_seqlens_q=self.cu_seqlens_q,
+            batch_idx=batch_idx,
         )
         half_warp_col_offset = (lane_idx >> Int32(4)) * Int32(
             cfg.head_dim_per_stage_v // 2

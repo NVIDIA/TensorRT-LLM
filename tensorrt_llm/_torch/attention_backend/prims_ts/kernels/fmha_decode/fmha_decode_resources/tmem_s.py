@@ -76,12 +76,14 @@ from .helpers_common import (
     _mma_kind_for_qkv,
     _neg_max_f32,
     _softmax_scale_pair_width,
+    _swaps_routed_coordinate,
     _q_row_is_valid_for_seq,
     _q_row_token_and_local_head,
     _q_group_token_base,
     _softmax_tile_idx,
 )
 from .smem_block_sparse_metadata import (
+    _SOFTMAX_ROUTE_IS_PROXY_FLAG,
     _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG,
     _swaps_forwards_packed_route_full,
 )
@@ -116,7 +118,7 @@ def _swaps_uses_origin0_k32_full_guard(cfg: FmhaDecodeConfig) -> bool:
 
     return (
         cfg.kv_block_size >= 32
-        and not cfg.use_kv_valid_bits
+        and not cfg.uses_prepared_score_keep_words
         and not cfg.uses_uniform_causal_mask
         and not cfg.uses_per_row_causal_mask
     )
@@ -126,7 +128,7 @@ def _swaps_token_word_covers_kv_tail(cfg: FmhaDecodeConfig) -> bool:
     """Whether SWAP's prepared token word covers the logical KV tail."""
 
     return (
-        cfg.use_kv_valid_bits
+        cfg.uses_prepared_score_keep_words
         and not cfg.uses_uniform_causal_mask
         and not cfg.uses_per_row_causal_mask
     )
@@ -180,7 +182,7 @@ def _can_skip_sparse_keeps_structural_mask(
 
 
 @cute.jit
-def _sparse_k32_effective_keep_word(
+def _sparse_effective_keep_word(
     q_row_is_valid: Boolean,
     fragment_origin: Int32,
     fragment_valid: Int32,
@@ -1179,7 +1181,7 @@ class TmemSResource(DecodeGenResourceBase):
         valid0 = route_flags & Int32(1)
         valid1 = (route_flags >> Int32(1)) & Int32(1)
         route_token_mask_is_full = cutlass.Boolean(False)
-        if cutlass.const_expr(self.cfg.use_kv_valid_bits):
+        if cutlass.const_expr(self.cfg.uses_prepared_score_keep_words):
             route_token_mask_is_full = cutlass.Boolean(
                 (route_flags & Int32(_SOFTMAX_TOKEN_MASK_IS_FULL_FLAG)) != Int32(0)
             )
@@ -1192,7 +1194,7 @@ class TmemSResource(DecodeGenResourceBase):
         )
         for word_idx in cutlass.range_constexpr(num_local_words):
             local_token_words[word_idx] = Uint32(0xFFFFFFFF)
-        if cutlass.const_expr(self.cfg.use_kv_valid_bits):
+        if cutlass.const_expr(self.cfg.uses_prepared_score_keep_words):
             if not route_token_mask_is_full:
                 if cutlass.const_expr(self.cfg.tile_size_q == 128):
                     local_token_words[0] = Uint32(routed_token_word0)
@@ -1271,7 +1273,9 @@ class TmemSResource(DecodeGenResourceBase):
             + self._softmax_loop_stage_slot_offset(stage_info)
         )
         num_load_atoms = num_s_regs // 32
-        if cutlass.const_expr(cfg.tile_size_q == 64 and cfg.use_kv_valid_bits):
+        if cutlass.const_expr(
+            cfg.tile_size_q == 64 and cfg.uses_prepared_score_keep_words
+        ):
             token_mask_is_required = not route_token_mask_is_full
 
             # Keep each Q64 atom's load, wait, and mask together. A/B testing
@@ -1332,6 +1336,14 @@ class TmemSResource(DecodeGenResourceBase):
             causal_end,
             apply_causal_mask=cfg.mask_type == CAUSAL,
         )
+        if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+            route_is_proxy = cutlass.Boolean(
+                (routed_route_flags & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Int32(0)
+            )
+            if route_is_proxy and q_row_is_valid:
+                # Summary-row origins must not enter K/V-token tail predicates;
+                # prepared score words carry proxy validity.
+                can_skip_structural_mask = cutlass.Boolean(True)
         # This guard covers only route/Q/tail/causal structure. Q64 token
         # holes were applied while materializing its two LDTM atoms; Q128
         # applies them in the post-pass below.
@@ -1363,7 +1375,9 @@ class TmemSResource(DecodeGenResourceBase):
         # interleaving each load with mask control flow regresses its codegen.
         # The post-pass follows structural masking; the producer's runtime
         # route flag skips it only when all four current token words are full.
-        if cutlass.const_expr(cfg.tile_size_q == 128 and cfg.use_kv_valid_bits):
+        if cutlass.const_expr(
+            cfg.tile_size_q == 128 and cfg.uses_prepared_score_keep_words
+        ):
             token_mask_is_required = not route_token_mask_is_full
             if token_mask_is_required:
                 for word_idx in cutlass.range_constexpr(4):
@@ -1642,32 +1656,6 @@ class TmemSResource(DecodeGenResourceBase):
         return s_arr
 
     @cute.jit
-    def _sparse_swaps_logical_k(
-        self,
-        lane_k_offset: Int32,
-        sparse_origin0: Int32,
-        sparse_origin1: Int32,
-        sparse_origin2: Int32,
-        sparse_origin3: Int32,
-        *,
-        token_group_idx: Constexpr[int],
-    ) -> tuple[Int32, Int32]:
-        """Map one SWAP register group to its routed logical K position."""
-
-        atom_size = min(self.cfg.kv_block_size, 32)
-        groups_per_atom = atom_size // 8
-        origin_idx = token_group_idx // groups_per_atom
-        atom_origin = sparse_origin0
-        if cutlass.const_expr(origin_idx == 1):
-            atom_origin = sparse_origin1
-        elif cutlass.const_expr(origin_idx == 2):
-            atom_origin = sparse_origin2
-        elif cutlass.const_expr(origin_idx == 3):
-            atom_origin = sparse_origin3
-        token_offset = (token_group_idx % groups_per_atom) * 8
-        return atom_origin, atom_origin + Int32(token_offset) + lane_k_offset
-
-    @cute.jit
     def _compute_softmax_loop_swaps(
         self,
         stage_info: StageInfo,
@@ -1860,6 +1848,11 @@ class TmemSResource(DecodeGenResourceBase):
                 s_vals[q_repeats * 4 + ld_base + 2] = loaded1[ld_base + 2]
                 s_vals[q_repeats * 4 + ld_base + 3] = loaded1[ld_base + 3]
 
+        route_is_proxy = cutlass.Boolean(False)
+        if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
+            route_is_proxy = cutlass.Boolean(
+                (sparse_route_flags & Uint32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Uint32(0)
+            )
         if cutlass.const_expr(use_sparse):
             # Route, KV-tail, uniform-causal, and token validity depend only on
             # K, so one predicate masks the adjacent pair of Q-row registers.
@@ -1894,7 +1887,8 @@ class TmemSResource(DecodeGenResourceBase):
                 lane_k_offset = Int32(task_cache[_TASK_CACHE_LANE_IDX]) >> Int32(2)
                 token_word_covers_kv_tail = _swaps_token_word_covers_kv_tail(cfg)
                 for token_group_idx in cutlass.range_constexpr(4):
-                    atom_origin, logical_k = self._sparse_swaps_logical_k(
+                    atom_origin, logical_k = _swaps_routed_coordinate(
+                        cfg,
                         lane_k_offset,
                         sparse_origin0,
                         sparse_origin1,
@@ -1906,19 +1900,20 @@ class TmemSResource(DecodeGenResourceBase):
                     # tail. Qualified profiles can therefore omit the local
                     # atom-origin guard, independently of the K/V issuer warp.
                     score_is_valid = cutlass.Boolean(True)
-                    if cutlass.const_expr(
-                        not _swaps_uses_token_only_score_validity(cfg)
-                    ):
-                        score_is_valid = cutlass.Boolean(atom_origin >= Int32(0))
-                    if cutlass.const_expr(not token_word_covers_kv_tail):
-                        score_is_valid = cutlass.Boolean(
-                            score_is_valid and logical_k < seq_len_kv
-                        )
-                    if cutlass.const_expr(cfg.uses_uniform_causal_mask):
-                        score_is_valid = cutlass.Boolean(
-                            score_is_valid and logical_k < element_mask_end_idx
-                        )
-                    if cutlass.const_expr(cfg.use_kv_valid_bits):
+                    if not route_is_proxy:
+                        if cutlass.const_expr(
+                            not _swaps_uses_token_only_score_validity(cfg)
+                        ):
+                            score_is_valid = cutlass.Boolean(atom_origin >= Int32(0))
+                        if cutlass.const_expr(not token_word_covers_kv_tail):
+                            score_is_valid = cutlass.Boolean(
+                                score_is_valid and logical_k < seq_len_kv
+                            )
+                        if cutlass.const_expr(cfg.uses_uniform_causal_mask):
+                            score_is_valid = cutlass.Boolean(
+                                score_is_valid and logical_k < element_mask_end_idx
+                            )
+                    if cutlass.const_expr(cfg.uses_prepared_score_keep_words):
                         token_bit_idx = Int32(token_group_idx * 8) + lane_k_offset
                         token_is_valid = (
                             (sparse_token_word >> token_bit_idx) & Uint32(1)
@@ -2061,7 +2056,8 @@ class TmemSResource(DecodeGenResourceBase):
                             tile_offset_k + local_idx_k0 + Int32(token_group_idx * 8)
                         )
                         if cutlass.const_expr(use_sparse):
-                            _, token_idx = self._sparse_swaps_logical_k(
+                            _, token_idx = _swaps_routed_coordinate(
+                                cfg,
                                 lane_idx >> Int32(2),
                                 sparse_origin0,
                                 sparse_origin1,
@@ -2367,13 +2363,7 @@ class TmemSResource(DecodeGenResourceBase):
         sparse_token_word2: Uint32,
         sparse_token_word3: Uint32,
     ) -> tuple[object, object, object, object]:
-        """Reduce one sparse KV256 route as four bounded K32 fragments.
-
-        The full route path only loads and reduces scores. A partial route
-        predicates one native 32-score fragment at a time and writes it back
-        to TMEM, so the later P pass can replay masked scores without keeping
-        the logical 128-score tile live in registers.
-        """
+        """Preserve the established KV256 online-softmax state update."""
 
         cfg = self.cfg
         assert cfg.tile_size_kv == 256
@@ -2419,16 +2409,22 @@ class TmemSResource(DecodeGenResourceBase):
             if cutlass.const_expr(fragment_idx >= 2):
                 fragment_origin = origin1 + Int32((fragment_idx % 2) * 32)
                 fragment_valid = valid1
-            keep_words[fragment_idx] = _sparse_k32_effective_keep_word(
-                q_row_is_valid,
-                fragment_origin,
-                fragment_valid,
-                Uint32(token_words[fragment_idx]),
-                seq_len_kv,
-                causal_end,
-                apply_causal_mask=cfg.mask_type == CAUSAL,
-                apply_token_mask=cfg.use_kv_valid_bits,
-            )
+            if cutlass.const_expr(cfg.trusts_prepared_score_words):
+                prepared_keep_word = Uint32(0)
+                if q_row_is_valid:
+                    prepared_keep_word = Uint32(token_words[fragment_idx])
+                keep_words[fragment_idx] = prepared_keep_word
+            else:
+                keep_words[fragment_idx] = _sparse_effective_keep_word(
+                    q_row_is_valid,
+                    fragment_origin,
+                    fragment_valid,
+                    Uint32(token_words[fragment_idx]),
+                    seq_len_kv,
+                    causal_end,
+                    apply_causal_mask=cfg.mask_type == CAUSAL,
+                    apply_token_mask=cfg.uses_prepared_score_keep_words,
+                )
 
         warp_scores_are_unmasked = cutlass.Boolean(True)
         for fragment_idx in cutlass.range_constexpr(4):

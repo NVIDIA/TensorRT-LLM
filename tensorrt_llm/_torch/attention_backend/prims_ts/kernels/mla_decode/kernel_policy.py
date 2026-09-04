@@ -32,13 +32,12 @@ from ``make_throughput_latency_mla_config``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TypedDict, cast
-
-from typing_extensions import Unpack
+from typing import Literal, cast
 
 from .helpers.constants import SUPPORTED_MLA_PAGE_SIZES
 from .throughput_latency_1cta.config import (
     MlaConfig,
+    SUPPORTED_TILE_SIZE_Q,
     enumerate_throughput_latency_mla_profiles,
     make_throughput_latency_mla_config,
     tile_size_q_from_profile_name,
@@ -50,16 +49,6 @@ MlaKernelPolicy = Literal["throughput_2cta", "throughput_latency_1cta"]
 
 MlaKernelName = MlaKernelPolicy
 """Concrete TS MLA kernel family selected for a launch."""
-
-
-class _AutomaticMlaWork(TypedDict, total=False):
-    """Optional occupancy inputs accepted by automatic family selection."""
-
-    one_cta_work: int | None
-    one_cta_capacity: int | None
-    two_cta_cluster_work: int | None
-    two_cta_cluster_capacity: int | None
-    one_cta_is_extended_fp8_swaps: bool
 
 
 @dataclass(frozen=True)
@@ -101,59 +90,27 @@ def select_default_mla_kernel_policy(
     num_heads: int,
     seq_len_q: int,
     *,
-    one_cta_work: int | None = None,
-    one_cta_capacity: int | None = None,
-    two_cta_cluster_work: int | None = None,
-    two_cta_cluster_capacity: int | None = None,
-    one_cta_is_extended_fp8_swaps: bool = False,
+    one_cta_split_kv: int | None = None,
+    two_cta_split_kv: int | None = None,
 ) -> MlaKernelPolicy:
-    """Choose the default TS MLA family from work and resident capacity.
+    """Choose a native family, preferring direct output over split reduction.
 
-    Logical Q rows up to 64 retain the throughput-latency family.  Larger
-    shapes normally retain 2CTA, but an automatic caller may provide projected
-    work for both candidates.  The established probe requires the complete
-    2CTA launch to occupy at most one quarter of its resident cluster wave and
-    the 1CTA candidate to improve normalized occupancy.  A separately bounded
-    FP8 Q16 Swaps probe may use the whole 2CTA wave and accept equal normalized
-    occupancy: its caller has already proved a two-step local K bound, and the
-    1CTA schedule avoids 2CTA coordination at equal service-unit fill.  No
-    shape or device-name whitelist participates in either decision.
+    The M64 1CTA schedule owns one native tile of logical query rows. Within
+    that tile, 2CTA is selected only when it can write the final output directly
+    while 1CTA would require a split-K reduction. This compares task-graph
+    structure; it does not contain shape, dtype, or measured crossover tables.
     """
 
-    # Above 64 logical token-head rows, the 2CTA M128 schedule has enough Q work
-    # to amortize the extra CTA and reduction coordination.  Smaller rows prefer
-    # the 1CTA throughput-latency schedule.
-    if num_heads * seq_len_q <= 64:
-        return "throughput_latency_1cta"
+    if (one_cta_split_kv is None) != (two_cta_split_kv is None):
+        raise ValueError("automatic MLA split topology must be provided as a pair")
+    if one_cta_split_kv is not None:
+        if one_cta_split_kv <= 0 or two_cta_split_kv is None or two_cta_split_kv <= 0:
+            raise ValueError("automatic MLA split counts must be positive")
 
-    occupancy_inputs = (
-        one_cta_work,
-        one_cta_capacity,
-        two_cta_cluster_work,
-        two_cta_cluster_capacity,
-    )
-    if any(value is None for value in occupancy_inputs):
-        return "throughput_2cta"
-    if any(int(value) <= 0 for value in occupancy_inputs):
-        raise ValueError("automatic MLA family work and capacities must be positive")
-
-    assert one_cta_work is not None
-    assert one_cta_capacity is not None
-    assert two_cta_cluster_work is not None
-    assert two_cta_cluster_capacity is not None
-    if one_cta_is_extended_fp8_swaps:
-        two_cta_underfilled = two_cta_cluster_work <= two_cta_cluster_capacity
-        one_cta_has_more_occupancy = (
-            one_cta_work * two_cta_cluster_capacity
-            >= two_cta_cluster_work * one_cta_capacity
-        )
-    else:
-        two_cta_underfilled = two_cta_cluster_work * 4 <= two_cta_cluster_capacity
-        one_cta_has_more_occupancy = (
-            one_cta_work * two_cta_cluster_capacity
-            > two_cta_cluster_work * one_cta_capacity
-        )
-    if two_cta_underfilled and one_cta_has_more_occupancy:
+    if num_heads * seq_len_q <= max(SUPPORTED_TILE_SIZE_Q):
+        if one_cta_split_kv is not None:
+            if one_cta_split_kv > 1 and two_cta_split_kv == 1:
+                return "throughput_2cta"
         return "throughput_latency_1cta"
     return "throughput_2cta"
 
@@ -162,7 +119,9 @@ def resolve_mla_kernel_policy(
     policy: str | None,
     num_heads: int,
     seq_len_q: int,
-    **automatic_work: Unpack[_AutomaticMlaWork],
+    *,
+    one_cta_split_kv: int | None = None,
+    two_cta_split_kv: int | None = None,
 ) -> tuple[MlaKernelPolicy, str]:
     """Resolve an explicit or automatic TS MLA kernel policy."""
 
@@ -171,7 +130,8 @@ def resolve_mla_kernel_policy(
             select_default_mla_kernel_policy(
                 num_heads,
                 seq_len_q,
-                **automatic_work,
+                one_cta_split_kv=one_cta_split_kv,
+                two_cta_split_kv=two_cta_split_kv,
             ),
             "auto",
         )

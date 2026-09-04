@@ -59,7 +59,7 @@ _SUPPORTED_DTYPES = (
     torch.bfloat16,
     torch.float8_e4m3fn,
 )
-_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
+_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _INT32_MAX = 2**31 - 1
 _CUDA_GRID_YZ_MAX = 65_535
 _CONTEXT_KV_TILE_N = 128
@@ -254,9 +254,16 @@ def _validate_device(device: torch.device) -> int:
         capability = torch.cuda.get_device_capability(device_index)
     if capability not in _SUPPORTED_COMPUTE_CAPABILITIES:
         raise NotImplementedError(
-            "attention-ts context requires an SM100a/B200 or SM103a/B300 GPU; "
+            "attention-ts context requires an SM100a/B200, SM103a/B300 or "
+            "SM107a/Rubin GPU; "
             f"device cuda:{device_index} has compute capability {capability}"
         )
+    # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
+    # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
+    if capability == (10, 7):
+        from ...cute_dsl.utils import require_cute_dsl_arch
+
+        require_cute_dsl_arch(device_index)
     return device_index
 
 

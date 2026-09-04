@@ -64,7 +64,7 @@ _B16_MIN_PARALLEL_ROUTE_PAIRS = 4
 
 @dataclass(frozen=True)
 class _BlockSparseCompileKey:
-    """Named, hashable inputs that determine one compiled adapter."""
+    """Named, hashable inputs that determine one compiled sparse adapter."""
 
     device_index: int
     batch_size: int
@@ -81,6 +81,8 @@ class _BlockSparseCompileKey:
     use_kv_valid_bits: bool
     use_persistent_scheduler: bool
     use_parallel_sparse_kv_loads: bool
+    sparse_format: Literal["bsr", "bitmask"] = "bsr"
+    use_proxy_routes: bool = False
     page_size: int | None = None
 
 
@@ -193,13 +195,9 @@ def _select_block_sparse_scheduler(
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
     max_row_route_capacity: int,
+    use_proxy_routes: bool,
 ) -> tuple[int, bool]:
     """Select the Q tile and scheduler without depending on KV storage."""
-
-    from ..kernels.fmha_decode.fmha_decode_config import (
-        _select_auto_launch_mode,
-        make_q_tile_geometry,
-    )
 
     heads_q_per_kv = num_qo_heads // num_kv_heads
     q_tile_size = _select_block_sparse_q_tile_size(
@@ -207,6 +205,11 @@ def _select_block_sparse_scheduler(
         heads_q_per_kv=heads_q_per_kv,
         kv_block_size=kv_block_size,
     )
+    # Reusable planning sees route capacity, not the live exact-route work.
+    # Keep proxy execution on the direct grid as a conservative workload-level
+    # default until runtime work can participate in scheduling.
+    if use_proxy_routes:
+        return q_tile_size, False
     if not _should_consider_clc(
         q_tile_size=q_tile_size,
         kv_block_size=kv_block_size,
@@ -215,6 +218,11 @@ def _select_block_sparse_scheduler(
         use_kv_valid_bits=use_kv_valid_bits,
     ):
         return q_tile_size, False
+
+    from ..kernels.fmha_decode.fmha_decode_config import (
+        _select_auto_launch_mode,
+        make_q_tile_geometry,
+    )
 
     q_geometry = make_q_tile_geometry(
         rows_per_cta=q_tile_size,
@@ -413,6 +421,8 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
     }
     if key.use_persistent_scheduler:
         config_args["use_persistent_scheduler"] = True
+    if key.use_proxy_routes:
+        config_args["use_block_sparse_proxy_routes"] = True
     layout_args: dict[str, object]
     if key.page_size is None:
         layout_args = {"qkv_layout": "contiguousKv"}
@@ -455,14 +465,17 @@ def _resolve_block_sparse_launch_spec(
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
     max_row_route_capacity: int,
+    sparse_format: Literal["bsr", "bitmask"] = "bsr",
+    use_proxy_routes: bool = False,
     page_size: int | None = None,
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
     ``max_row_route_capacity`` is a conservative prepared-route bound. Live
     index values and physical-tail morphology never specialize this cache
-    entry. If the selected persistent profile is unsupported, retain the valid
-    static profile instead.
+    entry. Proxy routes use the direct grid; exact routes retain the common
+    automatic scheduler. An unsupported persistent profile falls back to its
+    valid static counterpart.
     """
 
     q_tile_size, use_persistent_scheduler = _select_block_sparse_scheduler(
@@ -477,6 +490,7 @@ def _resolve_block_sparse_launch_spec(
         mask_type=mask_type,
         use_kv_valid_bits=use_kv_valid_bits,
         max_row_route_capacity=max_row_route_capacity,
+        use_proxy_routes=use_proxy_routes,
     )
     compile_key = _BlockSparseCompileKey(
         device_index=device_index,
@@ -499,6 +513,8 @@ def _resolve_block_sparse_launch_spec(
             max_row_route_capacity=max_row_route_capacity,
             use_persistent_scheduler=use_persistent_scheduler,
         ),
+        sparse_format=sparse_format,
+        use_proxy_routes=use_proxy_routes,
         page_size=page_size,
     )
     try:
@@ -521,6 +537,10 @@ def _resolve_block_sparse_launch_spec(
     policy_entries: list[tuple[str, object]] = [
         ("tile_size_q", q_tile_size),
         ("tile_size_kv", kv_route_size),
+        (
+            "scheduler",
+            "persistent" if compile_key.use_persistent_scheduler else "static",
+        ),
     ]
     if page_size is not None:
         policy_entries.append(("page_size", page_size))

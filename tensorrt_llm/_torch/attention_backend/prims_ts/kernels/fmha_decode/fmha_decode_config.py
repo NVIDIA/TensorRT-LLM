@@ -21,7 +21,7 @@ that should be set before kernel compilation.
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 
 import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
@@ -505,6 +505,10 @@ class FmhaDecodeConfig:
     # restricted to 8/16/32 or positive multiples of 64 and are assembled into
     # a profile-selected fixed KV128 or KV256 route.
     use_block_sparse: bool = False
+    # Interpret prepared records as a typed proxy/exact stream. Proxy records
+    # source semantic-block summaries while exact records retain the K/V
+    # atom path. Source selection is orthogonal to the physical Q/KV profile.
+    use_block_sparse_proxy_routes: bool = False
     q_block_size: int = 0
     kv_block_size: int = 0
     # Optional batch-wide physical-token validity metadata shared by every head
@@ -1246,6 +1250,10 @@ class FmhaDecodeConfig:
 
     def validate_block_sparse_profile(self, *, heads_q_per_kv: int) -> None:
         """Validate the qualified host profile for block-sparse."""
+        if self.use_block_sparse_proxy_routes and not self.use_block_sparse:
+            raise ValueError("proxy routes require block-sparse attention")
+        if self.use_block_sparse_proxy_routes and self.mask_type != DENSE:
+            raise ValueError("block-sparse proxy routes require mask_type='dense'")
         if not self.use_block_sparse:
             if self.use_parallel_sparse_kv_loads:
                 raise ValueError(
@@ -1317,6 +1325,41 @@ class FmhaDecodeConfig:
             or self.use_separate_reduction_kernel
         ):
             raise ValueError("block-sparse does not support split-KV reduction")
+
+    def compile_signature(self) -> tuple[tuple[str, object], ...]:
+        """Key and reconstruct the batch-dynamic callable in the decode cache.
+
+        The public planner can reuse one compiled topology across batch sizes.
+        Keeping the complete static config in the cache key prevents a callable
+        compiled for one scheduler, reduction, or tile layout from being reused
+        by another.
+        """
+
+        return tuple(
+            (config_field.name, getattr(self, config_field.name))
+            for config_field in fields(self)
+        )
+
+    @property
+    def uses_prepared_score_keep_words(self) -> bool:
+        """Whether prepared routes carry BMM1 score-column validity words."""
+
+        return self.use_kv_valid_bits or self.use_block_sparse_proxy_routes
+
+    @property
+    def trusts_prepared_score_words(self) -> bool:
+        """Whether prepared words fully describe dense score-column validity.
+
+        Dense prepared routes have already combined structural tail validity
+        with any caller-provided exact-token bits. Their K32 words therefore
+        apply to exact and proxy sources alike.
+        """
+
+        return (
+            self.use_block_sparse
+            and self.uses_prepared_score_keep_words
+            and self.mask_type == DENSE
+        )
 
     @property
     def uses_q_desc_ref(self) -> bool:

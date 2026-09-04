@@ -25,7 +25,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.experimental import primitives as prims
 
 from cutlass.experimental.task_scheduling.memory import (
@@ -42,6 +42,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
+from ...._block_sparse.common import _block_sparse_proxy_summary_geometry
 from ...placeholder_helpers import _placeholder_smem_array
 from .helpers_common import (
     Constexpr,
@@ -63,6 +64,7 @@ from .helpers_common import (
     _neg_max_f32,
     _pack_float2_to_bf16,
     _pack_float2_to_fp16,
+    _swaps_routed_coordinate,
     _wait_for_mbarrier_phase,
 )
 from .helpers_output import (
@@ -79,6 +81,7 @@ from .helpers_softmax import (
     _pack_float4_to_fp8_e4m3,
     _pack_float4_to_fp8_e4m3_inline,
 )
+from .smem_block_sparse_metadata import _SOFTMAX_ROUTE_IS_PROXY_FLAG
 from .tmem_s import TmemSResource
 
 
@@ -299,20 +302,44 @@ class SmemPResource(DecodeGenResourceBase):
         # work can publish a valid descriptor or TMEM address for this tile.
         self._create_initial_task_locals(stage_info.context)
 
-    @producer_work
     @cute.jit
-    def compute_p_fragment(
+    def _apply_proxy_route_denominator_mass(
+        self,
+        local_sum: Float32,
+        tail_p: Float32,
+        route_is_proxy: Int32,
+    ) -> Float32:
+        """Weight only a proxy route's softmax denominator by block mass."""
+
+        if cutlass.const_expr(not self.cfg.use_block_sparse_proxy_routes):
+            return local_sum
+        if route_is_proxy != Int32(0):
+            _, tail_len = _block_sparse_proxy_summary_geometry(
+                self.cfg.static_seq_len_kv,
+                self.cfg.kv_block_size,
+            )
+            local_sum *= Float32(self.cfg.kv_block_size)
+            tail_delta = tail_len - self.cfg.kv_block_size
+            if cutlass.const_expr(tail_delta != 0):
+                local_sum += Float32(tail_delta) * tail_p
+        return local_sum
+
+    @cute.jit
+    def _compute_p_fragment_impl(
         self,
         stage_info: StageInfo,
         *,
         fragment_idx: Constexpr[int],
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
+        route_is_proxy: Int32,
+        route_origin0: Int32,
+        route_origin1: Int32,
     ) -> None:
-        """Convert one KV256 K32 score fragment and publish its TMEM P slice."""
+        """Convert one KV256 K32 score fragment into its selected P storage."""
         cfg = self.cfg
         assert cfg.streams_tmem_p_fragments
-        assert not cfg.use_fp8_qkv and cfg.uses_two_inst_tmem_p
+        assert not cfg.use_fp8_qkv
         assert cfg.softmax_score_fragment_regs == 32
 
         new_max = new_max_arr[0]
@@ -360,10 +387,39 @@ class SmemPResource(DecodeGenResourceBase):
         total_pair = cute.arch.add_packed_f32x2(sum01, sum23)
         local_sum = Float32(total_pair[0] + total_pair[1])
 
+        if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+            if route_is_proxy != Int32(0):
+                # KC stores one mean K vector per semantic KV block while VC
+                # stores its V sum. Keep P itself unweighted for PV, and
+                # account for represented token mass only in the denominator.
+                num_summaries, tail_len = _block_sparse_proxy_summary_geometry(
+                    cfg.static_seq_len_kv,
+                    cfg.kv_block_size,
+                )
+                local_sum *= Float32(cfg.kv_block_size)
+                final_summary_idx = num_summaries - 1
+                tail_delta = tail_len - cfg.kv_block_size
+                if cutlass.const_expr(tail_delta != 0):
+                    fragment_origin = Int32(route_origin0)
+                    if cutlass.const_expr(fragment_idx >= 2):
+                        fragment_origin = Int32(route_origin1)
+                    fragment_origin += Int32((fragment_idx % 2) * 32)
+                    final_summary_offset = Int32(final_summary_idx) - fragment_origin
+                    if final_summary_offset >= Int32(
+                        0
+                    ) and final_summary_offset < Int32(32):
+                        # Proxy fragment origins are K32-aligned in summary
+                        # coordinates, so the tail's in-fragment lane is a
+                        # compile-time constant even though route ownership is
+                        # decided at runtime.  Keeping this index fixed avoids
+                        # materializing the whole FP32 probability array in
+                        # local memory.
+                        tail_lane = final_summary_idx % 32
+                        local_sum += Float32(tail_delta) * Float32(s_arr[tail_lane])
+
         packed_p = (
             s_arr.data_ptr().load(count=32, alignment=4).to(cfg.q_dtype).bitcast(Int32)
         )
-
         fragment_cols = cfg.softmax_score_fragment_regs // 2
         p_tmem_addr = (
             self._tmem_base_addr
@@ -382,16 +438,70 @@ class SmemPResource(DecodeGenResourceBase):
         cute.arch.fence_view_async_tmem_store()
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
 
-        # KV256 aliases P with the score tile that produced it. Each softmax
-        # warp publishes its own rows after the TMEM store drains; BMM2 waits
-        # for all producer warps before consuming the fragment.
-        tidx, _, _ = cute.arch.thread_idx()
-        if (tidx & Int32(31)) == Int32(0):
-            prims.mbarrier_arrive(self._fragment_ready.data_ptr() + Int32(fragment_idx))
+        if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+            # Streamed KV256 aliases P with the score tile that produced it.
+            # Each softmax warp publishes its rows after the TMEM store drains.
+            tidx, _, _ = cute.arch.thread_idx()
+            if (tidx & Int32(31)) == Int32(0):
+                prims.mbarrier_arrive(
+                    self._fragment_ready.data_ptr() + Int32(fragment_idx)
+                )
 
         if cutlass.const_expr(fragment_idx != 0):
             local_sum += self.tmem_s_ref.load_p_local_sum(0)
         self.tmem_s_ref.store_p_local_sum(0, local_sum)
+
+    # Task Scheduling treats every non-constexpr work argument as required.
+    # Keep the established exact-only ABI separate from the proxy route
+    # transport while sharing the generated P implementation.
+    @producer_work
+    @cute.jit
+    def compute_p_fragment(
+        self,
+        stage_info: StageInfo,
+        *,
+        fragment_idx: Constexpr[int],
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+    ) -> None:
+        """Convert one ordinary KV256 K32 score fragment into its TMEM P slice."""
+        self._compute_p_fragment_impl(
+            stage_info,
+            fragment_idx=fragment_idx,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            route_is_proxy=Int32(0),
+            route_origin0=Int32(0),
+            route_origin1=Int32(0),
+        )
+
+    @producer_work
+    @cute.jit
+    def compute_proxy_route_p_fragment(
+        self,
+        stage_info: StageInfo,
+        *,
+        fragment_idx: Constexpr[int],
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+        route_flags: Int32,
+        route_origin0: Int32,
+        route_origin1: Int32,
+    ) -> None:
+        """Convert one proxy-capable fragment with conditional proxy weighting."""
+        assert self.cfg.use_block_sparse_proxy_routes
+        route_is_proxy = Int32(
+            (route_flags & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Int32(0)
+        )
+        self._compute_p_fragment_impl(
+            stage_info,
+            fragment_idx=fragment_idx,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            route_is_proxy=route_is_proxy,
+            route_origin0=route_origin0,
+            route_origin1=route_origin1,
+        )
 
     @cute.jit
     def _compute_keeps_p(
@@ -400,6 +510,9 @@ class SmemPResource(DecodeGenResourceBase):
         *,
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
+        route_is_proxy: Int32,
+        route_origin0: Int32,
+        route_origin1: Int32,
     ) -> None:
         """Materialize one non-KV256 row-major Keeps probability tile.
 
@@ -439,6 +552,7 @@ class SmemPResource(DecodeGenResourceBase):
         # without keeping a second 16-value P array live beside the S row.
         local_sum_pair_01 = (Float32(0.0), Float32(0.0))
         local_sum_pair_23 = (Float32(0.0), Float32(0.0))
+        proxy_tail_p = Float32(0.0)
 
         # Each vector block is exactly 16 bytes after conversion. Compute and
         # pack adjacent pairs directly into their final register payload.
@@ -499,6 +613,29 @@ class SmemPResource(DecodeGenResourceBase):
                         cute.math.exp2(scaled_pair[0], fastmath=True),
                         cute.math.exp2(scaled_pair[1], fastmath=True),
                     )
+                    if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                        num_summaries, _ = _block_sparse_proxy_summary_geometry(
+                            cfg.static_seq_len_kv,
+                            cfg.kv_block_size,
+                        )
+                        final_summary_idx = num_summaries - 1
+                        for pair_element in cutlass.range_constexpr(2):
+                            reg_idx = s_base + val_base + pair_element
+                            summary_origin = route_origin0
+                            summary_offset = Int32(reg_idx)
+                            if cutlass.const_expr(
+                                cfg.tile_size_q == 128 and reg_idx >= 64
+                            ):
+                                summary_origin = route_origin1
+                                summary_offset = Int32(reg_idx - 64)
+                            elif cutlass.const_expr(cfg.tile_size_q == 64):
+                                if col_base >= Int32(64):
+                                    summary_origin = route_origin1
+                            logical_summary = summary_origin + summary_offset
+                            if summary_origin >= Int32(0) and logical_summary == Int32(
+                                final_summary_idx
+                            ):
+                                proxy_tail_p = Float32(p_pair[pair_element])
                     if cutlass.const_expr(packed_idx % 2 == 0):
                         local_sum_pair_01 = fadd2(local_sum_pair_01, p_pair)
                     else:
@@ -573,6 +710,11 @@ class SmemPResource(DecodeGenResourceBase):
                 )
         local_sum_pair0 = fadd2(local_sum_pair_01, local_sum_pair_23)
         local_sum = local_sum_pair0[0] + local_sum_pair0[1]
+        local_sum = self._apply_proxy_route_denominator_mass(
+            local_sum,
+            proxy_tail_p,
+            route_is_proxy,
+        )
         self.tmem_s_ref.store_p_local_sum(0, local_sum)
 
         # Publish the selected memory view before the task-level P pipeline
@@ -591,14 +733,18 @@ class SmemPResource(DecodeGenResourceBase):
             # point and no extra named barrier is needed here.
             cute.arch.fence_view_async_shared()
 
-    @producer_work
     @cute.jit
-    def compute_p(
+    def _compute_p_impl(
         self,
         stage_info: StageInfo,
         *,
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
+        route_is_proxy: Int32,
+        route_origin0: Int32,
+        route_origin1: Int32,
+        route_origin2: Int32,
+        route_origin3: Int32,
     ) -> None:
         """Compute P from S, stage its BMM2 operand, and publish local sums."""
         cfg = self.cfg
@@ -607,6 +753,9 @@ class SmemPResource(DecodeGenResourceBase):
                 stage_info,
                 new_max_arr=new_max_arr,
                 s_arr=s_arr,
+                route_is_proxy=route_is_proxy,
+                route_origin0=route_origin0,
+                route_origin1=route_origin1,
             )
             return
         # ProdWork: transform the softmax S registers into the P operand layout
@@ -616,6 +765,7 @@ class SmemPResource(DecodeGenResourceBase):
         # warp/lane ownership for SMEM offsets and STSM swizzles.
         task_cache = _decode_gen_task_cache(stage_info)
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        lane_idx = Int32(task_cache[_TASK_CACHE_LANE_IDX])
         if cutlass.const_expr(cfg.tile_size_q == 32 and cfg.use_fp8_qkv):
             # Tile-Q=32 FP8 fast path: compute E4M3 P registers in the
             # same order consumed by the STSM helper, while also capturing
@@ -796,10 +946,14 @@ class SmemPResource(DecodeGenResourceBase):
             local_sums = cutlass.Array(
                 Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
             )
+            proxy_tail_p = cutlass.Array(
+                Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
+            )
             for idx in cutlass.range_constexpr(num_s_regs):
                 p_vals[idx] = Float32(0.0)
             for idx in cutlass.range_constexpr(num_scale_groups):
                 local_sums[idx] = Float32(0.0)
+                proxy_tail_p[idx] = Float32(0.0)
 
             for scale_idx in cutlass.range_constexpr(num_scale_groups):
                 # Convert each softmax scale group from S to P. Masked rows have
@@ -828,9 +982,32 @@ class SmemPResource(DecodeGenResourceBase):
                         )
                         p_vals[s_idx] = p_val
                         local_sums[scale_idx] += p_val
+                        if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                            num_summaries, _ = _block_sparse_proxy_summary_geometry(
+                                cfg.static_seq_len_kv,
+                                cfg.kv_block_size,
+                            )
+                            atom_origin, logical_summary = _swaps_routed_coordinate(
+                                cfg,
+                                lane_idx >> Int32(2),
+                                route_origin0,
+                                route_origin1,
+                                route_origin2,
+                                route_origin3,
+                                token_group_idx=k_pair_idx,
+                            )
+                            if atom_origin >= Int32(0) and logical_summary == Int32(
+                                num_summaries - 1
+                            ):
+                                proxy_tail_p[scale_idx] = p_val
             # Hand off denominator contributions through TmemS. P remains a pure
             # MMA operand in SMEM; sums are not reloaded from the P tile.
             for scale_idx in cutlass.range_constexpr(num_scale_groups):
+                local_sums[scale_idx] = self._apply_proxy_route_denominator_mass(
+                    local_sums[scale_idx],
+                    proxy_tail_p[scale_idx],
+                    route_is_proxy,
+                )
                 self.tmem_s_ref.store_p_local_sum(scale_idx, local_sums[scale_idx])
 
             if cutlass.const_expr(cfg.use_fp8_qkv):
@@ -1057,6 +1234,33 @@ class SmemPResource(DecodeGenResourceBase):
                             p_vals[p_base + 4] = p_pair[1]
                             local_sum[scale_idx] += p_pair[0]
                             local_sum[scale_idx] += p_pair[1]
+            if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                num_summaries, _ = _block_sparse_proxy_summary_geometry(
+                    cfg.static_seq_len_kv,
+                    cfg.kv_block_size,
+                )
+                for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
+                    proxy_tail_p = Float32(0.0)
+                    for token_group_idx in cutlass.range_constexpr(4):
+                        atom_origin, logical_summary = _swaps_routed_coordinate(
+                            cfg,
+                            lane_idx >> Int32(2),
+                            route_origin0,
+                            route_origin1,
+                            route_origin2,
+                            route_origin3,
+                            token_group_idx=token_group_idx,
+                        )
+                        if atom_origin >= Int32(0) and logical_summary == Int32(
+                            num_summaries - 1
+                        ):
+                            p_idx = scale_idx + token_group_idx * 2
+                            proxy_tail_p = Float32(p_vals[p_idx])
+                    local_sum[scale_idx] = self._apply_proxy_route_denominator_mass(
+                        local_sum[scale_idx],
+                        proxy_tail_p,
+                        route_is_proxy,
+                    )
             # Pack the P scalars to match the dtype consumed by BMM2.
             regs_p = cutlass.Array(
                 Int32, cfg.num_packed_p_regs, space=cutlass.AddressSpace.rmem
@@ -1106,6 +1310,77 @@ class SmemPResource(DecodeGenResourceBase):
             # warpgroup before the UMMA-consumer pipeline is committed so
             # BMM2 cannot observe a partially written P tile.
             prims.barrier_cta_sync(4 + self.inst_id, thread_count=128)
+
+    @producer_work
+    @cute.jit
+    def compute_p(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+    ) -> None:
+        """Compute an exact/dense P tile without typed-route metadata."""
+
+        self._compute_p_impl(
+            stage_info,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            route_is_proxy=Int32(0),
+            route_origin0=Int32(0),
+            route_origin1=Int32(0),
+            route_origin2=Int32(0),
+            route_origin3=Int32(0),
+        )
+
+    @producer_work
+    @cute.jit
+    def compute_proxy_route_p(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+        route_origin0: Int32,
+        route_origin1: Int32,
+        keeps_route_flags_or_swaps_origin2: Int32,
+        swaps_route_origin3_bits: Uint32,
+        swaps_route_flags: Uint32,
+    ) -> None:
+        """Normalize the active Keeps/SWAP metadata view and compute P.
+
+        The shared Int32 input is Keeps route flags or SWAP origin2.  SWAP's
+        origin3 and flags stay bit-preserving Uint32 values until this work
+        boundary because schedule-level dataflow tokens cannot be cast.
+        """
+
+        assert self.cfg.use_block_sparse_proxy_routes
+        route_origin2 = Int32(0)
+        route_origin3 = Int32(0)
+        if cutlass.const_expr(self.cfg.use_keeps_mma_ab):
+            route_is_proxy = Int32(
+                (
+                    keeps_route_flags_or_swaps_origin2
+                    & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)
+                )
+                != Int32(0)
+            )
+        else:
+            route_is_proxy = Int32(
+                (swaps_route_flags & Uint32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Uint32(0)
+            )
+            route_origin2 = keeps_route_flags_or_swaps_origin2
+            route_origin3 = swaps_route_origin3_bits.bitcast(Int32)
+        self._compute_p_impl(
+            stage_info,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            route_is_proxy=route_is_proxy,
+            route_origin0=route_origin0,
+            route_origin1=route_origin1,
+            route_origin2=route_origin2,
+            route_origin3=route_origin3,
+        )
 
     @consumer_work(
         returns=(

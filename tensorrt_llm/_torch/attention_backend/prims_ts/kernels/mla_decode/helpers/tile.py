@@ -23,9 +23,9 @@ from cutlass.experimental.task_scheduling.resources import StageInfo
 from .layout import _TASK_CACHE_SEQ_LEN_KV
 from .mask import MaskType, mask_visible_k_length
 from .query import (
-    groups_tokens_heads_q_row_state,
+    flat_query_row_state,
     query_batch_bounds,
-    runtime_query_group_has_rows,
+    runtime_flat_query_tile_has_rows,
 )
 from .stage import MlaStage
 from ..throughput_latency_1cta.config import MlaConfig
@@ -181,18 +181,18 @@ def runtime_seq_len_kv_for_q(
     cta_idx_q,
     cu_seqlens_q=None,
 ):
-    """Return the KV domain shared by groups_tokens_heads_q rows in a CTA.
+    """Return the KV domain shared by flat query rows in a CTA.
 
-    The last effective row has the largest causal domain. Grouped causal
-    softmax applies the remaining row-specific mask; all other modes can use
+    The last physical row has the largest causal domain. Row-causal softmax
+    applies the remaining row-specific mask; all other modes can use
     this CTA-visible length with the ordinary dense tail predicate.
     """
     if cutlass.const_expr(cfg.mask_type == MaskType.DENSE.value):
         return runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx)
-    _, _, logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
-        Int32(cfg.num_heads_q - 1),
+    _, _, logical_q_idx, _, _ = flat_query_row_state(
+        Int32(cfg.tile_size_q - 1),
         cta_idx_q,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q,
@@ -218,9 +218,10 @@ def runtime_query_tile_is_active(
 
     query_is_active = cutlass.Boolean(True)
     if cutlass.const_expr(cu_seqlens_q is not None):
-        query_is_active = runtime_query_group_has_rows(
+        query_is_active = runtime_flat_query_tile_has_rows(
             cta_idx_q,
-            cfg.groups_tokens_heads_q_ratio,
+            cfg.tile_size_q,
+            cfg.logical_num_heads_q,
             cfg.logical_seq_len_q,
             cu_seqlens_q,
             batch_idx,
@@ -300,19 +301,19 @@ def runtime_work_tile_is_active(
 
 
 @cute.jit
-def runtime_seq_len_kv_for_effective_head(
+def runtime_seq_len_kv_for_query_row(
     cfg: MlaConfig,
     cache_seqs,
     batch_idx,
     cta_idx_q,
-    effective_head_idx,
+    row_in_tile,
     cu_seqlens_q=None,
 ):
-    """Return the KV length visible to one groups_tokens_heads_q row."""
-    _, _, logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
-        effective_head_idx,
+    """Return the KV length visible to one physical flat-query row."""
+    _, _, logical_q_idx, _, _ = flat_query_row_state(
+        row_in_tile,
         cta_idx_q,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q,
@@ -344,10 +345,10 @@ def runtime_seq_len_kv_from_task_cache(
         batch_idx,
         cfg.logical_seq_len_q,
     )
-    _, _, logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
-        Int32(cfg.num_heads_q - 1),
+    _, _, logical_q_idx, _, _ = flat_query_row_state(
+        Int32(cfg.tile_size_q - 1),
         cta_idx_q,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q,
