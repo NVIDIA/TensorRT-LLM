@@ -23,8 +23,35 @@ When both Tensor Parallel and Expert Parallel are enabled, each GPU handles a po
 
 ## How to Enable
 
-The default parallel pattern is Tensor Parallel. You can enable Expert Parallel or hybrid parallel by setting `--moe_tp_size` and `--moe_ep_size` when calling `convert_checkpoint.py`. If only `--moe_tp_size` is provided, TRT-LLM will use Tensor Parallel for the MoE model; if only `--moe_ep_size` is provided, TRT-LLM will use Expert Parallel; if both are provided, the hybrid parallel will be used.
+The default parallel pattern is Tensor Parallel for MoE experts. Enable Expert
+Parallel or hybrid parallel with the PyTorch / LLM API using
+`moe_expert_parallel_size` and `moe_tensor_parallel_size` together with
+`tensor_parallel_size`. The legacy `convert_checkpoint.py` / `trtllm-build` flags
+`--moe_tp_size` / `--moe_ep_size` were removed with the TensorRT backend; see
+[TensorRT Backend Removal](../tensorrt-backend-removal.md).
 
-Ensure the product of `moe_tp_size` and `moe_ep_size` is equal to `tp_size`, since the total number of MoE parallelism across all GPUs must match the total number of parallelism in other parts of the model.
+Example `trtllm-serve` YAML:
 
-The other parameters related to the MoE structure, such as `num_experts_per_tok` (TopK in previous context) and `num_local_experts`, can be found in the model’s configuration file, such as the one for [Mixtral 8x7B model](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json).
+```yaml
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+```
+
+Or CLI flags (aliases `--tp_size` / `--ep_size`):
+
+```bash
+trtllm-serve <model> --tensor_parallel_size 8 --moe_expert_parallel_size 8
+```
+
+If only `moe_tensor_parallel_size` is set, TRT-LLM uses Tensor Parallel for the
+MoE experts; if only `moe_expert_parallel_size` is set, it uses Expert Parallel;
+if both are set, hybrid parallel is used. When neither is set, MoE defaults to
+tensor-parallel experts (`moe_expert_parallel_size == 1`).
+
+Ensure the product of `moe_tensor_parallel_size` and `moe_expert_parallel_size`
+equals `tensor_parallel_size`, since MoE parallelism across GPUs must match the
+parallelism used for the rest of the model.
+
+The other parameters related to the MoE structure, such as `num_experts_per_tok`
+(TopK in previous context) and `num_local_experts`, can be found in the model’s
+configuration file, such as the one for [Mixtral 8x7B model](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json).
