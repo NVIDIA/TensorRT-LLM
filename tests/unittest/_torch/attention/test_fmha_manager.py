@@ -50,12 +50,14 @@ def _make_metadata(
     num_generations: int,
     num_ctx_tokens: int = 0,
     use_spec_decoding: bool = False,
+    is_cuda_graph: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         num_contexts=num_contexts,
         num_generations=num_generations,
         num_ctx_tokens=num_ctx_tokens,
         use_spec_decoding=use_spec_decoding,
+        is_cuda_graph=is_cuda_graph,
     )
 
 
@@ -430,6 +432,62 @@ def test_context_fmha_cache_uses_batch_grid_only() -> None:
     assert same_batch_different_q_length is fmha
     assert len(manager._cache) == 1
     assert events == [("support", "fmha", None)]
+
+
+@pytest.mark.parametrize("graph_first", [False, True])
+def test_fmha_cache_separates_cuda_graph_mode(graph_first: bool) -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    eager_fmha = FakeFmha(
+        attn,
+        "eager",
+        events,
+        request_support_predicate=lambda _q, metadata: not metadata.is_cuda_graph,
+    )
+    fallback = FakeFmha(attn, "fallback", events)
+    manager.fmha_libs = [eager_fmha, fallback]
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.context_only)
+    request_order = (True, False) if graph_first else (False, True)
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        selected_by_graph_mode = {
+            is_cuda_graph: manager.select(
+                attn,
+                torch.empty((1, 4)),
+                None,
+                None,
+                _make_metadata(
+                    num_contexts=1,
+                    num_generations=0,
+                    num_ctx_tokens=1,
+                    is_cuda_graph=is_cuda_graph,
+                ),
+                forward_args,
+            )
+            for is_cuda_graph in request_order
+        }
+        for is_cuda_graph in request_order:
+            assert (
+                manager.select(
+                    attn,
+                    torch.empty((1, 4)),
+                    None,
+                    None,
+                    _make_metadata(
+                        num_contexts=1,
+                        num_generations=0,
+                        num_ctx_tokens=1,
+                        is_cuda_graph=is_cuda_graph,
+                    ),
+                    forward_args,
+                )
+                is selected_by_graph_mode[is_cuda_graph]
+            )
+
+    assert selected_by_graph_mode == {False: eager_fmha, True: fallback}
+    assert len(manager._cache) == 2
+    assert events.count(("support", "eager", None)) == 2
+    assert events.count(("support", "fallback", None)) == 1
 
 
 @pytest.mark.parametrize("generation_first", [False, True])

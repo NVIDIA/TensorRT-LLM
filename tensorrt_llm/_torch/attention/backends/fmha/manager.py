@@ -129,6 +129,7 @@ class _FmhaCacheKey(NamedTuple):
     generation_seq_len_q: int
     attention_mask_type: AttentionMaskType
     use_spec_decoding: bool
+    is_cuda_graph: bool
     # LoRA can change the effective output from packed NVFP4 to unpacked BF16
     # without changing the request shape. Keep those selection regimes apart.
     output_dtype: torch.dtype | None
@@ -367,6 +368,7 @@ class FmhaManager:
             generation_seq_len_q=generation_seq_len_q,
             attention_mask_type=attention_mask_type,
             use_spec_decoding=metadata.use_spec_decoding,
+            is_cuda_graph=metadata.is_cuda_graph,
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,
         )
