@@ -51,24 +51,14 @@ tolerance) rather than rubber-stamping it.
 """
 
 import os
-import sys
 from functools import partial
 from pathlib import Path
 from typing import Optional
 
 import pytest
 import torch
-
-# Make sure the helpers directory is importable both when running under
-# pytest (which adds it via the ``pythonpath`` directive in
-# ``tests/unittest/pytest.ini``) and when running inside a spawn() worker
-# that does not inherit pytest's sys.path manipulation.
-_HELPERS_DIR = str(Path(__file__).resolve().parents[3] / "_utils_test")
-if _HELPERS_DIR not in sys.path:
-    sys.path.insert(0, _HELPERS_DIR)
-
-from _deterministic_routing import DeterministicMoeRoutingMode  # noqa: E402
-from _sharding_ir_helpers import (  # noqa: E402
+from _deterministic_routing import DeterministicMoeRoutingMode
+from _sharding_ir_helpers import (
     build_eagle_draft_model,
     build_ir_model,
     build_random_draft_inputs,

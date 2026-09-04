@@ -4,14 +4,13 @@ import pathlib as _pl
 import shutil
 import sys as _sys
 
+# Declared above the cpp_common import: this covers every file in this
+# directory, but only for imports that run after it, and cpp_common reaches
+# build_wheel while this conftest is still executing.
+__extra_import_path__ = ["~/scripts"]
+
 import defs.cpp.cpp_common as _cpp
 import pytest
-
-build_script_dir = _pl.Path(
-    __file__).parent.resolve().parent.parent.parent.parent / "scripts"
-assert build_script_dir.is_dir()
-_sys.path.append(str(build_script_dir))
-
 from build_wheel import main as build_trt_llm
 from defs.conftest import llm_models_root
 

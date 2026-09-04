@@ -1417,14 +1417,14 @@ dev = ["pytest", "pytest-xdist", "ruff"]
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.16"
+version = "0.6.18"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.16-py3-none-any.whl", hash = "sha256:059d629cf352dae2d2e17c9b632f1be7c12fd7feb4979d71cdffd96104219e53"},
-    {file = "flashinfer_python-0.6.16.tar.gz", hash = "sha256:0c89970ee42b0640d3dfd65ea4770710e21101ce2b43a09eda3e29cd1874fe48"},
+    {file = "flashinfer_python-0.6.18-py3-none-any.whl", hash = "sha256:d5d26edb48f8def0bf28b2c94415aef7f0754e2cd9e3cb3d6e7081262d068aad"},
+    {file = "flashinfer_python-0.6.18.tar.gz", hash = "sha256:70a2074d78cb17ed39c98e5ed47f626c6e8bb29015cf028c49cbf8f2629405a1"},
 ]
 
 [package.dependencies]
@@ -1437,7 +1437,7 @@ nccl4py = ">=0.3.1"
 ninja = "*"
 numpy = "*"
 nvidia-cudnn-frontend = ">=1.25.0"
-nvidia-cutlass-dsl = ">=4.5.0"
+nvidia-cutlass-dsl = ">=4.6.2a0"
 nvidia-ml-py = "*"
 packaging = ">=24.2"
 requests = "*"
@@ -1446,8 +1446,8 @@ torch = "*"
 tqdm = "*"
 
 [package.extras]
-cu12 = ["nvidia-cutlass-dsl (>=4.5.0)"]
-cu13 = ["nvidia-cutlass-dsl[cu13] (>=4.5.0)"]
+cu12 = ["nvidia-cutlass-dsl (>=4.6.2a0)"]
+cu13 = ["nvidia-cutlass-dsl[cu13] (>=4.6.2a0)"]
 
 [[package]]
 name = "frozenlist"
@@ -2391,6 +2391,13 @@ files = [
     {file = "lxml-6.1.3-cp315-cp315t-win32.whl", hash = "sha256:ace1d2c83b2bd24db5940600541140e87a325e119cb32d5fa9ad720d7e76648e"},
     {file = "lxml-6.1.3-cp315-cp315t-win_amd64.whl", hash = "sha256:b49638355ea3bebba70da783ccbc630fd72afa16bc46c54474bfa1f9a915bbc6"},
     {file = "lxml-6.1.3-cp315-cp315t-win_arm64.whl", hash = "sha256:5a721a98c649855963811b59b55755b30566e7f7fc40bdc9803d66dee9f811cf"},
+    {file = "lxml-6.1.3-cp38-cp38-macosx_10_9_x86_64.whl", hash = "sha256:13a620a3fcc20023f9e6ed5c383e00e826f1c2d5db554df2f67240760f9118e8"},
+    {file = "lxml-6.1.3-cp38-cp38-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:fbfb70ba01355251faf6b293171df49f73a88a1b6494db109ffea85442574458"},
+    {file = "lxml-6.1.3-cp38-cp38-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:302f72413251c03f671e063c9414bed5dc8c927069e5abb69245521e51a4e81b"},
+    {file = "lxml-6.1.3-cp38-cp38-manylinux_2_28_i686.whl", hash = "sha256:ce1f220114959941170e22b8ad44279f6dee2dcef7591814d01ae805dc058889"},
+    {file = "lxml-6.1.3-cp38-cp38-musllinux_1_2_x86_64.whl", hash = "sha256:170773d8a3cdc76259065523ddd978c44f9806e28605f08812e8f86783e44ac6"},
+    {file = "lxml-6.1.3-cp38-cp38-win32.whl", hash = "sha256:92d96586376fb79a33474797186bf993250152ee5c32650b67db78d54b92e6f3"},
+    {file = "lxml-6.1.3-cp38-cp38-win_amd64.whl", hash = "sha256:d44442effeb8781f392340c5dc8c6716fba41dbeacb82fd4c0f09026fb5ff682"},
     {file = "lxml-6.1.3-cp39-cp39-macosx_10_9_universal2.whl", hash = "sha256:869dfcd4d381cb0ea87085cc4f011b9171b494ef21e76ad8665f6d5e2d1dc8a1"},
     {file = "lxml-6.1.3-cp39-cp39-macosx_10_9_x86_64.whl", hash = "sha256:6ba4fe5bfbef6811a8e49b3719cde373ad399006c0c1ac184b7297116ecbba5d"},
     {file = "lxml-6.1.3-cp39-cp39-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:61116cec57ed69aebc70f37a545eec095339bb829efbdabcfb97c51e9536e158"},
@@ -3105,24 +3112,24 @@ sqlframe = ["sqlframe (>=3.22.0,!=3.39.3)"]
 
 [[package]]
 name = "nccl4py"
-version = "0.3.1"
+version = "0.3.1.post1"
 description = "NCCL4Py: Python bindings for NCCL"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "nccl4py-0.3.1-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:15517f1255a84cf3f48d36e406ff925afa40425925a1d68a7672621286488e0a"},
-    {file = "nccl4py-0.3.1-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a3115d8471cf4c207720c624174a0c023d8ef9893452310e6447dbc78a9e04ee"},
-    {file = "nccl4py-0.3.1-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d8e247d3a2b6e0253567322d518ec94320caa92649475416abceefaf0bc2db71"},
-    {file = "nccl4py-0.3.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7945acf8c0224f727f87db40eb3a6060ad7809256b0f37dde6b94d9d8fa6b65c"},
-    {file = "nccl4py-0.3.1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e0b1bab08b374ba21bb36612710866173e703c06dc197ab13b1e093436ac27ce"},
-    {file = "nccl4py-0.3.1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4f96117a0aed13744d2636760962f1cb45be9138846023b69c5a8053e531cc76"},
-    {file = "nccl4py-0.3.1-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:50068bb4e6f60dd831b2d394a9789f08a6f4346f0e51a9d717536868a8fdd398"},
-    {file = "nccl4py-0.3.1-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7fd7862777777162f4735b85472951d91b8847cd7010d8f60bfefe58c7285583"},
-    {file = "nccl4py-0.3.1-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:13db9f786c7919ed1df7079c03acbe49eb569d5625fd5cec2344075f37b5e140"},
-    {file = "nccl4py-0.3.1-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5b684a3ac083fd76bf1e57e69e76575502bcd2aface23e2dad7a88461ce8916d"},
-    {file = "nccl4py-0.3.1-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:aa09f12a93e0eb7b2dbbffbcb0a3daeeb3c211f2433cc6cc896faeec85ea4b2e"},
-    {file = "nccl4py-0.3.1-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c58bf4db2eb27636587b3ce899fe47d72c16bf1eeb76c5e1c9bb1feaf57048f5"},
+    {file = "nccl4py-0.3.1.post1-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e4693d6599fa72b574d65cc58cb70bbaa05e034e3d1c1dd12553d4879109e7f8"},
+    {file = "nccl4py-0.3.1.post1-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:24f76182ec2efdf16cd5673ed484934922189372b2d4a0289766364185f79f3e"},
+    {file = "nccl4py-0.3.1.post1-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a60cb581dafc547f81aa3eae5fc4542fb9eb9658a72cdea27b9ee2a931708629"},
+    {file = "nccl4py-0.3.1.post1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9ae86cabcb50948511e3b3c058543e80a85e6e129f40b8deb6350288fc7c38f8"},
+    {file = "nccl4py-0.3.1.post1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:35748dac947cb529db20559efa9d90d6b4a5344e74889e5e78abc014e1f59704"},
+    {file = "nccl4py-0.3.1.post1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5d6f2d543a080867e0df9ddc5580755f511a34797b6a78626ca6ad25a2ca08a2"},
+    {file = "nccl4py-0.3.1.post1-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8dc26fa7311be66591cf151223f3d0551c726929287509919b09ac136ea1a152"},
+    {file = "nccl4py-0.3.1.post1-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f5d6b9d37ce508dde8cbab35a8e350fc6a46e4e6efa2a02170809a416ea8e6e2"},
+    {file = "nccl4py-0.3.1.post1-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:910264c53e4b54c0139851157a532fd49c63f5bd97bd3da54b161f9d52e9e396"},
+    {file = "nccl4py-0.3.1.post1-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5772265892a6389871817728aba1716684106ea79cbb73c6aa0100884a287626"},
+    {file = "nccl4py-0.3.1.post1-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:cd6a48cfb31b8242f8cfd439569833fdac7e58ab9e644cec4ddd2819b3e0521a"},
+    {file = "nccl4py-0.3.1.post1-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f3acf4e3243445fa1623e8fab31064d4a5afaaff89bb6199793cf89c78c3a0d7"},
 ]
 
 [package.dependencies]
@@ -3133,8 +3140,8 @@ packaging = "*"
 typing_extensions = {version = "*", markers = "python_version < \"3.13\""}
 
 [package.extras]
-cu12 = ["cuda-bindings (>=12.0,<13.0)", "nvidia-cutlass-dsl (>=4.5.2,<5.0)", "nvidia-nccl-cu12"]
-cu13 = ["cuda-bindings (>=13.0,<14.0)", "nvidia-cutlass-dsl[cu13] (>=4.5.2,<5.0)", "nvidia-nccl-cu13"]
+cu12 = ["cuda-bindings (>=12.0,<13.0)", "nvidia-cutlass-dsl (>=4.5.2,<5.0)", "nvidia-nccl-cu12 (==2.30.4)"]
+cu13 = ["cuda-bindings (>=13.0,<14.0)", "nvidia-cutlass-dsl[cu13] (>=4.5.2,<5.0)", "nvidia-nccl-cu13 (==2.30.4)"]
 
 [[package]]
 name = "networkx"
@@ -3746,14 +3753,14 @@ PyYAML = ">=5.1.0"
 
 [[package]]
 name = "openai"
-version = "3.7.0"
+version = "3.8.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "openai-3.7.0-py3-none-any.whl", hash = "sha256:008fa33e0a01dc71039c27355ef8f476eed690e8e48bec18183878dcd32fb841"},
-    {file = "openai-3.7.0.tar.gz", hash = "sha256:e836eb7effee89df802cd0c7d1bad8de8c993976cf238c44d5b5b844f5aefd38"},
+    {file = "openai-3.8.0-py3-none-any.whl", hash = "sha256:514736aa1e4ef1033c1209ad53897392845ccd4f2c4fae6413b2cf5f91c2c926"},
+    {file = "openai-3.8.0.tar.gz", hash = "sha256:6138a5a1333a1be9e4d1edea2d160b311542787b029543f87de4961c66358d16"},
 ]
 
 [package.dependencies]
@@ -5848,14 +5855,14 @@ typing-extensions = "*"
 
 [[package]]
 name = "sse-starlette"
-version = "3.4.8"
+version = "3.4.10"
 description = "SSE plugin for Starlette"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "sse_starlette-3.4.8-py3-none-any.whl", hash = "sha256:6e82314c786709a3cd9520f2285cf9fff90e181e598e8a357b0cf80f66afba0d"},
-    {file = "sse_starlette-3.4.8.tar.gz", hash = "sha256:ed89ffbb75cbf78a5fe2f2109cd584792ee7f9dfac96f791db546df8f15f3f9c"},
+    {file = "sse_starlette-3.4.10-py3-none-any.whl", hash = "sha256:710f5f5b0527409903a22a91699db02f76f4c2eb9204e882e4ee7cada76bdf75"},
+    {file = "sse_starlette-3.4.10.tar.gz", hash = "sha256:c6c87280d8feb4e55a8d79633782766b9cac6a26da5c79a145d00aa404117a86"},
 ]
 
 [package.dependencies]
@@ -6968,4 +6975,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "c27c1cdce8fd886a35bf6a0c2080fb7355d1641bd823da4f8cedb028a25ab6c4"
+content-hash = "c551c1a29f23bee9daf1b4e089fa06265a9ee87e7440207d51fd9b00616a9853"
