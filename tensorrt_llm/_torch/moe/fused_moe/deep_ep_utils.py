@@ -2,14 +2,14 @@
 # https://github.com/deepseek-ai/DeepEP/blob/aae9fa9a6dd0fec2a723fbb85ec4b22460fab670/README.md
 import os
 import weakref
-from typing import List, Optional, Tuple, Union
+from typing import List, Tuple, Union
 
 import torch
 
 from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.mapping import Mapping
 
-_LowLatencyHandle = Tuple[torch.Tensor, torch.Tensor, int, int, int]
+_LowLatencyHandle = tuple[torch.Tensor, torch.Tensor, int, int, int]
 
 try:
     from tensorrt_llm.deep_ep import Buffer
@@ -188,7 +188,7 @@ class VariableLengthLowLatencyBuffer:
         self, hidden_states: torch.Tensor, global_scale: torch.Tensor,
         topk_idx: torch.Tensor, num_max_dispatch_tokens_per_rank: int,
         num_experts: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, _LowLatencyHandle]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, _LowLatencyHandle]:
         """Pack BF16 inputs to NVFP4 in the DeepEP dispatch send phase.
 
         Args:
@@ -222,7 +222,7 @@ class VariableLengthLowLatencyBuffer:
             self,
             precision: str,
             hidden_states: torch.Tensor,
-            global_scales: Optional[torch.Tensor],
+            global_scales: torch.Tensor | None,
             topk_idx: torch.Tensor,
             topk_weights: torch.Tensor,
             handle: _LowLatencyHandle,
